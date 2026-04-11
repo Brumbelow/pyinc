@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyfoundinc"
+version = "0.1.0"
+description = "A correctness-first incremental query engine for Python."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "pyfoundinc contributors" },
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyfoundinc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
