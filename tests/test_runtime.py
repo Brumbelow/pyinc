@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
-from pyfoundinc import Database, FileResource, Input, MutationError, UntrackedReadError, query
+from pyfoundinc import (
+    Database,
+    DirectoryResource,
+    FileResource,
+    FrozenDict,
+    Input,
+    MutationError,
+    UntrackedReadError,
+    query,
+)
 
 
 def test_equal_input_update_does_not_dirty_dependents() -> None:
@@ -81,6 +91,23 @@ def test_dynamic_dependencies_drop_stale_edges() -> None:
     assert "input[left]" not in explanation
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("strict", FrozenDict), ("checked", dict), ("fast", dict)],
+)
+def test_modes_expose_expected_boundary_shapes(mode: str, expected_type: type[object]) -> None:
+    payload = Input[dict[str, int]]("payload")
+
+    @query
+    def echo(db: Database) -> object:
+        return payload.read(db)
+
+    db = Database(mode=mode)
+    db.set(payload, {"x": 1})
+    result = db.get(echo)
+    assert isinstance(result, expected_type)
+
+
 @pytest.mark.parametrize("mode", ["strict", "checked"])
 def test_mutation_raises_for_boundary_inputs(mode: str) -> None:
     payload = Input[dict[str, int]]("payload")
@@ -97,6 +124,28 @@ def test_mutation_raises_for_boundary_inputs(mode: str) -> None:
         db.get(mutate)
 
 
+def test_fast_mode_uses_owned_values_without_mutation_detection() -> None:
+    payload = Input[tuple[dict[str, int], dict[str, int]]]("payload")
+
+    @query
+    def mutate_left(db: Database) -> int:
+        left, right = payload.read(db)
+        left["x"] = 99
+        return right["x"]
+
+    @query
+    def read_right(db: Database) -> int:
+        _, right = payload.read(db)
+        return right["x"]
+
+    shared = {"x": 1}
+    db = Database(mode="fast")
+    db.set(payload, (shared, shared))
+
+    assert db.get(mutate_left) == 1
+    assert db.get(read_right) == 1
+
+
 def test_raw_open_is_rejected_inside_query(tmp_path: Path) -> None:
     path = tmp_path / "sample.txt"
     path.write_text("hello", encoding="utf-8")
@@ -111,16 +160,29 @@ def test_raw_open_is_rejected_inside_query(tmp_path: Path) -> None:
         db.get(read_directly)
 
 
-def test_untracked_reads_appear_in_explanation() -> None:
+def test_untracked_queries_rerun_without_backdating_the_impure_node() -> None:
+    calls = {"impure_source": 0, "consumer": 0}
+
     @query
-    def maybe_remote(db: Database) -> str:
-        db.report_untracked_read("http GET https://example.test")
-        return "ok"
+    def impure_source(db: Database) -> str:
+        calls["impure_source"] += 1
+        db.report_untracked_read("clock.now()")
+        return "stable"
+
+    @query
+    def consumer(db: Database) -> str:
+        calls["consumer"] += 1
+        return impure_source(db)
 
     db = Database()
-    assert db.get(maybe_remote) == "ok"
-    explanation = db.explain(maybe_remote)
-    assert "untracked: http GET https://example.test" in explanation
+    assert db.get(consumer) == "stable"
+    assert db.get(consumer) == "stable"
+    assert calls["consumer"] == 2
+    assert calls["impure_source"] >= 2
+
+    explanation = db.explain(consumer)
+    assert "impure_source(): backdated" not in explanation
+    assert "untracked: clock.now()" in explanation
 
 
 def test_comment_only_file_edit_backdates_parse(tmp_path: Path) -> None:
@@ -132,7 +194,10 @@ def test_comment_only_file_edit_backdates_parse(tmp_path: Path) -> None:
     def ast_semantic_eq(left: str, right: str) -> bool:
         import ast
 
-        return ast.dump(ast.parse(left), include_attributes=False) == ast.dump(ast.parse(right), include_attributes=False)
+        return ast.dump(ast.parse(left), include_attributes=False) == ast.dump(
+            ast.parse(right),
+            include_attributes=False,
+        )
 
     @query(eq=ast_semantic_eq)
     def parse_source(db: Database, filename: str) -> str:
@@ -163,16 +228,46 @@ def test_comment_only_file_edit_backdates_parse(tmp_path: Path) -> None:
     assert counters["diagnostics"] == 1
 
 
-def test_resource_queries_use_file_resource(tmp_path: Path) -> None:
+def test_file_resource_detects_content_changes_even_when_stat_signature_is_stable(tmp_path: Path) -> None:
     files = FileResource()
     path = tmp_path / "sample.txt"
     path.write_text("alpha", encoding="utf-8")
+    original_stat = path.stat()
+    calls = {"read_file": 0}
 
     @query
     def read_file(db: Database, filename: str) -> str:
+        calls["read_file"] += 1
         return files.read(db, filename)
 
     db = Database()
     assert db.get(read_file, str(path)) == "alpha"
-    path.write_text("beta", encoding="utf-8")
-    assert db.get(read_file, str(path)) == "beta"
+    assert calls["read_file"] == 1
+
+    path.write_text("bravo", encoding="utf-8")
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert db.get(read_file, str(path)) == "bravo"
+    assert calls["read_file"] == 2
+
+
+def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) -> None:
+    directories = DirectoryResource()
+    path = tmp_path / "workspace"
+    path.mkdir()
+    child = path / "a.txt"
+    child.write_text("alpha", encoding="utf-8")
+    calls = {"entries": 0}
+
+    @query
+    def entries(db: Database, dirname: str) -> tuple[str, ...]:
+        calls["entries"] += 1
+        return directories.read(db, dirname)
+
+    db = Database()
+    assert db.get(entries, str(path)) == ("a.txt",)
+    assert calls["entries"] == 1
+
+    child.write_text("beta", encoding="utf-8")
+    assert db.get(entries, str(path)) == ("a.txt",)
+    assert calls["entries"] == 1

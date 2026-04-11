@@ -2,7 +2,17 @@ from .core import Input, query
 from .errors import CycleError, MutationError, PyFoundIncError, UnsupportedValueError, UntrackedReadError
 from .resources import DirectoryResource, EnvResource, FileResource
 from .runtime import Database
-from .value import FrozenDict, FrozenList, FrozenRecord, FrozenSet, freeze, semantic_equal, thaw
+from .value import (
+    FrozenAdapterValue,
+    FrozenDict,
+    FrozenList,
+    FrozenRecord,
+    FrozenSet,
+    ValueAdapter,
+    freeze,
+    semantic_equal,
+    thaw,
+)
 
 __all__ = [
     "CycleError",
@@ -10,6 +20,7 @@ __all__ = [
     "DirectoryResource",
     "EnvResource",
     "FileResource",
+    "FrozenAdapterValue",
     "FrozenDict",
     "FrozenList",
     "FrozenRecord",
@@ -19,6 +30,7 @@ __all__ = [
     "PyFoundIncError",
     "UnsupportedValueError",
     "UntrackedReadError",
+    "ValueAdapter",
     "freeze",
     "query",
     "semantic_equal",

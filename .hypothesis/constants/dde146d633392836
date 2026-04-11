@@ -1,0 +1,4 @@
+# file: /home/user1/pyfoundinc/src/pyfoundinc/runtime.py
+# hypothesis_version: 6.151.12
+
+['_query_registry', '_resource_registry', 'backdated', 'builtins.open', 'cache_tag', 'checked', 'cold execute', 'executed', 'fast', 'identity', 'input', 'input changed', 'input set', 'io.open', 'never', 'pending', 'query', 'query_id', 'resource', 'resource loaded', 'reused', 'strict', 'untracked dependency', 'value']

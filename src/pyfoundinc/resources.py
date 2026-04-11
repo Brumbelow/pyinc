@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
@@ -16,12 +17,11 @@ class FileResource:
     def label(self, path: str) -> str:
         return f"file[{path}]"
 
-    def probe(self, path: str) -> tuple[str, int, int] | tuple[str]:
+    def probe(self, path: str) -> tuple[str, str] | tuple[str]:
         file_path = Path(path)
         if not file_path.exists():
             return ("missing",)
-        stat = file_path.stat()
-        return ("present", stat.st_mtime_ns, stat.st_size)
+        return ("present", hashlib.sha256(file_path.read_bytes()).hexdigest())
 
     def load(self, db: "Database", path: str) -> str:
         with db._allow_raw_open():
@@ -51,15 +51,11 @@ class DirectoryResource:
     def label(self, path: str) -> str:
         return f"dir[{path}]"
 
-    def probe(self, path: str) -> tuple[tuple[str, int, int], ...] | tuple[str]:
+    def probe(self, path: str) -> tuple[str, ...] | tuple[str]:
         dir_path = Path(path)
         if not dir_path.exists():
             return ("missing",)
-        entries = []
-        for child in sorted(dir_path.iterdir(), key=lambda item: item.name):
-            stat = child.stat()
-            entries.append((child.name, stat.st_mtime_ns, stat.st_size))
-        return tuple(entries)
+        return tuple(sorted(child.name for child in dir_path.iterdir()))
 
     def load(self, db: "Database", path: str) -> tuple[str, ...]:
         dir_path = Path(path)

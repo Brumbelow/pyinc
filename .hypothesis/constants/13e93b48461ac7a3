@@ -1,0 +1,4 @@
+# file: /home/user1/pyfoundinc/src/pyfoundinc/value.py
+# hypothesis_version: 6.151.12
+
+['Snapshot', 'frozenset', 'range', 'set']

@@ -15,10 +15,11 @@ authors = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["hypothesis>=6.0", "pytest>=8.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pyfoundinc"]
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 testpaths = ["tests"]

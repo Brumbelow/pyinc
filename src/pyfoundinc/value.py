@@ -1,13 +1,26 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 import os
 import pickle
 from types import NoneType
-from typing import Any
+from typing import Any, Protocol
 
 from .errors import MutationError, UnsupportedValueError
+
+
+FreezeFn = Callable[[Any], "Snapshot"]
+ThawFn = Callable[[Any], Any]
+
+
+class ValueAdapter(Protocol):
+    def freeze(self, value: Any, freeze: FreezeFn) -> Any:
+        """Convert a live value into a snapshot-safe payload."""
+
+    def thaw(self, snapshot: Any, thaw: ThawFn) -> Any:
+        """Reconstruct an exposed value from a frozen payload."""
 
 
 @dataclass(frozen=True)
@@ -43,7 +56,8 @@ class FrozenDict(Mapping[Any, Any]):
 
 @dataclass(frozen=True)
 class FrozenSet:
-    items: frozenset[Any]
+    kind: str
+    items: tuple[Any, ...]
 
     def __contains__(self, value: Any) -> bool:
         return value in self.items
@@ -73,6 +87,12 @@ class FrozenRecord(Mapping[str, Any]):
         return len(self.entries)
 
 
+@dataclass(frozen=True)
+class FrozenAdapterValue:
+    adapter_key: str
+    payload: Any
+
+
 Snapshot = (
     str
     | bytes
@@ -85,38 +105,77 @@ Snapshot = (
     | FrozenDict
     | FrozenSet
     | FrozenRecord
+    | FrozenAdapterValue
     | tuple[Any, ...]
 )
 
 IMMUTABLE_SCALARS = (str, bytes, int, float, bool, NoneType, complex)
+AdapterMap = Mapping[type[Any], ValueAdapter]
 
 
-def freeze(value: Any) -> Snapshot:
+class _AdapterRegistry:
+    def __init__(self, adapters: AdapterMap | None = None) -> None:
+        self._adapters = dict(adapters or {})
+        self._adapters_by_key = {_adapter_key(value_type): adapter for value_type, adapter in self._adapters.items()}
+        if len(self._adapters_by_key) != len(self._adapters):
+            raise ValueError("Adapter registry contains duplicate type identifiers.")
+
+    def for_value(self, value: Any) -> tuple[str, ValueAdapter] | None:
+        for candidate in type(value).__mro__:
+            adapter = self._adapters.get(candidate)
+            if adapter is not None:
+                return _adapter_key(candidate), adapter
+        return None
+
+    def for_key(self, adapter_key: str) -> ValueAdapter | None:
+        return self._adapters_by_key.get(adapter_key)
+
+
+def freeze(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> Snapshot:
+    registry = _coerce_registry(adapters)
+    return _freeze(value, registry, set())
+
+
+def _freeze(value: Any, registry: _AdapterRegistry, active_ids: set[int]) -> Snapshot:
     if isinstance(value, IMMUTABLE_SCALARS):
         return value
-    if isinstance(value, FrozenList | FrozenDict | FrozenSet | FrozenRecord):
+    if isinstance(value, FrozenList | FrozenDict | FrozenSet | FrozenRecord | FrozenAdapterValue):
         return value
+    adapter_match = registry.for_value(value)
+    if adapter_match is not None:
+        adapter_key, adapter = adapter_match
+        with _freeze_guard(value, active_ids):
+            payload = adapter.freeze(value, lambda item: _freeze(item, registry, active_ids))
+            return FrozenAdapterValue(adapter_key, _freeze(payload, registry, active_ids))
     if isinstance(value, tuple):
-        return tuple(freeze(item) for item in value)
+        with _freeze_guard(value, active_ids):
+            return tuple(_freeze(item, registry, active_ids) for item in value)
     if isinstance(value, list):
-        return FrozenList(tuple(freeze(item) for item in value))
+        with _freeze_guard(value, active_ids):
+            return FrozenList(tuple(_freeze(item, registry, active_ids) for item in value))
     if isinstance(value, frozenset):
-        return frozenset(freeze(item) for item in value)
+        with _freeze_guard(value, active_ids):
+            return FrozenSet("frozenset", _freeze_unordered(value, registry, active_ids))
     if isinstance(value, set):
-        return FrozenSet(frozenset(freeze(item) for item in value))
+        with _freeze_guard(value, active_ids):
+            return FrozenSet("set", _freeze_unordered(value, registry, active_ids))
     if isinstance(value, Mapping):
-        frozen_items = tuple(
-            sorted(
-                ((freeze(key), freeze(item)) for key, item in value.items()),
-                key=_sort_key,
+        with _freeze_guard(value, active_ids):
+            frozen_items = tuple(
+                sorted(
+                    ((_freeze(key, registry, active_ids), _freeze(item, registry, active_ids)) for key, item in value.items()),
+                    key=lambda item: _canonical_sort_key(item[0]),
+                )
             )
-        )
-        return FrozenDict(frozen_items)
+            return FrozenDict(frozen_items)
     if isinstance(value, os.PathLike):
         return os.fspath(value)
     if is_dataclass(value) and not isinstance(value, type):
-        frozen_items = tuple((field.name, freeze(getattr(value, field.name))) for field in fields(value))
-        return FrozenRecord(type(value).__qualname__, frozen_items)
+        with _freeze_guard(value, active_ids):
+            frozen_items = tuple(
+                (field.name, _freeze(getattr(value, field.name), registry, active_ids)) for field in fields(value)
+            )
+            return FrozenRecord(type(value).__qualname__, frozen_items)
     if isinstance(value, range):
         return ("range", value.start, value.stop, value.step)
     if isinstance(value, Iterator):
@@ -132,24 +191,37 @@ def freeze(value: Any) -> Snapshot:
     )
 
 
-def thaw(value: Any) -> Any:
+def thaw(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> Any:
+    registry = _coerce_registry(adapters)
+    return _thaw(value, registry)
+
+
+def _thaw(value: Any, registry: _AdapterRegistry) -> Any:
+    if isinstance(value, FrozenAdapterValue):
+        adapter = registry.for_key(value.adapter_key)
+        if adapter is None:
+            raise UnsupportedValueError(
+                f"Cannot thaw adapted snapshot for {value.adapter_key!r} without the matching adapter registry."
+            )
+        return adapter.thaw(value.payload, lambda item: _thaw(item, registry))
     if isinstance(value, FrozenList):
-        return [thaw(item) for item in value.items]
+        return [ _thaw(item, registry) for item in value.items ]
     if isinstance(value, FrozenDict):
-        return {thaw(key): thaw(item) for key, item in value.entries}
+        return {_thaw(key, registry): _thaw(item, registry) for key, item in value.entries}
     if isinstance(value, FrozenSet):
-        return {thaw(item) for item in value.items}
+        thawed_items = tuple(_thaw(item, registry) for item in value.items)
+        if value.kind == "frozenset":
+            return frozenset(thawed_items)
+        return set(thawed_items)
     if isinstance(value, FrozenRecord):
-        return {key: thaw(item) for key, item in value.entries}
+        return {key: _thaw(item, registry) for key, item in value.entries}
     if isinstance(value, tuple):
-        return tuple(thaw(item) for item in value)
-    if isinstance(value, frozenset):
-        return frozenset(thaw(item) for item in value)
+        return tuple(_thaw(item, registry) for item in value)
     return value
 
 
-def fingerprint(value: Any) -> str:
-    snapshot = freeze(value)
+def fingerprint(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> str:
+    snapshot = freeze(value, adapters=adapters)
     return fingerprint_snapshot(snapshot)
 
 
@@ -161,8 +233,8 @@ def snapshots_equal(left: Any, right: Any) -> bool:
     return left == right
 
 
-def semantic_equal(left: Any, right: Any) -> bool:
-    return freeze(left) == freeze(right)
+def semantic_equal(left: Any, right: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> bool:
+    return freeze(left, adapters=adapters) == freeze(right, adapters=adapters)
 
 
 def assert_not_mutated(before: str, after: str) -> None:
@@ -170,6 +242,32 @@ def assert_not_mutated(before: str, after: str) -> None:
         raise MutationError("Query mutated one of its boundary inputs.")
 
 
-def _sort_key(item: tuple[Any, Any]) -> tuple[str, str]:
-    key, _ = item
-    return (type(key).__qualname__, repr(key))
+def _freeze_unordered(values: Iterable[Any], registry: _AdapterRegistry, active_ids: set[int]) -> tuple[Any, ...]:
+    snapshots = tuple(_freeze(item, registry, active_ids) for item in values)
+    return tuple(sorted(snapshots, key=_canonical_sort_key))
+
+
+def _canonical_sort_key(value: Any) -> str:
+    return fingerprint_snapshot(value)
+
+
+def _coerce_registry(adapters: AdapterMap | _AdapterRegistry | None) -> _AdapterRegistry:
+    if isinstance(adapters, _AdapterRegistry):
+        return adapters
+    return _AdapterRegistry(adapters)
+
+
+@contextmanager
+def _freeze_guard(value: Any, active_ids: set[int]) -> Iterator[None]:
+    object_id = id(value)
+    if object_id in active_ids:
+        raise UnsupportedValueError("Cyclic values cannot cross cached boundaries.")
+    active_ids.add(object_id)
+    try:
+        yield
+    finally:
+        active_ids.remove(object_id)
+
+
+def _adapter_key(value_type: type[Any]) -> str:
+    return f"{value_type.__module__}:{value_type.__qualname__}"
