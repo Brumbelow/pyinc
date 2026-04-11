@@ -13,6 +13,7 @@ from pyfoundinc import (
     FileResource,
     FileStatResource,
     FrozenDict,
+    InspectionNode,
     Input,
     MutationError,
     UnsupportedValueError,
@@ -34,9 +35,35 @@ def _query_record(db: Database, query_fn: object, *args: object, **kwargs: objec
     return db._records[key]
 
 
+def _inspect_node(db: Database, query_fn: object, *args: object, **kwargs: object) -> InspectionNode:
+    return db.inspect(query_fn, *args, **kwargs)
+
+
+def _find_node(root: InspectionNode, needle: str) -> InspectionNode:
+    if needle in root.label:
+        return root
+    for dependency in root.dependencies:
+        try:
+            return _find_node(dependency, needle)
+        except LookupError:
+            continue
+    raise LookupError(needle)
+
+
 def test_max_query_nodes_must_be_positive() -> None:
     with pytest.raises(ValueError):
         Database(max_query_nodes=0)
+
+
+def test_inputs_and_queries_reject_eq_and_cutoff_together() -> None:
+    with pytest.raises(ValueError, match="either eq= or cutoff="):
+        Input[int]("number", eq=lambda left, right: left == right, cutoff=abs)
+
+    with pytest.raises(ValueError, match="either eq= or cutoff="):
+
+        @query(eq=lambda left, right: left == right, cutoff=abs)
+        def invalid(db: Database) -> int:
+            return 1
 
 
 def test_equal_input_update_does_not_dirty_dependents() -> None:
@@ -49,12 +76,12 @@ def test_equal_input_update_does_not_dirty_dependents() -> None:
     db = Database()
     db.set(number, 4)
     assert db.get(double) == 8
-    assert _query_record(db, double).last_decision == "executed"
+    assert _inspect_node(db, double).last_decision == "executed"
 
     db.set(number, 4)
     assert db.revision == 1
     assert db.get(double) == 8
-    record = _query_record(db, double)
+    record = _inspect_node(db, double)
     assert record.last_decision == "reused"
     assert record.changed_at == 1
 
@@ -76,8 +103,9 @@ def test_equal_recompute_backdates_and_skips_downstream() -> None:
 
     db.set(number, 4)
     assert db.get(describe) == "value-is-even"
-    parity_record = _query_record(db, parity)
-    describe_record = _query_record(db, describe)
+    inspection = _inspect_node(db, describe)
+    parity_record = _find_node(inspection, "parity")
+    describe_record = inspection
     assert parity_record.last_decision == "backdated"
     assert parity_record.changed_at == 1
     assert describe_record.last_decision == "reused"
@@ -86,6 +114,70 @@ def test_equal_recompute_backdates_and_skips_downstream() -> None:
     explanation = db.explain(describe)
     assert "describe" in explanation
     assert "backdated" in explanation
+
+
+def test_input_cutoff_suppresses_equal_updates() -> None:
+    number = Input[int]("number", cutoff=abs)
+
+    @query
+    def describe(db: Database) -> int:
+        return abs(number.read(db))
+
+    db = Database()
+    db.set(number, 4)
+    assert db.get(describe) == 4
+
+    db.set(number, -4)
+    assert db.revision == 1
+    assert db.get(describe) == 4
+    inspection = _inspect_node(db, describe)
+    assert inspection.last_decision == "reused"
+    input_node = _find_node(inspection, "input[number]")
+    assert input_node.last_decision == "reused"
+    assert input_node.reason == "equal input update ignored"
+
+
+def test_query_cutoff_backdates_and_skips_downstream(tmp_path: Path) -> None:
+    files = FileResource()
+    path = tmp_path / "module.py"
+    path.write_text("import os\n", encoding="utf-8")
+
+    def ast_cutoff(source: str) -> str:
+        import ast
+
+        return ast.dump(ast.parse(source), include_attributes=False)
+
+    @query(cutoff=ast_cutoff)
+    def parse_source(db: Database, filename: str) -> str:
+        return files.read(db, filename)
+
+    @query
+    def imports(db: Database, filename: str) -> tuple[str, ...]:
+        source = parse_source(db, filename)
+        return ("os",) if "import os" in source else tuple()
+
+    @query
+    def diagnostics(db: Database, filename: str) -> tuple[str, ...]:
+        return tuple(f"import:{name}" for name in imports(db, filename))
+
+    db = Database()
+    assert db.get(diagnostics, str(path)) == ("import:os",)
+
+    path.write_text("# comment\nimport os\n", encoding="utf-8")
+    assert db.get(diagnostics, str(path)) == ("import:os",)
+    inspection = _inspect_node(db, diagnostics, str(path))
+    assert _find_node(inspection, "parse_source").last_decision == "backdated"
+    assert _find_node(inspection, "imports").last_decision == "reused"
+    assert inspection.last_decision == "reused"
+
+
+def test_cutoff_tokens_must_be_snapshot_safe() -> None:
+    number = Input[int]("number", cutoff=lambda value: iter((value,)))
+
+    db = Database()
+    db.set(number, 1)
+    with pytest.raises(UnsupportedValueError, match="Cutoff functions must return snapshot-safe values"):
+        db.set(number, 1)
 
 
 def test_dynamic_dependencies_drop_stale_edges() -> None:
@@ -109,9 +201,35 @@ def test_dynamic_dependencies_drop_stale_edges() -> None:
     db.set(chooser, "right")
     assert db.get(branch) == 10
 
-    explanation = db.explain(branch)
-    assert "input[right]" in explanation
-    assert "input[left]" not in explanation
+    inspection = _inspect_node(db, branch)
+    assert any(dependency.label == "input[right]" for dependency in inspection.dependencies)
+    assert all(dependency.label != "input[left]" for dependency in inspection.dependencies)
+
+
+def test_inspect_returns_structured_dependency_tree() -> None:
+    number = Input[int]("number")
+
+    @query
+    def double(db: Database) -> int:
+        return number.read(db) * 2
+
+    @query
+    def describe(db: Database) -> str:
+        return f"value={double(db)}"
+
+    db = Database()
+    db.set(number, 3)
+
+    inspection = db.inspect(describe)
+
+    assert inspection.kind == "query"
+    assert inspection.label.endswith("describe()")
+    assert inspection.last_decision == "executed"
+    double_node = _find_node(inspection, "double")
+    input_node = _find_node(inspection, "input[number]")
+    assert double_node.kind == "query"
+    assert input_node.kind == "input"
+    assert input_node.dependencies == ()
 
 
 @pytest.mark.parametrize(
@@ -269,9 +387,10 @@ def test_untracked_queries_rerun_without_backdating_the_impure_node() -> None:
     db = Database()
     assert db.get(consumer) == "stable"
     assert db.get(consumer) == "stable"
-    impure_record = _query_record(db, impure_source)
+    inspection = _inspect_node(db, consumer)
+    impure_record = _find_node(inspection, "impure_source")
     assert impure_record.is_untracked
-    assert impure_record.last_decision == "executed"
+    assert impure_record.last_recompute == "executed"
 
     explanation = db.explain(consumer)
     assert "impure_source(): backdated" not in explanation
@@ -311,9 +430,10 @@ def test_comment_only_file_edit_backdates_parse(tmp_path: Path) -> None:
 
     path.write_text("# comment\nimport os\n", encoding="utf-8")
     assert db.get(diagnostics, str(path)) == ("import:os",)
-    assert _query_record(db, parse_source, str(path)).last_decision == "backdated"
-    assert _query_record(db, imports, str(path)).last_decision == "reused"
-    assert _query_record(db, diagnostics, str(path)).last_decision == "reused"
+    inspection = _inspect_node(db, diagnostics, str(path))
+    assert _find_node(inspection, "parse_source").last_decision == "backdated"
+    assert _find_node(inspection, "imports").last_decision == "reused"
+    assert inspection.last_decision == "reused"
 
 
 def test_file_resource_detects_content_changes_even_when_stat_signature_is_stable(tmp_path: Path) -> None:
@@ -333,7 +453,7 @@ def test_file_resource_detects_content_changes_even_when_stat_signature_is_stabl
     os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
     assert db.get(read_file, str(path)) == "bravo"
-    record = _query_record(db, read_file, str(path))
+    record = _inspect_node(db, read_file, str(path))
     assert record.last_decision == "executed"
     assert record.changed_at == 1
 
@@ -356,7 +476,7 @@ def test_file_stat_resource_tracks_metadata_changes(tmp_path: Path) -> None:
     second = db.get(read_stat, str(path))
     assert second["exists"] is True
     assert second["size"] == 6
-    assert _query_record(db, read_stat, str(path)).last_decision == "executed"
+    assert _inspect_node(db, read_stat, str(path)).last_decision == "executed"
 
 
 def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) -> None:
@@ -375,7 +495,7 @@ def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) ->
 
     child.write_text("beta", encoding="utf-8")
     assert db.get(entries, str(path)) == ("a.txt",)
-    assert _query_record(db, entries, str(path)).last_decision == "reused"
+    assert _inspect_node(db, entries, str(path)).last_decision == "reused"
 
 
 def test_direct_cycles_raise_cycle_error() -> None:

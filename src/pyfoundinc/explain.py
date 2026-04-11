@@ -1,33 +1,41 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .runtime import Database, NodeKey
+from dataclasses import dataclass
 
 
-def format_explanation(db: "Database", key: "NodeKey") -> str:
+@dataclass(frozen=True)
+class InspectionNode:
+    label: str
+    kind: str
+    changed_at: int
+    verified_at: int
+    last_decision: str
+    last_recompute: str
+    reason: str
+    untracked_reasons: tuple[str, ...] = ()
+    dependencies: tuple[InspectionNode, ...] = ()
+
+    @property
+    def is_untracked(self) -> bool:
+        return bool(self.untracked_reasons)
+
+
+def format_explanation(root: InspectionNode) -> str:
     lines: list[str] = []
-    visited: set[NodeKey] = set()
 
-    def walk(current: "NodeKey", depth: int) -> None:
-        record = db._records[current]
+    def walk(current: InspectionNode, depth: int) -> None:
         indent = "  " * depth
         lines.append(
-            f"{indent}- {record.label}: {record.last_decision}"
-            f" [last_recompute={record.last_recompute}]"
-            f" (changed_at={record.changed_at}, verified_at={record.verified_at})"
+            f"{indent}- {current.label}: {current.last_decision}"
+            f" [last_recompute={current.last_recompute}]"
+            f" (changed_at={current.changed_at}, verified_at={current.verified_at})"
         )
-        if record.reason:
-            lines.append(f"{indent}  reason: {record.reason}")
-        for item in record.untracked_reasons:
+        if current.reason:
+            lines.append(f"{indent}  reason: {current.reason}")
+        for item in current.untracked_reasons:
             lines.append(f"{indent}  untracked: {item}")
-        if current in visited:
-            lines.append(f"{indent}  cycle-cut: already visited")
-            return
-        visited.add(current)
-        for dep in sorted(record.dependencies, key=lambda item: item.label):
-            walk(dep, depth + 1)
+        for dependency in current.dependencies:
+            walk(dependency, depth + 1)
 
-    walk(key, 0)
+    walk(root, 0)
     return "\n".join(lines)

@@ -1,5 +1,6 @@
 from .core import Input, query
 from .errors import CycleError, MutationError, PyFoundIncError, UnsupportedValueError, UntrackedReadError
+from .explain import InspectionNode
 from .resources import DirectoryResource, EnvResource, FileResource, FileStatResource, FileStatSnapshot
 from .runtime import Database
 from .value import (
@@ -28,6 +29,7 @@ __all__ = [
     "FrozenRecord",
     "FrozenSet",
     "Input",
+    "InspectionNode",
     "MutationError",
     "PyFoundIncError",
     "UnsupportedValueError",

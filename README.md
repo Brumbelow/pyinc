@@ -6,16 +6,19 @@ Current scope:
 
 - `@query` for derived values
 - `Input` for explicit base leaves
+- optional `eq=` and `cutoff=` policies on `Input` and `@query`
 - `ValueAdapter` for custom snapshot-safe boundary types
 - `FileResource`, `FileStatResource`, `EnvResource`, and `DirectoryResource` for explicit external reads
 - pull-based recomputation with revisions, dependency capture, red-green verification, and backdating
 - `strict`, `checked`, and `fast` execution modes with explicit boundary semantics
 - optional bounded query memoization via `Database(max_query_nodes=...)`
-- explanation output for reuse vs recompute decisions
+- `Database.inspect(...)` for structured provenance and `Database.explain(...)` for human-readable formatting
 
 The core contract is intentionally narrow: values crossing cached boundaries must be snapshot-safe, and hidden reads are treated as correctness violations rather than “best effort” cache misses.
 
 Queries may capture immutable constants plus explicit `Input`, `@query`, and resource handles. Mutable global/nonlocal ambient state is rejected so stale reuse does not silently depend on untracked Python objects.
+
+`cutoff=` is the low-level semantic cutoff hook. It maps a value to a snapshot-safe token used for equal-input suppression and query backdating. Use it when semantic equality is cheaper or more precise than comparing full output values directly. `eq=` and `cutoff=` are mutually exclusive.
 
 Development:
 

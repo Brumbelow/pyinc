@@ -16,7 +16,7 @@ from typing import Any
 from unittest import mock
 
 from .errors import CycleError, UnsupportedValueError, UntrackedReadError
-from .explain import format_explanation
+from .explain import InspectionNode, format_explanation
 from .value import (
     FrozenAdapterValue,
     FrozenDict,
@@ -164,8 +164,12 @@ class Database:
         digest = fingerprint_snapshot(snapshot)
         node_key = self._input_key(input_key)
         record = self._records.get(node_key)
-        comparator = input_key.eq or self._semantic_equal
-        if record is not None and comparator(self._thaw_value(record.snapshot), self._thaw_value(snapshot)):
+        if record is not None and self._compare_values(
+            eq=input_key.eq,
+            cutoff=input_key.cutoff,
+            left=self._thaw_value(record.snapshot),
+            right=self._thaw_value(snapshot),
+        ):
             record.snapshot = snapshot
             record.digest = digest
             record.verified_at = self._revision
@@ -214,10 +218,18 @@ class Database:
 
         if not isinstance(query, Query):
             raise TypeError("db.explain() expects a @query-decorated callable.")
+        return format_explanation(self.inspect(query, *args, **kwargs))
+
+    def inspect(self, query: Any, *args: Any, **kwargs: Any) -> InspectionNode:
+        from .core import Query
+
+        if not isinstance(query, Query):
+            raise TypeError("db.inspect() expects a @query-decorated callable.")
         with self._request_scope():
             key, call_snapshot = self._query_key(query, args, kwargs)
-            self._ensure_query(query, key, call_snapshot)
-            return format_explanation(self, key)
+            if key not in self._records:
+                self._ensure_query(query, key, call_snapshot)
+            return self._inspect_record(key)
 
     def report_untracked_read(self, reason: str) -> None:
         frame = self._current_frame()
@@ -311,7 +323,12 @@ class Database:
                 previous_changed_at = previous.changed_at
                 old_value = self._expose_snapshot(previous.snapshot)
                 new_value = self._expose_snapshot(snapshot)
-                equal = False if impure else self._compare_values(query.eq, old_value, new_value)
+                equal = False if impure else self._compare_values(
+                    eq=query.eq,
+                    cutoff=query.cutoff,
+                    left=old_value,
+                    right=new_value,
+                )
                 record.snapshot = snapshot
                 record.digest = digest
                 if equal:
@@ -469,6 +486,22 @@ class Database:
         if frame is None:
             return
         frame.dependencies.add(key)
+
+    def _inspect_record(self, key: NodeKey) -> InspectionNode:
+        record = self._records[key]
+        return InspectionNode(
+            label=record.label,
+            kind=record.key.kind,
+            changed_at=record.changed_at,
+            verified_at=record.verified_at,
+            last_decision=record.last_decision,
+            last_recompute=record.last_recompute,
+            reason=record.reason,
+            untracked_reasons=tuple(record.untracked_reasons),
+            dependencies=tuple(
+                self._inspect_record(dependency) for dependency in sorted(record.dependencies, key=lambda item: item.label)
+            ),
+        )
 
     def _query_objects(self) -> dict[str, Any]:
         if not hasattr(self, "_query_registry"):
@@ -763,7 +796,22 @@ class Database:
     def _semantic_equal(self, left: Any, right: Any) -> bool:
         return semantic_equal(left, right, adapters=self._adapters)
 
-    def _compare_values(self, comparator: Callable[[Any, Any], bool] | None, left: Any, right: Any) -> bool:
-        if comparator is None:
+    def _compare_values(
+        self,
+        *,
+        eq: Callable[[Any, Any], bool] | None,
+        cutoff: Callable[[Any], Any] | None,
+        left: Any,
+        right: Any,
+    ) -> bool:
+        if cutoff is not None:
+            return self._freeze_cutoff_token(cutoff(left)) == self._freeze_cutoff_token(cutoff(right))
+        if eq is None:
             return self._semantic_equal(left, right)
-        return comparator(left, right)
+        return eq(left, right)
+
+    def _freeze_cutoff_token(self, value: Any) -> Any:
+        try:
+            return self._freeze_value(value)
+        except UnsupportedValueError as exc:
+            raise UnsupportedValueError("Cutoff functions must return snapshot-safe values.") from exc
