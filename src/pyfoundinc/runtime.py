@@ -3,19 +3,25 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 import builtins
+import inspect
 import io
 import marshal
 import os
 import sys
-from types import FunctionType
+from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Any
 from unittest import mock
 
-from .errors import CycleError, UntrackedReadError
+from .errors import CycleError, UnsupportedValueError, UntrackedReadError
 from .explain import format_explanation
 from .value import (
+    FrozenAdapterValue,
+    FrozenDict,
+    FrozenList,
+    FrozenRecord,
+    FrozenSet,
     ValueAdapter,
     assert_not_mutated,
     fingerprint,
@@ -81,7 +87,10 @@ class Database:
         self._revision = 0
         self._records: dict[NodeKey, NodeRecord] = {}
         self._input_records: dict[Any, NodeKey] = {}
-        self._active_frame: ContextVar[ExecutionFrame | None] = ContextVar("pyfoundinc_active_frame", default=None)
+        self._execution_stack: ContextVar[tuple[ExecutionFrame, ...]] = ContextVar(
+            "pyfoundinc_execution_stack",
+            default=(),
+        )
         self._allow_open: ContextVar[bool] = ContextVar("pyfoundinc_allow_open", default=False)
         self._request_token: ContextVar[int | None] = ContextVar("pyfoundinc_request_token", default=None)
         self._request_counter = 0
@@ -155,7 +164,7 @@ class Database:
             return format_explanation(self, key)
 
     def report_untracked_read(self, reason: str) -> None:
-        frame = self._active_frame.get()
+        frame = self._current_frame()
         if frame is None:
             raise RuntimeError("db.report_untracked_read() must be called while a query is executing.")
         frame.untracked_reasons.append(reason)
@@ -175,6 +184,8 @@ class Database:
         return self._expose_boundary_snapshot(self._records[key].snapshot)
 
     def _ensure_query(self, query: Any, key: NodeKey, call_snapshot: Any) -> None:
+        if any(frame.key == key for frame in self._execution_stack.get()):
+            raise CycleError(f"Cycle detected while evaluating {key.label}.")
         existing = self._records.get(key)
         current_request = self._current_request_id()
         if existing is None:
@@ -202,11 +213,9 @@ class Database:
         self._execute_query(query, key, call_snapshot, previous=existing, reason=dirty_reason)
 
     def _execute_query(self, query: Any, key: NodeKey, call_snapshot: Any, previous: NodeRecord | None, reason: str) -> None:
-        current_frame = self._active_frame.get()
-        if current_frame is not None and current_frame.key == key:
-            raise CycleError(f"Cycle detected while evaluating {key.label}.")
         frame = ExecutionFrame(key=key)
-        token = self._active_frame.set(frame)
+        stack = self._execution_stack.get()
+        token = self._execution_stack.set(stack + (frame,))
         try:
             query_args, query_kwargs = self._materialize_call(
                 call_snapshot,
@@ -257,7 +266,7 @@ class Database:
             record.untracked_reasons = list(frame.untracked_reasons)
             record.checked_in_request = self._current_request_id()
         finally:
-            self._active_frame.reset(token)
+            self._execution_stack.reset(token)
 
     def _maybe_changed_after(self, key: NodeKey, revision: int) -> bool:
         record = self._records.get(key)
@@ -349,9 +358,10 @@ class Database:
     def _resource_key(self, resource: Any, parameter: Any) -> NodeKey:
         frozen_parameter = self._freeze_value(parameter)
         parameter_digest = fingerprint_snapshot(frozen_parameter)
+        resource_identity = fingerprint_snapshot(self._resource_identity_payload(resource))
         key = NodeKey(
             kind="resource",
-            identity=f"{type(resource).__module__}:{type(resource).__qualname__}",
+            identity=f"{type(resource).__module__}:{type(resource).__qualname__}:{resource_identity}",
             args_digest=parameter_digest,
             label=resource.label(parameter),
         )
@@ -378,7 +388,7 @@ class Database:
         return exposed
 
     def _expose_boundary_snapshot(self, snapshot: Any) -> Any:
-        frame = self._active_frame.get()
+        frame = self._current_frame()
         return self._expose_snapshot(
             snapshot,
             boundary=True,
@@ -387,7 +397,7 @@ class Database:
         )
 
     def _record_dependency(self, key: NodeKey) -> None:
-        frame = self._active_frame.get()
+        frame = self._current_frame()
         if frame is None:
             return
         frame.dependencies.add(key)
@@ -421,12 +431,12 @@ class Database:
         original_io_open = io.open
 
         def guarded_open(*args: Any, **kwargs: Any) -> Any:
-            if self._active_frame.get() is not None and not self._allow_open.get():
+            if self._current_frame() is not None and not self._allow_open.get():
                 raise UntrackedReadError("Raw open() inside a query is untracked. Use FileResource.read().")
             return original_builtins_open(*args, **kwargs)
 
         def guarded_io_open(*args: Any, **kwargs: Any) -> Any:
-            if self._active_frame.get() is not None and not self._allow_open.get():
+            if self._current_frame() is not None and not self._allow_open.get():
                 raise UntrackedReadError("Raw open() inside a query is untracked. Use FileResource.read().")
             return original_io_open(*args, **kwargs)
 
@@ -434,31 +444,158 @@ class Database:
             yield
 
     def _code_fingerprint(self, fn: FunctionType) -> str:
-        closure = None
-        if fn.__closure__:
-            closure = tuple(self._closure_digest(cell.cell_contents) for cell in fn.__closure__)
         payload = (
             sys.implementation.name,
             getattr(sys.implementation, "cache_tag", None),
             tuple(sys.version_info[:3]),
-            fn.__module__,
-            fn.__qualname__,
-            marshal.dumps(fn.__code__),
-            fn.__defaults__,
-            fn.__kwdefaults__,
-            closure,
+            self._function_definition_payload(fn, set()),
         )
-        return marshal.dumps(payload).hex()
+        return fingerprint_snapshot(payload)
 
-    def _closure_digest(self, value: Any) -> tuple[str, str]:
-        query_id = getattr(value, "query_id", None)
-        if query_id is not None:
-            return ("query", query_id)
-        if isinstance(value, (str, bytes, int, float, bool, type(None), complex, tuple, frozenset, range)):
-            return ("value", self._fingerprint_value(value))
+    def _function_definition_payload(self, fn: FunctionType, seen_functions: set[int]) -> Any:
+        fn_id = id(fn)
+        if fn_id in seen_functions:
+            return ("recursive-function", fn.__module__, fn.__qualname__)
+        seen_functions.add(fn_id)
+        try:
+            closure_vars = inspect.getclosurevars(fn)
+            return (
+                fn.__module__,
+                fn.__qualname__,
+                marshal.dumps(fn.__code__),
+                tuple(
+                    self._captured_dependency_digest(
+                        f"default[{index}]",
+                        value,
+                        seen_functions,
+                        owner=fn,
+                    )
+                    for index, value in enumerate(fn.__defaults__ or ())
+                ),
+                tuple(
+                    (
+                        name,
+                        self._captured_dependency_digest(
+                            f"kwdefault[{name}]",
+                            value,
+                            seen_functions,
+                            owner=fn,
+                        ),
+                    )
+                    for name, value in sorted((fn.__kwdefaults__ or {}).items())
+                ),
+                tuple(
+                    (
+                        scope_name,
+                        name,
+                        self._captured_dependency_digest(name, value, seen_functions, owner=fn),
+                    )
+                    for scope_name, mapping in (
+                        ("nonlocal", closure_vars.nonlocals),
+                        ("global", closure_vars.globals),
+                    )
+                    for name, value in sorted(mapping.items())
+                ),
+            )
+        finally:
+            seen_functions.remove(fn_id)
+
+    def _captured_dependency_digest(
+        self,
+        name: str,
+        value: Any,
+        seen_functions: set[int],
+        *,
+        owner: FunctionType,
+    ) -> Any:
+        from .core import Input, Query
+
+        if isinstance(value, Query):
+            return ("query", value.query_id)
+        if isinstance(value, Input):
+            return ("input", value.name, id(value))
+        if self._is_resource_handle(value):
+            return ("resource", self._resource_identity_payload(value))
+        if isinstance(value, ModuleType):
+            return ("module", value.__name__)
+        if isinstance(value, FunctionType):
+            return ("function", self._function_definition_payload(value, seen_functions))
+        if isinstance(value, BuiltinFunctionType):
+            return ("builtin", value.__module__, value.__qualname__)
+        if isinstance(value, type):
+            return ("type", value.__module__, value.__qualname__)
+        try:
+            return ("value", self._freeze_static_capture(value, set()))
+        except UnsupportedValueError as exc:
+            raise UnsupportedValueError(
+                f"Query {owner.__module__}:{owner.__qualname__} captures unsupported ambient value "
+                f"{name!r} of type {type(value).__qualname__}. "
+                "Move mutable state behind Input/Resource nodes or use an immutable value."
+            ) from exc
+
+    def _resource_identity_payload(self, resource: Any) -> Any:
+        resource_identity = getattr(resource, "identity", None)
+        if callable(resource_identity):
+            return (
+                type(resource).__module__,
+                type(resource).__qualname__,
+                self._freeze_value(resource_identity()),
+            )
+        try:
+            return (
+                type(resource).__module__,
+                type(resource).__qualname__,
+                self._freeze_value(resource),
+            )
+        except UnsupportedValueError as exc:
+            raise UnsupportedValueError(
+                f"Resource {type(resource).__module__}:{type(resource).__qualname__} must be snapshot-safe "
+                "or define identity()."
+            ) from exc
+
+    def _freeze_static_capture(self, value: Any, active_ids: set[int]) -> Any:
+        if isinstance(value, (str, bytes, int, float, bool, type(None), complex)):
+            return value
+        if isinstance(value, (FrozenList, FrozenDict, FrozenSet, FrozenRecord, FrozenAdapterValue)):
+            return value
         if isinstance(value, os.PathLike):
-            return ("value", self._fingerprint_value(value))
-        return ("identity", f"{type(value).__module__}:{type(value).__qualname__}:{id(value)}")
+            return os.fspath(value)
+        if isinstance(value, range):
+            return ("range", value.start, value.stop, value.step)
+        if isinstance(value, tuple):
+            with self._capture_guard(value, active_ids):
+                return tuple(self._freeze_static_capture(item, active_ids) for item in value)
+        if isinstance(value, frozenset):
+            with self._capture_guard(value, active_ids):
+                items = tuple(self._freeze_static_capture(item, active_ids) for item in value)
+                return ("frozenset", tuple(sorted(items, key=fingerprint_snapshot)))
+        if is_dataclass(value) and not isinstance(value, type):
+            params = getattr(type(value), "__dataclass_params__", None)
+            if params is None or not params.frozen:
+                raise UnsupportedValueError("Mutable dataclass values cannot be captured ambiently.")
+            with self._capture_guard(value, active_ids):
+                return FrozenRecord(
+                    type(value).__qualname__,
+                    tuple(
+                        (field.name, self._freeze_static_capture(getattr(value, field.name), active_ids))
+                        for field in fields(value)
+                    ),
+                )
+        raise UnsupportedValueError("Unsupported ambient capture.")
+
+    @contextmanager
+    def _capture_guard(self, value: Any, active_ids: set[int]) -> Any:
+        object_id = id(value)
+        if object_id in active_ids:
+            raise UnsupportedValueError("Cyclic ambient values are not supported.")
+        active_ids.add(object_id)
+        try:
+            yield
+        finally:
+            active_ids.remove(object_id)
+
+    def _is_resource_handle(self, value: Any) -> bool:
+        return all(callable(getattr(value, name, None)) for name in ("label", "probe", "load"))
 
     @contextmanager
     def _request_scope(self) -> Any:
@@ -478,6 +615,12 @@ class Database:
         if current is None:
             return -1
         return current
+
+    def _current_frame(self) -> ExecutionFrame | None:
+        stack = self._execution_stack.get()
+        if not stack:
+            return None
+        return stack[-1]
 
     def _freeze_value(self, value: Any) -> Any:
         return freeze(value, adapters=self._adapters)

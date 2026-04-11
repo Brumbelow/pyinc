@@ -70,11 +70,9 @@ def test_adapter_round_trip_works_for_freeze_and_thaw() -> None:
 def test_database_uses_adapters_for_boundary_values() -> None:
     adapters = {Point: PointAdapter()}
     payload = Input[Point]("payload")
-    calls = {"total": 0}
 
     @query
     def total(db: Database) -> int:
-        calls["total"] += 1
         point = payload.read(db)
         assert isinstance(point, Point)
         return point.x + point.y
@@ -82,8 +80,9 @@ def test_database_uses_adapters_for_boundary_values() -> None:
     db = Database(mode="checked", adapters=adapters)
     db.set(payload, Point(2, 3))
     assert db.get(total) == 5
-    assert calls["total"] == 1
+    key, _ = db._query_key(total, (), {})
+    assert db._records[key].last_decision == "executed"
 
     db.set(payload, Point(2, 3))
     assert db.get(total) == 5
-    assert calls["total"] == 1
+    assert db._records[key].last_decision == "reused"
