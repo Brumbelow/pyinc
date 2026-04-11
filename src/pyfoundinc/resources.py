@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
-from typing import Any
 
 
 @dataclass(frozen=True)
@@ -26,6 +25,29 @@ class FileResource:
     def load(self, db: "Database", path: str) -> str:
         with db._allow_raw_open():
             return Path(path).read_text(encoding=self.encoding)
+
+
+@dataclass(frozen=True)
+class FileStatSnapshot:
+    exists: bool
+    size: int | None
+    mtime_ns: int | None
+
+
+@dataclass(frozen=True)
+class FileStatResource:
+    def read(self, db: "Database", path: str | os.PathLike[str]) -> FileStatSnapshot:
+        return db._read_resource(self, os.fspath(path))
+
+    def label(self, path: str) -> str:
+        return f"filestat[{path}]"
+
+    def probe(self, path: str) -> tuple[bool, int | None, int | None]:
+        snapshot = _stat_snapshot(path)
+        return (snapshot.exists, snapshot.size, snapshot.mtime_ns)
+
+    def load(self, db: "Database", path: str) -> FileStatSnapshot:
+        return _stat_snapshot(path)
 
 
 @dataclass(frozen=True)
@@ -62,6 +84,19 @@ class DirectoryResource:
         if not dir_path.exists():
             return tuple()
         return tuple(sorted(child.name for child in dir_path.iterdir()))
+
+
+def _stat_snapshot(path: str) -> FileStatSnapshot:
+    file_path = Path(path)
+    try:
+        metadata = file_path.stat()
+    except FileNotFoundError:
+        return FileStatSnapshot(exists=False, size=None, mtime_ns=None)
+    return FileStatSnapshot(
+        exists=True,
+        size=metadata.st_size,
+        mtime_ns=metadata.st_mtime_ns,
+    )
 
 
 from .runtime import Database  # noqa: E402

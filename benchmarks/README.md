@@ -1,12 +1,18 @@
 # Benchmarks
 
-This directory is intentionally a placeholder for kernel-alpha performance tracking.
+Kernel microbench scenarios live in `benchmarks/run_microbench.py`.
 
-Planned scenarios:
+Run from repo root:
+
+```bash
+PYTHONPATH=src python benchmarks/run_microbench.py --samples 200 --payload-size 5000
+```
+
+The script reports cold/warm/delta timings for:
 
 - diamond dependency reuse
-- dynamic rewiring with stale-edge removal
-- content-probed file resources
-- large-value cutoff and backdating costs
+- dynamic rewiring
+- resource-backed file/directory reads
+- large boundary values (warm, equal-update, and delta paths)
 
-Benchmarks stay secondary until the runtime semantics and adversarial tests are stable.
+These numbers are non-gating regressions during kernel hardening.

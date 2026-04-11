@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -9,6 +9,7 @@ import inspect
 import io
 import marshal
 import os
+from pathlib import Path
 import sys
 from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Any
@@ -73,25 +74,80 @@ class ExecutionFrame:
     untracked_reasons: list[str] = field(default_factory=list)
 
 
+class _GuardedEnviron(MutableMapping[str, str]):
+    def __init__(self, wrapped: MutableMapping[str, str], check_read: Callable[[], None]) -> None:
+        self._wrapped = wrapped
+        self._check_read = check_read
+
+    def __getitem__(self, key: str) -> str:
+        self._check_read()
+        return self._wrapped[key]
+
+    def __setitem__(self, key: str, value: str) -> None:
+        self._wrapped[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self._wrapped[key]
+
+    def __iter__(self) -> Iterator[str]:
+        self._check_read()
+        return iter(self._wrapped)
+
+    def __len__(self) -> int:
+        self._check_read()
+        return len(self._wrapped)
+
+    def get(self, key: str, default: str | None = None) -> str | None:
+        self._check_read()
+        return self._wrapped.get(key, default)
+
+    def keys(self) -> Any:
+        self._check_read()
+        return self._wrapped.keys()
+
+    def items(self) -> Any:
+        self._check_read()
+        return self._wrapped.items()
+
+    def values(self) -> Any:
+        self._check_read()
+        return self._wrapped.values()
+
+    def copy(self) -> dict[str, str]:
+        self._check_read()
+        return self._wrapped.copy()
+
+    def __contains__(self, key: object) -> bool:
+        self._check_read()
+        return key in self._wrapped
+
+
 class Database:
     def __init__(
         self,
         mode: Mode = "strict",
         *,
         adapters: Mapping[type[Any], ValueAdapter] | None = None,
+        max_query_nodes: int | None = None,
     ) -> None:
         if mode not in {"strict", "checked", "fast"}:
             raise ValueError("mode must be one of: strict, checked, fast")
+        if max_query_nodes is not None and max_query_nodes <= 0:
+            raise ValueError("max_query_nodes must be a positive integer or None.")
         self.mode = mode
+        self.max_query_nodes = max_query_nodes
         self._adapters = dict(adapters or {})
         self._revision = 0
         self._records: dict[NodeKey, NodeRecord] = {}
         self._input_records: dict[Any, NodeKey] = {}
+        self._query_records: set[NodeKey] = set()
+        self._query_last_used: dict[NodeKey, int] = {}
+        self._query_touch_counter = 0
         self._execution_stack: ContextVar[tuple[ExecutionFrame, ...]] = ContextVar(
             "pyfoundinc_execution_stack",
             default=(),
         )
-        self._allow_open: ContextVar[bool] = ContextVar("pyfoundinc_allow_open", default=False)
+        self._allow_raw_reads: ContextVar[bool] = ContextVar("pyfoundinc_allow_raw_reads", default=False)
         self._request_token: ContextVar[int | None] = ContextVar("pyfoundinc_request_token", default=None)
         self._request_counter = 0
 
@@ -190,13 +246,16 @@ class Database:
         current_request = self._current_request_id()
         if existing is None:
             self._execute_query(query, key, call_snapshot, previous=None, reason="cold execute")
+            self._mark_query_used(key)
             return
         if existing.checked_in_request == current_request:
             existing.last_decision = "reused"
             existing.reason = "already checked in current request"
+            self._mark_query_used(key)
             return
         if existing.is_untracked:
             self._execute_query(query, key, call_snapshot, previous=existing, reason="untracked dependency")
+            self._mark_query_used(key)
             return
 
         dirty_reason = None
@@ -209,8 +268,10 @@ class Database:
             existing.last_decision = "reused"
             existing.reason = "dependencies unchanged"
             existing.checked_in_request = current_request
+            self._mark_query_used(key)
             return
         self._execute_query(query, key, call_snapshot, previous=existing, reason=dirty_reason)
+        self._mark_query_used(key)
 
     def _execute_query(self, query: Any, key: NodeKey, call_snapshot: Any, previous: NodeRecord | None, reason: str) -> None:
         frame = ExecutionFrame(key=key)
@@ -222,7 +283,7 @@ class Database:
                 record_boundaries=self.mode == "checked",
                 frame=frame,
             )
-            with self._guard_untracked_open():
+            with self._guard_untracked_reads():
                 result = query.fn(self, *query_args, **query_kwargs)
             if self.mode == "checked":
                 for before, value in zip(frame.boundary_fingerprints, frame.boundary_values, strict=True):
@@ -242,6 +303,7 @@ class Database:
                     last_recompute="executed",
                 )
                 self._records[key] = record
+                self._query_records.add(key)
                 previous_changed_at = self._revision
                 decision = "executed"
             else:
@@ -258,6 +320,7 @@ class Database:
                 else:
                     record.changed_at = self._revision
                     decision = "executed"
+            self._query_records.add(key)
             record.verified_at = self._revision
             record.dependencies = frame.dependencies
             record.last_decision = decision
@@ -274,16 +337,21 @@ class Database:
             return True
         if key.kind == "query":
             query = record.key.identity
-            query_obj = self._query_objects()[query]
-            call_snapshot = self._call_snapshots()[key]
+            query_obj = self._query_objects().get(query)
+            call_snapshot = self._call_snapshots().get(key)
+            if query_obj is None or call_snapshot is None:
+                return True
             self._ensure_query(query_obj, key, call_snapshot)
         elif key.kind == "resource":
-            resource, parameter = self._resource_objects()[key]
+            resource_pair = self._resource_objects().get(key)
+            if resource_pair is None:
+                return True
+            resource, parameter = resource_pair
             self._refresh_resource(resource, parameter, key)
         return self._records[key].is_untracked or self._records[key].changed_at > revision
 
     def _refresh_resource(self, resource: Any, parameter: Any, key: NodeKey) -> None:
-        with self._allow_raw_open():
+        with self._allow_raw_reads_scope():
             probe = resource.probe(parameter)
         record = self._records.get(key)
         current_request = self._current_request_id()
@@ -300,7 +368,7 @@ class Database:
         else:
             self._revision += 1
             changed_at = self._revision
-        with self._allow_raw_open():
+        with self._allow_raw_reads_scope():
             loaded_value = resource.load(self, parameter)
         snapshot = self._freeze_value(loaded_value)
         digest = fingerprint_snapshot(snapshot)
@@ -418,30 +486,72 @@ class Database:
         return self._call_snapshot_registry
 
     @contextmanager
-    def _allow_raw_open(self) -> Any:
-        token = self._allow_open.set(True)
+    def _allow_raw_reads_scope(self) -> Any:
+        token = self._allow_raw_reads.set(True)
         try:
             yield
         finally:
-            self._allow_open.reset(token)
+            self._allow_raw_reads.reset(token)
 
     @contextmanager
-    def _guard_untracked_open(self) -> Any:
+    def _allow_raw_open(self) -> Any:
+        # Backward-compatible alias for custom resources using the previous helper.
+        with self._allow_raw_reads_scope():
+            yield
+
+    @contextmanager
+    def _guard_untracked_reads(self) -> Any:
         original_builtins_open = builtins.open
         original_io_open = io.open
+        original_os_getenv = os.getenv
+        original_os_listdir = os.listdir
+        original_os_scandir = os.scandir
+        original_path_iterdir = Path.iterdir
+        original_environ = os.environ
+
+        def check_env_read() -> None:
+            self._ensure_tracked_read("Raw os.environ access inside a query is untracked. Use EnvResource.read().")
+
+        guarded_environ = _GuardedEnviron(original_environ, check_env_read)
 
         def guarded_open(*args: Any, **kwargs: Any) -> Any:
-            if self._current_frame() is not None and not self._allow_open.get():
-                raise UntrackedReadError("Raw open() inside a query is untracked. Use FileResource.read().")
+            self._ensure_tracked_read("Raw open() inside a query is untracked. Use FileResource.read().")
             return original_builtins_open(*args, **kwargs)
 
         def guarded_io_open(*args: Any, **kwargs: Any) -> Any:
-            if self._current_frame() is not None and not self._allow_open.get():
-                raise UntrackedReadError("Raw open() inside a query is untracked. Use FileResource.read().")
+            self._ensure_tracked_read("Raw open() inside a query is untracked. Use FileResource.read().")
             return original_io_open(*args, **kwargs)
 
-        with mock.patch("builtins.open", guarded_open), mock.patch("io.open", guarded_io_open):
+        def guarded_getenv(key: str, default: str | None = None) -> str | None:
+            self._ensure_tracked_read("Raw os.getenv() inside a query is untracked. Use EnvResource.read().")
+            return original_os_getenv(key, default)
+
+        def guarded_listdir(*args: Any, **kwargs: Any) -> Any:
+            self._ensure_tracked_read("Raw os.listdir() inside a query is untracked. Use DirectoryResource.read().")
+            return original_os_listdir(*args, **kwargs)
+
+        def guarded_scandir(*args: Any, **kwargs: Any) -> Any:
+            self._ensure_tracked_read("Raw os.scandir() inside a query is untracked. Use DirectoryResource.read().")
+            return original_os_scandir(*args, **kwargs)
+
+        def guarded_path_iterdir(path_obj: Path) -> Any:
+            self._ensure_tracked_read("Raw Path.iterdir() inside a query is untracked. Use DirectoryResource.read().")
+            return original_path_iterdir(path_obj)
+
+        with (
+            mock.patch("builtins.open", guarded_open),
+            mock.patch("io.open", guarded_io_open),
+            mock.patch("os.getenv", guarded_getenv),
+            mock.patch("os.listdir", guarded_listdir),
+            mock.patch("os.scandir", guarded_scandir),
+            mock.patch("os.environ", guarded_environ),
+            mock.patch("pathlib.Path.iterdir", guarded_path_iterdir),
+        ):
             yield
+
+    def _ensure_tracked_read(self, message: str) -> None:
+        if self._current_frame() is not None and not self._allow_raw_reads.get():
+            raise UntrackedReadError(message)
 
     def _code_fingerprint(self, fn: FunctionType) -> str:
         payload = (
@@ -609,6 +719,25 @@ class Database:
             yield
         finally:
             self._request_token.reset(token)
+            self._evict_query_nodes_if_needed()
+
+    def _mark_query_used(self, key: NodeKey) -> None:
+        self._query_touch_counter += 1
+        self._query_last_used[key] = self._query_touch_counter
+
+    def _evict_query_nodes_if_needed(self) -> None:
+        limit = self.max_query_nodes
+        if limit is None:
+            return
+        while len(self._query_records) > limit:
+            lru_key = min(self._query_records, key=lambda item: self._query_last_used.get(item, -1))
+            self._evict_query_record(lru_key)
+
+    def _evict_query_record(self, key: NodeKey) -> None:
+        self._records.pop(key, None)
+        self._query_records.discard(key)
+        self._query_last_used.pop(key, None)
+        self._call_snapshots().pop(key, None)
 
     def _current_request_id(self) -> int:
         current = self._request_token.get()

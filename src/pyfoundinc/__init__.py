@@ -1,6 +1,6 @@
 from .core import Input, query
 from .errors import CycleError, MutationError, PyFoundIncError, UnsupportedValueError, UntrackedReadError
-from .resources import DirectoryResource, EnvResource, FileResource
+from .resources import DirectoryResource, EnvResource, FileResource, FileStatResource, FileStatSnapshot
 from .runtime import Database
 from .value import (
     FrozenAdapterValue,
@@ -20,6 +20,8 @@ __all__ = [
     "DirectoryResource",
     "EnvResource",
     "FileResource",
+    "FileStatResource",
+    "FileStatSnapshot",
     "FrozenAdapterValue",
     "FrozenDict",
     "FrozenList",

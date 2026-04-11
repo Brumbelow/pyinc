@@ -13,6 +13,8 @@
 
 Evaluation is top-down. `db.get()` verifies dependencies first, then either reuses the memo or re-executes the query. If a re-executed query returns a semantically equal value, the record is backdated so downstream nodes stay clean.
 
+`Database(max_query_nodes=...)` bounds only query memo nodes via LRU at top-level request boundaries. Inputs and resources remain resident.
+
 ## Value Membrane
 
 Values crossing cached boundaries are frozen snapshots.
@@ -22,6 +24,8 @@ Values crossing cached boundaries are frozen snapshots.
 - `fast`: expose thawed copies without mutation checks.
 
 Hidden reads are not allowed in the core. Raw `open()` inside a query raises `UntrackedReadError` unless the access is routed through a resource object or explicitly marked via `db.report_untracked_read(...)`.
+
+The runtime also blocks raw ambient reads through `os.getenv`, `os.environ`, `os.listdir`, `os.scandir`, and `Path.iterdir` during query execution. Resource `probe`/`load` hooks run in an internal allow-scope so resource implementations can perform those reads safely.
 
 Query definitions are also checked for ambient state. Immutable constants and explicit `Input`/resource/query handles are allowed; mutable closure or global data is rejected so memo reuse never depends on hidden Python object mutation.
 
@@ -34,6 +38,7 @@ Version 1 targets:
 - module-defined `@query` functions
 - explicit `Input` leaves
 - explicit file, env, and directory resources
+- optional file metadata resources (`FileStatResource`) for stat-level dependencies
 - explanation/provenance for reuse vs recompute
 
 Version 1 does not include:

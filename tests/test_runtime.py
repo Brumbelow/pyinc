@@ -11,6 +11,7 @@ from pyfoundinc import (
     DirectoryResource,
     EnvResource,
     FileResource,
+    FileStatResource,
     FrozenDict,
     Input,
     MutationError,
@@ -31,6 +32,11 @@ def read_global_box(db: Database) -> int:
 def _query_record(db: Database, query_fn: object, *args: object, **kwargs: object) -> object:
     key, _ = db._query_key(query_fn, args, kwargs)
     return db._records[key]
+
+
+def test_max_query_nodes_must_be_positive() -> None:
+    with pytest.raises(ValueError):
+        Database(max_query_nodes=0)
 
 
 def test_equal_input_update_does_not_dirty_dependents() -> None:
@@ -177,6 +183,28 @@ def test_raw_open_is_rejected_inside_query(tmp_path: Path) -> None:
         db.get(read_directly)
 
 
+def test_os_getenv_is_rejected_inside_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYFOUNDINC_DIRECT_ENV", "value")
+
+    @query
+    def read_env(db: Database) -> str | None:
+        return os.getenv("PYFOUNDINC_DIRECT_ENV")
+
+    with pytest.raises(UntrackedReadError):
+        Database().get(read_env)
+
+
+def test_os_environ_access_is_rejected_inside_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYFOUNDINC_DIRECT_ENV", "value")
+
+    @query
+    def read_env_mapping(db: Database) -> str:
+        return os.environ["PYFOUNDINC_DIRECT_ENV"]
+
+    with pytest.raises(UntrackedReadError):
+        Database().get(read_env_mapping)
+
+
 @pytest.mark.parametrize("method_name", ["read_text", "read_bytes"])
 def test_path_read_helpers_are_rejected_inside_query(tmp_path: Path, method_name: str) -> None:
     path = tmp_path / "sample.txt"
@@ -192,6 +220,40 @@ def test_path_read_helpers_are_rejected_inside_query(tmp_path: Path, method_name
     db = Database()
     with pytest.raises(UntrackedReadError):
         db.get(read_via_path)
+
+
+@pytest.mark.parametrize("method_name", ["listdir", "scandir", "iterdir"])
+def test_directory_helpers_are_rejected_inside_query(tmp_path: Path, method_name: str) -> None:
+    path = tmp_path / "workspace"
+    path.mkdir()
+    (path / "a.txt").write_text("alpha", encoding="utf-8")
+
+    @query
+    def read_directory(db: Database) -> tuple[str, ...]:
+        if method_name == "listdir":
+            return tuple(sorted(os.listdir(path)))
+        if method_name == "scandir":
+            return tuple(sorted(entry.name for entry in os.scandir(path)))
+        return tuple(sorted(child.name for child in path.iterdir()))
+
+    with pytest.raises(UntrackedReadError):
+        Database().get(read_directory)
+
+
+def test_resource_reads_are_allowed_inside_query(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    env = EnvResource()
+    directories = DirectoryResource()
+    monkeypatch.setenv("PYFOUNDINC_TRACKED_ENV", "value")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "a.txt").write_text("alpha", encoding="utf-8")
+
+    @query
+    def read_tracked(db: Database, dirname: str) -> tuple[str | None, tuple[str, ...]]:
+        return env.read(db, "PYFOUNDINC_TRACKED_ENV"), directories.read(db, dirname)
+
+    db = Database()
+    assert db.get(read_tracked, str(workspace)) == ("value", ("a.txt",))
 
 
 def test_untracked_queries_rerun_without_backdating_the_impure_node() -> None:
@@ -274,6 +336,27 @@ def test_file_resource_detects_content_changes_even_when_stat_signature_is_stabl
     record = _query_record(db, read_file, str(path))
     assert record.last_decision == "executed"
     assert record.changed_at == 1
+
+
+def test_file_stat_resource_tracks_metadata_changes(tmp_path: Path) -> None:
+    stats = FileStatResource()
+    path = tmp_path / "sample.txt"
+    path.write_text("alpha", encoding="utf-8")
+
+    @query
+    def read_stat(db: Database, filename: str) -> object:
+        return stats.read(db, filename)
+
+    db = Database(mode="checked")
+    first = db.get(read_stat, str(path))
+    assert first["exists"] is True
+    assert first["size"] == 5
+
+    path.write_text("bravo!", encoding="utf-8")
+    second = db.get(read_stat, str(path))
+    assert second["exists"] is True
+    assert second["size"] == 6
+    assert _query_record(db, read_stat, str(path)).last_decision == "executed"
 
 
 def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) -> None:
@@ -383,3 +466,52 @@ def test_env_resource_instances_share_stable_behavior(monkeypatch: pytest.Monkey
     db = Database()
     assert db.get(read_a) == "value"
     assert db.get(read_b) == "value"
+
+
+def test_query_lru_eviction_prunes_oldest_query_records() -> None:
+    @query
+    def echo_number(db: Database, value: int) -> int:
+        return value
+
+    db = Database(max_query_nodes=2)
+    key_one, _ = db._query_key(echo_number, (1,), {})
+    assert db.get(echo_number, 1) == 1
+    key_two, _ = db._query_key(echo_number, (2,), {})
+    assert db.get(echo_number, 2) == 2
+    key_three, _ = db._query_key(echo_number, (3,), {})
+    assert db.get(echo_number, 3) == 3
+
+    assert key_one not in db._records
+    assert key_one not in db._call_snapshots()
+    assert key_two in db._records
+    assert key_three in db._records
+    assert len([key for key in db._records if key.kind == "query"]) == 2
+
+
+def test_dependencies_revalidate_correctly_after_lru_eviction() -> None:
+    number = Input[int]("number")
+
+    @query
+    def child(db: Database) -> int:
+        return number.read(db) * 2
+
+    @query
+    def parent(db: Database) -> int:
+        return child(db) + 1
+
+    @query
+    def unrelated(db: Database) -> str:
+        return "x"
+
+    db = Database(max_query_nodes=2)
+    db.set(number, 1)
+    assert db.get(parent) == 3
+    assert db.get(unrelated) == "x"
+
+    child_key, _ = db._query_key(child, (), {})
+    assert child_key not in db._records
+
+    db.set(number, 2)
+    assert db.get(parent) == 5
+    parent_record = _query_record(db, parent)
+    assert parent_record.last_decision == "executed"
