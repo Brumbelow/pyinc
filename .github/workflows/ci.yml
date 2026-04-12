@@ -28,11 +28,23 @@ jobs:
       - name: Run test suite
         run: pytest -q
 
-      - name: Smoke-check microbench harness
+      - name: Smoke-check benchmark harness
         run: |
           PYTHONPATH=src python benchmarks/run_microbench.py \
+            --bench diamond \
             --samples 2 \
             --warmup 0 \
             --rounds 1 \
             --payload-size 8 \
-            > /tmp/microbench.json
+            --format table \
+            --output-json /tmp/microbench-micro.json \
+            --output-markdown /tmp/microbench-micro.md
+          PYTHONPATH=src python benchmarks/run_microbench.py \
+            --bench source_analysis \
+            --samples 1 \
+            --warmup 0 \
+            --rounds 1 \
+            --payload-size 8 \
+            --format table \
+            --output-json /tmp/microbench-workload.json \
+            --output-markdown /tmp/microbench-workload.md

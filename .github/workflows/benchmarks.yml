@@ -1,0 +1,43 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Run full benchmark suite
+        run: |
+          PYTHONPATH=src python benchmarks/run_microbench.py \
+            --suite all \
+            --samples 20 \
+            --warmup 5 \
+            --rounds 3 \
+            --payload-size 512 \
+            --format markdown \
+            --output-json /tmp/pyfoundinc-bench.json \
+            --output-markdown /tmp/pyfoundinc-bench.md
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyfoundinc-benchmarks
+          path: |
+            /tmp/pyfoundinc-bench.json
+            /tmp/pyfoundinc-bench.md
