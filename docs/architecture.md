@@ -11,6 +11,8 @@
 - `changed_at` and `verified_at` revisions
 - the last decision: `executed`, `reused`, or `backdated`
 
+`Database.inspect(...)` returns the last recorded provenance tree for a query key, and `Database.explain(...)` formats that tree without changing the node's recorded decision just by inspecting it.
+
 Evaluation is top-down. `db.get()` verifies dependencies first, then either reuses the memo or re-executes the query. If a re-executed query returns a semantically equal value, the record is backdated so downstream nodes stay clean.
 
 `Database(max_query_nodes=...)` bounds only query memo nodes via LRU at top-level request boundaries. Inputs and resources remain resident.
@@ -29,6 +31,8 @@ The runtime also blocks raw ambient reads through `os.getenv`, `os.environ`, `os
 
 Query definitions are also checked for ambient state. Immutable constants and explicit `Input`/resource/query handles are allowed; mutable closure or global data is rejected so memo reuse never depends on hidden Python object mutation.
 
+Query identity includes the supported function definition payload, so ambient immutable captures contribute to the fingerprint instead of being ignored.
+
 Resource node identity includes resource configuration. Built-in resources are snapshot-safe dataclasses, and custom resources must either be snapshot-safe themselves or expose an `identity()` payload for keying.
 
 ## Scope
@@ -40,6 +44,7 @@ Version 1 targets:
 - explicit file, env, and directory resources
 - optional file metadata resources (`FileStatResource`) for stat-level dependencies
 - explanation/provenance for reuse vs recompute
+- inline package typing via `py.typed`
 
 Version 1 does not include:
 

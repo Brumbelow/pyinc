@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping, MutableMapping
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass, field, fields, is_dataclass
 import builtins
 import inspect
 import io
 import marshal
 import os
-from pathlib import Path
 import sys
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, fields, is_dataclass
+from pathlib import Path
 from types import BuiltinFunctionType, FunctionType, ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast, overload
 from unittest import mock
 
 from .errors import CycleError, UnsupportedValueError, UntrackedReadError
@@ -23,17 +23,24 @@ from .value import (
     FrozenList,
     FrozenRecord,
     FrozenSet,
+    Snapshot,
     ValueAdapter,
     assert_not_mutated,
     fingerprint,
     fingerprint_snapshot,
     freeze,
-    thaw,
     semantic_equal,
+    thaw,
 )
+
+if TYPE_CHECKING:
+    from .core import Input, Query
 
 
 Mode = str
+DefaultT = TypeVar("DefaultT")
+P = ParamSpec("P")
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -97,7 +104,16 @@ class _GuardedEnviron(MutableMapping[str, str]):
         self._check_read()
         return len(self._wrapped)
 
-    def get(self, key: str, default: str | None = None) -> str | None:
+    @overload
+    def get(self, key: str, default: None = None) -> str | None: ...
+
+    @overload
+    def get(self, key: str, default: str = ...) -> str: ...
+
+    @overload
+    def get(self, key: str, default: DefaultT) -> str | DefaultT: ...
+
+    def get(self, key: str, default: DefaultT | None = None) -> str | DefaultT | None:
         self._check_read()
         return self._wrapped.get(key, default)
 
@@ -115,7 +131,7 @@ class _GuardedEnviron(MutableMapping[str, str]):
 
     def copy(self) -> dict[str, str]:
         self._check_read()
-        return self._wrapped.copy()
+        return dict(self._wrapped)
 
     def __contains__(self, key: object) -> bool:
         self._check_read()
@@ -202,7 +218,7 @@ class Database:
             record.reason = "input changed"
             record.checked_in_request = self._current_request_id()
 
-    def get(self, query: Any, *args: Any, **kwargs: Any) -> Any:
+    def get(self, query: Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
         from .core import Query
 
         if not isinstance(query, Query):
@@ -211,16 +227,16 @@ class Database:
             key, call_snapshot = self._query_key(query, args, kwargs)
             self._record_dependency(key)
             self._ensure_query(query, key, call_snapshot)
-            return self._expose_boundary_snapshot(self._records[key].snapshot)
+            return cast(T, self._expose_boundary_snapshot(self._records[key].snapshot))
 
-    def explain(self, query: Any, *args: Any, **kwargs: Any) -> str:
+    def explain(self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> str:
         from .core import Query
 
         if not isinstance(query, Query):
             raise TypeError("db.explain() expects a @query-decorated callable.")
         return format_explanation(self.inspect(query, *args, **kwargs))
 
-    def inspect(self, query: Any, *args: Any, **kwargs: Any) -> InspectionNode:
+    def inspect(self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> InspectionNode:
         from .core import Query
 
         if not isinstance(query, Query):
@@ -237,13 +253,13 @@ class Database:
             raise RuntimeError("db.report_untracked_read() must be called while a query is executing.")
         frame.untracked_reasons.append(reason)
 
-    def _read_input(self, input_key: Any) -> Any:
+    def _read_input(self, input_key: Input[T]) -> T:
         key = self._input_key(input_key)
         record = self._records.get(key)
         if record is None:
             raise KeyError(f"Input {input_key.name!r} has not been set.")
         self._record_dependency(key)
-        return self._expose_boundary_snapshot(record.snapshot)
+        return cast(T, self._expose_boundary_snapshot(record.snapshot))
 
     def _read_resource(self, resource: Any, parameter: Any) -> Any:
         key = self._resource_key(resource, parameter)
@@ -463,10 +479,7 @@ class Database:
         return args, kwargs
 
     def _expose_snapshot(self, snapshot: Any, *, boundary: bool = False, record_boundaries: bool = False, frame: ExecutionFrame | None = None) -> Any:
-        if self.mode == "strict":
-            exposed = snapshot
-        else:
-            exposed = self._thaw_value(snapshot)
+        exposed = snapshot if self.mode == "strict" else self._thaw_value(snapshot)
         if boundary and record_boundaries and frame is not None:
             frame.boundary_fingerprints.append(self._fingerprint_value(exposed))
             frame.boundary_values.append(exposed)
@@ -519,7 +532,7 @@ class Database:
         return self._call_snapshot_registry
 
     @contextmanager
-    def _allow_raw_reads_scope(self) -> Any:
+    def _allow_raw_reads_scope(self) -> Iterator[None]:
         token = self._allow_raw_reads.set(True)
         try:
             yield
@@ -527,13 +540,13 @@ class Database:
             self._allow_raw_reads.reset(token)
 
     @contextmanager
-    def _allow_raw_open(self) -> Any:
+    def _allow_raw_open(self) -> Iterator[None]:
         # Backward-compatible alias for custom resources using the previous helper.
         with self._allow_raw_reads_scope():
             yield
 
     @contextmanager
-    def _guard_untracked_reads(self) -> Any:
+    def _guard_untracked_reads(self) -> Iterator[None]:
         original_builtins_open = builtins.open
         original_io_open = io.open
         original_os_getenv = os.getenv
@@ -595,7 +608,7 @@ class Database:
         )
         return fingerprint_snapshot(payload)
 
-    def _function_definition_payload(self, fn: FunctionType, seen_functions: set[int]) -> Any:
+    def _function_definition_payload(self, fn: FunctionType, seen_functions: builtins.set[int]) -> Any:
         fn_id = id(fn)
         if fn_id in seen_functions:
             return ("recursive-function", fn.__module__, fn.__qualname__)
@@ -647,7 +660,7 @@ class Database:
         self,
         name: str,
         value: Any,
-        seen_functions: set[int],
+        seen_functions: builtins.set[int],
         *,
         owner: FunctionType,
     ) -> Any:
@@ -696,7 +709,7 @@ class Database:
                 "or define identity()."
             ) from exc
 
-    def _freeze_static_capture(self, value: Any, active_ids: set[int]) -> Any:
+    def _freeze_static_capture(self, value: Any, active_ids: builtins.set[int]) -> Any:
         if isinstance(value, (str, bytes, int, float, bool, type(None), complex)):
             return value
         if isinstance(value, (FrozenList, FrozenDict, FrozenSet, FrozenRecord, FrozenAdapterValue)):
@@ -727,7 +740,7 @@ class Database:
         raise UnsupportedValueError("Unsupported ambient capture.")
 
     @contextmanager
-    def _capture_guard(self, value: Any, active_ids: set[int]) -> Any:
+    def _capture_guard(self, value: Any, active_ids: builtins.set[int]) -> Iterator[None]:
         object_id = id(value)
         if object_id in active_ids:
             raise UnsupportedValueError("Cyclic ambient values are not supported.")
@@ -741,7 +754,7 @@ class Database:
         return all(callable(getattr(value, name, None)) for name in ("label", "probe", "load"))
 
     @contextmanager
-    def _request_scope(self) -> Any:
+    def _request_scope(self) -> Iterator[None]:
         current = self._request_token.get()
         if current is not None:
             yield
@@ -784,7 +797,7 @@ class Database:
             return None
         return stack[-1]
 
-    def _freeze_value(self, value: Any) -> Any:
+    def _freeze_value(self, value: Any) -> Snapshot:
         return freeze(value, adapters=self._adapters)
 
     def _thaw_value(self, value: Any) -> Any:
@@ -810,7 +823,7 @@ class Database:
             return self._semantic_equal(left, right)
         return eq(left, right)
 
-    def _freeze_cutoff_token(self, value: Any) -> Any:
+    def _freeze_cutoff_token(self, value: Any) -> Snapshot:
         try:
             return self._freeze_value(value)
         except UnsupportedValueError as exc:

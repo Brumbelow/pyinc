@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -13,14 +14,13 @@ from pyfoundinc import (
     FileResource,
     FileStatResource,
     FrozenDict,
-    InspectionNode,
     Input,
+    InspectionNode,
     MutationError,
     UnsupportedValueError,
     UntrackedReadError,
     query,
 )
-
 
 _GLOBAL_BOX = {"x": 1}
 
@@ -30,12 +30,12 @@ def read_global_box(db: Database) -> int:
     return _GLOBAL_BOX["x"]
 
 
-def _query_record(db: Database, query_fn: object, *args: object, **kwargs: object) -> object:
+def _query_record(db: Database, query_fn: object, *args: object, **kwargs: object) -> Any:
     key, _ = db._query_key(query_fn, args, kwargs)
     return db._records[key]
 
 
-def _inspect_node(db: Database, query_fn: object, *args: object, **kwargs: object) -> InspectionNode:
+def _inspect_node(db: Database, query_fn: Any, *args: object, **kwargs: object) -> InspectionNode:
     return db.inspect(query_fn, *args, **kwargs)
 
 
@@ -468,12 +468,12 @@ def test_file_stat_resource_tracks_metadata_changes(tmp_path: Path) -> None:
         return stats.read(db, filename)
 
     db = Database(mode="checked")
-    first = db.get(read_stat, str(path))
+    first = cast(dict[str, object], db.get(read_stat, str(path)))
     assert first["exists"] is True
     assert first["size"] == 5
 
     path.write_text("bravo!", encoding="utf-8")
-    second = db.get(read_stat, str(path))
+    second = cast(dict[str, object], db.get(read_stat, str(path)))
     assert second["exists"] is True
     assert second["size"] == 6
     assert _inspect_node(db, read_stat, str(path)).last_decision == "executed"
@@ -551,7 +551,7 @@ def test_queries_allow_immutable_closure_values() -> None:
 
 def test_file_resource_identity_includes_configuration(tmp_path: Path) -> None:
     path = tmp_path / "encoded.txt"
-    path.write_bytes("café".encode("latin-1"))
+    path.write_bytes("caf\xe9".encode("latin-1"))
     latin1 = FileResource(encoding="latin-1")
     utf8 = FileResource(encoding="utf-8")
 
@@ -564,10 +564,10 @@ def test_file_resource_identity_includes_configuration(tmp_path: Path) -> None:
         return utf8.read(db, filename)
 
     db = Database()
-    assert db.get(read_latin1, str(path)) == "café"
+    assert db.get(read_latin1, str(path)) == "caf\xe9"
     with pytest.raises(UnicodeDecodeError):
         db.get(read_utf8, str(path))
-    assert db.get(read_latin1, str(path)) == "café"
+    assert db.get(read_latin1, str(path)) == "caf\xe9"
 
 
 def test_env_resource_instances_share_stable_behavior(monkeypatch: pytest.MonkeyPatch) -> None:

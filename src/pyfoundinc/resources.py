@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
+if TYPE_CHECKING:
+    from .runtime import Database
 
 @dataclass(frozen=True)
 class FileResource:
     encoding: str = "utf-8"
 
-    def read(self, db: "Database", path: str | os.PathLike[str]) -> str:
-        return db._read_resource(self, os.fspath(path))
+    def read(self, db: Database, path: str | os.PathLike[str]) -> str:
+        return cast(str, db._read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"file[{path}]"
@@ -22,7 +25,7 @@ class FileResource:
             return ("missing",)
         return ("present", hashlib.sha256(file_path.read_bytes()).hexdigest())
 
-    def load(self, db: "Database", path: str) -> str:
+    def load(self, db: Database, path: str) -> str:
         with db._allow_raw_open():
             return Path(path).read_text(encoding=self.encoding)
 
@@ -36,8 +39,8 @@ class FileStatSnapshot:
 
 @dataclass(frozen=True)
 class FileStatResource:
-    def read(self, db: "Database", path: str | os.PathLike[str]) -> FileStatSnapshot:
-        return db._read_resource(self, os.fspath(path))
+    def read(self, db: Database, path: str | os.PathLike[str]) -> FileStatSnapshot:
+        return cast(FileStatSnapshot, db._read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"filestat[{path}]"
@@ -46,14 +49,14 @@ class FileStatResource:
         snapshot = _stat_snapshot(path)
         return (snapshot.exists, snapshot.size, snapshot.mtime_ns)
 
-    def load(self, db: "Database", path: str) -> FileStatSnapshot:
+    def load(self, db: Database, path: str) -> FileStatSnapshot:
         return _stat_snapshot(path)
 
 
 @dataclass(frozen=True)
 class EnvResource:
-    def read(self, db: "Database", name: str) -> str | None:
-        return db._read_resource(self, name)
+    def read(self, db: Database, name: str) -> str | None:
+        return cast(str | None, db._read_resource(self, name))
 
     def label(self, name: str) -> str:
         return f"env[{name}]"
@@ -61,14 +64,14 @@ class EnvResource:
     def probe(self, name: str) -> tuple[str | None]:
         return (os.environ.get(name),)
 
-    def load(self, db: "Database", name: str) -> str | None:
+    def load(self, db: Database, name: str) -> str | None:
         return os.environ.get(name)
 
 
 @dataclass(frozen=True)
 class DirectoryResource:
-    def read(self, db: "Database", path: str | os.PathLike[str]) -> tuple[str, ...]:
-        return db._read_resource(self, os.fspath(path))
+    def read(self, db: Database, path: str | os.PathLike[str]) -> tuple[str, ...]:
+        return cast(tuple[str, ...], db._read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"dir[{path}]"
@@ -79,7 +82,7 @@ class DirectoryResource:
             return ("missing",)
         return tuple(sorted(child.name for child in dir_path.iterdir()))
 
-    def load(self, db: "Database", path: str) -> tuple[str, ...]:
+    def load(self, db: Database, path: str) -> tuple[str, ...]:
         dir_path = Path(path)
         if not dir_path.exists():
             return tuple()
@@ -97,6 +100,3 @@ def _stat_snapshot(path: str) -> FileStatSnapshot:
         size=metadata.st_size,
         mtime_ns=metadata.st_mtime_ns,
     )
-
-
-from .runtime import Database  # noqa: E402

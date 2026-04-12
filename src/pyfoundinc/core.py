@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Concatenate, Generic, ParamSpec, TypeVar, overload
 
 from .value import semantic_equal
 
+if TYPE_CHECKING:
+    from .runtime import Database
+
+P = ParamSpec("P")
 T = TypeVar("T")
 EqFn = Callable[[Any, Any], bool]
 CutoffFn = Callable[[Any], Any]
@@ -21,12 +26,18 @@ class Input(Generic[T]):
         if self.eq is not None and self.cutoff is not None:
             raise ValueError("Input() accepts either eq= or cutoff=, but not both.")
 
-    def read(self, db: "Database") -> T:
+    def read(self, db: Database) -> T:
         return db._read_input(self)
 
 
-class Query(Generic[T]):
-    def __init__(self, fn: Callable[..., T], *, eq: EqFn | None = None, cutoff: CutoffFn | None = None) -> None:
+class Query(Generic[P, T]):
+    def __init__(
+        self,
+        fn: Callable[Concatenate[Database, P], T],
+        *,
+        eq: EqFn | None = None,
+        cutoff: CutoffFn | None = None,
+    ) -> None:
         if eq is not None and cutoff is not None:
             raise ValueError("@query accepts either eq= or cutoff=, but not both.")
         self.fn = fn
@@ -39,7 +50,7 @@ class Query(Generic[T]):
         self.__wrapped__ = fn
         wraps(fn)(self)
 
-    def __call__(self, db: "Database", *args: Any, **kwargs: Any) -> T:
+    def __call__(self, db: Database, *args: P.args, **kwargs: P.kwargs) -> T:
         return db.get(self, *args, **kwargs)
 
     def compare(self, old_value: Any, new_value: Any) -> bool:
@@ -49,15 +60,33 @@ class Query(Generic[T]):
         return comparator(old_value, new_value)
 
 
+@overload
 def query(
-    fn: Callable[..., T] | None = None,
+    fn: Callable[Concatenate[Database, P], T],
     *,
     eq: EqFn | None = None,
     cutoff: CutoffFn | None = None,
-) -> Query[T] | Callable[[Callable[..., T]], Query[T]]:
+) -> Query[P, T]: ...
+
+
+@overload
+def query(
+    fn: None = None,
+    *,
+    eq: EqFn | None = None,
+    cutoff: CutoffFn | None = None,
+) -> Callable[[Callable[Concatenate[Database, P], T]], Query[P, T]]: ...
+
+
+def query(
+    fn: Callable[Concatenate[Database, P], T] | None = None,
+    *,
+    eq: EqFn | None = None,
+    cutoff: CutoffFn | None = None,
+) -> Query[P, T] | Callable[[Callable[Concatenate[Database, P], T]], Query[P, T]]:
+    def decorate(wrapped: Callable[Concatenate[Database, P], T]) -> Query[P, T]:
+        return Query(wrapped, eq=eq, cutoff=cutoff)
+
     if fn is None:
-        return lambda wrapped: Query(wrapped, eq=eq, cutoff=cutoff)
-    return Query(fn, eq=eq, cutoff=cutoff)
-
-
-from .runtime import Database  # noqa: E402
+        return decorate
+    return decorate(fn)

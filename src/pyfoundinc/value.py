@@ -1,15 +1,14 @@
 from __future__ import annotations
 
+import os
+import pickle
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
-import os
-import pickle
 from types import NoneType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast, overload
 
 from .errors import MutationError, UnsupportedValueError
-
 
 FreezeFn = Callable[[Any], "Snapshot"]
 ThawFn = Callable[[Any], Any]
@@ -27,7 +26,13 @@ class ValueAdapter(Protocol):
 class FrozenList(Sequence[Any]):
     items: tuple[Any, ...]
 
-    def __getitem__(self, index: int) -> Any:
+    @overload
+    def __getitem__(self, index: int) -> Any: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[Any]: ...
+
+    def __getitem__(self, index: int | slice) -> Any:
         return self.items[index]
 
     def __len__(self) -> int:
@@ -169,11 +174,12 @@ def _freeze(value: Any, registry: _AdapterRegistry, active_ids: set[int]) -> Sna
             )
             return FrozenDict(frozen_items)
     if isinstance(value, os.PathLike):
-        return os.fspath(value)
+        return cast(str | bytes, os.fspath(value))
     if is_dataclass(value) and not isinstance(value, type):
         with _freeze_guard(value, active_ids):
-            frozen_items = tuple(
-                (field.name, _freeze(getattr(value, field.name), registry, active_ids)) for field in fields(value)
+            frozen_items = cast(
+                tuple[tuple[str, Any], ...],
+                tuple((field.name, _freeze(getattr(value, field.name), registry, active_ids)) for field in fields(value)),
             )
             return FrozenRecord(type(value).__qualname__, frozen_items)
     if isinstance(value, range):
@@ -205,7 +211,7 @@ def _thaw(value: Any, registry: _AdapterRegistry) -> Any:
             )
         return adapter.thaw(value.payload, lambda item: _thaw(item, registry))
     if isinstance(value, FrozenList):
-        return [ _thaw(item, registry) for item in value.items ]
+        return [_thaw(item, registry) for item in value.items]
     if isinstance(value, FrozenDict):
         return {_thaw(key, registry): _thaw(item, registry) for key, item in value.entries}
     if isinstance(value, FrozenSet):
@@ -230,7 +236,7 @@ def fingerprint_snapshot(snapshot: Any) -> str:
 
 
 def snapshots_equal(left: Any, right: Any) -> bool:
-    return left == right
+    return bool(left == right)
 
 
 def semantic_equal(left: Any, right: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> bool:

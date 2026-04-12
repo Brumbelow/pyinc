@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, cast
 
 import pytest
 
-from pyfoundinc import Database, FrozenAdapterValue, Input, UnsupportedValueError, ValueAdapter, freeze, thaw, query
+from pyfoundinc import (
+    Database,
+    FrozenAdapterValue,
+    Input,
+    UnsupportedValueError,
+    ValueAdapter,
+    freeze,
+    query,
+    thaw,
+)
 
 
 @dataclass(frozen=True)
@@ -14,15 +24,16 @@ class Point:
 
 
 class PointAdapter(ValueAdapter):
-    def freeze(self, value: Point, freeze: object) -> object:
+    def freeze(self, value: Point, freeze: Any) -> object:
         assert callable(freeze)
         return {"x": value.x, "y": value.y}
 
-    def thaw(self, snapshot: object, thaw: object) -> Point:
+    def thaw(self, snapshot: Any, thaw: Any) -> Point:
         assert callable(thaw)
+        data = cast(dict[str, Any], snapshot)
         return Point(
-            x=thaw(snapshot["x"]),
-            y=thaw(snapshot["y"]),
+            x=thaw(data["x"]),
+            y=thaw(data["y"]),
         )
 
 
@@ -35,13 +46,14 @@ class Key:
 
 
 class KeyAdapter(ValueAdapter):
-    def freeze(self, value: Key, freeze: object) -> object:
+    def freeze(self, value: Key, freeze: Any) -> object:
         assert callable(freeze)
         return {"name": value.name}
 
-    def thaw(self, snapshot: object, thaw: object) -> Key:
+    def thaw(self, snapshot: Any, thaw: Any) -> Key:
         assert callable(thaw)
-        return Key(name=thaw(snapshot["name"]))
+        data = cast(dict[str, Any], snapshot)
+        return Key(name=thaw(data["name"]))
 
 
 def test_freeze_rejects_cyclic_values() -> None:

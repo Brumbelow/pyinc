@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 import pytest
-
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from pyfoundinc import Database, FileResource, Input, MutationError, query
-
 
 Operation = tuple[str, int | str]
 
