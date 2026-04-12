@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import ast
 import gc
+import importlib.util
 import json
 import math
 import os
 import platform
 import statistics
+import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
@@ -40,8 +42,15 @@ if TYPE_CHECKING:
 else:
     try:
         from benchmarks.plain_python_source import directory_analysis as plain_directory_analysis
-    except ModuleNotFoundError:
-        from plain_python_source import directory_analysis as plain_directory_analysis
+    except ModuleNotFoundError as err:
+        plain_module_path = Path(__file__).with_name("plain_python_source.py")
+        plain_spec = importlib.util.spec_from_file_location("benchmarks.plain_python_source", plain_module_path)
+        if plain_spec is None or plain_spec.loader is None:
+            raise RuntimeError(f"unable to load plain benchmark baseline from {plain_module_path}") from err
+        plain_module = importlib.util.module_from_spec(plain_spec)
+        sys.modules.setdefault("benchmarks.plain_python_source", plain_module)
+        plain_spec.loader.exec_module(plain_module)
+        plain_directory_analysis = plain_module.directory_analysis
 
 CleanupFn: TypeAlias = Callable[[], None]
 ObserveFn: TypeAlias = Callable[[], Mapping[str, int]]
