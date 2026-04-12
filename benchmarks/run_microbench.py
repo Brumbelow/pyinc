@@ -34,14 +34,19 @@ from pyfoundinc.integrations.python_source import (
     directory_analysis,
     directory_analysis_payload,
     file_analysis_payload,
+    module_analysis_payload,
     source_text,
+    workspace_analysis,
+    workspace_analysis_payload,
 )
 
 if TYPE_CHECKING:
     from benchmarks.plain_python_source import directory_analysis as plain_directory_analysis
+    from benchmarks.plain_python_source import workspace_analysis as plain_workspace_analysis
 else:
     try:
         from benchmarks.plain_python_source import directory_analysis as plain_directory_analysis
+        from benchmarks.plain_python_source import workspace_analysis as plain_workspace_analysis
     except ModuleNotFoundError as err:
         plain_module_path = Path(__file__).with_name("plain_python_source.py")
         plain_spec = importlib.util.spec_from_file_location("benchmarks.plain_python_source", plain_module_path)
@@ -51,6 +56,7 @@ else:
         sys.modules.setdefault("benchmarks.plain_python_source", plain_module)
         plain_spec.loader.exec_module(plain_module)
         plain_directory_analysis = plain_module.directory_analysis
+        plain_workspace_analysis = plain_module.workspace_analysis
 
 CleanupFn: TypeAlias = Callable[[], None]
 ObserveFn: TypeAlias = Callable[[], Mapping[str, int]]
@@ -70,6 +76,7 @@ DEFAULT_MODE_BY_SCENARIO = {
     "resource_granularity": "checked",
     "lru_pressure": "strict",
     "source_analysis": "strict",
+    "workspace_import_graph": "strict",
 }
 
 ALIASES = {
@@ -2088,6 +2095,491 @@ def benchmark_source_analysis_compare(config: BenchConfig, mode: str) -> Workloa
     )
 
 
+WORKSPACE_IMPORT_GRAPH_OPERATIONS = (
+    "initial_full",
+    "no_change_repeat",
+    "provider_comment_edit",
+    "provider_internal_edit",
+    "provider_export_edit",
+)
+
+
+@dataclass(frozen=True)
+class WorkspaceImportGraphWorkspace:
+    root: Path
+    provider: Path
+    consumers: tuple[Path, ...]
+    provider_baseline: str
+    consumer_count: int
+    cleanup: CleanupFn
+
+
+def _workspace_import_graph_shape(payload_size: int) -> int:
+    return _scale(payload_size, minimum=8, maximum=128, divisor=2)
+
+
+def _workspace_import_graph_parameters(payload_size: int) -> dict[str, int]:
+    return {"consumer_count": _workspace_import_graph_shape(payload_size)}
+
+
+def _provider_module_source(
+    *,
+    return_value: int = 1,
+    include_extra_export: bool = False,
+    trailing_comment: str = "",
+) -> str:
+    lines = [
+        "def exported() -> int:\n",
+        f"    return {return_value}\n",
+    ]
+    if include_extra_export:
+        lines.extend(
+            [
+                "\n",
+                "def exported_two() -> int:\n",
+                "    return 2\n",
+            ]
+        )
+    if trailing_comment:
+        lines.append(trailing_comment)
+    return "".join(lines)
+
+
+def _consumer_module_source(index: int) -> str:
+    return (
+        "from pkg.provider import exported\n"
+        f"def use_{index}() -> int:\n"
+        "    return exported()\n"
+    )
+
+
+def _create_workspace_import_graph_workspace(payload_size: int) -> WorkspaceImportGraphWorkspace:
+    consumer_count = _workspace_import_graph_shape(payload_size)
+    tmpdir = tempfile.TemporaryDirectory()
+    root = Path(tmpdir.name)
+    pkg = root / "pkg"
+    app = root / "app"
+    pkg.mkdir()
+    app.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (app / "__init__.py").write_text("", encoding="utf-8")
+    provider = pkg / "provider.py"
+    provider_baseline = _provider_module_source()
+    provider.write_text(provider_baseline, encoding="utf-8")
+    consumers: list[Path] = []
+    for index in range(consumer_count):
+        path = app / f"consumer_{index:02d}.py"
+        path.write_text(_consumer_module_source(index), encoding="utf-8")
+        consumers.append(path)
+    return WorkspaceImportGraphWorkspace(
+        root=root,
+        provider=provider,
+        consumers=tuple(consumers),
+        provider_baseline=provider_baseline,
+        consumer_count=consumer_count,
+        cleanup=tmpdir.cleanup,
+    )
+
+
+def _build_workspace_import_graph(
+    mode: str,
+    payload_size: int,
+) -> tuple[BenchCall, WorkspaceImportGraphWorkspace]:
+    workspace = _create_workspace_import_graph_workspace(payload_size)
+    db = Database(mode=mode)
+
+    def invoke() -> object:
+        return workspace_analysis(db, workspace.root)
+
+    def inspect() -> InspectionNode:
+        return db.inspect(workspace_analysis_payload, str(workspace.root))
+
+    def observe() -> dict[str, int]:
+        inspection = inspect()
+        provider_source = _find_node(inspection, "source_text", str(workspace.provider))
+        provider_module = _find_node(inspection, "module_analysis_payload", str(workspace.provider))
+        consumer_module = _find_node(inspection, "module_analysis_payload", str(workspace.consumers[0]))
+        return _merged_markers(
+            _decision_markers(inspection, "root"),
+            _decision_markers(provider_module, "provider"),
+            _decision_markers(consumer_module, "consumer"),
+            {
+                f"provider_source_recompute_{provider_source.last_recompute}": 1,
+                f"consumer_recompute_{consumer_module.last_recompute}": 1,
+            },
+        )
+
+    return BenchCall(db=db, invoke=invoke, inspect=inspect, observe=observe), workspace
+
+
+def _build_plain_workspace_import_graph(payload_size: int) -> tuple[SimpleBenchCall, WorkspaceImportGraphWorkspace]:
+    workspace = _create_workspace_import_graph_workspace(payload_size)
+
+    def invoke() -> object:
+        return plain_workspace_analysis(workspace.root)
+
+    return SimpleBenchCall(invoke=invoke), workspace
+
+
+def _plain_workspace_import_graph_call_for_workspace(
+    workspace: WorkspaceImportGraphWorkspace,
+) -> SimpleBenchCall:
+    def invoke() -> object:
+        return plain_workspace_analysis(workspace.root)
+
+    return SimpleBenchCall(invoke=invoke)
+
+
+def _prepare_workspace_import_graph_operation(
+    call: MeasuredCall,
+    workspace: WorkspaceImportGraphWorkspace,
+    operation: str,
+) -> None:
+    if operation == "initial_full":
+        return
+    call.invoke()
+    if operation == "no_change_repeat":
+        return
+    if operation == "provider_comment_edit":
+        workspace.provider.write_text(
+            _provider_module_source(trailing_comment="# trailing comment\n"),
+            encoding="utf-8",
+        )
+        return
+    if operation == "provider_internal_edit":
+        workspace.provider.write_text(_provider_module_source(return_value=2), encoding="utf-8")
+        return
+    if operation == "provider_export_edit":
+        workspace.provider.write_text(
+            _provider_module_source(include_extra_export=True),
+            encoding="utf-8",
+        )
+        return
+    raise ValueError(f"unknown workspace import graph operation: {operation}")
+
+
+def _setup_incremental_workspace_import_graph_operation(
+    mode: str,
+    payload_size: int,
+    operation: str,
+) -> tuple[BenchCall, CleanupFn]:
+    call, workspace = _build_workspace_import_graph(mode, payload_size)
+    _prepare_workspace_import_graph_operation(call, workspace, operation)
+    return call, workspace.cleanup
+
+
+def _setup_plain_workspace_import_graph_operation(
+    payload_size: int,
+    operation: str,
+) -> tuple[SimpleBenchCall, CleanupFn]:
+    call, workspace = _build_plain_workspace_import_graph(payload_size)
+    _prepare_workspace_import_graph_operation(call, workspace, operation)
+    return call, workspace.cleanup
+
+
+def _run_workspace_import_graph_operation(
+    call: MeasuredCall,
+    workspace: WorkspaceImportGraphWorkspace,
+    operation: str,
+) -> tuple[object, dict[str, int]]:
+    _prepare_workspace_import_graph_operation(call, workspace, operation)
+    result = call.invoke()
+    markers = {} if call.observe is None else dict(call.observe())
+    return result, markers
+
+
+def _workspace_import_graph_operation_note(operation: str, speedup_ratio: float | None) -> str:
+    if speedup_ratio is None:
+        return f"{operation} did not produce a stable speedup ratio."
+    if operation == "initial_full":
+        return "Cold workspace analysis still pays the full graph construction cost."
+    if operation == "no_change_repeat":
+        return "No-change repeats favor the incremental engine because the workspace root reuses."
+    if operation == "provider_comment_edit":
+        return "Comment-only provider edits favor the incremental engine because the provider source backdates."
+    if operation == "provider_internal_edit":
+        return "Provider body edits can still reuse downstream consumers when the export surface is unchanged."
+    if operation == "provider_export_edit":
+        return "Export-surface edits still force the affected consumer graph to execute."
+    return f"{operation} completed with a meaningful incremental/plain comparison."
+
+
+def benchmark_workspace_import_graph(config: BenchConfig, mode: str) -> ScenarioResult:
+    call, workspace = _build_workspace_import_graph(mode, config.payload_size)
+    try:
+        call.invoke()
+        workspace.provider.write_text(
+            _provider_module_source(trailing_comment="# trailing comment\n"),
+            encoding="utf-8",
+        )
+        call.invoke()
+        comment_inspection = call.inspect()
+        comment_source = _find_node(comment_inspection, "source_text", str(workspace.provider))
+        comment_consumer = _find_node(comment_inspection, "module_analysis_payload", str(workspace.consumers[0]))
+        workspace.provider.write_text(_provider_module_source(return_value=2), encoding="utf-8")
+        call.invoke()
+        internal_inspection = call.inspect()
+        internal_consumer = _find_node(
+            internal_inspection,
+            "module_analysis_payload",
+            str(workspace.consumers[0]),
+        )
+        workspace.provider.write_text(
+            _provider_module_source(include_extra_export=True),
+            encoding="utf-8",
+        )
+        call.invoke()
+        export_inspection = call.inspect()
+        export_consumer = _find_node(export_inspection, "module_analysis_payload", str(workspace.consumers[0]))
+        invariants = (
+            _require(
+                comment_source.last_recompute == "backdated",
+                "workspace_import_graph_comment_backdates_provider_source",
+                "comment-only provider edits backdate the tracked provider source query",
+            ),
+            _require(
+                comment_inspection.last_decision == "reused",
+                "workspace_import_graph_comment_reuses_root",
+                "comment-only provider edits reuse the workspace root",
+            ),
+            _require(
+                internal_inspection.last_decision == "reused",
+                "workspace_import_graph_internal_reuses_root",
+                "provider body edits reuse the workspace root when the export surface is unchanged",
+            ),
+            _require(
+                internal_consumer.last_decision == "reused",
+                "workspace_import_graph_internal_reuses_consumers",
+                "provider body edits reuse downstream consumer module analyses",
+            ),
+            _require(
+                export_inspection.last_recompute == "executed",
+                "workspace_import_graph_export_executes_root",
+                "export-surface edits execute the workspace root",
+            ),
+            _require(
+                export_consumer.last_recompute == "executed",
+                "workspace_import_graph_export_executes_consumers",
+                "export-surface edits execute downstream consumer module analyses",
+            ),
+            _require(
+                comment_consumer.last_decision == "reused",
+                "workspace_import_graph_comment_reuses_consumers",
+                "comment-only provider edits reuse downstream consumer module analyses",
+            ),
+        )
+    finally:
+        workspace.cleanup()
+
+    def setup_call() -> tuple[BenchCall, CleanupFn]:
+        local_call, local_workspace = _build_workspace_import_graph(mode, config.payload_size)
+        return local_call, local_workspace.cleanup
+
+    def setup_comment_only() -> SequenceFixture:
+        local_call, local_workspace = _build_workspace_import_graph(mode, config.payload_size)
+
+        def prepare(step: int) -> None:
+            suffix = "# trailing comment\n" if step % 2 == 0 else ""
+            local_workspace.provider.write_text(
+                _provider_module_source(trailing_comment=suffix),
+                encoding="utf-8",
+            )
+
+        return SequenceFixture(call=local_call, prepare=prepare, cleanup=local_workspace.cleanup)
+
+    def setup_internal() -> SequenceFixture:
+        local_call, local_workspace = _build_workspace_import_graph(mode, config.payload_size)
+        next_value = 2
+
+        def prepare(_: int) -> None:
+            nonlocal next_value
+            local_workspace.provider.write_text(
+                _provider_module_source(return_value=next_value),
+                encoding="utf-8",
+            )
+            next_value += 1
+
+        return SequenceFixture(call=local_call, prepare=prepare, cleanup=local_workspace.cleanup)
+
+    def setup_export() -> SequenceFixture:
+        local_call, local_workspace = _build_workspace_import_graph(mode, config.payload_size)
+
+        def prepare(step: int) -> None:
+            local_workspace.provider.write_text(
+                _provider_module_source(include_extra_export=step % 2 == 0),
+                encoding="utf-8",
+            )
+
+        return SequenceFixture(call=local_call, prepare=prepare, cleanup=local_workspace.cleanup)
+
+    phases = (
+        _measure_cold("cold_full", setup_call, rounds=config.rounds),
+        _measure_cached("warm_reuse", setup_call, config),
+        _measure_sequence("provider_comment_edit", setup_comment_only, config),
+        _measure_fresh_sequence("provider_comment_edit_fresh", setup_comment_only, config),
+        _measure_sequence("provider_internal_edit", setup_internal, config),
+        _measure_fresh_sequence("provider_internal_edit_fresh", setup_internal, config),
+        _measure_sequence("provider_export_edit", setup_export, config),
+        _measure_fresh_sequence("provider_export_edit_fresh", setup_export, config),
+    )
+    return _scenario_result(
+        key="workspace_import_graph",
+        suite="workload",
+        title="Workspace Import Graph",
+        why="Benchmarks recursive workspace analysis where many consumers depend on one provider through an explicit import graph.",
+        mode=mode,
+        parameters=_workspace_import_graph_parameters(config.payload_size),
+        phases=phases,
+        invariants=invariants,
+        comparison_pairs=(
+            ("warm_vs_cold", "warm_reuse", "cold_full"),
+            ("comment_vs_fresh", "provider_comment_edit", "provider_comment_edit_fresh"),
+            ("internal_vs_fresh", "provider_internal_edit", "provider_internal_edit_fresh"),
+            ("export_vs_fresh", "provider_export_edit", "provider_export_edit_fresh"),
+        ),
+    )
+
+
+def benchmark_workspace_import_graph_plain(config: BenchConfig) -> ScenarioResult:
+    def setup_operation(operation: str) -> tuple[SimpleBenchCall, CleanupFn]:
+        return _setup_plain_workspace_import_graph_operation(config.payload_size, operation)
+
+    phases = tuple(
+        _measure_prepared(operation, partial(setup_operation, operation), config)
+        for operation in WORKSPACE_IMPORT_GRAPH_OPERATIONS
+    )
+    invariants = (
+        _require(
+            True,
+            "plain_workspace_import_graph_baseline",
+            "plain baseline performs direct recursive workspace analysis on every operation",
+        ),
+    )
+    return _scenario_result(
+        key="workspace_import_graph",
+        suite="workload",
+        title="Workspace Import Graph",
+        why="Benchmarks the plain stdlib baseline for the recursive workspace import-graph workload.",
+        mode="plain",
+        parameters=_workspace_import_graph_parameters(config.payload_size),
+        phases=phases,
+        invariants=invariants,
+        comparison_pairs=(),
+    )
+
+
+def benchmark_workspace_import_graph_compare(config: BenchConfig, mode: str) -> WorkloadScenarioResult:
+    invariants: list[InvariantResult] = []
+    operations: list[WorkloadOperationResult] = []
+
+    for operation in WORKSPACE_IMPORT_GRAPH_OPERATIONS:
+        incremental_call, incremental_workspace = _build_workspace_import_graph(mode, config.payload_size)
+        try:
+            incremental_result, incremental_markers = _run_workspace_import_graph_operation(
+                incremental_call,
+                incremental_workspace,
+                operation,
+            )
+            plain_call = _plain_workspace_import_graph_call_for_workspace(incremental_workspace)
+            plain_result = plain_call.invoke()
+        finally:
+            incremental_workspace.cleanup()
+
+        invariants.append(
+            _require(
+                incremental_result == plain_result,
+                f"workspace_import_graph_{operation}_matches_plain",
+                f"incremental and plain workspace import graph analysis agree for {operation}",
+            ),
+        )
+        if operation == "no_change_repeat":
+            invariants.append(
+                _require(
+                    incremental_markers.get("root_reused", 0) > 0,
+                    "workspace_import_graph_no_change_reuses_root",
+                    "no-change repeats reuse the workspace root",
+                ),
+            )
+        if operation == "provider_comment_edit":
+            invariants.extend(
+                [
+                    _require(
+                        incremental_markers.get("root_reused", 0) > 0,
+                        "workspace_import_graph_comment_reuses_root",
+                        "comment-only provider edits reuse the workspace root",
+                    ),
+                    _require(
+                        incremental_markers.get("provider_source_recompute_backdated", 0) > 0,
+                        "workspace_import_graph_comment_backdates_provider_source",
+                        "comment-only provider edits backdate the tracked provider source query",
+                    ),
+                ],
+            )
+        if operation == "provider_internal_edit":
+            invariants.extend(
+                [
+                    _require(
+                        incremental_markers.get("root_reused", 0) > 0,
+                        "workspace_import_graph_internal_reuses_root",
+                        "provider body edits reuse the workspace root",
+                    ),
+                    _require(
+                        incremental_markers.get("consumer_reused", 0) > 0,
+                        "workspace_import_graph_internal_reuses_consumers",
+                        "provider body edits reuse downstream consumers",
+                    ),
+                ],
+            )
+        if operation == "provider_export_edit":
+            invariants.extend(
+                [
+                    _require(
+                        incremental_markers.get("root_executed", 0) > 0,
+                        "workspace_import_graph_export_executes_root",
+                        "export-surface edits execute the workspace root",
+                    ),
+                    _require(
+                        incremental_markers.get("consumer_recompute_executed", 0) > 0,
+                        "workspace_import_graph_export_executes_consumers",
+                        "export-surface edits execute downstream consumers",
+                    ),
+                ],
+            )
+
+        incremental_phase = _measure_prepared(
+            operation,
+            partial(_setup_incremental_workspace_import_graph_operation, mode, config.payload_size, operation),
+            config,
+        )
+        plain_phase = _measure_prepared(
+            operation,
+            partial(_setup_plain_workspace_import_graph_operation, config.payload_size, operation),
+            config,
+        )
+        comparison = _phase_speedup("plain_vs_incremental", "incremental", incremental_phase, "plain", plain_phase)
+        operations.append(
+            WorkloadOperationResult(
+                name=operation,
+                measurements=(
+                    ImplementationPhaseResult(implementation="incremental", phase=incremental_phase),
+                    ImplementationPhaseResult(implementation="plain", phase=plain_phase),
+                ),
+                comparison=comparison,
+                note=_workspace_import_graph_operation_note(operation, comparison.speedup_ratio),
+            ),
+        )
+
+    return WorkloadScenarioResult(
+        key="workspace_import_graph",
+        suite="workload",
+        title="Workspace Import Graph",
+        why="Compares the incremental workspace import-graph integration against the plain recursive baseline.",
+        parameters=_workspace_import_graph_parameters(config.payload_size),
+        operations=tuple(operations),
+        invariants=tuple(invariants),
+    )
+
+
 SCENARIOS = (
     ScenarioSpec(
         key="diamond_reuse",
@@ -2166,14 +2658,23 @@ SCENARIOS = (
         why="Benchmarks the reference source-analysis integration.",
         run=benchmark_source_analysis,
     ),
+    ScenarioSpec(
+        key="workspace_import_graph",
+        suite="workload",
+        title="Workspace Import Graph",
+        why="Benchmarks the recursive import-graph analysis integration.",
+        run=benchmark_workspace_import_graph,
+    ),
 )
 
 SCENARIO_INDEX = {scenario.key: scenario for scenario in SCENARIOS}
 PLAIN_WORKLOAD_RUNNERS = {
     "source_analysis": benchmark_source_analysis_plain,
+    "workspace_import_graph": benchmark_workspace_import_graph_plain,
 }
 COMPARE_WORKLOAD_RUNNERS = {
     "source_analysis": benchmark_source_analysis_compare,
+    "workspace_import_graph": benchmark_workspace_import_graph_compare,
 }
 
 

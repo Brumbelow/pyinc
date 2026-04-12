@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from pyfoundinc import Database
-from pyfoundinc.integrations.python_source import file_analysis, file_analysis_payload
+from pyfoundinc.integrations.python_source import (
+    file_analysis,
+    file_analysis_payload,
+    workspace_analysis,
+    workspace_analysis_payload,
+)
 
 if __name__ == "__main__":
     sample = Path(__file__).with_name("sample_module.py")
@@ -12,3 +17,5 @@ if __name__ == "__main__":
     db = Database(mode="strict")
     print(file_analysis(db, sample))
     print(db.explain(file_analysis_payload, str(sample)))
+    print(workspace_analysis(db, sample.parent))
+    print(db.explain(workspace_analysis_payload, str(sample.parent)))

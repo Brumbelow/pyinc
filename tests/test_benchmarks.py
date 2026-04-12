@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 
 from pyfoundinc import Database
-from pyfoundinc.integrations.python_source import directory_analysis, file_analysis
+from pyfoundinc.integrations.python_source import (
+    directory_analysis,
+    file_analysis,
+    workspace_analysis,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCH_PATH = ROOT / "benchmarks" / "run_microbench.py"
@@ -50,6 +54,19 @@ def test_plain_directory_analysis_matches_incremental_directory(tmp_path: Path) 
     (root / "notes.txt").write_text("ignored\n", encoding="utf-8")
 
     assert plain_source.directory_analysis(root) == directory_analysis(Database(), root)
+
+
+def test_plain_workspace_analysis_matches_incremental_workspace(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    app = root / "app"
+    pkg.mkdir(parents=True)
+    app.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "provider.py").write_text("def exported() -> int:\n    return 1\n", encoding="utf-8")
+    (app / "consumer.py").write_text("from pkg.provider import exported\n", encoding="utf-8")
+
+    assert plain_source.workspace_analysis(root) == workspace_analysis(Database(), root)
 
 
 def test_table_output_contains_scenario_rows_and_vs_fresh(capsys: pytest.CaptureFixture[str]) -> None:
@@ -130,6 +147,36 @@ def test_compare_table_output_contains_incremental_and_plain_columns(capsys: pyt
     assert "plain_mean_ms" in captured.out
     assert "speedup_pct" in captured.out
     assert "comment_only_edit" in captured.out
+
+
+def test_workspace_compare_table_output_contains_new_workload_rows(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bench.main(
+        [
+            "--suite",
+            "workload",
+            "--bench",
+            "workspace_import_graph",
+            "--samples",
+            "1",
+            "--warmup",
+            "0",
+            "--rounds",
+            "1",
+            "--payload-size",
+            "8",
+            "--implementation",
+            "compare",
+            "--format",
+            "table",
+        ],
+    )
+
+    captured = capsys.readouterr()
+    assert "workspace_import_graph" in captured.out
+    assert "provider_internal_edit" in captured.out
+    assert "plain_mean_ms" in captured.out
 
 
 def test_json_output_includes_environment_and_comparisons(capsys: pytest.CaptureFixture[str]) -> None:
@@ -219,7 +266,13 @@ def test_compare_markdown_output_contains_summary_and_workload_sections(
 def test_selected_benchmark_invariants_pass() -> None:
     config = bench.BenchConfig(samples=1, warmup=0, rounds=1, payload_size=8)
 
-    for scenario_key in ("backdating_chain", "rewiring_torture", "resource_granularity", "source_analysis"):
+    for scenario_key in (
+        "backdating_chain",
+        "rewiring_torture",
+        "resource_granularity",
+        "source_analysis",
+        "workspace_import_graph",
+    ):
         result = bench.SCENARIO_INDEX[scenario_key].run(config, bench._resolved_mode(scenario_key, None))
         assert result.invariants
         assert all(invariant.passed for invariant in result.invariants)
@@ -227,6 +280,9 @@ def test_selected_benchmark_invariants_pass() -> None:
     compare_result = bench.benchmark_source_analysis_compare(config, "strict")
     assert compare_result.invariants
     assert all(invariant.passed for invariant in compare_result.invariants)
+    workspace_compare = bench.benchmark_workspace_import_graph_compare(config, "strict")
+    assert workspace_compare.invariants
+    assert all(invariant.passed for invariant in workspace_compare.invariants)
 
 
 def test_compare_mode_rejects_micro_suite() -> None:

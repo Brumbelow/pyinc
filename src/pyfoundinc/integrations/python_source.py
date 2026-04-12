@@ -1,22 +1,46 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
 from pyfoundinc.core import query
-from pyfoundinc.resources import DirectoryResource, FileResource
+from pyfoundinc.resources import DirectoryResource
 from pyfoundinc.runtime import Database
 from pyfoundinc.value import thaw
 
 ImportKind: TypeAlias = Literal["import", "from"]
 DefinitionKind: TypeAlias = Literal["function", "class"]
+ImportResolution: TypeAlias = Literal["workspace", "external", "missing", "ambiguous"]
 
 ImportPayload: TypeAlias = tuple[str, ImportKind, int]
 DefinitionPayload: TypeAlias = tuple[str, DefinitionKind, int]
 DiagnosticPayload: TypeAlias = tuple[str, str, int | None, int | None]
+ImportStatementPayload: TypeAlias = tuple[str, ImportKind, int, tuple[str, ...]]
+ResolvedImportPayload: TypeAlias = tuple[
+    str,
+    ImportKind,
+    int,
+    str | None,
+    str | None,
+    str | None,
+    ImportResolution,
+]
+DependencySurfacePayload: TypeAlias = tuple[str, str, tuple[str, ...]]
+ModuleIndexEntryPayload: TypeAlias = tuple[str, str]
+ModuleAnalysisPayload: TypeAlias = tuple[
+    str,
+    str,
+    tuple[ImportPayload, ...],
+    tuple[DefinitionPayload, ...],
+    tuple[DiagnosticPayload, ...],
+    tuple[ResolvedImportPayload, ...],
+    tuple[DependencySurfacePayload, ...],
+]
+WorkspaceAnalysisPayload: TypeAlias = tuple[str, tuple[ModuleAnalysisPayload, ...]]
 FileAnalysisPayload: TypeAlias = tuple[
     str,
     tuple[ImportPayload, ...],
@@ -56,12 +80,76 @@ class PythonFileAnalysis:
     diagnostics: tuple[Diagnostic, ...]
 
 
-_FILES = FileResource()
+@dataclass(frozen=True)
+class ResolvedImportRef:
+    module: str
+    kind: ImportKind
+    lineno: int
+    imported_name: str | None
+    resolved_module: str | None
+    resolved_path: str | None
+    resolution: ImportResolution
+
+
+@dataclass(frozen=True)
+class DependencySurface:
+    module: str
+    path: str
+    exports: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PythonModuleAnalysis:
+    path: str
+    module: str
+    imports: tuple[ImportRef, ...]
+    definitions: tuple[DefinitionRef, ...]
+    diagnostics: tuple[Diagnostic, ...]
+    resolved_imports: tuple[ResolvedImportRef, ...]
+    dependencies: tuple[DependencySurface, ...]
+
+
+@dataclass(frozen=True)
+class PythonWorkspaceAnalysis:
+    root: str
+    modules: tuple[PythonModuleAnalysis, ...]
+
+
+@dataclass(frozen=True)
+class _SourceTextResource:
+    encoding: str = "utf-8"
+
+    def read(self, db: Database, path: str | os.PathLike[str]) -> str:
+        return cast(str, db._read_resource(self, os.fspath(path)))
+
+    def label(self, path: str) -> str:
+        return f"sourcefile[{path}]"
+
+    def probe(self, path: str) -> tuple[str, str] | tuple[str]:
+        file_path = Path(path)
+        if not file_path.exists():
+            return ("missing",)
+        return ("present", hashlib.sha256(file_path.read_bytes()).hexdigest())
+
+    def load(self, db: Database, path: str) -> str:
+        file_path = Path(path)
+        if not file_path.exists():
+            return ""
+        with db._allow_raw_open():
+            return file_path.read_text(encoding=self.encoding)
+
+
+_FILES = _SourceTextResource()
 _DIRECTORIES = DirectoryResource()
 
 
 def _normalize_path(path: str | os.PathLike[str]) -> str:
     return os.fspath(path)
+
+
+def _relative_import_module(module: str | None, level: int) -> str:
+    prefix = "." * level
+    return f"{prefix}{module or ''}"
 
 
 def _source_cutoff_token(source: str) -> tuple[str, str]:
@@ -78,9 +166,142 @@ def _try_parse(source: str) -> ast.Module | None:
         return None
 
 
-def _relative_module_name(node: ast.ImportFrom) -> str:
-    prefix = "." * node.level
-    return f"{prefix}{node.module or ''}"
+def _module_name_for_path(root: str, path: str) -> str:
+    relative_path = Path(path).relative_to(Path(root))
+    if relative_path.suffix != ".py":
+        raise ValueError(f"{path!r} is not a Python source file under {root!r}.")
+    if relative_path.name == "__init__.py":
+        module_parts = relative_path.parts[:-1]
+    else:
+        module_parts = relative_path.parts[:-1] + (relative_path.stem,)
+    return ".".join(module_parts)
+
+
+def _is_package_path(path: str) -> bool:
+    return Path(path).name == "__init__.py"
+
+
+def _top_level_module_name(module: str) -> str | None:
+    if not module:
+        return None
+    return module.split(".", 1)[0]
+
+
+def _index_groups(
+    index: tuple[ModuleIndexEntryPayload, ...],
+) -> dict[str, tuple[str, ...]]:
+    grouped: dict[str, list[str]] = {}
+    for module, path in index:
+        grouped.setdefault(module, []).append(path)
+    return {
+        module: tuple(sorted(paths))
+        for module, paths in grouped.items()
+    }
+
+
+def _resolve_relative_base(
+    current_module: str,
+    current_path: str,
+    request_module: str,
+) -> str | None:
+    level = 0
+    for char in request_module:
+        if char != ".":
+            break
+        level += 1
+    base = request_module[level:]
+    if level == 0:
+        return request_module
+
+    package_parts = [part for part in current_module.split(".") if part]
+    if package_parts and not _is_package_path(current_path):
+        package_parts = package_parts[:-1]
+    if level - 1 > len(package_parts):
+        return None
+    anchor = package_parts[: len(package_parts) - (level - 1)]
+    base_parts = [part for part in base.split(".") if part]
+    combined = anchor + base_parts
+    return ".".join(combined)
+
+
+def _missing_resolution(
+    requested_module: str,
+    index_groups: dict[str, tuple[str, ...]],
+    *,
+    prefer_external: bool,
+) -> ImportResolution:
+    top_level = _top_level_module_name(requested_module)
+    if top_level is None:
+        return "missing"
+    if top_level in index_groups:
+        return "missing"
+    return "external" if prefer_external else "missing"
+
+
+def _resolve_workspace_module(
+    module: str,
+    index_groups: dict[str, tuple[str, ...]],
+) -> tuple[str | None, str | None, ImportResolution | None]:
+    paths = index_groups.get(module, ())
+    if len(paths) == 1:
+        return module, paths[0], "workspace"
+    if len(paths) > 1:
+        return None, None, "ambiguous"
+    return None, None, None
+
+
+def _resolve_import_reference(
+    *,
+    current_module: str,
+    current_path: str,
+    request_module: str,
+    kind: ImportKind,
+    imported_name: str | None,
+    index_groups: dict[str, tuple[str, ...]],
+) -> tuple[str | None, str | None, ImportResolution]:
+    if kind == "import":
+        resolved_module, resolved_path, resolution = _resolve_workspace_module(request_module, index_groups)
+        if resolution is not None:
+            return resolved_module, resolved_path, resolution
+        return None, None, _missing_resolution(request_module, index_groups, prefer_external=True)
+
+    absolute_base = _resolve_relative_base(current_module, current_path, request_module)
+    if absolute_base is None:
+        return None, None, "missing"
+
+    candidates: list[str] = []
+    if imported_name is not None and imported_name != "*":
+        candidate = f"{absolute_base}.{imported_name}" if absolute_base else imported_name
+        candidates.append(candidate)
+    if absolute_base:
+        candidates.append(absolute_base)
+
+    for candidate in candidates:
+        resolved_module, resolved_path, resolution = _resolve_workspace_module(candidate, index_groups)
+        if resolution is not None:
+            return resolved_module, resolved_path, resolution
+
+    requested_target = candidates[0] if candidates else absolute_base
+    return None, None, _missing_resolution(
+        requested_target,
+        index_groups,
+        prefer_external=not request_module.startswith("."),
+    )
+
+
+def _collect_python_files(db: Database, directory: str, entries: tuple[str, ...]) -> tuple[str, ...]:
+    python_files: list[str] = []
+    base = Path(directory)
+    for name in entries:
+        child = str(base / name)
+        try:
+            child_entries = _DIRECTORIES.read(db, child)
+        except NotADirectoryError:
+            if name.endswith(".py"):
+                python_files.append(child)
+            continue
+        python_files.extend(_collect_python_files(db, child, child_entries))
+    return tuple(python_files)
 
 
 @query(cutoff=_source_cutoff_token)
@@ -89,18 +310,31 @@ def source_text(db: Database, path: str) -> str:
 
 
 @query
-def imports_for_file(db: Database, path: str) -> tuple[ImportPayload, ...]:
+def import_statements_for_file(db: Database, path: str) -> tuple[ImportStatementPayload, ...]:
     tree = _try_parse(source_text(db, path))
     if tree is None:
         return tuple()
 
-    imports: list[ImportPayload] = []
+    statements: list[ImportStatementPayload] = []
     for node in tree.body:
         if isinstance(node, ast.Import):
-            imports.extend((alias.name, "import", node.lineno) for alias in node.names)
+            statements.extend((alias.name, "import", node.lineno, tuple()) for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            imports.append((_relative_module_name(node), "from", node.lineno))
-    return tuple(imports)
+            statements.append(
+                (
+                    _relative_import_module(node.module, node.level),
+                    "from",
+                    node.lineno,
+                    tuple(alias.name for alias in node.names),
+                )
+            )
+    return tuple(statements)
+
+
+@query
+def imports_for_file(db: Database, path: str) -> tuple[ImportPayload, ...]:
+    statements = import_statements_for_file(db, path)
+    return tuple((module, kind, lineno) for module, kind, lineno, _ in statements)
 
 
 @query
@@ -146,6 +380,106 @@ def file_analysis_payload(db: Database, path: str) -> FileAnalysisPayload:
 
 
 @query
+def workspace_python_files(db: Database, root: str) -> tuple[str, ...]:
+    try:
+        entries = _DIRECTORIES.read(db, root)
+    except NotADirectoryError:
+        return tuple()
+    return _collect_python_files(db, root, entries)
+
+
+@query
+def workspace_module_index(db: Database, root: str) -> tuple[ModuleIndexEntryPayload, ...]:
+    return tuple(
+        (_module_name_for_path(root, path), path)
+        for path in workspace_python_files(db, root)
+    )
+
+
+@query
+def resolved_imports_for_file(db: Database, root: str, path: str) -> tuple[ResolvedImportPayload, ...]:
+    current_module = _module_name_for_path(root, path)
+    index_groups = _index_groups(workspace_module_index(db, root))
+    statements = import_statements_for_file(db, path)
+
+    resolved: list[ResolvedImportPayload] = []
+    for request_module, kind, lineno, imported_names in statements:
+        if kind == "import":
+            resolved_module, resolved_path, resolution = _resolve_import_reference(
+                current_module=current_module,
+                current_path=path,
+                request_module=request_module,
+                kind=kind,
+                imported_name=None,
+                index_groups=index_groups,
+            )
+            resolved.append(
+                (request_module, kind, lineno, None, resolved_module, resolved_path, resolution)
+            )
+            continue
+
+        for imported_name in imported_names:
+            resolved_module, resolved_path, resolution = _resolve_import_reference(
+                current_module=current_module,
+                current_path=path,
+                request_module=request_module,
+                kind=kind,
+                imported_name=imported_name,
+                index_groups=index_groups,
+            )
+            resolved.append(
+                (
+                    request_module,
+                    kind,
+                    lineno,
+                    imported_name,
+                    resolved_module,
+                    resolved_path,
+                    resolution,
+                )
+            )
+    return tuple(resolved)
+
+
+@query
+def module_export_surface(db: Database, root: str, path: str) -> DependencySurfacePayload:
+    module = _module_name_for_path(root, path)
+    exports = tuple(sorted(name for name, _, _ in definitions_for_file(db, path)))
+    return (module, path, exports)
+
+
+@query
+def module_analysis_payload(db: Database, root: str, path: str) -> ModuleAnalysisPayload:
+    workspace_files = workspace_python_files(db, root)
+    if path not in workspace_files:
+        return _empty_module_analysis_payload(root, path)
+
+    resolved_imports = resolved_imports_for_file(db, root, path)
+    dependencies: dict[tuple[str, str], DependencySurfacePayload] = {}
+    for _, _, _, _, resolved_module, resolved_path, resolution in resolved_imports:
+        if resolution != "workspace" or resolved_module is None or resolved_path is None:
+            continue
+        surface = module_export_surface(db, root, resolved_path)
+        dependencies[(surface[0], surface[1])] = surface
+
+    return (
+        path,
+        _module_name_for_path(root, path),
+        imports_for_file(db, path),
+        definitions_for_file(db, path),
+        syntax_diagnostics_for_file(db, path),
+        resolved_imports,
+        tuple(sorted(dependencies.values(), key=lambda item: (item[0], item[1]))),
+    )
+
+
+@query
+def workspace_analysis_payload(db: Database, root: str) -> WorkspaceAnalysisPayload:
+    files = workspace_python_files(db, root)
+    return (root, tuple(module_analysis_payload(db, root, path) for path in files))
+
+
+@query
 def directory_analysis_payload(db: Database, root: str) -> DirectoryAnalysisPayload:
     entries = _DIRECTORIES.read(db, root)
     base = Path(root)
@@ -168,6 +502,36 @@ def _decode_diagnostic(payload: DiagnosticPayload) -> Diagnostic:
     return Diagnostic(code=code, message=message, lineno=lineno, col_offset=col_offset)
 
 
+def _decode_resolved_import(payload: ResolvedImportPayload) -> ResolvedImportRef:
+    module, kind, lineno, imported_name, resolved_module, resolved_path, resolution = payload
+    return ResolvedImportRef(
+        module=module,
+        kind=kind,
+        lineno=lineno,
+        imported_name=imported_name,
+        resolved_module=resolved_module,
+        resolved_path=resolved_path,
+        resolution=resolution,
+    )
+
+
+def _decode_dependency_surface(payload: DependencySurfacePayload) -> DependencySurface:
+    module, path, exports = payload
+    return DependencySurface(module=module, path=path, exports=exports)
+
+
+def _empty_module_analysis_payload(root: str, path: str) -> ModuleAnalysisPayload:
+    return (
+        path,
+        _module_name_for_path(root, path),
+        tuple(),
+        tuple(),
+        tuple(),
+        tuple(),
+        tuple(),
+    )
+
+
 def _decode_file_analysis(payload: FileAnalysisPayload) -> PythonFileAnalysis:
     path, imports, definitions, diagnostics = payload
     return PythonFileAnalysis(
@@ -175,6 +539,19 @@ def _decode_file_analysis(payload: FileAnalysisPayload) -> PythonFileAnalysis:
         imports=tuple(_decode_import(item) for item in imports),
         definitions=tuple(_decode_definition(item) for item in definitions),
         diagnostics=tuple(_decode_diagnostic(item) for item in diagnostics),
+    )
+
+
+def _decode_module_analysis(payload: ModuleAnalysisPayload) -> PythonModuleAnalysis:
+    path, module, imports, definitions, diagnostics, resolved_imports, dependencies = payload
+    return PythonModuleAnalysis(
+        path=path,
+        module=module,
+        imports=tuple(_decode_import(item) for item in imports),
+        definitions=tuple(_decode_definition(item) for item in definitions),
+        diagnostics=tuple(_decode_diagnostic(item) for item in diagnostics),
+        resolved_imports=tuple(_decode_resolved_import(item) for item in resolved_imports),
+        dependencies=tuple(_decode_dependency_surface(item) for item in dependencies),
     )
 
 
@@ -190,17 +567,56 @@ def directory_analysis(db: Database, root: str | os.PathLike[str]) -> tuple[Pyth
     return tuple(_decode_file_analysis(item) for item in payload)
 
 
+def module_analysis(db: Database, root: str | os.PathLike[str], path: str | os.PathLike[str]) -> PythonModuleAnalysis:
+    normalized_root = _normalize_path(root)
+    normalized_path = _normalize_path(path)
+    workspace_files = cast(tuple[str, ...], thaw(db.get(workspace_python_files, normalized_root)))
+    if normalized_path not in workspace_files:
+        raise ValueError(f"{normalized_path!r} is not a Python source file under {normalized_root!r}.")
+    payload = cast(
+        ModuleAnalysisPayload,
+        thaw(db.get(module_analysis_payload, normalized_root, normalized_path)),
+    )
+    return _decode_module_analysis(payload)
+
+
+def workspace_analysis(db: Database, root: str | os.PathLike[str]) -> PythonWorkspaceAnalysis:
+    normalized_root = _normalize_path(root)
+    payload = cast(
+        WorkspaceAnalysisPayload,
+        thaw(db.get(workspace_analysis_payload, normalized_root)),
+    )
+    workspace_root, modules = payload
+    return PythonWorkspaceAnalysis(
+        root=workspace_root,
+        modules=tuple(_decode_module_analysis(item) for item in modules),
+    )
+
+
 __all__ = [
+    "DependencySurface",
     "DefinitionRef",
     "Diagnostic",
     "ImportRef",
     "PythonFileAnalysis",
+    "PythonModuleAnalysis",
+    "PythonWorkspaceAnalysis",
+    "ResolvedImportRef",
     "definitions_for_file",
     "directory_analysis",
     "directory_analysis_payload",
     "file_analysis",
     "file_analysis_payload",
+    "import_statements_for_file",
     "imports_for_file",
+    "module_analysis",
+    "module_analysis_payload",
+    "module_export_surface",
+    "resolved_imports_for_file",
     "source_text",
     "syntax_diagnostics_for_file",
+    "workspace_analysis",
+    "workspace_analysis_payload",
+    "workspace_module_index",
+    "workspace_python_files",
 ]

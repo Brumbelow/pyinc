@@ -263,8 +263,8 @@ class Database:
 
     def _read_resource(self, resource: Any, parameter: Any) -> Any:
         key = self._resource_key(resource, parameter)
-        self._record_dependency(key)
         self._refresh_resource(resource, parameter, key)
+        self._record_dependency(key)
         return self._expose_boundary_snapshot(self._records[key].snapshot)
 
     def _ensure_query(self, query: Any, key: NodeKey, call_snapshot: Any) -> None:

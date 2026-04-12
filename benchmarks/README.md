@@ -49,10 +49,11 @@ Micro scenarios:
 Workload scenarios:
 
 - `source_analysis`
+- `workspace_import_graph`
 
 Legacy aliases still work for the original scenarios: `diamond`, `rewiring`, `files`, `large`, and `backdating`.
 
-`--implementation plain` and `--implementation compare` are workload-only. They currently support `source_analysis`.
+`--implementation plain` and `--implementation compare` are workload-only. They support `source_analysis` and `workspace_import_graph`.
 
 ## Output
 
@@ -117,7 +118,7 @@ Workload comparison report:
 ```bash
 PYTHONPATH=src python benchmarks/run_microbench.py \
   --suite workload \
-  --bench source_analysis \
+  --bench workspace_import_graph \
   --implementation compare \
   --format markdown \
   --output-json /tmp/pyfoundinc-workload-compare.json \

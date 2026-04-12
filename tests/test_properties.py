@@ -8,8 +8,10 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from pyfoundinc import Database, FileResource, Input, MutationError, query
+from pyfoundinc.integrations.python_source import workspace_analysis
 
 Operation = tuple[str, int | str]
+WorkspaceState = tuple[str, str, bool]
 
 
 def operation_sequences() -> st.SearchStrategy[list[Operation]]:
@@ -88,6 +90,35 @@ def file_contents() -> st.SearchStrategy[list[str]]:
     )
 
 
+def workspace_states() -> st.SearchStrategy[list[WorkspaceState]]:
+    provider_variant = st.sampled_from(["internal_a", "internal_b", "export_a", "export_b"])
+    consumer_variant = st.sampled_from(["provider_only", "provider_and_helper", "external_only"])
+    helper_present = st.booleans()
+    return st.lists(
+        st.tuples(provider_variant, consumer_variant, helper_present),
+        min_size=1,
+        max_size=20,
+    )
+
+
+def _provider_source(variant: str) -> str:
+    if variant == "internal_a":
+        return "def exported() -> int:\n    return 1\n"
+    if variant == "internal_b":
+        return "def exported() -> int:\n    return 2\n"
+    if variant == "export_a":
+        return "def exported() -> int:\n    return 1\n"
+    return "def exported() -> int:\n    return 1\n\ndef extra() -> int:\n    return 2\n"
+
+
+def _consumer_source(variant: str) -> str:
+    if variant == "provider_only":
+        return "from provider import exported\n"
+    if variant == "provider_and_helper":
+        return "from provider import exported\nfrom pkg import helper\n"
+    return "import os\n"
+
+
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("max_query_nodes", [None, 2])
 @settings(max_examples=30, deadline=None)
@@ -117,6 +148,39 @@ def test_resource_backed_queries_match_fresh_recomputation(
 
             fresh = Database(mode=mode, max_query_nodes=max_query_nodes)
             assert incremental.get(diagnostics, str(path)) == fresh.get(diagnostics, str(path))
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("max_query_nodes", [None, 2])
+@settings(max_examples=30, deadline=None)
+@given(states=workspace_states())
+def test_workspace_queries_match_fresh_recomputation(
+    mode: str,
+    max_query_nodes: int | None,
+    states: list[WorkspaceState],
+) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "workspace"
+        root.mkdir()
+        pkg = root / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+
+        incremental = Database(mode=mode, max_query_nodes=max_query_nodes)
+        provider = root / "provider.py"
+        consumer = root / "consumer.py"
+        helper = pkg / "helper.py"
+
+        for provider_variant, consumer_variant, helper_present in states:
+            provider.write_text(_provider_source(provider_variant), encoding="utf-8")
+            consumer.write_text(_consumer_source(consumer_variant), encoding="utf-8")
+            if helper_present:
+                helper.write_text("def helper() -> int:\n    return 1\n", encoding="utf-8")
+            elif helper.exists():
+                helper.unlink()
+
+            fresh = Database(mode=mode, max_query_nodes=max_query_nodes)
+            assert workspace_analysis(incremental, root) == workspace_analysis(fresh, root)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

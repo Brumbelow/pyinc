@@ -18,8 +18,9 @@ First supported integration:
 
 - `pyfoundinc.integrations.python_source` formalizes the mini-analyzer example as a supported reference integration.
 - `file_analysis(db, path)` and `directory_analysis(db, root)` return stable dataclass views over low-level query nodes such as `source_text`, `imports_for_file`, and `file_analysis_payload`.
-- The integration is intentionally narrow: non-recursive directory analysis, top-level imports and definitions only, and syntax diagnostics only.
-- Import resolution, LSP wiring, watchers, and recursive workspace graphs remain out of scope.
+- `module_analysis(db, root, path)` and `workspace_analysis(db, root)` add a recursive, workspace-local module graph over the same kernel.
+- The integration is still intentionally narrow: workspace-local module discovery, top-level imports and definitions only, syntax diagnostics only, and dependency invalidation based on resolved module export surfaces.
+- Full `sys.path` / installed-package resolution, symbol/type resolution, LSP wiring, and watchers remain out of scope.
 
 The core contract is intentionally narrow: values crossing cached boundaries must be snapshot-safe, and hidden reads are treated as correctness violations rather than “best effort” cache misses.
 

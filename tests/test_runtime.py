@@ -374,6 +374,26 @@ def test_resource_reads_are_allowed_inside_query(monkeypatch: pytest.MonkeyPatch
     assert db.get(read_tracked, str(workspace)) == ("value", ("a.txt",))
 
 
+def test_failed_resource_reads_do_not_leave_dangling_dependencies(tmp_path: Path) -> None:
+    directories = DirectoryResource()
+    path = tmp_path / "sample.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+
+    @query
+    def classify(db: Database, candidate: str) -> str:
+        try:
+            directories.read(db, candidate)
+        except NotADirectoryError:
+            return "file"
+        return "directory"
+
+    db = Database()
+    assert db.get(classify, str(path)) == "file"
+    inspection = _inspect_node(db, classify, str(path))
+    assert inspection.last_decision == "executed"
+    assert inspection.dependencies == ()
+
+
 def test_untracked_queries_rerun_without_backdating_the_impure_node() -> None:
     @query
     def impure_source(db: Database) -> str:
