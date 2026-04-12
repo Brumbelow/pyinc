@@ -34,6 +34,23 @@ jobs:
             --output-json /tmp/pyfoundinc-bench.json \
             --output-markdown /tmp/pyfoundinc-bench.md
 
+      - name: Run workload comparison
+        run: |
+          PYTHONPATH=src python benchmarks/run_microbench.py \
+            --suite workload \
+            --bench source_analysis \
+            --implementation compare \
+            --samples 20 \
+            --warmup 5 \
+            --rounds 3 \
+            --payload-size 512 \
+            --format markdown \
+            --output-json /tmp/pyfoundinc-workload-compare.json \
+            --output-markdown /tmp/pyfoundinc-workload-compare.md
+
+      - name: Publish comparison summary
+        run: cat /tmp/pyfoundinc-workload-compare.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -41,3 +58,5 @@ jobs:
           path: |
             /tmp/pyfoundinc-bench.json
             /tmp/pyfoundinc-bench.md
+            /tmp/pyfoundinc-workload-compare.json
+            /tmp/pyfoundinc-workload-compare.md

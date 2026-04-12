@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from pyfoundinc import (
     Database,
@@ -34,6 +34,14 @@ from pyfoundinc.integrations.python_source import (
     file_analysis_payload,
     source_text,
 )
+
+if TYPE_CHECKING:
+    from benchmarks.plain_python_source import directory_analysis as plain_directory_analysis
+else:
+    try:
+        from benchmarks.plain_python_source import directory_analysis as plain_directory_analysis
+    except ModuleNotFoundError:
+        from plain_python_source import directory_analysis as plain_directory_analysis
 
 CleanupFn: TypeAlias = Callable[[], None]
 ObserveFn: TypeAlias = Callable[[], Mapping[str, int]]
@@ -65,14 +73,6 @@ ALIASES = {
 
 
 @dataclass(frozen=True)
-class BenchConfig:
-    samples: int
-    warmup: int
-    rounds: int
-    payload_size: int
-
-
-@dataclass(frozen=True)
 class BenchCall:
     db: Database
     invoke: Callable[[], object]
@@ -81,8 +81,26 @@ class BenchCall:
 
 
 @dataclass(frozen=True)
+class SimpleBenchCall:
+    invoke: Callable[[], object]
+    observe: ObserveFn | None = None
+
+
+MeasuredCall: TypeAlias = BenchCall | SimpleBenchCall
+PreparedSetup: TypeAlias = Callable[[], tuple[MeasuredCall, CleanupFn]]
+
+
+@dataclass(frozen=True)
+class BenchConfig:
+    samples: int
+    warmup: int
+    rounds: int
+    payload_size: int
+
+
+@dataclass(frozen=True)
 class SequenceFixture:
-    call: BenchCall
+    call: MeasuredCall
     prepare: PrepareFn
     cleanup: CleanupFn
 
@@ -214,6 +232,95 @@ class BenchReport:
 
 
 @dataclass(frozen=True)
+class ImplementationPhaseResult:
+    implementation: str
+    phase: PhaseResult
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "implementation": self.implementation,
+            "phase": self.phase.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class WorkloadOperationResult:
+    name: str
+    measurements: tuple[ImplementationPhaseResult, ...]
+    comparison: ComparisonResult | None = None
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "measurements": [measurement.to_dict() for measurement in self.measurements],
+            "comparison": None if self.comparison is None else self.comparison.to_dict(),
+            "note": self.note,
+        }
+
+    def measurement(self, implementation: str) -> ImplementationPhaseResult | None:
+        for measurement in self.measurements:
+            if measurement.implementation == implementation:
+                return measurement
+        return None
+
+    def speedup(self) -> float | None:
+        if self.comparison is None:
+            return None
+        return self.comparison.speedup_ratio
+
+
+@dataclass(frozen=True)
+class WorkloadScenarioResult:
+    key: str
+    suite: str
+    title: str
+    why: str
+    parameters: dict[str, Any]
+    operations: tuple[WorkloadOperationResult, ...]
+    invariants: tuple[InvariantResult, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "suite": self.suite,
+            "title": self.title,
+            "why": self.why,
+            "parameters": self.parameters,
+            "operations": [operation.to_dict() for operation in self.operations],
+            "invariants": [invariant.to_dict() for invariant in self.invariants],
+            "interpretation": self.interpretation(),
+        }
+
+    def interpretation(self) -> str:
+        fastest = max(
+            (operation for operation in self.operations if operation.speedup() is not None),
+            key=lambda operation: operation.speedup() or 0.0,
+            default=None,
+        )
+        if fastest is not None and fastest.note:
+            return fastest.note
+        passed = sum(1 for item in self.invariants if item.passed)
+        return f"{passed} invariant checks passed."
+
+
+@dataclass(frozen=True)
+class WorkloadComparisonReport:
+    environment: dict[str, Any]
+    config: dict[str, Any]
+    implementations: tuple[str, ...]
+    results: tuple[WorkloadScenarioResult, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "environment": self.environment,
+            "config": self.config,
+            "implementations": list(self.implementations),
+            "results": [result.to_dict() for result in self.results],
+        }
+
+
+@dataclass(frozen=True)
 class ScenarioSpec:
     key: str
     suite: str
@@ -282,13 +389,13 @@ def _query_call(
     )
 
 
-def _record_markers(call: BenchCall, aggregate: Counter[str]) -> None:
+def _record_markers(call: MeasuredCall, aggregate: Counter[str]) -> None:
     if call.observe is None:
         return
     aggregate.update(call.observe())
 
 
-def _measure_cold(name: str, setup: Callable[[], tuple[BenchCall, CleanupFn]], *, rounds: int) -> PhaseResult:
+def _measure_cold(name: str, setup: PreparedSetup, *, rounds: int) -> PhaseResult:
     times: list[float] = []
     markers: Counter[str] = Counter()
     for _ in range(rounds):
@@ -303,7 +410,7 @@ def _measure_cold(name: str, setup: Callable[[], tuple[BenchCall, CleanupFn]], *
 
 def _measure_cached(
     name: str,
-    setup: Callable[[], tuple[BenchCall, CleanupFn]],
+    setup: PreparedSetup,
     config: BenchConfig,
 ) -> PhaseResult:
     times: list[float] = []
@@ -366,6 +473,26 @@ def _measure_fresh_sequence(
     return PhaseResult(name=name, metrics=_phase_metrics(times), markers=dict(sorted(markers.items())))
 
 
+def _measure_prepared(name: str, setup: PreparedSetup, config: BenchConfig) -> PhaseResult:
+    times: list[float] = []
+    markers: Counter[str] = Counter()
+    for _ in range(config.rounds):
+        for _ in range(config.warmup):
+            call, cleanup = setup()
+            try:
+                call.invoke()
+            finally:
+                cleanup()
+        for _ in range(config.samples):
+            call, cleanup = setup()
+            try:
+                times.append(_timed(call.invoke))
+                _record_markers(call, markers)
+            finally:
+                cleanup()
+    return PhaseResult(name=name, metrics=_phase_metrics(times), markers=dict(sorted(markers.items())))
+
+
 def _run_sequence_step(fixture: SequenceFixture, step: int) -> object:
     fixture.prepare(step)
     return fixture.call.invoke()
@@ -411,17 +538,33 @@ def _speedup(
     candidate_phase: str,
     baseline_phase: str,
 ) -> ComparisonResult:
-    candidate = phases[candidate_phase].metrics.mean_s
-    baseline = phases[baseline_phase].metrics.mean_s
+    return _phase_speedup(
+        name,
+        candidate_phase,
+        phases[candidate_phase],
+        baseline_phase,
+        phases[baseline_phase],
+    )
+
+
+def _phase_speedup(
+    name: str,
+    candidate_label: str,
+    candidate_phase: PhaseResult,
+    baseline_label: str,
+    baseline_phase: PhaseResult,
+) -> ComparisonResult:
+    candidate = candidate_phase.metrics.mean_s
+    baseline = baseline_phase.metrics.mean_s
     ratio = None if candidate <= 0.0 else baseline / candidate
     if ratio is None:
-        detail = f"{candidate_phase} completed too quickly for a stable ratio against {baseline_phase}."
+        detail = f"{candidate_label} completed too quickly for a stable ratio against {baseline_label}."
     else:
-        detail = f"{candidate_phase} is {ratio:.2f}x faster than {baseline_phase} by mean latency."
+        detail = f"{candidate_label} is {ratio:.2f}x faster than {baseline_label} by mean latency."
     return ComparisonResult(
         name=name,
-        candidate_phase=candidate_phase,
-        baseline_phase=baseline_phase,
+        candidate_phase=candidate_label,
+        baseline_phase=baseline_label,
         speedup_ratio=ratio,
         detail=detail,
     )
@@ -1572,49 +1715,174 @@ def _module_source(index: int, defs_per_file: int) -> str:
     return "".join(lines)
 
 
-def _build_source_analysis(
-    mode: str,
-    payload_size: int,
-) -> tuple[BenchCall, Path, Path, str, CleanupFn]:
-    file_count = _scale(payload_size, minimum=6, maximum=24, divisor=32)
-    defs_per_file = _scale(payload_size, minimum=2, maximum=12, divisor=max(8, file_count * 8))
+SOURCE_ANALYSIS_OPERATIONS = (
+    "initial_full",
+    "no_change_repeat",
+    "comment_only_edit",
+    "semantic_edit",
+)
+
+
+@dataclass(frozen=True)
+class SourceAnalysisWorkspace:
+    root: Path
+    target: Path
+    baseline_source: str
+    file_count: int
+    definitions_per_file: int
+    cleanup: CleanupFn
+
+
+def _source_analysis_shape(payload_size: int) -> tuple[int, int]:
+    file_count = _scale(payload_size, minimum=12, maximum=256, divisor=2)
+    defs_per_file = _scale(payload_size, minimum=4, maximum=24, divisor=max(8, file_count // 8))
+    return file_count, defs_per_file
+
+
+def _source_analysis_parameters(payload_size: int) -> dict[str, int]:
+    file_count, defs_per_file = _source_analysis_shape(payload_size)
+    return {"file_count": file_count, "definitions_per_file": defs_per_file}
+
+
+def _create_source_analysis_workspace(payload_size: int) -> SourceAnalysisWorkspace:
+    file_count, defs_per_file = _source_analysis_shape(payload_size)
     tmpdir = tempfile.TemporaryDirectory()
     root = Path(tmpdir.name)
     target = root / "module_00.py"
     baseline_source = _module_source(0, defs_per_file)
     for index in range(file_count):
         (root / f"module_{index:02d}.py").write_text(_module_source(index, defs_per_file), encoding="utf-8")
+    return SourceAnalysisWorkspace(
+        root=root,
+        target=target,
+        baseline_source=baseline_source,
+        file_count=file_count,
+        definitions_per_file=defs_per_file,
+        cleanup=tmpdir.cleanup,
+    )
+
+
+def _build_source_analysis(
+    mode: str,
+    payload_size: int,
+) -> tuple[BenchCall, SourceAnalysisWorkspace]:
+    workspace = _create_source_analysis_workspace(payload_size)
     db = Database(mode=mode)
 
     def invoke() -> tuple[object, ...]:
-        return directory_analysis(db, root)
+        return directory_analysis(db, workspace.root)
 
     def inspect() -> InspectionNode:
-        return db.inspect(directory_analysis_payload, str(root))
+        return db.inspect(directory_analysis_payload, str(workspace.root))
 
     def observe() -> dict[str, int]:
         inspection = inspect()
-        source_node = db.inspect(source_text, str(target))
+        source_node = db.inspect(source_text, str(workspace.target))
         return _merged_markers(
             _decision_markers(inspection, "root"),
             {f"source_recompute_{source_node.last_recompute}": 1},
         )
 
-    return BenchCall(db=db, invoke=invoke, inspect=inspect, observe=observe), root, target, baseline_source, tmpdir.cleanup
+    return BenchCall(db=db, invoke=invoke, inspect=inspect, observe=observe), workspace
+
+
+def _build_plain_source_analysis(payload_size: int) -> tuple[SimpleBenchCall, SourceAnalysisWorkspace]:
+    workspace = _create_source_analysis_workspace(payload_size)
+
+    def invoke() -> tuple[object, ...]:
+        return plain_directory_analysis(workspace.root)
+
+    return SimpleBenchCall(invoke=invoke), workspace
+
+
+def _plain_source_analysis_call_for_workspace(workspace: SourceAnalysisWorkspace) -> SimpleBenchCall:
+    def invoke() -> tuple[object, ...]:
+        return plain_directory_analysis(workspace.root)
+
+    return SimpleBenchCall(invoke=invoke)
+
+
+def _prepare_source_analysis_operation(
+    call: MeasuredCall,
+    workspace: SourceAnalysisWorkspace,
+    operation: str,
+) -> None:
+    if operation == "initial_full":
+        return
+    call.invoke()
+    if operation == "no_change_repeat":
+        return
+    if operation == "comment_only_edit":
+        workspace.target.write_text(workspace.baseline_source + "# trailing comment\n", encoding="utf-8")
+        return
+    if operation == "semantic_edit":
+        workspace.target.write_text(
+            workspace.baseline_source.replace("import dep_0", "import dep_rewritten", 1),
+            encoding="utf-8",
+        )
+        return
+    raise ValueError(f"unknown source analysis operation: {operation}")
+
+
+def _setup_incremental_source_analysis_operation(
+    mode: str,
+    payload_size: int,
+    operation: str,
+) -> tuple[BenchCall, CleanupFn]:
+    call, workspace = _build_source_analysis(mode, payload_size)
+    _prepare_source_analysis_operation(call, workspace, operation)
+    return call, workspace.cleanup
+
+
+def _setup_plain_source_analysis_operation(
+    payload_size: int,
+    operation: str,
+) -> tuple[SimpleBenchCall, CleanupFn]:
+    call, workspace = _build_plain_source_analysis(payload_size)
+    _prepare_source_analysis_operation(call, workspace, operation)
+    return call, workspace.cleanup
+
+
+def _run_source_analysis_operation(
+    call: MeasuredCall,
+    workspace: SourceAnalysisWorkspace,
+    operation: str,
+) -> tuple[object, dict[str, int]]:
+    _prepare_source_analysis_operation(call, workspace, operation)
+    result = call.invoke()
+    markers = {} if call.observe is None else dict(call.observe())
+    return result, markers
+
+
+def _source_analysis_operation_note(operation: str, speedup_ratio: float | None) -> str:
+    if speedup_ratio is None:
+        return f"{operation} did not produce a stable speedup ratio."
+    if operation == "initial_full":
+        return "Cold full analysis still carries the incremental engine's setup cost."
+    if operation == "no_change_repeat":
+        return "No-change repeats favor the incremental engine because the root query reuses."
+    if operation == "comment_only_edit":
+        return "Comment-only edits favor the incremental engine because the source query backdates and the directory result reuses."
+    if operation == "semantic_edit":
+        return "One-file semantic edits still require targeted recomputation, so the gap is smaller."
+    return f"{operation} completed with a meaningful incremental/plain comparison."
 
 
 def benchmark_source_analysis(config: BenchConfig, mode: str) -> ScenarioResult:
-    call, _, target, baseline_source, cleanup = _build_source_analysis(mode, config.payload_size)
+    call, workspace = _build_source_analysis(mode, config.payload_size)
     try:
         call.invoke()
-        target.write_text(baseline_source + "# trailing comment\n", encoding="utf-8")
+        workspace.target.write_text(workspace.baseline_source + "# trailing comment\n", encoding="utf-8")
         call.invoke()
         comment_inspection = call.inspect()
-        comment_source = call.db.inspect(source_text, str(target))
-        comment_file = call.db.inspect(file_analysis_payload, str(target))
-        target.write_text(baseline_source.replace("import dep_0", "import dep_rewritten", 1), encoding="utf-8")
+        comment_source = call.db.inspect(source_text, str(workspace.target))
+        comment_file = call.db.inspect(file_analysis_payload, str(workspace.target))
+        workspace.target.write_text(
+            workspace.baseline_source.replace("import dep_0", "import dep_rewritten", 1),
+            encoding="utf-8",
+        )
         call.invoke()
-        semantic_file = call.db.inspect(file_analysis_payload, str(target))
+        semantic_file = call.db.inspect(file_analysis_payload, str(workspace.target))
         invariants = (
             _require(
                 comment_source.last_recompute == "backdated",
@@ -1638,29 +1906,32 @@ def benchmark_source_analysis(config: BenchConfig, mode: str) -> ScenarioResult:
             ),
         )
     finally:
-        cleanup()
+        workspace.cleanup()
 
     def setup_call() -> tuple[BenchCall, CleanupFn]:
-        local_call, _, _, _, local_cleanup = _build_source_analysis(mode, config.payload_size)
-        return local_call, local_cleanup
+        local_call, local_workspace = _build_source_analysis(mode, config.payload_size)
+        return local_call, local_workspace.cleanup
 
     def setup_comment_only() -> SequenceFixture:
-        local_call, _, local_target, local_source, local_cleanup = _build_source_analysis(mode, config.payload_size)
+        local_call, local_workspace = _build_source_analysis(mode, config.payload_size)
 
         def prepare(step: int) -> None:
             suffix = "# trailing comment\n" if step % 2 == 0 else ""
-            local_target.write_text(local_source + suffix, encoding="utf-8")
+            local_workspace.target.write_text(local_workspace.baseline_source + suffix, encoding="utf-8")
 
-        return SequenceFixture(call=local_call, prepare=prepare, cleanup=local_cleanup)
+        return SequenceFixture(call=local_call, prepare=prepare, cleanup=local_workspace.cleanup)
 
     def setup_semantic() -> SequenceFixture:
-        local_call, _, local_target, local_source, local_cleanup = _build_source_analysis(mode, config.payload_size)
+        local_call, local_workspace = _build_source_analysis(mode, config.payload_size)
 
         def prepare(step: int) -> None:
             replacement = f"dep_rewritten_{step}"
-            local_target.write_text(local_source.replace("import dep_0", f"import {replacement}", 1), encoding="utf-8")
+            local_workspace.target.write_text(
+                local_workspace.baseline_source.replace("import dep_0", f"import {replacement}", 1),
+                encoding="utf-8",
+            )
 
-        return SequenceFixture(call=local_call, prepare=prepare, cleanup=local_cleanup)
+        return SequenceFixture(call=local_call, prepare=prepare, cleanup=local_workspace.cleanup)
 
     phases = (
         _measure_cold("cold_full", setup_call, rounds=config.rounds),
@@ -1670,15 +1941,13 @@ def benchmark_source_analysis(config: BenchConfig, mode: str) -> ScenarioResult:
         _measure_sequence("semantic_edit", setup_semantic, config),
         _measure_fresh_sequence("semantic_edit_fresh", setup_semantic, config),
     )
-    file_count = _scale(config.payload_size, minimum=6, maximum=24, divisor=32)
-    defs_per_file = _scale(config.payload_size, minimum=2, maximum=12, divisor=max(8, file_count * 8))
     return _scenario_result(
         key="source_analysis",
         suite="workload",
         title="Python Source Analysis",
         why="Benchmarks the real reference workload: flat-directory source analysis with one-file edits versus fresh whole-directory recomputation.",
         mode=mode,
-        parameters={"file_count": file_count, "definitions_per_file": defs_per_file},
+        parameters=_source_analysis_parameters(config.payload_size),
         phases=phases,
         invariants=invariants,
         comparison_pairs=(
@@ -1686,6 +1955,127 @@ def benchmark_source_analysis(config: BenchConfig, mode: str) -> ScenarioResult:
             ("comment_vs_fresh", "comment_only_backdate", "comment_only_backdate_fresh"),
             ("semantic_vs_fresh", "semantic_edit", "semantic_edit_fresh"),
         ),
+    )
+
+
+def benchmark_source_analysis_plain(config: BenchConfig) -> ScenarioResult:
+    def setup_operation(operation: str) -> tuple[SimpleBenchCall, CleanupFn]:
+        return _setup_plain_source_analysis_operation(config.payload_size, operation)
+
+    phases = tuple(
+        _measure_prepared(operation, partial(setup_operation, operation), config)
+        for operation in SOURCE_ANALYSIS_OPERATIONS
+    )
+    invariants = (
+        _require(True, "plain_source_analysis_baseline", "plain baseline performs direct whole-directory analysis on every operation"),
+    )
+    return _scenario_result(
+        key="source_analysis",
+        suite="workload",
+        title="Python Source Analysis",
+        why="Benchmarks the plain stdlib baseline without incremental computation.",
+        mode="plain",
+        parameters=_source_analysis_parameters(config.payload_size),
+        phases=phases,
+        invariants=invariants,
+        comparison_pairs=(),
+    )
+
+
+def benchmark_source_analysis_compare(config: BenchConfig, mode: str) -> WorkloadScenarioResult:
+    invariants: list[InvariantResult] = []
+    operations: list[WorkloadOperationResult] = []
+
+    for operation in SOURCE_ANALYSIS_OPERATIONS:
+        incremental_call, incremental_workspace = _build_source_analysis(mode, config.payload_size)
+        try:
+            incremental_result, incremental_markers = _run_source_analysis_operation(
+                incremental_call,
+                incremental_workspace,
+                operation,
+            )
+            plain_call = _plain_source_analysis_call_for_workspace(incremental_workspace)
+            plain_result = plain_call.invoke()
+        finally:
+            incremental_workspace.cleanup()
+
+        invariants.append(
+            _require(
+                incremental_result == plain_result,
+                f"source_analysis_{operation}_matches_plain",
+                f"incremental and plain source analysis agree for {operation}",
+            ),
+        )
+        if operation == "no_change_repeat":
+            invariants.append(
+                _require(
+                    incremental_markers.get("root_reused", 0) > 0,
+                    "source_analysis_no_change_reuses_root",
+                    "no-change repeats reuse the directory analysis root",
+                ),
+            )
+        if operation == "comment_only_edit":
+            invariants.extend(
+                [
+                    _require(
+                        incremental_markers.get("root_reused", 0) > 0,
+                        "source_analysis_comment_edit_reuses_root",
+                        "comment-only edits reuse the directory analysis root",
+                    ),
+                    _require(
+                        incremental_markers.get("source_recompute_backdated", 0) > 0,
+                        "source_analysis_comment_edit_backdates_source",
+                        "comment-only edits backdate the tracked source query",
+                    ),
+                ],
+            )
+        if operation == "semantic_edit":
+            invariants.extend(
+                [
+                    _require(
+                        incremental_markers.get("root_executed", 0) > 0,
+                        "source_analysis_semantic_edit_executes_root",
+                        "semantic edits re-execute the directory analysis root",
+                    ),
+                    _require(
+                        incremental_markers.get("source_recompute_executed", 0) > 0,
+                        "source_analysis_semantic_edit_executes_source",
+                        "semantic edits execute the tracked source query",
+                    ),
+                ],
+            )
+
+        incremental_phase = _measure_prepared(
+            operation,
+            partial(_setup_incremental_source_analysis_operation, mode, config.payload_size, operation),
+            config,
+        )
+        plain_phase = _measure_prepared(
+            operation,
+            partial(_setup_plain_source_analysis_operation, config.payload_size, operation),
+            config,
+        )
+        comparison = _phase_speedup("plain_vs_incremental", "incremental", incremental_phase, "plain", plain_phase)
+        operations.append(
+            WorkloadOperationResult(
+                name=operation,
+                measurements=(
+                    ImplementationPhaseResult(implementation="incremental", phase=incremental_phase),
+                    ImplementationPhaseResult(implementation="plain", phase=plain_phase),
+                ),
+                comparison=comparison,
+                note=_source_analysis_operation_note(operation, comparison.speedup_ratio),
+            ),
+        )
+
+    return WorkloadScenarioResult(
+        key="source_analysis",
+        suite="workload",
+        title="Python Source Analysis",
+        why="Compares the incremental integration against the plain stdlib baseline on the same workload operations.",
+        parameters=_source_analysis_parameters(config.payload_size),
+        operations=tuple(operations),
+        invariants=tuple(invariants),
     )
 
 
@@ -1770,6 +2160,12 @@ SCENARIOS = (
 )
 
 SCENARIO_INDEX = {scenario.key: scenario for scenario in SCENARIOS}
+PLAIN_WORKLOAD_RUNNERS = {
+    "source_analysis": benchmark_source_analysis_plain,
+}
+COMPARE_WORKLOAD_RUNNERS = {
+    "source_analysis": benchmark_source_analysis_compare,
+}
 
 
 def _selected_scenarios(suite: str, bench: str) -> tuple[str, ...]:
@@ -1785,6 +2181,42 @@ def _selected_scenarios(suite: str, bench: str) -> tuple[str, ...]:
     return tuple(scenario.key for scenario in SCENARIOS)
 
 
+def _selected_scenario_specs(suite: str, bench: str) -> tuple[ScenarioSpec, ...]:
+    return tuple(SCENARIO_INDEX[key] for key in _selected_scenarios(suite, bench))
+
+
+def _build_environment() -> dict[str, Any]:
+    return {
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "timestamp_utc": datetime.now(UTC).isoformat(),
+    }
+
+
+def _build_report_config(
+    *,
+    config: BenchConfig,
+    suite: str,
+    bench: str,
+    mode_override: str | None,
+    implementation: str,
+    selected: Sequence[str],
+) -> dict[str, Any]:
+    return {
+        "suite": suite,
+        "bench": bench,
+        "selected": list(selected),
+        "samples": config.samples,
+        "warmup": config.warmup,
+        "rounds": config.rounds,
+        "payload_size": config.payload_size,
+        "mode_override": mode_override,
+        "implementation": implementation,
+    }
+
+
 def run_benchmarks(
     *,
     config: BenchConfig,
@@ -1797,27 +2229,74 @@ def run_benchmarks(
         SCENARIO_INDEX[scenario_key].run(config, _resolved_mode(scenario_key, mode_override))
         for scenario_key in selected
     )
-    environment = {
-        "python_version": platform.python_version(),
-        "python_implementation": platform.python_implementation(),
-        "platform": platform.platform(),
-        "machine": platform.machine(),
-        "timestamp_utc": datetime.now(UTC).isoformat(),
-    }
-    report_config = {
-        "suite": suite,
-        "bench": bench,
-        "selected": list(selected),
-        "samples": config.samples,
-        "warmup": config.warmup,
-        "rounds": config.rounds,
-        "payload_size": config.payload_size,
-        "mode_override": mode_override,
-    }
-    return BenchReport(environment=environment, config=report_config, results=results)
+    return BenchReport(
+        environment=_build_environment(),
+        config=_build_report_config(
+            config=config,
+            suite=suite,
+            bench=bench,
+            mode_override=mode_override,
+            implementation="incremental",
+            selected=selected,
+        ),
+        results=results,
+    )
+
+
+def run_plain_workload_benchmarks(
+    *,
+    config: BenchConfig,
+    suite: str,
+    bench: str,
+) -> BenchReport:
+    selected = _selected_scenarios(suite, bench)
+    results = tuple(PLAIN_WORKLOAD_RUNNERS[scenario_key](config) for scenario_key in selected)
+    return BenchReport(
+        environment=_build_environment(),
+        config=_build_report_config(
+            config=config,
+            suite=suite,
+            bench=bench,
+            mode_override=None,
+            implementation="plain",
+            selected=selected,
+        ),
+        results=results,
+    )
+
+
+def run_workload_comparison(
+    *,
+    config: BenchConfig,
+    suite: str,
+    bench: str,
+    mode_override: str | None,
+) -> WorkloadComparisonReport:
+    selected = _selected_scenarios(suite, bench)
+    results = tuple(
+        COMPARE_WORKLOAD_RUNNERS[scenario_key](config, _resolved_mode(scenario_key, mode_override))
+        for scenario_key in selected
+    )
+    return WorkloadComparisonReport(
+        environment=_build_environment(),
+        config=_build_report_config(
+            config=config,
+            suite=suite,
+            bench=bench,
+            mode_override=mode_override,
+            implementation="compare",
+            selected=selected,
+        ),
+        implementations=("incremental", "plain"),
+        results=results,
+    )
 
 
 def render_json(report: BenchReport) -> str:
+    return json.dumps(report.to_dict(), indent=2, sort_keys=True)
+
+
+def render_compare_json(report: WorkloadComparisonReport) -> str:
     return json.dumps(report.to_dict(), indent=2, sort_keys=True)
 
 
@@ -1852,6 +2331,59 @@ def render_table(report: BenchReport) -> str:
             "suite="
             f"{report.config['suite']} "
             f"bench={report.config['bench']} "
+            f"samples={report.config['samples']} "
+            f"warmup={report.config['warmup']} "
+            f"rounds={report.config['rounds']} "
+            f"payload_size={report.config['payload_size']}"
+        ),
+        "",
+        _render_table_rows(rows),
+    ]
+    return "\n".join(lines)
+
+
+def render_compare_table(report: WorkloadComparisonReport) -> str:
+    rows: list[list[str]] = [
+        [
+            "scenario",
+            "operation",
+            "inc_mean_ms",
+            "inc_p95_ms",
+            "plain_mean_ms",
+            "plain_p95_ms",
+            "speedup_pct",
+            "incremental_markers",
+        ],
+    ]
+    for scenario in report.results:
+        for operation in scenario.operations:
+            incremental = operation.measurement("incremental")
+            plain = operation.measurement("plain")
+            rows.append(
+                [
+                    scenario.key,
+                    operation.name,
+                    "-" if incremental is None else f"{incremental.phase.metrics.mean_s * 1000:.3f}",
+                    "-" if incremental is None else f"{incremental.phase.metrics.p95_s * 1000:.3f}",
+                    "-" if plain is None else f"{plain.phase.metrics.mean_s * 1000:.3f}",
+                    "-" if plain is None else f"{plain.phase.metrics.p95_s * 1000:.3f}",
+                    _format_percentage_ratio(operation.speedup()),
+                    "-" if incremental is None else _format_markers(incremental.phase.markers),
+                ],
+            )
+    lines = [
+        "pyfoundinc workload comparison",
+        (
+            "python="
+            f"{report.environment['python_version']} "
+            f"impl={report.environment['python_implementation']} "
+            f"platform={report.environment['platform']}"
+        ),
+        (
+            "suite="
+            f"{report.config['suite']} "
+            f"bench={report.config['bench']} "
+            f"implementations={','.join(report.implementations)} "
             f"samples={report.config['samples']} "
             f"warmup={report.config['warmup']} "
             f"rounds={report.config['rounds']} "
@@ -1951,10 +2483,94 @@ def render_markdown(report: BenchReport) -> str:
     return "\n".join(lines).rstrip()
 
 
+def render_compare_markdown(report: WorkloadComparisonReport) -> str:
+    lines = [
+        "# pyfoundinc workload comparison report",
+        "",
+        (
+            f"- Python: `{report.environment['python_version']}` "
+            f"({report.environment['python_implementation']}) on `{report.environment['platform']}`"
+        ),
+        (
+            f"- Config: `suite={report.config['suite']}` "
+            f"`bench={report.config['bench']}` "
+            f"`implementation={report.config['implementation']}` "
+            f"`samples={report.config['samples']}` "
+            f"`warmup={report.config['warmup']}` "
+            f"`rounds={report.config['rounds']}` "
+            f"`payload_size={report.config['payload_size']}`"
+        ),
+        "",
+        "## Summary",
+        "",
+        "| scenario | operation | incremental_mean_ms | plain_mean_ms | speedup_pct | incremental_markers |",
+        "| --- | --- | ---: | ---: | ---: | --- |",
+    ]
+    for scenario in report.results:
+        for operation in scenario.operations:
+            incremental = operation.measurement("incremental")
+            plain = operation.measurement("plain")
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        scenario.key,
+                        operation.name,
+                        "-" if incremental is None else f"{incremental.phase.metrics.mean_s * 1000:.3f}",
+                        "-" if plain is None else f"{plain.phase.metrics.mean_s * 1000:.3f}",
+                        _format_percentage_ratio(operation.speedup()),
+                        "-" if incremental is None else _format_markers(incremental.phase.markers),
+                    ],
+                )
+                + " |"
+            )
+    lines.append("")
+    lines.extend(["## Workload", ""])
+    for scenario in report.results:
+        lines.extend(
+            [
+                f"### {scenario.title}",
+                "",
+                f"Why this matters: {scenario.why}",
+                "",
+                f"Invariant checks: {len(scenario.invariants)} passed.",
+                "",
+                "| operation | incremental_mean_ms | incremental_p95_ms | plain_mean_ms | plain_p95_ms | speedup_pct | incremental_markers |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+            ],
+        )
+        for operation in scenario.operations:
+            incremental = operation.measurement("incremental")
+            plain = operation.measurement("plain")
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        operation.name,
+                        "-" if incremental is None else f"{incremental.phase.metrics.mean_s * 1000:.3f}",
+                        "-" if incremental is None else f"{incremental.phase.metrics.p95_s * 1000:.3f}",
+                        "-" if plain is None else f"{plain.phase.metrics.mean_s * 1000:.3f}",
+                        "-" if plain is None else f"{plain.phase.metrics.p95_s * 1000:.3f}",
+                        _format_percentage_ratio(operation.speedup()),
+                        "-" if incremental is None else _format_markers(incremental.phase.markers),
+                    ],
+                )
+                + " |"
+            )
+        lines.extend(["", f"Interpretation: {scenario.interpretation()}", ""])
+    return "\n".join(lines).rstrip()
+
+
 def _format_ratio(value: float | None) -> str:
     if value is None:
         return "-"
     return f"{value:.2f}x"
+
+
+def _format_percentage_ratio(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value * 100:.0f}%"
 
 
 def _format_markers(markers: Mapping[str, int]) -> str:
@@ -2010,6 +2626,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the default mode for all selected scenarios.",
     )
     parser.add_argument(
+        "--implementation",
+        choices=["incremental", "plain", "compare"],
+        default="incremental",
+        help="Choose the incremental engine, the plain baseline, or a workload comparison report.",
+    )
+    parser.add_argument(
         "--format",
         choices=["table", "json", "markdown"],
         default="table",
@@ -2051,6 +2673,10 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         key = ALIASES.get(args.bench, args.bench)
         if key not in SCENARIO_INDEX:
             parser.error(f"--bench must be one of: all, {', '.join(sorted(SCENARIO_INDEX | ALIASES))}")
+    if args.implementation != "incremental":
+        selected_specs = _selected_scenario_specs(args.suite, args.bench)
+        if any(spec.suite != "workload" for spec in selected_specs):
+            parser.error("--implementation plain/compare is only supported for workload scenarios")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2064,26 +2690,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         rounds=args.rounds,
         payload_size=args.payload_size,
     )
-    report = run_benchmarks(
-        config=config,
-        suite=args.suite,
-        bench=args.bench,
-        mode_override=args.mode,
-    )
-
-    if args.format == "json":
-        stdout_payload = render_json(report)
-    elif args.format == "markdown":
-        stdout_payload = render_markdown(report)
+    if args.implementation == "incremental":
+        incremental_report = run_benchmarks(
+            config=config,
+            suite=args.suite,
+            bench=args.bench,
+            mode_override=args.mode,
+        )
+        if args.format == "json":
+            stdout_payload = render_json(incremental_report)
+        elif args.format == "markdown":
+            stdout_payload = render_markdown(incremental_report)
+        else:
+            stdout_payload = render_table(incremental_report)
+        output_json_payload = render_json(incremental_report)
+        output_markdown_payload = render_markdown(incremental_report)
+    elif args.implementation == "plain":
+        plain_report = run_plain_workload_benchmarks(
+            config=config,
+            suite=args.suite,
+            bench=args.bench,
+        )
+        if args.format == "json":
+            stdout_payload = render_json(plain_report)
+        elif args.format == "markdown":
+            stdout_payload = render_markdown(plain_report)
+        else:
+            stdout_payload = render_table(plain_report)
+        output_json_payload = render_json(plain_report)
+        output_markdown_payload = render_markdown(plain_report)
     else:
-        stdout_payload = render_table(report)
+        compare_report = run_workload_comparison(
+            config=config,
+            suite=args.suite,
+            bench=args.bench,
+            mode_override=args.mode,
+        )
+        if args.format == "json":
+            stdout_payload = render_compare_json(compare_report)
+        elif args.format == "markdown":
+            stdout_payload = render_compare_markdown(compare_report)
+        else:
+            stdout_payload = render_compare_table(compare_report)
+        output_json_payload = render_compare_json(compare_report)
+        output_markdown_payload = render_compare_markdown(compare_report)
     print(stdout_payload)
 
     output_json = args.output_json or args.output
     if output_json is not None:
-        _write_text(output_json, render_json(report))
+        _write_text(output_json, output_json_payload)
     if args.output_markdown is not None:
-        _write_text(args.output_markdown, render_markdown(report))
+        _write_text(args.output_markdown, output_markdown_payload)
     return 0
 
 

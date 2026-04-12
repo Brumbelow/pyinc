@@ -7,6 +7,7 @@ The harness is intentionally stdlib-only and focuses on internal baselines:
 - incremental work on one long-lived `Database`
 - fresh recomputation on a new `Database` with the same edits
 - semantic markers such as reuse, execution, and backdating
+- workload comparison against a plain stdlib baseline with no incremental engine
 
 ## CLI
 
@@ -20,6 +21,7 @@ Common flags:
 
 - `--suite {micro,workload,all}`: choose the benchmark family
 - `--bench NAME`: run one scenario or `all`
+- `--implementation {incremental,plain,compare}`: choose the incremental engine, the plain workload baseline, or the workload comparison report
 - `--format {table,json,markdown}`: choose stdout format; default is `table`
 - `--output-json PATH`: write a JSON artifact
 - `--output-markdown PATH`: write a Markdown artifact
@@ -50,6 +52,8 @@ Workload scenarios:
 
 Legacy aliases still work for the original scenarios: `diamond`, `rewiring`, `files`, `large`, and `backdating`.
 
+`--implementation plain` and `--implementation compare` are workload-only. They currently support `source_analysis`.
+
 ## Output
 
 Default terminal output is a compact table with:
@@ -61,7 +65,14 @@ Default terminal output is a compact table with:
 - `vs_fresh` speedup when a fresh baseline exists
 - compact semantic markers
 
-Markdown output adds grouped scenario sections plus a short interpretation line for each scenario. JSON output is the machine-readable schema with environment metadata, parameters, phases, comparisons, and invariant summaries.
+Compare mode renders workload tables with:
+
+- incremental mean/p95
+- plain mean/p95
+- `speedup_pct`, where `100%` means parity and values above `100%` mean the incremental engine is faster than the plain baseline
+- incremental semantic markers
+
+Markdown output adds grouped scenario sections plus a short interpretation line for each scenario. JSON output is the machine-readable schema with environment metadata, parameters, phases or operations, comparisons, and invariant summaries.
 
 ## Recommended Commands
 
@@ -99,4 +110,16 @@ Workload-only report:
 PYTHONPATH=src python benchmarks/run_microbench.py \
   --suite workload \
   --format markdown
+```
+
+Workload comparison report:
+
+```bash
+PYTHONPATH=src python benchmarks/run_microbench.py \
+  --suite workload \
+  --bench source_analysis \
+  --implementation compare \
+  --format markdown \
+  --output-json /tmp/pyfoundinc-workload-compare.json \
+  --output-markdown /tmp/pyfoundinc-workload-compare.md
 ```

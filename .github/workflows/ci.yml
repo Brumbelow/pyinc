@@ -48,3 +48,14 @@ jobs:
             --format table \
             --output-json /tmp/microbench-workload.json \
             --output-markdown /tmp/microbench-workload.md
+          PYTHONPATH=src python benchmarks/run_microbench.py \
+            --suite workload \
+            --bench source_analysis \
+            --implementation compare \
+            --samples 1 \
+            --warmup 0 \
+            --rounds 1 \
+            --payload-size 8 \
+            --format table \
+            --output-json /tmp/microbench-compare.json \
+            --output-markdown /tmp/microbench-compare.md
