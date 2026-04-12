@@ -14,6 +14,13 @@ Current scope:
 - optional bounded query memoization via `Database(max_query_nodes=...)`
 - `Database.inspect(...)` for structured provenance and `Database.explain(...)` for human-readable formatting
 
+First supported integration:
+
+- `pyfoundinc.integrations.python_source` formalizes the mini-analyzer example as a supported reference integration.
+- `file_analysis(db, path)` and `directory_analysis(db, root)` return stable dataclass views over low-level query nodes such as `source_text`, `imports_for_file`, and `file_analysis_payload`.
+- The integration is intentionally narrow: non-recursive directory analysis, top-level imports and definitions only, and syntax diagnostics only.
+- Import resolution, LSP wiring, watchers, and recursive workspace graphs remain out of scope.
+
 The core contract is intentionally narrow: values crossing cached boundaries must be snapshot-safe, and hidden reads are treated as correctness violations rather than “best effort” cache misses.
 
 Queries may capture immutable constants plus explicit `Input`, `@query`, and resource handles. Mutable global/nonlocal ambient state is rejected so stale reuse does not silently depend on untracked Python objects.
