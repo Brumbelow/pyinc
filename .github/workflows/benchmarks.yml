@@ -44,7 +44,7 @@ jobs:
             --warmup 5 \
             --rounds 3 \
             --payload-size 512 \
-            --format compare \
+            --format markdown \
             --output-json /tmp/pyfoundinc-workload-compare.json \
             --output-markdown /tmp/pyfoundinc-workload-compare.md
 
