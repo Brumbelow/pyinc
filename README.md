@@ -2,6 +2,8 @@
 
 `pyfoundinc` is a correctness-first incremental computation engine for Python: a Python-native query kernel in the design space of Salsa, Jane Street Incremental, and Bazel/Skyframe.
 
+The package remains alpha. The v1 kernel contract is stable within the documented soundness envelope.
+
 Current scope:
 
 - `@query` for derived values
@@ -14,13 +16,16 @@ Current scope:
 - optional bounded query memoization via `Database(max_query_nodes=...)`
 - `Database.inspect(...)` for structured provenance and `Database.explain(...)` for human-readable formatting
 
-First supported integration:
+Supported reference integration:
 
 - `pyfoundinc.integrations.python_source` formalizes the mini-analyzer example as a supported reference integration.
-- `file_analysis(db, path)` and `directory_analysis(db, root)` return stable dataclass views over low-level query nodes such as `source_text`, `imports_for_file`, and `file_analysis_payload`.
+- `file_analysis(db, path)` and `directory_analysis(db, root)` return stable dataclass views backed by internal query nodes.
 - `module_analysis(db, root, path)` and `workspace_analysis(db, root)` add a recursive, workspace-local module graph over the same kernel.
 - The integration is still intentionally narrow: workspace-local module discovery, top-level imports and definitions only, syntax diagnostics only, and dependency invalidation based on resolved module export surfaces.
+- `pyfoundinc.integrations` re-exports only the stable dataclass/result surface and the four high-level analysis entrypoints. Low-level query helpers such as `source_text` and the `*_payload` nodes remain module-local experimental helpers in `pyfoundinc.integrations.python_source`.
 - Full `sys.path` / installed-package resolution, symbol/type resolution, LSP wiring, and watchers remain out of scope.
+
+The integration boundary is summarized in [docs/integration-contract.md](docs/integration-contract.md).
 
 The core contract is intentionally narrow: values crossing cached boundaries must be snapshot-safe, and hidden reads are treated as correctness violations rather than “best effort” cache misses.
 
@@ -44,7 +49,6 @@ python -m pip install -e '.[dev]'
 pytest -q
 python -m mypy src tests
 python -m ruff check src tests
-PYTHONPATH=src python benchmarks/run_microbench.py --samples 2 --warmup 0 --rounds 1 --payload-size 8
 ```
 
-The runtime contract is summarized in [docs/kernel-contract.md](docs/kernel-contract.md).
+The runtime contract is summarized in [docs/kernel-contract.md](docs/kernel-contract.md). Integration API boundaries are summarized in [docs/integration-contract.md](docs/integration-contract.md).

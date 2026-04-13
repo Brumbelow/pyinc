@@ -242,8 +242,20 @@ def _resolve_workspace_module(
     module: str,
     index_groups: dict[str, tuple[str, ...]],
 ) -> tuple[str | None, str | None, ImportResolution | None]:
+    ancestor_blocked = False
+    parts = module.split(".")
+    for index in range(1, len(parts)):
+        prefix = ".".join(parts[:index])
+        prefix_paths = index_groups.get(prefix, ())
+        if len(prefix_paths) > 1:
+            return None, None, "ambiguous"
+        if len(prefix_paths) == 1 and not _is_package_path(prefix_paths[0]):
+            ancestor_blocked = True
+
     paths = index_groups.get(module, ())
     if len(paths) == 1:
+        if ancestor_blocked:
+            return None, None, "ambiguous"
         return module, paths[0], "workspace"
     if len(paths) > 1:
         return None, None, "ambiguous"
@@ -602,21 +614,8 @@ __all__ = [
     "PythonModuleAnalysis",
     "PythonWorkspaceAnalysis",
     "ResolvedImportRef",
-    "definitions_for_file",
     "directory_analysis",
-    "directory_analysis_payload",
     "file_analysis",
-    "file_analysis_payload",
-    "import_statements_for_file",
-    "imports_for_file",
     "module_analysis",
-    "module_analysis_payload",
-    "module_export_surface",
-    "resolved_imports_for_file",
-    "source_text",
-    "syntax_diagnostics_for_file",
     "workspace_analysis",
-    "workspace_analysis_payload",
-    "workspace_module_index",
-    "workspace_python_files",
 ]

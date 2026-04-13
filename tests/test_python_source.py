@@ -5,6 +5,7 @@ from typing import Literal
 
 import pytest
 
+import pyfoundinc.integrations as integrations
 from pyfoundinc import Database
 from pyfoundinc.integrations.python_source import (
     DefinitionRef,
@@ -25,6 +26,18 @@ from pyfoundinc.integrations.python_source import (
 )
 
 Operation = tuple[Literal["write", "delete"], str, str | None]
+
+
+def test_package_namespace_exports_only_stable_python_source_api() -> None:
+    assert hasattr(integrations, "file_analysis")
+    assert hasattr(integrations, "directory_analysis")
+    assert hasattr(integrations, "module_analysis")
+    assert hasattr(integrations, "workspace_analysis")
+    assert hasattr(integrations, "PythonFileAnalysis")
+    assert not hasattr(integrations, "source_text")
+    assert not hasattr(integrations, "imports_for_file")
+    assert not hasattr(integrations, "file_analysis_payload")
+    assert not hasattr(integrations, "workspace_analysis_payload")
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -253,6 +266,38 @@ def test_module_analysis_resolves_relative_imports(tmp_path: Path) -> None:
     )
 
 
+def test_module_analysis_prefers_workspace_submodule_for_package_imports(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    helper = pkg / "helper.py"
+    consumer = root / "consumer.py"
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    helper.write_text("def util() -> int:\n    return 1\n", encoding="utf-8")
+    consumer.write_text("from pkg import helper\n", encoding="utf-8")
+
+    analysis = module_analysis(Database(mode="strict"), root, consumer)
+
+    assert analysis.resolved_imports == (
+        integrations.ResolvedImportRef(
+            module="pkg",
+            kind="from",
+            lineno=1,
+            imported_name="helper",
+            resolved_module="pkg.helper",
+            resolved_path=str(helper),
+            resolution="workspace",
+        ),
+    )
+    assert analysis.dependencies == (
+        DependencySurface(
+            module="pkg.helper",
+            path=str(helper),
+            exports=("util",),
+        ),
+    )
+
+
 def test_module_analysis_rejects_non_workspace_paths(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
@@ -262,6 +307,24 @@ def test_module_analysis_rejects_non_workspace_paths(tmp_path: Path) -> None:
     db = Database(mode="strict")
     with pytest.raises(ValueError):
         module_analysis(db, root, outside)
+
+
+def test_module_analysis_marks_file_package_conflicts_as_ambiguous(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (root / "pkg.py").write_text("value = 1\n", encoding="utf-8")
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    submodule = pkg / "sub.py"
+    submodule.write_text("def thing() -> int:\n    return 1\n", encoding="utf-8")
+    consumer = root / "consumer.py"
+    consumer.write_text("import pkg.sub\nfrom pkg.sub import thing\n", encoding="utf-8")
+
+    analysis = module_analysis(Database(mode="strict"), root, consumer)
+
+    assert tuple(item.resolution for item in analysis.resolved_imports) == ("ambiguous", "ambiguous")
+    assert tuple(item.resolved_module for item in analysis.resolved_imports) == (None, None)
+    assert analysis.dependencies == ()
 
 
 def test_workspace_analysis_reuses_dependents_when_provider_internal_edit_preserves_exports(
@@ -307,6 +370,84 @@ def test_workspace_analysis_executes_dependents_when_provider_exports_change(tmp
 
     assert second != first
     assert db.inspect(module_analysis_payload, str(root), str(provider)).last_recompute == "executed"
+    assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute == "executed"
+    assert db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+
+
+def test_workspace_analysis_reexecutes_consumer_when_missing_module_is_added(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    consumer = root / "consumer.py"
+    consumer.write_text("from pkg import helper\n", encoding="utf-8")
+    helper = pkg / "helper.py"
+    db = Database(mode="strict")
+
+    initial = workspace_analysis(db, root)
+    initial_consumer = next(item for item in initial.modules if item.module == "consumer")
+    assert initial_consumer.resolved_imports[0].resolution == "workspace"
+    assert initial_consumer.resolved_imports[0].resolved_module == "pkg"
+    assert initial_consumer.dependencies == (
+        DependencySurface(
+            module="pkg",
+            path=str(pkg / "__init__.py"),
+            exports=(),
+        ),
+    )
+
+    helper.write_text("def util() -> int:\n    return 1\n", encoding="utf-8")
+    updated = workspace_analysis(db, root)
+
+    consumer_view = next(item for item in updated.modules if item.module == "consumer")
+    assert consumer_view.resolved_imports[0].resolution == "workspace"
+    assert consumer_view.resolved_imports[0].resolved_module == "pkg.helper"
+    assert consumer_view.dependencies == (
+        DependencySurface(
+            module="pkg.helper",
+            path=str(helper),
+            exports=("util",),
+        ),
+    )
+    assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute == "executed"
+    assert db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+
+
+def test_workspace_analysis_reexecutes_consumer_when_dependency_module_is_deleted(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    helper = pkg / "helper.py"
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    helper.write_text("def util() -> int:\n    return 1\n", encoding="utf-8")
+    consumer = root / "consumer.py"
+    consumer.write_text("from pkg import helper\n", encoding="utf-8")
+    db = Database(mode="strict")
+
+    initial = workspace_analysis(db, root)
+    consumer_view = next(item for item in initial.modules if item.module == "consumer")
+    assert consumer_view.resolved_imports[0].resolution == "workspace"
+    assert consumer_view.dependencies == (
+        DependencySurface(
+            module="pkg.helper",
+            path=str(helper),
+            exports=("util",),
+        ),
+    )
+
+    helper.unlink()
+    updated = workspace_analysis(db, root)
+
+    updated_consumer = next(item for item in updated.modules if item.module == "consumer")
+    assert updated_consumer.resolved_imports[0].resolution == "workspace"
+    assert updated_consumer.resolved_imports[0].resolved_module == "pkg"
+    assert updated_consumer.dependencies == (
+        DependencySurface(
+            module="pkg",
+            path=str(pkg / "__init__.py"),
+            exports=(),
+        ),
+    )
     assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute == "executed"
     assert db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
 
