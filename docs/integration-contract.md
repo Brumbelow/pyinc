@@ -41,6 +41,7 @@ Those names remain importable from the module itself, but they are experimental:
 The reference integration is intentionally narrow:
 
 - workspace-local module discovery rooted at the supplied directory
+- traversal is cycle-safe and constrained to real paths under the supplied root
 - top-level imports and top-level definitions only
 - syntax diagnostics only
 - dependency invalidation based on resolved module export surfaces

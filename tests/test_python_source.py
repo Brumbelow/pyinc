@@ -28,7 +28,28 @@ from pyfoundinc.integrations.python_source import (
 Operation = tuple[Literal["write", "delete"], str, str | None]
 
 
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except (AttributeError, NotImplementedError, OSError):
+        pytest.skip("symlink support is unavailable in this environment")
+
+
 def test_package_namespace_exports_only_stable_python_source_api() -> None:
+    assert set(integrations.__all__) == {
+        "DependencySurface",
+        "DefinitionRef",
+        "Diagnostic",
+        "ImportRef",
+        "PythonFileAnalysis",
+        "PythonModuleAnalysis",
+        "PythonWorkspaceAnalysis",
+        "ResolvedImportRef",
+        "directory_analysis",
+        "file_analysis",
+        "module_analysis",
+        "workspace_analysis",
+    }
     assert hasattr(integrations, "file_analysis")
     assert hasattr(integrations, "directory_analysis")
     assert hasattr(integrations, "module_analysis")
@@ -204,6 +225,51 @@ def test_workspace_analysis_discovers_recursive_modules_and_derives_names(tmp_pa
         ),
     )
     assert tuple(item.module for item in analysis.modules) == ("main", "pkg", "pkg.nested.util")
+
+
+def test_workspace_analysis_ignores_symlink_cycles_and_outside_workspace(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    root.mkdir()
+    pkg.mkdir()
+    (root / "main.py").write_text("import pkg\n", encoding="utf-8")
+    (pkg / "__init__.py").write_text("from .helper import util\n", encoding="utf-8")
+    (pkg / "helper.py").write_text("def util() -> int:\n    return 1\n", encoding="utf-8")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "external.py").write_text("value = 1\n", encoding="utf-8")
+
+    _symlink_or_skip(root / "external_link", outside)
+    _symlink_or_skip(pkg / "loop", root)
+
+    analysis = workspace_analysis(Database(mode="strict"), root)
+
+    assert tuple(item.module for item in analysis.modules) == ("main", "pkg", "pkg.helper")
+    assert all("external_link" not in item.path for item in analysis.modules)
+    assert all(".loop." not in item.module for item in analysis.modules)
+
+
+def test_workspace_analysis_reuses_when_only_outside_symlink_target_changes(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "main.py").write_text("value = 1\n", encoding="utf-8")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "external.py"
+    outside_file.write_text("value = 1\n", encoding="utf-8")
+
+    _symlink_or_skip(root / "external_link", outside)
+
+    db = Database(mode="strict")
+    first = workspace_analysis(db, root)
+
+    outside_file.write_text("value = 2\n", encoding="utf-8")
+    second = workspace_analysis(db, root)
+
+    assert second == first
+    assert db.inspect(workspace_analysis_payload, str(root)).last_decision == "reused"
 
 
 def test_module_analysis_resolves_absolute_and_external_imports(tmp_path: Path) -> None:

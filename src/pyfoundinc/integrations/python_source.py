@@ -147,6 +147,18 @@ def _normalize_path(path: str | os.PathLike[str]) -> str:
     return os.fspath(path)
 
 
+def _canonical_path(path: str) -> str:
+    return str(Path(path).resolve(strict=False))
+
+
+def _is_within_root(path: str, root: str) -> bool:
+    try:
+        Path(path).relative_to(Path(root))
+    except ValueError:
+        return False
+    return True
+
+
 def _relative_import_module(module: str | None, level: int) -> str:
     prefix = "." * level
     return f"{prefix}{module or ''}"
@@ -301,18 +313,39 @@ def _resolve_import_reference(
     )
 
 
-def _collect_python_files(db: Database, directory: str, entries: tuple[str, ...]) -> tuple[str, ...]:
+def _collect_python_files(
+    db: Database,
+    directory: str,
+    entries: tuple[str, ...],
+    *,
+    canonical_root: str,
+    visited_directories: set[str],
+) -> tuple[str, ...]:
     python_files: list[str] = []
     base = Path(directory)
     for name in entries:
         child = str(base / name)
+        canonical_child = _canonical_path(child)
+        if not _is_within_root(canonical_child, canonical_root):
+            continue
         try:
             child_entries = _DIRECTORIES.read(db, child)
         except NotADirectoryError:
             if name.endswith(".py"):
                 python_files.append(child)
             continue
-        python_files.extend(_collect_python_files(db, child, child_entries))
+        if canonical_child in visited_directories:
+            continue
+        visited_directories.add(canonical_child)
+        python_files.extend(
+            _collect_python_files(
+                db,
+                child,
+                child_entries,
+                canonical_root=canonical_root,
+                visited_directories=visited_directories,
+            )
+        )
     return tuple(python_files)
 
 
@@ -397,7 +430,15 @@ def workspace_python_files(db: Database, root: str) -> tuple[str, ...]:
         entries = _DIRECTORIES.read(db, root)
     except NotADirectoryError:
         return tuple()
-    return _collect_python_files(db, root, entries)
+    canonical_root = _canonical_path(root)
+    files = _collect_python_files(
+        db,
+        root,
+        entries,
+        canonical_root=canonical_root,
+        visited_directories={canonical_root},
+    )
+    return tuple(sorted(files))
 
 
 @query
