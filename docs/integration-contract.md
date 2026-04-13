@@ -42,13 +42,19 @@ The reference integration is intentionally narrow:
 
 - workspace-local module discovery rooted at the supplied directory
 - traversal is cycle-safe and constrained to real paths under the supplied root
-- top-level imports and top-level definitions only
+- top-level imports, top-level definitions, and simple top-level assignments for export-surface tracking
 - syntax diagnostics only
-- dependency invalidation based on resolved module export surfaces
+- dependency invalidation based on resolved module export surfaces, including conservative static support for `from x import *`
 - conservative import resolution with `workspace`, `external`, `missing`, and `ambiguous` outcomes
 
 When a resolution case is unsupported or structurally ambiguous, the integration must prefer
 `missing`/`ambiguous` or re-execution over optimistic dependency reuse.
+
+Wildcard export handling is intentionally static:
+
+- literal top-level `__all__ = [...]` / `(...)` / `{...}` assignments of string constants are honored
+- otherwise wildcard exports fall back to statically known top-level bound names that do not start with `_`
+- dynamic `__all__`, provider-side wildcard re-exports, and other unsupported top-level export shapes are treated conservatively via re-execution instead of optimistic reuse
 
 ## Out Of Scope
 

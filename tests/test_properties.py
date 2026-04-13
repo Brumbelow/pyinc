@@ -92,7 +92,9 @@ def file_contents() -> st.SearchStrategy[list[str]]:
 
 def workspace_states() -> st.SearchStrategy[list[WorkspaceState]]:
     provider_variant = st.sampled_from(["internal_a", "internal_b", "export_a", "export_b"])
-    consumer_variant = st.sampled_from(["provider_only", "provider_and_helper", "external_only"])
+    consumer_variant = st.sampled_from(
+        ["provider_only", "provider_and_helper", "provider_star", "external_only"]
+    )
     helper_present = st.booleans()
     return st.lists(
         st.tuples(provider_variant, consumer_variant, helper_present),
@@ -116,6 +118,8 @@ def _consumer_source(variant: str) -> str:
         return "from provider import exported\n"
     if variant == "provider_and_helper":
         return "from provider import exported\nfrom pkg import helper\n"
+    if variant == "provider_star":
+        return "from provider import *\n"
     return "import os\n"
 
 

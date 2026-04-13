@@ -21,8 +21,9 @@ Supported reference integration:
 - `pyfoundinc.integrations.python_source` formalizes the mini-analyzer example as a supported reference integration.
 - `file_analysis(db, path)` and `directory_analysis(db, root)` return stable dataclass views backed by internal query nodes.
 - `module_analysis(db, root, path)` and `workspace_analysis(db, root)` add a recursive, workspace-local module graph over the same kernel.
-- The integration is still intentionally narrow: workspace-local module discovery, top-level imports and definitions only, syntax diagnostics only, and dependency invalidation based on resolved module export surfaces.
+- The integration is still intentionally narrow: workspace-local module discovery, top-level imports/definitions plus simple top-level assignment tracking for export surfaces, syntax diagnostics only, and dependency invalidation based on resolved module export surfaces.
 - Workspace traversal is cycle-safe and constrained to real paths under the supplied root.
+- `from x import *` is supported conservatively: literal top-level `__all__` is honored when statically recoverable, otherwise wildcard exports fall back to non-underscore top-level bound names, and dynamic export cases re-execute conservatively instead of reusing optimistically.
 - `pyfoundinc.integrations` re-exports only the stable dataclass/result surface and the four high-level analysis entrypoints. Low-level query helpers such as `source_text` and the `*_payload` nodes remain module-local experimental helpers in `pyfoundinc.integrations.python_source`.
 - Full `sys.path` / installed-package resolution, symbol/type resolution, LSP wiring, and watchers remain out of scope.
 

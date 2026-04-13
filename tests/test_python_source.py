@@ -20,6 +20,7 @@ from pyfoundinc.integrations.python_source import (
     module_analysis,
     module_analysis_payload,
     module_export_surface,
+    module_wildcard_export_surface,
     source_text,
     workspace_analysis,
     workspace_analysis_payload,
@@ -332,6 +333,96 @@ def test_module_analysis_resolves_relative_imports(tmp_path: Path) -> None:
     )
 
 
+def test_module_analysis_dependency_surface_tracks_reexport_aliases_and_assignments(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    root.mkdir()
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "sub.py").write_text("value = 1\n", encoding="utf-8")
+
+    (root / "impl.py").write_text("def exported() -> int:\n    return 1\n", encoding="utf-8")
+    provider = root / "provider.py"
+    consumer = root / "consumer.py"
+    provider.write_text(
+        "from impl import exported as alias\n"
+        "import pkg.sub as submod\n"
+        "value = 1\n",
+        encoding="utf-8",
+    )
+    consumer.write_text("from provider import alias\n", encoding="utf-8")
+
+    analysis = module_analysis(Database(mode="strict"), root, consumer)
+
+    assert analysis.dependencies == (
+        DependencySurface(
+            module="provider",
+            path=str(provider),
+            exports=("alias", "submod", "value"),
+        ),
+    )
+
+
+def test_module_analysis_wildcard_dependency_uses_static_all(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "provider.py"
+    consumer = root / "consumer.py"
+    provider.write_text(
+        "shown = 1\n"
+        "_hidden = 2\n"
+        "__all__ = ['shown']\n",
+        encoding="utf-8",
+    )
+    consumer.write_text("from provider import *\n", encoding="utf-8")
+
+    analysis = module_analysis(Database(mode="strict"), root, consumer)
+
+    assert analysis.resolved_imports == (
+        integrations.ResolvedImportRef(
+            module="provider",
+            kind="from",
+            lineno=1,
+            imported_name="*",
+            resolved_module="provider",
+            resolved_path=str(provider),
+            resolution="workspace",
+        ),
+    )
+    assert analysis.dependencies == (
+        DependencySurface(
+            module="provider",
+            path=str(provider),
+            exports=("shown",),
+        ),
+    )
+
+
+def test_module_analysis_wildcard_dependency_excludes_underscore_names_without_static_all(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "provider.py"
+    consumer = root / "consumer.py"
+    provider.write_text(
+        "shown = 1\n"
+        "_hidden = 2\n",
+        encoding="utf-8",
+    )
+    consumer.write_text("from provider import *\n", encoding="utf-8")
+
+    analysis = module_analysis(Database(mode="strict"), root, consumer)
+
+    assert analysis.dependencies == (
+        DependencySurface(
+            module="provider",
+            path=str(provider),
+            exports=("shown",),
+        ),
+    )
+
+
 def test_module_analysis_prefers_workspace_submodule_for_package_imports(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     pkg = root / "pkg"
@@ -416,6 +507,26 @@ def test_workspace_analysis_reuses_dependents_when_provider_internal_edit_preser
     assert db.inspect(workspace_analysis_payload, str(root)).last_decision == "reused"
 
 
+def test_workspace_analysis_reuses_wildcard_consumer_when_exports_do_not_change(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "provider.py"
+    consumer = root / "consumer.py"
+    provider.write_text("shown = 1\n_hidden = 2\n", encoding="utf-8")
+    consumer.write_text("from provider import *\n", encoding="utf-8")
+    db = Database(mode="strict")
+
+    first = workspace_analysis(db, root)
+
+    provider.write_text("shown = 10\n_hidden = 20\n", encoding="utf-8")
+    second = workspace_analysis(db, root)
+
+    assert second == first
+    assert db.inspect(module_wildcard_export_surface, str(root), str(provider)).last_decision == "reused"
+    assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_decision == "reused"
+    assert db.inspect(workspace_analysis_payload, str(root)).last_decision == "reused"
+
+
 def test_workspace_analysis_executes_dependents_when_provider_exports_change(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
@@ -438,6 +549,75 @@ def test_workspace_analysis_executes_dependents_when_provider_exports_change(tmp
     assert db.inspect(module_analysis_payload, str(root), str(provider)).last_recompute == "executed"
     assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute == "executed"
     assert db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+
+
+def test_workspace_analysis_executes_wildcard_consumer_when_wildcard_exports_change(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "provider.py"
+    consumer = root / "consumer.py"
+    provider.write_text("shown = 1\n", encoding="utf-8")
+    consumer.write_text("from provider import *\n", encoding="utf-8")
+    db = Database(mode="strict")
+
+    first = workspace_analysis(db, root)
+
+    provider.write_text("shown = 1\nextra = 2\n", encoding="utf-8")
+    second = workspace_analysis(db, root)
+
+    assert second != first
+    assert db.inspect(module_wildcard_export_surface, str(root), str(provider)).last_recompute == "executed"
+    assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute == "executed"
+    assert db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+
+
+def test_dynamic_all_marks_wildcard_consumers_untracked(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "provider.py"
+    consumer = root / "consumer.py"
+    provider.write_text(
+        "shown = 1\n"
+        "extra = 2\n"
+        "__all__ = ['shown']\n"
+        "__all__ += ['extra']\n",
+        encoding="utf-8",
+    )
+    consumer.write_text("from provider import *\n", encoding="utf-8")
+    db = Database(mode="strict")
+
+    first = workspace_analysis(db, root)
+    second = workspace_analysis(db, root)
+
+    assert second == first
+    wildcard_surface = db.inspect(module_wildcard_export_surface, str(root), str(provider))
+    consumer_view = db.inspect(module_analysis_payload, str(root), str(consumer))
+    assert wildcard_surface.is_untracked
+    assert consumer_view.is_untracked
+    assert wildcard_surface.last_recompute == "executed"
+    assert consumer_view.last_recompute == "executed"
+
+
+def test_provider_wildcard_reexport_marks_wildcard_consumers_untracked(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "impl.py").write_text("shown = 1\n", encoding="utf-8")
+    provider = root / "provider.py"
+    consumer = root / "consumer.py"
+    provider.write_text("from impl import *\n", encoding="utf-8")
+    consumer.write_text("from provider import *\n", encoding="utf-8")
+    db = Database(mode="strict")
+
+    first = workspace_analysis(db, root)
+    second = workspace_analysis(db, root)
+
+    assert second == first
+    wildcard_surface = db.inspect(module_wildcard_export_surface, str(root), str(provider))
+    consumer_view = db.inspect(module_analysis_payload, str(root), str(consumer))
+    assert wildcard_surface.is_untracked
+    assert consumer_view.is_untracked
+    assert wildcard_surface.last_recompute == "executed"
+    assert consumer_view.last_recompute == "executed"
 
 
 def test_workspace_analysis_reexecutes_consumer_when_missing_module_is_added(tmp_path: Path) -> None:

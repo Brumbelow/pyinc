@@ -16,6 +16,11 @@ ImportKind: TypeAlias = Literal["import", "from"]
 DefinitionKind: TypeAlias = Literal["function", "class"]
 ImportResolution: TypeAlias = Literal["workspace", "external", "missing", "ambiguous"]
 
+ModuleBindingAnalysisPayload: TypeAlias = tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]
 ImportPayload: TypeAlias = tuple[str, ImportKind, int]
 DefinitionPayload: TypeAlias = tuple[str, DefinitionKind, int]
 DiagnosticPayload: TypeAlias = tuple[str, str, int | None, int | None]
@@ -176,6 +181,134 @@ def _try_parse(source: str) -> ast.Module | None:
         return ast.parse(source)
     except SyntaxError:
         return None
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    if value not in items:
+        items.append(value)
+
+
+def _bound_name_for_import(alias: ast.alias) -> str:
+    if alias.asname is not None:
+        return alias.asname
+    return alias.name.split(".", 1)[0]
+
+
+def _bound_name_for_from_import(alias: ast.alias) -> str:
+    return alias.asname or alias.name
+
+
+def _target_bound_names(target: ast.expr) -> tuple[str, ...]:
+    if isinstance(target, ast.Name):
+        return (target.id,)
+    if isinstance(target, ast.Starred):
+        return _target_bound_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        names: list[str] = []
+        for item in target.elts:
+            names.extend(_target_bound_names(item))
+        return tuple(names)
+    return tuple()
+
+
+def _literal_string_collection(value: ast.expr | None) -> tuple[str, ...] | None:
+    if value is None or not isinstance(value, (ast.List, ast.Set, ast.Tuple)):
+        return None
+
+    items: list[str] = []
+    for item in value.elts:
+        if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+            return None
+        items.append(item.value)
+    return tuple(sorted(set(items)))
+
+
+def _contains_name(node: ast.AST, name: str) -> bool:
+    return any(isinstance(item, ast.Name) and item.id == name for item in ast.walk(node))
+
+
+def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
+    bound_names: set[str] = set()
+    static_all_names: tuple[str, ...] | None = None
+    impurity_reasons: list[str] = []
+
+    for node in tree.body:
+        if isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef)):
+            bound_names.add(node.name)
+            continue
+
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound_names.add(_bound_name_for_import(alias))
+            continue
+
+        if isinstance(node, ast.ImportFrom):
+            if any(alias.name == "*" for alias in node.names):
+                _append_unique(impurity_reasons, "top-level wildcard re-export")
+                continue
+            for alias in node.names:
+                bound_names.add(_bound_name_for_from_import(alias))
+            continue
+
+        if isinstance(node, ast.Assign):
+            target_names = {name for target in node.targets for name in _target_bound_names(target)}
+            bound_names.update(target_names)
+            if "__all__" in target_names:
+                literal_names = _literal_string_collection(node.value)
+                if literal_names is None:
+                    static_all_names = None
+                    _append_unique(impurity_reasons, "dynamic __all__")
+                elif "dynamic __all__" not in impurity_reasons:
+                    static_all_names = literal_names
+            continue
+
+        if isinstance(node, ast.AnnAssign):
+            target_names = set(_target_bound_names(node.target))
+            if node.value is not None:
+                bound_names.update(target_names)
+            if "__all__" in target_names:
+                literal_names = _literal_string_collection(node.value)
+                if literal_names is None:
+                    static_all_names = None
+                    _append_unique(impurity_reasons, "dynamic __all__")
+                elif "dynamic __all__" not in impurity_reasons:
+                    static_all_names = literal_names
+            continue
+
+        if isinstance(node, ast.AugAssign):
+            if "__all__" in _target_bound_names(node.target) or _contains_name(node.value, "__all__"):
+                static_all_names = None
+                _append_unique(impurity_reasons, "dynamic __all__")
+            continue
+
+        if isinstance(node, ast.Delete):
+            deleted_names = {name for target in node.targets for name in _target_bound_names(target)}
+            bound_names.difference_update(deleted_names)
+            if "__all__" in deleted_names:
+                static_all_names = None
+                _append_unique(impurity_reasons, "dynamic __all__")
+            continue
+
+        if isinstance(node, ast.Expr):
+            if _contains_name(node.value, "__all__"):
+                static_all_names = None
+                _append_unique(impurity_reasons, "dynamic __all__")
+            continue
+
+        if isinstance(node, ast.Pass):
+            continue
+
+        if _contains_name(node, "__all__"):
+            static_all_names = None
+            _append_unique(impurity_reasons, "dynamic __all__")
+        _append_unique(impurity_reasons, f"unsupported top-level {type(node).__name__}")
+
+    explicit_exports = tuple(sorted(bound_names))
+    if static_all_names is not None:
+        wildcard_exports = static_all_names
+    else:
+        wildcard_exports = tuple(name for name in explicit_exports if not name.startswith("_"))
+    return explicit_exports, wildcard_exports, tuple(impurity_reasons)
 
 
 def _module_name_for_path(root: str, path: str) -> str:
@@ -415,6 +548,14 @@ def syntax_diagnostics_for_file(db: Database, path: str) -> tuple[DiagnosticPayl
 
 
 @query
+def module_binding_analysis_payload(db: Database, path: str) -> ModuleBindingAnalysisPayload:
+    tree = _try_parse(source_text(db, path))
+    if tree is None:
+        return (tuple(), tuple(), tuple())
+    return _module_binding_analysis(tree)
+
+
+@query
 def file_analysis_payload(db: Database, path: str) -> FileAnalysisPayload:
     return (
         path,
@@ -497,7 +638,18 @@ def resolved_imports_for_file(db: Database, root: str, path: str) -> tuple[Resol
 @query
 def module_export_surface(db: Database, root: str, path: str) -> DependencySurfacePayload:
     module = _module_name_for_path(root, path)
-    exports = tuple(sorted(name for name, _, _ in definitions_for_file(db, path)))
+    exports, _, impurity_reasons = module_binding_analysis_payload(db, path)
+    for reason in impurity_reasons:
+        db.report_untracked_read(f"{module} export surface: {reason}")
+    return (module, path, exports)
+
+
+@query
+def module_wildcard_export_surface(db: Database, root: str, path: str) -> DependencySurfacePayload:
+    module = _module_name_for_path(root, path)
+    _, exports, impurity_reasons = module_binding_analysis_payload(db, path)
+    for reason in impurity_reasons:
+        db.report_untracked_read(f"{module} wildcard export surface: {reason}")
     return (module, path, exports)
 
 
@@ -508,12 +660,22 @@ def module_analysis_payload(db: Database, root: str, path: str) -> ModuleAnalysi
         return _empty_module_analysis_payload(root, path)
 
     resolved_imports = resolved_imports_for_file(db, root, path)
-    dependencies: dict[tuple[str, str], DependencySurfacePayload] = {}
-    for _, _, _, _, resolved_module, resolved_path, resolution in resolved_imports:
+    dependencies: dict[tuple[str, str], tuple[DependencySurfacePayload, bool]] = {}
+    for _, kind, _, imported_name, resolved_module, resolved_path, resolution in resolved_imports:
         if resolution != "workspace" or resolved_module is None or resolved_path is None:
             continue
-        surface = module_export_surface(db, root, resolved_path)
-        dependencies[(surface[0], surface[1])] = surface
+        _, _, impurity_reasons = module_binding_analysis_payload(db, resolved_path)
+        for reason in impurity_reasons:
+            db.report_untracked_read(f"{resolved_module} dependency surface: {reason}")
+        use_wildcard_surface = kind == "from" and imported_name == "*"
+        if use_wildcard_surface:
+            surface = module_wildcard_export_surface(db, root, resolved_path)
+        else:
+            surface = module_export_surface(db, root, resolved_path)
+        key = (surface[0], surface[1])
+        existing = dependencies.get(key)
+        if existing is None or use_wildcard_surface:
+            dependencies[key] = (surface, use_wildcard_surface)
 
     return (
         path,
@@ -522,7 +684,7 @@ def module_analysis_payload(db: Database, root: str, path: str) -> ModuleAnalysi
         definitions_for_file(db, path),
         syntax_diagnostics_for_file(db, path),
         resolved_imports,
-        tuple(sorted(dependencies.values(), key=lambda item: (item[0], item[1]))),
+        tuple(sorted((item[0] for item in dependencies.values()), key=lambda item: (item[0], item[1]))),
     )
 
 
