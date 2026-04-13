@@ -12,8 +12,18 @@ from .python_source import (
     module_analysis,
     workspace_analysis,
 )
+from .toml_config import (
+    ConfigAnalysis,
+    ConfigKey,
+    ConfigSection,
+    config_analysis,
+    workspace_config_analysis,
+)
 
 __all__ = [
+    "ConfigAnalysis",
+    "ConfigKey",
+    "ConfigSection",
     "DependencySurface",
     "DefinitionRef",
     "Diagnostic",
@@ -22,8 +32,10 @@ __all__ = [
     "PythonModuleAnalysis",
     "PythonWorkspaceAnalysis",
     "ResolvedImportRef",
+    "config_analysis",
     "directory_analysis",
     "file_analysis",
     "module_analysis",
     "workspace_analysis",
+    "workspace_config_analysis",
 ]

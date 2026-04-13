@@ -22,7 +22,17 @@ For `pyfoundinc.integrations.python_source`, the stable public surface is:
   - `module_analysis(db, root, path)`
   - `workspace_analysis(db, root)`
 
-`pyfoundinc.integrations` re-exports only that stable surface.
+`pyfoundinc.integrations` re-exports only these stable surfaces.
+
+For `pyfoundinc.integrations.toml_config`, the stable public surface is:
+
+- dataclass result types:
+  - `ConfigKey`
+  - `ConfigSection`
+  - `ConfigAnalysis`
+- high-level entrypoints:
+  - `config_analysis(db, path)`
+  - `workspace_config_analysis(db, root)`
 
 ## Experimental Helpers
 
@@ -55,6 +65,19 @@ Wildcard export handling is intentionally static:
 - literal top-level `__all__ = [...]` / `(...)` / `{...}` assignments of string constants are honored
 - otherwise wildcard exports fall back to statically known top-level bound names that do not start with `_`
 - dynamic `__all__`, provider-side wildcard re-exports, and other unsupported top-level export shapes are treated conservatively via re-execution instead of optimistic reuse
+
+## TOML Config Integration Scope
+
+The TOML config integration is intentionally narrow:
+
+- single-file TOML analysis via `config_analysis(db, path)`
+- workspace-root discovery of `pyproject.toml` via `workspace_config_analysis(db, root)`
+- section extraction by walking the TOML table hierarchy
+- dependency extraction from `[project.dependencies]` and `[project.optional-dependencies]`
+- tool config discovery under `[tool.*]`
+- syntax diagnostics for malformed TOML
+- cutoff-based backdating using parsed structure (comment-only edits are backdated)
+- TOML datetime values are converted to ISO strings (no adapter required)
 
 ## Out Of Scope
 

@@ -36,8 +36,9 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
         pytest.skip("symlink support is unavailable in this environment")
 
 
-def test_package_namespace_exports_only_stable_python_source_api() -> None:
+def test_package_namespace_exports_only_stable_api() -> None:
     assert set(integrations.__all__) == {
+        # python_source
         "DependencySurface",
         "DefinitionRef",
         "Diagnostic",
@@ -50,16 +51,29 @@ def test_package_namespace_exports_only_stable_python_source_api() -> None:
         "file_analysis",
         "module_analysis",
         "workspace_analysis",
+        # toml_config
+        "ConfigAnalysis",
+        "ConfigKey",
+        "ConfigSection",
+        "config_analysis",
+        "workspace_config_analysis",
     }
     assert hasattr(integrations, "file_analysis")
     assert hasattr(integrations, "directory_analysis")
     assert hasattr(integrations, "module_analysis")
     assert hasattr(integrations, "workspace_analysis")
     assert hasattr(integrations, "PythonFileAnalysis")
+    assert hasattr(integrations, "config_analysis")
+    assert hasattr(integrations, "workspace_config_analysis")
+    assert hasattr(integrations, "ConfigAnalysis")
+    # Experimental helpers must not leak.
     assert not hasattr(integrations, "source_text")
     assert not hasattr(integrations, "imports_for_file")
     assert not hasattr(integrations, "file_analysis_payload")
     assert not hasattr(integrations, "workspace_analysis_payload")
+    assert not hasattr(integrations, "config_file_text")
+    assert not hasattr(integrations, "config_sections_payload")
+    assert not hasattr(integrations, "config_analysis_payload")
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

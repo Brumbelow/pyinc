@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mmap
 import os
 from pathlib import Path
 from typing import Any, cast
@@ -1091,3 +1092,324 @@ def test_cycle_error_does_not_corrupt_database_for_subsequent_queries() -> None:
     # Input updates must still propagate.
     db.set(number, 7)
     assert db.get(safe) == 14
+
+
+# ---------------------------------------------------------------------------
+# Soundness boundary tests — deeper coverage per kernel-contract.md
+# ---------------------------------------------------------------------------
+
+
+# Limitation 1 — Unintercepted ambient reads
+
+
+def test_os_pipe_and_os_read_bypass_untracked_read_guard() -> None:
+    """os.pipe/os.read/os.write (raw fd I/O) are NOT intercepted by the guard."""
+
+    @query
+    def communicate_via_pipe(db: Database) -> str:
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"hello from pipe")
+            os.close(write_fd)
+            data = os.read(read_fd, 4096)
+        finally:
+            os.close(read_fd)
+        return data.decode("utf-8")
+
+    db = Database()
+    assert db.get(communicate_via_pipe) == "hello from pipe"
+
+
+def test_mmap_bypasses_untracked_read_guard(tmp_path: Path) -> None:
+    """mmap.mmap over an os.open fd is NOT intercepted by the untracked-read guard."""
+    path = tmp_path / "sample.txt"
+    path.write_text("hello from mmap", encoding="utf-8")
+
+    @query
+    def read_via_mmap(db: Database) -> str:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            with mmap.mmap(fd, 0, access=mmap.ACCESS_READ) as mm:
+                return mm[:].decode("utf-8")
+        finally:
+            os.close(fd)
+
+    db = Database()
+    assert db.get(read_via_mmap) == "hello from mmap"
+
+
+# Limitation 2 — Custom eq/cutoff with side effects
+
+
+def test_cutoff_performing_ambient_read_does_not_crash(tmp_path: Path) -> None:
+    """A cutoff= that performs ambient file I/O doesn't crash the graph.
+
+    The backdating decision may be wrong, but the database stays functional.
+    """
+    control_file = tmp_path / "control.txt"
+    control_file.write_text("1", encoding="utf-8")
+
+    number = Input[int]("number")
+
+    def side_effecting_cutoff(value: int) -> tuple[str, int]:
+        content = control_file.read_text(encoding="utf-8")
+        return (content, value % 2)
+
+    @query(cutoff=side_effecting_cutoff)
+    def transform(db: Database) -> int:
+        return number.read(db)
+
+    @query
+    def downstream(db: Database) -> str:
+        return f"v={transform(db)}"
+
+    db = Database()
+    db.set(number, 2)
+    assert db.get(downstream) == "v=2"
+
+    # Same parity — cutoff may backdate.
+    db.set(number, 4)
+    db.get(downstream)
+
+    # Change control file — cutoff token changes, but the cutoff re-evaluates
+    # BOTH old and new values at comparison time. Since the control file now
+    # reads "2" for both, the tokens still match and the graph keeps backdating
+    # to the original stale result. This is the documented limitation:
+    # side-effecting cutoffs can cause incorrect but structurally safe backdating.
+    control_file.write_text("2", encoding="utf-8")
+    db.set(number, 6)
+    result = db.get(downstream)
+    assert isinstance(result, str)
+    # The graph is functional — further queries still work.
+    db.set(number, 8)
+    assert isinstance(db.get(downstream), str)
+
+
+def test_eq_raising_exception_mid_comparison_leaves_database_usable() -> None:
+    """If eq= raises an exception, the error propagates but safe queries still work."""
+    comparisons = {"count": 0}
+
+    def raising_eq(left: int, right: int) -> bool:
+        comparisons["count"] += 1
+        if comparisons["count"] >= 2:
+            raise RuntimeError("boom")
+        return left == right
+
+    number = Input[int]("number")
+
+    @query(eq=raising_eq)
+    def transform(db: Database) -> int:
+        return number.read(db)
+
+    @query
+    def safe(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 1)
+    assert db.get(transform) == 1  # First execution — no comparison.
+
+    db.set(number, 2)
+    assert db.get(transform) == 2  # Re-executes, comparison #1 (doesn't raise).
+
+    # Third change triggers comparison #2 which raises.
+    db.set(number, 3)
+    with pytest.raises(RuntimeError, match="boom"):
+        db.get(transform)
+
+    # Safe queries must still work.
+    assert db.get(safe) == 6
+    db.set(number, 4)
+    assert db.get(safe) == 8
+
+
+# Limitation 3 — Mutation in fast mode
+
+
+def test_fast_mode_does_not_detect_return_value_mutation_unlike_checked() -> None:
+    """Fast mode allows silent mutation; checked mode detects it."""
+    trigger = Input[int]("trigger")
+
+    @query
+    def produce(db: Database) -> dict[str, list[int]]:
+        trigger.read(db)
+        return {"items": [1, 2, 3]}
+
+    @query
+    def mutate_and_read(db: Database) -> int:
+        data = produce(db)
+        cast(dict[str, list[int]], data)["items"].append(4)
+        return len(cast(dict[str, list[int]], data)["items"])
+
+    # Fast mode: no error, mutation silently allowed.
+    fast_db = Database(mode="fast")
+    fast_db.set(trigger, 1)
+    assert fast_db.get(mutate_and_read) == 4
+
+    # Checked mode: mutation detected.
+    checked_db = Database(mode="checked")
+    checked_db.set(trigger, 1)
+    with pytest.raises(MutationError):
+        checked_db.get(mutate_and_read)
+
+
+def test_fast_mode_frozen_snapshot_safe_despite_mutation() -> None:
+    """After mutation in fast mode, the frozen snapshot is still intact."""
+    trigger = Input[int]("trigger")
+
+    @query
+    def produce(db: Database) -> dict[str, list[int]]:
+        trigger.read(db)
+        return {"items": [1, 2, 3]}
+
+    db = Database(mode="fast")
+    db.set(trigger, 1)
+
+    first = db.get(produce)
+    cast(dict[str, list[int]], first)["items"].append(4)
+
+    # Fresh get returns uncontaminated copy from the frozen snapshot.
+    second = db.get(produce)
+    assert cast(dict[str, list[int]], second)["items"] == [1, 2, 3]
+
+
+# Limitation 5 — Cycle-adjacent partial state
+
+
+def test_indirect_cycle_three_node_chain_recovery() -> None:
+    """A->B->C->A cycle raises CycleError; safe queries work after."""
+    number = Input[int]("number")
+
+    @query
+    def query_a(db: Database) -> int:
+        return query_b(db)
+
+    @query
+    def query_b(db: Database) -> int:
+        return query_c(db)
+
+    @query
+    def query_c(db: Database) -> int:
+        return query_a(db)
+
+    @query
+    def safe(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 5)
+
+    with pytest.raises(CycleError):
+        db.get(query_a)
+
+    assert db.get(safe) == 10
+    db.set(number, 7)
+    assert db.get(safe) == 14
+
+
+def test_cycle_and_safe_query_sharing_dependency() -> None:
+    """Cyclic and safe queries share an Input; cycle doesn't block the safe path."""
+    shared = Input[int]("shared")
+
+    @query
+    def cyclic(db: Database) -> int:
+        shared.read(db)
+        return cyclic(db)
+
+    @query
+    def safe(db: Database) -> int:
+        return shared.read(db) * 3
+
+    db = Database()
+    db.set(shared, 4)
+
+    with pytest.raises(CycleError):
+        db.get(cyclic)
+
+    assert db.get(safe) == 12
+
+    db.set(shared, 5)
+    assert db.get(safe) == 15
+    assert _inspect_node(db, safe).last_decision == "executed"
+
+
+# Limitation 6 — LRU eviction under active dependencies
+
+
+def test_very_low_max_query_nodes_causes_reexecution_cascade() -> None:
+    """max_query_nodes=1 with a 3-node chain — correctness via full re-execution."""
+    number = Input[int]("number")
+
+    @query
+    def step1(db: Database) -> int:
+        return number.read(db)
+
+    @query
+    def step2(db: Database) -> int:
+        return step1(db) + 10
+
+    @query
+    def step3(db: Database) -> int:
+        return step2(db) + 100
+
+    db = Database(max_query_nodes=1)
+    db.set(number, 1)
+
+    assert db.get(step3) == 111
+
+    # Second request — eviction forces re-execution from scratch.
+    assert db.get(step3) == 111
+
+    # Input change still propagates correctly through the chain.
+    db.set(number, 2)
+    assert db.get(step3) == 112
+
+    # Verify from-scratch consistency.
+    fresh = Database()
+    fresh.set(number, 2)
+    assert fresh.get(step3) == db.get(step3)
+
+
+def test_inputs_and_resources_survive_eviction(tmp_path: Path) -> None:
+    """LRU eviction only affects query nodes; inputs and resources remain resident."""
+    number = Input[int]("number")
+    files = FileResource()
+
+    sample = tmp_path / "data.txt"
+    sample.write_text("content", encoding="utf-8")
+
+    @query
+    def read_input(db: Database) -> int:
+        return number.read(db)
+
+    @query
+    def read_file(db: Database) -> str:
+        return files.read(db, str(sample))
+
+    @query
+    def filler_a(db: Database) -> str:
+        return "a"
+
+    @query
+    def filler_b(db: Database) -> str:
+        return "b"
+
+    db = Database(max_query_nodes=1)
+    db.set(number, 42)
+
+    assert db.get(read_input) == 42
+    assert db.get(read_file) == "content"
+
+    # Evict all query nodes by requesting fillers.
+    assert db.get(filler_a) == "a"
+    assert db.get(filler_b) == "b"
+
+    # Input and resource nodes survive eviction.
+    input_keys = [k for k in db._records if k.kind == "input"]
+    resource_keys = [k for k in db._records if k.kind == "resource"]
+    assert len(input_keys) >= 1
+    assert len(resource_keys) >= 1
+
+    # Queries still return correct results after re-execution.
+    assert db.get(read_input) == 42
+    assert db.get(read_file) == "content"
