@@ -214,3 +214,65 @@ def test_aliasing_mutation_boundaries_behave_by_mode(mode: str, values: list[int
         else:
             with pytest.raises((MutationError, TypeError, AttributeError)):
                 db.get(mutate_left)
+
+
+def multi_level_rewiring_steps() -> st.SearchStrategy[list[tuple[str, str, int, int, int, int]]]:
+    return st.lists(
+        st.tuples(
+            st.sampled_from(["a", "b"]),       # level0 chooser
+            st.sampled_from(["x", "y"]),       # level1 chooser
+            st.integers(min_value=-10, max_value=10),  # a
+            st.integers(min_value=-10, max_value=10),  # b
+            st.integers(min_value=-10, max_value=10),  # x
+            st.integers(min_value=-10, max_value=10),  # y
+        ),
+        min_size=1,
+        max_size=20,
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("max_query_nodes", [None, 3])
+@settings(max_examples=40, deadline=None)
+@given(steps=multi_level_rewiring_steps())
+def test_multi_level_rewiring_matches_fresh_recomputation(
+    mode: str,
+    max_query_nodes: int | None,
+    steps: list[tuple[str, str, int, int, int, int]],
+) -> None:
+    l0_chooser = Input[str]("l0_chooser")
+    l1_chooser = Input[str]("l1_chooser")
+    a = Input[int]("a")
+    b = Input[int]("b")
+    x = Input[int]("x")
+    y = Input[int]("y")
+    inputs = {"l0_chooser": l0_chooser, "l1_chooser": l1_chooser, "a": a, "b": b, "x": x, "y": y}
+
+    @query
+    def level0(db: Database) -> int:
+        return a.read(db) if l0_chooser.read(db) == "a" else b.read(db)
+
+    @query
+    def level1(db: Database) -> int:
+        return x.read(db) if l1_chooser.read(db) == "x" else y.read(db)
+
+    @query
+    def combined(db: Database) -> tuple[int, int, str]:
+        v0, v1 = level0(db), level1(db)
+        return (v0, v1, "even" if (v0 + v1) % 2 == 0 else "odd")
+
+    incremental = Database(mode=mode, max_query_nodes=max_query_nodes)
+    state: dict[str, int | str] = {"l0_chooser": "a", "l1_chooser": "x", "a": 0, "b": 0, "x": 0, "y": 0}
+    for name, inp in inputs.items():
+        incremental.set(inp, state[name])
+
+    for l0c, l1c, av, bv, xv, yv in steps:
+        state.update({"l0_chooser": l0c, "l1_chooser": l1c, "a": av, "b": bv, "x": xv, "y": yv})
+        for name, inp in inputs.items():
+            incremental.set(inp, state[name])
+
+        fresh = Database(mode=mode, max_query_nodes=max_query_nodes)
+        for name, inp in inputs.items():
+            fresh.set(inp, state[name])
+
+        assert incremental.get(combined) == fresh.get(combined)

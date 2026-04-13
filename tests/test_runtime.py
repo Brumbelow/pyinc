@@ -655,3 +655,439 @@ def test_dependencies_revalidate_correctly_after_lru_eviction() -> None:
     assert db.get(parent) == 5
     parent_record = _query_record(db, parent)
     assert parent_record.last_decision == "executed"
+
+
+# ---------------------------------------------------------------------------
+# Rewiring torture suite (Adapton sharing / switching / swapping patterns)
+# ---------------------------------------------------------------------------
+
+
+def test_diamond_dependency_with_rewiring() -> None:
+    chooser = Input[str]("chooser")
+    left = Input[int]("left")
+    right = Input[int]("right")
+
+    @query
+    def intermediate(db: Database) -> int:
+        if chooser.read(db) == "left":
+            return left.read(db)
+        return right.read(db)
+
+    @query
+    def consumer_a(db: Database) -> int:
+        return intermediate(db) + 1
+
+    @query
+    def consumer_b(db: Database) -> int:
+        return intermediate(db) * 2
+
+    db = Database()
+    db.set(chooser, "left")
+    db.set(left, 5)
+    db.set(right, 10)
+
+    assert db.get(consumer_a) == 6
+    assert db.get(consumer_b) == 10
+
+    # Switch intermediate from left to right.
+    db.set(chooser, "right")
+    assert db.get(consumer_a) == 11
+    assert db.get(consumer_b) == 20
+
+    # Verify stale edge dropped and new edge present.
+    intermediate_node = _find_node(_inspect_node(db, consumer_a), "intermediate")
+    dep_labels = {dep.label for dep in intermediate_node.dependencies}
+    assert "input[right]" in dep_labels
+    assert "input[left]" not in dep_labels
+
+
+def test_multi_level_switching() -> None:
+    level0_chooser = Input[str]("level0_chooser")
+    level1_chooser = Input[str]("level1_chooser")
+    a = Input[int]("a")
+    b = Input[int]("b")
+    x = Input[int]("x")
+    y = Input[int]("y")
+
+    @query
+    def level0(db: Database) -> int:
+        return a.read(db) if level0_chooser.read(db) == "a" else b.read(db)
+
+    @query
+    def level1(db: Database) -> int:
+        return x.read(db) if level1_chooser.read(db) == "x" else y.read(db)
+
+    @query
+    def combined(db: Database) -> int:
+        return level0(db) + level1(db)
+
+    db = Database()
+    db.set(level0_chooser, "a")
+    db.set(level1_chooser, "x")
+    db.set(a, 1)
+    db.set(b, 2)
+    db.set(x, 10)
+    db.set(y, 20)
+
+    assert db.get(combined) == 11  # a(1) + x(10)
+
+    # Switch both choosers simultaneously.
+    db.set(level0_chooser, "b")
+    db.set(level1_chooser, "y")
+    assert db.get(combined) == 22  # b(2) + y(20)
+
+    # Verify stale edges dropped at both levels.
+    tree = _inspect_node(db, combined)
+    level0_node = _find_node(tree, "level0")
+    level1_node = _find_node(tree, "level1")
+    l0_deps = {dep.label for dep in level0_node.dependencies}
+    l1_deps = {dep.label for dep in level1_node.dependencies}
+    assert "input[b]" in l0_deps and "input[a]" not in l0_deps
+    assert "input[y]" in l1_deps and "input[x]" not in l1_deps
+
+
+def test_sharing_pattern_backdates_when_rewired_result_is_equal() -> None:
+    chooser = Input[str]("chooser")
+    left = Input[int]("left")
+    right = Input[int]("right")
+
+    @query
+    def shared(db: Database) -> int:
+        return left.read(db) if chooser.read(db) == "left" else right.read(db)
+
+    @query
+    def consumer_a(db: Database) -> str:
+        return f"a={shared(db)}"
+
+    @query
+    def consumer_b(db: Database) -> str:
+        return f"b={shared(db)}"
+
+    db = Database()
+    db.set(chooser, "left")
+    db.set(left, 5)
+    db.set(right, 5)  # Same value as left.
+
+    assert db.get(consumer_a) == "a=5"
+    assert db.get(consumer_b) == "b=5"
+
+    # Switch chooser; shared rewires but produces the same value.
+    db.set(chooser, "right")
+    assert db.get(consumer_a) == "a=5"
+
+    # Inspect before consumer_b runs — shared was backdated during consumer_a's request.
+    tree_a = _inspect_node(db, consumer_a)
+    shared_node = _find_node(tree_a, "shared")
+    assert shared_node.last_decision == "backdated"
+    assert tree_a.last_decision == "reused"
+
+    assert db.get(consumer_b) == "b=5"
+    tree_b = _inspect_node(db, consumer_b)
+    assert tree_b.last_decision == "reused"
+
+
+def test_swapping_pattern_two_queries_exchange_deps() -> None:
+    selector = Input[str]("selector")
+    a_val = Input[int]("a_val")
+    b_val = Input[int]("b_val")
+
+    @query
+    def read_a(db: Database) -> int:
+        if selector.read(db) == "normal":
+            return a_val.read(db)
+        return b_val.read(db)
+
+    @query
+    def read_b(db: Database) -> int:
+        if selector.read(db) == "normal":
+            return b_val.read(db)
+        return a_val.read(db)
+
+    @query
+    def combined(db: Database) -> tuple[int, int]:
+        return (read_a(db), read_b(db))
+
+    db = Database()
+    db.set(selector, "normal")
+    db.set(a_val, 1)
+    db.set(b_val, 2)
+
+    assert db.get(combined) == (1, 2)
+
+    # Swap: read_a now reads b_val, read_b now reads a_val.
+    db.set(selector, "swapped")
+    assert db.get(combined) == (2, 1)
+
+    # Verify edges swapped.
+    tree = _inspect_node(db, combined)
+    ra_node = _find_node(tree, "read_a")
+    rb_node = _find_node(tree, "read_b")
+    ra_deps = {dep.label for dep in ra_node.dependencies}
+    rb_deps = {dep.label for dep in rb_node.dependencies}
+    assert "input[b_val]" in ra_deps and "input[a_val]" not in ra_deps
+    assert "input[a_val]" in rb_deps and "input[b_val]" not in rb_deps
+
+
+def test_rewiring_with_lru_eviction() -> None:
+    chooser = Input[str]("chooser")
+    left = Input[int]("left")
+    right = Input[int]("right")
+
+    @query
+    def branch(db: Database) -> int:
+        return left.read(db) if chooser.read(db) == "left" else right.read(db)
+
+    @query
+    def consumer(db: Database) -> int:
+        return branch(db) + 1
+
+    @query
+    def filler(db: Database) -> str:
+        return "filler"
+
+    db = Database(max_query_nodes=2)
+    db.set(chooser, "left")
+    db.set(left, 10)
+    db.set(right, 20)
+
+    assert db.get(consumer) == 11
+
+    # Evict branch by requesting filler (max_query_nodes=2 keeps consumer + filler).
+    assert db.get(filler) == "filler"
+
+    # Now switch and request consumer again — branch must re-execute from scratch.
+    db.set(chooser, "right")
+    assert db.get(consumer) == 21
+
+    # Verify correctness against a fresh database.
+    fresh = Database()
+    fresh.set(chooser, "right")
+    fresh.set(left, 10)
+    fresh.set(right, 20)
+    assert fresh.get(consumer) == db.get(consumer)
+
+
+# ---------------------------------------------------------------------------
+# Mutation adversarial tests
+# ---------------------------------------------------------------------------
+
+
+def test_external_alias_mutation_after_boundary_crossing() -> None:
+    payload = Input[dict[str, list[int]]]("payload")
+
+    @query
+    def echo(db: Database) -> object:
+        return payload.read(db)
+
+    data: dict[str, list[int]] = {"key": [1, 2, 3]}
+    db = Database(mode="checked")
+    db.set(payload, data)
+
+    assert db.get(echo) == {"key": [1, 2, 3]}
+
+    # Mutate through the external alias — kernel snapshot must be unaffected.
+    data["key"].append(4)
+    data["new_key"] = [99]
+
+    assert db.get(echo) == {"key": [1, 2, 3]}
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked"])
+def test_deeply_nested_mutation_detection(mode: str) -> None:
+    payload = Input[dict[str, Any]]("nested")
+
+    @query
+    def mutate_deep(db: Database) -> int:
+        value = payload.read(db)
+        value["l1"]["l2"]["l3"].append(4)
+        return 1
+
+    db = Database(mode=mode)
+    db.set(payload, {"l1": {"l2": {"l3": [1, 2, 3]}}})
+    with pytest.raises((MutationError, TypeError, AttributeError)):
+        db.get(mutate_deep)
+
+
+@pytest.mark.parametrize("mode", ["checked", "fast"])
+def test_mutation_of_query_return_value_does_not_corrupt_memo(mode: str) -> None:
+    payload = Input[int]("trigger")
+
+    @query
+    def produce(db: Database) -> dict[str, list[int]]:
+        payload.read(db)
+        return {"items": [1, 2, 3]}
+
+    db = Database(mode=mode)
+    db.set(payload, 1)
+
+    first = db.get(produce)
+    assert first == {"items": [1, 2, 3]}
+
+    # Caller mutates the returned copy.
+    first["items"].append(4)
+    assert first == {"items": [1, 2, 3, 4]}
+
+    # Next get must return a fresh copy from the frozen memo.
+    second = db.get(produce)
+    assert second == {"items": [1, 2, 3]}
+
+
+def test_custom_eq_with_side_effect_does_not_corrupt_graph() -> None:
+    call_count = [0]
+
+    def parity_eq(left: int, right: int) -> bool:
+        call_count[0] += 1
+        return left % 2 == right % 2
+
+    number = Input[int]("number")
+
+    @query(eq=parity_eq)
+    def transform(db: Database) -> int:
+        return number.read(db)
+
+    @query
+    def describe(db: Database) -> str:
+        return f"v={transform(db)}"
+
+    db = Database()
+    db.set(number, 3)
+    assert db.get(describe) == "v=3"
+
+    # Change input: 3 → 5 (both odd), parity_eq(3, 5) → True → backdated.
+    # eq callback fires with a side effect; kernel should still function correctly.
+    db.set(number, 5)
+    assert db.get(describe) == "v=3"  # Backdated — parity says equal.
+    assert call_count[0] > 0
+    assert _inspect_node(db, describe).last_decision == "reused"
+
+    # Now change parity: odd → even, eq returns False → graph updates.
+    db.set(number, 4)
+    assert db.get(describe) == "v=4"
+
+
+@pytest.mark.parametrize("mode", ["checked", "fast"])
+def test_two_queries_reading_same_input_get_independent_copies(mode: str) -> None:
+    payload = Input[dict[str, list[int]]]("shared")
+
+    @query
+    def query_a(db: Database) -> object:
+        return payload.read(db)
+
+    @query
+    def query_b(db: Database) -> object:
+        return payload.read(db)
+
+    db = Database(mode=mode)
+    db.set(payload, {"items": [1, 2, 3]})
+
+    result_a = db.get(query_a)
+    result_b = db.get(query_b)
+
+    # Independent objects — no shared aliases.
+    assert result_a is not result_b
+    assert result_a == result_b
+    assert cast(dict[str, list[int]], result_a)["items"] is not cast(dict[str, list[int]], result_b)["items"]
+
+    # Mutating one must not affect the other.
+    cast(dict[str, list[int]], result_a)["items"].append(4)
+    result_b_again = db.get(query_b)
+    assert cast(dict[str, list[int]], result_b_again)["items"] == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# Outside-the-envelope behavior tests
+# ---------------------------------------------------------------------------
+
+
+def test_os_open_bypasses_untracked_read_guard(tmp_path: Path) -> None:
+    """Documents that os.open() (the low-level syscall) is NOT intercepted.
+
+    This is a known limitation of the enforcement boundary — only builtins.open,
+    io.open, os.getenv, os.environ, os.listdir, os.scandir, and Path.iterdir
+    are guarded.
+    """
+    path = tmp_path / "sample.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    @query
+    def read_via_os_open(db: Database) -> str:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            data = os.read(fd, 4096)
+        finally:
+            os.close(fd)
+        return data.decode("utf-8")
+
+    db = Database()
+    # This does NOT raise — os.open is outside the guard.
+    assert db.get(read_via_os_open) == "hello"
+
+
+def test_report_untracked_read_forces_reexecution_on_every_request() -> None:
+    @query
+    def impure(db: Database) -> str:
+        db.report_untracked_read("external_clock")
+        return "stable"
+
+    db = Database()
+
+    # Three consecutive gets with no input changes at all.
+    # Each must re-execute (not reuse) because the query is impure.
+    for _ in range(3):
+        assert db.get(impure) == "stable"
+        record = _inspect_node(db, impure)
+        assert record.last_recompute == "executed"
+        assert record.is_untracked
+
+
+def test_impure_child_prevents_parent_backdating_unless_result_unchanged() -> None:
+    @query
+    def impure_source(db: Database) -> int:
+        db.report_untracked_read("sensor")
+        return 42  # Always returns the same value.
+
+    @query
+    def consumer(db: Database) -> str:
+        return f"v={impure_source(db)}"
+
+    db = Database()
+    assert db.get(consumer) == "v=42"
+
+    # Second request: impure_source re-executes (impure), never backdates.
+    # consumer re-executes because its dependency (impure_source) reports
+    # changed_at == current_revision. But consumer's result is unchanged,
+    # so consumer itself CAN backdate.
+    assert db.get(consumer) == "v=42"
+
+    source_node = _find_node(_inspect_node(db, consumer), "impure_source")
+    assert source_node.is_untracked
+    assert source_node.last_recompute == "executed"
+
+    consumer_node = _inspect_node(db, consumer)
+    assert consumer_node.last_decision == "backdated"
+
+
+def test_cycle_error_does_not_corrupt_database_for_subsequent_queries() -> None:
+    number = Input[int]("number")
+
+    @query
+    def cyclic(db: Database) -> int:
+        return cyclic(db)
+
+    @query
+    def safe(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 5)
+
+    # Trigger cycle error.
+    with pytest.raises(CycleError):
+        db.get(cyclic)
+
+    # Database must still work for non-cyclic queries.
+    assert db.get(safe) == 10
+
+    # Input updates must still propagate.
+    db.set(number, 7)
+    assert db.get(safe) == 14
