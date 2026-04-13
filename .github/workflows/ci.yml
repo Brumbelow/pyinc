@@ -20,6 +20,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Normalize Python root vars
+        run: |
+          echo "Python_ROOT_DIR=${pythonLocation}" >> "$GITHUB_ENV"
+          echo "Python3_ROOT_DIR=${pythonLocation}" >> "$GITHUB_ENV"
+          echo "Python2_ROOT_DIR=" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

@@ -88,6 +88,8 @@ Formulas:
 
 Markdown output adds grouped scenario sections with raw metric tables only. JSON output is the machine-readable schema with environment metadata, parameters, phases or operations, paired comparisons, and invariant summaries.
 
+Environment metadata now includes `python_executable`, `python_root_dir`, `python2_root_dir`, and `python3_root_dir` (empty values are normalized to `null`).
+
 ## Recommended Commands
 
 Quick smoke:

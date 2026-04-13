@@ -200,6 +200,9 @@ def test_json_output_includes_environment_and_comparisons(capsys: pytest.Capture
     payload = json.loads(capsys.readouterr().out)
     assert payload["environment"]["python_version"]
     assert payload["environment"]["python_implementation"]
+    assert payload["environment"]["python_executable"]
+    assert "python2_root_dir" in payload["environment"]
+    assert "python3_root_dir" in payload["environment"]
     assert payload["results"][0]["comparisons"]
     assert payload["results"][0]["phases"][0]["metrics"]["mean_s"] >= 0.0
 

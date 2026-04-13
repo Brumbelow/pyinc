@@ -2956,10 +2956,22 @@ def _selected_scenario_specs(suite: str, bench: str) -> tuple[ScenarioSpec, ...]
     return tuple(SCENARIO_INDEX[key] for key in _selected_scenarios(suite, bench))
 
 
+def _env_or_none(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    text = value.strip()
+    return text or None
+
+
 def _build_environment() -> dict[str, Any]:
     return {
         "python_version": platform.python_version(),
         "python_implementation": platform.python_implementation(),
+        "python_executable": sys.executable,
+        "python_root_dir": _env_or_none("Python_ROOT_DIR"),
+        "python2_root_dir": _env_or_none("Python2_ROOT_DIR"),
+        "python3_root_dir": _env_or_none("Python3_ROOT_DIR"),
         "platform": platform.platform(),
         "machine": platform.machine(),
         "timestamp_utc": datetime.now(UTC).isoformat(),
