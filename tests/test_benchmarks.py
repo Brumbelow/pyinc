@@ -117,7 +117,7 @@ def test_markdown_output_contains_summary_and_scenario_sections(capsys: pytest.C
     assert "## Summary" in captured.out
     assert "## Workload" in captured.out
     assert "### Python Source Analysis" in captured.out
-    assert "Interpretation:" in captured.out
+    assert "Interpretation:" not in captured.out
 
 
 def test_compare_table_output_contains_incremental_and_plain_columns(capsys: pytest.CaptureFixture[str]) -> None:
@@ -228,8 +228,15 @@ def test_compare_json_output_includes_implementations_and_ratios(capsys: pytest.
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["implementations"] == ["incremental", "plain"]
-    assert payload["results"][0]["operations"][0]["measurements"]
-    assert payload["results"][0]["operations"][0]["comparison"]["speedup_ratio"] is not None
+    operation = payload["results"][0]["operations"][0]
+    comparison = operation["comparison"]
+    assert operation["measurements"]
+    assert comparison["speedup_ratio"] is not None
+    assert comparison["speedup_x"] == comparison["speedup_ratio"]
+    assert comparison["speedup_ci_low_x"] is not None
+    assert comparison["speedup_ci_high_x"] is not None
+    assert comparison["latency_reduction_pct"] is not None
+    assert comparison["paired_count"] > 0
 
 
 def test_compare_markdown_output_contains_summary_and_workload_sections(
@@ -259,8 +266,48 @@ def test_compare_markdown_output_contains_summary_and_workload_sections(
     captured = capsys.readouterr()
     assert "## Summary" in captured.out
     assert "speedup_pct" in captured.out
+    assert "speedup_ci_x" in captured.out
+    assert "latency_reduction_pct" in captured.out
     assert "## Workload" in captured.out
     assert "### Python Source Analysis" in captured.out
+    assert "Interpretation:" not in captured.out
+
+
+def test_paired_speedup_stats_are_deterministic_and_include_ci() -> None:
+    config = bench.BenchConfig(
+        samples=3,
+        warmup=0,
+        rounds=2,
+        payload_size=8,
+        bootstrap_resamples=200,
+        confidence_level=0.95,
+        seed=7,
+    )
+    candidate = bench.PhaseResult(
+        name="candidate",
+        metrics=bench._phase_metrics([1.0, 1.1, 0.9, 1.2, 1.0, 1.1]),
+        markers={},
+        round_samples=((1.0, 1.1, 0.9), (1.2, 1.0, 1.1)),
+    )
+    baseline = bench.PhaseResult(
+        name="baseline",
+        metrics=bench._phase_metrics([2.0, 2.2, 1.8, 2.4, 2.0, 2.2]),
+        markers={},
+        round_samples=((2.0, 2.2, 1.8), (2.4, 2.0, 2.2)),
+    )
+    first = bench._phase_speedup("test", "candidate", candidate, "baseline", baseline, config=config)
+    second = bench._phase_speedup("test", "candidate", candidate, "baseline", baseline, config=config)
+
+    assert first.speedup_x is not None
+    assert first.speedup_ratio == first.speedup_x
+    assert first.speedup_ci_low_x is not None
+    assert first.speedup_ci_high_x is not None
+    assert first.speedup_ci_low_x <= first.speedup_x <= first.speedup_ci_high_x
+    assert first.latency_reduction_pct is not None
+    assert first.paired_count == 6
+    assert first.speedup_x == pytest.approx(second.speedup_x)
+    assert first.speedup_ci_low_x == pytest.approx(second.speedup_ci_low_x)
+    assert first.speedup_ci_high_x == pytest.approx(second.speedup_ci_high_x)
 
 
 def test_selected_benchmark_invariants_pass() -> None:

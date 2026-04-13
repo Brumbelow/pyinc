@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import ast
 import gc
+import hashlib
 import importlib.util
 import json
 import math
 import os
 import platform
+import random
 import statistics
 import sys
 import tempfile
@@ -34,7 +36,6 @@ from pyfoundinc.integrations.python_source import (
     directory_analysis,
     directory_analysis_payload,
     file_analysis_payload,
-    module_analysis_payload,
     source_text,
     workspace_analysis,
     workspace_analysis_payload,
@@ -112,6 +113,10 @@ class BenchConfig:
     warmup: int
     rounds: int
     payload_size: int
+    bootstrap_resamples: int = 2000
+    confidence_level: float = 0.95
+    seed: int = 0
+    pair_order: str = "alternating"
 
 
 @dataclass(frozen=True)
@@ -152,6 +157,7 @@ class PhaseResult:
     name: str
     metrics: PhaseMetrics
     markers: dict[str, int]
+    round_samples: tuple[tuple[float, ...], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -181,6 +187,14 @@ class ComparisonResult:
     candidate_phase: str
     baseline_phase: str
     speedup_ratio: float | None
+    speedup_x: float | None
+    speedup_ci_low_x: float | None
+    speedup_ci_high_x: float | None
+    latency_reduction_pct: float | None
+    latency_reduction_ci_low_pct: float | None
+    latency_reduction_ci_high_pct: float | None
+    paired_count: int
+    confidence_level: float
     detail: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -189,6 +203,14 @@ class ComparisonResult:
             "candidate_phase": self.candidate_phase,
             "baseline_phase": self.baseline_phase,
             "speedup_ratio": self.speedup_ratio,
+            "speedup_x": self.speedup_x,
+            "speedup_ci_low_x": self.speedup_ci_low_x,
+            "speedup_ci_high_x": self.speedup_ci_high_x,
+            "latency_reduction_pct": self.latency_reduction_pct,
+            "latency_reduction_ci_low_pct": self.latency_reduction_ci_low_pct,
+            "latency_reduction_ci_high_pct": self.latency_reduction_ci_high_pct,
+            "paired_count": self.paired_count,
+            "confidence_level": self.confidence_level,
             "detail": self.detail,
         }
 
@@ -221,7 +243,7 @@ class ScenarioResult:
 
     def interpretation(self) -> str:
         for comparison in self.comparisons:
-            if comparison.speedup_ratio is not None:
+            if comparison.speedup_x is not None:
                 return comparison.detail
         passed = sum(1 for item in self.invariants if item.passed)
         return f"{passed} invariant checks passed."
@@ -229,8 +251,14 @@ class ScenarioResult:
     def vs_fresh(self, phase_name: str) -> float | None:
         for comparison in self.comparisons:
             if comparison.candidate_phase == phase_name and "fresh" in comparison.baseline_phase:
-                return comparison.speedup_ratio
+                return comparison.speedup_x
         return None
+
+    def vs_fresh_ci(self, phase_name: str) -> tuple[float | None, float | None]:
+        for comparison in self.comparisons:
+            if comparison.candidate_phase == phase_name and "fresh" in comparison.baseline_phase:
+                return comparison.speedup_ci_low_x, comparison.speedup_ci_high_x
+        return None, None
 
 
 @dataclass(frozen=True)
@@ -283,7 +311,7 @@ class WorkloadOperationResult:
     def speedup(self) -> float | None:
         if self.comparison is None:
             return None
-        return self.comparison.speedup_ratio
+        return self.comparison.speedup_x
 
 
 @dataclass(frozen=True)
@@ -310,12 +338,16 @@ class WorkloadScenarioResult:
 
     def interpretation(self) -> str:
         fastest = max(
-            (operation for operation in self.operations if operation.speedup() is not None),
-            key=lambda operation: operation.speedup() or 0.0,
+            (
+                operation.comparison
+                for operation in self.operations
+                if operation.comparison is not None and operation.comparison.speedup_x is not None
+            ),
+            key=lambda comparison: comparison.speedup_x or 0.0,
             default=None,
         )
-        if fastest is not None and fastest.note:
-            return fastest.note
+        if fastest is not None:
+            return fastest.detail
         passed = sum(1 for item in self.invariants if item.passed)
         return f"{passed} invariant checks passed."
 
@@ -414,14 +446,22 @@ def _record_markers(call: MeasuredCall, aggregate: Counter[str]) -> None:
 def _measure_cold(name: str, setup: PreparedSetup, *, rounds: int) -> PhaseResult:
     times: list[float] = []
     markers: Counter[str] = Counter()
+    round_samples: list[tuple[float, ...]] = []
     for _ in range(rounds):
         call, cleanup = setup()
         try:
-            times.append(_timed(call.invoke))
+            elapsed = _timed(call.invoke)
+            times.append(elapsed)
+            round_samples.append((elapsed,))
             _record_markers(call, markers)
         finally:
             cleanup()
-    return PhaseResult(name=name, metrics=_phase_metrics(times), markers=dict(sorted(markers.items())))
+    return PhaseResult(
+        name=name,
+        metrics=_phase_metrics(times),
+        markers=dict(sorted(markers.items())),
+        round_samples=tuple(round_samples),
+    )
 
 
 def _measure_cached(
@@ -431,18 +471,28 @@ def _measure_cached(
 ) -> PhaseResult:
     times: list[float] = []
     markers: Counter[str] = Counter()
+    round_samples: list[tuple[float, ...]] = []
     for _ in range(config.rounds):
+        round_times: list[float] = []
         call, cleanup = setup()
         try:
             call.invoke()
             for _ in range(config.warmup):
                 call.invoke()
             for _ in range(config.samples):
-                times.append(_timed(call.invoke))
+                elapsed = _timed(call.invoke)
+                times.append(elapsed)
+                round_times.append(elapsed)
                 _record_markers(call, markers)
         finally:
             cleanup()
-    return PhaseResult(name=name, metrics=_phase_metrics(times), markers=dict(sorted(markers.items())))
+        round_samples.append(tuple(round_times))
+    return PhaseResult(
+        name=name,
+        metrics=_phase_metrics(times),
+        markers=dict(sorted(markers.items())),
+        round_samples=tuple(round_samples),
+    )
 
 
 def _measure_sequence(
@@ -452,7 +502,9 @@ def _measure_sequence(
 ) -> PhaseResult:
     times: list[float] = []
     markers: Counter[str] = Counter()
+    round_samples: list[tuple[float, ...]] = []
     for _ in range(config.rounds):
+        round_times: list[float] = []
         fixture = setup()
         try:
             fixture.call.invoke()
@@ -460,11 +512,19 @@ def _measure_sequence(
                 fixture.prepare(step)
                 fixture.call.invoke()
             for step in range(config.warmup, config.warmup + config.samples):
-                times.append(_timed(partial(_run_sequence_step, fixture, step)))
+                elapsed = _timed(partial(_run_sequence_step, fixture, step))
+                times.append(elapsed)
+                round_times.append(elapsed)
                 _record_markers(fixture.call, markers)
         finally:
             fixture.cleanup()
-    return PhaseResult(name=name, metrics=_phase_metrics(times), markers=dict(sorted(markers.items())))
+        round_samples.append(tuple(round_times))
+    return PhaseResult(
+        name=name,
+        metrics=_phase_metrics(times),
+        markers=dict(sorted(markers.items())),
+        round_samples=tuple(round_samples),
+    )
 
 
 def _measure_fresh_sequence(
@@ -474,25 +534,37 @@ def _measure_fresh_sequence(
 ) -> PhaseResult:
     times: list[float] = []
     markers: Counter[str] = Counter()
+    round_samples: list[tuple[float, ...]] = []
     total_steps = config.warmup + config.samples
     for _ in range(config.rounds):
+        round_times: list[float] = []
         for step in range(total_steps):
             fixture = setup()
             try:
                 if step < config.warmup:
                     _run_fresh_sequence_step(fixture, step)
                 else:
-                    times.append(_timed(partial(_run_fresh_sequence_step, fixture, step)))
+                    elapsed = _timed(partial(_run_fresh_sequence_step, fixture, step))
+                    times.append(elapsed)
+                    round_times.append(elapsed)
                     _record_markers(fixture.call, markers)
             finally:
                 fixture.cleanup()
-    return PhaseResult(name=name, metrics=_phase_metrics(times), markers=dict(sorted(markers.items())))
+        round_samples.append(tuple(round_times))
+    return PhaseResult(
+        name=name,
+        metrics=_phase_metrics(times),
+        markers=dict(sorted(markers.items())),
+        round_samples=tuple(round_samples),
+    )
 
 
 def _measure_prepared(name: str, setup: PreparedSetup, config: BenchConfig) -> PhaseResult:
     times: list[float] = []
     markers: Counter[str] = Counter()
+    round_samples: list[tuple[float, ...]] = []
     for _ in range(config.rounds):
+        round_times: list[float] = []
         for _ in range(config.warmup):
             call, cleanup = setup()
             try:
@@ -502,11 +574,19 @@ def _measure_prepared(name: str, setup: PreparedSetup, config: BenchConfig) -> P
         for _ in range(config.samples):
             call, cleanup = setup()
             try:
-                times.append(_timed(call.invoke))
+                elapsed = _timed(call.invoke)
+                times.append(elapsed)
+                round_times.append(elapsed)
                 _record_markers(call, markers)
             finally:
                 cleanup()
-    return PhaseResult(name=name, metrics=_phase_metrics(times), markers=dict(sorted(markers.items())))
+        round_samples.append(tuple(round_times))
+    return PhaseResult(
+        name=name,
+        metrics=_phase_metrics(times),
+        markers=dict(sorted(markers.items())),
+        round_samples=tuple(round_samples),
+    )
 
 
 def _run_sequence_step(fixture: SequenceFixture, step: int) -> object:
@@ -548,11 +628,184 @@ def _merged_markers(*entries: Mapping[str, int]) -> dict[str, int]:
     return dict(merged)
 
 
+def _stable_seed(*parts: str, base: int) -> int:
+    digest = hashlib.blake2b(
+        f"{base}|{'|'.join(parts)}".encode(),
+        digest_size=8,
+    ).digest()
+    return int.from_bytes(digest, "big", signed=False)
+
+
+def _sorted_quantile(sorted_values: Sequence[float], quantile: float) -> float:
+    if not sorted_values:
+        raise ValueError("quantile requires at least one value")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    clamped = min(1.0, max(0.0, quantile))
+    position = clamped * (len(sorted_values) - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return sorted_values[lower]
+    weight = position - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def _flatten_round_samples(phase: PhaseResult) -> tuple[float, ...]:
+    return tuple(sample for round_samples in phase.round_samples for sample in round_samples)
+
+
+def _apply_pair_alignment(
+    candidate_samples: Sequence[float],
+    baseline_samples: Sequence[float],
+    *,
+    pair_order: str,
+    round_index: int,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    candidate = tuple(candidate_samples)
+    baseline = tuple(baseline_samples)
+    if pair_order == "baseline_first":
+        return tuple(reversed(candidate)), tuple(reversed(baseline))
+    if pair_order == "alternating" and round_index % 2 == 1:
+        return tuple(reversed(candidate)), tuple(reversed(baseline))
+    return candidate, baseline
+
+
+def _paired_phase_samples(
+    candidate_phase: PhaseResult,
+    baseline_phase: PhaseResult,
+    *,
+    pair_order: str,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    candidate_rounds = tuple(round_samples for round_samples in candidate_phase.round_samples if round_samples)
+    baseline_rounds = tuple(round_samples for round_samples in baseline_phase.round_samples if round_samples)
+    if candidate_rounds and baseline_rounds and len(candidate_rounds) == len(baseline_rounds):
+        if all(len(candidate_rounds[index]) == len(baseline_rounds[index]) for index in range(len(candidate_rounds))):
+            paired_candidate: list[float] = []
+            paired_baseline: list[float] = []
+            for round_index, (candidate_round, baseline_round) in enumerate(
+                zip(candidate_rounds, baseline_rounds, strict=True)
+            ):
+                aligned_candidate, aligned_baseline = _apply_pair_alignment(
+                    candidate_round,
+                    baseline_round,
+                    pair_order=pair_order,
+                    round_index=round_index,
+                )
+                paired_candidate.extend(aligned_candidate)
+                paired_baseline.extend(aligned_baseline)
+            return tuple(paired_candidate), tuple(paired_baseline)
+        candidate_round_means = tuple(statistics.mean(round_samples) for round_samples in candidate_rounds)
+        baseline_round_means = tuple(statistics.mean(round_samples) for round_samples in baseline_rounds)
+        return candidate_round_means, baseline_round_means
+
+    candidate_flat = _flatten_round_samples(candidate_phase)
+    baseline_flat = _flatten_round_samples(baseline_phase)
+    pair_count = min(len(candidate_flat), len(baseline_flat))
+    return candidate_flat[:pair_count], baseline_flat[:pair_count]
+
+
+def _latency_reduction_pct(speedup_x: float | None) -> float | None:
+    if speedup_x is None or speedup_x <= 0.0:
+        return None
+    return 100.0 * (1.0 - (1.0 / speedup_x))
+
+
+def _paired_speedup_stats(
+    *,
+    name: str,
+    candidate_label: str,
+    candidate_phase: PhaseResult,
+    baseline_label: str,
+    baseline_phase: PhaseResult,
+    config: BenchConfig,
+) -> ComparisonResult:
+    candidate_samples, baseline_samples = _paired_phase_samples(
+        candidate_phase,
+        baseline_phase,
+        pair_order=config.pair_order,
+    )
+    raw_pair_count = min(len(candidate_samples), len(baseline_samples))
+    valid_pairs = [
+        (candidate, baseline)
+        for candidate, baseline in zip(candidate_samples, baseline_samples, strict=True)
+        if candidate > 0.0 and baseline > 0.0
+    ]
+    paired_count = len(valid_pairs)
+    if paired_count == 0:
+        detail = "paired_count=0 speedup_x=unavailable"
+        return ComparisonResult(
+            name=name,
+            candidate_phase=candidate_label,
+            baseline_phase=baseline_label,
+            speedup_ratio=None,
+            speedup_x=None,
+            speedup_ci_low_x=None,
+            speedup_ci_high_x=None,
+            latency_reduction_pct=None,
+            latency_reduction_ci_low_pct=None,
+            latency_reduction_ci_high_pct=None,
+            paired_count=raw_pair_count,
+            confidence_level=config.confidence_level,
+            detail=detail,
+        )
+
+    log_ratios = [math.log(baseline) - math.log(candidate) for candidate, baseline in valid_pairs]
+    speedup_x = math.exp(statistics.mean(log_ratios))
+    speedup_ci_low_x = speedup_x
+    speedup_ci_high_x = speedup_x
+
+    if paired_count > 1 and config.bootstrap_resamples > 0:
+        rng = random.Random(
+            _stable_seed(
+                name,
+                candidate_label,
+                baseline_label,
+                base=config.seed,
+            )
+        )
+        resampled_speedups: list[float] = []
+        for _ in range(config.bootstrap_resamples):
+            sampled_mean = statistics.mean(log_ratios[rng.randrange(paired_count)] for _ in range(paired_count))
+            resampled_speedups.append(math.exp(sampled_mean))
+        resampled_speedups.sort()
+        alpha = (1.0 - config.confidence_level) / 2.0
+        speedup_ci_low_x = _sorted_quantile(resampled_speedups, alpha)
+        speedup_ci_high_x = _sorted_quantile(resampled_speedups, 1.0 - alpha)
+
+    latency_reduction_pct = _latency_reduction_pct(speedup_x)
+    latency_reduction_ci_low_pct = _latency_reduction_pct(speedup_ci_low_x)
+    latency_reduction_ci_high_pct = _latency_reduction_pct(speedup_ci_high_x)
+
+    detail = (
+        f"paired_count={paired_count} "
+        f"speedup_x={speedup_x:.4f} "
+        f"speedup_ci_x=[{speedup_ci_low_x:.4f},{speedup_ci_high_x:.4f}] "
+        f"latency_reduction_pct={0.0 if latency_reduction_pct is None else latency_reduction_pct:.2f}"
+    )
+    return ComparisonResult(
+        name=name,
+        candidate_phase=candidate_label,
+        baseline_phase=baseline_label,
+        speedup_ratio=speedup_x,
+        speedup_x=speedup_x,
+        speedup_ci_low_x=speedup_ci_low_x,
+        speedup_ci_high_x=speedup_ci_high_x,
+        latency_reduction_pct=latency_reduction_pct,
+        latency_reduction_ci_low_pct=latency_reduction_ci_low_pct,
+        latency_reduction_ci_high_pct=latency_reduction_ci_high_pct,
+        paired_count=paired_count,
+        confidence_level=config.confidence_level,
+        detail=detail,
+    )
+
+
 def _speedup(
     phases: Mapping[str, PhaseResult],
     name: str,
     candidate_phase: str,
     baseline_phase: str,
+    config: BenchConfig,
 ) -> ComparisonResult:
     return _phase_speedup(
         name,
@@ -560,6 +813,7 @@ def _speedup(
         phases[candidate_phase],
         baseline_phase,
         phases[baseline_phase],
+        config=config,
     )
 
 
@@ -569,25 +823,22 @@ def _phase_speedup(
     candidate_phase: PhaseResult,
     baseline_label: str,
     baseline_phase: PhaseResult,
+    *,
+    config: BenchConfig,
 ) -> ComparisonResult:
-    candidate = candidate_phase.metrics.mean_s
-    baseline = baseline_phase.metrics.mean_s
-    ratio = None if candidate <= 0.0 else baseline / candidate
-    if ratio is None:
-        detail = f"{candidate_label} completed too quickly for a stable ratio against {baseline_label}."
-    else:
-        detail = f"{candidate_label} is {ratio:.2f}x faster than {baseline_label} by mean latency."
-    return ComparisonResult(
+    return _paired_speedup_stats(
         name=name,
-        candidate_phase=candidate_label,
-        baseline_phase=baseline_label,
-        speedup_ratio=ratio,
-        detail=detail,
+        candidate_label=candidate_label,
+        candidate_phase=candidate_phase,
+        baseline_label=baseline_label,
+        baseline_phase=baseline_phase,
+        config=config,
     )
 
 
 def _scenario_result(
     *,
+    config: BenchConfig,
     key: str,
     suite: str,
     title: str,
@@ -601,7 +852,7 @@ def _scenario_result(
     ordered_phases = tuple(phases)
     phase_map = {phase.name: phase for phase in ordered_phases}
     comparisons = tuple(
-        _speedup(phase_map, name, candidate_phase, baseline_phase)
+        _speedup(phase_map, name, candidate_phase, baseline_phase, config)
         for name, candidate_phase, baseline_phase in comparison_pairs
     )
     return ScenarioResult(
@@ -681,6 +932,7 @@ def benchmark_diamond(config: BenchConfig, mode: str) -> ScenarioResult:
         _measure_fresh_sequence("fresh_recompute", setup_delta, config),
     )
     return _scenario_result(
+        config=config,
         key="diamond_reuse",
         suite="micro",
         title="Diamond Reuse",
@@ -773,6 +1025,7 @@ def benchmark_rewiring(config: BenchConfig, mode: str) -> ScenarioResult:
         _measure_fresh_sequence("fresh_recompute", setup_delta, config),
     )
     return _scenario_result(
+        config=config,
         key="dynamic_rewiring",
         suite="micro",
         title="Dynamic Rewiring",
@@ -841,6 +1094,7 @@ def benchmark_file_resources(config: BenchConfig, mode: str) -> ScenarioResult:
         _measure_fresh_sequence("fresh_recompute", setup_delta, config),
     )
     return _scenario_result(
+        config=config,
         key="resource_reads",
         suite="micro",
         title="Resource Reads",
@@ -937,6 +1191,7 @@ def benchmark_large_boundary(config: BenchConfig, mode: str) -> ScenarioResult:
         _measure_fresh_sequence("fresh_recompute", setup_delta, config),
     )
     return _scenario_result(
+        config=config,
         key="large_boundary",
         suite="micro",
         title="Large Boundary",
@@ -1034,6 +1289,7 @@ def benchmark_query_backdating(config: BenchConfig, mode: str) -> ScenarioResult
         _measure_fresh_sequence("real_change_fresh", setup_real_change, config),
     )
     return _scenario_result(
+        config=config,
         key="query_backdating",
         suite="micro",
         title="Query Backdating",
@@ -1155,6 +1411,7 @@ def benchmark_backdating_chain(config: BenchConfig, mode: str) -> ScenarioResult
         _measure_fresh_sequence("real_change_fresh", setup_real_change, config),
     )
     return _scenario_result(
+        config=config,
         key="backdating_chain",
         suite="micro",
         title="Backdating Chain",
@@ -1286,6 +1543,7 @@ def benchmark_rewiring_torture(config: BenchConfig, mode: str) -> ScenarioResult
         _measure_fresh_sequence("inactive_churn_fresh", setup_inactive_churn, config),
     )
     return _scenario_result(
+        config=config,
         key="rewiring_torture",
         suite="micro",
         title="Rewiring Torture",
@@ -1444,6 +1702,7 @@ def benchmark_cutoff_economics(config: BenchConfig, mode: str) -> ScenarioResult
         _measure_fresh_sequence("without_cutoff_comment_edit_fresh", setup_plain_sequence, config),
     )
     return _scenario_result(
+        config=config,
         key="cutoff_economics",
         suite="micro",
         title="Cutoff Economics",
@@ -1593,6 +1852,7 @@ def benchmark_resource_granularity(config: BenchConfig, mode: str) -> ScenarioRe
         _measure_fresh_sequence("listing_change_fresh", setup_listing_change, config),
     )
     return _scenario_result(
+        config=config,
         key="resource_granularity",
         suite="micro",
         title="Resource Granularity",
@@ -1703,6 +1963,7 @@ def benchmark_lru_pressure(config: BenchConfig, mode: str) -> ScenarioResult:
         _measure_fresh_sequence("fresh_recompute", setup_fresh, config),
     )
     return _scenario_result(
+        config=config,
         key="lru_pressure",
         suite="micro",
         title="LRU Pressure",
@@ -1872,16 +2133,8 @@ def _run_source_analysis_operation(
 
 def _source_analysis_operation_note(operation: str, speedup_ratio: float | None) -> str:
     if speedup_ratio is None:
-        return f"{operation} did not produce a stable speedup ratio."
-    if operation == "initial_full":
-        return "Cold full analysis still carries the incremental engine's setup cost."
-    if operation == "no_change_repeat":
-        return "No-change repeats favor the incremental engine because the root query reuses."
-    if operation == "comment_only_edit":
-        return "Comment-only edits favor the incremental engine because the source query backdates and the directory result reuses."
-    if operation == "semantic_edit":
-        return "One-file semantic edits still require targeted recomputation, so the gap is smaller."
-    return f"{operation} completed with a meaningful incremental/plain comparison."
+        return f"{operation} paired comparison unavailable."
+    return f"{operation} paired comparison recorded."
 
 
 def benchmark_source_analysis(config: BenchConfig, mode: str) -> ScenarioResult:
@@ -1958,6 +2211,7 @@ def benchmark_source_analysis(config: BenchConfig, mode: str) -> ScenarioResult:
         _measure_fresh_sequence("semantic_edit_fresh", setup_semantic, config),
     )
     return _scenario_result(
+        config=config,
         key="source_analysis",
         suite="workload",
         title="Python Source Analysis",
@@ -1986,6 +2240,7 @@ def benchmark_source_analysis_plain(config: BenchConfig) -> ScenarioResult:
         _require(True, "plain_source_analysis_baseline", "plain baseline performs direct whole-directory analysis on every operation"),
     )
     return _scenario_result(
+        config=config,
         key="source_analysis",
         suite="workload",
         title="Python Source Analysis",
@@ -2071,7 +2326,14 @@ def benchmark_source_analysis_compare(config: BenchConfig, mode: str) -> Workloa
             partial(_setup_plain_source_analysis_operation, config.payload_size, operation),
             config,
         )
-        comparison = _phase_speedup("plain_vs_incremental", "incremental", incremental_phase, "plain", plain_phase)
+        comparison = _phase_speedup(
+            "plain_vs_incremental",
+            "incremental",
+            incremental_phase,
+            "plain",
+            plain_phase,
+            config=config,
+        )
         operations.append(
             WorkloadOperationResult(
                 name=operation,
@@ -2290,18 +2552,8 @@ def _run_workspace_import_graph_operation(
 
 def _workspace_import_graph_operation_note(operation: str, speedup_ratio: float | None) -> str:
     if speedup_ratio is None:
-        return f"{operation} did not produce a stable speedup ratio."
-    if operation == "initial_full":
-        return "Cold workspace analysis still pays the full graph construction cost."
-    if operation == "no_change_repeat":
-        return "No-change repeats favor the incremental engine because the workspace root reuses."
-    if operation == "provider_comment_edit":
-        return "Comment-only provider edits favor the incremental engine because the provider source backdates."
-    if operation == "provider_internal_edit":
-        return "Provider body edits can still reuse downstream consumers when the export surface is unchanged."
-    if operation == "provider_export_edit":
-        return "Export-surface edits still force the affected consumer graph to execute."
-    return f"{operation} completed with a meaningful incremental/plain comparison."
+        return f"{operation} paired comparison unavailable."
+    return f"{operation} paired comparison recorded."
 
 
 def benchmark_workspace_import_graph(config: BenchConfig, mode: str) -> ScenarioResult:
@@ -2423,6 +2675,7 @@ def benchmark_workspace_import_graph(config: BenchConfig, mode: str) -> Scenario
         _measure_fresh_sequence("provider_export_edit_fresh", setup_export, config),
     )
     return _scenario_result(
+        config=config,
         key="workspace_import_graph",
         suite="workload",
         title="Workspace Import Graph",
@@ -2456,6 +2709,7 @@ def benchmark_workspace_import_graph_plain(config: BenchConfig) -> ScenarioResul
         ),
     )
     return _scenario_result(
+        config=config,
         key="workspace_import_graph",
         suite="workload",
         title="Workspace Import Graph",
@@ -2556,7 +2810,14 @@ def benchmark_workspace_import_graph_compare(config: BenchConfig, mode: str) -> 
             partial(_setup_plain_workspace_import_graph_operation, config.payload_size, operation),
             config,
         )
-        comparison = _phase_speedup("plain_vs_incremental", "incremental", incremental_phase, "plain", plain_phase)
+        comparison = _phase_speedup(
+            "plain_vs_incremental",
+            "incremental",
+            incremental_phase,
+            "plain",
+            plain_phase,
+            config=config,
+        )
         operations.append(
             WorkloadOperationResult(
                 name=operation,
@@ -2722,6 +2983,10 @@ def _build_report_config(
         "warmup": config.warmup,
         "rounds": config.rounds,
         "payload_size": config.payload_size,
+        "bootstrap_resamples": config.bootstrap_resamples,
+        "confidence_level": config.confidence_level,
+        "seed": config.seed,
+        "pair_order": config.pair_order,
         "mode_override": mode_override,
         "implementation": implementation,
     }
@@ -2812,10 +3077,11 @@ def render_compare_json(report: WorkloadComparisonReport) -> str:
 
 def render_table(report: BenchReport) -> str:
     rows: list[list[str]] = [
-        ["scenario", "phase", "mode", "n", "mean_ms", "p95_ms", "ops/s", "vs_fresh", "markers"],
+        ["scenario", "phase", "mode", "n", "mean_ms", "p95_ms", "ops/s", "vs_fresh_x", "vs_fresh_ci_x", "markers"],
     ]
     for scenario in report.results:
         for phase in scenario.phases:
+            ci_low, ci_high = scenario.vs_fresh_ci(phase.name)
             rows.append(
                 [
                     scenario.key,
@@ -2826,6 +3092,7 @@ def render_table(report: BenchReport) -> str:
                     f"{phase.metrics.p95_s * 1000:.3f}",
                     f"{phase.metrics.ops_per_s:.1f}",
                     _format_ratio(scenario.vs_fresh(phase.name)),
+                    _format_ratio_ci(ci_low, ci_high),
                     _format_markers(phase.markers),
                 ],
             )
@@ -2844,7 +3111,11 @@ def render_table(report: BenchReport) -> str:
             f"samples={report.config['samples']} "
             f"warmup={report.config['warmup']} "
             f"rounds={report.config['rounds']} "
-            f"payload_size={report.config['payload_size']}"
+            f"payload_size={report.config['payload_size']} "
+            f"bootstrap_resamples={report.config['bootstrap_resamples']} "
+            f"confidence_level={report.config['confidence_level']} "
+            f"seed={report.config['seed']} "
+            f"pair_order={report.config['pair_order']}"
         ),
         "",
         _render_table_rows(rows),
@@ -2861,7 +3132,12 @@ def render_compare_table(report: WorkloadComparisonReport) -> str:
             "inc_p95_ms",
             "plain_mean_ms",
             "plain_p95_ms",
+            "speedup_x",
+            "speedup_ci_x",
+            "latency_reduction_pct",
+            "latency_reduction_ci_pct",
             "speedup_pct",
+            "paired_n",
             "incremental_markers",
         ],
     ]
@@ -2869,6 +3145,7 @@ def render_compare_table(report: WorkloadComparisonReport) -> str:
         for operation in scenario.operations:
             incremental = operation.measurement("incremental")
             plain = operation.measurement("plain")
+            comparison = operation.comparison
             rows.append(
                 [
                     scenario.key,
@@ -2877,7 +3154,18 @@ def render_compare_table(report: WorkloadComparisonReport) -> str:
                     "-" if incremental is None else f"{incremental.phase.metrics.p95_s * 1000:.3f}",
                     "-" if plain is None else f"{plain.phase.metrics.mean_s * 1000:.3f}",
                     "-" if plain is None else f"{plain.phase.metrics.p95_s * 1000:.3f}",
+                    _format_ratio(None if comparison is None else comparison.speedup_x),
+                    _format_ratio_ci(
+                        None if comparison is None else comparison.speedup_ci_low_x,
+                        None if comparison is None else comparison.speedup_ci_high_x,
+                    ),
+                    _format_signed_percentage(None if comparison is None else comparison.latency_reduction_pct),
+                    _format_signed_percentage_ci(
+                        None if comparison is None else comparison.latency_reduction_ci_low_pct,
+                        None if comparison is None else comparison.latency_reduction_ci_high_pct,
+                    ),
                     _format_percentage_ratio(operation.speedup()),
+                    "-" if comparison is None else str(comparison.paired_count),
                     "-" if incremental is None else _format_markers(incremental.phase.markers),
                 ],
             )
@@ -2897,7 +3185,11 @@ def render_compare_table(report: WorkloadComparisonReport) -> str:
             f"samples={report.config['samples']} "
             f"warmup={report.config['warmup']} "
             f"rounds={report.config['rounds']} "
-            f"payload_size={report.config['payload_size']}"
+            f"payload_size={report.config['payload_size']} "
+            f"bootstrap_resamples={report.config['bootstrap_resamples']} "
+            f"confidence_level={report.config['confidence_level']} "
+            f"seed={report.config['seed']} "
+            f"pair_order={report.config['pair_order']}"
         ),
         "",
         _render_table_rows(rows),
@@ -2919,16 +3211,21 @@ def render_markdown(report: BenchReport) -> str:
             f"`samples={report.config['samples']}` "
             f"`warmup={report.config['warmup']}` "
             f"`rounds={report.config['rounds']}` "
-            f"`payload_size={report.config['payload_size']}`"
+            f"`payload_size={report.config['payload_size']}` "
+            f"`bootstrap_resamples={report.config['bootstrap_resamples']}` "
+            f"`confidence_level={report.config['confidence_level']}` "
+            f"`seed={report.config['seed']}` "
+            f"`pair_order={report.config['pair_order']}`"
         ),
         "",
         "## Summary",
         "",
-        "| scenario | phase | mode | mean_ms | p95_ms | ops/s | vs_fresh |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: |",
+        "| scenario | phase | mode | mean_ms | p95_ms | ops/s | vs_fresh_x | vs_fresh_ci_x |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
     ]
     for scenario in report.results:
         for phase in scenario.phases:
+            ci_low, ci_high = scenario.vs_fresh_ci(phase.name)
             lines.append(
                 "| "
                 + " | ".join(
@@ -2940,6 +3237,7 @@ def render_markdown(report: BenchReport) -> str:
                         f"{phase.metrics.p95_s * 1000:.3f}",
                         f"{phase.metrics.ops_per_s:.1f}",
                         _format_ratio(scenario.vs_fresh(phase.name)),
+                        _format_ratio_ci(ci_low, ci_high),
                     ],
                 )
                 + " |"
@@ -2963,11 +3261,12 @@ def render_markdown(report: BenchReport) -> str:
                     "",
                     f"Invariant checks: {len(scenario.invariants)} passed.",
                     "",
-                    "| phase | mean_ms | p95_ms | total_ms | ops/s | vs_fresh | markers |",
-                    "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+                    "| phase | mean_ms | p95_ms | total_ms | ops/s | vs_fresh_x | vs_fresh_ci_x | markers |",
+                    "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
                 ],
             )
             for phase in scenario.phases:
+                ci_low, ci_high = scenario.vs_fresh_ci(phase.name)
                 lines.append(
                     "| "
                     + " | ".join(
@@ -2978,18 +3277,13 @@ def render_markdown(report: BenchReport) -> str:
                             f"{phase.metrics.total_s * 1000:.3f}",
                             f"{phase.metrics.ops_per_s:.1f}",
                             _format_ratio(scenario.vs_fresh(phase.name)),
+                            _format_ratio_ci(ci_low, ci_high),
                             _format_markers(phase.markers),
                         ],
                     )
                     + " |"
                 )
-            lines.extend(
-                [
-                    "",
-                    f"Interpretation: {scenario.interpretation()}",
-                    "",
-                ],
-            )
+            lines.append("")
     return "\n".join(lines).rstrip()
 
 
@@ -3008,18 +3302,26 @@ def render_compare_markdown(report: WorkloadComparisonReport) -> str:
             f"`samples={report.config['samples']}` "
             f"`warmup={report.config['warmup']}` "
             f"`rounds={report.config['rounds']}` "
-            f"`payload_size={report.config['payload_size']}`"
+            f"`payload_size={report.config['payload_size']}` "
+            f"`bootstrap_resamples={report.config['bootstrap_resamples']}` "
+            f"`confidence_level={report.config['confidence_level']}` "
+            f"`seed={report.config['seed']}` "
+            f"`pair_order={report.config['pair_order']}`"
         ),
         "",
         "## Summary",
         "",
-        "| scenario | operation | incremental_mean_ms | plain_mean_ms | speedup_pct | incremental_markers |",
-        "| --- | --- | ---: | ---: | ---: | --- |",
+        (
+            "| scenario | operation | incremental_mean_ms | plain_mean_ms | speedup_x | "
+            "speedup_ci_x | latency_reduction_pct | speedup_pct | paired_n | incremental_markers |"
+        ),
+        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- |",
     ]
     for scenario in report.results:
         for operation in scenario.operations:
             incremental = operation.measurement("incremental")
             plain = operation.measurement("plain")
+            comparison = operation.comparison
             lines.append(
                 "| "
                 + " | ".join(
@@ -3028,7 +3330,14 @@ def render_compare_markdown(report: WorkloadComparisonReport) -> str:
                         operation.name,
                         "-" if incremental is None else f"{incremental.phase.metrics.mean_s * 1000:.3f}",
                         "-" if plain is None else f"{plain.phase.metrics.mean_s * 1000:.3f}",
+                        _format_ratio(None if comparison is None else comparison.speedup_x),
+                        _format_ratio_ci(
+                            None if comparison is None else comparison.speedup_ci_low_x,
+                            None if comparison is None else comparison.speedup_ci_high_x,
+                        ),
+                        _format_signed_percentage(None if comparison is None else comparison.latency_reduction_pct),
                         _format_percentage_ratio(operation.speedup()),
+                        "-" if comparison is None else str(comparison.paired_count),
                         "-" if incremental is None else _format_markers(incremental.phase.markers),
                     ],
                 )
@@ -3045,13 +3354,18 @@ def render_compare_markdown(report: WorkloadComparisonReport) -> str:
                 "",
                 f"Invariant checks: {len(scenario.invariants)} passed.",
                 "",
-                "| operation | incremental_mean_ms | incremental_p95_ms | plain_mean_ms | plain_p95_ms | speedup_pct | incremental_markers |",
-                "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+                (
+                    "| operation | incremental_mean_ms | incremental_p95_ms | plain_mean_ms | plain_p95_ms | "
+                    "speedup_x | speedup_ci_x | latency_reduction_pct | latency_reduction_ci_pct | speedup_pct | "
+                    "paired_n | incremental_markers |"
+                ),
+                "| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- | ---: | ---: | --- |",
             ],
         )
         for operation in scenario.operations:
             incremental = operation.measurement("incremental")
             plain = operation.measurement("plain")
+            comparison = operation.comparison
             lines.append(
                 "| "
                 + " | ".join(
@@ -3061,13 +3375,24 @@ def render_compare_markdown(report: WorkloadComparisonReport) -> str:
                         "-" if incremental is None else f"{incremental.phase.metrics.p95_s * 1000:.3f}",
                         "-" if plain is None else f"{plain.phase.metrics.mean_s * 1000:.3f}",
                         "-" if plain is None else f"{plain.phase.metrics.p95_s * 1000:.3f}",
+                        _format_ratio(None if comparison is None else comparison.speedup_x),
+                        _format_ratio_ci(
+                            None if comparison is None else comparison.speedup_ci_low_x,
+                            None if comparison is None else comparison.speedup_ci_high_x,
+                        ),
+                        _format_signed_percentage(None if comparison is None else comparison.latency_reduction_pct),
+                        _format_signed_percentage_ci(
+                            None if comparison is None else comparison.latency_reduction_ci_low_pct,
+                            None if comparison is None else comparison.latency_reduction_ci_high_pct,
+                        ),
                         _format_percentage_ratio(operation.speedup()),
+                        "-" if comparison is None else str(comparison.paired_count),
                         "-" if incremental is None else _format_markers(incremental.phase.markers),
                     ],
                 )
                 + " |"
             )
-        lines.extend(["", f"Interpretation: {scenario.interpretation()}", ""])
+        lines.append("")
     return "\n".join(lines).rstrip()
 
 
@@ -3077,10 +3402,28 @@ def _format_ratio(value: float | None) -> str:
     return f"{value:.2f}x"
 
 
+def _format_ratio_ci(low: float | None, high: float | None) -> str:
+    if low is None or high is None:
+        return "-"
+    return f"[{low:.2f}x, {high:.2f}x]"
+
+
 def _format_percentage_ratio(value: float | None) -> str:
     if value is None:
         return "-"
     return f"{value * 100:.0f}%"
+
+
+def _format_signed_percentage(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:+.1f}%"
+
+
+def _format_signed_percentage_ci(low: float | None, high: float | None) -> str:
+    if low is None or high is None:
+        return "-"
+    return f"[{low:+.1f}%, {high:+.1f}%]"
 
 
 def _format_markers(markers: Mapping[str, int]) -> str:
@@ -3112,6 +3455,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--samples", type=int, default=30, help="Measured iterations per phase and round.")
     parser.add_argument("--warmup", type=int, default=5, help="Untimed warmup iterations before each measured phase.")
     parser.add_argument("--rounds", type=int, default=3, help="Independent benchmark rounds per phase.")
+    parser.add_argument(
+        "--bootstrap-resamples",
+        type=int,
+        default=2000,
+        help="Bootstrap resamples used for paired speedup confidence intervals.",
+    )
+    parser.add_argument(
+        "--confidence-level",
+        type=float,
+        default=0.95,
+        help="Confidence level used for paired speedup intervals.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Deterministic seed used for bootstrap resampling.",
+    )
+    parser.add_argument(
+        "--pair-order",
+        choices=["alternating", "candidate_first", "baseline_first"],
+        default="alternating",
+        help="Pair alignment strategy for candidate/baseline sample units.",
+    )
     parser.add_argument(
         "--payload-size",
         type=int,
@@ -3175,6 +3542,12 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--warmup must be zero or a positive integer")
     if args.rounds <= 0:
         parser.error("--rounds must be a positive integer")
+    if args.bootstrap_resamples < 0:
+        parser.error("--bootstrap-resamples must be zero or a positive integer")
+    if not 0.0 < args.confidence_level < 1.0:
+        parser.error("--confidence-level must be between 0 and 1")
+    if args.seed < 0:
+        parser.error("--seed must be zero or a positive integer")
     if args.payload_size <= 0:
         parser.error("--payload-size must be a positive integer")
     if args.output is not None and args.output_json is not None:
@@ -3199,6 +3572,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         warmup=args.warmup,
         rounds=args.rounds,
         payload_size=args.payload_size,
+        bootstrap_resamples=args.bootstrap_resamples,
+        confidence_level=args.confidence_level,
+        seed=args.seed,
+        pair_order=args.pair_order,
     )
     if args.implementation == "incremental":
         incremental_report = run_benchmarks(

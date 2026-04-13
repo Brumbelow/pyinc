@@ -26,6 +26,10 @@ Common flags:
 - `--output-json PATH`: write a JSON artifact
 - `--output-markdown PATH`: write a Markdown artifact
 - `--samples N`, `--warmup N`, `--rounds N`: measurement controls
+- `--bootstrap-resamples N`: bootstrap resamples for paired speedup confidence intervals
+- `--confidence-level FLOAT`: confidence level for paired speedup intervals (default `0.95`)
+- `--seed N`: deterministic seed for paired bootstrap resampling
+- `--pair-order {alternating,candidate_first,baseline_first}`: pair alignment strategy
 - `--payload-size N`: generic scale factor for larger scenarios
 - `--mode {strict,checked,fast}`: optional mode override
 
@@ -63,17 +67,26 @@ Default terminal output is a compact table with:
 - mode and sample count
 - mean and p95 latency
 - ops/s
-- `vs_fresh` speedup when a fresh baseline exists
+- `vs_fresh_x` and paired confidence interval when a fresh baseline exists
 - compact semantic markers
 
 Compare mode renders workload tables with:
 
 - incremental mean/p95
 - plain mean/p95
-- `speedup_pct`, where `100%` means parity and values above `100%` mean the incremental engine is faster than the plain baseline
+- `speedup_x` (paired geometric speedup ratio) and `speedup_ci_x`
+- `latency_reduction_pct` and `latency_reduction_ci_pct`
+- `speedup_pct` for backward compatibility (`100% == 1.0x`, this is ratio-as-percent, not percent-faster)
 - incremental semantic markers
+- paired sample count (`paired_n`)
 
-Markdown output adds grouped scenario sections plus a short interpretation line for each scenario. JSON output is the machine-readable schema with environment metadata, parameters, phases or operations, comparisons, and invariant summaries.
+Formulas:
+
+- `speedup_x = exp(mean(log(baseline_i) - log(candidate_i)))`
+- `latency_reduction_pct = 100 * (1 - 1 / speedup_x)`
+- confidence intervals are paired bootstrap percentile intervals computed from the paired sample units
+
+Markdown output adds grouped scenario sections with raw metric tables only. JSON output is the machine-readable schema with environment metadata, parameters, phases or operations, paired comparisons, and invariant summaries.
 
 ## Recommended Commands
 
