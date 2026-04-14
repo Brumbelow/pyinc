@@ -23,7 +23,10 @@ Supported integrations:
 - `pyfoundinc.integrations.toml_config` provides `config_analysis(db, path)` and `workspace_config_analysis(db, root)` for narrow TOML inspection: section/key extraction, dependency and optional-dependency discovery, tool config discovery, and syntax diagnostics for malformed TOML.
 - `pyfoundinc.integrations.requirements_txt` provides `requirements_analysis(db, path)` and `workspace_requirements_analysis(db, root)` for narrow requirements parsing: normalized requirement specs, file references, index directives, editable installs, URL requirements, and parse diagnostics.
 - `pyfoundinc.integrations` re-exports only the stable dataclass/result types and high-level entrypoints for these integrations. Low-level payload queries, decode helpers, and resource helpers remain experimental in their defining submodules.
-- Full `sys.path` / installed-package resolution, marker evaluation, recursive `-r` following, symbol/type resolution, LSP wiring, and watchers remain out of scope.
+
+Not yet supported:
+
+- Full `sys.path` / installed-package resolution, marker evaluation, recursive `-r` following, symbol/type resolution, LSP wiring, and watchers.
 
 Verification:
 
