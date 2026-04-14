@@ -1,3 +1,10 @@
+from .installed_packages import (
+    ImportNameResolution,
+    InstalledPackageRef,
+    InstalledPackagesAnalysis,
+    installed_packages_analysis,
+    resolve_import_name,
+)
 from .python_source import (
     DefinitionRef,
     DependencySurface,
@@ -36,8 +43,11 @@ __all__ = [
     "DependencySurface",
     "Diagnostic",
     "FileReference",
+    "ImportNameResolution",
     "ImportRef",
     "IndexDirective",
+    "InstalledPackageRef",
+    "InstalledPackagesAnalysis",
     "PythonFileAnalysis",
     "PythonModuleAnalysis",
     "PythonWorkspaceAnalysis",
@@ -47,8 +57,10 @@ __all__ = [
     "config_analysis",
     "directory_analysis",
     "file_analysis",
+    "installed_packages_analysis",
     "module_analysis",
     "requirements_analysis",
+    "resolve_import_name",
     "workspace_analysis",
     "workspace_config_analysis",
     "workspace_requirements_analysis",

@@ -13,7 +13,7 @@
 
 `Database.inspect(...)` returns the last recorded provenance tree for a query key, and `Database.explain(...)` formats that tree without changing the node's recorded decision just by inspecting it.
 
-Evaluation is top-down. `db.get()` verifies dependencies first, then either reuses the memo or re-executes the query. If a re-executed query returns a semantically equal value, the record is backdated so downstream nodes stay clean.
+Evaluation is top-down. `db.get()` verifies dependencies first, then either reuses the memo or re-executes the query. If a re-executed query returns a semantically equal value, the record is **backdated** (also called **early cutoff**) so downstream nodes stay clean.
 
 `Database(max_query_nodes=...)` bounds only query memo nodes via LRU at top-level request boundaries. Inputs and resources remain resident.
 
@@ -44,11 +44,12 @@ Resource node identity includes resource configuration. Built-in resources are s
 - value-boundary helpers such as `freeze`, `thaw`, `semantic_equal`, and `ValueAdapter`
 - structured inspection via `InspectionNode`, `Database.inspect(...)`, and `Database.explain(...)`
 
-`pyinc.integrations` exposes the stable high-level surfaces from the three shipped integrations:
+`pyinc.integrations` exposes the stable high-level surfaces from the four shipped integrations:
 
 - `python_source` for narrow Python source and workspace-local module analysis
 - `toml_config` for narrow `pyproject.toml` inspection
 - `requirements_txt` for narrow `requirements.txt` inspection
+- `installed_packages` for installed package discovery, stdlib module identification, and import name resolution
 
 Low-level payload queries, decode helpers, and resource helpers remain module-local experimental helpers. The public integration boundary is the dataclass/result layer plus the documented high-level entrypoints in `docs/integration-contract.md`.
 
@@ -64,7 +65,7 @@ Version 1 targets:
 - optional file metadata resources (`FileStatResource`) for stat-level dependencies
 - explanation/provenance for reuse vs recompute
 - inline package typing via `py.typed`
-- narrow supported integrations for Python source analysis, TOML config inspection, and requirements parsing
+- narrow supported integrations for Python source analysis, TOML config inspection, requirements parsing, and installed package discovery
 
 Version 1 does not include:
 

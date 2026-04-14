@@ -8,6 +8,11 @@ pyinc guarantees **from-scratch consistency** — the result of incremental
 evaluation matches a fresh evaluation on the same declared inputs and resources —
 when and only when the three conditions below hold.
 
+When a recomputed value is semantically equal to the previously stored value,
+the record is **backdated** (also called **early cutoff**): its `changed_at`
+revision is not advanced, so downstream dependents remain green and avoid
+unnecessary recomputation.
+
 ### Conditions for From-Scratch Consistency
 
 **1. Value boundary ownership.**

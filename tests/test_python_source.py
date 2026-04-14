@@ -64,6 +64,12 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "ConfigSection",
         "config_analysis",
         "workspace_config_analysis",
+        # installed_packages
+        "ImportNameResolution",
+        "InstalledPackageRef",
+        "InstalledPackagesAnalysis",
+        "installed_packages_analysis",
+        "resolve_import_name",
     }
     assert hasattr(integrations, "file_analysis")
     assert hasattr(integrations, "directory_analysis")

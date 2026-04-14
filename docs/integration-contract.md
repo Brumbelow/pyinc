@@ -119,11 +119,36 @@ Out of scope for this integration:
 - recursive `-r` file inclusion (references are extracted but not followed)
 - pip-specific options beyond index/find-links directives
 
+## Installed Packages Integration Scope
+
+The `installed_packages` integration is intentionally narrow:
+
+Scope:
+
+- installed package discovery via `.dist-info` directory scanning in site-packages
+- `METADATA` file parsing for distribution name, version, summary, and `Requires-Dist`
+- `top_level.txt` reading for import-name-to-package mapping (falls back to normalized distribution name)
+- stdlib module identification via `sys.stdlib_module_names` (Python 3.10+)
+- import name resolution: `stdlib` / `installed` / `unknown`
+- resource-tracked site-packages directory listings and metadata files
+- `db.report_untracked_read()` for `sys.path` discovery (runtime list, not interceptable)
+- cutoff-based backdating on metadata parsing (field-only comparison, whitespace changes backdate)
+- `installed_packages_analysis(db)` for full environment analysis
+- `resolve_import_name(db, import_name)` for single import resolution
+
+Out of scope for this integration:
+
+- `.egg-info` or `.egg` format packages
+- namespace package detection
+- marker expression evaluation or version satisfaction
+- `sys.path` manipulation or `.pth` file processing
+- integration with `python_source` import resolution (future composition)
+
 ## Out Of Scope
 
 This contract does not include:
 
-- full `sys.path` or installed-package resolution
+- full `sys.path` / installed-package resolution integrated into `python_source` import resolution
 - symbol or type resolution
 - LSP wiring
 - file watchers or schedulers
