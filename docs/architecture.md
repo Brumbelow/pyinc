@@ -35,6 +35,25 @@ Query identity includes the supported function definition payload, so ambient im
 
 Resource node identity includes resource configuration. Built-in resources are snapshot-safe dataclasses, and custom resources must either be snapshot-safe themselves or expose an `identity()` payload for keying.
 
+## Package Shape Today
+
+`pyfoundinc` exposes a stable kernel surface from the top-level package:
+
+- `Database`, `Input`, and `@query` for the query runtime
+- `FileResource`, `FileStatResource`, `EnvResource`, and `DirectoryResource` for tracked external reads
+- value-boundary helpers such as `freeze`, `thaw`, `semantic_equal`, and `ValueAdapter`
+- structured inspection via `InspectionNode`, `Database.inspect(...)`, and `Database.explain(...)`
+
+`pyfoundinc.integrations` exposes the stable high-level surfaces from the three shipped integrations:
+
+- `python_source` for narrow Python source and workspace-local module analysis
+- `toml_config` for narrow `pyproject.toml` inspection
+- `requirements_txt` for narrow `requirements.txt` inspection
+
+Low-level payload queries, decode helpers, and resource helpers remain module-local experimental helpers. The public integration boundary is the dataclass/result layer plus the documented high-level entrypoints in `docs/integration-contract.md`.
+
+The repository also includes small examples under `examples/` plus dedicated tests for kernel semantics, property-based from-scratch consistency, and each shipped integration.
+
 ## Scope
 
 Version 1 targets:
@@ -45,6 +64,7 @@ Version 1 targets:
 - optional file metadata resources (`FileStatResource`) for stat-level dependencies
 - explanation/provenance for reuse vs recompute
 - inline package typing via `py.typed`
+- narrow supported integrations for Python source analysis, TOML config inspection, and requirements parsing
 
 Version 1 does not include:
 

@@ -4,11 +4,11 @@ An integration is a domain-specific query graph built on the pyfoundinc kernel. 
 provides revisions, dependency tracking, red-green verification, and backdating. The
 integration provides domain types, query decomposition, and external-state resources.
 
-This guide extracts the patterns from the reference integration
-(`pyfoundinc.integrations.python_source`) as a reusable recipe. Read
+This guide extracts the shared patterns from the shipped integrations, using
+`pyfoundinc.integrations.python_source` as the reference template and
+`toml_config` / `requirements_txt` as smaller companion examples. Read
 [kernel-contract.md](kernel-contract.md) for the soundness envelope and
-[integration-contract.md](integration-contract.md) for the reference integration's
-public boundary.
+[integration-contract.md](integration-contract.md) for the current public boundary.
 
 ### Three-Layer Query Structure
 
@@ -163,17 +163,17 @@ Three categories of tests for an integration:
 
 **Contract lock tests.** Verify that `__all__` has not drifted and that experimental
 helpers are not re-exported. Reference:
-`test_package_namespace_exports_only_stable_python_source_api` (test_python_source.py:39).
+`test_package_namespace_exports_only_stable_api` in `tests/test_python_source.py`.
 
 **Mode-parametrized correctness tests.** Verify results across `strict`, `checked`, and
 `fast` modes. Verify backdating explicitly: non-semantic edits should trigger backdating
 and downstream reuse. Reference: `test_file_analysis_reports_top_level_symbols_by_mode`
-(test_python_source.py:66).
+in `tests/test_python_source.py`.
 
 **From-scratch consistency tests.** The gold standard: compare incremental results against
 fresh-database recomputation over a sequence of state changes. Reference:
-`test_workspace_analysis_matches_fresh_recomputation_over_changes`
-(test_python_source.py:702).
+`test_workspace_analysis_matches_fresh_recomputation_over_changes` in
+`tests/test_python_source.py`.
 
 ### Checklist
 

@@ -5,7 +5,11 @@
 
 ## Stable Public API
 
-For `pyfoundinc.integrations.python_source`, the stable public surface is:
+`pyfoundinc.integrations` re-exports only the stable dataclass/result types and
+high-level entrypoints from the shipped integrations below.
+
+For `pyfoundinc.integrations.python_source` (the reference integration), the stable public
+surface is:
 
 - dataclass result types:
   - `ImportRef`
@@ -22,8 +26,6 @@ For `pyfoundinc.integrations.python_source`, the stable public surface is:
   - `module_analysis(db, root, path)`
   - `workspace_analysis(db, root)`
 
-`pyfoundinc.integrations` re-exports only these stable surfaces.
-
 For `pyfoundinc.integrations.toml_config`, the stable public surface is:
 
 - dataclass result types:
@@ -34,21 +36,33 @@ For `pyfoundinc.integrations.toml_config`, the stable public surface is:
   - `config_analysis(db, path)`
   - `workspace_config_analysis(db, root)`
 
+For `pyfoundinc.integrations.requirements_txt`, the stable public surface is:
+
+- dataclass result types:
+  - `RequirementRef`
+  - `FileReference`
+  - `IndexDirective`
+  - `RequirementsAnalysis`
+- high-level entrypoints:
+  - `requirements_analysis(db, path)`
+  - `workspace_requirements_analysis(db, root)`
+
 ## Experimental Helpers
 
-Low-level query nodes and payload helpers in `pyfoundinc.integrations.python_source` are retained for
-debugging and targeted tests. Examples include `source_text`, `imports_for_file`,
-`resolved_imports_for_file`, and the `*_payload` helpers.
+Low-level query nodes, payload helpers, decode helpers, and module-local resource helpers in
+the integration submodules are retained for debugging and targeted tests. Examples include
+`source_text`, `imports_for_file`, `config_file_text`, `requirements_payload`, and the
+`*_payload` helpers.
 
-Those names remain importable from the module itself, but they are experimental:
+Those names remain importable from their defining submodules, but they are experimental:
 
 - they are not re-exported from `pyfoundinc.integrations`
 - they do not carry the same compatibility promise as the stable dataclass views and entrypoints
 - new integrations should not depend on them as a public contract
 
-## Current Reference Integration Scope
+## Python Source Integration Scope
 
-The reference integration is intentionally narrow:
+`python_source` is intentionally narrow:
 
 - workspace-local module discovery rooted at the supplied directory
 - traversal is cycle-safe and constrained to real paths under the supplied root
@@ -81,16 +95,7 @@ The TOML config integration is intentionally narrow:
 
 ## Requirements.txt Integration Scope
 
-The requirements.txt integration is intentionally narrow:
-
-- dataclass result types:
-  - `RequirementRef`
-  - `FileReference`
-  - `IndexDirective`
-  - `RequirementsAnalysis`
-- high-level entrypoints:
-  - `requirements_analysis(db, path)`
-  - `workspace_requirements_analysis(db, root)`
+The `requirements_txt` integration is intentionally narrow:
 
 Scope:
 

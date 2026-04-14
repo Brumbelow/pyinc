@@ -16,16 +16,20 @@ Current scope:
 - optional bounded query memoization via `Database(max_query_nodes=...)`
 - `Database.inspect(...)` for structured provenance and `Database.explain(...)` for human-readable formatting
 
-Supported reference integration:
+Supported integrations:
 
-- `pyfoundinc.integrations.python_source` formalizes the mini-analyzer example as a supported reference integration.
-- `file_analysis(db, path)` and `directory_analysis(db, root)` return stable dataclass views backed by internal query nodes.
-- `module_analysis(db, root, path)` and `workspace_analysis(db, root)` add a recursive, workspace-local module graph over the same kernel.
-- The integration is still intentionally narrow: workspace-local module discovery, top-level imports/definitions plus simple top-level assignment tracking for export surfaces, syntax diagnostics only, and dependency invalidation based on resolved module export surfaces.
-- Workspace traversal is cycle-safe and constrained to real paths under the supplied root.
-- `from x import *` is supported conservatively: literal top-level `__all__` is honored when statically recoverable, otherwise wildcard exports fall back to non-underscore top-level bound names, and dynamic export cases re-execute conservatively instead of reusing optimistically.
-- `pyfoundinc.integrations` re-exports only the stable dataclass/result surface and the four high-level analysis entrypoints. Low-level query helpers such as `source_text` and the `*_payload` nodes remain module-local experimental helpers in `pyfoundinc.integrations.python_source`.
-- Full `sys.path` / installed-package resolution, symbol/type resolution, LSP wiring, and watchers remain out of scope.
+- `pyfoundinc.integrations.python_source` is the reference integration. `file_analysis(db, path)` and `directory_analysis(db, root)` expose file-level analysis, while `module_analysis(db, root, path)` and `workspace_analysis(db, root)` add a recursive workspace-local module graph.
+- `python_source` stays intentionally narrow: workspace-local module discovery, top-level imports/definitions plus simple top-level assignment tracking for export surfaces, syntax diagnostics only, and conservative dependency invalidation based on resolved module export surfaces.
+- `pyfoundinc.integrations.toml_config` provides `config_analysis(db, path)` and `workspace_config_analysis(db, root)` for narrow TOML inspection: section/key extraction, dependency and optional-dependency discovery, tool config discovery, and syntax diagnostics for malformed TOML.
+- `pyfoundinc.integrations.requirements_txt` provides `requirements_analysis(db, path)` and `workspace_requirements_analysis(db, root)` for narrow requirements parsing: normalized requirement specs, file references, index directives, editable installs, URL requirements, and parse diagnostics.
+- `pyfoundinc.integrations` re-exports only the stable dataclass/result types and high-level entrypoints for these integrations. Low-level payload queries, decode helpers, and resource helpers remain experimental in their defining submodules.
+- Full `sys.path` / installed-package resolution, marker evaluation, recursive `-r` following, symbol/type resolution, LSP wiring, and watchers remain out of scope.
+
+Verification:
+
+- The runtime contract is summarized in [docs/kernel-contract.md](docs/kernel-contract.md).
+- The repo includes dedicated test modules for value semantics, runtime behavior, provenance/explanation formatting, property-based from-scratch consistency, and each shipped integration.
+- The integration suites exercise `strict`, `checked`, and `fast` modes and compare incremental results against fresh recomputation over edit sequences.
 
 The integration boundary is summarized in [docs/integration-contract.md](docs/integration-contract.md).
 
