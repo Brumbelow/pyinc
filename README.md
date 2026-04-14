@@ -24,10 +24,6 @@ Supported integrations:
 - `pyfoundinc.integrations.requirements_txt` provides `requirements_analysis(db, path)` and `workspace_requirements_analysis(db, root)` for narrow requirements parsing: normalized requirement specs, file references, index directives, editable installs, URL requirements, and parse diagnostics.
 - `pyfoundinc.integrations` re-exports only the stable dataclass/result types and high-level entrypoints for these integrations. Low-level payload queries, decode helpers, and resource helpers remain experimental in their defining submodules.
 
-Not yet supported:
-
-- Full `sys.path` / installed-package resolution, marker evaluation, recursive `-r` following, symbol/type resolution, LSP wiring, and watchers.
-
 Verification:
 
 - The runtime contract is summarized in [docs/kernel-contract.md](docs/kernel-contract.md).
@@ -48,6 +44,10 @@ Gotchas:
 - Query identity includes the function definition payload. If you capture ambient values, those captures are part of the query fingerprint, and mutable closure/global captures are rejected.
 - `Database.report_untracked_read(...)` is an explicit impurity escape hatch. It marks that query as always re-executing and disables backdating for that node.
 - The package ships inline typing metadata via `py.typed`.
+
+Not yet supported:
+
+- Full `sys.path` / installed-package resolution, marker evaluation, recursive `-r` following, symbol/type resolution, LSP wiring, and watchers.
 
 Development:
 
