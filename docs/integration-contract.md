@@ -79,6 +79,41 @@ The TOML config integration is intentionally narrow:
 - cutoff-based backdating using parsed structure (comment-only edits are backdated)
 - TOML datetime values are converted to ISO strings (no adapter required)
 
+## Requirements.txt Integration Scope
+
+The requirements.txt integration is intentionally narrow:
+
+- dataclass result types:
+  - `RequirementRef`
+  - `FileReference`
+  - `IndexDirective`
+  - `RequirementsAnalysis`
+- high-level entrypoints:
+  - `requirements_analysis(db, path)`
+  - `workspace_requirements_analysis(db, root)`
+
+Scope:
+
+- single-file requirements.txt parsing via `requirements_analysis(db, path)`
+- workspace-root discovery of `requirements.txt` via `workspace_requirements_analysis(db, root)`
+- PEP 508 specifier extraction: package name, extras, version constraints, environment markers
+- package name normalization per PEP 503 (lowercase, hyphens/dots to underscores)
+- file references (`-r`/`--requirement`, `-c`/`--constraint`)
+- index directives (`--index-url`, `--extra-index-url`, `--find-links`)
+- editable install detection (`-e`/`--editable`)
+- URL-based requirements (`name @ url`)
+- line continuation support (backslash-newline)
+- diagnostics for unparseable lines
+- cutoff-based backdating (comment-only and whitespace-only edits are backdated)
+
+Out of scope for this integration:
+
+- marker expression evaluation
+- version specifier satisfaction or resolution
+- URL fetching or VCS cloning
+- recursive `-r` file inclusion (references are extracted but not followed)
+- pip-specific options beyond index/find-links directives
+
 ## Out Of Scope
 
 This contract does not include:

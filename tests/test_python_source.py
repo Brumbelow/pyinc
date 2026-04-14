@@ -51,6 +51,13 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "file_analysis",
         "module_analysis",
         "workspace_analysis",
+        # requirements_txt
+        "FileReference",
+        "IndexDirective",
+        "RequirementRef",
+        "RequirementsAnalysis",
+        "requirements_analysis",
+        "workspace_requirements_analysis",
         # toml_config
         "ConfigAnalysis",
         "ConfigKey",
