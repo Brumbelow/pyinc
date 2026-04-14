@@ -8,10 +8,10 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, TypeAlias, cast
 
-from pyfoundinc.core import query
-from pyfoundinc.resources import DirectoryResource
-from pyfoundinc.runtime import Database
-from pyfoundinc.value import freeze, thaw
+from pyinc.core import query
+from pyinc.resources import DirectoryResource
+from pyinc.runtime import Database
+from pyinc.value import freeze, thaw
 
 ConfigKeyPayload: TypeAlias = tuple[str, str, str, str]
 ConfigSectionPayload: TypeAlias = tuple[str, tuple[ConfigKeyPayload, ...], tuple[str, ...]]

@@ -3,14 +3,14 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pyfoundinc"
+name = "pyinc"
 version = "0.1.0"
 description = "A correctness-first incremental query engine for Python."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
-  { name = "pyfoundinc contributors" },
+  { name = "pyinc contributors" },
 ]
 keywords = ["incremental-computation", "query-kernel", "salsa", "red-green", "backdating", "provenance"]
 classifiers = [
@@ -35,7 +35,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pyfoundinc"]
+packages = ["src/pyinc"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

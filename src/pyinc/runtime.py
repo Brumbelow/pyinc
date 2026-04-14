@@ -160,11 +160,11 @@ class Database:
         self._query_last_used: dict[NodeKey, int] = {}
         self._query_touch_counter = 0
         self._execution_stack: ContextVar[tuple[ExecutionFrame, ...]] = ContextVar(
-            "pyfoundinc_execution_stack",
+            "pyinc_execution_stack",
             default=(),
         )
-        self._allow_raw_reads: ContextVar[bool] = ContextVar("pyfoundinc_allow_raw_reads", default=False)
-        self._request_token: ContextVar[int | None] = ContextVar("pyfoundinc_request_token", default=None)
+        self._allow_raw_reads: ContextVar[bool] = ContextVar("pyinc_allow_raw_reads", default=False)
+        self._request_token: ContextVar[int | None] = ContextVar("pyinc_request_token", default=None)
         self._request_counter = 0
 
     @property

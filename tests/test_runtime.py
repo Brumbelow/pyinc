@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 
-from pyfoundinc import (
+from pyinc import (
     CycleError,
     Database,
     DirectoryResource,
@@ -303,22 +303,22 @@ def test_raw_open_is_rejected_inside_query(tmp_path: Path) -> None:
 
 
 def test_os_getenv_is_rejected_inside_query(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("PYFOUNDINC_DIRECT_ENV", "value")
+    monkeypatch.setenv("PYINC_DIRECT_ENV", "value")
 
     @query
     def read_env(db: Database) -> str | None:
-        return os.getenv("PYFOUNDINC_DIRECT_ENV")
+        return os.getenv("PYINC_DIRECT_ENV")
 
     with pytest.raises(UntrackedReadError):
         Database().get(read_env)
 
 
 def test_os_environ_access_is_rejected_inside_query(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("PYFOUNDINC_DIRECT_ENV", "value")
+    monkeypatch.setenv("PYINC_DIRECT_ENV", "value")
 
     @query
     def read_env_mapping(db: Database) -> str:
-        return os.environ["PYFOUNDINC_DIRECT_ENV"]
+        return os.environ["PYINC_DIRECT_ENV"]
 
     with pytest.raises(UntrackedReadError):
         Database().get(read_env_mapping)
@@ -362,14 +362,14 @@ def test_directory_helpers_are_rejected_inside_query(tmp_path: Path, method_name
 def test_resource_reads_are_allowed_inside_query(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     env = EnvResource()
     directories = DirectoryResource()
-    monkeypatch.setenv("PYFOUNDINC_TRACKED_ENV", "value")
+    monkeypatch.setenv("PYINC_TRACKED_ENV", "value")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "a.txt").write_text("alpha", encoding="utf-8")
 
     @query
     def read_tracked(db: Database, dirname: str) -> tuple[str | None, tuple[str, ...]]:
-        return env.read(db, "PYFOUNDINC_TRACKED_ENV"), directories.read(db, dirname)
+        return env.read(db, "PYINC_TRACKED_ENV"), directories.read(db, dirname)
 
     db = Database()
     assert db.get(read_tracked, str(workspace)) == ("value", ("a.txt",))
@@ -594,15 +594,15 @@ def test_file_resource_identity_includes_configuration(tmp_path: Path) -> None:
 def test_env_resource_instances_share_stable_behavior(monkeypatch: pytest.MonkeyPatch) -> None:
     env_a = EnvResource()
     env_b = EnvResource()
-    monkeypatch.setenv("PYFOUNDINC_SAMPLE", "value")
+    monkeypatch.setenv("PYINC_SAMPLE", "value")
 
     @query
     def read_a(db: Database) -> str | None:
-        return env_a.read(db, "PYFOUNDINC_SAMPLE")
+        return env_a.read(db, "PYINC_SAMPLE")
 
     @query
     def read_b(db: Database) -> str | None:
-        return env_b.read(db, "PYFOUNDINC_SAMPLE")
+        return env_b.read(db, "PYINC_SAMPLE")
 
     db = Database()
     assert db.get(read_a) == "value"
@@ -1238,8 +1238,8 @@ def test_fast_mode_does_not_detect_return_value_mutation_unlike_checked() -> Non
     @query
     def mutate_and_read(db: Database) -> int:
         data = produce(db)
-        cast(dict[str, list[int]], data)["items"].append(4)
-        return len(cast(dict[str, list[int]], data)["items"])
+        data["items"].append(4)
+        return len(data["items"])
 
     # Fast mode: no error, mutation silently allowed.
     fast_db = Database(mode="fast")
@@ -1266,11 +1266,11 @@ def test_fast_mode_frozen_snapshot_safe_despite_mutation() -> None:
     db.set(trigger, 1)
 
     first = db.get(produce)
-    cast(dict[str, list[int]], first)["items"].append(4)
+    first["items"].append(4)
 
     # Fresh get returns uncontaminated copy from the frozen snapshot.
     second = db.get(produce)
-    assert cast(dict[str, list[int]], second)["items"] == [1, 2, 3]
+    assert second["items"] == [1, 2, 3]
 
 
 # Limitation 5 — Cycle-adjacent partial state

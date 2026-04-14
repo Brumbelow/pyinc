@@ -5,9 +5,9 @@ from typing import Literal
 
 import pytest
 
-import pyfoundinc.integrations as integrations
-from pyfoundinc import Database
-from pyfoundinc.integrations.requirements_txt import (
+import pyinc.integrations as integrations
+from pyinc import Database
+from pyinc.integrations.requirements_txt import (
     RequirementsAnalysis,
     requirements_analysis,
     workspace_requirements_analysis,

@@ -5,9 +5,9 @@ from typing import Literal
 
 import pytest
 
-import pyfoundinc.integrations as integrations
-from pyfoundinc import Database
-from pyfoundinc.integrations.toml_config import (
+import pyinc.integrations as integrations
+from pyinc import Database
+from pyinc.integrations.toml_config import (
     ConfigAnalysis,
     config_analysis,
     workspace_config_analysis,

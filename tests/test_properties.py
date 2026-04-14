@@ -7,8 +7,8 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from pyfoundinc import Database, FileResource, Input, MutationError, query
-from pyfoundinc.integrations.python_source import workspace_analysis
+from pyinc import Database, FileResource, Input, MutationError, query
+from pyinc.integrations.python_source import workspace_analysis
 
 Operation = tuple[str, int | str]
 WorkspaceState = tuple[str, str, bool]

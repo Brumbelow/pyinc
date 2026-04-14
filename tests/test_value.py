@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import pytest
 
-from pyfoundinc import (
+from pyinc import (
     Database,
     FrozenAdapterValue,
     Input,
@@ -17,7 +17,7 @@ from pyfoundinc import (
     query,
     thaw,
 )
-from pyfoundinc.value import (
+from pyinc.value import (
     FrozenDict,
     FrozenList,
     FrozenRecord,

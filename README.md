@@ -1,6 +1,6 @@
-# pyfoundinc
+# pyinc
 
-`pyfoundinc` is a correctness-first incremental computation engine for Python: a Python-native query kernel in the design space of Salsa, Jane Street Incremental, and Bazel/Skyframe.
+`pyinc` is a correctness-first incremental computation engine for Python: a Python-native query kernel in the design space of Salsa, Jane Street Incremental, and Bazel/Skyframe.
 
 The package remains alpha. The v1 kernel contract is stable within the documented soundness envelope.
 
@@ -18,11 +18,11 @@ Current scope:
 
 Supported integrations:
 
-- `pyfoundinc.integrations.python_source` is the reference integration. `file_analysis(db, path)` and `directory_analysis(db, root)` expose file-level analysis, while `module_analysis(db, root, path)` and `workspace_analysis(db, root)` add a recursive workspace-local module graph.
+- `pyinc.integrations.python_source` is the reference integration. `file_analysis(db, path)` and `directory_analysis(db, root)` expose file-level analysis, while `module_analysis(db, root, path)` and `workspace_analysis(db, root)` add a recursive workspace-local module graph.
 - `python_source` stays intentionally narrow: workspace-local module discovery, top-level imports/definitions plus simple top-level assignment tracking for export surfaces, syntax diagnostics only, and conservative dependency invalidation based on resolved module export surfaces.
-- `pyfoundinc.integrations.toml_config` provides `config_analysis(db, path)` and `workspace_config_analysis(db, root)` for narrow TOML inspection: section/key extraction, dependency and optional-dependency discovery, tool config discovery, and syntax diagnostics for malformed TOML.
-- `pyfoundinc.integrations.requirements_txt` provides `requirements_analysis(db, path)` and `workspace_requirements_analysis(db, root)` for narrow requirements parsing: normalized requirement specs, file references, index directives, editable installs, URL requirements, and parse diagnostics.
-- `pyfoundinc.integrations` re-exports only the stable dataclass/result types and high-level entrypoints for these integrations. Low-level payload queries, decode helpers, and resource helpers remain experimental in their defining submodules.
+- `pyinc.integrations.toml_config` provides `config_analysis(db, path)` and `workspace_config_analysis(db, root)` for narrow TOML inspection: section/key extraction, dependency and optional-dependency discovery, tool config discovery, and syntax diagnostics for malformed TOML.
+- `pyinc.integrations.requirements_txt` provides `requirements_analysis(db, path)` and `workspace_requirements_analysis(db, root)` for narrow requirements parsing: normalized requirement specs, file references, index directives, editable installs, URL requirements, and parse diagnostics.
+- `pyinc.integrations` re-exports only the stable dataclass/result types and high-level entrypoints for these integrations. Low-level payload queries, decode helpers, and resource helpers remain experimental in their defining submodules.
 
 Verification:
 

@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 
-class PyFoundIncError(Exception):
-    """Base error for pyfoundinc."""
+class PyIncError(Exception):
+    """Base error for pyinc."""
 
 
-class MutationError(PyFoundIncError):
+class MutationError(PyIncError):
     """Raised when a query mutates one of its boundary inputs."""
 
 
-class UntrackedReadError(PyFoundIncError):
+class UntrackedReadError(PyIncError):
     """Raised when code performs an undeclared external read."""
 
 
-class UnsupportedValueError(PyFoundIncError):
+class UnsupportedValueError(PyIncError):
     """Raised when a value cannot cross a cached boundary safely."""
 
 
-class CycleError(PyFoundIncError):
+class CycleError(PyIncError):
     """Raised when query evaluation encounters a dependency cycle."""

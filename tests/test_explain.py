@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pyfoundinc.explain import InspectionNode, format_explanation
+from pyinc.explain import InspectionNode, format_explanation
 
 
 def _leaf(label: str = "leaf", reason: str = "set by user") -> InspectionNode:

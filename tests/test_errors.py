@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import pyfoundinc
-from pyfoundinc.errors import (
+import pyinc
+from pyinc.errors import (
     CycleError,
     MutationError,
-    PyFoundIncError,
+    PyIncError,
     UnsupportedValueError,
     UntrackedReadError,
 )
@@ -12,16 +12,16 @@ from pyfoundinc.errors import (
 
 def test_error_hierarchy_inherits_from_base() -> None:
     for cls in (MutationError, UntrackedReadError, UnsupportedValueError, CycleError):
-        assert issubclass(cls, PyFoundIncError)
+        assert issubclass(cls, PyIncError)
 
 
 def test_base_error_inherits_from_exception() -> None:
-    assert issubclass(PyFoundIncError, Exception)
+    assert issubclass(PyIncError, Exception)
 
 
 def test_error_messages_are_preserved() -> None:
     msg = "something went wrong"
-    for cls in (PyFoundIncError, MutationError, UntrackedReadError, UnsupportedValueError, CycleError):
+    for cls in (PyIncError, MutationError, UntrackedReadError, UnsupportedValueError, CycleError):
         err = cls(msg)
         assert str(err) == msg
 
@@ -31,13 +31,13 @@ def test_errors_are_catchable_by_base_class() -> None:
         with_caught = False
         try:
             raise cls("test")
-        except PyFoundIncError:
+        except PyIncError:
             with_caught = True
         assert with_caught
 
 
 def test_error_types_are_exported_from_package() -> None:
-    for name in ("PyFoundIncError", "MutationError", "UntrackedReadError",
+    for name in ("PyIncError", "MutationError", "UntrackedReadError",
                  "UnsupportedValueError", "CycleError"):
-        assert name in pyfoundinc.__all__
-        assert hasattr(pyfoundinc, name)
+        assert name in pyinc.__all__
+        assert hasattr(pyinc, name)

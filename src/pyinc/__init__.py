@@ -2,7 +2,7 @@ from .core import Input, query
 from .errors import (
     CycleError,
     MutationError,
-    PyFoundIncError,
+    PyIncError,
     UnsupportedValueError,
     UntrackedReadError,
 )
@@ -43,7 +43,7 @@ __all__ = [
     "Input",
     "InspectionNode",
     "MutationError",
-    "PyFoundIncError",
+    "PyIncError",
     "UnsupportedValueError",
     "UntrackedReadError",
     "ValueAdapter",

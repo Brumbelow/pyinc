@@ -1,14 +1,14 @@
 # Integration Contract
 
-`pyfoundinc` keeps integrations narrow on purpose. The core runtime contract stays in
+`pyinc` keeps integrations narrow on purpose. The core runtime contract stays in
 `docs/kernel-contract.md`; this document defines what an integration may expose as public API.
 
 ## Stable Public API
 
-`pyfoundinc.integrations` re-exports only the stable dataclass/result types and
+`pyinc.integrations` re-exports only the stable dataclass/result types and
 high-level entrypoints from the shipped integrations below.
 
-For `pyfoundinc.integrations.python_source` (the reference integration), the stable public
+For `pyinc.integrations.python_source` (the reference integration), the stable public
 surface is:
 
 - dataclass result types:
@@ -26,7 +26,7 @@ surface is:
   - `module_analysis(db, root, path)`
   - `workspace_analysis(db, root)`
 
-For `pyfoundinc.integrations.toml_config`, the stable public surface is:
+For `pyinc.integrations.toml_config`, the stable public surface is:
 
 - dataclass result types:
   - `ConfigKey`
@@ -36,7 +36,7 @@ For `pyfoundinc.integrations.toml_config`, the stable public surface is:
   - `config_analysis(db, path)`
   - `workspace_config_analysis(db, root)`
 
-For `pyfoundinc.integrations.requirements_txt`, the stable public surface is:
+For `pyinc.integrations.requirements_txt`, the stable public surface is:
 
 - dataclass result types:
   - `RequirementRef`
@@ -56,7 +56,7 @@ the integration submodules are retained for debugging and targeted tests. Exampl
 
 Those names remain importable from their defining submodules, but they are experimental:
 
-- they are not re-exported from `pyfoundinc.integrations`
+- they are not re-exported from `pyinc.integrations`
 - they do not carry the same compatibility promise as the stable dataclass views and entrypoints
 - new integrations should not depend on them as a public contract
 

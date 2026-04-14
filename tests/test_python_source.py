@@ -5,9 +5,9 @@ from typing import Literal
 
 import pytest
 
-import pyfoundinc.integrations as integrations
-from pyfoundinc import Database
-from pyfoundinc.integrations.python_source import (
+import pyinc.integrations as integrations
+from pyinc import Database
+from pyinc.integrations.python_source import (
     DefinitionRef,
     DependencySurface,
     ImportRef,

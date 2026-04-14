@@ -1,8 +1,8 @@
-# pyfoundinc Architecture
+# pyinc Architecture
 
 ## Kernel
 
-`pyfoundinc` is a pull-based incremental query runtime. The database stores query memos, inputs, and resources as revisioned node records with:
+`pyinc` is a pull-based incremental query runtime. The database stores query memos, inputs, and resources as revisioned node records with:
 
 - a stable node key
 - a frozen boundary snapshot
@@ -37,14 +37,14 @@ Resource node identity includes resource configuration. Built-in resources are s
 
 ## Package Shape Today
 
-`pyfoundinc` exposes a stable kernel surface from the top-level package:
+`pyinc` exposes a stable kernel surface from the top-level package:
 
 - `Database`, `Input`, and `@query` for the query runtime
 - `FileResource`, `FileStatResource`, `EnvResource`, and `DirectoryResource` for tracked external reads
 - value-boundary helpers such as `freeze`, `thaw`, `semantic_equal`, and `ValueAdapter`
 - structured inspection via `InspectionNode`, `Database.inspect(...)`, and `Database.explain(...)`
 
-`pyfoundinc.integrations` exposes the stable high-level surfaces from the three shipped integrations:
+`pyinc.integrations` exposes the stable high-level surfaces from the three shipped integrations:
 
 - `python_source` for narrow Python source and workspace-local module analysis
 - `toml_config` for narrow `pyproject.toml` inspection

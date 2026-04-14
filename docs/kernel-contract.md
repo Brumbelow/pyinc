@@ -1,10 +1,10 @@
 ## Kernel Contract — Soundness Envelope
 
-`pyfoundinc` v1 is a correctness-first, in-memory incremental query kernel.
+`pyinc` v1 is a correctness-first, in-memory incremental query kernel.
 
 ### The Guarantee
 
-pyfoundinc guarantees **from-scratch consistency** — the result of incremental
+pyinc guarantees **from-scratch consistency** — the result of incremental
 evaluation matches a fresh evaluation on the same declared inputs and resources —
 when and only when the three conditions below hold.
 

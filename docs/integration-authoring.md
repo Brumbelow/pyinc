@@ -1,11 +1,11 @@
 ## Integration Authoring Guide
 
-An integration is a domain-specific query graph built on the pyfoundinc kernel. The kernel
+An integration is a domain-specific query graph built on the pyinc kernel. The kernel
 provides revisions, dependency tracking, red-green verification, and backdating. The
 integration provides domain types, query decomposition, and external-state resources.
 
 This guide extracts the shared patterns from the shipped integrations, using
-`pyfoundinc.integrations.python_source` as the reference template and
+`pyinc.integrations.python_source` as the reference template and
 `toml_config` / `requirements_txt` as smaller companion examples. Read
 [kernel-contract.md](kernel-contract.md) for the soundness envelope and
 [integration-contract.md](integration-contract.md) for the current public boundary.
@@ -151,11 +151,11 @@ Define the public boundary explicitly:
 1. Add `__all__` to your integration module listing only stable dataclass types and
    high-level entrypoints. Reference: python_source.py:811-824 lists 8 types and
    4 functions.
-2. Add re-exports in `src/pyfoundinc/integrations/__init__.py` for only those stable
+2. Add re-exports in `src/pyinc/integrations/__init__.py` for only those stable
    names.
 3. Experimental helpers (payload queries, decode functions, internal utilities) stay
    importable from the submodule but are **not** re-exported from
-   `pyfoundinc.integrations`.
+   `pyinc.integrations`.
 
 ### Testing
 

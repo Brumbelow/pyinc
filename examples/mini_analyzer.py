@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pyfoundinc import Database
-from pyfoundinc.integrations.python_source import (
+from pyinc import Database
+from pyinc.integrations.python_source import (
     file_analysis,
     workspace_analysis,
 )

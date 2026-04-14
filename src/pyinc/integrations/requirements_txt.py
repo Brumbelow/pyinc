@@ -7,10 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias, cast
 
-from pyfoundinc.core import query
-from pyfoundinc.resources import DirectoryResource
-from pyfoundinc.runtime import Database
-from pyfoundinc.value import thaw
+from pyinc.core import query
+from pyinc.resources import DirectoryResource
+from pyinc.runtime import Database
+from pyinc.value import thaw
 
 # ---------------------------------------------------------------------------
 # Payload type aliases
