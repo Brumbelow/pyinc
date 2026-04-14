@@ -57,7 +57,7 @@ The full contract, including explicit limitations and escape hatches, is in [doc
 
 ## Integrations
 
-- `pyinc.integrations.python_source` — workspace-local module discovery, top-level imports/definitions, simple assignment tracking for export surfaces, conservative import resolution (`workspace`/`external`/`missing`/`ambiguous`).
+- `pyinc.integrations.python_source` — workspace-local module discovery, top-level imports/definitions, simple assignment tracking for export surfaces, conservative import resolution with `workspace`/`stdlib`/`installed`/`missing`/`ambiguous` outcomes (stdlib and installed classification via composition with `installed_packages`).
 - `pyinc.integrations.toml_config` — single-file TOML inspection: section/key extraction, dependency and optional-dependency discovery, tool config discovery.
 - `pyinc.integrations.requirements_txt` — narrow requirements parsing: normalized requirement specs, file references, index directives, editable installs, URL requirements.
 - `pyinc.integrations.installed_packages` — installed package discovery via `importlib.metadata`-compatible `.dist-info` directories, stdlib module identification via `sys.stdlib_module_names`, and import name resolution (`stdlib`/`installed`/`unknown`).
@@ -81,8 +81,10 @@ The integration boundary is summarized in [docs/integration-contract.md](docs/in
 
 ## Not yet supported
 
-- Full `sys.path` / installed-package resolution beyond top-level module classification
-- Marker evaluation, recursive `-r` following, symbol/type resolution, LSP wiring, and watchers
+- Deep module path resolution (subpackage-level `sys.path` walking, `.pth` file processing, namespace packages)
+- Dependency satisfaction validation (cross-referencing declared dependencies against installed packages)
+- Marker expression evaluation, recursive `-r` file following, version constraint satisfaction
+- Symbol/type resolution, LSP wiring, and file watchers
 
 ## Development
 

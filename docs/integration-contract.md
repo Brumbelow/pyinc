@@ -136,6 +136,7 @@ Scope:
 - cutoff-based backdating on metadata parsing (field-only comparison, whitespace changes backdate)
 - `installed_packages_analysis(db)` for full environment analysis
 - `resolve_import_name(db, import_name)` for single import resolution
+- `environment_index(db)` composition query for cross-integration import resolution (exported in the module's `__all__` but intentionally not re-exported from `pyinc.integrations` — exists for query-layer composition with other integrations, currently used by `python_source`)
 
 Out of scope for this integration:
 
@@ -143,7 +144,26 @@ Out of scope for this integration:
 - namespace package detection
 - marker expression evaluation or version satisfaction
 - `sys.path` manipulation or `.pth` file processing
-- `environment_index(db)` query for cross-integration import resolution composition with `python_source`
+
+## Cross-Integration Composition
+
+Integrations can compose at the query layer by importing `@query` functions from other
+integration modules. The kernel's dependency tracking extends automatically across
+integration boundaries — if an upstream integration's query result changes, downstream
+queries that called it are re-verified and re-executed as needed.
+
+Current composition edges:
+
+- `python_source` imports `environment_index` from `installed_packages` to classify
+  non-workspace imports as `stdlib`, `installed`, or `missing` (rather than the opaque
+  `external` that a standalone workspace analysis would produce)
+
+Composition queries like `environment_index` are public `@query` functions listed in their
+module's `__all__`, but they are intentionally **not** re-exported from `pyinc.integrations`.
+They exist for cross-integration use at the query layer, not as user-facing entrypoints.
+
+`toml_config` and `requirements_txt` do not currently compose with `installed_packages`.
+Declared dependencies are extracted but not validated against the installed environment.
 
 ## Out Of Scope
 

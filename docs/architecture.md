@@ -55,6 +55,14 @@ Low-level payload queries, decode helpers, and resource helpers remain module-lo
 
 The repository also includes small examples under `examples/` plus dedicated tests for kernel semantics, property-based from-scratch consistency, and each shipped integration.
 
+## Cross-Integration Composition
+
+Integrations can compose at the query layer by importing `@query` functions from other integration modules. The kernel's dependency tracking extends automatically across integration boundaries -- no special wiring is required. When an upstream integration's query result changes, downstream queries that depend on it are re-verified and re-executed through the normal red-green algorithm.
+
+Currently, `python_source` composes with `installed_packages`: it imports the `environment_index` query to classify non-workspace imports as `stdlib`, `installed`, or `missing`. This means that if the installed package environment changes (e.g., a package is installed or removed), `python_source`'s import resolution results are automatically invalidated and recomputed on the next request.
+
+Composition queries like `environment_index` are public `@query` functions exported in their module's `__all__`, but they are intentionally not re-exported from `pyinc.integrations`. They exist for query-layer composition between integrations, not as user-facing entrypoints.
+
 ## Scope
 
 Version 1 targets:
