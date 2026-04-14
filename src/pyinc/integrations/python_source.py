@@ -8,13 +8,16 @@ from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
 from pyinc.core import query
+from pyinc.integrations.installed_packages import environment_index
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
 ImportKind: TypeAlias = Literal["import", "from"]
 DefinitionKind: TypeAlias = Literal["function", "class"]
-ImportResolution: TypeAlias = Literal["workspace", "external", "missing", "ambiguous"]
+ImportResolution: TypeAlias = Literal[
+    "workspace", "external", "stdlib", "installed", "missing", "ambiguous",
+]
 
 ModuleBindingAnalysisPayload: TypeAlias = tuple[
     tuple[str, ...],
@@ -33,6 +36,8 @@ ResolvedImportPayload: TypeAlias = tuple[
     str | None,
     str | None,
     ImportResolution,
+    str | None,
+    str | None,
 ]
 DependencySurfacePayload: TypeAlias = tuple[str, str, tuple[str, ...]]
 ModuleIndexEntryPayload: TypeAlias = tuple[str, str]
@@ -94,6 +99,8 @@ class ResolvedImportRef:
     resolved_module: str | None
     resolved_path: str | None
     resolution: ImportResolution
+    distribution_name: str | None
+    distribution_version: str | None
 
 
 @dataclass(frozen=True)
@@ -344,6 +351,15 @@ def _index_groups(
     }
 
 
+def _build_environment_lookup(
+    env_data: tuple[tuple[str, ...], tuple[tuple[str, str, str], ...]],
+) -> tuple[frozenset[str], dict[str, tuple[str, str]]]:
+    stdlib_modules, package_entries = env_data
+    stdlib_set = frozenset(stdlib_modules)
+    pkg_map = {name: (dist, ver) for name, dist, ver in package_entries}
+    return stdlib_set, pkg_map
+
+
 def _resolve_relative_base(
     current_module: str,
     current_path: str,
@@ -374,13 +390,21 @@ def _missing_resolution(
     index_groups: dict[str, tuple[str, ...]],
     *,
     prefer_external: bool,
-) -> ImportResolution:
+    stdlib_modules: frozenset[str],
+    package_top_levels: dict[str, tuple[str, str]],
+) -> tuple[ImportResolution, str | None, str | None]:
     top_level = _top_level_module_name(requested_module)
     if top_level is None:
-        return "missing"
+        return "missing", None, None
     if top_level in index_groups:
-        return "missing"
-    return "external" if prefer_external else "missing"
+        return "missing", None, None
+    if prefer_external:
+        if top_level in stdlib_modules:
+            return "stdlib", None, None
+        if top_level in package_top_levels:
+            dist_name, dist_ver = package_top_levels[top_level]
+            return "installed", dist_name, dist_ver
+    return "missing", None, None
 
 
 def _resolve_workspace_module(
@@ -415,16 +439,21 @@ def _resolve_import_reference(
     kind: ImportKind,
     imported_name: str | None,
     index_groups: dict[str, tuple[str, ...]],
-) -> tuple[str | None, str | None, ImportResolution]:
+    stdlib_modules: frozenset[str],
+    package_top_levels: dict[str, tuple[str, str]],
+) -> tuple[str | None, str | None, ImportResolution, str | None, str | None]:
     if kind == "import":
         resolved_module, resolved_path, resolution = _resolve_workspace_module(request_module, index_groups)
         if resolution is not None:
-            return resolved_module, resolved_path, resolution
-        return None, None, _missing_resolution(request_module, index_groups, prefer_external=True)
+            return resolved_module, resolved_path, resolution, None, None
+        return None, None, *_missing_resolution(
+            request_module, index_groups, prefer_external=True,
+            stdlib_modules=stdlib_modules, package_top_levels=package_top_levels,
+        )
 
     absolute_base = _resolve_relative_base(current_module, current_path, request_module)
     if absolute_base is None:
-        return None, None, "missing"
+        return None, None, "missing", None, None
 
     candidates: list[str] = []
     if imported_name is not None and imported_name != "*":
@@ -436,13 +465,15 @@ def _resolve_import_reference(
     for candidate in candidates:
         resolved_module, resolved_path, resolution = _resolve_workspace_module(candidate, index_groups)
         if resolution is not None:
-            return resolved_module, resolved_path, resolution
+            return resolved_module, resolved_path, resolution, None, None
 
     requested_target = candidates[0] if candidates else absolute_base
-    return None, None, _missing_resolution(
+    return None, None, *_missing_resolution(
         requested_target,
         index_groups,
         prefer_external=not request_module.startswith("."),
+        stdlib_modules=stdlib_modules,
+        package_top_levels=package_top_levels,
     )
 
 
@@ -595,31 +626,37 @@ def resolved_imports_for_file(db: Database, root: str, path: str) -> tuple[Resol
     current_module = _module_name_for_path(root, path)
     index_groups = _index_groups(workspace_module_index(db, root))
     statements = import_statements_for_file(db, path)
+    env_data = environment_index(db)
+    stdlib_modules, pkg_map = _build_environment_lookup(env_data)
 
     resolved: list[ResolvedImportPayload] = []
     for request_module, kind, lineno, imported_names in statements:
         if kind == "import":
-            resolved_module, resolved_path, resolution = _resolve_import_reference(
+            resolved_module, resolved_path, resolution, dist_name, dist_ver = _resolve_import_reference(
                 current_module=current_module,
                 current_path=path,
                 request_module=request_module,
                 kind=kind,
                 imported_name=None,
                 index_groups=index_groups,
+                stdlib_modules=stdlib_modules,
+                package_top_levels=pkg_map,
             )
             resolved.append(
-                (request_module, kind, lineno, None, resolved_module, resolved_path, resolution)
+                (request_module, kind, lineno, None, resolved_module, resolved_path, resolution, dist_name, dist_ver)
             )
             continue
 
         for imported_name in imported_names:
-            resolved_module, resolved_path, resolution = _resolve_import_reference(
+            resolved_module, resolved_path, resolution, dist_name, dist_ver = _resolve_import_reference(
                 current_module=current_module,
                 current_path=path,
                 request_module=request_module,
                 kind=kind,
                 imported_name=imported_name,
                 index_groups=index_groups,
+                stdlib_modules=stdlib_modules,
+                package_top_levels=pkg_map,
             )
             resolved.append(
                 (
@@ -630,6 +667,8 @@ def resolved_imports_for_file(db: Database, root: str, path: str) -> tuple[Resol
                     resolved_module,
                     resolved_path,
                     resolution,
+                    dist_name,
+                    dist_ver,
                 )
             )
     return tuple(resolved)
@@ -661,7 +700,7 @@ def module_analysis_payload(db: Database, root: str, path: str) -> ModuleAnalysi
 
     resolved_imports = resolved_imports_for_file(db, root, path)
     dependencies: dict[tuple[str, str], tuple[DependencySurfacePayload, bool]] = {}
-    for _, kind, _, imported_name, resolved_module, resolved_path, resolution in resolved_imports:
+    for _, kind, _, imported_name, resolved_module, resolved_path, resolution, _, _ in resolved_imports:
         if resolution != "workspace" or resolved_module is None or resolved_path is None:
             continue
         _, _, impurity_reasons = module_binding_analysis_payload(db, resolved_path)
@@ -718,7 +757,7 @@ def _decode_diagnostic(payload: DiagnosticPayload) -> Diagnostic:
 
 
 def _decode_resolved_import(payload: ResolvedImportPayload) -> ResolvedImportRef:
-    module, kind, lineno, imported_name, resolved_module, resolved_path, resolution = payload
+    module, kind, lineno, imported_name, resolved_module, resolved_path, resolution, dist_name, dist_ver = payload
     return ResolvedImportRef(
         module=module,
         kind=kind,
@@ -727,6 +766,8 @@ def _decode_resolved_import(payload: ResolvedImportPayload) -> ResolvedImportRef
         resolved_module=resolved_module,
         resolved_path=resolved_path,
         resolution=resolution,
+        distribution_name=dist_name,
+        distribution_version=dist_ver,
     )
 
 

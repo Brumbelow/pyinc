@@ -9,6 +9,7 @@ import pyinc.integrations as integrations
 from pyinc import Database
 from pyinc.integrations.installed_packages import (
     InstalledPackagesAnalysis,
+    environment_index,
     installed_packages_analysis,
     resolve_import_name,
 )
@@ -442,3 +443,37 @@ def test_resolve_import_matches_fresh_recomputation(
     # Step 3: check stdlib resolution stays correct
     assert resolve_import_name(incremental, "os") == resolve_import_name(fresh2, "os")
     assert resolve_import_name(incremental, "os").origin == "stdlib"
+
+
+# ---------------------------------------------------------------------------
+# environment_index query (cross-integration composition support)
+# ---------------------------------------------------------------------------
+
+
+def test_environment_index_returns_stdlib_and_package_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "2.31.0", top_level="requests")
+    _make_dist_info(site_dir, "boto3", "1.28.0", top_level="boto3\nbotocore")
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    db = Database(mode="strict")
+    stdlib_modules, package_entries = environment_index(db)
+
+    assert "os" in stdlib_modules
+    assert "sys" in stdlib_modules
+
+    entry_map = {name: (dist, ver) for name, dist, ver in package_entries}
+    assert entry_map["requests"] == ("requests", "2.31.0")
+    assert entry_map["boto3"] == ("boto3", "1.28.0")
+    assert entry_map["botocore"] == ("boto3", "1.28.0")
+
+
+def test_environment_index_not_in_integrations_namespace() -> None:
+    """environment_index is a composition query, not re-exported from integrations."""
+    assert "environment_index" not in integrations.__all__

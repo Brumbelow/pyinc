@@ -34,6 +34,11 @@ InstalledPackagesAnalysisPayload: TypeAlias = tuple[
     tuple[DiagnosticPayload, ...],
 ]
 
+EnvironmentIndexPayload: TypeAlias = tuple[
+    tuple[str, ...],                       # stdlib_modules
+    tuple[tuple[str, str, str], ...],      # (top_level_name, dist_name, version)
+]
+
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
@@ -263,6 +268,19 @@ def _installed_packages_payload(db: Database) -> InstalledPackagesAnalysisPayloa
     return (tuple(packages), stdlib_modules, tuple(diagnostics))
 
 
+@query
+def environment_index(db: Database) -> EnvironmentIndexPayload:
+    """Environment classification data for cross-integration import resolution."""
+    raw = _installed_packages_payload(db)
+    packages_raw, stdlib_modules, _ = raw
+    entries: list[tuple[str, str, str]] = []
+    for pkg in packages_raw:
+        dist_name, version, top_level_names, _, _ = pkg
+        for tln in top_level_names:
+            entries.append((tln, dist_name, version))
+    return (stdlib_modules, tuple(sorted(entries)))
+
+
 # ---------------------------------------------------------------------------
 # Layer 3 — Entrypoints
 # ---------------------------------------------------------------------------
@@ -334,6 +352,7 @@ __all__ = [
     "ImportNameResolution",
     "InstalledPackageRef",
     "InstalledPackagesAnalysis",
+    "environment_index",
     "installed_packages_analysis",
     "resolve_import_name",
 ]

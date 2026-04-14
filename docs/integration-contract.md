@@ -69,7 +69,8 @@ Those names remain importable from their defining submodules, but they are exper
 - top-level imports, top-level definitions, and simple top-level assignments for export-surface tracking
 - syntax diagnostics only
 - dependency invalidation based on resolved module export surfaces, including conservative static support for `from x import *`
-- conservative import resolution with `workspace`, `external`, `missing`, and `ambiguous` outcomes
+- import resolution with `workspace`, `stdlib`, `installed`, `missing`, and `ambiguous` outcomes
+- environment-aware resolution via composition with `installed_packages` (stdlib and installed package classification)
 
 When a resolution case is unsupported or structurally ambiguous, the integration must prefer
 `missing`/`ambiguous` or re-execution over optimistic dependency reuse.
@@ -142,13 +143,13 @@ Out of scope for this integration:
 - namespace package detection
 - marker expression evaluation or version satisfaction
 - `sys.path` manipulation or `.pth` file processing
-- integration with `python_source` import resolution (future composition)
+- `environment_index(db)` query for cross-integration import resolution composition with `python_source`
 
 ## Out Of Scope
 
 This contract does not include:
 
-- full `sys.path` / installed-package resolution integrated into `python_source` import resolution
+- full `sys.path` / installed-package resolution beyond top-level module classification
 - symbol or type resolution
 - LSP wiring
 - file watchers or schedulers

@@ -81,7 +81,7 @@ The integration boundary is summarized in [docs/integration-contract.md](docs/in
 
 ## Not yet supported
 
-- Full `sys.path` / installed-package resolution integrated into `python_source` import resolution (the `installed_packages` integration provides the building blocks)
+- Full `sys.path` / installed-package resolution beyond top-level module classification
 - Marker evaluation, recursive `-r` following, symbol/type resolution, LSP wiring, and watchers
 
 ## Development

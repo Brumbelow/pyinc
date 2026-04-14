@@ -318,7 +318,7 @@ def test_module_analysis_resolves_absolute_and_external_imports(tmp_path: Path) 
     assert tuple(item.module for item in analysis.imports) == ("provider", "os", "provider")
     assert tuple(item.resolution for item in analysis.resolved_imports) == (
         "workspace",
-        "external",
+        "stdlib",
         "workspace",
     )
     assert analysis.resolved_imports[2].imported_name == "exported"
@@ -414,6 +414,8 @@ def test_module_analysis_wildcard_dependency_uses_static_all(tmp_path: Path) -> 
             resolved_module="provider",
             resolved_path=str(provider),
             resolution="workspace",
+            distribution_name=None,
+            distribution_version=None,
         ),
     )
     assert analysis.dependencies == (
@@ -471,6 +473,8 @@ def test_module_analysis_prefers_workspace_submodule_for_package_imports(tmp_pat
             resolved_module="pkg.helper",
             resolved_path=str(helper),
             resolution="workspace",
+            distribution_name=None,
+            distribution_version=None,
         ),
     )
     assert analysis.dependencies == (
@@ -752,3 +756,89 @@ def test_workspace_analysis_matches_fresh_recomputation_over_changes(mode: str, 
 
         fresh = Database(mode=mode)
         assert workspace_analysis(incremental, root) == workspace_analysis(fresh, root)
+
+
+# ---------------------------------------------------------------------------
+# Environment composition tests (python_source + installed_packages)
+# ---------------------------------------------------------------------------
+
+
+def test_import_resolution_classifies_stdlib_and_installed(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    mod = root / "app.py"
+    mod.write_text(
+        "import os\n"
+        "import pytest\n"
+        "import nonexistent_xyz_abc\n",
+        encoding="utf-8",
+    )
+    db = Database(mode="strict")
+    analysis = module_analysis(db, root, mod)
+    resolutions = {r.module: r for r in analysis.resolved_imports}
+    assert resolutions["os"].resolution == "stdlib"
+    assert resolutions["os"].distribution_name is None
+    assert resolutions["pytest"].resolution == "installed"
+    assert resolutions["pytest"].distribution_name is not None
+    assert resolutions["pytest"].distribution_version is not None
+    assert resolutions["nonexistent_xyz_abc"].resolution == "missing"
+    assert resolutions["nonexistent_xyz_abc"].distribution_name is None
+
+
+def test_from_import_stdlib_resolution(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    mod = root / "app.py"
+    mod.write_text("from collections import OrderedDict\n", encoding="utf-8")
+    db = Database(mode="strict")
+    analysis = module_analysis(db, root, mod)
+    ri = analysis.resolved_imports[0]
+    assert ri.resolution == "stdlib"
+    assert ri.imported_name == "OrderedDict"
+    assert ri.distribution_name is None
+
+
+def test_workspace_import_preferred_over_environment(tmp_path: Path) -> None:
+    """A workspace module named 'os' should resolve as workspace, not stdlib."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "os.py").write_text("x = 1\n", encoding="utf-8")
+    consumer = root / "app.py"
+    consumer.write_text("import os\n", encoding="utf-8")
+    db = Database(mode="strict")
+    analysis = module_analysis(db, root, consumer)
+    assert analysis.resolved_imports[0].resolution == "workspace"
+
+
+def test_relative_import_failure_stays_missing(tmp_path: Path) -> None:
+    """Relative imports with excessive nesting are 'missing', not checked against env."""
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    consumer = pkg / "consumer.py"
+    # Three levels up from pkg.consumer goes beyond the workspace root
+    consumer.write_text("from ...deep import something\n", encoding="utf-8")
+    db = Database(mode="strict")
+    analysis = module_analysis(db, root, consumer)
+    assert analysis.resolved_imports[0].resolution == "missing"
+    assert analysis.resolved_imports[0].distribution_name is None
+
+
+def test_resolved_import_ref_distribution_fields_none_for_non_installed(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "provider.py"
+    consumer = root / "consumer.py"
+    provider.write_text("x = 1\n", encoding="utf-8")
+    consumer.write_text("import provider\nimport os\n", encoding="utf-8")
+    db = Database(mode="strict")
+    analysis = module_analysis(db, root, consumer)
+    workspace_ref = analysis.resolved_imports[0]
+    stdlib_ref = analysis.resolved_imports[1]
+    assert workspace_ref.resolution == "workspace"
+    assert workspace_ref.distribution_name is None
+    assert workspace_ref.distribution_version is None
+    assert stdlib_ref.resolution == "stdlib"
+    assert stdlib_ref.distribution_name is None
+    assert stdlib_ref.distribution_version is None
