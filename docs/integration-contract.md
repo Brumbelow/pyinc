@@ -36,6 +36,16 @@ For `pyinc.integrations.toml_config`, the stable public surface is:
   - `config_analysis(db, path)`
   - `workspace_config_analysis(db, root)`
 
+For `pyinc.integrations.json_config`, the stable public surface is:
+
+- dataclass result types:
+  - `JsonKey`
+  - `JsonSection`
+  - `JsonAnalysis`
+- high-level entrypoints:
+  - `json_analysis(db, path)`
+  - `workspace_json_analysis(db, root, filename)`
+
 For `pyinc.integrations.requirements_txt`, the stable public surface is:
 
 - dataclass result types:
@@ -51,8 +61,8 @@ For `pyinc.integrations.requirements_txt`, the stable public surface is:
 
 Low-level query nodes, payload helpers, decode helpers, and module-local resource helpers in
 the integration submodules are retained for debugging and targeted tests. Examples include
-`source_text`, `imports_for_file`, `config_file_text`, `requirements_payload`, and the
-`*_payload` helpers.
+`source_text`, `imports_for_file`, `config_file_text`, `json_file_text`,
+`requirements_payload`, and the `*_payload` helpers.
 
 Those names remain importable from their defining submodules, but they are experimental:
 
@@ -93,6 +103,29 @@ The TOML config integration is intentionally narrow:
 - syntax diagnostics for malformed TOML
 - cutoff-based backdating using parsed structure (comment-only edits are backdated)
 - TOML datetime values are converted to ISO strings (no adapter required)
+
+## JSON Config Integration Scope
+
+The `json_config` integration is intentionally narrow:
+
+Scope:
+
+- single-file JSON analysis via `json_analysis(db, path)`
+- workspace-root discovery via `workspace_json_analysis(db, root, filename)` (default filename: `package.json`)
+- section extraction by walking the JSON object hierarchy (nested objects become subsections)
+- value type classification: string, number, boolean, null, array, object
+- syntax diagnostics for malformed JSON
+- cutoff-based backdating using parsed structure (whitespace and formatting changes are backdated)
+- standard JSON only (stdlib `json` module)
+- non-object top-level values (arrays, primitives) produce no sections
+
+Out of scope for this integration:
+
+- JSONC (comments) or JSON5 (trailing commas, unquoted keys)
+- schema validation or JSON Schema
+- JSON Pointer or JSON Path queries
+- recursive `$ref` resolution
+- schema-specific field extraction (dependencies, scripts, etc. -- belongs in downstream consumers)
 
 ## Requirements.txt Integration Scope
 

@@ -64,6 +64,12 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "ConfigSection",
         "config_analysis",
         "workspace_config_analysis",
+        # json_config
+        "JsonAnalysis",
+        "JsonKey",
+        "JsonSection",
+        "json_analysis",
+        "workspace_json_analysis",
         # installed_packages
         "ImportNameResolution",
         "InstalledPackageRef",

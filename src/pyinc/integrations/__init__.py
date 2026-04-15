@@ -5,6 +5,13 @@ from .installed_packages import (
     installed_packages_analysis,
     resolve_import_name,
 )
+from .json_config import (
+    JsonAnalysis,
+    JsonKey,
+    JsonSection,
+    json_analysis,
+    workspace_json_analysis,
+)
 from .python_source import (
     DefinitionRef,
     DependencySurface,
@@ -48,6 +55,9 @@ __all__ = [
     "IndexDirective",
     "InstalledPackageRef",
     "InstalledPackagesAnalysis",
+    "JsonAnalysis",
+    "JsonKey",
+    "JsonSection",
     "PythonFileAnalysis",
     "PythonModuleAnalysis",
     "PythonWorkspaceAnalysis",
@@ -58,10 +68,12 @@ __all__ = [
     "directory_analysis",
     "file_analysis",
     "installed_packages_analysis",
+    "json_analysis",
     "module_analysis",
     "requirements_analysis",
     "resolve_import_name",
     "workspace_analysis",
     "workspace_config_analysis",
+    "workspace_json_analysis",
     "workspace_requirements_analysis",
 ]
