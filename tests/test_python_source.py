@@ -38,6 +38,12 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
 
 def test_package_namespace_exports_only_stable_api() -> None:
     assert set(integrations.__all__) == {
+        # dependency_check
+        "DependencyCheckAnalysis",
+        "DependencyStatus",
+        "UndeclaredImport",
+        "dependency_check_analysis",
+        "workspace_dependency_check",
         # python_source
         "DependencySurface",
         "DefinitionRef",
@@ -87,6 +93,7 @@ def test_package_namespace_exports_only_stable_api() -> None:
     assert hasattr(integrations, "ConfigAnalysis")
     # Experimental helpers must not leak.
     assert not hasattr(integrations, "source_text")
+    assert not hasattr(integrations, "dependency_check_payload")
     assert not hasattr(integrations, "imports_for_file")
     assert not hasattr(integrations, "file_analysis_payload")
     assert not hasattr(integrations, "workspace_analysis_payload")

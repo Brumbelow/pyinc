@@ -81,6 +81,23 @@ class ExecutionFrame:
     untracked_reasons: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class DatabaseStatistics:
+    node_count: int
+    input_count: int
+    query_count: int
+    resource_count: int
+    query_executions: int
+    query_reuses: int
+    query_backdates: int
+    resource_loads: int
+    resource_probe_hits: int
+    input_sets: int
+    input_equal_ignores: int
+    evictions: int
+    total_requests: int
+
+
 class _GuardedEnviron(MutableMapping[str, str]):
     def __init__(self, wrapped: MutableMapping[str, str], check_read: Callable[[], None]) -> None:
         self._wrapped = wrapped
@@ -166,10 +183,42 @@ class Database:
         self._allow_raw_reads: ContextVar[bool] = ContextVar("pyinc_allow_raw_reads", default=False)
         self._request_token: ContextVar[int | None] = ContextVar("pyinc_request_token", default=None)
         self._request_counter = 0
+        self._stats: dict[str, int] = {
+            "query_executions": 0,
+            "query_reuses": 0,
+            "query_backdates": 0,
+            "resource_loads": 0,
+            "resource_probe_hits": 0,
+            "input_sets": 0,
+            "input_equal_ignores": 0,
+            "evictions": 0,
+        }
 
     @property
     def revision(self) -> int:
         return self._revision
+
+    def statistics(self) -> DatabaseStatistics:
+        resource_count = sum(1 for k in self._records if k.kind == "resource")
+        return DatabaseStatistics(
+            node_count=len(self._records),
+            input_count=len(self._input_records),
+            query_count=len(self._query_records),
+            resource_count=resource_count,
+            query_executions=self._stats["query_executions"],
+            query_reuses=self._stats["query_reuses"],
+            query_backdates=self._stats["query_backdates"],
+            resource_loads=self._stats["resource_loads"],
+            resource_probe_hits=self._stats["resource_probe_hits"],
+            input_sets=self._stats["input_sets"],
+            input_equal_ignores=self._stats["input_equal_ignores"],
+            evictions=self._stats["evictions"],
+            total_requests=self._request_counter,
+        )
+
+    def reset_statistics(self) -> None:
+        for key in self._stats:
+            self._stats[key] = 0
 
     def set(self, input_key: Any, value: Any) -> None:
         from .core import Input
@@ -192,6 +241,7 @@ class Database:
             record.last_decision = "reused"
             record.reason = "equal input update ignored"
             record.checked_in_request = self._current_request_id()
+            self._stats["input_equal_ignores"] += 1
             return
         self._revision += 1
         changed_at = self._revision
@@ -217,6 +267,7 @@ class Database:
             record.last_recompute = "executed"
             record.reason = "input changed"
             record.checked_in_request = self._current_request_id()
+        self._stats["input_sets"] += 1
 
     def get(self, query: Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
         from .core import Query
@@ -279,6 +330,7 @@ class Database:
         if existing.checked_in_request == current_request:
             existing.last_decision = "reused"
             existing.reason = "already checked in current request"
+            self._stats["query_reuses"] += 1
             self._mark_query_used(key)
             return
         if existing.is_untracked:
@@ -296,6 +348,7 @@ class Database:
             existing.last_decision = "reused"
             existing.reason = "dependencies unchanged"
             existing.checked_in_request = current_request
+            self._stats["query_reuses"] += 1
             self._mark_query_used(key)
             return
         self._execute_query(query, key, call_snapshot, previous=existing, reason=dirty_reason)
@@ -361,6 +414,10 @@ class Database:
             record.reason = reason
             record.untracked_reasons = list(frame.untracked_reasons)
             record.checked_in_request = self._current_request_id()
+            if decision == "backdated":
+                self._stats["query_backdates"] += 1
+            else:
+                self._stats["query_executions"] += 1
         finally:
             self._execution_stack.reset(token)
 
@@ -395,6 +452,7 @@ class Database:
             record.last_decision = "reused"
             record.reason = "resource probe unchanged"
             record.checked_in_request = current_request
+            self._stats["resource_probe_hits"] += 1
             return
         if record is None:
             changed_at = self._revision
@@ -419,6 +477,7 @@ class Database:
                 probe=probe,
                 checked_in_request=current_request,
             )
+            self._stats["resource_loads"] += 1
             return
         record.snapshot = snapshot
         record.digest = digest
@@ -427,6 +486,7 @@ class Database:
         record.last_decision = "executed"
         record.last_recompute = "executed"
         record.reason = "resource probe changed"
+        self._stats["resource_loads"] += 1
         record.probe = probe
         record.checked_in_request = current_request
 
@@ -780,6 +840,7 @@ class Database:
             self._evict_query_record(lru_key)
 
     def _evict_query_record(self, key: NodeKey) -> None:
+        self._stats["evictions"] += 1
         self._records.pop(key, None)
         self._query_records.discard(key)
         self._query_last_used.pop(key, None)

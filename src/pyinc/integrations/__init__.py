@@ -1,3 +1,10 @@
+from .dependency_check import (
+    DependencyCheckAnalysis,
+    DependencyStatus,
+    UndeclaredImport,
+    dependency_check_analysis,
+    workspace_dependency_check,
+)
 from .installed_packages import (
     ImportNameResolution,
     InstalledPackageRef,
@@ -43,6 +50,9 @@ from .toml_config import (
 )
 
 __all__ = [
+    "DependencyCheckAnalysis",
+    "DependencyStatus",
+    "UndeclaredImport",
     "ConfigAnalysis",
     "ConfigKey",
     "ConfigSection",
@@ -65,6 +75,7 @@ __all__ = [
     "RequirementsAnalysis",
     "ResolvedImportRef",
     "config_analysis",
+    "dependency_check_analysis",
     "directory_analysis",
     "file_analysis",
     "installed_packages_analysis",
@@ -74,6 +85,7 @@ __all__ = [
     "resolve_import_name",
     "workspace_analysis",
     "workspace_config_analysis",
+    "workspace_dependency_check",
     "workspace_json_analysis",
     "workspace_requirements_analysis",
 ]

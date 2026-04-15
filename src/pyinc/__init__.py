@@ -14,7 +14,7 @@ from .resources import (
     FileStatResource,
     FileStatSnapshot,
 )
-from .runtime import Database
+from .runtime import Database, DatabaseStatistics
 from .value import (
     FrozenAdapterValue,
     FrozenDict,
@@ -30,6 +30,7 @@ from .value import (
 __all__ = [
     "CycleError",
     "Database",
+    "DatabaseStatistics",
     "DirectoryResource",
     "EnvResource",
     "FileResource",

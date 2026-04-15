@@ -190,13 +190,48 @@ Current composition edges:
 - `python_source` imports `environment_index` from `installed_packages` to classify
   non-workspace imports as `stdlib`, `installed`, or `missing` (rather than the opaque
   `external` that a standalone workspace analysis would produce)
+- `dependency_check` imports `installed_distributions_index` and `environment_index`
+  from `installed_packages` to validate declared dependencies against installed versions
+- `dependency_check.workspace_dependency_check` composes with
+  `python_source.workspace_analysis` at the entrypoint layer to detect undeclared imports
 
-Composition queries like `environment_index` are public `@query` functions listed in their
-module's `__all__`, but they are intentionally **not** re-exported from `pyinc.integrations`.
-They exist for cross-integration use at the query layer, not as user-facing entrypoints.
+Composition queries like `environment_index` and `installed_distributions_index` are public
+`@query` functions listed in their module's `__all__`, but they are intentionally **not**
+re-exported from `pyinc.integrations`. They exist for cross-integration use at the query
+layer, not as user-facing entrypoints.
 
-`toml_config` and `requirements_txt` do not currently compose with `installed_packages`.
-Declared dependencies are extracted but not validated against the installed environment.
+## Dependency Check Integration Scope
+
+The `dependency_check` integration cross-references declared dependencies against the
+installed environment:
+
+Scope:
+
+- `dependency_check_analysis(db, declared_deps)` checks declared dependencies (as PEP 508
+  specifier strings) against installed packages for missing, satisfied, version-mismatch,
+  or ambiguous outcomes
+- `workspace_dependency_check(db, root, declared_deps)` extends the base check with
+  undeclared import detection by composing with `python_source.workspace_analysis`
+  at the entrypoint layer
+- PEP 440 version matching for common operators (`==`, `!=`, `>=`, `<=`, `>`, `<`, `~=`)
+  with dotted numeric versions; unparseable specifiers return `ambiguous`
+- PEP 503 distribution name normalization
+- result types: `DependencyStatus`, `UndeclaredImport`, `DependencyCheckAnalysis`
+
+Cross-integration composition:
+
+- imports `installed_distributions_index` from `installed_packages` at the query layer
+  (creates an incremental dependency edge — package installs trigger revalidation)
+- imports `environment_index` from `installed_packages` at the query layer
+- composes with `python_source.workspace_analysis` at the entrypoint layer (not the
+  query layer, since `workspace_analysis` is a non-query function)
+
+Out of scope for this integration:
+
+- full PEP 440 version matching (pre-release, post-release, local, wildcard specifiers)
+- marker expression evaluation
+- transitive dependency resolution
+- lock file comparison
 
 ## Out Of Scope
 

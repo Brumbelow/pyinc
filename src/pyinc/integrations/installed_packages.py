@@ -34,6 +34,9 @@ InstalledPackagesAnalysisPayload: TypeAlias = tuple[
     tuple[DiagnosticPayload, ...],
 ]
 
+InstalledDistributionsIndexPayload: TypeAlias = tuple[tuple[str, str], ...]
+#                                                      (normalized_dist_name, version)
+
 EnvironmentIndexPayload: TypeAlias = tuple[
     tuple[str, ...],                       # stdlib_modules
     tuple[tuple[str, str, str], ...],      # (top_level_name, dist_name, version)
@@ -281,6 +284,18 @@ def environment_index(db: Database) -> EnvironmentIndexPayload:
     return (stdlib_modules, tuple(sorted(entries)))
 
 
+@query
+def installed_distributions_index(db: Database) -> InstalledDistributionsIndexPayload:
+    """Distribution-name-to-version index for cross-integration dependency validation."""
+    raw = _installed_packages_payload(db)
+    packages_raw, _, _ = raw
+    entries: list[tuple[str, str]] = []
+    for pkg in packages_raw:
+        dist_name, version, _, _, _ = pkg
+        entries.append((_normalize_dist_name(dist_name), version))
+    return tuple(sorted(entries))
+
+
 # ---------------------------------------------------------------------------
 # Layer 3 — Entrypoints
 # ---------------------------------------------------------------------------
@@ -353,6 +368,7 @@ __all__ = [
     "InstalledPackageRef",
     "InstalledPackagesAnalysis",
     "environment_index",
+    "installed_distributions_index",
     "installed_packages_analysis",
     "resolve_import_name",
 ]

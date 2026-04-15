@@ -10,6 +10,7 @@ import pytest
 from pyinc import (
     CycleError,
     Database,
+    DatabaseStatistics,
     DirectoryResource,
     EnvResource,
     FileResource,
@@ -1413,3 +1414,177 @@ def test_inputs_and_resources_survive_eviction(tmp_path: Path) -> None:
     # Queries still return correct results after re-execution.
     assert db.get(read_input) == 42
     assert db.get(read_file) == "content"
+
+
+# ---------------------------------------------------------------------------
+# Database statistics
+# ---------------------------------------------------------------------------
+
+
+def test_statistics_returns_frozen_snapshot() -> None:
+    db = Database()
+    stats = db.statistics()
+    assert isinstance(stats, DatabaseStatistics)
+    assert all(isinstance(getattr(stats, f.name), int) for f in stats.__dataclass_fields__.values())
+    with pytest.raises(AttributeError):
+        stats.node_count = 99  # type: ignore[misc]
+
+
+def test_statistics_counts_input_operations() -> None:
+    number = Input[int]("number")
+    db = Database()
+
+    db.set(number, 1)
+    stats = db.statistics()
+    assert stats.input_sets == 1
+    assert stats.input_equal_ignores == 0
+
+    db.set(number, 1)  # equal value
+    stats = db.statistics()
+    assert stats.input_sets == 1
+    assert stats.input_equal_ignores == 1
+
+    db.set(number, 2)  # changed value
+    stats = db.statistics()
+    assert stats.input_sets == 2
+    assert stats.input_equal_ignores == 1
+
+
+def test_statistics_counts_query_operations() -> None:
+    number = Input[int]("number")
+
+    @query
+    def double(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 5)
+
+    db.get(double)
+    stats = db.statistics()
+    assert stats.query_executions == 1
+    assert stats.query_reuses == 0
+
+    db.get(double)  # same state -> reused
+    stats = db.statistics()
+    assert stats.query_reuses == 1
+    assert stats.query_executions == 1
+
+    db.set(number, 10)
+    db.get(double)  # dependency changed -> re-executed
+    stats = db.statistics()
+    assert stats.query_executions == 2
+
+
+def test_statistics_counts_backdating() -> None:
+    number = Input[int]("number")
+
+    @query
+    def parity(db: Database) -> str:
+        return "even" if number.read(db) % 2 == 0 else "odd"
+
+    db = Database()
+    db.set(number, 2)
+    db.get(parity)  # initial execution: "even"
+
+    db.set(number, 4)  # still even -> backdate
+    db.get(parity)
+    stats = db.statistics()
+    assert stats.query_backdates == 1
+
+
+def test_statistics_counts_evictions() -> None:
+    @query
+    def a(db: Database) -> str:
+        return "a"
+
+    @query
+    def b(db: Database) -> str:
+        return "b"
+
+    @query
+    def c(db: Database) -> str:
+        return "c"
+
+    db = Database(max_query_nodes=2)
+    db.get(a)
+    db.get(b)
+    db.get(c)  # triggers eviction
+    stats = db.statistics()
+    assert stats.evictions >= 1
+
+
+def test_statistics_counts_resource_operations(tmp_path: Path) -> None:
+    file_path = tmp_path / "data.txt"
+    file_path.write_text("hello")
+
+    resource = FileResource()
+
+    @query
+    def read_file(db: Database) -> str:
+        return resource.read(db, str(file_path))
+
+    db = Database()
+    db.get(read_file)
+    stats = db.statistics()
+    assert stats.resource_loads == 1
+    assert stats.resource_probe_hits == 0
+
+    db.get(read_file)  # probe unchanged -> hit
+    stats = db.statistics()
+    assert stats.resource_probe_hits == 1
+    assert stats.resource_loads == 1
+
+    file_path.write_text("world")
+    db.get(read_file)  # probe changed -> reload
+    stats = db.statistics()
+    assert stats.resource_loads == 2
+
+
+def test_reset_statistics_zeroes_counters() -> None:
+    number = Input[int]("number")
+
+    @query
+    def double(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 5)
+    db.get(double)
+    db.get(double)
+
+    stats_before = db.statistics()
+    assert stats_before.query_executions > 0
+    assert stats_before.total_requests > 0
+
+    db.reset_statistics()
+    stats_after = db.statistics()
+    assert stats_after.query_executions == 0
+    assert stats_after.query_reuses == 0
+    assert stats_after.input_sets == 0
+    # Node counts and total_requests are structural, not reset
+    assert stats_after.total_requests == stats_before.total_requests
+    assert stats_after.node_count == stats_before.node_count
+
+
+def test_statistics_node_counts_match_records(tmp_path: Path) -> None:
+    number = Input[int]("number")
+    file_path = tmp_path / "data.txt"
+    file_path.write_text("content")
+    resource = FileResource()
+
+    @query
+    def compute(db: Database) -> str:
+        val = number.read(db)
+        text = resource.read(db, str(file_path))
+        return f"{val}:{text}"
+
+    db = Database()
+    db.set(number, 42)
+    db.get(compute)
+
+    stats = db.statistics()
+    assert stats.node_count == stats.input_count + stats.query_count + stats.resource_count
+    assert stats.input_count >= 1
+    assert stats.query_count >= 1
+    assert stats.resource_count >= 1
