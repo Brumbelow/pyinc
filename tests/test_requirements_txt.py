@@ -9,6 +9,7 @@ import pyinc.integrations as integrations
 from pyinc import Database
 from pyinc.integrations.requirements_txt import (
     RequirementsAnalysis,
+    deep_requirements_analysis,
     requirements_analysis,
     workspace_requirements_analysis,
 )
@@ -377,3 +378,120 @@ def test_requirements_analysis_matches_fresh_recomputation_over_changes(
         assert requirements_analysis(incremental, str(path)) == requirements_analysis(
             fresh, str(path)
         )
+
+
+# ---------------------------------------------------------------------------
+# deep_requirements_analysis
+# ---------------------------------------------------------------------------
+
+
+def test_deep_single_file_matches_shallow(tmp_path: Path) -> None:
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text("requests>=2.0\nflask\n")
+    db = Database()
+    shallow = requirements_analysis(db, str(req_file))
+    deep = deep_requirements_analysis(db, str(req_file))
+    assert len(deep.requirements) == len(shallow.requirements)
+    names = {r.name for r in deep.requirements}
+    assert names == {"requests", "flask"}
+
+
+def test_deep_two_level_chain(tmp_path: Path) -> None:
+    base = tmp_path / "base.txt"
+    base.write_text("numpy>=1.20\n")
+    main = tmp_path / "requirements.txt"
+    main.write_text("-r base.txt\npandas>=1.0\n")
+    db = Database()
+    result = deep_requirements_analysis(db, str(main))
+    names = {r.name for r in result.requirements}
+    assert names == {"numpy", "pandas"}
+
+
+def test_deep_three_level_chain(tmp_path: Path) -> None:
+    core = tmp_path / "core.txt"
+    core.write_text("click\n")
+    base = tmp_path / "base.txt"
+    base.write_text("-r core.txt\nflask\n")
+    main = tmp_path / "requirements.txt"
+    main.write_text("-r base.txt\ngunicorn\n")
+    db = Database()
+    result = deep_requirements_analysis(db, str(main))
+    names = {r.name for r in result.requirements}
+    assert names == {"click", "flask", "gunicorn"}
+
+
+def test_deep_circular_reference_produces_diagnostic(tmp_path: Path) -> None:
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_text("-r b.txt\nrequests\n")
+    b.write_text("-r a.txt\nflask\n")
+    db = Database()
+    result = deep_requirements_analysis(db, str(a))
+    cycle_diagnostics = [d for d in result.diagnostics if d[0] == "cycle"]
+    assert len(cycle_diagnostics) >= 1
+    names = {r.name for r in result.requirements}
+    assert "requests" in names
+    assert "flask" in names
+
+
+def test_deep_duplicate_dedup_last_wins(tmp_path: Path) -> None:
+    base = tmp_path / "base.txt"
+    base.write_text("requests>=1.0\n")
+    main = tmp_path / "requirements.txt"
+    main.write_text("-r base.txt\nrequests>=2.0\n")
+    db = Database()
+    result = deep_requirements_analysis(db, str(main))
+    req_names = [r.name for r in result.requirements]
+    assert req_names.count("requests") == 1
+    req = [r for r in result.requirements if r.name == "requests"][0]
+    assert "2.0" in req.version_spec
+
+
+def test_deep_relative_path_resolution(tmp_path: Path) -> None:
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    leaf = sub / "leaf.txt"
+    leaf.write_text("boto3\n")
+    main = tmp_path / "requirements.txt"
+    main.write_text("-r sub/leaf.txt\ndjango\n")
+    db = Database()
+    result = deep_requirements_analysis(db, str(main))
+    names = {r.name for r in result.requirements}
+    assert names == {"boto3", "django"}
+
+
+def test_deep_constraint_not_followed(tmp_path: Path) -> None:
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("requests<3.0\n")
+    main = tmp_path / "requirements.txt"
+    main.write_text("-c constraints.txt\nrequests\n")
+    db = Database()
+    result = deep_requirements_analysis(db, str(main))
+    names = {r.name for r in result.requirements}
+    assert names == {"requests"}
+    assert len(result.file_references) == 1
+    assert result.file_references[0].kind == "constraint"
+
+
+def test_deep_missing_referenced_file(tmp_path: Path) -> None:
+    main = tmp_path / "requirements.txt"
+    main.write_text("-r nonexistent.txt\nflask\n")
+    db = Database()
+    result = deep_requirements_analysis(db, str(main))
+    assert "flask" in {r.name for r in result.requirements}
+
+
+def test_deep_incremental_revalidation(tmp_path: Path) -> None:
+    base = tmp_path / "base.txt"
+    base.write_text("numpy>=1.0\n")
+    main = tmp_path / "requirements.txt"
+    main.write_text("-r base.txt\npandas\n")
+    db = Database()
+
+    result1 = deep_requirements_analysis(db, str(main))
+    assert {r.name for r in result1.requirements} == {"numpy", "pandas"}
+
+    base.write_text("numpy>=2.0\nscipy\n")
+    result2 = deep_requirements_analysis(db, str(main))
+    names = {r.name for r in result2.requirements}
+    assert names == {"numpy", "scipy", "pandas"}

@@ -14,7 +14,7 @@ from .resources import (
     FileStatResource,
     FileStatSnapshot,
 )
-from .runtime import Database, DatabaseStatistics
+from .runtime import Database, DatabaseStatistics, DependencyGraphNode, QueryProfile
 from .value import (
     FrozenAdapterValue,
     FrozenDict,
@@ -31,6 +31,7 @@ __all__ = [
     "CycleError",
     "Database",
     "DatabaseStatistics",
+    "DependencyGraphNode",
     "DirectoryResource",
     "EnvResource",
     "FileResource",
@@ -45,6 +46,7 @@ __all__ = [
     "InspectionNode",
     "MutationError",
     "PyIncError",
+    "QueryProfile",
     "UnsupportedValueError",
     "UntrackedReadError",
     "ValueAdapter",

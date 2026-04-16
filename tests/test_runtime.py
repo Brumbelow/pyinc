@@ -11,6 +11,7 @@ from pyinc import (
     CycleError,
     Database,
     DatabaseStatistics,
+    DependencyGraphNode,
     DirectoryResource,
     EnvResource,
     FileResource,
@@ -19,6 +20,7 @@ from pyinc import (
     Input,
     InspectionNode,
     MutationError,
+    QueryProfile,
     UnsupportedValueError,
     UntrackedReadError,
     query,
@@ -1588,3 +1590,300 @@ def test_statistics_node_counts_match_records(tmp_path: Path) -> None:
     assert stats.input_count >= 1
     assert stats.query_count >= 1
     assert stats.resource_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# Dependency graph export
+# ---------------------------------------------------------------------------
+
+
+def test_dependency_graph_empty_database() -> None:
+    db = Database()
+    graph = db.dependency_graph()
+    assert graph == ()
+
+
+def test_dependency_graph_inputs_and_queries() -> None:
+    x = Input[int]("x")
+    y = Input[int]("y")
+
+    @query
+    def add(db: Database) -> int:
+        return x.read(db) + y.read(db)
+
+    db = Database()
+    db.set(x, 1)
+    db.set(y, 2)
+    db.get(add)
+
+    graph = db.dependency_graph()
+
+    add_nodes = [n for n in graph if n.kind == "query"]
+    assert len(add_nodes) == 1
+    add_node = add_nodes[0]
+    assert add_node.last_decision == "executed"
+    assert not add_node.is_untracked
+    assert len(add_node.dependency_labels) == 2
+
+    input_nodes = [n for n in graph if n.kind == "input"]
+    assert len(input_nodes) == 2
+    for node in input_nodes:
+        assert node.dependency_labels == ()
+
+
+def test_dependency_graph_with_resource(tmp_path: Path) -> None:
+    file_path = tmp_path / "data.txt"
+    file_path.write_text("hello")
+    resource = FileResource()
+
+    @query
+    def read_file(db: Database) -> str:
+        return resource.read(db, str(file_path))
+
+    db = Database()
+    db.get(read_file)
+
+    graph = db.dependency_graph()
+    kinds = {n.kind for n in graph}
+    assert "query" in kinds
+    assert "resource" in kinds
+
+
+def test_dependency_graph_diamond_structure() -> None:
+    x = Input[int]("x")
+
+    @query
+    def left(db: Database) -> int:
+        return x.read(db) + 1
+
+    @query
+    def right(db: Database) -> int:
+        return x.read(db) * 2
+
+    @query
+    def combine(db: Database) -> int:
+        return db.get(left) + db.get(right)
+
+    db = Database()
+    db.set(x, 5)
+    db.get(combine)
+
+    graph = db.dependency_graph()
+
+    combine_nodes = [n for n in graph if n.kind == "query" and len(n.dependency_labels) == 2
+                     and all(d not in [n2.label for n2 in graph if n2.kind == "input"] for d in n.dependency_labels)]
+    assert len(combine_nodes) == 1
+    combine_node = combine_nodes[0]
+
+    input_label = [n.label for n in graph if n.kind == "input"][0]
+    mid_nodes = [n for n in graph if n.kind == "query" and input_label in n.dependency_labels]
+    assert len(mid_nodes) == 2
+    mid_labels = {n.label for n in mid_nodes}
+    assert set(combine_node.dependency_labels) == mid_labels
+
+
+def test_dependency_graph_untracked_node() -> None:
+    @query
+    def impure(db: Database) -> str:
+        db.report_untracked_read("test reason")
+        return "value"
+
+    db = Database()
+    db.get(impure)
+
+    graph = db.dependency_graph()
+    query_nodes = [n for n in graph if n.kind == "query"]
+    assert len(query_nodes) == 1
+    assert query_nodes[0].is_untracked
+
+
+def test_dependency_graph_returns_frozen_nodes() -> None:
+    x = Input[int]("x")
+    db = Database()
+    db.set(x, 1)
+
+    graph = db.dependency_graph()
+    assert isinstance(graph, tuple)
+    assert all(isinstance(n, DependencyGraphNode) for n in graph)
+
+
+# ---------------------------------------------------------------------------
+# Batch invalidation
+# ---------------------------------------------------------------------------
+
+
+def test_set_many_empty_iterable_is_noop() -> None:
+    db = Database()
+    rev_before = db.revision
+    db.set_many([])
+    assert db.revision == rev_before
+
+
+def test_set_many_single_changed_input() -> None:
+    x = Input[int]("x")
+    db = Database()
+    db.set_many([(x, 42)])
+    assert db.revision == 1
+
+    @query
+    def read_x(db: Database) -> int:
+        return x.read(db)
+
+    assert db.get(read_x) == 42
+
+
+def test_set_many_multiple_changed_inputs_single_revision() -> None:
+    x = Input[int]("x")
+    y = Input[int]("y")
+    db = Database()
+    db.set_many([(x, 1), (y, 2)])
+    assert db.revision == 1
+
+
+def test_set_many_no_change_no_revision_bump() -> None:
+    x = Input[int]("x")
+    db = Database()
+    db.set(x, 10)
+    rev_before = db.revision
+    db.set_many([(x, 10)])
+    assert db.revision == rev_before
+
+
+def test_set_many_mixed_equal_and_changed() -> None:
+    x = Input[int]("x")
+    y = Input[int]("y")
+    db = Database()
+    db.set(x, 1)
+    db.set(y, 2)
+    rev_before = db.revision
+    db.set_many([(x, 1), (y, 99)])
+    assert db.revision == rev_before + 1
+    stats = db.statistics()
+    assert stats.input_equal_ignores >= 1
+
+
+def test_set_many_downstream_query_sees_all_updates() -> None:
+    x = Input[int]("x")
+    y = Input[int]("y")
+
+    @query
+    def add(db: Database) -> int:
+        return x.read(db) + y.read(db)
+
+    db = Database()
+    db.set_many([(x, 10), (y, 20)])
+    assert db.get(add) == 30
+
+    db.set_many([(x, 100), (y, 200)])
+    assert db.get(add) == 300
+
+
+def test_set_many_stats_counters() -> None:
+    x = Input[int]("x")
+    y = Input[int]("y")
+    db = Database()
+    db.set(x, 1)
+    db.set(y, 2)
+    db.reset_statistics()
+
+    db.set_many([(x, 1), (y, 99)])
+    stats = db.statistics()
+    assert stats.input_sets >= 1
+    assert stats.input_equal_ignores >= 1
+
+
+def test_set_many_rejects_non_input() -> None:
+    db = Database()
+    with pytest.raises(TypeError, match="set_many"):
+        db.set_many([("not_an_input", 1)])
+
+
+# ---------------------------------------------------------------------------
+# Query profiling
+# ---------------------------------------------------------------------------
+
+
+def test_query_profile_empty_on_fresh_database() -> None:
+    db = Database()
+    assert db.query_profile() == ()
+
+
+def test_query_profile_after_execution() -> None:
+    x = Input[int]("x")
+
+    @query
+    def double(db: Database) -> int:
+        return x.read(db) * 2
+
+    db = Database()
+    db.set(x, 5)
+    db.get(double)
+
+    profiles = db.query_profile()
+    assert len(profiles) == 1
+    p = profiles[0]
+    assert isinstance(p, QueryProfile)
+    assert p.execution_count == 1
+    assert p.total_ns > 0
+    assert p.mean_ns == p.total_ns
+
+
+def test_query_profile_counts_executions_not_reuses() -> None:
+    x = Input[int]("x")
+
+    @query
+    def read_x(db: Database) -> int:
+        return x.read(db)
+
+    db = Database()
+    db.set(x, 1)
+    db.get(read_x)
+    db.get(read_x)  # reuse, not re-execution
+
+    profiles = db.query_profile()
+    assert len(profiles) == 1
+    assert profiles[0].execution_count == 1
+
+    db.set(x, 2)
+    db.get(read_x)  # re-execution
+
+    profiles = db.query_profile()
+    assert profiles[0].execution_count == 2
+
+
+def test_query_profile_multiple_queries() -> None:
+    x = Input[int]("x")
+
+    @query
+    def alpha(db: Database) -> int:
+        return x.read(db) + 1
+
+    @query
+    def beta(db: Database) -> int:
+        return x.read(db) * 2
+
+    db = Database()
+    db.set(x, 1)
+    db.get(alpha)
+    db.get(beta)
+
+    profiles = db.query_profile()
+    assert len(profiles) == 2
+    labels = {p.query_label for p in profiles}
+    assert len(labels) == 2
+
+
+def test_reset_statistics_clears_query_timings() -> None:
+    x = Input[int]("x")
+
+    @query
+    def compute(db: Database) -> int:
+        return x.read(db)
+
+    db = Database()
+    db.set(x, 1)
+    db.get(compute)
+    assert len(db.query_profile()) == 1
+
+    db.reset_statistics()
+    assert db.query_profile() == ()

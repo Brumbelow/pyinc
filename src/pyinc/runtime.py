@@ -6,7 +6,8 @@ import io
 import marshal
 import os
 import sys
-from collections.abc import Callable, Iterator, Mapping, MutableMapping
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -96,6 +97,25 @@ class DatabaseStatistics:
     input_equal_ignores: int
     evictions: int
     total_requests: int
+
+
+@dataclass(frozen=True)
+class DependencyGraphNode:
+    label: str
+    kind: str
+    changed_at: int
+    verified_at: int
+    last_decision: str
+    is_untracked: bool
+    dependency_labels: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class QueryProfile:
+    query_label: str
+    execution_count: int
+    total_ns: int
+    mean_ns: int
 
 
 class _GuardedEnviron(MutableMapping[str, str]):
@@ -193,6 +213,7 @@ class Database:
             "input_equal_ignores": 0,
             "evictions": 0,
         }
+        self._query_timings: dict[str, list[int]] = {}
 
     @property
     def revision(self) -> int:
@@ -219,6 +240,37 @@ class Database:
     def reset_statistics(self) -> None:
         for key in self._stats:
             self._stats[key] = 0
+        self._query_timings.clear()
+
+    def query_profile(self) -> tuple[QueryProfile, ...]:
+        profiles: list[QueryProfile] = []
+        for identity, timings in sorted(self._query_timings.items()):
+            total_ns = sum(timings)
+            count = len(timings)
+            profiles.append(QueryProfile(
+                query_label=identity,
+                execution_count=count,
+                total_ns=total_ns,
+                mean_ns=total_ns // count,
+            ))
+        return tuple(profiles)
+
+    def dependency_graph(self) -> tuple[DependencyGraphNode, ...]:
+        nodes: list[DependencyGraphNode] = []
+        for key, record in self._records.items():
+            dep_labels = tuple(
+                sorted(self._records[dep].label for dep in record.dependencies if dep in self._records)
+            )
+            nodes.append(DependencyGraphNode(
+                label=record.label,
+                kind=key.kind,
+                changed_at=record.changed_at,
+                verified_at=record.verified_at,
+                last_decision=record.last_decision,
+                is_untracked=record.is_untracked,
+                dependency_labels=dep_labels,
+            ))
+        return tuple(sorted(nodes, key=lambda n: n.label))
 
     def set(self, input_key: Any, value: Any) -> None:
         from .core import Input
@@ -268,6 +320,75 @@ class Database:
             record.reason = "input changed"
             record.checked_in_request = self._current_request_id()
         self._stats["input_sets"] += 1
+
+    def set_many(self, updates: Iterable[tuple[Any, Any]]) -> None:
+        from .core import Input
+
+        # Phase 1: collect and validate all updates, compute snapshots.
+        pending: list[tuple[Any, Any, NodeKey, Any, str]] = []  # (input_key, value, node_key, snapshot, digest)
+        for input_key, value in updates:
+            if not isinstance(input_key, Input):
+                raise TypeError("db.set_many() expects (Input, value) pairs.")
+            snapshot = self._freeze_value(value)
+            digest = fingerprint_snapshot(snapshot)
+            node_key = self._input_key(input_key)
+            pending.append((input_key, value, node_key, snapshot, digest))
+
+        # Phase 2: determine which inputs actually changed.
+        changed: list[tuple[Any, NodeKey, Any, str]] = []
+        equal_count = 0
+        request_id = self._current_request_id()
+        for input_key, _value, node_key, snapshot, digest in pending:
+            record = self._records.get(node_key)
+            if record is not None and self._compare_values(
+                eq=input_key.eq,
+                cutoff=input_key.cutoff,
+                left=self._thaw_value(record.snapshot),
+                right=self._thaw_value(snapshot),
+            ):
+                record.snapshot = snapshot
+                record.digest = digest
+                record.verified_at = self._revision
+                record.last_decision = "reused"
+                record.reason = "equal input update ignored"
+                record.checked_in_request = request_id
+                equal_count += 1
+            else:
+                changed.append((input_key, node_key, snapshot, digest))
+
+        self._stats["input_equal_ignores"] += equal_count
+
+        if not changed:
+            return
+
+        # Phase 3: single revision bump, apply all changed inputs.
+        self._revision += 1
+        changed_at = self._revision
+        for _input_key, node_key, snapshot, digest in changed:
+            record = self._records.get(node_key)
+            if record is None:
+                self._records[node_key] = NodeRecord(
+                    key=node_key,
+                    label=node_key.label,
+                    snapshot=snapshot,
+                    digest=digest,
+                    changed_at=changed_at,
+                    verified_at=changed_at,
+                    last_decision="executed",
+                    last_recompute="executed",
+                    reason="input set",
+                    checked_in_request=request_id,
+                )
+            else:
+                record.snapshot = snapshot
+                record.digest = digest
+                record.changed_at = changed_at
+                record.verified_at = changed_at
+                record.last_decision = "executed"
+                record.last_recompute = "executed"
+                record.reason = "input changed"
+                record.checked_in_request = request_id
+            self._stats["input_sets"] += 1
 
     def get(self, query: Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
         from .core import Query
@@ -365,7 +486,10 @@ class Database:
                 frame=frame,
             )
             with self._guard_untracked_reads():
+                t0 = time.perf_counter_ns()
                 result = query.fn(self, *query_args, **query_kwargs)
+                elapsed = time.perf_counter_ns() - t0
+            self._query_timings.setdefault(key.label, []).append(elapsed)
             if self.mode == "checked":
                 for before, value in zip(frame.boundary_fingerprints, frame.boundary_values, strict=True):
                     assert_not_mutated(before, self._fingerprint_value(value))

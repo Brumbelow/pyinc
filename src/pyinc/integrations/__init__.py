@@ -50,6 +50,7 @@ from .requirements_txt import (
     IndexDirective,
     RequirementRef,
     RequirementsAnalysis,
+    deep_requirements_analysis,
     requirements_analysis,
     workspace_requirements_analysis,
 )
@@ -102,6 +103,7 @@ __all__ = [
     "XmlElement",
     "config_analysis",
     "csv_analysis",
+    "deep_requirements_analysis",
     "dependency_check_analysis",
     "directory_analysis",
     "env_analysis",

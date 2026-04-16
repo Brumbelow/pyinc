@@ -422,11 +422,63 @@ def workspace_requirements_analysis(
     return None
 
 
+def deep_requirements_analysis(
+    db: Database, path: str | os.PathLike[str]
+) -> RequirementsAnalysis:
+    """Follow -r/--requirement references recursively, merging all requirements.
+
+    Composes at the entrypoint layer: calls requirements_analysis() for each
+    file in the chain, merges results.  Cycle detection via canonical path set.
+    Constraint files (-c) are noted as file references but not followed.
+    """
+    root = Path(os.fspath(path)).resolve()
+    all_requirements: dict[str, RequirementRef] = {}
+    all_file_references: list[FileReference] = []
+    all_index_directives: list[IndexDirective] = []
+    all_diagnostics: list[tuple[str, str]] = []
+    visited: set[str] = set()
+
+    def _walk(file_path: Path) -> None:
+        canonical = str(file_path.resolve())
+        if canonical in visited:
+            all_diagnostics.append(("cycle", f"circular -r reference: {canonical}"))
+            return
+        visited.add(canonical)
+
+        analysis = requirements_analysis(db, str(file_path))
+        all_file_references.extend(analysis.file_references)
+        all_index_directives.extend(analysis.index_directives)
+        all_diagnostics.extend(analysis.diagnostics)
+
+        # Walk referenced files first so the including file's requirements
+        # take precedence (last-wins deduplication by name).
+        for ref in analysis.file_references:
+            if ref.kind == "requirement":
+                ref_path = Path(ref.path)
+                if not ref_path.is_absolute():
+                    ref_path = file_path.parent / ref_path
+                _walk(ref_path)
+
+        for req in analysis.requirements:
+            all_requirements[req.name] = req
+
+    _walk(root)
+
+    return RequirementsAnalysis(
+        path=str(root),
+        requirements=tuple(all_requirements.values()),
+        file_references=tuple(all_file_references),
+        index_directives=tuple(all_index_directives),
+        diagnostics=tuple(all_diagnostics),
+    )
+
+
 __all__ = [
     "FileReference",
     "IndexDirective",
     "RequirementRef",
     "RequirementsAnalysis",
+    "deep_requirements_analysis",
     "requirements_analysis",
     "workspace_requirements_analysis",
 ]

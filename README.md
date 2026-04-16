@@ -53,13 +53,16 @@ The full contract, including explicit limitations and escape hatches, is in [doc
 - pull-based recomputation with revisions, dependency capture, red-green verification, and backdating (early cutoff)
 - `strict`, `checked`, and `fast` execution modes with explicit boundary semantics
 - optional bounded query memoization via `Database(max_query_nodes=...)`
+- `Database.set_many(...)` for atomic batch invalidation of multiple inputs (single revision bump)
+- `Database.dependency_graph()` for machine-readable graph export of all nodes and edges
 - `Database.inspect(...)` for structured provenance and `Database.explain(...)` for human-readable formatting
+- `Database.statistics()` for aggregate counters and `Database.query_profile()` for per-query timing
 
 ## Integrations
 
 - `pyinc.integrations.python_source` — workspace-local module discovery, top-level imports/definitions, simple assignment tracking for export surfaces, conservative import resolution with `workspace`/`stdlib`/`installed`/`missing`/`ambiguous` outcomes (stdlib and installed classification via composition with `installed_packages`).
 - `pyinc.integrations.toml_config` — single-file TOML inspection: section/key extraction, dependency and optional-dependency discovery, tool config discovery.
-- `pyinc.integrations.requirements_txt` — narrow requirements parsing: normalized requirement specs, file references, index directives, editable installs, URL requirements.
+- `pyinc.integrations.requirements_txt` — narrow requirements parsing: normalized requirement specs, file references, index directives, editable installs, URL requirements. Includes `deep_requirements_analysis` for recursive `-r`/`--requirement` file following with cycle detection.
 - `pyinc.integrations.installed_packages` — installed package discovery via `importlib.metadata`-compatible `.dist-info` directories, stdlib module identification via `sys.stdlib_module_names`, and import name resolution (`stdlib`/`installed`/`unknown`).
 - `pyinc.integrations.json_config` — single-file JSON inspection: section/key extraction with type detection, nested object traversal, parse error diagnostics.
 - `pyinc.integrations.dependency_check` — cross-integration dependency validation: composes `installed_packages` and `python_source` to detect undeclared imports and missing packages.
@@ -87,7 +90,7 @@ The integration boundary is summarized in [docs/integration-contract.md](docs/in
 ## Not yet supported
 
 - Deep module path resolution (subpackage-level `sys.path` walking, `.pth` file processing, namespace packages)
-- Marker expression evaluation, recursive `-r` file following, version constraint satisfaction
+- Marker expression evaluation, version constraint satisfaction
 - Symbol/type resolution, LSP wiring, and file watchers
 
 ## Development
