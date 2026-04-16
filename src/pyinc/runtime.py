@@ -509,7 +509,6 @@ class Database:
                 )
                 self._records[key] = record
                 self._query_records.add(key)
-                previous_changed_at = self._revision
                 decision = "executed"
             else:
                 record = previous

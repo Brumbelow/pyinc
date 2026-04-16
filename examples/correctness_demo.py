@@ -16,7 +16,7 @@ import tempfile
 import textwrap
 from pathlib import Path
 
-from pyinc import Database, FileResource, Input, UntrackedReadError, query
+from pyinc import Database, FileResource, UntrackedReadError, query
 
 # ---------------------------------------------------------------------------
 # Setup: a tiny incremental pipeline

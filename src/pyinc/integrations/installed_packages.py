@@ -22,9 +22,6 @@ from pyinc.value import thaw
 InstalledPackagePayload: TypeAlias = tuple[str, str, tuple[str, ...], tuple[str, ...], str]
 #                                          dist_name, version, top_level_names, requires_dist, summary
 
-ImportNameResolutionPayload: TypeAlias = tuple[str, str, str | None, str | None]
-#                                              import_name, origin, dist_name?, dist_version?
-
 DiagnosticPayload: TypeAlias = tuple[str, str]
 #                                    code, message
 
@@ -146,12 +143,10 @@ def _get_site_packages_dirs() -> tuple[str, ...]:
     dirs: list[str] = []
     with contextlib.suppress(AttributeError):
         dirs.extend(site.getsitepackages())
-    try:
+    with contextlib.suppress(AttributeError):
         user_site = site.getusersitepackages()
         if isinstance(user_site, str):
             dirs.append(user_site)
-    except AttributeError:
-        pass
     seen: set[str] = set()
     result: list[str] = []
     for d in dirs:

@@ -21,22 +21,6 @@ Operation = tuple[Literal["write", "delete"], str, str | None]
 # Helpers: build fake dist-info directories
 # ---------------------------------------------------------------------------
 
-_METADATA_TEMPLATE = """\
-Metadata-Version: 2.1
-Name: {name}
-Version: {version}
-Summary: {summary}
-"""
-
-_METADATA_WITH_DEPS = """\
-Metadata-Version: 2.1
-Name: {name}
-Version: {version}
-Summary: {summary}
-Requires-Dist: {dep1}
-Requires-Dist: {dep2}
-"""
-
 
 def _make_dist_info(
     site_dir: Path,
