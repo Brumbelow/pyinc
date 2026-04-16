@@ -96,12 +96,12 @@ The integration boundary is summarized in [docs/integration-contract.md](docs/in
 ## Development
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e '.[dev]'
+python3 -m pip install -e '.[dev]'
 pytest -q
-python -m mypy src tests
-python -m ruff check src tests
+python3 -m mypy src tests
+python3 -m ruff check src tests
 ```
 
 The runtime contract is summarized in [docs/kernel-contract.md](docs/kernel-contract.md). Integration API boundaries are summarized in [docs/integration-contract.md](docs/integration-contract.md). A guide for building new integrations is at [docs/integration-authoring.md](docs/integration-authoring.md).
