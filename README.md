@@ -61,6 +61,11 @@ The full contract, including explicit limitations and escape hatches, is in [doc
 - `pyinc.integrations.toml_config` — single-file TOML inspection: section/key extraction, dependency and optional-dependency discovery, tool config discovery.
 - `pyinc.integrations.requirements_txt` — narrow requirements parsing: normalized requirement specs, file references, index directives, editable installs, URL requirements.
 - `pyinc.integrations.installed_packages` — installed package discovery via `importlib.metadata`-compatible `.dist-info` directories, stdlib module identification via `sys.stdlib_module_names`, and import name resolution (`stdlib`/`installed`/`unknown`).
+- `pyinc.integrations.json_config` — single-file JSON inspection: section/key extraction with type detection, nested object traversal, parse error diagnostics.
+- `pyinc.integrations.dependency_check` — cross-integration dependency validation: composes `installed_packages` and `python_source` to detect undeclared imports and missing packages.
+- `pyinc.integrations.env_file` — `.env` file parsing: key-value extraction with quoted/unquoted values, `export` prefix handling, interpolation reference detection.
+- `pyinc.integrations.xml_config` — XML file inspection via `xml.etree.ElementTree`: element/attribute extraction, dot-path traversal, namespace-aware tag normalization.
+- `pyinc.integrations.csv_data` — CSV/TSV structural analysis via stdlib `csv`: header detection, column discovery, delimiter sniffing, row counting, inconsistent column diagnostics.
 
 `pyinc.integrations` re-exports only the stable dataclass/result types and high-level entrypoints for these integrations. Low-level payload queries, decode helpers, and resource helpers remain experimental in their defining submodules.
 
@@ -82,7 +87,6 @@ The integration boundary is summarized in [docs/integration-contract.md](docs/in
 ## Not yet supported
 
 - Deep module path resolution (subpackage-level `sys.path` walking, `.pth` file processing, namespace packages)
-- Dependency satisfaction validation (cross-referencing declared dependencies against installed packages)
 - Marker expression evaluation, recursive `-r` file following, version constraint satisfaction
 - Symbol/type resolution, LSP wiring, and file watchers
 

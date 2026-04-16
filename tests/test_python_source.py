@@ -38,12 +38,34 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
 
 def test_package_namespace_exports_only_stable_api() -> None:
     assert set(integrations.__all__) == {
+        # csv_data
+        "CsvAnalysis",
+        "CsvColumn",
+        "csv_analysis",
+        "workspace_csv_analysis",
         # dependency_check
         "DependencyCheckAnalysis",
         "DependencyStatus",
         "UndeclaredImport",
         "dependency_check_analysis",
         "workspace_dependency_check",
+        # env_file
+        "EnvEntry",
+        "EnvFileAnalysis",
+        "env_analysis",
+        "workspace_env_analysis",
+        # installed_packages
+        "ImportNameResolution",
+        "InstalledPackageRef",
+        "InstalledPackagesAnalysis",
+        "installed_packages_analysis",
+        "resolve_import_name",
+        # json_config
+        "JsonAnalysis",
+        "JsonKey",
+        "JsonSection",
+        "json_analysis",
+        "workspace_json_analysis",
         # python_source
         "DependencySurface",
         "DefinitionRef",
@@ -70,18 +92,12 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "ConfigSection",
         "config_analysis",
         "workspace_config_analysis",
-        # json_config
-        "JsonAnalysis",
-        "JsonKey",
-        "JsonSection",
-        "json_analysis",
-        "workspace_json_analysis",
-        # installed_packages
-        "ImportNameResolution",
-        "InstalledPackageRef",
-        "InstalledPackagesAnalysis",
-        "installed_packages_analysis",
-        "resolve_import_name",
+        # xml_config
+        "XmlAnalysis",
+        "XmlAttribute",
+        "XmlElement",
+        "xml_analysis",
+        "workspace_xml_analysis",
     }
     assert hasattr(integrations, "file_analysis")
     assert hasattr(integrations, "directory_analysis")

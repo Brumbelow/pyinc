@@ -1,9 +1,21 @@
+from .csv_data import (
+    CsvAnalysis,
+    CsvColumn,
+    csv_analysis,
+    workspace_csv_analysis,
+)
 from .dependency_check import (
     DependencyCheckAnalysis,
     DependencyStatus,
     UndeclaredImport,
     dependency_check_analysis,
     workspace_dependency_check,
+)
+from .env_file import (
+    EnvEntry,
+    EnvFileAnalysis,
+    env_analysis,
+    workspace_env_analysis,
 )
 from .installed_packages import (
     ImportNameResolution,
@@ -48,17 +60,27 @@ from .toml_config import (
     config_analysis,
     workspace_config_analysis,
 )
+from .xml_config import (
+    XmlAnalysis,
+    XmlAttribute,
+    XmlElement,
+    workspace_xml_analysis,
+    xml_analysis,
+)
 
 __all__ = [
-    "DependencyCheckAnalysis",
-    "DependencyStatus",
-    "UndeclaredImport",
     "ConfigAnalysis",
     "ConfigKey",
     "ConfigSection",
+    "CsvAnalysis",
+    "CsvColumn",
     "DefinitionRef",
+    "DependencyCheckAnalysis",
+    "DependencyStatus",
     "DependencySurface",
     "Diagnostic",
+    "EnvEntry",
+    "EnvFileAnalysis",
     "FileReference",
     "ImportNameResolution",
     "ImportRef",
@@ -74,9 +96,15 @@ __all__ = [
     "RequirementRef",
     "RequirementsAnalysis",
     "ResolvedImportRef",
+    "UndeclaredImport",
+    "XmlAnalysis",
+    "XmlAttribute",
+    "XmlElement",
     "config_analysis",
+    "csv_analysis",
     "dependency_check_analysis",
     "directory_analysis",
+    "env_analysis",
     "file_analysis",
     "installed_packages_analysis",
     "json_analysis",
@@ -85,7 +113,11 @@ __all__ = [
     "resolve_import_name",
     "workspace_analysis",
     "workspace_config_analysis",
+    "workspace_csv_analysis",
     "workspace_dependency_check",
+    "workspace_env_analysis",
     "workspace_json_analysis",
     "workspace_requirements_analysis",
+    "workspace_xml_analysis",
+    "xml_analysis",
 ]

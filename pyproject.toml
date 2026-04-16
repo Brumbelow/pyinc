@@ -8,15 +8,15 @@ version = "0.1.0"
 description = "A correctness-first incremental query engine for Python."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [
-  { name = "pyinc contributors" },
+  { name = "Andrew Brumbelow", email = "andrew@vangelder-inc.com" },
 ]
 keywords = ["incremental-computation", "query-kernel", "salsa", "red-green", "backdating", "provenance"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -24,6 +24,11 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/abrumbelow/pyinc"
+Repository = "https://github.com/abrumbelow/pyinc"
+Issues = "https://github.com/abrumbelow/pyinc/issues"
 
 [project.optional-dependencies]
 dev = [
