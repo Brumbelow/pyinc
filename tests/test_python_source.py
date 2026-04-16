@@ -43,6 +43,14 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "CsvColumn",
         "csv_analysis",
         "workspace_csv_analysis",
+        # deep_module_resolution
+        "DeepModuleResolutionAnalysis",
+        "ModulePathEntry",
+        "NamespacePackage",
+        "PthDirective",
+        "ResolvedModuleLocation",
+        "deep_module_resolution_analysis",
+        "resolve_module_path",
         # dependency_check
         "DependencyCheckAnalysis",
         "DependencyStatus",
@@ -838,6 +846,72 @@ def test_workspace_import_preferred_over_environment(tmp_path: Path) -> None:
     db = Database(mode="strict")
     analysis = module_analysis(db, root, consumer)
     assert analysis.resolved_imports[0].resolution == "workspace"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_installed_import_resolves_to_file_via_deep_module_resolution(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: installed-package imports should have resolved_path populated."""
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    pkg_dir = site / "fake_installed"
+    pkg_dir.mkdir()
+    (pkg_dir / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (pkg_dir / "submod.py").write_text("EXTRA = 2\n", encoding="utf-8")
+
+    # Stage dist-info so environment_index classifies `fake_installed` as installed.
+    dist_info = site / "fake_installed-1.0.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\n"
+        "Name: fake_installed\n"
+        "Version: 1.0.0\n"
+        "Summary: Fake\n",
+        encoding="utf-8",
+    )
+    (dist_info / "top_level.txt").write_text("fake_installed\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site),),
+    )
+    monkeypatch.setattr(
+        "pyinc.integrations.deep_module_resolution._get_sys_path_entries",
+        lambda: (str(site),),
+    )
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "app.py"
+    consumer.write_text(
+        "import fake_installed\n"
+        "from fake_installed import submod\n"
+        "from fake_installed import VALUE\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode=mode)
+    analysis = module_analysis(db, root, consumer)
+    by_module = {(r.module, r.imported_name): r for r in analysis.resolved_imports}
+
+    top = by_module[("fake_installed", None)]
+    assert top.resolution == "installed"
+    assert top.distribution_name == "fake_installed"
+    assert top.resolved_path is not None
+    assert Path(top.resolved_path).resolve() == (pkg_dir / "__init__.py").resolve()
+
+    submod_ref = by_module[("fake_installed", "submod")]
+    assert submod_ref.resolution == "installed"
+    assert submod_ref.resolved_path is not None
+    assert Path(submod_ref.resolved_path).resolve() == (pkg_dir / "submod.py").resolve()
+
+    # `from fake_installed import VALUE` (a plain symbol, not a submodule):
+    # Expected to fall back to the package __init__.py since VALUE has no file.
+    value_ref = by_module[("fake_installed", "VALUE")]
+    assert value_ref.resolution == "installed"
+    assert value_ref.resolved_path is not None
+    assert Path(value_ref.resolved_path).resolve() == (pkg_dir / "__init__.py").resolve()
 
 
 def test_relative_import_failure_stays_missing(tmp_path: Path) -> None:

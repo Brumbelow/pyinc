@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
 from pyinc.core import query
+from pyinc.integrations.deep_module_resolution import resolve_module_location
 from pyinc.integrations.installed_packages import environment_index
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
@@ -431,6 +432,53 @@ def _resolve_workspace_module(
     return None, None, None
 
 
+def _installed_module_candidates(
+    *,
+    request_module: str,
+    kind: ImportKind,
+    imported_name: str | None,
+    current_module: str,
+    current_path: str,
+) -> tuple[str, ...]:
+    if kind == "import":
+        return (request_module,) if request_module else ()
+    absolute_base = _resolve_relative_base(current_module, current_path, request_module)
+    if absolute_base is None:
+        return ()
+    candidates: list[str] = []
+    if imported_name is not None and imported_name != "*":
+        candidate = f"{absolute_base}.{imported_name}" if absolute_base else imported_name
+        candidates.append(candidate)
+    if absolute_base:
+        candidates.append(absolute_base)
+    return tuple(candidates)
+
+
+def _enrich_installed_path(
+    db: Database,
+    *,
+    request_module: str,
+    kind: ImportKind,
+    imported_name: str | None,
+    current_module: str,
+    current_path: str,
+) -> tuple[str | None, str | None]:
+    for candidate in _installed_module_candidates(
+        request_module=request_module,
+        kind=kind,
+        imported_name=imported_name,
+        current_module=current_module,
+        current_path=current_path,
+    ):
+        payload = resolve_module_location(db, candidate)
+        _, loc_kind, file_path, _, _, _, _ = payload
+        if loc_kind == "regular-module" or loc_kind == "regular-package":
+            return candidate, file_path
+        if loc_kind == "namespace-package":
+            return candidate, None
+    return None, None
+
+
 def _resolve_import_reference(
     *,
     current_module: str,
@@ -642,6 +690,20 @@ def resolved_imports_for_file(db: Database, root: str, path: str) -> tuple[Resol
                 stdlib_modules=stdlib_modules,
                 package_top_levels=pkg_map,
             )
+            if resolution == "installed" and resolved_path is None:
+                enriched_module, enriched_path = _enrich_installed_path(
+                    db,
+                    request_module=request_module,
+                    kind=kind,
+                    imported_name=None,
+                    current_module=current_module,
+                    current_path=path,
+                )
+                if enriched_path is not None:
+                    resolved_module = enriched_module
+                    resolved_path = enriched_path
+                elif enriched_module is not None:
+                    resolved_module = enriched_module
             resolved.append(
                 (request_module, kind, lineno, None, resolved_module, resolved_path, resolution, dist_name, dist_ver)
             )
@@ -658,6 +720,20 @@ def resolved_imports_for_file(db: Database, root: str, path: str) -> tuple[Resol
                 stdlib_modules=stdlib_modules,
                 package_top_levels=pkg_map,
             )
+            if resolution == "installed" and resolved_path is None:
+                enriched_module, enriched_path = _enrich_installed_path(
+                    db,
+                    request_module=request_module,
+                    kind=kind,
+                    imported_name=imported_name,
+                    current_module=current_module,
+                    current_path=path,
+                )
+                if enriched_path is not None:
+                    resolved_module = enriched_module
+                    resolved_path = enriched_path
+                elif enriched_module is not None:
+                    resolved_module = enriched_module
             resolved.append(
                 (
                     request_module,
