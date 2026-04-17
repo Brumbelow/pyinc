@@ -8,6 +8,10 @@ import pyinc.integrations as integrations
 from pyinc import Database
 from pyinc.integrations.xml_config import (
     XmlAnalysis,
+    XmlSecurityError,
+    _normalize_xml_text,
+    _reject_doctype,
+    _xml_cutoff_token,
     workspace_xml_analysis,
     xml_analysis,
 )
@@ -312,3 +316,78 @@ def test_xml_analysis_matches_fresh_recomputation(mode: str, tmp_path: Path) -> 
         path.write_text(content, encoding="utf-8")
         fresh = Database(mode=mode)
         assert xml_analysis(incremental, str(path)) == xml_analysis(fresh, str(path))
+
+
+# ---------------------------------------------------------------------------
+# Audit remediation: DOCTYPE/ENTITY rejection + parse-free cutoff (Finding 6)
+# ---------------------------------------------------------------------------
+
+
+_BILLION_LAUGHS = """\
+<?xml version="1.0"?>
+<!DOCTYPE lolz [
+  <!ENTITY lol "lol">
+  <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+  <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">
+]>
+<lolz>&lol2;</lolz>
+"""
+
+
+def test_reject_doctype_blocks_billion_laughs() -> None:
+    with pytest.raises(XmlSecurityError):
+        _reject_doctype(_BILLION_LAUGHS)
+
+
+def test_reject_doctype_blocks_plain_doctype() -> None:
+    with pytest.raises(XmlSecurityError):
+        _reject_doctype('<?xml version="1.0"?>\n<!DOCTYPE note SYSTEM "note.dtd">\n<note/>')
+
+
+def test_reject_doctype_accepts_xml_declaration() -> None:
+    # XML declaration is not a DOCTYPE.
+    _reject_doctype('<?xml version="1.0" encoding="UTF-8"?>\n<root/>')
+
+
+def test_xml_analysis_surfaces_security_error_as_diagnostic(tmp_path: Path) -> None:
+    path = tmp_path / "lolz.xml"
+    path.write_text(_BILLION_LAUGHS, encoding="utf-8")
+
+    db = Database()
+    result = xml_analysis(db, str(path))
+    # No elements extracted (security-rejected inputs are treated like unparseable).
+    assert result.elements == ()
+    assert any(kind == "xml-security-error" for kind, _msg in result.diagnostics)
+
+
+def test_xml_cutoff_token_does_not_parse(monkeypatch: pytest.MonkeyPatch) -> None:
+    import xml.etree.ElementTree as ET
+
+    call_count = {"n": 0}
+    original = ET.fromstring
+
+    def spy(text: str, *args: object, **kwargs: object) -> object:
+        call_count["n"] += 1
+        return original(text, *args, **kwargs)
+
+    monkeypatch.setattr(ET, "fromstring", spy)
+    _xml_cutoff_token("<root><child>text</child></root>")
+    assert call_count["n"] == 0
+
+
+def test_xml_cutoff_token_stable_under_whitespace_reformat() -> None:
+    a = _xml_cutoff_token("<root><child>text</child></root>")
+    b = _xml_cutoff_token("<root>\n  <child>text</child>\n</root>\n")
+    assert a == b
+
+
+def test_xml_cutoff_token_differs_on_tag_rename() -> None:
+    a = _xml_cutoff_token("<root><child>text</child></root>")
+    b = _xml_cutoff_token("<root><renamed>text</renamed></root>")
+    assert a != b
+
+
+def test_xml_normalize_preserves_attribute_whitespace() -> None:
+    # Attribute values (inside double quotes) must not be whitespace-collapsed.
+    normalized = _normalize_xml_text('<root attr="a  b  c"/>')
+    assert 'attr="a  b  c"' in normalized

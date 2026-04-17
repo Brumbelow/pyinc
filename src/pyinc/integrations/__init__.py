@@ -74,6 +74,7 @@ from .xml_config import (
     XmlAnalysis,
     XmlAttribute,
     XmlElement,
+    XmlSecurityError,
     workspace_xml_analysis,
     xml_analysis,
 )
@@ -115,6 +116,7 @@ __all__ = [
     "XmlAnalysis",
     "XmlAttribute",
     "XmlElement",
+    "XmlSecurityError",
     "config_analysis",
     "csv_analysis",
     "deep_module_resolution_analysis",

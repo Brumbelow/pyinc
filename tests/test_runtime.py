@@ -1887,3 +1887,138 @@ def test_reset_statistics_clears_query_timings() -> None:
 
     db.reset_statistics()
     assert db.query_profile() == ()
+
+
+# ---------------------------------------------------------------------------
+# Audit remediation: DirectoryResource probe collision (Finding 1)
+# ---------------------------------------------------------------------------
+
+
+def test_directory_resource_missing_dir_does_not_collide_with_single_entry_named_missing(
+    tmp_path: Path,
+) -> None:
+    directories = DirectoryResource()
+    target = tmp_path / "workspace"
+
+    @query
+    def entries(db: Database, dirname: str) -> tuple[str, ...]:
+        return directories.read(db, dirname)
+
+    db = Database()
+    # Directory does not exist -> empty listing.
+    assert db.get(entries, str(target)) == ()
+
+    # Replace with a directory that contains exactly one file literally named
+    # "missing". The old probe collapsed both states to ("missing",), so the
+    # stale empty tuple would be reused.
+    target.mkdir()
+    (target / "missing").write_text("", encoding="utf-8")
+
+    assert db.get(entries, str(target)) == ("missing",)
+    assert _inspect_node(db, entries, str(target)).last_decision == "executed"
+
+
+# ---------------------------------------------------------------------------
+# Audit remediation: resource probe/load TOCTOU (Finding 2)
+# ---------------------------------------------------------------------------
+
+
+def test_file_resource_probe_is_recomputed_from_loaded_bytes(tmp_path: Path) -> None:
+    """Probe returned to the kernel must reflect the bytes that were loaded,
+    so a later revert to the originally-probed bytes triggers a reload rather
+    than silently reusing a value that was loaded against different content."""
+    files = FileResource()
+    path = tmp_path / "sample.txt"
+    path.write_text("alpha", encoding="utf-8")
+
+    @query
+    def read_file(db: Database, filename: str) -> str:
+        return files.read(db, filename)
+
+    # Wrap FileResource so that probe() sees "alpha" bytes but load() sees
+    # "bravo" bytes (the classic TOCTOU scenario between probe and load).
+    class RacyFileResource(FileResource):
+        def probe(self, path: str) -> tuple[str, str] | tuple[str]:
+            return super().probe(path)
+
+        def load(self, db: Database, path: str) -> str:
+            # Simulate a mutation happening between probe and load.
+            if Path(path).read_text(encoding="utf-8") == "alpha":
+                Path(path).write_text("bravo", encoding="utf-8")
+            return super().load(db, path)
+
+    racy = RacyFileResource()
+
+    @query
+    def racy_read(db: Database, filename: str) -> str:
+        return racy.read(db, filename)
+
+    db = Database()
+    # First access: probe sees "alpha", load observes the mutation and reads
+    # "bravo". The stored probe must match the loaded bytes ("bravo"), not
+    # the pre-load observation ("alpha").
+    assert db.get(racy_read, str(path)) == "bravo"
+
+    # Revert the file to the originally-probed bytes. With the TOCTOU bug,
+    # the stored probe was ("present", hash_of_alpha) and a revert would
+    # match it -> stale "bravo" reused. With the fix, stored probe is
+    # ("present", hash_of_bravo), revert differs -> reload.
+    path.write_text("alpha", encoding="utf-8")
+    # Override load to be plain (no further mutation) for this call.
+    racy.load = lambda db, p: Path(p).read_bytes().decode("utf-8")  # type: ignore[assignment, method-assign]
+    assert db.get(racy_read, str(path)) == "alpha"
+
+
+# ---------------------------------------------------------------------------
+# Audit remediation: owner-thread assertion (Finding 4)
+# ---------------------------------------------------------------------------
+
+
+def test_database_rejects_access_from_non_owner_thread() -> None:
+    import threading
+
+    x = Input[int](name="x")
+
+    @query
+    def compute(db: Database) -> int:
+        return x.read(db) + 1
+
+    db = Database()
+    db.set(x, 1)
+
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            db.get(compute)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "single-threaded" in str(errors[0])
+
+
+def test_database_entirely_on_worker_thread_is_accepted() -> None:
+    import threading
+
+    x = Input[int](name="x")
+
+    @query
+    def compute(db: Database) -> int:
+        return x.read(db) + 1
+
+    results: list[int] = []
+
+    def worker() -> None:
+        db = Database()
+        db.set(x, 1)
+        results.append(db.get(compute))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert results == [2]

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
-import pickle
+import struct
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
@@ -232,7 +233,61 @@ def fingerprint(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = 
 
 
 def fingerprint_snapshot(snapshot: Any) -> str:
-    return pickle.dumps(snapshot, protocol=5).hex()
+    return hashlib.sha256(_canonical_bytes(snapshot)).hexdigest()
+
+
+_LEN = struct.Struct(">Q")
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    if value is None:
+        return b"N"
+    if isinstance(value, bool):
+        return b"B" + (b"\x01" if value else b"\x00")
+    if isinstance(value, int):
+        magnitude = abs(value)
+        data = magnitude.to_bytes((magnitude.bit_length() + 7) // 8 or 1, "big")
+        sign = b"\x01" if value < 0 else b"\x00"
+        return b"I" + sign + _LEN.pack(len(data)) + data
+    if isinstance(value, float):
+        if value != value:  # NaN canonicalization
+            payload = struct.pack(">Q", 0x7FF8000000000000)
+        elif value == 0.0:  # -0.0 → +0.0
+            payload = struct.pack(">d", 0.0)
+        else:
+            payload = struct.pack(">d", value)
+        return b"F" + payload
+    if isinstance(value, complex):
+        return b"C" + _canonical_bytes(value.real) + _canonical_bytes(value.imag)
+    if isinstance(value, str):
+        encoded = value.encode("utf-8")
+        return b"s" + _LEN.pack(len(encoded)) + encoded
+    if isinstance(value, bytes):
+        return b"b" + _LEN.pack(len(value)) + value
+    if isinstance(value, FrozenList):
+        return b"L" + _LEN.pack(len(value.items)) + b"".join(_canonical_bytes(item) for item in value.items)
+    if isinstance(value, FrozenDict):
+        return b"D" + _LEN.pack(len(value.entries)) + b"".join(
+            _canonical_bytes(key) + _canonical_bytes(item) for key, item in value.entries
+        )
+    if isinstance(value, FrozenSet):
+        kind = b"\x01" if value.kind == "frozenset" else b"\x00"
+        return b"S" + kind + _LEN.pack(len(value.items)) + b"".join(_canonical_bytes(item) for item in value.items)
+    if isinstance(value, FrozenRecord):
+        name = value.type_name.encode("utf-8")
+        entries = b"".join(
+            _canonical_bytes(key) + _canonical_bytes(item) for key, item in value.entries
+        )
+        return b"R" + _LEN.pack(len(name)) + name + _LEN.pack(len(value.entries)) + entries
+    if isinstance(value, FrozenAdapterValue):
+        key = value.adapter_key.encode("utf-8")
+        return b"A" + _LEN.pack(len(key)) + key + _canonical_bytes(value.payload)
+    if isinstance(value, tuple):
+        return b"t" + _LEN.pack(len(value)) + b"".join(_canonical_bytes(item) for item in value)
+    raise UnsupportedValueError(
+        f"Cannot canonicalize snapshot value of type {type(value).__qualname__}; "
+        "expected a frozen/immutable snapshot node."
+    )
 
 
 def snapshots_equal(left: Any, right: Any) -> bool:
@@ -253,8 +308,8 @@ def _freeze_unordered(values: Iterable[Any], registry: _AdapterRegistry, active_
     return tuple(sorted(snapshots, key=_canonical_sort_key))
 
 
-def _canonical_sort_key(value: Any) -> str:
-    return fingerprint_snapshot(value)
+def _canonical_sort_key(value: Any) -> bytes:
+    return _canonical_bytes(value)
 
 
 def _coerce_registry(adapters: AdapterMap | _AdapterRegistry | None) -> _AdapterRegistry:

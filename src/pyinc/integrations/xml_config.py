@@ -10,7 +10,7 @@ from typing import TypeAlias, cast
 from pyinc.core import query
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
-from pyinc.value import freeze, thaw
+from pyinc.value import thaw
 
 XmlAttributePayload: TypeAlias = tuple[str, str]
 XmlElementPayload: TypeAlias = tuple[
@@ -27,6 +27,10 @@ XmlAnalysisPayload: TypeAlias = tuple[
     tuple[XmlElementPayload, ...],    # elements
     tuple[DiagnosticPayload, ...],    # diagnostics
 ]
+
+
+class XmlSecurityError(ValueError):
+    """Raised when an XML document uses a feature that is disallowed for safety reasons."""
 
 
 @dataclass(frozen=True)
@@ -78,7 +82,15 @@ class _XmlFileResource:
         if not file_path.exists():
             return ""
         with db._allow_raw_open():
-            return file_path.read_text(encoding=self.encoding)
+            data = file_path.read_bytes()
+        return data.decode(self.encoding)
+
+    def recompute_probe(self, path: str, loaded_value: str) -> tuple[str, str] | tuple[str]:
+        if not loaded_value:
+            file_path = Path(path)
+            if not file_path.exists():
+                return ("missing",)
+        return ("present", hashlib.sha256(loaded_value.encode(self.encoding)).hexdigest())
 
 
 _FILES = _XmlFileResource()
@@ -125,20 +137,79 @@ def _walk_elements(
     return elements
 
 
+def _reject_doctype(text: str) -> None:
+    # DOCTYPE declarations must appear in the XML prolog; we additionally reject
+    # any occurrence anywhere as a belt-and-braces defense against entity-expansion
+    # ("billion laughs") attacks. Stdlib xml.etree disables external entity
+    # retrieval but still expands internal entity definitions.
+    if "<!DOCTYPE" in text or "<!ENTITY" in text:
+        raise XmlSecurityError(
+            "XML DOCTYPE/ENTITY declarations are not permitted; strip the prolog "
+            "before loading or use a different parser."
+        )
+
+
+def _normalize_xml_text(text: str) -> str:
+    # Produce a cutoff token that is cheap to compute (no XML parse) and stable
+    # under whitespace-only reformatting. Drop XML comments, collapse ASCII
+    # whitespace runs outside double-quoted attribute values to a single space,
+    # then drop spaces adjacent to tag boundaries. This treats inter-tag and
+    # leading/trailing text whitespace as insignificant — a semantic edit (tag
+    # rename, attribute change, text change) still invalidates; a reformat does
+    # not. False invalidations are still possible for whitespace-significant
+    # XML; the kernel is correctness-first, so false-reuse is the failure mode
+    # to avoid.
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_quote = False
+    while i < n:
+        ch = text[i]
+        if not in_quote and text.startswith("<!--", i):
+            end = text.find("-->", i + 4)
+            if end < 0:
+                break
+            i = end + 3
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+            out.append(ch)
+            i += 1
+            continue
+        if not in_quote and ch in " \t\r\n":
+            if out and out[-1] != " ":
+                out.append(" ")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    collapsed = "".join(out).strip()
+    # Drop spaces immediately adjacent to '<' or '>'.
+    result: list[str] = []
+    j = 0
+    m = len(collapsed)
+    while j < m:
+        c = collapsed[j]
+        if c == " " and (
+            (result and result[-1] == ">")
+            or (j + 1 < m and collapsed[j + 1] == "<")
+        ):
+            j += 1
+            continue
+        result.append(c)
+        j += 1
+    return "".join(result)
+
+
 def _xml_cutoff_token(text: str) -> tuple[str, str]:
-    try:
-        root = ET.fromstring(text)  # noqa: S314
-        elements = _walk_elements(root, "")
-        snapshot = freeze(elements)
-        return ("parsed", repr(snapshot))
-    except ET.ParseError:
-        return ("raw", text)
+    return ("text", _normalize_xml_text(text))
 
 
 def _try_parse_xml(text: str) -> ET.Element | None:
     try:
+        _reject_doctype(text)
         return ET.fromstring(text)  # noqa: S314
-    except ET.ParseError:
+    except (ET.ParseError, XmlSecurityError):
         return None
 
 
@@ -166,6 +237,10 @@ def xml_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload,
     text = xml_file_text(db, path)
     if not text:
         return ()
+    try:
+        _reject_doctype(text)
+    except XmlSecurityError as exc:
+        return (("xml-security-error", str(exc)),)
     try:
         ET.fromstring(text)  # noqa: S314
         return ()
@@ -235,6 +310,7 @@ __all__ = [
     "XmlAttribute",
     "XmlElement",
     "XmlAnalysis",
+    "XmlSecurityError",
     "xml_analysis",
     "workspace_xml_analysis",
 ]

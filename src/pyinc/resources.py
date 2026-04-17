@@ -27,7 +27,11 @@ class FileResource:
 
     def load(self, db: Database, path: str) -> str:
         with db._allow_raw_open():
-            return Path(path).read_text(encoding=self.encoding)
+            data = Path(path).read_bytes()
+        return data.decode(self.encoding)
+
+    def recompute_probe(self, path: str, loaded_value: str) -> tuple[str, str]:
+        return ("present", hashlib.sha256(loaded_value.encode(self.encoding)).hexdigest())
 
 
 @dataclass(frozen=True)
@@ -76,11 +80,11 @@ class DirectoryResource:
     def label(self, path: str) -> str:
         return f"dir[{path}]"
 
-    def probe(self, path: str) -> tuple[str, ...] | tuple[str]:
+    def probe(self, path: str) -> tuple[str, tuple[str, ...]] | tuple[str]:
         dir_path = Path(path)
         if not dir_path.exists():
             return ("missing",)
-        return tuple(sorted(child.name for child in dir_path.iterdir()))
+        return ("present", tuple(sorted(child.name for child in dir_path.iterdir())))
 
     def load(self, db: Database, path: str) -> tuple[str, ...]:
         dir_path = Path(path)

@@ -30,7 +30,12 @@ state; each `db.get()` call returns an independent copy.
 **2. Tracked ambient reads.**
 All reads of external state within a query must go through the Resource API
 (`FileResource`, `FileStatResource`, `EnvResource`, `DirectoryResource`) or a
-user-defined resource implementing the `label`/`probe`/`load` protocol.
+user-defined resource implementing the `label`/`probe`/`load` protocol. A
+resource may additionally implement `recompute_probe(parameter, loaded_value)`;
+if present, the kernel uses its return value as the stored probe after load,
+so the probe always describes the value that was loaded rather than a
+pre-load observation (closing the probe/load time-of-check/time-of-use gap
+for content-hashed resources).
 
 The kernel intercepts the following during query execution and raises
 `UntrackedReadError` if they are called outside a resource scope:
@@ -91,6 +96,12 @@ The kernel is in-memory and single-process. Code fingerprints include the Python
 implementation and version tuple but not all possible build configuration
 differences. There is no durable cache.
 
+A `Database` instance is owned by the thread that constructed it; calls from
+any other thread raise `RuntimeError`. The untracked-read guard patches
+`builtins.open`, `io.open`, `os.environ`, `os.getenv`, `os.listdir`,
+`os.scandir`, and `Path.iterdir` process-wide during query execution, so even
+concurrent use from other threads would share that global patch.
+
 **5. Cycle-adjacent partial state.**
 When a `CycleError` is raised, the dependency graph may contain partial state from
 the aborted evaluation. The database remains functional for non-cyclic queries
@@ -124,7 +135,14 @@ scratch on its next request. This is correct but may degrade performance.
 ### Additional Kernel Properties
 
 - Query identity includes the function definition payload, including supported
-  captured values. Mutable closure/global captures are rejected.
+  captured values. Mutable closure/global captures are rejected. Captured
+  modules are fingerprinted by `(name, __file__, __version__)` and captured
+  C-extension builtins by `(module, qualname, <containing module's __version__>)`;
+  this catches version bumps of well-behaved packages but does not detect
+  in-process monkey-patching, `importlib.reload`, or builds that fail to advertise
+  `__version__`. Capture the specific attribute instead of the module (e.g.
+  `pkg.CONSTANT` in a free variable) to route identity through the static-capture
+  fingerprinter.
 - Resource identity includes resource configuration (e.g., encoding for
   `FileResource`).
 - `Database.inspect(...)` exposes the last recorded provenance tree as structured

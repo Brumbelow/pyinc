@@ -377,3 +377,76 @@ def test_adapter_registry_for_value_returns_none_for_unknown_type() -> None:
     registry = _AdapterRegistry({Point: PointAdapter()})
     assert registry.for_value("a string") is None
     assert registry.for_value(42) is None
+
+
+# ---------------------------------------------------------------------------
+# Audit remediation: canonical fingerprint encoder (Finding 3)
+# ---------------------------------------------------------------------------
+
+
+def test_fingerprint_stable_under_dict_insertion_order() -> None:
+    a = fingerprint({"a": 1, "b": 2, "c": 3})
+    b = fingerprint({"c": 3, "a": 1, "b": 2})
+    c = fingerprint({"b": 2, "c": 3, "a": 1})
+    assert a == b == c
+
+
+def test_fingerprint_stable_under_set_insertion_order() -> None:
+    # Build two sets with different insertion order; freeze/encode sorts them.
+    a = fingerprint({1, 2, 3, 4})
+    b = fingerprint({4, 2, 1, 3})
+    assert a == b
+
+
+def test_fingerprint_nan_is_canonical() -> None:
+    nan_a = float("nan")
+    nan_b = float("nan")
+    assert fingerprint(nan_a) == fingerprint(nan_b)
+
+
+def test_fingerprint_signed_zero_is_canonical() -> None:
+    assert fingerprint(0.0) == fingerprint(-0.0)
+
+
+def test_fingerprint_distinguishes_tuple_and_list() -> None:
+    # Tuples stay tuples (frozen as such); lists become FrozenList — different tag.
+    assert fingerprint((1, 2, 3)) != fingerprint([1, 2, 3])
+
+
+def test_fingerprint_distinguishes_set_kind() -> None:
+    assert fingerprint({1, 2, 3}) != fingerprint(frozenset({1, 2, 3}))
+
+
+def test_fingerprint_cross_process_determinism(tmp_path: Path) -> None:
+    """Spawn a subprocess that imports the library fresh and compare the
+    digest of a fixed snapshot to the in-process digest."""
+    import os
+    import subprocess
+    import sys
+
+    src = (
+        "import sys\n"
+        "from pyinc.value import fingerprint\n"
+        "value = {'pkg': ['a', 'b'], 'n': 7, 'nested': {'x': 1}, 'tup': (1, 2)}\n"
+        "sys.stdout.write(fingerprint(value))\n"
+    )
+    # Ensure the subprocess can import pyinc even under uv-managed pytest
+    # where sys.executable points at a pytest venv without pyinc installed.
+    repo_src = Path(__file__).resolve().parent.parent / "src"
+    env = os.environ.copy()
+    existing_pp = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{repo_src}{os.pathsep}{existing_pp}" if existing_pp else str(repo_src)
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", src],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=str(tmp_path),
+        env=env,
+    )
+    in_process = fingerprint(
+        {"pkg": ["a", "b"], "n": 7, "nested": {"x": 1}, "tup": (1, 2)}
+    )
+    assert result.stdout == in_process

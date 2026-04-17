@@ -6,6 +6,7 @@ import io
 import marshal
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
@@ -190,6 +191,7 @@ class Database:
         self.mode = mode
         self.max_query_nodes = max_query_nodes
         self._adapters = dict(adapters or {})
+        self._owner_thread = threading.get_ident()
         self._revision = 0
         self._records: dict[NodeKey, NodeRecord] = {}
         self._input_records: dict[Any, NodeKey] = {}
@@ -215,11 +217,21 @@ class Database:
         }
         self._query_timings: dict[str, list[int]] = {}
 
+    def _assert_owner_thread(self) -> None:
+        current = threading.get_ident()
+        if current != self._owner_thread:
+            raise RuntimeError(
+                f"Database is single-threaded; accessed from thread {current}, "
+                f"owned by {self._owner_thread}."
+            )
+
     @property
     def revision(self) -> int:
+        self._assert_owner_thread()
         return self._revision
 
     def statistics(self) -> DatabaseStatistics:
+        self._assert_owner_thread()
         resource_count = sum(1 for k in self._records if k.kind == "resource")
         return DatabaseStatistics(
             node_count=len(self._records),
@@ -238,11 +250,13 @@ class Database:
         )
 
     def reset_statistics(self) -> None:
+        self._assert_owner_thread()
         for key in self._stats:
             self._stats[key] = 0
         self._query_timings.clear()
 
     def query_profile(self) -> tuple[QueryProfile, ...]:
+        self._assert_owner_thread()
         profiles: list[QueryProfile] = []
         for identity, timings in sorted(self._query_timings.items()):
             total_ns = sum(timings)
@@ -256,6 +270,7 @@ class Database:
         return tuple(profiles)
 
     def dependency_graph(self) -> tuple[DependencyGraphNode, ...]:
+        self._assert_owner_thread()
         nodes: list[DependencyGraphNode] = []
         for key, record in self._records.items():
             dep_labels = tuple(
@@ -273,6 +288,7 @@ class Database:
         return tuple(sorted(nodes, key=lambda n: n.label))
 
     def set(self, input_key: Any, value: Any) -> None:
+        self._assert_owner_thread()
         from .core import Input
 
         if not isinstance(input_key, Input):
@@ -322,6 +338,7 @@ class Database:
         self._stats["input_sets"] += 1
 
     def set_many(self, updates: Iterable[tuple[Any, Any]]) -> None:
+        self._assert_owner_thread()
         from .core import Input
 
         # Phase 1: collect and validate all updates, compute snapshots.
@@ -391,6 +408,7 @@ class Database:
             self._stats["input_sets"] += 1
 
     def get(self, query: Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        self._assert_owner_thread()
         from .core import Query
 
         if not isinstance(query, Query):
@@ -402,6 +420,7 @@ class Database:
             return cast(T, self._expose_boundary_snapshot(self._records[key].snapshot))
 
     def explain(self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> str:
+        self._assert_owner_thread()
         from .core import Query
 
         if not isinstance(query, Query):
@@ -409,6 +428,7 @@ class Database:
         return format_explanation(self.inspect(query, *args, **kwargs))
 
     def inspect(self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> InspectionNode:
+        self._assert_owner_thread()
         from .core import Query
 
         if not isinstance(query, Query):
@@ -420,6 +440,7 @@ class Database:
             return self._inspect_record(key)
 
     def report_untracked_read(self, reason: str) -> None:
+        self._assert_owner_thread()
         frame = self._current_frame()
         if frame is None:
             raise RuntimeError("db.report_untracked_read() must be called while a query is executing.")
@@ -584,6 +605,9 @@ class Database:
             changed_at = self._revision
         with self._allow_raw_reads_scope():
             loaded_value = resource.load(self, parameter)
+        recompute = getattr(resource, "recompute_probe", None)
+        if recompute is not None:
+            probe = recompute(parameter, loaded_value)
         snapshot = self._freeze_value(loaded_value)
         digest = fingerprint_snapshot(snapshot)
         if record is None:
@@ -856,11 +880,21 @@ class Database:
         if self._is_resource_handle(value):
             return ("resource", self._resource_identity_payload(value))
         if isinstance(value, ModuleType):
-            return ("module", value.__name__)
+            return (
+                "module",
+                value.__name__,
+                getattr(value, "__file__", None),
+                getattr(value, "__version__", None),
+            )
         if isinstance(value, FunctionType):
             return ("function", self._function_definition_payload(value, seen_functions))
         if isinstance(value, BuiltinFunctionType):
-            return ("builtin", value.__module__, value.__qualname__)
+            return (
+                "builtin",
+                getattr(value, "__module__", None),
+                value.__qualname__,
+                getattr(sys.modules.get(getattr(value, "__module__", "") or ""), "__version__", None),
+            )
         if isinstance(value, type):
             return ("type", value.__module__, value.__qualname__)
         try:

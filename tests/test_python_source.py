@@ -105,6 +105,7 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "XmlAnalysis",
         "XmlAttribute",
         "XmlElement",
+        "XmlSecurityError",
         "xml_analysis",
         "workspace_xml_analysis",
     }
