@@ -1986,12 +1986,12 @@ def test_database_rejects_access_from_non_owner_thread() -> None:
     db = Database()
     db.set(x, 1)
 
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def worker() -> None:
         try:
             db.get(compute)
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:
             errors.append(exc)
 
     thread = threading.Thread(target=worker)
