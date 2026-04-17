@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import struct
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -250,7 +251,7 @@ def _canonical_bytes(value: Any) -> bytes:
         sign = b"\x01" if value < 0 else b"\x00"
         return b"I" + sign + _LEN.pack(len(data)) + data
     if isinstance(value, float):
-        if value != value:  # NaN canonicalization
+        if math.isnan(value):  # NaN canonicalization
             payload = struct.pack(">Q", 0x7FF8000000000000)
         elif value == 0.0:  # -0.0 → +0.0
             payload = struct.pack(">d", 0.0)
