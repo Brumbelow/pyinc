@@ -87,15 +87,45 @@ for mutation safety.
 (See: `test_fast_mode_uses_owned_values_without_mutation_detection`)
 
 **4. Cross-process or cross-run persistence.**
-The kernel is in-memory and single-process. Code fingerprints include the Python
-implementation and version tuple but not all possible build configuration
-differences. There is no durable cache.
+The kernel is in-memory. Code fingerprints include the Python implementation
+and version tuple but not all possible build configuration differences. There
+is no durable cache.
+
+Within a process, `Database` is thread-safe for concurrent use both across
+independent instances and on a single shared instance. Each `Database` holds
+a `threading.RLock` that serialises state mutations across public entry
+points (`get`, `set`, `set_many`, `inspect`, `explain`). The ambient-read
+guard is installed globally exactly once and dispatches per-context via a
+`ContextVar` stack of active databases — two threads inside queries on
+different `Database` instances do not stomp each other's enforcement, and
+raw I/O from a thread that is *not* inside any query continues to work
+unaffected. If many threads share a single `Database`, work serialises on the
+per-instance lock; if they hold separate `Database` instances they run in
+parallel.
+
+`fingerprint_snapshot(snapshot)` is a deterministic, stable function of the
+`Snapshot` union (scalars, `FrozenList`, `FrozenDict`, `FrozenSet`,
+`FrozenRecord`, `FrozenAdapterValue`, tuples of the same). Digests are an
+injective-by-construction length-prefixed, type-tagged encoding finalized with
+sha256. They are stable across CPython minor versions and safe to persist if a
+durable cache is added later. Any change to the encoder counts as a cache-key
+break and must be accompanied by a bump of the kernel identity so older
+fingerprints are rejected rather than silently reused.
 
 **5. Cycle-adjacent partial state.**
 When a `CycleError` is raised, the dependency graph may contain partial state from
 the aborted evaluation. The database remains functional for non-cyclic queries
 after the error.
 (See: `test_cycle_error_does_not_corrupt_database_for_subsequent_queries`)
+
+**5b. Ambient module monkey-patching.**
+Captured modules contribute their `__version__`, source-file digest (sha256
+for `.py`, `(size, mtime_ns)` for compiled files), and declared `__all__` to
+the code fingerprint — a third-party version bump or source-file edit
+invalidates cached results that capture that module. An in-process
+monkey-patch of an existing attribute (e.g. `sys.modules["foo"].X = 42`
+without reloading or touching the file) is **not** detected. Route such
+mutable state through an `Input` or a custom `Resource`.
 
 **6. LRU eviction under active dependencies.**
 If `max_query_nodes` is set low enough that an intermediate query is evicted while

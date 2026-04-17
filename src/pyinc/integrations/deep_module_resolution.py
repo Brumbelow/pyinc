@@ -10,7 +10,7 @@ from typing import TypeAlias, cast
 
 from pyinc.core import query
 from pyinc.integrations.installed_packages import environment_index
-from pyinc.resources import DirectoryResource, FileStatResource
+from pyinc.resources import DirectoryResource, FileStatResource, _file_read_snapshot
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
@@ -120,6 +120,12 @@ class _PthFileResource:
             return ""
         with db._allow_raw_open():
             return file_path.read_text(encoding="utf-8")
+
+    def probe_and_load(
+        self, db: Database, path: str
+    ) -> tuple[tuple[str, str] | tuple[str], str]:
+        probe, text = _file_read_snapshot(path, "utf-8")
+        return probe, text if text is not None else ""
 
 
 _DIRECTORIES = DirectoryResource()

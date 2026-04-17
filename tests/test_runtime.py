@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import mmap
 import os
+import threading
 from pathlib import Path
 from typing import Any, cast
 
@@ -520,6 +521,140 @@ def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) ->
     child.write_text("beta", encoding="utf-8")
     assert db.get(entries, str(path)) == ("a.txt",)
     assert _inspect_node(db, entries, str(path)).last_decision == "reused"
+
+
+def test_file_resource_atomic_probe_and_load_keeps_digest_and_text_coherent(tmp_path: Path) -> None:
+    import hashlib
+
+    files = FileResource()
+    path = tmp_path / "config.txt"
+    original = "alpha beta gamma"
+    path.write_text(original, encoding="utf-8")
+
+    @query
+    def read(db: Database, target: str) -> str:
+        return files.read(db, target)
+
+    db = Database()
+    text = db.get(read, str(path))
+    assert text == original
+
+    resource_record = db._records[db._resource_key(files, str(path))]
+    probe = resource_record.probe
+    assert probe[0] == "present"
+    stored_digest = cast(str, probe[1])
+    assert stored_digest == hashlib.sha256(original.encode("utf-8")).hexdigest()
+
+    updated = "delta epsilon zeta"
+    path.write_text(updated, encoding="utf-8")
+
+    text_after = db.get(read, str(path))
+    assert text_after == updated
+    resource_record_after = db._records[db._resource_key(files, str(path))]
+    probe_after = resource_record_after.probe
+    assert probe_after[0] == "present"
+    stored_digest_after = cast(str, probe_after[1])
+    assert stored_digest_after == hashlib.sha256(updated.encode("utf-8")).hexdigest()
+
+
+def test_file_resource_coherent_under_read_race(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import hashlib
+
+    files = FileResource()
+    path = tmp_path / "race.txt"
+    path.write_text("first", encoding="utf-8")
+
+    @query
+    def read(db: Database, target: str) -> str:
+        return files.read(db, target)
+
+    # Simulate a concurrent writer: the first read_bytes returns "first",
+    # a second unexpected read_bytes would return "second". Under atomic
+    # probe_and_load, only one read happens, so probe and text must agree.
+    sequence = iter([b"first", b"second"])
+
+    real_read_bytes = Path.read_bytes
+
+    def fake_read_bytes(self: Path) -> bytes:
+        if str(self) == str(path):
+            return next(sequence)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+
+    db = Database()
+    text = db.get(read, str(path))
+    assert text == "first"
+
+    resource_record = db._records[db._resource_key(files, str(path))]
+    probe = resource_record.probe
+    assert probe[0] == "present"
+    assert probe[1] == hashlib.sha256(b"first").hexdigest()
+
+
+def test_directory_resource_distinguishes_missing_dir_from_entry_named_missing(tmp_path: Path) -> None:
+    directories = DirectoryResource()
+    workspace = tmp_path / "workspace"
+
+    @query
+    def listing(db: Database, dirname: str) -> tuple[str, ...]:
+        return directories.read(db, dirname)
+
+    workspace.mkdir()
+    (workspace / "missing").write_text("x", encoding="utf-8")
+
+    db = Database()
+    present = db.get(listing, str(workspace))
+    assert present == ("missing",)
+
+    (workspace / "missing").unlink()
+    workspace.rmdir()
+
+    absent = db.get(listing, str(workspace))
+    assert absent == ()
+    assert _inspect_node(db, listing, str(workspace)).last_decision == "executed"
+
+
+def test_directory_resource_matches_fresh_recomputation_across_missing_toggles(tmp_path: Path) -> None:
+    directories = DirectoryResource()
+    workspace = tmp_path / "workspace"
+
+    @query
+    def listing(db: Database, dirname: str) -> tuple[str, ...]:
+        return directories.read(db, dirname)
+
+    incremental = Database()
+
+    transitions: list[tuple[str, tuple[str, ...]]] = []
+
+    def current_listing() -> tuple[str, ...]:
+        if not workspace.exists():
+            return ()
+        return tuple(sorted(child.name for child in workspace.iterdir()))
+
+    def record(tag: str) -> None:
+        incremental_result = incremental.get(listing, str(workspace))
+        fresh_result = Database().get(listing, str(workspace))
+        assert incremental_result == fresh_result == current_listing(), tag
+        transitions.append((tag, incremental_result))
+
+    record("initial-missing")
+
+    workspace.mkdir()
+    record("empty-present")
+
+    (workspace / "missing").write_text("x", encoding="utf-8")
+    record("single-child-named-missing")
+
+    (workspace / "missing").unlink()
+    workspace.rmdir()
+    record("missing-again")
+
+    workspace.mkdir()
+    (workspace / "missing").write_text("y", encoding="utf-8")
+    record("single-child-named-missing-again")
+
+    assert len({payload for _, payload in transitions}) >= 2
 
 
 def test_direct_cycles_raise_cycle_error() -> None:
@@ -1887,3 +2022,219 @@ def test_reset_statistics_clears_query_timings() -> None:
 
     db.reset_statistics()
     assert db.query_profile() == ()
+
+
+# ---------------------------------------------------------------------------
+# Thread safety
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_queries_across_databases_are_thread_safe() -> None:
+    x = Input[int]("x")
+
+    @query
+    def double(db: Database) -> int:
+        return x.read(db) * 2
+
+    errors: list[BaseException] = []
+    results: list[int] = []
+
+    def worker(value: int) -> None:
+        try:
+            db = Database()
+            db.set(x, value)
+            for _ in range(50):
+                results.append(db.get(double))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"thread errors: {errors}"
+    # Each of 8 threads pushed 50 results — 400 total. Values are 2*i for i in [0..7].
+    assert len(results) == 8 * 50
+    assert set(results) == {2 * i for i in range(8)}
+
+
+def test_shared_database_serializes_concurrent_set_and_get() -> None:
+    x = Input[int]("x")
+
+    @query
+    def read_x(db: Database) -> int:
+        return x.read(db)
+
+    db = Database()
+    db.set(x, 0)
+
+    errors: list[BaseException] = []
+    observed: list[int] = []
+
+    def setter() -> None:
+        try:
+            for value in range(100):
+                db.set(x, value)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def getter() -> None:
+        try:
+            for _ in range(200):
+                observed.append(db.get(read_x))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=setter),
+        threading.Thread(target=setter),
+        threading.Thread(target=getter),
+        threading.Thread(target=getter),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"thread errors: {errors}"
+    # All observed values must be valid iterations assigned by some setter.
+    assert all(0 <= v < 100 for v in observed)
+
+
+def test_untracked_read_still_enforced_per_thread(tmp_path: Path) -> None:
+    path = tmp_path / "f.txt"
+    path.write_text("ok", encoding="utf-8")
+
+    @query
+    def raw_open(db: Database) -> int:
+        with open(str(path), encoding="utf-8"):
+            pass
+        return 1
+
+    db_a = Database()
+    errors_a: list[BaseException] = []
+
+    started = threading.Event()
+    may_finish = threading.Event()
+    outside_reads_ok: list[bool] = []
+
+    def worker_a() -> None:
+        try:
+            db_a.get(raw_open)
+        except UntrackedReadError:
+            errors_a.append(UntrackedReadError("raised as expected"))
+
+    def worker_b() -> None:
+        started.wait()
+        try:
+            with open(str(path), encoding="utf-8") as fh:
+                outside_reads_ok.append(fh.read() == "ok")
+        finally:
+            may_finish.set()
+
+    # Prime: trigger query execution on a separate thread; while it's active,
+    # a parallel thread should still be able to read raw files because it's
+    # outside any query frame.
+    t_a = threading.Thread(target=worker_a)
+    t_b = threading.Thread(target=worker_b)
+    t_a.start()
+    started.set()
+    t_b.start()
+    t_a.join()
+    t_b.join()
+
+    assert errors_a, "query that called raw open must raise UntrackedReadError"
+    assert outside_reads_ok == [True]
+
+
+def test_module_capture_invalidates_on_source_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+    import sys as _sys
+
+    module_dir = tmp_path
+    module_file = module_dir / "pyinc_test_f5_source_change.py"
+    module_file.write_text("CONSTANT = 'alpha'\n", encoding="utf-8")
+
+    monkeypatch.syspath_prepend(str(module_dir))
+    mod = importlib.import_module("pyinc_test_f5_source_change")
+    try:
+
+        @query
+        def read_constant(db: Database) -> str:
+            return cast(str, mod.CONSTANT)
+
+        db1 = Database()
+        first_fp = db1._code_fingerprint(cast(Any, read_constant.fn))
+
+        # Update the source and reload. A later query registration must see a
+        # different code fingerprint because the captured module's source
+        # changed.
+        module_file.write_text("CONSTANT = 'omega'\n", encoding="utf-8")
+        os.utime(str(module_file), ns=(0, 2_000_000_000))
+        importlib.reload(mod)
+
+        db2 = Database()
+        second_fp = db2._code_fingerprint(cast(Any, read_constant.fn))
+
+        assert first_fp != second_fp
+    finally:
+        _sys.modules.pop("pyinc_test_f5_source_change", None)
+
+
+def test_module_capture_invalidates_on_version_attr_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+    import sys as _sys
+
+    module_dir = tmp_path
+    module_file = module_dir / "pyinc_test_f5_version.py"
+    module_file.write_text("__version__ = '1.0.0'\n", encoding="utf-8")
+
+    monkeypatch.syspath_prepend(str(module_dir))
+    mod = importlib.import_module("pyinc_test_f5_version")
+    try:
+
+        @query
+        def read_version(db: Database) -> str:
+            return cast(str, mod.__version__)
+
+        first_fp = Database()._code_fingerprint(cast(Any, read_version.fn))
+
+        # Simulate a version bump in-process; the captured module's payload
+        # must reflect the new value.
+        mod.__version__ = "2.0.0"  # type: ignore[attr-defined]
+
+        second_fp = Database()._code_fingerprint(cast(Any, read_version.fn))
+        assert first_fp != second_fp
+    finally:
+        _sys.modules.pop("pyinc_test_f5_version", None)
+
+
+def test_module_capture_stable_for_stdlib_within_same_interpreter() -> None:
+    import os as _os
+
+    @query
+    def uses_os(db: Database) -> str:
+        return _os.sep
+
+    db_a = Database()
+    db_b = Database()
+    fp_a = db_a._code_fingerprint(cast(Any, uses_os.fn))
+    fp_b = db_b._code_fingerprint(cast(Any, uses_os.fn))
+    assert fp_a == fp_b
+
+
+def test_guard_stack_reentrant_within_same_thread() -> None:
+    @query
+    def inner(db: Database) -> int:
+        return 1
+
+    @query
+    def outer(db: Database) -> int:
+        return inner(db) + 1
+
+    db = Database()
+    assert db.get(outer) == 2
+    # Stack popped cleanly: running inner by itself after outer still works.
+    assert db.get(inner) == 1

@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import os
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.resources import DirectoryResource
+from pyinc.resources import DirectoryResource, _file_read_snapshot
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
 
@@ -80,6 +81,12 @@ class _XmlFileResource:
         with db._allow_raw_open():
             return file_path.read_text(encoding=self.encoding)
 
+    def probe_and_load(
+        self, db: Database, path: str
+    ) -> tuple[tuple[str, str] | tuple[str], str]:
+        probe, text = _file_read_snapshot(path, self.encoding)
+        return probe, text if text is not None else ""
+
 
 _FILES = _XmlFileResource()
 _DIRECTORIES = DirectoryResource()
@@ -125,9 +132,51 @@ def _walk_elements(
     return elements
 
 
+def _safe_parse(text: str) -> ET.Element:
+    """Parse XML with DOCTYPE and entity declarations rejected.
+
+    DTDs and entity declarations are blocked at parse time; this neutralises
+    billion-laughs expansion and external-DTD exfiltration regardless of the
+    underlying expat version's default handling. Namespace-qualified tags are
+    normalised to Clark notation (`{uri}localname`) so the result is shaped
+    identically to `ET.fromstring`. Malformed input and rejected constructs
+    both surface as `ET.ParseError`.
+    """
+    builder = ET.TreeBuilder()
+    parser = xml.parsers.expat.ParserCreate(encoding=None, namespace_separator="}")
+    forbidden = False
+
+    def _forbid(*_args: object, **_kwargs: object) -> None:
+        nonlocal forbidden
+        forbidden = True
+
+    def _start_element(tag: str, attrs: dict[str, str]) -> None:
+        normalised_tag = "{" + tag if "}" in tag else tag
+        normalised_attrs = {
+            ("{" + k if "}" in k else k): v for k, v in attrs.items()
+        }
+        builder.start(normalised_tag, normalised_attrs)
+
+    def _end_element(tag: str) -> None:
+        builder.end("{" + tag if "}" in tag else tag)
+
+    parser.StartDoctypeDeclHandler = _forbid
+    parser.EntityDeclHandler = _forbid
+    parser.StartElementHandler = _start_element
+    parser.EndElementHandler = _end_element
+    parser.CharacterDataHandler = builder.data
+    try:
+        parser.Parse(text.encode("utf-8"), True)
+    except xml.parsers.expat.ExpatError as exc:
+        raise ET.ParseError(str(exc)) from exc
+    if forbidden:
+        raise ET.ParseError("DTD / entity declarations disabled for safety")
+    return builder.close()
+
+
 def _xml_cutoff_token(text: str) -> tuple[str, str]:
     try:
-        root = ET.fromstring(text)  # noqa: S314
+        root = _safe_parse(text)
         elements = _walk_elements(root, "")
         snapshot = freeze(elements)
         return ("parsed", repr(snapshot))
@@ -137,7 +186,7 @@ def _xml_cutoff_token(text: str) -> tuple[str, str]:
 
 def _try_parse_xml(text: str) -> ET.Element | None:
     try:
-        return ET.fromstring(text)  # noqa: S314
+        return _safe_parse(text)
     except ET.ParseError:
         return None
 
@@ -167,7 +216,7 @@ def xml_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload,
     if not text:
         return ()
     try:
-        ET.fromstring(text)  # noqa: S314
+        _safe_parse(text)
         return ()
     except ET.ParseError as exc:
         return (("xml-parse-error", str(exc)),)

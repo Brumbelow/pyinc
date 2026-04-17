@@ -312,3 +312,67 @@ def test_xml_analysis_matches_fresh_recomputation(mode: str, tmp_path: Path) -> 
         path.write_text(content, encoding="utf-8")
         fresh = Database(mode=mode)
         assert xml_analysis(incremental, str(path)) == xml_analysis(fresh, str(path))
+
+
+_BILLION_LAUGHS = """\
+<?xml version="1.0"?>
+<!DOCTYPE lolz [
+  <!ENTITY lol "lol">
+  <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+  <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+  <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">
+]>
+<root>&lol4;</root>
+"""
+
+_EXTERNAL_DTD = """\
+<?xml version="1.0"?>
+<!DOCTYPE r SYSTEM "file:///etc/passwd">
+<r/>
+"""
+
+
+def test_xml_analysis_rejects_billion_laughs_payload(tmp_path: Path) -> None:
+    import time
+
+    path = tmp_path / "evil.xml"
+    path.write_text(_BILLION_LAUGHS, encoding="utf-8")
+
+    start = time.monotonic()
+    result = xml_analysis(Database(), str(path))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0, f"parse took {elapsed:.2f}s; billion-laughs not bounded"
+    assert result.elements == ()
+    assert any(diag[0] == "xml-parse-error" for diag in result.diagnostics)
+
+
+def test_xml_analysis_rejects_external_dtd(tmp_path: Path) -> None:
+    path = tmp_path / "ext.xml"
+    path.write_text(_EXTERNAL_DTD, encoding="utf-8")
+
+    result = xml_analysis(Database(), str(path))
+    assert result.elements == ()
+    assert any(diag[0] == "xml-parse-error" for diag in result.diagnostics)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_xml_analysis_matches_fresh_recomputation_with_adversarial_payloads(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "shifty.xml"
+
+    steps: tuple[tuple[str, str], ...] = (
+        ("safe", "<root><child>hi</child></root>"),
+        ("billion-laughs", _BILLION_LAUGHS),
+        ("external-dtd", _EXTERNAL_DTD),
+        ("safe again", "<root><child>hi</child></root>"),
+        ("minimal doctype", "<?xml version='1.0'?><!DOCTYPE r><r/>"),
+        ("safe different", "<root><other>bye</other></root>"),
+    )
+
+    incremental = Database(mode=mode)
+    for _label, content in steps:
+        path.write_text(content, encoding="utf-8")
+        fresh = Database(mode=mode)
+        assert xml_analysis(incremental, str(path)) == xml_analysis(fresh, str(path))

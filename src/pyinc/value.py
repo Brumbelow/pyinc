@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import hashlib
 import os
-import pickle
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
@@ -232,7 +232,134 @@ def fingerprint(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = 
 
 
 def fingerprint_snapshot(snapshot: Any) -> str:
-    return pickle.dumps(snapshot, protocol=5).hex()
+    buf = bytearray()
+    _encode_snapshot(snapshot, buf)
+    return hashlib.sha256(buf).hexdigest()
+
+
+def _encode_snapshot(value: Any, buf: bytearray) -> None:
+    if value is None:
+        buf += b"N;"
+        return
+    if value is True:
+        buf += b"T;"
+        return
+    if value is False:
+        buf += b"F;"
+        return
+    if isinstance(value, int):
+        body = str(value).encode("ascii")
+        buf += b"i"
+        buf += str(len(body)).encode("ascii")
+        buf += b":"
+        buf += body
+        buf += b";"
+        return
+    if isinstance(value, float):
+        body = value.hex().encode("ascii")
+        buf += b"f"
+        buf += str(len(body)).encode("ascii")
+        buf += b":"
+        buf += body
+        buf += b";"
+        return
+    if isinstance(value, complex):
+        real_body = value.real.hex().encode("ascii")
+        imag_body = value.imag.hex().encode("ascii")
+        buf += b"c"
+        buf += str(len(real_body)).encode("ascii")
+        buf += b":"
+        buf += real_body
+        buf += b","
+        buf += str(len(imag_body)).encode("ascii")
+        buf += b":"
+        buf += imag_body
+        buf += b";"
+        return
+    if isinstance(value, str):
+        body = value.encode("utf-8")
+        buf += b"s"
+        buf += str(len(body)).encode("ascii")
+        buf += b":"
+        buf += body
+        buf += b";"
+        return
+    if isinstance(value, bytes):
+        buf += b"b"
+        buf += str(len(value)).encode("ascii")
+        buf += b":"
+        buf += value
+        buf += b";"
+        return
+    if isinstance(value, FrozenList):
+        buf += b"L"
+        buf += str(len(value.items)).encode("ascii")
+        buf += b":"
+        for item in value.items:
+            _encode_snapshot(item, buf)
+        buf += b";"
+        return
+    if isinstance(value, FrozenDict):
+        buf += b"D"
+        buf += str(len(value.entries)).encode("ascii")
+        buf += b":"
+        for key, item in value.entries:
+            _encode_snapshot(key, buf)
+            _encode_snapshot(item, buf)
+        buf += b";"
+        return
+    if isinstance(value, FrozenSet):
+        kind_body = value.kind.encode("utf-8")
+        buf += b"S"
+        buf += str(len(kind_body)).encode("ascii")
+        buf += b":"
+        buf += kind_body
+        buf += b","
+        buf += str(len(value.items)).encode("ascii")
+        buf += b":"
+        for item in value.items:
+            _encode_snapshot(item, buf)
+        buf += b";"
+        return
+    if isinstance(value, FrozenRecord):
+        name_body = value.type_name.encode("utf-8")
+        buf += b"R"
+        buf += str(len(name_body)).encode("ascii")
+        buf += b":"
+        buf += name_body
+        buf += b","
+        buf += str(len(value.entries)).encode("ascii")
+        buf += b":"
+        for key, item in value.entries:
+            key_body = key.encode("utf-8")
+            buf += str(len(key_body)).encode("ascii")
+            buf += b":"
+            buf += key_body
+            _encode_snapshot(item, buf)
+        buf += b";"
+        return
+    if isinstance(value, FrozenAdapterValue):
+        key_body = value.adapter_key.encode("utf-8")
+        buf += b"A"
+        buf += str(len(key_body)).encode("ascii")
+        buf += b":"
+        buf += key_body
+        buf += b","
+        _encode_snapshot(value.payload, buf)
+        buf += b";"
+        return
+    if isinstance(value, tuple):
+        buf += b"t"
+        buf += str(len(value)).encode("ascii")
+        buf += b":"
+        for item in value:
+            _encode_snapshot(item, buf)
+        buf += b";"
+        return
+    raise TypeError(
+        f"fingerprint_snapshot: unsupported snapshot value of type {type(value).__qualname__!r}; "
+        "all inputs must be produced by freeze()."
+    )
 
 
 def snapshots_equal(left: Any, right: Any) -> bool:

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import inspect
 import io
 import marshal
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
@@ -14,7 +16,6 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast, overload
-from unittest import mock
 
 from .errors import CycleError, UnsupportedValueError, UntrackedReadError
 from .explain import InspectionNode, format_explanation
@@ -118,6 +119,90 @@ class QueryProfile:
     mean_ns: int
 
 
+_ACTIVE_GUARDS: ContextVar[tuple[Database, ...]] = ContextVar(
+    "pyinc_active_guards", default=()
+)
+_GUARD_INSTALLED = False
+_GUARD_INSTALL_LOCK = threading.Lock()
+
+
+def _raise_if_guarded(message: str) -> None:
+    """Raise `UntrackedReadError` if any active Database has a running query without raw-read permission."""
+    for db in _ACTIVE_GUARDS.get():
+        if db._current_frame() is not None and not db._allow_raw_reads.get():
+            raise UntrackedReadError(message)
+
+
+def _install_guards_once() -> None:
+    """Install global wrappers around raw I/O entry points exactly once per process.
+
+    The wrappers consult `_ACTIVE_GUARDS` (a `ContextVar`) to determine whether
+    any `Database` currently has a query frame on the calling context without
+    raw-read permission. Installation is idempotent and thread-safe; once
+    installed, the wrappers stay in place for the life of the process.
+    """
+    global _GUARD_INSTALLED
+    if _GUARD_INSTALLED:
+        return
+    with _GUARD_INSTALL_LOCK:
+        if _GUARD_INSTALLED:
+            return
+
+        original_builtins_open = builtins.open
+        original_io_open = io.open
+        original_os_getenv = os.getenv
+        original_os_listdir = os.listdir
+        original_os_scandir = os.scandir
+        original_path_iterdir = Path.iterdir
+        original_environ = os.environ
+
+        def guarded_open(*args: Any, **kwargs: Any) -> Any:
+            _raise_if_guarded("Raw open() inside a query is untracked. Use FileResource.read().")
+            return original_builtins_open(*args, **kwargs)
+
+        def guarded_io_open(*args: Any, **kwargs: Any) -> Any:
+            _raise_if_guarded("Raw open() inside a query is untracked. Use FileResource.read().")
+            return original_io_open(*args, **kwargs)
+
+        def guarded_getenv(key: str, default: str | None = None) -> str | None:
+            _raise_if_guarded("Raw os.getenv() inside a query is untracked. Use EnvResource.read().")
+            return original_os_getenv(key, default)
+
+        def guarded_listdir(*args: Any, **kwargs: Any) -> Any:
+            _raise_if_guarded(
+                "Raw os.listdir() inside a query is untracked. Use DirectoryResource.read()."
+            )
+            return original_os_listdir(*args, **kwargs)
+
+        def guarded_scandir(*args: Any, **kwargs: Any) -> Any:
+            _raise_if_guarded(
+                "Raw os.scandir() inside a query is untracked. Use DirectoryResource.read()."
+            )
+            return original_os_scandir(*args, **kwargs)
+
+        def guarded_path_iterdir(path_obj: Path) -> Any:
+            _raise_if_guarded(
+                "Raw Path.iterdir() inside a query is untracked. Use DirectoryResource.read()."
+            )
+            return original_path_iterdir(path_obj)
+
+        guarded_environ = _GuardedEnviron(
+            original_environ,
+            lambda: _raise_if_guarded(
+                "Raw os.environ access inside a query is untracked. Use EnvResource.read()."
+            ),
+        )
+
+        builtins.open = guarded_open
+        io.open = guarded_io_open
+        os.getenv = guarded_getenv  # type: ignore[assignment]
+        os.listdir = guarded_listdir
+        os.scandir = guarded_scandir
+        os.environ = guarded_environ  # type: ignore[assignment]  # noqa: B003
+        Path.iterdir = guarded_path_iterdir  # type: ignore[assignment, method-assign]
+        _GUARD_INSTALLED = True
+
+
 class _GuardedEnviron(MutableMapping[str, str]):
     def __init__(self, wrapped: MutableMapping[str, str], check_read: Callable[[], None]) -> None:
         self._wrapped = wrapped
@@ -214,6 +299,9 @@ class Database:
             "evictions": 0,
         }
         self._query_timings: dict[str, list[int]] = {}
+        self._module_identity_cache: dict[tuple[str, str, int, int], Any] = {}
+        self._state_lock = threading.RLock()
+        _install_guards_once()
 
     @property
     def revision(self) -> int:
@@ -277,68 +365,10 @@ class Database:
 
         if not isinstance(input_key, Input):
             raise TypeError("db.set() expects an Input instance.")
-        snapshot = self._freeze_value(value)
-        digest = fingerprint_snapshot(snapshot)
-        node_key = self._input_key(input_key)
-        record = self._records.get(node_key)
-        if record is not None and self._compare_values(
-            eq=input_key.eq,
-            cutoff=input_key.cutoff,
-            left=self._thaw_value(record.snapshot),
-            right=self._thaw_value(snapshot),
-        ):
-            record.snapshot = snapshot
-            record.digest = digest
-            record.verified_at = self._revision
-            record.last_decision = "reused"
-            record.reason = "equal input update ignored"
-            record.checked_in_request = self._current_request_id()
-            self._stats["input_equal_ignores"] += 1
-            return
-        self._revision += 1
-        changed_at = self._revision
-        if record is None:
-            self._records[node_key] = NodeRecord(
-                key=node_key,
-                label=node_key.label,
-                snapshot=snapshot,
-                digest=digest,
-                changed_at=changed_at,
-                verified_at=changed_at,
-                last_decision="executed",
-                last_recompute="executed",
-                reason="input set",
-                checked_in_request=self._current_request_id(),
-            )
-        else:
-            record.snapshot = snapshot
-            record.digest = digest
-            record.changed_at = changed_at
-            record.verified_at = changed_at
-            record.last_decision = "executed"
-            record.last_recompute = "executed"
-            record.reason = "input changed"
-            record.checked_in_request = self._current_request_id()
-        self._stats["input_sets"] += 1
-
-    def set_many(self, updates: Iterable[tuple[Any, Any]]) -> None:
-        from .core import Input
-
-        # Phase 1: collect and validate all updates, compute snapshots.
-        pending: list[tuple[Any, Any, NodeKey, Any, str]] = []  # (input_key, value, node_key, snapshot, digest)
-        for input_key, value in updates:
-            if not isinstance(input_key, Input):
-                raise TypeError("db.set_many() expects (Input, value) pairs.")
+        with self._state_lock:
             snapshot = self._freeze_value(value)
             digest = fingerprint_snapshot(snapshot)
             node_key = self._input_key(input_key)
-            pending.append((input_key, value, node_key, snapshot, digest))
-
-        # Phase 2: determine which inputs actually changed.
-        changed: list[tuple[Any, NodeKey, Any, str]] = []
-        equal_count = 0
-        request_id = self._current_request_id()
-        for input_key, _value, node_key, snapshot, digest in pending:
             record = self._records.get(node_key)
             if record is not None and self._compare_values(
                 eq=input_key.eq,
@@ -351,21 +381,11 @@ class Database:
                 record.verified_at = self._revision
                 record.last_decision = "reused"
                 record.reason = "equal input update ignored"
-                record.checked_in_request = request_id
-                equal_count += 1
-            else:
-                changed.append((input_key, node_key, snapshot, digest))
-
-        self._stats["input_equal_ignores"] += equal_count
-
-        if not changed:
-            return
-
-        # Phase 3: single revision bump, apply all changed inputs.
-        self._revision += 1
-        changed_at = self._revision
-        for _input_key, node_key, snapshot, digest in changed:
-            record = self._records.get(node_key)
+                record.checked_in_request = self._current_request_id()
+                self._stats["input_equal_ignores"] += 1
+                return
+            self._revision += 1
+            changed_at = self._revision
             if record is None:
                 self._records[node_key] = NodeRecord(
                     key=node_key,
@@ -377,7 +397,7 @@ class Database:
                     last_decision="executed",
                     last_recompute="executed",
                     reason="input set",
-                    checked_in_request=request_id,
+                    checked_in_request=self._current_request_id(),
                 )
             else:
                 record.snapshot = snapshot
@@ -387,15 +407,85 @@ class Database:
                 record.last_decision = "executed"
                 record.last_recompute = "executed"
                 record.reason = "input changed"
-                record.checked_in_request = request_id
+                record.checked_in_request = self._current_request_id()
             self._stats["input_sets"] += 1
+
+    def set_many(self, updates: Iterable[tuple[Any, Any]]) -> None:
+        from .core import Input
+
+        with self._state_lock:
+            # Phase 1: collect and validate all updates, compute snapshots.
+            pending: list[tuple[Any, Any, NodeKey, Any, str]] = []  # (input_key, value, node_key, snapshot, digest)
+            for input_key, value in updates:
+                if not isinstance(input_key, Input):
+                    raise TypeError("db.set_many() expects (Input, value) pairs.")
+                snapshot = self._freeze_value(value)
+                digest = fingerprint_snapshot(snapshot)
+                node_key = self._input_key(input_key)
+                pending.append((input_key, value, node_key, snapshot, digest))
+
+            # Phase 2: determine which inputs actually changed.
+            changed: list[tuple[Any, NodeKey, Any, str]] = []
+            equal_count = 0
+            request_id = self._current_request_id()
+            for input_key, _value, node_key, snapshot, digest in pending:
+                record = self._records.get(node_key)
+                if record is not None and self._compare_values(
+                    eq=input_key.eq,
+                    cutoff=input_key.cutoff,
+                    left=self._thaw_value(record.snapshot),
+                    right=self._thaw_value(snapshot),
+                ):
+                    record.snapshot = snapshot
+                    record.digest = digest
+                    record.verified_at = self._revision
+                    record.last_decision = "reused"
+                    record.reason = "equal input update ignored"
+                    record.checked_in_request = request_id
+                    equal_count += 1
+                else:
+                    changed.append((input_key, node_key, snapshot, digest))
+
+            self._stats["input_equal_ignores"] += equal_count
+
+            if not changed:
+                return
+
+            # Phase 3: single revision bump, apply all changed inputs.
+            self._revision += 1
+            changed_at = self._revision
+            for _input_key, node_key, snapshot, digest in changed:
+                record = self._records.get(node_key)
+                if record is None:
+                    self._records[node_key] = NodeRecord(
+                        key=node_key,
+                        label=node_key.label,
+                        snapshot=snapshot,
+                        digest=digest,
+                        changed_at=changed_at,
+                        verified_at=changed_at,
+                        last_decision="executed",
+                        last_recompute="executed",
+                        reason="input set",
+                        checked_in_request=request_id,
+                    )
+                else:
+                    record.snapshot = snapshot
+                    record.digest = digest
+                    record.changed_at = changed_at
+                    record.verified_at = changed_at
+                    record.last_decision = "executed"
+                    record.last_recompute = "executed"
+                    record.reason = "input changed"
+                    record.checked_in_request = request_id
+                self._stats["input_sets"] += 1
 
     def get(self, query: Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
         from .core import Query
 
         if not isinstance(query, Query):
             raise TypeError("db.get() expects a @query-decorated callable.")
-        with self._request_scope():
+        with self._state_lock, self._request_scope():
             key, call_snapshot = self._query_key(query, args, kwargs)
             self._record_dependency(key)
             self._ensure_query(query, key, call_snapshot)
@@ -413,7 +503,7 @@ class Database:
 
         if not isinstance(query, Query):
             raise TypeError("db.inspect() expects a @query-decorated callable.")
-        with self._request_scope():
+        with self._state_lock, self._request_scope():
             key, call_snapshot = self._query_key(query, args, kwargs)
             if key not in self._records:
                 self._ensure_query(query, key, call_snapshot)
@@ -564,8 +654,14 @@ class Database:
         return self._records[key].is_untracked or self._records[key].changed_at > revision
 
     def _refresh_resource(self, resource: Any, parameter: Any, key: NodeKey) -> None:
-        with self._allow_raw_reads_scope():
-            probe = resource.probe(parameter)
+        atomic = hasattr(resource, "probe_and_load")
+        if atomic:
+            with self._allow_raw_reads_scope():
+                probe, loaded_value = resource.probe_and_load(self, parameter)
+        else:
+            with self._allow_raw_reads_scope():
+                probe = resource.probe(parameter)
+            loaded_value = None
         record = self._records.get(key)
         current_request = self._current_request_id()
         if record is not None and record.checked_in_request == current_request:
@@ -582,8 +678,9 @@ class Database:
         else:
             self._revision += 1
             changed_at = self._revision
-        with self._allow_raw_reads_scope():
-            loaded_value = resource.load(self, parameter)
+        if not atomic:
+            with self._allow_raw_reads_scope():
+                loaded_value = resource.load(self, parameter)
         snapshot = self._freeze_value(loaded_value)
         digest = fingerprint_snapshot(snapshot)
         if record is None:
@@ -730,53 +827,12 @@ class Database:
 
     @contextmanager
     def _guard_untracked_reads(self) -> Iterator[None]:
-        original_builtins_open = builtins.open
-        original_io_open = io.open
-        original_os_getenv = os.getenv
-        original_os_listdir = os.listdir
-        original_os_scandir = os.scandir
-        original_path_iterdir = Path.iterdir
-        original_environ = os.environ
-
-        def check_env_read() -> None:
-            self._ensure_tracked_read("Raw os.environ access inside a query is untracked. Use EnvResource.read().")
-
-        guarded_environ = _GuardedEnviron(original_environ, check_env_read)
-
-        def guarded_open(*args: Any, **kwargs: Any) -> Any:
-            self._ensure_tracked_read("Raw open() inside a query is untracked. Use FileResource.read().")
-            return original_builtins_open(*args, **kwargs)
-
-        def guarded_io_open(*args: Any, **kwargs: Any) -> Any:
-            self._ensure_tracked_read("Raw open() inside a query is untracked. Use FileResource.read().")
-            return original_io_open(*args, **kwargs)
-
-        def guarded_getenv(key: str, default: str | None = None) -> str | None:
-            self._ensure_tracked_read("Raw os.getenv() inside a query is untracked. Use EnvResource.read().")
-            return original_os_getenv(key, default)
-
-        def guarded_listdir(*args: Any, **kwargs: Any) -> Any:
-            self._ensure_tracked_read("Raw os.listdir() inside a query is untracked. Use DirectoryResource.read().")
-            return original_os_listdir(*args, **kwargs)
-
-        def guarded_scandir(*args: Any, **kwargs: Any) -> Any:
-            self._ensure_tracked_read("Raw os.scandir() inside a query is untracked. Use DirectoryResource.read().")
-            return original_os_scandir(*args, **kwargs)
-
-        def guarded_path_iterdir(path_obj: Path) -> Any:
-            self._ensure_tracked_read("Raw Path.iterdir() inside a query is untracked. Use DirectoryResource.read().")
-            return original_path_iterdir(path_obj)
-
-        with (
-            mock.patch("builtins.open", guarded_open),
-            mock.patch("io.open", guarded_io_open),
-            mock.patch("os.getenv", guarded_getenv),
-            mock.patch("os.listdir", guarded_listdir),
-            mock.patch("os.scandir", guarded_scandir),
-            mock.patch("os.environ", guarded_environ),
-            mock.patch("pathlib.Path.iterdir", guarded_path_iterdir),
-        ):
+        stack = _ACTIVE_GUARDS.get()
+        token = _ACTIVE_GUARDS.set(stack + (self,))
+        try:
             yield
+        finally:
+            _ACTIVE_GUARDS.reset(token)
 
     def _ensure_tracked_read(self, message: str) -> None:
         if self._current_frame() is not None and not self._allow_raw_reads.get():
@@ -856,7 +912,7 @@ class Database:
         if self._is_resource_handle(value):
             return ("resource", self._resource_identity_payload(value))
         if isinstance(value, ModuleType):
-            return ("module", value.__name__)
+            return ("module", value.__name__, self._module_identity_payload(value))
         if isinstance(value, FunctionType):
             return ("function", self._function_definition_payload(value, seen_functions))
         if isinstance(value, BuiltinFunctionType):
@@ -871,6 +927,62 @@ class Database:
                 f"{name!r} of type {type(value).__qualname__}. "
                 "Move mutable state behind Input/Resource nodes or use an immutable value."
             ) from exc
+
+    def _module_identity_payload(self, module: ModuleType) -> Any:
+        """Compute a structural digest for a captured module.
+
+        Name-only capture is not sufficient: a third-party version bump or a
+        source-file edit changes `module.CONSTANT` without touching the
+        module's name, which would silently reuse stale cache entries.
+        The payload combines:
+
+        * `__version__` (if the module exposes one — standard for third-party
+          packages);
+        * a digest of `module.__file__` — `sha256` of the bytes for `.py`
+          sources, `(path, size, mtime_ns)` for compiled or namespace-pkg
+          files, `None` for frozen / built-in modules (which are pinned via
+          `sys.version_info` in the outer code fingerprint);
+        * a sorted `__all__` tuple when declared, capturing the module's
+          publicly promised surface.
+
+        In-process monkey-patch of module attributes is *not* covered and is
+        explicitly listed in `docs/kernel-contract.md` as out of scope; users
+        relying on such state must route it through `Input` / `Resource`.
+        """
+        version = getattr(module, "__version__", None)
+        version_digest: str | None = str(version) if version is not None else None
+
+        all_attr = getattr(module, "__all__", None)
+        if isinstance(all_attr, (list, tuple)):
+            all_tuple: tuple[str, ...] | None = tuple(sorted(str(item) for item in all_attr))
+        else:
+            all_tuple = None
+
+        file_path = getattr(module, "__file__", None)
+        if not isinstance(file_path, str):
+            return (version_digest, None, all_tuple)
+
+        with self._allow_raw_reads_scope():
+            try:
+                stat_result = os.stat(file_path)
+            except OSError:
+                return (version_digest, None, all_tuple)
+
+            cache_key = (module.__name__, file_path, stat_result.st_mtime_ns, stat_result.st_size)
+            cached = self._module_identity_cache.get(cache_key)
+            if cached is None:
+                if file_path.endswith(".py"):
+                    try:
+                        raw = Path(file_path).read_bytes()
+                    except OSError:
+                        cached = ("stat", file_path, stat_result.st_mtime_ns, stat_result.st_size)
+                    else:
+                        cached = ("source-sha256", hashlib.sha256(raw).hexdigest())
+                else:
+                    cached = ("stat", file_path, stat_result.st_mtime_ns, stat_result.st_size)
+                self._module_identity_cache[cache_key] = cached
+
+        return (version_digest, cached, all_tuple)
 
     def _resource_identity_payload(self, resource: Any) -> Any:
         resource_identity = getattr(resource, "identity", None)

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.resources import DirectoryResource
+from pyinc.resources import DirectoryResource, _file_read_snapshot
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
 
@@ -71,6 +71,12 @@ class _JsonFileResource:
             return ""
         with db._allow_raw_open():
             return file_path.read_text(encoding=self.encoding)
+
+    def probe_and_load(
+        self, db: Database, path: str
+    ) -> tuple[tuple[str, str] | tuple[str], str]:
+        probe, text = _file_read_snapshot(path, self.encoding)
+        return probe, text if text is not None else ""
 
 
 _FILES = _JsonFileResource()
