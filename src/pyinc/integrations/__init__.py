@@ -54,6 +54,17 @@ from .python_source import (
     module_analysis,
     workspace_analysis,
 )
+from .requirement_evaluation import (
+    ApplicableRequirement,
+    ApplicableRequirementsAnalysis,
+    MarkerEvaluation,
+    PythonEnvironmentSnapshot,
+    VersionSpecifierEvaluation,
+    applicable_requirements,
+    evaluate_markers,
+    evaluate_version_specifier,
+    workspace_applicable_requirements,
+)
 from .requirements_txt import (
     FileReference,
     IndexDirective,
@@ -79,6 +90,8 @@ from .xml_config import (
 )
 
 __all__ = [
+    "ApplicableRequirement",
+    "ApplicableRequirementsAnalysis",
     "ConfigAnalysis",
     "ConfigKey",
     "ConfigSection",
@@ -101,9 +114,11 @@ __all__ = [
     "JsonAnalysis",
     "JsonKey",
     "JsonSection",
+    "MarkerEvaluation",
     "ModulePathEntry",
     "NamespacePackage",
     "PthDirective",
+    "PythonEnvironmentSnapshot",
     "PythonFileAnalysis",
     "PythonModuleAnalysis",
     "PythonWorkspaceAnalysis",
@@ -112,9 +127,11 @@ __all__ = [
     "ResolvedImportRef",
     "ResolvedModuleLocation",
     "UndeclaredImport",
+    "VersionSpecifierEvaluation",
     "XmlAnalysis",
     "XmlAttribute",
     "XmlElement",
+    "applicable_requirements",
     "config_analysis",
     "csv_analysis",
     "deep_module_resolution_analysis",
@@ -122,6 +139,8 @@ __all__ = [
     "dependency_check_analysis",
     "directory_analysis",
     "env_analysis",
+    "evaluate_markers",
+    "evaluate_version_specifier",
     "file_analysis",
     "installed_packages_analysis",
     "json_analysis",
@@ -130,6 +149,7 @@ __all__ = [
     "resolve_import_name",
     "resolve_module_path",
     "workspace_analysis",
+    "workspace_applicable_requirements",
     "workspace_config_analysis",
     "workspace_csv_analysis",
     "workspace_dependency_check",

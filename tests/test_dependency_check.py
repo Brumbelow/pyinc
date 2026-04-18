@@ -195,6 +195,108 @@ def test_compatible_release_operator(
     assert result2.statuses[0].status == "version_mismatch"
 
 
+# ---------------------------------------------------------------------------
+# PEP 440 regression — shapes newly supported after migration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_wildcard_specifier(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "2.31.0", top_level="requests")
+    _patch_site(monkeypatch, site_dir)
+
+    db = Database(mode=mode)
+    assert dependency_check_analysis(db, ("requests==2.*",)).statuses[0].status == "satisfied"
+    assert dependency_check_analysis(db, ("requests==3.*",)).statuses[0].status == "version_mismatch"
+    assert dependency_check_analysis(db, ("requests!=3.*",)).statuses[0].status == "satisfied"
+    assert dependency_check_analysis(db, ("requests!=2.*",)).statuses[0].status == "version_mismatch"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_prerelease_installed_version(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    # Installed pre-release version.
+    _make_dist_info(site_dir, "requests", "2.31.0rc1", top_level="requests")
+    _patch_site(monkeypatch, site_dir)
+
+    db = Database(mode=mode)
+    # include_prerelease=True from dependency_check means pre-releases are allowed.
+    result = dependency_check_analysis(db, ("requests>=2.0",))
+    assert result.statuses[0].status == "satisfied"
+    assert result.statuses[0].installed_version == "2.31.0rc1"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_post_release_installed_version(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "2.31.0.post1", top_level="requests")
+    _patch_site(monkeypatch, site_dir)
+
+    db = Database(mode=mode)
+    result = dependency_check_analysis(db, ("requests>=2.31.0",))
+    assert result.statuses[0].status == "satisfied"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_dev_release_installed_version(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "2.31.0.dev0", top_level="requests")
+    _patch_site(monkeypatch, site_dir)
+
+    db = Database(mode=mode)
+    # With include_prerelease=True (dependency_check default), dev is accepted.
+    result = dependency_check_analysis(db, ("requests>=2.0",))
+    assert result.statuses[0].status == "satisfied"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_epoch_specifier(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "mypkg", "1!2.0", top_level="mypkg")
+    _patch_site(monkeypatch, site_dir)
+
+    db = Database(mode=mode)
+    # An older epoch spec should not match a higher epoch installed.
+    assert dependency_check_analysis(db, ("mypkg==1!2.0",)).statuses[0].status == "satisfied"
+    # Pre-epoch version cannot satisfy an epoch-bumped installed version.
+    assert dependency_check_analysis(db, ("mypkg==2.0",)).statuses[0].status == "version_mismatch"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_compatible_release_three_component(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "2.31.5", top_level="requests")
+    _patch_site(monkeypatch, site_dir)
+
+    db = Database(mode=mode)
+    # ~=2.31.0 means >=2.31.0, <2.32.0 — 2.31.5 satisfies.
+    assert dependency_check_analysis(db, ("requests~=2.31.0",)).statuses[0].status == "satisfied"
+    # ~=2.30.0 means >=2.30.0, <2.31.0 — 2.31.5 fails.
+    assert (
+        dependency_check_analysis(db, ("requests~=2.30.0",)).statuses[0].status
+        == "version_mismatch"
+    )
+
+
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_extras_stripped_from_specifier(
     mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -9,6 +9,10 @@ from pyinc.integrations.installed_packages import (
     environment_index,
     installed_distributions_index,
 )
+from pyinc.integrations.requirement_evaluation import (
+    _parse_specifier_set,
+    _satisfies,
+)
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
@@ -52,81 +56,25 @@ class DependencyCheckAnalysis:
 
 
 # ---------------------------------------------------------------------------
-# PEP 440 version matching (stdlib-only subset)
+# PEP 440 version matching — delegated to requirement_evaluation
 # ---------------------------------------------------------------------------
-
-_VERSION_PAT = r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[._-].*)?$"
-_SPEC_PAT = r"^(~=|==|!=|>=|<=|>|<)\s*(.+)$"
-
-
-def _parse_version_tuple(version: str) -> tuple[int, ...] | None:
-    m = re.match(_VERSION_PAT, version.strip())
-    if m is None:
-        return None
-    parts: list[int] = []
-    for g in m.groups():
-        if g is None:
-            break
-        parts.append(int(g))
-    return tuple(parts)
-
-
-def _pad_versions(
-    a: tuple[int, ...], b: tuple[int, ...]
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    length = max(len(a), len(b))
-    return a + (0,) * (length - len(a)), b + (0,) * (length - len(b))
-
-
-def _check_single_specifier(op: str, spec_version: str, installed: str) -> str:
-    spec_tuple = _parse_version_tuple(spec_version)
-    inst_tuple = _parse_version_tuple(installed)
-    if spec_tuple is None or inst_tuple is None:
-        return "ambiguous"
-
-    s, i = _pad_versions(spec_tuple, inst_tuple)
-
-    if op == "==":
-        return "satisfied" if i == s else "version_mismatch"
-    if op == "!=":
-        return "satisfied" if i != s else "version_mismatch"
-    if op == ">=":
-        return "satisfied" if i >= s else "version_mismatch"
-    if op == "<=":
-        return "satisfied" if i <= s else "version_mismatch"
-    if op == ">":
-        return "satisfied" if i > s else "version_mismatch"
-    if op == "<":
-        return "satisfied" if i < s else "version_mismatch"
-    if op == "~=":
-        # Compatible release: ~=X.Y means >=X.Y, <(X+1).0
-        if len(spec_tuple) < 2:
-            return "ambiguous"
-        lower = spec_tuple
-        upper = (spec_tuple[0] + 1,)
-        _, i_low = _pad_versions(lower, inst_tuple)
-        _, i_up = _pad_versions(upper, inst_tuple)
-        s_low, _ = _pad_versions(lower, inst_tuple)
-        s_up, _ = _pad_versions(upper, inst_tuple)
-        return "satisfied" if i_low >= s_low and i_up < s_up else "version_mismatch"
-    return "ambiguous"
 
 
 def _check_version_constraints(
     declared_spec: str, installed_version: str
 ) -> tuple[str, str]:
-    specs = [s.strip() for s in declared_spec.split(",")]
-    for spec_str in specs:
-        m = re.match(_SPEC_PAT, spec_str.strip())
-        if m is None:
-            return "ambiguous", f"cannot parse specifier: {spec_str}"
-        op, ver = m.group(1), m.group(2).strip()
-        result = _check_single_specifier(op, ver, installed_version)
-        if result == "ambiguous":
-            return "ambiguous", f"cannot evaluate: {op}{ver}"
-        if result == "version_mismatch":
-            return "version_mismatch", f"{installed_version} does not satisfy {op}{ver}"
-    return "satisfied", f"{installed_version} satisfies {declared_spec}"
+    spec_set = _parse_specifier_set(declared_spec)
+    if spec_set is None:
+        return "ambiguous", f"cannot parse specifier: {declared_spec}"
+    for op, _ver in spec_set:
+        if op == "===":
+            return "ambiguous", f"cannot evaluate: {op}{_ver}"
+    ok, detail = _satisfies(spec_set, installed_version, include_prerelease=True)
+    if not ok:
+        if "unparseable" in detail or "cannot evaluate" in detail:
+            return "ambiguous", detail
+        return "version_mismatch", detail
+    return "satisfied", detail
 
 
 # ---------------------------------------------------------------------------

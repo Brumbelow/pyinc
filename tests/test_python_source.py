@@ -87,6 +87,16 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "file_analysis",
         "module_analysis",
         "workspace_analysis",
+        # requirement_evaluation
+        "ApplicableRequirement",
+        "ApplicableRequirementsAnalysis",
+        "MarkerEvaluation",
+        "PythonEnvironmentSnapshot",
+        "VersionSpecifierEvaluation",
+        "applicable_requirements",
+        "evaluate_markers",
+        "evaluate_version_specifier",
+        "workspace_applicable_requirements",
         # requirements_txt
         "FileReference",
         "IndexDirective",

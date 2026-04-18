@@ -70,6 +70,7 @@ The full contract, including explicit limitations and escape hatches, is in [doc
 - `pyinc.integrations.env_file` — `.env` file parsing: key-value extraction with quoted/unquoted values, `export` prefix handling, interpolation reference detection.
 - `pyinc.integrations.xml_config` — XML file inspection via `xml.etree.ElementTree`: element/attribute extraction, dot-path traversal, namespace-aware tag normalization.
 - `pyinc.integrations.csv_data` — CSV/TSV structural analysis via stdlib `csv`: header detection, column discovery, delimiter sniffing, row counting, inconsistent column diagnostics.
+- `pyinc.integrations.requirement_evaluation` — PEP 440 version specifier satisfaction and PEP 508 environment marker evaluation; composes with `requirements_txt` and `installed_packages` to surface the effective applicable/satisfied requirement set for the current Python environment. Exposes `evaluate_markers`, `evaluate_version_specifier`, and `applicable_requirements`.
 
 `pyinc.integrations` re-exports only the stable dataclass/result types and high-level entrypoints for these integrations. Low-level payload queries, decode helpers, and resource helpers remain experimental in their defining submodules.
 
@@ -90,8 +91,16 @@ The integration boundary is summarized in [docs/integration-contract.md](docs/in
 
 ## Not yet supported
 
-- Marker expression evaluation, version constraint satisfaction
-- Symbol/type resolution, LSP wiring, and file watchers
+- Symbol/type resolution
+
+## Not supported
+
+- LSP wiring
+- File watchers (push-based filesystem invalidation)
+
+These are architectural non-goals for v1. pyinc is a pull-based kernel; LSP servers
+and push-based watchers belong to a consumer tool built on top of pyinc, not to the
+kernel itself. See `docs/architecture.md:80-82` for the v1 scope boundary.
 
 ## Development
 
