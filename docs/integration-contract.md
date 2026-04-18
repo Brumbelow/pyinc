@@ -185,20 +185,14 @@ integration modules. The kernel's dependency tracking extends automatically acro
 integration boundaries — if an upstream integration's query result changes, downstream
 queries that called it are re-verified and re-executed as needed.
 
-Current composition edges:
+The canonical list of current composition edges is maintained below under
+*Cross-Integration Composition Edges*.
 
-- `python_source` imports `environment_index` from `installed_packages` to classify
-  non-workspace imports as `stdlib`, `installed`, or `missing` (rather than the opaque
-  `external` that a standalone workspace analysis would produce)
-- `dependency_check` imports `installed_distributions_index` and `environment_index`
-  from `installed_packages` to validate declared dependencies against installed versions
-- `dependency_check.workspace_dependency_check` composes with
-  `python_source.workspace_analysis` at the entrypoint layer to detect undeclared imports
-
-Composition queries like `environment_index` and `installed_distributions_index` are public
-`@query` functions listed in their module's `__all__`, but they are intentionally **not**
-re-exported from `pyinc.integrations`. They exist for cross-integration use at the query
-layer, not as user-facing entrypoints.
+Composition queries (e.g. `environment_index`, `installed_distributions_index`,
+`resolve_module_location`, the `python_source` helpers consumed by `symbol_resolution`) are
+public `@query` functions listed in their defining module's `__all__`, but they are
+intentionally **not** re-exported from `pyinc.integrations`. They exist for cross-integration
+use at the query layer, not as user-facing entrypoints.
 
 ## Dependency Check Integration Scope
 
@@ -233,12 +227,160 @@ Out of scope for this integration:
 - transitive dependency resolution
 - lock file comparison
 
+## CSV Data Integration Scope
+
+The `csv_data` integration is intentionally narrow:
+
+Scope:
+
+- single-file CSV/TSV structural analysis via `csv_analysis(db, path)`
+- workspace-root discovery via `workspace_csv_analysis(db, root)`
+- stdlib `csv` module only — no third-party parsers
+- header detection and column discovery
+- delimiter sniffing via `csv.Sniffer`
+- row counting
+- inconsistent-column diagnostics (rows with a column count that does not match the header)
+- cutoff-based backdating on structural parse
+
+Out of scope for this integration:
+
+- schema validation or type inference
+- multi-line field handling beyond what `csv` defaults support
+- streaming / iterator APIs (analysis reads the whole file)
+- alternate dialects that `csv.Sniffer` cannot detect
+
+## Deep Module Resolution Integration Scope
+
+The `deep_module_resolution` integration resolves dotted module names to physical file paths by walking `sys.path`:
+
+Scope:
+
+- `sys.path` entry walking (the live list, reported via `db.report_untracked_read` because it is runtime-mutable and not resource-tracked)
+- `.pth` file processing with whitespace-tolerant / comment-tolerant backdating
+- PEP 420 namespace package collection
+- dotted-name → file resolution via `resolve_module_path(db, dotted_name)`
+- workspace-wide snapshot via `deep_module_resolution_analysis(db)`
+- result types: `ResolvedModuleLocation`, `NamespacePackage`, `PthDirective`, `ModulePathEntry`, `DeepModuleResolutionAnalysis`
+- `resolve_module_location` composition query (exported in `__all__` but not re-exported from `pyinc.integrations`)
+
+Out of scope for this integration:
+
+- editable-install pointer files beyond simple path-line `.pth` contents
+- loader customizations (`sys.path_hooks`, meta path finders)
+- `importlib.util.find_spec`-style fully dynamic resolution
+- `.egg` / `.egg-info` legacy layouts
+
+## Env File Integration Scope
+
+The `env_file` integration parses `.env`-style key/value files:
+
+Scope:
+
+- single-file `.env` analysis via `env_analysis(db, path)`
+- workspace-root discovery via `workspace_env_analysis(db, root)`
+- key/value extraction with support for quoted (single or double) vs unquoted values
+- `export` prefix handling
+- interpolation reference detection (the parser records `$VAR` / `${VAR}` references; it does not evaluate them)
+- diagnostics for malformed lines
+- cutoff-based backdating on structural parse
+
+Out of scope for this integration:
+
+- interpolation evaluation or variable substitution
+- dotenv command-substitution syntax (`$(...)`, backticks)
+- multi-line values beyond the single-line `.env` convention
+- writing / mutating `.env` files
+
+## Requirement Evaluation Integration Scope
+
+The `requirement_evaluation` integration implements PEP 440 version-specifier satisfaction and PEP 508 marker evaluation:
+
+Scope:
+
+- PEP 440 version parsing and comparison: epochs, pre-release (`a`/`b`/`rc`), post-release, dev, local version labels, wildcard `==x.*`, compatible release `~=`
+- PEP 508 marker tokenizer and recursive-descent parser
+- marker evaluation against the live Python environment via a single-point private function `_current_python_env()` (tests monkeypatch this one symbol; do not patch `sys` / `platform` attributes directly)
+- `PythonEnvironmentResource` captures the environment snapshot for change-triggered re-evaluation
+- entrypoints: `evaluate_markers`, `evaluate_version_specifier`, `applicable_requirements`, `workspace_applicable_requirements`
+- result types: `MarkerEvaluation`, `VersionSpecifierEvaluation`, `ApplicableRequirement`, `ApplicableRequirementsAnalysis`, `PythonEnvironmentSnapshot`
+
+Cross-integration composition:
+
+- composes with `requirements_txt` payload helpers to read declared requirements
+- composes with `installed_packages.installed_distributions_index` to report satisfaction
+- shared private helpers `_parse_specifier_set` and `_satisfies` are reused by `dependency_check` (documented exception to the "public `@query` only" rule)
+
+Out of scope for this integration:
+
+- VCS URL / direct URL fetching
+- lock-file comparison or resolution
+- transitive dependency graph construction
+- build-time marker evaluation against non-current Python environments (marker evaluation uses the live `_current_python_env()` only)
+
+## XML Config Integration Scope
+
+The `xml_config` integration parses XML configuration files via the stdlib `xml.etree.ElementTree`:
+
+Scope:
+
+- single-file XML analysis via `xml_analysis(db, path)`
+- workspace-root discovery via `workspace_xml_analysis(db, root, filename)`
+- element traversal with namespace-aware tag normalization
+- dot-path queries into the parsed tree
+- attribute extraction for each element
+- diagnostics for malformed XML
+- cutoff-based backdating on structural parse
+
+Out of scope for this integration:
+
+- DTD validation
+- XSD / schema validation
+- XInclude / entity resolution beyond defaults
+- streaming / pull-parser APIs
+- XPath queries beyond the dot-path convention
+
+## Symbol Resolution Integration Scope
+
+The `symbol_resolution` integration exposes workspace-wide symbol tables and cross-module re-export resolution, intentionally narrow and stdlib-only:
+
+Scope:
+
+- module-level and class-level symbol extraction: functions, methods, classes, class variables, top-level variables, import aliases, from-import aliases, wildcard-import stubs
+- arbitrary class nesting depth; qualified name scheme is `foo` / `Foo.bar` / `Foo.Inner.bar`
+- cross-module resolution that follows re-export chains (`from a import x` → `a.py: from b import x` → ...) bounded by `MAX_FOLLOW_DEPTH = 8` with cycle detection
+- type-annotation *text* extraction via `ast.unparse` (no type evaluation, no type checking)
+- installed-package lookups stop at the import boundary (`resolution="installed"`, `distribution_name`, `distribution_version`, `defining_path=None`)
+- dynamic `__all__` on the wildcard-provider side → `"ambiguous"` with `db.report_untracked_read`
+- conditional top-level binding (`if TYPE_CHECKING:`, top-level `For`, `While`, `Try`, `With`) → `impurity_reasons` includes `"conditional top-level binding"` and the binding produces no symbol
+- entrypoints: `module_symbol_table`, `resolve_symbol`, `workspace_symbol_index`
+- result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`, `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`
+
+Out of scope for this integration:
+
+- function-local symbols
+- decorator-induced rebinding (`@functools.cache`, `@property`, `@classmethod`, etc.)
+- MRO / class-member override resolution
+- following into installed third-party source files (v2 concern)
+- type evaluation or static type checking
+
+## Cross-Integration Composition Edges
+
+These are the current concrete composition edges between shipped integrations. Each edge is tracked by the kernel as an ordinary dependency and contributes to incremental re-verification.
+
+- `python_source` → `installed_packages.environment_index` (classifies non-workspace imports as `stdlib` / `installed` / `missing`)
+- `python_source` → `deep_module_resolution.resolve_module_location` (populates `resolved_path` for installed imports)
+- `dependency_check` → `installed_packages.installed_distributions_index`, `installed_packages.environment_index`
+- `dependency_check.workspace_dependency_check` → `python_source.workspace_analysis` (entrypoint-layer composition for undeclared-import detection)
+- `dependency_check` → `requirement_evaluation._parse_specifier_set` / `_satisfies` (shared private helpers; documented exception to the "public `@query` only" rule)
+- `requirement_evaluation` → `installed_packages.installed_distributions_index`, `requirements_txt` payload helpers
+- `deep_module_resolution` → `installed_packages.environment_index`
+- `symbol_resolution` → `python_source.{source_text, module_binding_analysis_payload, resolved_imports_for_file, module_wildcard_export_surface, workspace_python_files}`
+
 ## Out Of Scope
 
 This contract does not include:
 
 - full `sys.path` / installed-package resolution beyond top-level module classification
-- symbol or type resolution
 - LSP wiring
 - file watchers or schedulers
 - widening the core runtime semantics to accommodate integration convenience

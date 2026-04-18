@@ -105,6 +105,17 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "deep_requirements_analysis",
         "requirements_analysis",
         "workspace_requirements_analysis",
+        # symbol_resolution
+        "ModuleSymbolTable",
+        "Parameter",
+        "ResolvedSymbol",
+        "Signature",
+        "Symbol",
+        "WorkspaceSymbolEntry",
+        "WorkspaceSymbolIndex",
+        "module_symbol_table",
+        "resolve_symbol",
+        "workspace_symbol_index",
         # toml_config
         "ConfigAnalysis",
         "ConfigKey",
@@ -135,6 +146,9 @@ def test_package_namespace_exports_only_stable_api() -> None:
     assert not hasattr(integrations, "config_file_text")
     assert not hasattr(integrations, "config_sections_payload")
     assert not hasattr(integrations, "config_analysis_payload")
+    assert not hasattr(integrations, "module_symbol_table_payload")
+    assert not hasattr(integrations, "resolve_symbol_payload")
+    assert not hasattr(integrations, "workspace_symbol_index_payload")
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

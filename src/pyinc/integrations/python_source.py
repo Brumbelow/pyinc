@@ -943,5 +943,10 @@ __all__ = [
     "directory_analysis",
     "file_analysis",
     "module_analysis",
+    "module_binding_analysis_payload",
+    "module_wildcard_export_surface",
+    "resolved_imports_for_file",
+    "source_text",
     "workspace_analysis",
+    "workspace_python_files",
 ]

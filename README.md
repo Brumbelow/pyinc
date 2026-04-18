@@ -71,6 +71,7 @@ The full contract, including explicit limitations and escape hatches, is in [doc
 - `pyinc.integrations.xml_config` — XML file inspection via `xml.etree.ElementTree`: element/attribute extraction, dot-path traversal, namespace-aware tag normalization.
 - `pyinc.integrations.csv_data` — CSV/TSV structural analysis via stdlib `csv`: header detection, column discovery, delimiter sniffing, row counting, inconsistent column diagnostics.
 - `pyinc.integrations.requirement_evaluation` — PEP 440 version specifier satisfaction and PEP 508 environment marker evaluation; composes with `requirements_txt` and `installed_packages` to surface the effective applicable/satisfied requirement set for the current Python environment. Exposes `evaluate_markers`, `evaluate_version_specifier`, and `applicable_requirements`.
+- `pyinc.integrations.symbol_resolution` — workspace-wide symbol tables (module-level + class-level), cross-module re-export following with cycle detection, and type-annotation text extraction via `ast.unparse` (no type evaluation). Exposes `module_symbol_table`, `resolve_symbol`, and `workspace_symbol_index`.
 
 `pyinc.integrations` re-exports only the stable dataclass/result types and high-level entrypoints for these integrations. Low-level payload queries, decode helpers, and resource helpers remain experimental in their defining submodules.
 
@@ -88,10 +89,6 @@ The integration boundary is summarized in [docs/integration-contract.md](docs/in
 - Query identity includes the function definition payload. If you capture ambient values, those captures are part of the query fingerprint, and mutable closure/global captures are rejected.
 - `Database.report_untracked_read(...)` is an explicit impurity escape hatch. It marks that query as always re-executing and disables backdating for that node.
 - The package ships inline typing metadata via `py.typed`.
-
-## Not yet supported
-
-- Symbol/type resolution
 
 ## Not supported
 
