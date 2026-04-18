@@ -1,8 +1,8 @@
 # pyinc
 
 [![CI](https://github.com/Brumbelow/pyinc/actions/workflows/ci.yml/badge.svg)](https://github.com/Brumbelow/pyinc/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/pyinc.svg)](https://pypi.org/project/pyinc/)
-[![Python versions](https://img.shields.io/pypi/pyversions/pyinc.svg)](https://pypi.org/project/pyinc/)
+[![PyPI version](https://img.shields.io/pypi/v/pyinc)](https://pypi.org/project/pyinc/)
+[![Python versions](https://img.shields.io/pypi/pyversions/pyinc)](https://pypi.org/project/pyinc/)
 [![License](https://img.shields.io/pypi/l/pyinc.svg)](https://github.com/Brumbelow/pyinc/blob/main/LICENSE)
 
 ```
