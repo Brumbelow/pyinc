@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyinc"
-version = "0.1.0"
+version = "1.0.0"
 description = "A correctness-first incremental query engine for Python."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["incremental-computation", "query-kernel", "salsa", "red-green", "backdating", "provenance"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
@@ -26,9 +26,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/abrumbelow/pyinc"
-Repository = "https://github.com/abrumbelow/pyinc"
-Issues = "https://github.com/abrumbelow/pyinc/issues"
+Homepage = "https://github.com/Brumbelow/pyinc"
+Repository = "https://github.com/Brumbelow/pyinc"
+Issues = "https://github.com/Brumbelow/pyinc/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -41,6 +41,18 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pyinc"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/examples",
+  "/docs",
+  "/README.md",
+  "/LICENSE",
+  "/CHANGELOG.md",
+  "/pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

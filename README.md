@@ -1,10 +1,19 @@
 # pyinc
 
+[![CI](https://github.com/Brumbelow/pyinc/actions/workflows/ci.yml/badge.svg)](https://github.com/Brumbelow/pyinc/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/pyinc.svg)](https://pypi.org/project/pyinc/)
+[![Python versions](https://img.shields.io/pypi/pyversions/pyinc.svg)](https://pypi.org/project/pyinc/)
+[![License](https://img.shields.io/pypi/l/pyinc.svg)](https://github.com/Brumbelow/pyinc/blob/main/LICENSE)
+
+```
+pip install pyinc
+```
+
 Python is mutable by default, identity-heavy, and full of hidden side effects. These properties make incremental computation unsound in practice: cached results silently depend on mutated state, untracked file reads, and object identity that the cache cannot see.
 
 `pyinc` is a correctness-first incremental computation engine that solves this problem. It is a pure-Python, stdlib-only query kernel in the design space of Salsa, Jane Street Incremental, and Bazel/Skyframe — but designed specifically for the challenges Python creates.
 
-The package remains alpha. The v1 kernel contract is stable within the documented soundness envelope.
+v1.0.0 is the first stable release. The v1 kernel contract and public integration surface are stable under semver, within the soundness envelope documented in [docs/kernel-contract.md](docs/kernel-contract.md).
 
 ## Quick example
 
@@ -32,7 +41,7 @@ result = db.get(parse_names, "/tmp/names.txt")   # reuses memo — file unchange
 # In strict mode, returned values are frozen — mutation raises TypeError.
 ```
 
-See `examples/correctness_demo.py` for a full walkthrough of backdating (early cutoff), mutation protection, untracked read enforcement, and provenance inspection.
+See `examples/correctness_demo.py` for a full walkthrough of backdating (early cutoff), mutation protection, untracked read enforcement, and provenance inspection. `examples/undeclared_imports.py`, `examples/applicable_requirements.py`, and `examples/symbol_lookup.py` demonstrate three of the shipped integrations end-to-end on self-contained tempdir workspaces.
 
 ## What pyinc guarantees
 
