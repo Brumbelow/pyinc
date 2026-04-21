@@ -4,9 +4,28 @@ All notable changes to this project will be documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-04-21
+
+### Added
+
+- **Consumer tooling.** New `pyinc_tools` layer with a mirror-workspace
+  `WorkspaceSession`, polling/debounce watcher support, `pyinc-tools analyze`,
+  and `pyinc-tools lsp`, all kept outside `src/pyinc` so the kernel contract
+  stays stable.
+- **Examples.** Focused diagnostics/escape-hatch examples for
+  `inspect_fresh(...)`, `explain_query_captures(...)`, and
+  `report_untracked_read(...)`.
+
+### Changed
+
+- **Docs.** Reconciled the stable v1.x release story across `AGENTS.md`,
+  `README.md`, `docs/architecture.md`, and `docs/integration-contract.md`.
+- **Runtime diagnostics.** Unsupported ambient-capture failures now point users
+  to `pyinc.explain_query_captures(...)` for preflight inspection.
+
 ## [1.0.0] — 2026-04-18
 
-First stable release.
+The first stable v1 release.
 
 ### Added
 
@@ -38,3 +57,4 @@ First stable release.
   for v1; see `docs/architecture.md` for scope boundary.
 
 [1.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.0.0
+[1.0.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.0.1

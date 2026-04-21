@@ -42,18 +42,27 @@ Resource node identity includes resource configuration. Built-in resources are s
 - `Database`, `Input`, and `@query` for the query runtime
 - `FileResource`, `FileStatResource`, `EnvResource`, and `DirectoryResource` for tracked external reads
 - value-boundary helpers such as `freeze`, `thaw`, `semantic_equal`, and `ValueAdapter`
-- structured inspection via `InspectionNode`, `Database.inspect(...)`, and `Database.explain(...)`
+- structured inspection via `InspectionNode`, `Database.inspect(...)`, `Database.inspect_fresh(...)`, and `Database.explain(...)`
+- observability via `Database.dependency_graph()`, `Database.statistics()`, and `Database.query_profile()`
 
-`pyinc.integrations` exposes the stable high-level surfaces from the four shipped integrations:
+`pyinc.integrations` exposes the stable dataclass/result types and high-level entrypoints from the shipped integrations:
 
-- `python_source` for narrow Python source and workspace-local module analysis
-- `toml_config` for narrow `pyproject.toml` inspection
-- `requirements_txt` for narrow `requirements.txt` inspection
-- `installed_packages` for installed package discovery, stdlib module identification, and import name resolution
+- `python_source`
+- `toml_config`
+- `requirements_txt`
+- `installed_packages`
+- `json_config`
+- `dependency_check`
+- `env_file`
+- `xml_config`
+- `csv_data`
+- `deep_module_resolution`
+- `requirement_evaluation`
+- `symbol_resolution`
 
 Low-level payload queries, decode helpers, and resource helpers remain module-local experimental helpers. The public integration boundary is the dataclass/result layer plus the documented high-level entrypoints in `docs/integration-contract.md`.
 
-The repository also includes small examples under `examples/` plus dedicated tests for kernel semantics, property-based from-scratch consistency, and each shipped integration.
+The repository also includes small examples under `examples/`, dedicated tests for kernel semantics and from-scratch consistency, and a separate consumer tooling layer under `pyinc_tools` for editor/watcher-facing behavior built on top of the stable kernel.
 
 ## Cross-Integration Composition
 
@@ -73,12 +82,14 @@ Version 1 targets:
 - optional file metadata resources (`FileStatResource`) for stat-level dependencies
 - explanation/provenance for reuse vs recompute
 - inline package typing via `py.typed`
-- narrow supported integrations for Python source analysis, TOML config inspection, requirements parsing, and installed package discovery
+- narrow supported integrations for Python source analysis, symbol resolution, config inspection (TOML, JSON, XML, `.env`, CSV), requirements parsing and evaluation, installed package discovery, dependency validation, and deep module resolution
 
 Version 1 does not include:
 
 - notebook integration
-- push observers
+- push observers in the kernel
 - schedulers or worker pools
 - content-addressed artifact storage
 - arbitrary mutable object graphs across cached boundaries
+
+Watcher loops, mirror workspaces, and LSP adapters belong to consumer tooling above the kernel. They can live in the repository, but they do not widen `src/pyinc`'s semver contract unless a concrete correctness gap forces a kernel change.

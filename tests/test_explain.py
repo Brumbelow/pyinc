@@ -267,6 +267,17 @@ def test_explain_query_captures_matches_fingerprint_rejections() -> None:
         Database().get(fail_on_get)
 
 
+def test_runtime_capture_error_points_to_preflight_diagnostics() -> None:
+    box = {"z": 7}
+
+    @query
+    def fail_on_get(db: Database) -> int:
+        return box["z"]
+
+    with pytest.raises(UnsupportedValueError, match="explain_query_captures"):
+        Database().get(fail_on_get)
+
+
 def test_capture_info_is_frozen() -> None:
     info = CaptureInfo(name="x", origin="closure", type_name="int", accepted=True, kind="value")
     with pytest.raises(FrozenInstanceError):

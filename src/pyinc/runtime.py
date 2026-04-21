@@ -935,7 +935,8 @@ class Database:
             raise UnsupportedValueError(
                 f"Query {owner.__module__}:{owner.__qualname__} captures unsupported ambient value "
                 f"{name!r} of type {type(value).__qualname__}. "
-                "Move mutable state behind Input/Resource nodes or use an immutable value."
+                "Move mutable state behind Input/Resource nodes or use an immutable value. "
+                "Run pyinc.explain_query_captures(...) to inspect the capture set before the first db.get()."
             ) from exc
 
     def _module_identity_payload(self, module: ModuleType) -> Any:

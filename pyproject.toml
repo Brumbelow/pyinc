@@ -25,6 +25,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+pyinc-tools = "pyinc_tools.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/Brumbelow/pyinc"
 Repository = "https://github.com/Brumbelow/pyinc"
@@ -40,7 +43,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pyinc"]
+packages = ["src/pyinc", "src/pyinc_tools"]
 
 [tool.hatch.build.targets.sdist]
 include = [

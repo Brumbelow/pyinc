@@ -13,7 +13,7 @@ Python is mutable by default, identity-heavy, and full of hidden side effects. T
 
 `pyinc` is a correctness-first incremental computation engine that solves this problem. It is a pure-Python, stdlib-only query kernel in the design space of Salsa, Jane Street Incremental, and Bazel/Skyframe — but designed specifically for the challenges Python creates.
 
-v1.0.0 is the first stable release. The v1 kernel contract and public integration surface are stable under semver, within the soundness envelope documented in [docs/kernel-contract.md](docs/kernel-contract.md).
+The `pyinc` v1.x line is stable. `pyinc` 1.0.1 ships the stable v1 kernel contract and public integration surface under semver, within the soundness envelope documented in [docs/kernel-contract.md](docs/kernel-contract.md).
 
 ## Quick example
 
@@ -41,7 +41,7 @@ result = db.get(parse_names, "/tmp/names.txt")   # reuses memo — file unchange
 # In strict mode, returned values are frozen — mutation raises TypeError.
 ```
 
-See `examples/correctness_demo.py` for a full walkthrough of backdating (early cutoff), mutation protection, untracked read enforcement, and provenance inspection. `examples/undeclared_imports.py`, `examples/applicable_requirements.py`, and `examples/symbol_lookup.py` demonstrate three of the shipped integrations end-to-end on self-contained tempdir workspaces.
+See `examples/correctness_demo.py` for a full walkthrough of backdating (early cutoff), mutation protection, untracked read enforcement, and provenance inspection. `examples/undeclared_imports.py`, `examples/applicable_requirements.py`, and `examples/symbol_lookup.py` demonstrate shipped integrations end-to-end on self-contained tempdir workspaces.
 
 ## What pyinc guarantees
 
@@ -92,11 +92,12 @@ The full contract, including explicit limitations and escape hatches, is in [doc
 
 The integration boundary is summarized in [docs/integration-contract.md](docs/integration-contract.md).
 
-## Gotchas
+## Diagnostics and escape hatches
 
-- `Database.inspect(...)` is observational. It returns the last recorded provenance tree for that query key and does not force a fresh revalidation pass by itself. Use `Database.inspect_fresh(...)` when you need the tree after re-verification.
-- Query identity includes the function definition payload. If you capture ambient values, those captures are part of the query fingerprint, and mutable closure/global captures are rejected. Use `pyinc.explain_query_captures(fn)` to see how each capture will be classified before running the query.
-- `Database.report_untracked_read(...)` is an explicit impurity escape hatch. It marks that query as always re-executing and disables backdating for that node.
+- `Database.inspect(...)` is observational. It returns the last recorded provenance tree for that query key and does not force a fresh revalidation pass by itself. Use `Database.inspect_fresh(...)` when you need the tree after re-verification. See `examples/inspect_fresh_demo.py`.
+- Query identity includes the function definition payload. If you capture ambient values, those captures are part of the query fingerprint, and mutable closure/global captures are rejected. Run `pyinc.explain_query_captures(fn)` before the first `db.get(...)` to see how each capture will be classified. See `examples/capture_diagnostics.py`.
+- `Database.report_untracked_read(...)` is an explicit impurity escape hatch. It marks that query as always re-executing and disables backdating for that node, which is the right trade when a dependency is real but not resource-trackable. See `examples/untracked_escape_hatch.py`.
+- Unsupported ambient-capture failures now point back to `pyinc.explain_query_captures(...)` so you can diagnose the rejection before rewriting the query shape.
 - The package ships inline typing metadata via `py.typed`.
 
 ## Not supported
@@ -106,7 +107,12 @@ The integration boundary is summarized in [docs/integration-contract.md](docs/in
 
 These are architectural non-goals for v1. pyinc is a pull-based kernel; LSP servers
 and push-based watchers belong to a consumer tool built on top of pyinc, not to the
-kernel itself. See `docs/architecture.md:80-82` for the v1 scope boundary.
+kernel itself. See [docs/architecture.md](docs/architecture.md) for the v1 scope boundary.
+
+The repository now includes that consumer boundary as a separate tooling layer in
+`pyinc_tools`, not in `src/pyinc`. Use `pyinc-tools analyze ...` or `pyinc-tools lsp`
+when you want editor- or watcher-facing behavior on top of the stable kernel and
+integration entrypoints.
 
 ## Development
 

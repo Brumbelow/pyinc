@@ -8,54 +8,67 @@
 `pyinc.integrations` re-exports only the stable dataclass/result types and
 high-level entrypoints from the shipped integrations below.
 
-For `pyinc.integrations.python_source` (the reference integration), the stable public
-surface is:
+Stable public surface by module:
 
-- dataclass result types:
-  - `ImportRef`
-  - `DefinitionRef`
-  - `Diagnostic`
-  - `ResolvedImportRef`
-  - `DependencySurface`
-  - `PythonFileAnalysis`
-  - `PythonModuleAnalysis`
-  - `PythonWorkspaceAnalysis`
-- high-level entrypoints:
-  - `file_analysis(db, path)`
-  - `directory_analysis(db, root)`
-  - `module_analysis(db, root, path)`
-  - `workspace_analysis(db, root)`
-
-For `pyinc.integrations.toml_config`, the stable public surface is:
-
-- dataclass result types:
-  - `ConfigKey`
-  - `ConfigSection`
-  - `ConfigAnalysis`
-- high-level entrypoints:
-  - `config_analysis(db, path)`
-  - `workspace_config_analysis(db, root)`
-
-For `pyinc.integrations.json_config`, the stable public surface is:
-
-- dataclass result types:
-  - `JsonKey`
-  - `JsonSection`
-  - `JsonAnalysis`
-- high-level entrypoints:
-  - `json_analysis(db, path)`
-  - `workspace_json_analysis(db, root, filename)`
-
-For `pyinc.integrations.requirements_txt`, the stable public surface is:
-
-- dataclass result types:
-  - `RequirementRef`
-  - `FileReference`
-  - `IndexDirective`
-  - `RequirementsAnalysis`
-- high-level entrypoints:
-  - `requirements_analysis(db, path)`
-  - `workspace_requirements_analysis(db, root)`
+- `python_source`
+  - result types: `ImportRef`, `DefinitionRef`, `Diagnostic`,
+    `ResolvedImportRef`, `DependencySurface`, `PythonFileAnalysis`,
+    `PythonModuleAnalysis`, `PythonWorkspaceAnalysis`
+  - entrypoints: `file_analysis(db, path)`, `directory_analysis(db, root)`,
+    `module_analysis(db, root, path)`, `workspace_analysis(db, root)`
+- `toml_config`
+  - result types: `ConfigKey`, `ConfigSection`, `ConfigAnalysis`
+  - entrypoints: `config_analysis(db, path)`,
+    `workspace_config_analysis(db, root)`
+- `json_config`
+  - result types: `JsonKey`, `JsonSection`, `JsonAnalysis`
+  - entrypoints: `json_analysis(db, path)`,
+    `workspace_json_analysis(db, root, filename)`
+- `requirements_txt`
+  - result types: `RequirementRef`, `FileReference`, `IndexDirective`,
+    `RequirementsAnalysis`
+  - entrypoints: `requirements_analysis(db, path)`,
+    `workspace_requirements_analysis(db, root)`,
+    `deep_requirements_analysis(db, path)`
+- `installed_packages`
+  - result types: `InstalledPackageRef`, `ImportNameResolution`,
+    `InstalledPackagesAnalysis`
+  - entrypoints: `installed_packages_analysis(db)`,
+    `resolve_import_name(db, import_name)`
+- `dependency_check`
+  - result types: `DependencyStatus`, `UndeclaredImport`,
+    `DependencyCheckAnalysis`
+  - entrypoints: `dependency_check_analysis(db, declared_deps)`,
+    `workspace_dependency_check(db, root, declared_deps)`
+- `env_file`
+  - result types: `EnvEntry`, `EnvFileAnalysis`
+  - entrypoints: `env_analysis(db, path)`, `workspace_env_analysis(db, root)`
+- `xml_config`
+  - result types: `XmlAttribute`, `XmlElement`, `XmlAnalysis`
+  - entrypoints: `xml_analysis(db, path)`,
+    `workspace_xml_analysis(db, root, filename)`
+- `csv_data`
+  - result types: `CsvColumn`, `CsvAnalysis`
+  - entrypoints: `csv_analysis(db, path)`, `workspace_csv_analysis(db, root)`
+- `deep_module_resolution`
+  - result types: `ResolvedModuleLocation`, `NamespacePackage`,
+    `PthDirective`, `ModulePathEntry`, `DeepModuleResolutionAnalysis`
+  - entrypoints: `resolve_module_path(db, dotted_name)`,
+    `deep_module_resolution_analysis(db)`
+- `requirement_evaluation`
+  - result types: `MarkerEvaluation`, `VersionSpecifierEvaluation`,
+    `ApplicableRequirement`, `ApplicableRequirementsAnalysis`,
+    `PythonEnvironmentSnapshot`
+  - entrypoints: `evaluate_markers(db, marker)`,
+    `evaluate_version_specifier(db, specifier, version)`,
+    `applicable_requirements(db, path)`,
+    `workspace_applicable_requirements(db, root)`
+- `symbol_resolution`
+  - result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`,
+    `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`
+  - entrypoints: `module_symbol_table(db, root, path)`,
+    `resolve_symbol(db, root, path, qualified_name)`,
+    `workspace_symbol_index(db, root)`
 
 ## Experimental Helpers
 
@@ -381,6 +394,6 @@ These are the current concrete composition edges between shipped integrations. E
 This contract does not include:
 
 - full `sys.path` / installed-package resolution beyond top-level module classification
-- LSP wiring
-- file watchers or schedulers
+- LSP wiring inside `src/pyinc`
+- file watchers or schedulers inside `src/pyinc`
 - widening the core runtime semantics to accommodate integration convenience
