@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 from urllib.parse import urlparse
 from urllib.request import url2pathname
+
+from pyinc.integrations import Symbol
 
 from .session import AnalysisDiagnostic, WorkspaceSession
 
@@ -44,6 +47,9 @@ _PYINC_SEVERITY_TO_LSP = {
     "hint": 4,
 }
 
+_ID_START_RE = re.compile(r"[A-Za-z_]")
+_ID_CONT_RE = re.compile(r"[A-Za-z0-9_]")
+
 
 def _path_to_uri(path: str) -> str:
     return Path(path).resolve(strict=False).as_uri()
@@ -54,6 +60,65 @@ def _uri_to_path(uri: str) -> str:
     if parsed.scheme != "file":
         raise ValueError(f"Unsupported URI scheme: {parsed.scheme!r}")
     return str(Path(url2pathname(parsed.path)).resolve(strict=False))
+
+
+def _identifier_at_position(source: str, line: int, character: int) -> str | None:
+    lines = source.splitlines()
+    if not (0 <= line < len(lines)):
+        return None
+    text = lines[line]
+    if not (0 <= character <= len(text)):
+        return None
+    start = character
+    while start > 0 and _ID_CONT_RE.match(text[start - 1]):
+        start -= 1
+    end = character
+    while end < len(text) and _ID_CONT_RE.match(text[end]):
+        end += 1
+    if start == end or not _ID_START_RE.match(text[start]):
+        return None
+    return text[start:end]
+
+
+def _find_symbol_by_identifier(
+    symbols: tuple[Symbol, ...], identifier: str
+) -> Symbol | None:
+    for symbol in symbols:
+        if symbol.qualified_name == identifier:
+            return symbol
+    for symbol in symbols:
+        if symbol.qualified_name.rsplit(".", 1)[-1] == identifier:
+            return symbol
+    return None
+
+
+def _format_hover_markdown(symbol: Symbol) -> str:
+    header = _format_symbol_declaration(symbol)
+    lines = [f"```python\n{header}\n```"]
+    if symbol.import_source_module and symbol.import_source_name:
+        lines.append(
+            f"*re-exported from* `{symbol.import_source_module}.{symbol.import_source_name}`"
+        )
+    return "\n\n".join(lines)
+
+
+def _format_symbol_declaration(symbol: Symbol) -> str:
+    bare_name = symbol.qualified_name.rsplit(".", 1)[-1]
+    if symbol.kind == "class":
+        return f"class {bare_name}"
+    if symbol.kind in ("function", "method") and symbol.signature is not None:
+        params = ", ".join(
+            f"{parameter.name}: {parameter.annotation}"
+            if parameter.annotation is not None
+            else parameter.name
+            for parameter in symbol.signature.parameters
+        )
+        return_annotation = symbol.signature.return_annotation
+        suffix = f" -> {return_annotation}" if return_annotation is not None else ""
+        return f"def {bare_name}({params}){suffix}"
+    if symbol.annotation is not None:
+        return f"{bare_name}: {symbol.annotation}"
+    return bare_name
 
 
 class LanguageServer:
@@ -114,6 +179,10 @@ class LanguageServer:
             return self._document_symbols(params)
         if method == "workspace/symbol":
             return self._workspace_symbols(params)
+        if method == "textDocument/hover":
+            return self._hover(params)
+        if method == "textDocument/definition":
+            return self._definition(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -191,8 +260,10 @@ class LanguageServer:
                 },
                 "documentSymbolProvider": True,
                 "workspaceSymbolProvider": True,
+                "hoverProvider": True,
+                "definitionProvider": True,
             },
-            "serverInfo": {"name": "pyinc-tools", "version": "1.0.1"},
+            "serverInfo": {"name": "pyinc-tools", "version": "1.1.0"},
         }
 
     def _document_symbols(self, params: Any) -> list[dict[str, Any]]:
@@ -244,6 +315,55 @@ class LanguageServer:
                 }
             )
         return matches
+
+    def _hover(self, params: Any) -> dict[str, Any] | None:
+        session = self._require_session()
+        real_path = _uri_to_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        source = session.source_text(real_path)
+        if source is None:
+            return None
+        identifier = _identifier_at_position(source, line, character)
+        if identifier is None:
+            return None
+        analysis = session.analyze_file(real_path)
+        if analysis.symbols is None:
+            return None
+        symbol = _find_symbol_by_identifier(analysis.symbols.symbols, identifier)
+        if symbol is None:
+            return None
+        return {"contents": {"kind": "markdown", "value": _format_hover_markdown(symbol)}}
+
+    def _definition(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = _uri_to_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        source = session.source_text(real_path)
+        if source is None:
+            return []
+        identifier = _identifier_at_position(source, line, character)
+        if identifier is None:
+            return []
+        try:
+            resolved = session.resolve_symbol_reference(real_path, identifier)
+        except FileNotFoundError:
+            return []
+        if resolved.defining_path is None or resolved.defining_lineno is None:
+            return []
+        line_zero = max(resolved.defining_lineno - 1, 0)
+        return [
+            {
+                "uri": _path_to_uri(resolved.defining_path),
+                "range": {
+                    "start": {"line": line_zero, "character": 0},
+                    "end": {"line": line_zero, "character": 1},
+                },
+            }
+        ]
 
     def _workspace_root_from_params(self, params: Any) -> str:
         if isinstance(params, dict):

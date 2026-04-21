@@ -1,7 +1,7 @@
 # pyinc
 
 [![CI](https://github.com/Brumbelow/pyinc/actions/workflows/ci.yml/badge.svg)](https://github.com/Brumbelow/pyinc/actions/workflows/ci.yml)
-[![PyPI version](https://img.shields.io/pypi/v/pyinc/1.0.1)](https://pypi.org/project/pyinc/)
+[![PyPI version](https://img.shields.io/pypi/v/pyinc)](https://pypi.org/project/pyinc/)
 [![Python versions](https://img.shields.io/pypi/pyversions/pyinc)](https://pypi.org/project/pyinc/)
 [![PyPI license](https://img.shields.io/pypi/l/pyinc)](https://pypi.org/project/pyinc/)
 
@@ -100,19 +100,21 @@ The integration boundary is summarized in [docs/integration-contract.md](docs/in
 - Unsupported ambient-capture failures now point back to `pyinc.explain_query_captures(...)` so you can diagnose the rejection before rewriting the query shape.
 - The package ships inline typing metadata via `py.typed`.
 
-## Not supported
+## Not supported (in the kernel)
 
-- LSP wiring
-- File watchers (push-based filesystem invalidation)
+- LSP wiring inside `src/pyinc`
+- Push-based filesystem watchers inside `src/pyinc`
 
 These are architectural non-goals for v1. pyinc is a pull-based kernel; LSP servers
 and push-based watchers belong to a consumer tool built on top of pyinc, not to the
 kernel itself. See [docs/architecture.md](docs/architecture.md) for the v1 scope boundary.
 
-The repository now includes that consumer boundary as a separate tooling layer in
-`pyinc_tools`, not in `src/pyinc`. Use `pyinc-tools analyze ...` or `pyinc-tools lsp`
-when you want editor- or watcher-facing behavior on top of the stable kernel and
-integration entrypoints.
+The repository ships that consumer boundary as a separate tooling layer in
+`pyinc_tools`, not in `src/pyinc`. Use `pyinc-tools analyze ...` for one-shot or
+`--watch` analysis via the polling watcher, or `pyinc-tools lsp` for stdio LSP
+with document symbols, workspace symbols, diagnostics, hover, and goto-definition
+(backed by `pyinc.integrations.symbol_resolution` for cross-module re-export
+following).
 
 ## Development
 

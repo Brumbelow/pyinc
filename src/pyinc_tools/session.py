@@ -227,6 +227,29 @@ class WorkspaceSession:
             diagnostics=diagnostics,
         )
 
+    def resolve_symbol_reference(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+    ) -> ResolvedSymbol:
+        real_path = self._normalize_real_path(path)
+        mirror_path = self._mirror_path_for_real(real_path)
+        if not mirror_path.exists() or mirror_path.suffix != ".py":
+            raise FileNotFoundError(real_path)
+        resolved = resolve_symbol(
+            self.db, self.mirror_root, str(mirror_path), qualified_name
+        )
+        return self._remap_resolved_symbol(resolved)
+
+    def source_text(self, path: str | os.PathLike[str]) -> str | None:
+        real_path = self._normalize_real_path(path)
+        if real_path in self._overlays:
+            return self._overlays[real_path]
+        try:
+            return Path(real_path).read_text(encoding="utf-8")
+        except OSError:
+            return None
+
     def _build_file_result(
         self,
         real_path: str,

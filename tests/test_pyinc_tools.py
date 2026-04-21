@@ -118,6 +118,8 @@ def test_language_server_reports_document_and_workspace_symbols(tmp_path: Path) 
     try:
         init = server._handle_request("initialize", {"rootUri": root.as_uri()})
         assert init["capabilities"]["documentSymbolProvider"] is True
+        assert init["capabilities"]["hoverProvider"] is True
+        assert init["capabilities"]["definitionProvider"] is True
 
         document_symbols = server._handle_request(
             "textDocument/documentSymbol",
@@ -128,6 +130,146 @@ def test_language_server_reports_document_and_workspace_symbols(tmp_path: Path) 
         workspace_symbols = server._handle_request("workspace/symbol", {"query": "help"})
         assert len(workspace_symbols) == 1
         assert workspace_symbols[0]["name"] == "helper"
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_hover_local_function_includes_signature(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper(x: int) -> int:\n    return x\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        hover = server._handle_request(
+            "textDocument/hover",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+        assert hover is not None
+        assert "def helper(x: int) -> int" in hover["contents"]["value"]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_hover_on_whitespace_returns_none(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        hover = server._handle_request(
+            "textDocument/hover",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 3},
+            },
+        )
+        assert hover is None
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_hover_class_shows_kind(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "class Box:\n    pass\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        hover = server._handle_request(
+            "textDocument/hover",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 7},
+            },
+        )
+        assert hover is not None
+        assert "class Box" in hover["contents"]["value"]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_definition_local_function_returns_same_file(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+        assert len(locations) == 1
+        assert locations[0]["uri"] == target.as_uri()
+        assert locations[0]["range"]["start"]["line"] == 0
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_definition_follows_cross_file_reexport(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "a.py"
+    consumer = root / "b.py"
+    _write(provider, "def foo() -> int:\n    return 1\n")
+    _write(consumer, "from a import foo\n\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+        assert len(locations) == 1
+        assert locations[0]["uri"] == provider.as_uri()
+        assert locations[0]["range"]["start"]["line"] == 0
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_definition_on_unknown_identifier_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return xyz\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 1, "character": 12},
+            },
+        )
+        assert locations == []
     finally:
         if server._session is not None:
             server._session.close()

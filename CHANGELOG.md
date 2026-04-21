@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-04-21
+
+### Added
+
+- **LSP hover and goto-definition.** `pyinc-tools lsp` now advertises
+  `hoverProvider` and `definitionProvider`. Hover returns a markdown signature
+  for the symbol under the cursor (functions with parameters and return
+  annotation, classes, annotated variables, re-exported aliases);
+  goto-definition follows cross-module re-exports via
+  `symbol_resolution.resolve_symbol` and returns a `Location` in the defining
+  module.
+- **WorkspaceSession API.** `resolve_symbol_reference(path, qualified_name)`
+  wraps `resolve_symbol` with mirror-root → real-root path remapping.
+  `source_text(path)` returns the active overlay or on-disk contents for a
+  tracked file.
+
+### Notes
+
+- Kernel contract (`src/pyinc`) is unchanged; the minor version bump reflects
+  new public API on the `pyinc_tools` consumer layer. LSP wiring and
+  push-based watchers remain architectural non-goals for the kernel itself;
+  they live in `pyinc_tools` on top of stable `pyinc.integrations`
+  entrypoints.
+
 ## [1.0.1] — 2026-04-21
 
 ### Added
@@ -58,3 +82,4 @@ The first stable v1 release.
 
 [1.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.0.0
 [1.0.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.0.1
+[1.1.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.1.0
