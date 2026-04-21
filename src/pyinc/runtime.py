@@ -509,6 +509,16 @@ class Database:
                 self._ensure_query(query, key, call_snapshot)
             return self._inspect_record(key)
 
+    def inspect_fresh(self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> InspectionNode:
+        from .core import Query
+
+        if not isinstance(query, Query):
+            raise TypeError("db.inspect_fresh() expects a @query-decorated callable.")
+        with self._state_lock, self._request_scope():
+            key, call_snapshot = self._query_key(query, args, kwargs)
+            self._ensure_query(query, key, call_snapshot)
+            return self._inspect_record(key)
+
     def report_untracked_read(self, reason: str) -> None:
         frame = self._current_frame()
         if frame is None:

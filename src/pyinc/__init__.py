@@ -6,7 +6,7 @@ from .errors import (
     UnsupportedValueError,
     UntrackedReadError,
 )
-from .explain import InspectionNode
+from .explain import CaptureInfo, InspectionNode, explain_query_captures
 from .resources import (
     DirectoryResource,
     EnvResource,
@@ -28,6 +28,7 @@ from .value import (
 )
 
 __all__ = [
+    "CaptureInfo",
     "CycleError",
     "Database",
     "DatabaseStatistics",
@@ -50,6 +51,7 @@ __all__ = [
     "UnsupportedValueError",
     "UntrackedReadError",
     "ValueAdapter",
+    "explain_query_captures",
     "freeze",
     "query",
     "semantic_equal",

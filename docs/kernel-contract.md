@@ -154,12 +154,16 @@ scratch on its next request. This is correct but may degrade performance.
 ### Additional Kernel Properties
 
 - Query identity includes the function definition payload, including supported
-  captured values. Mutable closure/global captures are rejected.
+  captured values. Mutable closure/global captures are rejected. Use
+  `pyinc.explain_query_captures(fn)` to preview how each capture will be
+  classified before the first `db.get()`.
 - Resource identity includes resource configuration (e.g., encoding for
   `FileResource`).
 - `Database.inspect(...)` exposes the last recorded provenance tree as structured
   data. `Database.explain(...)` formats it for humans. Inspection is
-  observational and does not force an extra verification pass.
+  observational and does not force an extra verification pass;
+  `Database.inspect_fresh(...)` runs verification first and then returns the
+  provenance tree.
 - `Database(max_query_nodes=...)` enables bounded memoization. Eviction happens
   at top-level request boundaries and affects query nodes only.
 - The distributed package is PEP 561 typed via `py.typed`.

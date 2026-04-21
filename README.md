@@ -94,8 +94,8 @@ The integration boundary is summarized in [docs/integration-contract.md](docs/in
 
 ## Gotchas
 
-- `Database.inspect(...)` is observational. It returns the last recorded provenance tree for that query key and does not force a fresh revalidation pass by itself.
-- Query identity includes the function definition payload. If you capture ambient values, those captures are part of the query fingerprint, and mutable closure/global captures are rejected.
+- `Database.inspect(...)` is observational. It returns the last recorded provenance tree for that query key and does not force a fresh revalidation pass by itself. Use `Database.inspect_fresh(...)` when you need the tree after re-verification.
+- Query identity includes the function definition payload. If you capture ambient values, those captures are part of the query fingerprint, and mutable closure/global captures are rejected. Use `pyinc.explain_query_captures(fn)` to see how each capture will be classified before running the query.
 - `Database.report_untracked_read(...)` is an explicit impurity escape hatch. It marks that query as always re-executing and disables backdating for that node.
 - The package ships inline typing metadata via `py.typed`.
 

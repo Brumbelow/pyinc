@@ -237,6 +237,56 @@ def test_inspect_returns_structured_dependency_tree() -> None:
     assert input_node.dependencies == ()
 
 
+def test_inspect_fresh_triggers_reverification_after_input_change() -> None:
+    number = Input[int]("number")
+
+    @query
+    def double(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 3)
+    assert db.get(double) == 6
+
+    db.set(number, 5)
+
+    stale = db.inspect(double)
+    assert stale.last_decision == "executed"
+    assert stale.verified_at == 1
+
+    fresh = db.inspect_fresh(double)
+    assert fresh.last_decision == "executed"
+    assert fresh.verified_at == 2
+    assert db.get(double) == 10
+
+
+def test_inspect_fresh_on_cold_cache_returns_same_shape_as_inspect() -> None:
+    number = Input[int]("number")
+
+    @query
+    def double(db: Database) -> int:
+        return number.read(db) * 2
+
+    db_a = Database()
+    db_a.set(number, 7)
+    tree_a = db_a.inspect(double)
+
+    db_b = Database()
+    db_b.set(number, 7)
+    tree_b = db_b.inspect_fresh(double)
+
+    assert tree_a.label == tree_b.label
+    assert tree_a.kind == tree_b.kind
+    assert tree_a.last_decision == tree_b.last_decision == "executed"
+    assert {dep.label for dep in tree_a.dependencies} == {dep.label for dep in tree_b.dependencies}
+
+
+def test_inspect_fresh_rejects_non_query() -> None:
+    db = Database()
+    with pytest.raises(TypeError):
+        db.inspect_fresh(cast(Any, lambda db_: None))
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_type"),
     [("strict", FrozenDict), ("checked", dict), ("fast", dict)],
