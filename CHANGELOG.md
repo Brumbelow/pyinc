@@ -4,6 +4,76 @@ All notable changes to this project will be documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-04-22
+
+### Added
+
+- **`textDocument/references`.** `pyinc-tools lsp` now advertises
+  `referencesProvider` and honors `context.includeDeclaration`. References
+  are returned with per-occurrence character ranges (`col_offset` /
+  `end_col_offset` from the AST, not the line-0 placeholder used for some
+  other requests), so editors can highlight every match precisely.
+- **`pyinc.integrations.find_references`.** New stable entrypoint +
+  `Reference` and `ReferenceQueryResult` dataclasses. Backed by two new
+  composition-layer `@query` functions in `symbol_resolution`:
+  `name_occurrences_for_file` (full-AST `Name`/`Attribute` walk) and
+  `workspace_name_occurrence_index`. Candidate filtering is bounded by a
+  bare-name pre-filter; each surviving candidate is verified through
+  `resolve_symbol_payload`, so results respect the existing
+  `MAX_FOLLOW_DEPTH = 8` cross-module re-export semantics. Only
+  workspace-resolved targets are indexed; `stdlib`/`installed`/`ambiguous`
+  targets return an empty tuple with the `ResolvedSymbol` carried on the
+  result.
+- **`WorkspaceSession.find_references`.** Mirror-path aware wrapper around
+  the integration entrypoint; paths in the returned `Reference` tuples are
+  remapped to the real workspace root.
+- **Threaded live polling.** `PollingWorkspaceWatcher.start(on_change, *,
+  interval_s, on_error)` spawns a daemon thread that delivers debounced
+  change batches to a caller-supplied callback; `stop(timeout=5.0)` joins
+  the thread cleanly. Context-manager support (`with watcher: ...`)
+  guarantees `stop()` on exit. Exceptions from `on_change` are forwarded to
+  the optional `on_error` hook, or logged to stderr by default, without
+  killing the watcher thread. `poll()` remains available for synchronous
+  use but raises `RuntimeError` while the thread is running (one driver at
+  a time).
+- **LSP live polling.** `pyinc-tools lsp` starts a threaded
+  `PollingWorkspaceWatcher` in `initialize` by default so external file
+  changes (e.g. `git pull`, formatter scripts) publish fresh diagnostics
+  without requiring `workspace/didChangeWatchedFiles` from the editor.
+  Opt-out via `initializationOptions.pyinc.watcher.enabled=false`; tune via
+  `pyinc.watcher.debounceMs` and `pyinc.watcher.intervalMs`. Repeated
+  `publishDiagnostics` for an unchanged URI are suppressed via a
+  diagnostic-tuple signature cache.
+- **CLI `--poll-interval-ms` flag.** Explicit control over watcher poll
+  cadence. `pyinc-tools analyze --watch` now drives its loop through the
+  threaded watcher API; behavior is unchanged.
+
+### Changed
+
+- **`WorkspaceSession` is thread-safe for its own public surface.** A
+  session-level `threading.RLock` now guards `set_overlay`, `clear_overlay`,
+  `refresh_paths`, `analyze_file`, `analyze_workspace`,
+  `resolve_symbol_reference`, and `find_references`; mutators raise
+  `RuntimeError` once `close()` has been called so the watcher thread
+  exits cleanly when the session shuts down. The kernel's existing
+  `Database` `RLock` is unchanged.
+
+### Notes
+
+- Kernel contract (`src/pyinc`) unchanged. Minor version bump reflects new
+  public consumer-layer API surface only. Watcher loops and LSP wiring
+  remain architectural non-goals for the kernel itself; all new code lives
+  in `pyinc_tools` on top of stable `pyinc.integrations` entrypoints.
+- Known limitations for `find_references` in v1.2.0:
+  - References via attribute access to a module-level symbol only
+    imported as a module (`import a; a.foo()`) are not counted because
+    the resolver is name-local. Use `from a import foo` to opt in.
+  - Forward-reference strings (`'Foo'` in annotations) are not scanned.
+  - Function-local shadowing is not modeled: a local `foo = 1` inside a
+    function is still reported as a reference to a module-level `foo`.
+    `symbol_resolution` is module/class-scope only per
+    `docs/integration-contract.md`.
+
 ## [1.1.1] — 2026-04-22
 
 ### Added
@@ -103,3 +173,4 @@ The first stable v1 release.
 [1.0.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.0.1
 [1.1.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.1.0
 [1.1.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.1.1
+[1.2.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.2.0

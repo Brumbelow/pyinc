@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
+import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -19,10 +22,13 @@ from pyinc.integrations import (
     ModuleSymbolTable,
     PythonModuleAnalysis,
     PythonWorkspaceAnalysis,
+    Reference,
+    ReferenceQueryResult,
     RequirementsAnalysis,
     ResolvedImportRef,
     ResolvedSymbol,
     WorkspaceSymbolIndex,
+    find_references,
     module_analysis,
     module_symbol_table,
     resolve_symbol,
@@ -131,10 +137,20 @@ class WorkspaceSession:
         self._mirror_root_path.mkdir(parents=True, exist_ok=True)
         self._overlays: dict[str, str] = {}
         self._scheduled_paths: set[str] = set()
+        self._state_lock = threading.RLock()
+        self._closed = False
         self._copy_workspace_into_mirror()
 
     def close(self) -> None:
-        self._tempdir.cleanup()
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._tempdir.cleanup()
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("WorkspaceSession is closed.")
 
     def __enter__(self) -> WorkspaceSession:
         return self
@@ -143,108 +159,157 @@ class WorkspaceSession:
         self.close()
 
     def set_overlay(self, path: str | os.PathLike[str], text: str) -> str:
-        real_path = self._normalize_real_path(path)
-        mirror_path = self._mirror_path_for_real(real_path)
-        mirror_path.parent.mkdir(parents=True, exist_ok=True)
-        mirror_path.write_text(text, encoding="utf-8")
-        self._overlays[real_path] = text
-        self._scheduled_paths.add(real_path)
-        return real_path
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            mirror_path.parent.mkdir(parents=True, exist_ok=True)
+            mirror_path.write_text(text, encoding="utf-8")
+            self._overlays[real_path] = text
+            self._scheduled_paths.add(real_path)
+            return real_path
 
     def clear_overlay(self, path: str | os.PathLike[str]) -> str:
-        real_path = self._normalize_real_path(path)
-        self._overlays.pop(real_path, None)
-        self._sync_path_from_disk(real_path)
-        self._scheduled_paths.add(real_path)
-        return real_path
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            self._overlays.pop(real_path, None)
+            self._sync_path_from_disk(real_path)
+            self._scheduled_paths.add(real_path)
+            return real_path
 
     def refresh_paths(
         self,
         paths: Sequence[str | os.PathLike[str]],
     ) -> tuple[str, ...]:
-        refreshed: list[str] = []
-        seen: set[str] = set()
-        for raw_path in paths:
-            real_path = self._normalize_real_path(raw_path)
-            if real_path in seen:
-                continue
-            seen.add(real_path)
-            if real_path not in self._overlays:
-                self._sync_path_from_disk(real_path)
-            self._scheduled_paths.add(real_path)
-            refreshed.append(real_path)
-        return tuple(refreshed)
+        with self._state_lock:
+            self._check_open()
+            refreshed: list[str] = []
+            seen: set[str] = set()
+            for raw_path in paths:
+                real_path = self._normalize_real_path(raw_path)
+                if real_path in seen:
+                    continue
+                seen.add(real_path)
+                if real_path not in self._overlays:
+                    self._sync_path_from_disk(real_path)
+                self._scheduled_paths.add(real_path)
+                refreshed.append(real_path)
+            return tuple(refreshed)
 
     def analyze_file(self, path: str | os.PathLike[str]) -> FileAnalysisResult:
-        real_path = self._normalize_real_path(path)
-        dependency_inputs = self._dependency_inputs()
-        dependency_check = workspace_dependency_check(
-            self.db,
-            self.mirror_root,
-            dependency_inputs.declared_dependencies,
-        )
-        result = self._build_file_result(real_path, dependency_inputs, dependency_check)
-        self._scheduled_paths.discard(real_path)
-        return result
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            dependency_inputs = self._dependency_inputs()
+            dependency_check = workspace_dependency_check(
+                self.db,
+                self.mirror_root,
+                dependency_inputs.declared_dependencies,
+            )
+            result = self._build_file_result(real_path, dependency_inputs, dependency_check)
+            self._scheduled_paths.discard(real_path)
+            return result
 
     def analyze_workspace(self) -> WorkspaceAnalysisResult:
-        dependency_inputs = self._dependency_inputs()
-        dependency_check = workspace_dependency_check(
-            self.db,
-            self.mirror_root,
-            dependency_inputs.declared_dependencies,
-        )
-        python_analysis = self._remap_workspace_analysis(
-            workspace_analysis(self.db, self.mirror_root)
-        )
-        symbol_index = self._remap_workspace_symbol_index(
-            workspace_symbol_index(self.db, self.mirror_root)
-        )
-        files = tuple(
-            self._build_file_result(
-                module.path,
-                dependency_inputs,
-                dependency_check,
-                module=module,
+        with self._state_lock:
+            self._check_open()
+            dependency_inputs = self._dependency_inputs()
+            dependency_check = workspace_dependency_check(
+                self.db,
+                self.mirror_root,
+                dependency_inputs.declared_dependencies,
             )
-            for module in python_analysis.modules
-        )
-        diagnostics = self._dedupe_diagnostics(
-            tuple(
-                diagnostic
-                for file_result in files
-                for diagnostic in file_result.diagnostics
+            python_analysis = self._remap_workspace_analysis(
+                workspace_analysis(self.db, self.mirror_root)
             )
-            + self._dependency_status_diagnostics(dependency_inputs, dependency_check)
-        )
-        self._scheduled_paths.clear()
-        return WorkspaceAnalysisResult(
-            root=self.root,
-            python=python_analysis,
-            symbols=symbol_index,
-            dependency_check=dependency_check,
-            files=files,
-            diagnostics=diagnostics,
-        )
+            symbol_index = self._remap_workspace_symbol_index(
+                workspace_symbol_index(self.db, self.mirror_root)
+            )
+            files = tuple(
+                self._build_file_result(
+                    module.path,
+                    dependency_inputs,
+                    dependency_check,
+                    module=module,
+                )
+                for module in python_analysis.modules
+            )
+            diagnostics = self._dedupe_diagnostics(
+                tuple(
+                    diagnostic
+                    for file_result in files
+                    for diagnostic in file_result.diagnostics
+                )
+                + self._dependency_status_diagnostics(dependency_inputs, dependency_check)
+            )
+            self._scheduled_paths.clear()
+            return WorkspaceAnalysisResult(
+                root=self.root,
+                python=python_analysis,
+                symbols=symbol_index,
+                dependency_check=dependency_check,
+                files=files,
+                diagnostics=diagnostics,
+            )
 
     def resolve_symbol_reference(
         self,
         path: str | os.PathLike[str],
         qualified_name: str,
     ) -> ResolvedSymbol:
-        real_path = self._normalize_real_path(path)
-        mirror_path = self._mirror_path_for_real(real_path)
-        if not mirror_path.exists() or mirror_path.suffix != ".py":
-            raise FileNotFoundError(real_path)
-        resolved = resolve_symbol(
-            self.db, self.mirror_root, str(mirror_path), qualified_name
-        )
-        return self._remap_resolved_symbol(resolved)
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            resolved = resolve_symbol(
+                self.db, self.mirror_root, str(mirror_path), qualified_name
+            )
+            return self._remap_resolved_symbol(resolved)
+
+    def find_references(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+        *,
+        include_declaration: bool = True,
+    ) -> ReferenceQueryResult:
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            result = find_references(
+                self.db,
+                self.mirror_root,
+                str(mirror_path),
+                qualified_name,
+                include_declaration=include_declaration,
+            )
+            remapped_target = self._remap_resolved_symbol(result.target)
+            remapped_refs = tuple(
+                Reference(
+                    path=self._remap_path(ref.path) or ref.path,
+                    lineno=ref.lineno,
+                    col_offset=ref.col_offset,
+                    end_col_offset=ref.end_col_offset,
+                    is_declaration=ref.is_declaration,
+                )
+                for ref in result.references
+            )
+            return ReferenceQueryResult(target=remapped_target, references=remapped_refs)
 
     def source_text(self, path: str | os.PathLike[str]) -> str | None:
         real_path = self._normalize_real_path(path)
-        if real_path in self._overlays:
-            return self._overlays[real_path]
+        with self._state_lock:
+            if self._closed:
+                return None
+            overlay = self._overlays.get(real_path)
+        if overlay is not None:
+            return overlay
         try:
             return Path(real_path).read_text(encoding="utf-8")
         except OSError:
@@ -703,8 +768,24 @@ class PollingWorkspaceWatcher:
             self._session._ignored_dir_names,
         )
         self._pending: dict[str, float] = {}
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._on_change: Callable[[tuple[str, ...]], None] | None = None
+        self._on_error: Callable[[BaseException], None] | None = None
+
+    @property
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
 
     def poll(self) -> tuple[str, ...]:
+        if self.is_running:
+            raise RuntimeError(
+                "PollingWorkspaceWatcher is running; stop() it before calling poll() directly."
+            )
+        return self._poll_once()
+
+    def _poll_once(self) -> tuple[str, ...]:
         now = self._clock()
         current_snapshot = _collect_filesystem_snapshot(
             self._session.root,
@@ -733,3 +814,78 @@ class PollingWorkspaceWatcher:
 
         self._snapshot = current_snapshot
         return ready
+
+    def start(
+        self,
+        on_change: Callable[[tuple[str, ...]], None],
+        *,
+        interval_s: float | None = None,
+        on_error: Callable[[BaseException], None] | None = None,
+    ) -> None:
+        if self.is_running:
+            raise RuntimeError("PollingWorkspaceWatcher is already running.")
+        effective_interval = (
+            interval_s if interval_s is not None else max(self._debounce_seconds / 2.0, 0.05)
+        )
+        self._on_change = on_change
+        self._on_error = on_error
+        self._stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._run,
+            args=(effective_interval,),
+            name="pyinc-tools-watcher",
+            daemon=True,
+        )
+        self._thread = thread
+        thread.start()
+
+    def stop(self, *, timeout: float = 5.0) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop_event.set()
+        thread.join(timeout)
+        if thread.is_alive():
+            print(
+                "pyinc-tools watcher: thread did not stop within timeout",
+                file=sys.stderr,
+            )
+        self._thread = None
+        self._on_change = None
+        self._on_error = None
+
+    def __enter__(self) -> PollingWorkspaceWatcher:
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+        self.stop()
+
+    def _run(self, interval_s: float) -> None:
+        while not self._stop_event.is_set():
+            try:
+                ready = self._poll_once()
+            except RuntimeError:
+                # Session was closed out from under us; exit cleanly.
+                return
+            except BaseException as exc:  # pragma: no cover - defensive
+                self._handle_error(exc)
+                ready = ()
+            if ready:
+                callback = self._on_change
+                if callback is not None:
+                    try:
+                        callback(ready)
+                    except BaseException as exc:
+                        self._handle_error(exc)
+            if self._stop_event.wait(interval_s):
+                return
+
+    def _handle_error(self, exc: BaseException) -> None:
+        if self._on_error is not None:
+            with contextlib.suppress(BaseException):  # pragma: no cover - defensive
+                self._on_error(exc)
+            return
+        print(
+            f"pyinc-tools watcher: callback raised: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )

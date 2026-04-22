@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sys
@@ -10,7 +11,7 @@ from urllib.request import url2pathname
 
 from pyinc.integrations import Symbol
 
-from .session import AnalysisDiagnostic, WorkspaceSession
+from .session import AnalysisDiagnostic, PollingWorkspaceWatcher, WorkspaceSession
 
 _LSP_SYMBOL_KINDS = {
     "file": 1,
@@ -60,6 +61,22 @@ def _uri_to_path(uri: str) -> str:
     if parsed.scheme != "file":
         raise ValueError(f"Unsupported URI scheme: {parsed.scheme!r}")
     return str(Path(url2pathname(parsed.path)).resolve(strict=False))
+
+
+def _diagnostic_signature(diagnostic: dict[str, Any]) -> tuple[Any, ...]:
+    range_ = diagnostic.get("range", {})
+    start = range_.get("start", {})
+    end = range_.get("end", {})
+    return (
+        start.get("line"),
+        start.get("character"),
+        end.get("line"),
+        end.get("character"),
+        diagnostic.get("severity"),
+        diagnostic.get("source"),
+        diagnostic.get("code"),
+        diagnostic.get("message"),
+    )
 
 
 def _identifier_at_position(source: str, line: int, character: int) -> str | None:
@@ -133,16 +150,21 @@ class LanguageServer:
         self._output = out_stream or sys.stdout.buffer
         self._default_root = default_root
         self._session: WorkspaceSession | None = None
+        self._watcher: PollingWorkspaceWatcher | None = None
         self._shutdown_requested = False
         self._published_paths: set[str] = set()
+        self._published_signatures: dict[str, tuple[tuple[Any, ...], ...]] = {}
 
     def serve(self) -> int:
-        while True:
-            message = self._read_message()
-            if message is None:
-                return 0
-            if not self._handle_message(message):
-                return 0
+        try:
+            while True:
+                message = self._read_message()
+                if message is None:
+                    return 0
+                if not self._handle_message(message):
+                    return 0
+        finally:
+            self._teardown_session()
 
     def _handle_message(self, message: dict[str, Any]) -> bool:
         if "method" not in message:
@@ -174,6 +196,7 @@ class LanguageServer:
             return self._initialize(params)
         if method == "shutdown":
             self._shutdown_requested = True
+            self._stop_watcher()
             return None
         if method == "textDocument/documentSymbol":
             return self._document_symbols(params)
@@ -183,10 +206,13 @@ class LanguageServer:
             return self._hover(params)
         if method == "textDocument/definition":
             return self._definition(params)
+        if method == "textDocument/references":
+            return self._references(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
         if method == "exit":
+            self._stop_watcher()
             return False
         if method == "initialized":
             self.publish_workspace_diagnostics()
@@ -236,21 +262,48 @@ class LanguageServer:
 
         current_paths = set(grouped)
         for path in sorted(current_paths | self._published_paths):
+            diagnostics = grouped.get(path, [])
+            signature = tuple(_diagnostic_signature(item) for item in diagnostics)
+            if self._published_signatures.get(path) == signature:
+                continue
+            self._published_signatures[path] = signature
             self._send_notification(
                 "textDocument/publishDiagnostics",
                 {
                     "uri": _path_to_uri(path),
-                    "diagnostics": grouped.get(path, []),
+                    "diagnostics": diagnostics,
                 },
             )
+        for stale_path in self._published_paths - current_paths:
+            # Clear the cached signature so a future reappearance republishes.
+            self._published_signatures.pop(stale_path, None)
         self._published_paths = current_paths
 
     def _initialize(self, params: Any) -> dict[str, Any]:
         root = self._workspace_root_from_params(params)
-        if self._session is not None:
-            self._session.close()
+        self._teardown_session()
         self._session = WorkspaceSession(root)
         self._published_paths.clear()
+        self._published_signatures.clear()
+
+        options = {}
+        if isinstance(params, dict):
+            init_options = params.get("initializationOptions")
+            if isinstance(init_options, dict):
+                options = init_options
+
+        watcher_enabled = bool(options.get("pyinc.watcher.enabled", True))
+        if watcher_enabled:
+            debounce_ms = int(options.get("pyinc.watcher.debounceMs", 200))
+            interval_ms = options.get("pyinc.watcher.intervalMs")
+            interval_s: float | None
+            if isinstance(interval_ms, (int, float)):
+                interval_s = float(interval_ms) / 1000.0
+            else:
+                interval_s = None
+            self._watcher = PollingWorkspaceWatcher(self._session, debounce_ms=debounce_ms)
+            self._watcher.start(self._on_watcher_change, interval_s=interval_s)
+
         return {
             "capabilities": {
                 "textDocumentSync": {
@@ -262,9 +315,34 @@ class LanguageServer:
                 "workspaceSymbolProvider": True,
                 "hoverProvider": True,
                 "definitionProvider": True,
+                "referencesProvider": True,
             },
-            "serverInfo": {"name": "pyinc-tools", "version": "1.1.1"},
+            "serverInfo": {"name": "pyinc-tools", "version": "1.2.0"},
         }
+
+    def _on_watcher_change(self, _changed: tuple[str, ...]) -> None:
+        try:
+            self.publish_workspace_diagnostics()
+        except Exception as exc:  # pragma: no cover - defensive
+            print(
+                f"pyinc-tools lsp: publishDiagnostics raised: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _stop_watcher(self) -> None:
+        watcher = self._watcher
+        if watcher is None:
+            return
+        self._watcher = None
+        with contextlib.suppress(Exception):  # pragma: no cover - defensive
+            watcher.stop()
+
+    def _teardown_session(self) -> None:
+        self._stop_watcher()
+        if self._session is not None:
+            with contextlib.suppress(Exception):  # pragma: no cover - defensive
+                self._session.close()
+            self._session = None
 
     def _document_symbols(self, params: Any) -> list[dict[str, Any]]:
         document = params["textDocument"]
@@ -364,6 +442,43 @@ class LanguageServer:
                 },
             }
         ]
+
+    def _references(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = _uri_to_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        context = params.get("context") or {}
+        include_declaration = bool(context.get("includeDeclaration", True))
+
+        source = session.source_text(real_path)
+        if source is None:
+            return []
+        identifier = _identifier_at_position(source, line, character)
+        if identifier is None:
+            return []
+        try:
+            result = session.find_references(
+                real_path, identifier, include_declaration=include_declaration
+            )
+        except FileNotFoundError:
+            return []
+        if result.target.resolution != "workspace":
+            return []
+        locations: list[dict[str, Any]] = []
+        for reference in result.references:
+            ref_line = max(reference.lineno - 1, 0)
+            locations.append(
+                {
+                    "uri": _path_to_uri(reference.path),
+                    "range": {
+                        "start": {"line": ref_line, "character": reference.col_offset},
+                        "end": {"line": ref_line, "character": reference.end_col_offset},
+                    },
+                }
+            )
+        return locations
 
     def _workspace_root_from_params(self, params: Any) -> str:
         if isinstance(params, dict):

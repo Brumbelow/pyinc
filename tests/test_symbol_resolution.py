@@ -10,10 +10,13 @@ from pyinc import Database
 from pyinc.integrations.symbol_resolution import (
     Parameter,
     Signature,
+    find_references,
     module_symbol_table,
     module_symbol_table_payload,
+    name_occurrences_for_file,
     resolve_symbol,
     resolve_symbol_payload,
+    workspace_name_occurrence_index,
     workspace_symbol_index,
 )
 
@@ -31,11 +34,14 @@ def test_symbol_resolution_all_list_is_exact() -> None:
     assert set(symbol_resolution.__all__) == {
         "ModuleSymbolTable",
         "Parameter",
+        "Reference",
+        "ReferenceQueryResult",
         "ResolvedSymbol",
         "Signature",
         "Symbol",
         "WorkspaceSymbolEntry",
         "WorkspaceSymbolIndex",
+        "find_references",
         "module_symbol_table",
         "resolve_symbol",
         "workspace_symbol_index",
@@ -46,11 +52,14 @@ def test_symbol_resolution_stable_surface_on_integrations_namespace() -> None:
     for name in (
         "ModuleSymbolTable",
         "Parameter",
+        "Reference",
+        "ReferenceQueryResult",
         "ResolvedSymbol",
         "Signature",
         "Symbol",
         "WorkspaceSymbolEntry",
         "WorkspaceSymbolIndex",
+        "find_references",
         "module_symbol_table",
         "resolve_symbol",
         "workspace_symbol_index",
@@ -63,6 +72,9 @@ def test_symbol_resolution_payload_helpers_are_not_re_exported() -> None:
     assert not hasattr(integrations, "module_symbol_table_for_module")
     assert not hasattr(integrations, "resolve_symbol_payload")
     assert not hasattr(integrations, "workspace_symbol_index_payload")
+    assert not hasattr(integrations, "name_occurrences_for_file")
+    assert not hasattr(integrations, "workspace_name_occurrence_index")
+    assert not hasattr(integrations, "find_references_payload")
 
 
 # ---------------------------------------------------------------------------
@@ -654,3 +666,256 @@ def test_workspace_symbol_index_against_own_source_tree() -> None:
         and entry.module == "integrations.symbol_resolution"
         for entry in idx.entries
     )
+
+
+# ---------------------------------------------------------------------------
+# find_references
+# ---------------------------------------------------------------------------
+
+
+def test_find_references_returns_declaration_and_call_site(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    target.write_text(
+        "def foo() -> int:\n    return 1\n\nfoo()\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, target, "foo")
+
+    assert result.target.resolution == "workspace"
+    assert result.target.defining_lineno == 1
+    assert len(result.references) == 2
+    declaration = next(r for r in result.references if r.is_declaration)
+    assert declaration.lineno == 1
+    assert declaration.path == str(target)
+    call = next(r for r in result.references if not r.is_declaration)
+    assert call.lineno == 4
+    assert call.col_offset == 0
+    assert call.end_col_offset == 3
+
+
+def test_find_references_excludes_declaration_when_flag_false(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    target.write_text(
+        "def foo() -> int:\n    return 1\n\nfoo()\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, target, "foo", include_declaration=False)
+
+    assert all(not r.is_declaration for r in result.references)
+    assert len(result.references) == 1
+    assert result.references[0].lineno == 4
+
+
+def test_find_references_crosses_re_export(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "def foo() -> int:\n    return 1\n",
+        encoding="utf-8",
+    )
+    b = root / "b.py"
+    b.write_text("from a import foo\n\nfoo()\nfoo()\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "foo")
+
+    assert result.target.resolution == "workspace"
+    call_sites = sorted(
+        (r for r in result.references if not r.is_declaration),
+        key=lambda r: (r.path, r.lineno),
+    )
+    assert [(Path(r.path).name, r.lineno) for r in call_sites] == [
+        ("b.py", 3),
+        ("b.py", 4),
+    ]
+    declarations = [r for r in result.references if r.is_declaration]
+    assert len(declarations) == 1
+    assert Path(declarations[0].path).name == "a.py"
+
+
+def test_find_references_does_not_resolve_attribute_chain_on_module(tmp_path: Path) -> None:
+    """Pins v1.2.0 behavior: ``import a; a.foo()`` is NOT counted as a reference to
+    ``foo`` because resolving the bare rightmost name ``foo`` at the call site returns
+    ``missing`` (``foo`` is not bound locally). Attribute-chain reference following
+    would require a richer resolver and is out of scope for v1.2.0."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "def foo() -> int:\n    return 1\n",
+        encoding="utf-8",
+    )
+    (root / "b.py").write_text("import a\n\na.foo()\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "foo")
+
+    # Only the declaration is reported; the ``a.foo()`` attribute access is not.
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert non_decl == []
+
+
+def test_find_references_ignores_shadowing_local_known_limitation(tmp_path: Path) -> None:
+    """Pins v1.2.0 behavior: a function-local binding that shadows a module-level
+    name is still reported as a reference to the module-level target, because
+    ``symbol_resolution`` does not track function-local scopes."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    target.write_text(
+        "def foo() -> int:\n    return 1\n\n"
+        "def other() -> int:\n"
+        "    foo = 42\n"
+        "    return foo\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, target, "foo")
+
+    # Both the local ``foo = 42`` (line 5) and the local ``return foo`` (line 6)
+    # currently count as references because the resolver is module-scoped.
+    linenos = sorted(r.lineno for r in result.references if not r.is_declaration)
+    assert linenos == [5, 6]
+
+
+def test_find_references_ignores_forward_ref_strings(tmp_path: Path) -> None:
+    """Pins v1.2.0 behavior: forward-reference strings like ``'Foo'`` in annotations
+    are not AST-walked into, so they are not counted as references."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        "from a import Foo\n\n"
+        "def g(a: 'Foo') -> 'Foo':\n"
+        "    return a\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    # Neither ``'Foo'`` string is counted; only the import line would be, but
+    # imports don't produce Name nodes either.
+    assert non_decl == []
+
+
+def test_find_references_on_stdlib_target_returns_empty_with_target_carried(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "consumer.py"
+    consumer.write_text(
+        "from json import JSONDecoder\n\nJSONDecoder()\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, consumer, "JSONDecoder")
+
+    assert result.target.resolution == "stdlib"
+    assert result.references == ()
+
+
+def test_find_references_on_ambiguous_target_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("from b import foo\n", encoding="utf-8")
+    (root / "b.py").write_text("from a import foo\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "foo")
+
+    assert result.target.resolution == "ambiguous"
+    assert result.references == ()
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_find_references_by_mode(mode: str, tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "def foo() -> int:\n    return 1\n",
+        encoding="utf-8",
+    )
+    b = root / "b.py"
+    b.write_text("from a import foo\n\nfoo()\n", encoding="utf-8")
+
+    db = Database(mode=mode)
+    result = find_references(db, root, root / "a.py", "foo")
+
+    assert result.target.resolution == "workspace"
+    assert sorted(
+        (Path(r.path).name, r.lineno, r.is_declaration) for r in result.references
+    ) == [
+        ("a.py", 1, True),
+        ("b.py", 3, False),
+    ]
+
+
+def test_comment_only_edit_backdates_name_occurrences_for_file(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "a.py"
+    path.write_text("x = 1\nprint(x)\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    first = name_occurrences_for_file(db, str(path))
+
+    path.write_text("x = 1\nprint(x)\n# trailing\n", encoding="utf-8")
+    second = name_occurrences_for_file(db, str(path))
+
+    assert first == second
+    assert db.inspect(name_occurrences_for_file, str(path)).last_decision == "reused"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_find_references_matches_fresh_recomputation_over_edits(
+    mode: str, tmp_path: Path
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    a = root / "a.py"
+    b = root / "b.py"
+    a.write_text("def foo() -> int:\n    return 1\n", encoding="utf-8")
+    b.write_text("from a import foo\n\nfoo()\n", encoding="utf-8")
+
+    incremental = Database(mode=mode)
+    edits = (
+        "def foo() -> int:\n    return 1\n",
+        "# edit\ndef foo() -> int:\n    return 2\n",
+        "def foo(x: int) -> int:\n    return x\n",
+        "def foo() -> int:\n    return 3\n\nfoo()\n",
+    )
+    for content in edits:
+        a.write_text(content, encoding="utf-8")
+        fresh = Database(mode=mode)
+        inc = find_references(incremental, root, a, "foo")
+        fresh_result = find_references(fresh, root, a, "foo")
+        assert inc == fresh_result
+
+
+def test_workspace_name_occurrence_index_skips_missing_syntax(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "good.py").write_text("x = 1\nprint(x)\n", encoding="utf-8")
+    (root / "broken.py").write_text("def (\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    index = workspace_name_occurrence_index(db, str(root))
+    mapping = dict(index)
+
+    assert mapping[str(root / "broken.py")] == ()
+    good_names = {entry[0] for entry in mapping[str(root / "good.py")]}
+    assert "x" in good_names
+    assert "print" in good_names

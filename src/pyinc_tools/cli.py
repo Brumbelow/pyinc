@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
+import threading
 from collections.abc import Sequence
 from dataclasses import asdict
 
@@ -19,6 +19,12 @@ def _build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--path", help="Analyze one path under the workspace root.")
     analyze.add_argument("--watch", action="store_true", help="Poll for file changes and re-run analysis.")
     analyze.add_argument("--debounce-ms", type=int, default=200, help="Watcher debounce window.")
+    analyze.add_argument(
+        "--poll-interval-ms",
+        type=int,
+        default=None,
+        help="Watcher poll cadence (defaults to half the debounce window).",
+    )
     analyze.add_argument("--indent", type=int, default=2, help="JSON indentation level.")
 
     lsp = subparsers.add_parser("lsp", help="Start the stdio LSP adapter.")
@@ -27,7 +33,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _emit_json(payload: object, *, indent: int) -> None:
-    print(json.dumps(payload, indent=indent, sort_keys=True))
+    print(json.dumps(payload, indent=indent, sort_keys=True), flush=True)
 
 
 def _analyze_once(session: WorkspaceSession, path: str | None) -> object:
@@ -46,21 +52,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not args.watch:
                 return 0
 
+            interval_s = (
+                args.poll_interval_ms / 1000.0
+                if args.poll_interval_ms is not None
+                else max(args.debounce_ms / 1000.0 / 2.0, 0.05)
+            )
             watcher = PollingWorkspaceWatcher(session, debounce_ms=args.debounce_ms)
-            try:
-                while True:
-                    changed = watcher.poll()
-                    if changed:
-                        _emit_json(
-                            {
-                                "changed_paths": changed,
-                                "analysis": _analyze_once(session, args.path),
-                            },
-                            indent=args.indent,
-                        )
-                    time.sleep(max(args.debounce_ms / 1000.0 / 2.0, 0.05))
-            except KeyboardInterrupt:
-                return 0
+            idle_event = threading.Event()
+
+            def _on_change(changed: tuple[str, ...]) -> None:
+                _emit_json(
+                    {
+                        "changed_paths": list(changed),
+                        "analysis": _analyze_once(session, args.path),
+                    },
+                    indent=args.indent,
+                )
+
+            with watcher:
+                watcher.start(_on_change, interval_s=interval_s)
+                try:
+                    idle_event.wait()
+                except KeyboardInterrupt:
+                    return 0
+            return 0
 
     server = LanguageServer(default_root=args.root)
     return server.serve()

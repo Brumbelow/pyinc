@@ -101,6 +101,23 @@ WorkspaceSymbolIndexPayload: TypeAlias = tuple[
 ]
 #   root, entries
 
+NameOccurrencePayload: TypeAlias = tuple[str, int, int, int]
+#                                    bare_name, lineno, col_offset, end_col_offset
+
+FileNameOccurrencesPayload: TypeAlias = tuple[str, tuple[NameOccurrencePayload, ...]]
+#                                    path,  occurrences
+
+WorkspaceNameOccurrencesPayload: TypeAlias = tuple[FileNameOccurrencesPayload, ...]
+
+ReferenceEntryPayload: TypeAlias = tuple[str, int, int, int, bool]
+#                                    path, lineno, col_offset, end_col_offset, is_declaration
+
+ReferenceQueryResultPayload: TypeAlias = tuple[
+    ResolvedSymbolPayload,
+    tuple[ReferenceEntryPayload, ...],
+]
+#   target, references
+
 # ---------------------------------------------------------------------------
 # Result dataclasses (Layer 3 public API)
 # ---------------------------------------------------------------------------
@@ -164,6 +181,21 @@ class WorkspaceSymbolEntry:
 class WorkspaceSymbolIndex:
     root: str
     entries: tuple[WorkspaceSymbolEntry, ...]
+
+
+@dataclass(frozen=True)
+class Reference:
+    path: str
+    lineno: int
+    col_offset: int
+    end_col_offset: int
+    is_declaration: bool
+
+
+@dataclass(frozen=True)
+class ReferenceQueryResult:
+    target: ResolvedSymbol
+    references: tuple[Reference, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -809,6 +841,125 @@ def workspace_symbol_index_payload(
 
 
 # ---------------------------------------------------------------------------
+# Layer 1 query: per-file name occurrences (full-AST walk)
+# ---------------------------------------------------------------------------
+
+
+def _collect_name_occurrences(tree: ast.Module) -> tuple[NameOccurrencePayload, ...]:
+    occurrences: list[NameOccurrencePayload] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            end_col = node.end_col_offset
+            if end_col is None:
+                end_col = node.col_offset + len(node.id)
+            occurrences.append((node.id, node.lineno, node.col_offset, end_col))
+            continue
+        if isinstance(node, ast.Attribute):
+            end_col = node.end_col_offset
+            end_lineno = node.end_lineno
+            if end_col is None or end_lineno is None:
+                continue
+            attr_col = end_col - len(node.attr)
+            if attr_col < 0:
+                continue
+            occurrences.append((node.attr, end_lineno, attr_col, end_col))
+    occurrences.sort(key=lambda item: (item[1], item[2]))
+    return tuple(occurrences)
+
+
+@query
+def name_occurrences_for_file(
+    db: Database, path: str
+) -> tuple[NameOccurrencePayload, ...]:
+    source = source_text(db, path)
+    tree = _try_parse(source)
+    if tree is None:
+        return tuple()
+    return _collect_name_occurrences(tree)
+
+
+# ---------------------------------------------------------------------------
+# Layer 2 query: workspace-wide name occurrence index
+# ---------------------------------------------------------------------------
+
+
+@query
+def workspace_name_occurrence_index(
+    db: Database, root: str
+) -> WorkspaceNameOccurrencesPayload:
+    files = workspace_python_files(db, root)
+    entries: list[FileNameOccurrencesPayload] = []
+    for path in files:
+        occurrences = name_occurrences_for_file(db, path)
+        entries.append((path, tuple(occurrences)))
+    return tuple(entries)
+
+
+# ---------------------------------------------------------------------------
+# Layer 2 query: workspace-wide reference index for a target symbol
+# ---------------------------------------------------------------------------
+
+
+@query
+def find_references_payload(
+    db: Database, root: str, path: str, qualified_name: str
+) -> ReferenceQueryResultPayload:
+    target_payload = resolve_symbol_payload(db, root, path, qualified_name)
+    (
+        _orig_module,
+        _qname,
+        resolution,
+        defining_module,
+        defining_path,
+        defining_lineno,
+        _dist_name,
+        _dist_ver,
+        _follow_depth,
+        _trail,
+    ) = target_payload
+
+    if resolution != "workspace" or defining_path is None:
+        return (target_payload, tuple())
+
+    bare_target = qualified_name.rsplit(".", 1)[-1]
+    references: list[ReferenceEntryPayload] = []
+    declaration_seen = False
+
+    occurrences_index = workspace_name_occurrence_index(db, root)
+    for file_path, occurrences in occurrences_index:
+        for bare_name, lineno, col_offset, end_col_offset in occurrences:
+            if bare_name != bare_target:
+                continue
+            verify = resolve_symbol_payload(db, root, file_path, bare_name)
+            v_resolution = verify[2]
+            v_def_module = verify[3]
+            v_def_path = verify[4]
+            v_def_lineno = verify[5]
+            if v_resolution != "workspace":
+                continue
+            if v_def_module != defining_module:
+                continue
+            if v_def_path != defining_path:
+                continue
+            if v_def_lineno != defining_lineno:
+                continue
+            is_declaration = (
+                file_path == defining_path and lineno == defining_lineno
+            )
+            if is_declaration:
+                declaration_seen = True
+            references.append(
+                (file_path, lineno, col_offset, end_col_offset, is_declaration)
+            )
+
+    if not declaration_seen and defining_lineno is not None:
+        references.append((defining_path, defining_lineno, 0, 1, True))
+
+    references.sort(key=lambda item: (item[0], item[1], item[2]))
+    return (target_payload, tuple(references))
+
+
+# ---------------------------------------------------------------------------
 # Decoders
 # ---------------------------------------------------------------------------
 
@@ -909,6 +1060,17 @@ def _decode_workspace_symbol_index(
     )
 
 
+def _decode_reference(payload: ReferenceEntryPayload) -> Reference:
+    path, lineno, col_offset, end_col_offset, is_declaration = payload
+    return Reference(
+        path=path,
+        lineno=lineno,
+        col_offset=col_offset,
+        end_col_offset=end_col_offset,
+        is_declaration=is_declaration,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Layer 3 entrypoints
 # ---------------------------------------------------------------------------
@@ -961,14 +1123,46 @@ def workspace_symbol_index(
     return _decode_workspace_symbol_index(payload)
 
 
+def find_references(
+    db: Database,
+    root: str | os.PathLike[str],
+    path: str | os.PathLike[str],
+    qualified_name: str,
+    *,
+    include_declaration: bool = True,
+) -> ReferenceQueryResult:
+    normalized_root = _normalize_path(root)
+    normalized_path = _normalize_path(path)
+    payload = cast(
+        ReferenceQueryResultPayload,
+        thaw(
+            db.get(
+                find_references_payload,
+                normalized_root,
+                normalized_path,
+                qualified_name,
+            )
+        ),
+    )
+    target_payload, references_payload = payload
+    target = _decode_resolved_symbol(target_payload)
+    decoded = tuple(_decode_reference(item) for item in references_payload)
+    if not include_declaration:
+        decoded = tuple(item for item in decoded if not item.is_declaration)
+    return ReferenceQueryResult(target=target, references=decoded)
+
+
 __all__ = [
     "ModuleSymbolTable",
     "Parameter",
+    "Reference",
+    "ReferenceQueryResult",
     "ResolvedSymbol",
     "Signature",
     "Symbol",
     "WorkspaceSymbolEntry",
     "WorkspaceSymbolIndex",
+    "find_references",
     "module_symbol_table",
     "resolve_symbol",
     "workspace_symbol_index",

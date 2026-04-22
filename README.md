@@ -80,7 +80,7 @@ The full contract, including explicit limitations and escape hatches, is in [doc
 - `pyinc.integrations.xml_config` — XML file inspection via `xml.etree.ElementTree`: element/attribute extraction, dot-path traversal, namespace-aware tag normalization.
 - `pyinc.integrations.csv_data` — CSV/TSV structural analysis via stdlib `csv`: header detection, column discovery, delimiter sniffing, row counting, inconsistent column diagnostics.
 - `pyinc.integrations.requirement_evaluation` — PEP 440 version specifier satisfaction and PEP 508 environment marker evaluation; composes with `requirements_txt` and `installed_packages` to surface the effective applicable/satisfied requirement set for the current Python environment. Exposes `evaluate_markers`, `evaluate_version_specifier`, and `applicable_requirements`.
-- `pyinc.integrations.symbol_resolution` — workspace-wide symbol tables (module-level + class-level), cross-module re-export following with cycle detection, and type-annotation text extraction via `ast.unparse` (no type evaluation). Exposes `module_symbol_table`, `resolve_symbol`, and `workspace_symbol_index`.
+- `pyinc.integrations.symbol_resolution` — workspace-wide symbol tables (module-level + class-level), cross-module re-export following with cycle detection, type-annotation text extraction via `ast.unparse` (no type evaluation), and a workspace-wide reverse-reference index for a given qualified name. Exposes `module_symbol_table`, `resolve_symbol`, `workspace_symbol_index`, and `find_references`.
 
 `pyinc.integrations` re-exports only the stable dataclass/result types and high-level entrypoints for these integrations. Low-level payload queries, decode helpers, and resource helpers remain experimental in their defining submodules.
 
@@ -111,11 +111,15 @@ kernel itself. See [docs/architecture.md](docs/architecture.md) for the v1 scope
 
 The repository ships that consumer boundary as a separate tooling layer in
 `pyinc_tools`, not in `src/pyinc`. Use `pyinc-tools analyze ...` for one-shot or
-`--watch` analysis via the polling watcher, or `pyinc-tools lsp` for stdio LSP
-with document symbols, workspace symbols, diagnostics, hover, and goto-definition
-(backed by `pyinc.integrations.symbol_resolution` for cross-module re-export
-following). See [docs/pyinc-tools-guide.md](docs/pyinc-tools-guide.md) for
-install, editor wiring (Neovim, Emacs, VS Code note), the overlay model, and a
+threaded `--watch` analysis via the polling watcher, or `pyinc-tools lsp` for
+stdio LSP with document symbols, workspace symbols, diagnostics, hover,
+goto-definition, and find-references (all backed by
+`pyinc.integrations.symbol_resolution` for cross-module re-export following).
+The LSP server starts a threaded filesystem watcher by default so external
+edits (git pull, formatter scripts) publish fresh diagnostics even when the
+editor does not emit `workspace/didChangeWatchedFiles`. See
+[docs/pyinc-tools-guide.md](docs/pyinc-tools-guide.md) for install, editor
+wiring (Neovim, Emacs, VS Code note), the overlay model, and a
 supported-vs.-not-yet reference.
 
 ## Development

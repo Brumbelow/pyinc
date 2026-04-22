@@ -9,9 +9,9 @@ push-based filesystem watchers are architectural non-goals for the kernel itself
 The package exposes two executables:
 
 - `pyinc-tools analyze` — one-shot workspace or file analysis, with an optional
-  polling `--watch` mode.
+  threaded `--watch` mode.
 - `pyinc-tools lsp` — a stdio LSP adapter with document/workspace symbols,
-  diagnostics, hover, and goto-definition.
+  diagnostics, hover, goto-definition, and find-references.
 
 Both build on the same `WorkspaceSession` — a mirrored workspace with editor
 overlays, so editor edits never touch the user's source tree.
@@ -34,7 +34,9 @@ pyinc-tools --help
 
 ```bash
 pyinc-tools analyze <root> [--path PATH] [--watch]
-                           [--debounce-ms DEBOUNCE_MS] [--indent INDENT]
+                           [--debounce-ms DEBOUNCE_MS]
+                           [--poll-interval-ms POLL_INTERVAL_MS]
+                           [--indent INDENT]
 ```
 
 Runs `WorkspaceSession.analyze_workspace()` (or `analyze_file(PATH)` if `--path`
@@ -74,14 +76,38 @@ pyinc-tools analyze <root> --watch
 
 Wraps the session in a `PollingWorkspaceWatcher` and prints a `{"changed_paths",
 "analysis"}` JSON record every time one or more files quiesce for the debounce
-window (default 200 ms). `--debounce-ms` tunes the window; the watcher sleeps
-`max(debounce_ms / 2, 50)` ms between polls.
+window (default 200 ms). `--debounce-ms` tunes the window; `--poll-interval-ms`
+tunes how often the watcher re-scans the filesystem (default: half the debounce
+window, minimum 50 ms). The watcher runs on a dedicated daemon thread, so the
+main loop stays responsive to Ctrl-C.
 
 Polling is the only mode shipped. Push-based watchers (`inotify`, `FSEvents`,
 `ReadDirectoryChangesW`) are deliberately out of scope — they would pull in
 platform-specific dependencies and do not fit the pure-stdlib boundary. If you
 need sub-200 ms latency on large workspaces, wrap the session yourself with a
 platform watcher and call `session.refresh_paths(paths)` on each event.
+
+### Live polling from Python
+
+```python
+from pyinc_tools.session import PollingWorkspaceWatcher, WorkspaceSession
+
+def on_change(changed: tuple[str, ...]) -> None:
+    # Runs on the watcher thread; keep this short or offload to a queue.
+    print("changed:", changed)
+
+with WorkspaceSession("/path/to/workspace") as session:
+    watcher = PollingWorkspaceWatcher(session, debounce_ms=200)
+    with watcher:
+        watcher.start(on_change, interval_s=0.1)
+        # ... do other work ...
+```
+
+`start()` spawns a daemon thread; `stop()` signals it via `threading.Event` and
+`join`s with a 5-second timeout. Exceptions raised by `on_change` are forwarded
+to the optional `on_error` hook (default: a one-line `stderr` log) without
+killing the thread. `poll()` remains available for synchronous use but raises
+`RuntimeError` while the thread is running — one driver at a time.
 
 ## `pyinc-tools lsp`
 
@@ -102,11 +128,27 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     "documentSymbolProvider": true,
     "workspaceSymbolProvider": true,
     "hoverProvider": true,
-    "definitionProvider": true
+    "definitionProvider": true,
+    "referencesProvider": true
   },
-  "serverInfo": { "name": "pyinc-tools", "version": "1.1.1" }
+  "serverInfo": { "name": "pyinc-tools", "version": "1.2.0" }
 }
 ```
+
+### Initialization options
+
+The server honors the following keys under `params.initializationOptions`:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `pyinc.watcher.enabled` | bool | `true` | Start a threaded polling watcher on `initialize` and publish diagnostics when it detects filesystem changes outside the editor (e.g. `git pull`, formatter scripts). |
+| `pyinc.watcher.debounceMs` | int | `200` | How long a change must quiesce before the watcher acts on it. |
+| `pyinc.watcher.intervalMs` | int | `max(debounceMs / 2, 50)` | How often the watcher re-scans the workspace. |
+
+If your editor already emits `workspace/didChangeWatchedFiles` reliably, set
+`pyinc.watcher.enabled: false` to avoid the redundant thread. The server
+deduplicates identical `publishDiagnostics` payloads per URI, so enabling both
+channels does not produce duplicate messages.
 
 ### Supported LSP methods
 
@@ -119,7 +161,8 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
 | `workspace/symbol` | Case-insensitive substring filter over `workspace_symbol_index`. |
 | `textDocument/hover` | Markdown `def foo(x: int) -> int` / `class Foo` / `x: int`, plus a `*re-exported from*` line for import aliases. |
 | `textDocument/definition` | Single `Location` via `resolve_symbol`; follows cross-module re-exports bounded by `MAX_FOLLOW_DEPTH = 8`. |
-| `textDocument/publishDiagnostics` | Server-pushed after every state change; scoped to paths currently or previously reported. |
+| `textDocument/references` | `Location[]` via `find_references`; honors `context.includeDeclaration`; per-occurrence `col_offset` / `end_col_offset` ranges so editors can highlight each match. Only workspace-resolved targets are indexed — stdlib / installed / ambiguous targets return `[]`. |
+| `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
 ## Editor wiring
 
@@ -185,7 +228,7 @@ Consequences:
 
 ## Supported vs. not yet supported
 
-**Supported as of v1.1.1:**
+**Supported as of v1.2.0:**
 
 - Document symbols (all eight kinds: `function`, `method`, `class`,
   `class_variable`, `variable`, `import_alias`, `from_import_alias`,
@@ -196,10 +239,16 @@ Consequences:
 - Hover on local symbols.
 - Goto-definition, following `import` / `from X import Y` / single-level
   `from X import *` chains through `symbol_resolution.resolve_symbol`.
+- Find references, via `symbol_resolution.find_references`. Bare-name and
+  rightmost-attribute `Name` / `Attribute` occurrences are verified through the
+  same resolver as goto-definition. Per-occurrence character ranges are
+  returned, so editors can highlight each match precisely. Honors
+  `context.includeDeclaration`.
+- Threaded live polling via `PollingWorkspaceWatcher.start(...)`. LSP server
+  starts one by default; opt out with `initializationOptions.pyinc.watcher.enabled=false`.
 
 **Not supported:**
 
-- `textDocument/references` (no reverse index yet).
 - `textDocument/completion` (needs statement-context analysis).
 - `textDocument/rename`, `textDocument/codeAction`, `textDocument/formatting`.
 - Hover or goto-def on stdlib or installed-package symbols — resolution
@@ -217,6 +266,14 @@ Consequences:
   `resolution == "ambiguous"` and the LSP returns `[]`.
 - Cyclic re-exports. Detected and returned as
   `resolution == "ambiguous"`; the LSP returns `[]`.
+- `find_references` limitations (v1.2.0):
+  - Attribute access to a module-level symbol only imported as a module
+    (`import a; a.foo()`) is not counted because the resolver is name-local.
+    Use `from a import foo` to opt in.
+  - Forward-reference strings (`'Foo'` in annotations) are not scanned.
+  - Function-local shadowing is not modeled: a local `foo = 1` inside a
+    function is still reported as a reference to a module-level `foo`.
+    `symbol_resolution` is module/class-scope only.
 
 ## Troubleshooting
 

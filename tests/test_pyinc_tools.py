@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import contextlib
+import threading
+from collections.abc import Iterator
 from pathlib import Path
+
+import pytest
 
 from pyinc_tools.lsp import LanguageServer
 from pyinc_tools.session import PollingWorkspaceWatcher, WorkspaceSession
@@ -15,6 +20,29 @@ _LSP_SYMBOL_KIND_VARIABLE = 13
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+class _WatcherFactory:
+    def __init__(self) -> None:
+        self.built: list[PollingWorkspaceWatcher] = []
+
+    def __call__(
+        self, session: WorkspaceSession, *, debounce_ms: int = 30
+    ) -> PollingWorkspaceWatcher:
+        watcher = PollingWorkspaceWatcher(session, debounce_ms=debounce_ms)
+        self.built.append(watcher)
+        return watcher
+
+
+@pytest.fixture()
+def watcher_factory() -> Iterator[_WatcherFactory]:
+    factory = _WatcherFactory()
+    try:
+        yield factory
+    finally:
+        for watcher in factory.built:
+            with contextlib.suppress(Exception):  # pragma: no cover - best-effort teardown
+                watcher.stop(timeout=2.0)
 
 
 def test_workspace_session_overlay_edits_do_not_touch_disk(tmp_path: Path) -> None:
@@ -478,6 +506,205 @@ def test_language_server_document_symbol_surfaces_every_symbol_kind(tmp_path: Pa
             server._session.close()
 
 
+def test_language_server_references_local_function_returns_declaration_and_call(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        assert init["capabilities"]["referencesProvider"] is True
+        assert init["serverInfo"]["version"] == "1.2.0"
+
+        locations = server._handle_request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+                "context": {"includeDeclaration": True},
+            },
+        )
+        uris = sorted(loc["uri"] for loc in locations)
+        assert uris == sorted([target.as_uri(), target.as_uri()])
+        lines = sorted(loc["range"]["start"]["line"] for loc in locations)
+        assert lines == [0, 3]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_references_exclude_declaration_honored(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+                "context": {"includeDeclaration": False},
+            },
+        )
+        assert len(locations) == 1
+        assert locations[0]["range"]["start"]["line"] == 3
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_references_follows_cross_file_reexport(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "a.py"
+    consumer = root / "b.py"
+    _write(provider, "def foo() -> int:\n    return 1\n")
+    _write(consumer, "from a import foo\n\nfoo()\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+                "context": {"includeDeclaration": True},
+            },
+        )
+        uris = [loc["uri"] for loc in locations]
+        assert provider.as_uri() in uris
+        assert consumer.as_uri() in uris
+        lines_in_consumer = sorted(
+            loc["range"]["start"]["line"]
+            for loc in locations
+            if loc["uri"] == consumer.as_uri()
+        )
+        assert lines_in_consumer == [2, 3]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_references_on_unknown_identifier_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 3},
+                "context": {"includeDeclaration": True},
+            },
+        )
+        assert locations == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_references_on_stdlib_identifier_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "consumer.py"
+    _write(consumer, "from json import JSONDecoder\n\nJSONDecoder()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 0},
+                "context": {"includeDeclaration": True},
+            },
+        )
+        assert locations == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_references_range_matches_occurrence_columns(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n\n    result = helper()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+                "context": {"includeDeclaration": False},
+            },
+        )
+        assert len(locations) == 1
+        range_ = locations[0]["range"]
+        assert range_["start"]["character"] == len("    result = ")
+        assert range_["end"]["character"] == len("    result = ") + len("helper")
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_references_overlay_sees_edit(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+
+        # Overlay adds a new call site without touching disk.
+        overlay_text = "def foo() -> int:\n    return 1\n\nfoo()\nfoo()\n"
+        server._handle_notification(
+            "textDocument/didOpen",
+            {"textDocument": {"uri": target.as_uri(), "text": overlay_text}},
+        )
+
+        locations = server._handle_request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+                "context": {"includeDeclaration": False},
+            },
+        )
+        assert len(locations) == 2
+        lines = sorted(loc["range"]["start"]["line"] for loc in locations)
+        assert lines == [3, 4]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
 def test_module_symbol_table_flags_type_checking_import_as_impurity(tmp_path: Path) -> None:
     """Pins current behavior: ``if TYPE_CHECKING:`` imports are a conditional top-level
     binding, so they are not walked into ``ModuleSymbolTable.symbols`` and instead are
@@ -529,6 +756,304 @@ def test_module_symbol_table_flags_type_checking_import_as_impurity(tmp_path: Pa
             },
         )
         assert locations == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+# ---------------------------------------------------------------------------
+# Threaded watcher (live polling)
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_event(event: threading.Event, timeout: float = 2.0) -> bool:
+    return event.wait(timeout=timeout)
+
+
+def test_watcher_start_stop_clean_lifecycle(
+    tmp_path: Path, watcher_factory: _WatcherFactory
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    with WorkspaceSession(root) as session:
+        watcher = watcher_factory(session)
+        assert watcher.is_running is False
+
+        invocations: list[tuple[str, ...]] = []
+        watcher.start(invocations.append, interval_s=0.02)
+        assert watcher.is_running is True
+        # Let the watcher spin a few times with no filesystem changes.
+        threading.Event().wait(0.15)
+        watcher.stop()
+        assert watcher.is_running is False
+        assert invocations == []
+
+
+def test_watcher_callback_fires_for_debounced_change(
+    tmp_path: Path, watcher_factory: _WatcherFactory
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "x = 1\n")
+
+    with WorkspaceSession(root) as session:
+        watcher = watcher_factory(session, debounce_ms=30)
+        fired = threading.Event()
+        batches: list[tuple[str, ...]] = []
+
+        def on_change(paths: tuple[str, ...]) -> None:
+            batches.append(paths)
+            fired.set()
+
+        watcher.start(on_change, interval_s=0.02)
+        # Make a change; content size differs from the original.
+        _write(target, "x = 1\ny = 2\nz = 3\n")
+        assert _wait_for_event(fired)
+        watcher.stop()
+
+        assert any(str(target) in batch for batch in batches)
+
+
+def test_watcher_callback_batches_multiple_changes_per_window(
+    tmp_path: Path, watcher_factory: _WatcherFactory
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    first = root / "a.py"
+    second = root / "b.py"
+    _write(first, "x = 1\n")
+
+    with WorkspaceSession(root) as session:
+        watcher = watcher_factory(session, debounce_ms=40)
+        lock = threading.Lock()
+        batches: list[tuple[str, ...]] = []
+        both_seen = threading.Event()
+
+        def on_change(paths: tuple[str, ...]) -> None:
+            with lock:
+                batches.append(paths)
+                combined_inner = {p for batch in batches for p in batch}
+                if str(first) in combined_inner and str(second) in combined_inner:
+                    both_seen.set()
+
+        watcher.start(on_change, interval_s=0.01)
+        # Both writes land before any debounce window can fully close.
+        _write(first, "x = 11\n")
+        _write(second, "y = 22\n")
+        assert _wait_for_event(both_seen, timeout=3.0)
+        watcher.stop()
+
+        with lock:
+            combined = {p for batch in batches for p in batch}
+        assert str(first) in combined
+        assert str(second) in combined
+
+
+def test_watcher_callback_error_is_contained(
+    tmp_path: Path, watcher_factory: _WatcherFactory
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "x = 1\n")
+
+    with WorkspaceSession(root) as session:
+        watcher = watcher_factory(session, debounce_ms=30)
+        error_seen = threading.Event()
+        errors: list[BaseException] = []
+
+        def on_change(_paths: tuple[str, ...]) -> None:
+            raise RuntimeError("boom")
+
+        def on_error(exc: BaseException) -> None:
+            errors.append(exc)
+            error_seen.set()
+
+        watcher.start(on_change, interval_s=0.02, on_error=on_error)
+        _write(target, "x = 99\n")
+        assert _wait_for_event(error_seen)
+        # Thread should still be alive after the callback raised.
+        assert watcher.is_running is True
+        watcher.stop()
+
+        assert errors and isinstance(errors[0], RuntimeError)
+
+
+def test_watcher_double_start_raises(
+    tmp_path: Path, watcher_factory: _WatcherFactory
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    with WorkspaceSession(root) as session:
+        watcher = watcher_factory(session)
+        watcher.start(lambda _paths: None, interval_s=0.02)
+        try:
+            with pytest.raises(RuntimeError):
+                watcher.start(lambda _paths: None)
+        finally:
+            watcher.stop()
+
+
+def test_watcher_double_stop_is_noop(
+    tmp_path: Path, watcher_factory: _WatcherFactory
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    with WorkspaceSession(root) as session:
+        watcher = watcher_factory(session)
+        watcher.stop()  # before start
+        watcher.start(lambda _paths: None, interval_s=0.02)
+        watcher.stop()
+        watcher.stop()  # after start + stop — still a no-op
+        assert watcher.is_running is False
+
+
+def test_watcher_poll_after_start_raises(
+    tmp_path: Path, watcher_factory: _WatcherFactory
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    with WorkspaceSession(root) as session:
+        watcher = watcher_factory(session)
+        watcher.start(lambda _paths: None, interval_s=0.02)
+        try:
+            with pytest.raises(RuntimeError):
+                watcher.poll()
+        finally:
+            watcher.stop()
+
+
+def test_watcher_stop_joins_within_timeout(
+    tmp_path: Path, watcher_factory: _WatcherFactory
+) -> None:
+    import time
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    with WorkspaceSession(root) as session:
+        watcher = watcher_factory(session)
+        watcher.start(lambda _paths: None, interval_s=0.2)
+        start = time.monotonic()
+        watcher.stop(timeout=2.0)
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.5
+
+
+def test_watcher_concurrent_overlay_and_poll_preserves_mirror(
+    tmp_path: Path, watcher_factory: _WatcherFactory
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "x = 1\n")
+
+    with WorkspaceSession(root) as session:
+        watcher = watcher_factory(session, debounce_ms=30)
+        stop_event = threading.Event()
+        errors: list[BaseException] = []
+        watcher.start(lambda _paths: None, interval_s=0.01, on_error=errors.append)
+        try:
+            # Hammer overlays from the main thread while the watcher loops.
+            for i in range(20):
+                session.set_overlay(target, f"x = {i}\n")
+                stop_event.wait(0.01)
+            final = session.set_overlay(target, "x = 999\n")
+            stop_event.wait(0.1)
+            # The latest overlay should be visible via analyze_file (uses mirror + db).
+            assert session.source_text(final) == "x = 999\n"
+        finally:
+            watcher.stop()
+        assert errors == []
+
+
+def test_watcher_context_manager_stops_on_exit(
+    tmp_path: Path, watcher_factory: _WatcherFactory
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    with WorkspaceSession(root) as session:
+        watcher = watcher_factory(session)
+        with watcher:
+            watcher.start(lambda _paths: None, interval_s=0.02)
+            assert watcher.is_running is True
+        assert watcher.is_running is False
+
+
+def test_session_raises_after_close(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "x = 1\n")
+
+    session = WorkspaceSession(root)
+    session.close()
+    with pytest.raises(RuntimeError):
+        session.set_overlay(target, "x = 2\n")
+    # source_text tolerates close (returns None) so it is safe to call from a
+    # thread that races with session teardown.
+    assert session.source_text(target) is None
+
+
+def test_language_server_initialize_starts_watcher_and_shutdown_stops_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request(
+            "initialize",
+            {
+                "rootUri": root.as_uri(),
+                "initializationOptions": {
+                    "pyinc.watcher.enabled": True,
+                    "pyinc.watcher.debounceMs": 30,
+                    "pyinc.watcher.intervalMs": 20,
+                },
+            },
+        )
+        assert server._watcher is not None
+        assert server._watcher.is_running is True
+
+        server._handle_request("shutdown", {})
+        assert server._watcher is None
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_watcher_opt_out(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request(
+            "initialize",
+            {
+                "rootUri": root.as_uri(),
+                "initializationOptions": {
+                    "pyinc.watcher.enabled": False,
+                },
+            },
+        )
+        assert server._watcher is None
     finally:
         if server._session is not None:
             server._session.close()

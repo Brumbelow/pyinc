@@ -65,10 +65,12 @@ Stable public surface by module:
     `workspace_applicable_requirements(db, root)`
 - `symbol_resolution`
   - result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`,
-    `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`
+    `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`,
+    `Reference`, `ReferenceQueryResult`
   - entrypoints: `module_symbol_table(db, root, path)`,
     `resolve_symbol(db, root, path, qualified_name)`,
-    `workspace_symbol_index(db, root)`
+    `workspace_symbol_index(db, root)`,
+    `find_references(db, root, path, qualified_name, *, include_declaration=True)`
 
 ## Experimental Helpers
 
@@ -365,12 +367,15 @@ Scope:
 - installed-package lookups stop at the import boundary (`resolution="installed"`, `distribution_name`, `distribution_version`, `defining_path=None`)
 - dynamic `__all__` on the wildcard-provider side → `"ambiguous"` with `db.report_untracked_read`
 - conditional top-level binding (`if TYPE_CHECKING:`, top-level `For`, `While`, `Try`, `With`) → `impurity_reasons` includes `"conditional top-level binding"` and the binding produces no symbol
-- entrypoints: `module_symbol_table`, `resolve_symbol`, `workspace_symbol_index`
-- result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`, `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`
+- workspace-wide reference index composed over `name_occurrences_for_file` (full-AST `Name`/`Attribute` walk) and verified through `resolve_symbol_payload`; only workspace-resolved targets are indexed (stdlib / installed / ambiguous return empty with `ResolvedSymbol` carried)
+- entrypoints: `module_symbol_table`, `resolve_symbol`, `workspace_symbol_index`, `find_references`
+- result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`, `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`, `Reference`, `ReferenceQueryResult`
 
 Out of scope for this integration:
 
-- function-local symbols
+- function-local symbols (`find_references` therefore reports a local rebinding like `foo = 1` inside a function as a reference to the module-level `foo` of the same name)
+- attribute-chain reference resolution — `import a; a.foo()` is not counted as a reference to `a.foo` because the resolver is name-local at the call site
+- forward-reference strings in annotations (e.g. `'Foo'` in `def g(a: 'Foo')`)
 - decorator-induced rebinding (`@functools.cache`, `@property`, `@classmethod`, etc.)
 - MRO / class-member override resolution
 - following into installed third-party source files (v2 concern)
