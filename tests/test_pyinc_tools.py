@@ -5,6 +5,12 @@ from pathlib import Path
 from pyinc_tools.lsp import LanguageServer
 from pyinc_tools.session import PollingWorkspaceWatcher, WorkspaceSession
 
+_LSP_SYMBOL_KIND_FUNCTION = 12
+_LSP_SYMBOL_KIND_METHOD = 6
+_LSP_SYMBOL_KIND_CLASS = 5
+_LSP_SYMBOL_KIND_FIELD = 8
+_LSP_SYMBOL_KIND_VARIABLE = 13
+
 
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -267,6 +273,259 @@ def test_language_server_definition_on_unknown_identifier_returns_empty(tmp_path
             {
                 "textDocument": {"uri": target.as_uri()},
                 "position": {"line": 1, "character": 12},
+            },
+        )
+        assert locations == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def _write_reexport_chain(root: Path, length: int, symbol: str) -> Path:
+    """Write `length + 1` files hop_00..hop_<length> where hop_<length> defines `symbol`
+    and every earlier hop does `from hop_<n+1> import <symbol>`.
+
+    Returns the first file (hop_00), the entry point for a caller that wants to resolve
+    `symbol` across `length` re-export hops.
+    """
+    for index in range(length):
+        next_index = index + 1
+        _write(
+            root / f"hop_{index:02d}.py",
+            f"from hop_{next_index:02d} import {symbol}\n",
+        )
+    _write(root / f"hop_{length:02d}.py", f"def {symbol}() -> int:\n    return 1\n")
+    return root / "hop_00.py"
+
+
+def test_language_server_definition_follows_single_level_wildcard_import(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "provider.py", "def foo() -> int:\n    return 1\n")
+    consumer = root / "consumer.py"
+    _write(consumer, "from provider import *\n\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+        assert len(locations) == 1
+        assert locations[0]["uri"] == (root / "provider.py").as_uri()
+        assert locations[0]["range"]["start"]["line"] == 0
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_resolve_symbol_reference_wildcard_chain_is_bounded_by_intermediate_surface(
+    tmp_path: Path,
+) -> None:
+    """Two-level ``from X import *`` chain currently does **not** resolve end-to-end:
+    ``_module_binding_analysis`` treats ``from X import *`` as a
+    "top-level wildcard re-export" impurity and binds no names, so an intermediate
+    module's wildcard export surface is empty. Resolution from the outer consumer
+    therefore cannot see the innermost definition. This pins the design so a future
+    change that widens wildcard propagation does not do so silently.
+    """
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "deepest.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "middle.py", "from deepest import *\n")
+    outer = root / "outer.py"
+    _write(outer, "from middle import *\n")
+
+    with WorkspaceSession(root) as session:
+        resolved = session.resolve_symbol_reference(outer, "foo")
+        assert resolved.resolution == "missing"
+
+
+def test_resolve_symbol_reference_max_follow_depth_boundary(tmp_path: Path) -> None:
+    inside = tmp_path / "inside"
+    inside.mkdir()
+    entry_inside = _write_reexport_chain(inside, length=7, symbol="target")
+
+    with WorkspaceSession(inside) as session:
+        resolved = session.resolve_symbol_reference(entry_inside, "target")
+        assert resolved.resolution == "workspace"
+        assert resolved.defining_path == str(inside / "hop_07.py")
+        assert resolved.defining_lineno == 1
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    entry_outside = _write_reexport_chain(outside, length=8, symbol="target")
+
+    with WorkspaceSession(outside) as session:
+        too_deep = session.resolve_symbol_reference(entry_outside, "target")
+        assert too_deep.resolution == "ambiguous"
+        assert too_deep.defining_path is None
+
+    server = LanguageServer(default_root=str(outside))
+    try:
+        server._handle_request("initialize", {"rootUri": outside.as_uri()})
+        locations = server._handle_request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": entry_outside.as_uri()},
+                "position": {"line": 0, "character": len("from hop_01 import ") + 1},
+            },
+        )
+        assert locations == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_resolve_symbol_reference_cyclic_reexport_returns_ambiguous(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "from b import foo\n")
+    _write(root / "b.py", "from a import foo\n")
+
+    with WorkspaceSession(root) as session:
+        resolved = session.resolve_symbol_reference(root / "a.py", "foo")
+        assert resolved.resolution == "ambiguous"
+        assert resolved.defining_path is None
+
+
+def test_language_server_hover_on_ambiguous_wildcard_returns_none(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "providers_a.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "providers_b.py", "def foo() -> int:\n    return 2\n")
+    consumer = root / "consumer.py"
+    _write(consumer, "from providers_a import *\nfrom providers_b import *\n\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        resolved = session.resolve_symbol_reference(consumer, "foo")
+        assert resolved.resolution == "ambiguous"
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        hover = server._handle_request(
+            "textDocument/hover",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 3, "character": 1},
+            },
+        )
+        # `foo` isn't a local symbol in consumer.py (only wildcard stubs are), so
+        # the hover handler finds no symbol and returns None. This pins the current
+        # behavior: the LSP does not synthesize a hover payload for ambiguous
+        # wildcard resolutions.
+        assert hover is None
+
+        locations = server._handle_request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 3, "character": 1},
+            },
+        )
+        assert locations == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_document_symbol_surfaces_every_symbol_kind(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "all_kinds.py"
+    _write(
+        target,
+        "import os as my_os\n"
+        "from typing import Any as A\n"
+        "from json import *\n"
+        "\n"
+        "x: int = 1\n"
+        "\n"
+        "class Box:\n"
+        "    attr: str = \"\"\n"
+        "\n"
+        "    def method(self) -> int:\n"
+        "        return 0\n"
+        "\n"
+        "def func() -> int:\n"
+        "    return 1\n",
+    )
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        document_symbols = server._handle_request(
+            "textDocument/documentSymbol",
+            {"textDocument": {"uri": target.as_uri()}},
+        )
+        kinds_by_name = {item["name"]: item["kind"] for item in document_symbols}
+
+        assert kinds_by_name["my_os"] == _LSP_SYMBOL_KIND_VARIABLE
+        assert kinds_by_name["A"] == _LSP_SYMBOL_KIND_VARIABLE
+        assert kinds_by_name["*"] == _LSP_SYMBOL_KIND_VARIABLE
+        assert kinds_by_name["x"] == _LSP_SYMBOL_KIND_VARIABLE
+        assert kinds_by_name["Box"] == _LSP_SYMBOL_KIND_CLASS
+        assert kinds_by_name["Box.attr"] == _LSP_SYMBOL_KIND_FIELD
+        assert kinds_by_name["Box.method"] == _LSP_SYMBOL_KIND_METHOD
+        assert kinds_by_name["func"] == _LSP_SYMBOL_KIND_FUNCTION
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_module_symbol_table_flags_type_checking_import_as_impurity(tmp_path: Path) -> None:
+    """Pins current behavior: ``if TYPE_CHECKING:`` imports are a conditional top-level
+    binding, so they are not walked into ``ModuleSymbolTable.symbols`` and instead are
+    recorded in ``impurity_reasons``. The LSP hover and goto-definition handlers
+    therefore cannot currently resolve a type-only import. This is a known limitation
+    to revisit if we want editor support for annotations that only exist under
+    ``TYPE_CHECKING``.
+    """
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "class Foo:\n    pass\n")
+    consumer = root / "consumer.py"
+    _write(
+        consumer,
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from helper import Foo\n"
+        "\n"
+        "def g(a: \"Foo\") -> \"Foo\":\n"
+        "    return a\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        analysis = session.analyze_file(consumer)
+        assert analysis.symbols is not None
+        qualified_names = {symbol.qualified_name for symbol in analysis.symbols.symbols}
+        assert "Foo" not in qualified_names
+        assert "conditional top-level binding" in analysis.symbols.impurity_reasons
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        hover = server._handle_request(
+            "textDocument/hover",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 5, "character": 10},
+            },
+        )
+        assert hover is None
+
+        locations = server._handle_request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 5, "character": 10},
             },
         )
         assert locations == []

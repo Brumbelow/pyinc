@@ -114,7 +114,9 @@ The repository ships that consumer boundary as a separate tooling layer in
 `--watch` analysis via the polling watcher, or `pyinc-tools lsp` for stdio LSP
 with document symbols, workspace symbols, diagnostics, hover, and goto-definition
 (backed by `pyinc.integrations.symbol_resolution` for cross-module re-export
-following).
+following). See [docs/pyinc-tools-guide.md](docs/pyinc-tools-guide.md) for
+install, editor wiring (Neovim, Emacs, VS Code note), the overlay model, and a
+supported-vs.-not-yet reference.
 
 ## Development
 

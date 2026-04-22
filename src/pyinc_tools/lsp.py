@@ -263,7 +263,7 @@ class LanguageServer:
                 "hoverProvider": True,
                 "definitionProvider": True,
             },
-            "serverInfo": {"name": "pyinc-tools", "version": "1.1.0"},
+            "serverInfo": {"name": "pyinc-tools", "version": "1.1.1"},
         }
 
     def _document_symbols(self, params: Any) -> list[dict[str, Any]]:

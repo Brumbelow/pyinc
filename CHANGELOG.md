@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] — 2026-04-22
+
+### Added
+
+- **`docs/pyinc-tools-guide.md`.** Consumer-facing guide covering install,
+  `pyinc-tools analyze` (one-shot + `--watch`), `pyinc-tools lsp` (stdio +
+  advertised capabilities), editor wiring (Neovim, Emacs/eglot, VS Code note),
+  the `WorkspaceSession` overlay model, a supported-vs.-not-yet table, and
+  troubleshooting. Cross-linked from `README.md`.
+- **LSP hardening tests.** Added coverage for single-level wildcard goto-def,
+  the `MAX_FOLLOW_DEPTH = 8` boundary, cyclic re-exports returning
+  `ambiguous`, ambiguous wildcard lookups, the full eight-kind
+  `documentSymbol` surface, and the current `if TYPE_CHECKING:` limitation.
+
+### Notes
+
+- Kernel contract (`src/pyinc`) unchanged. Patch-level release: docs and test
+  coverage only.
+
 ## [1.1.0] — 2026-04-21
 
 ### Added
@@ -83,3 +102,4 @@ The first stable v1 release.
 [1.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.0.0
 [1.0.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.0.1
 [1.1.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.1.0
+[1.1.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.1.1
