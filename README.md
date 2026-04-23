@@ -125,6 +125,7 @@ supported-vs.-not-yet reference.
 ## Development
 
 ```bash
+git clone https://github.com/Brumbelow/pyinc.git && cd pyinc
 python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install -e '.[dev]'
