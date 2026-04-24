@@ -21,7 +21,9 @@ from pyinc import (
     Input,
     InspectionNode,
     MutationError,
+    QueryChangeEvent,
     QueryProfile,
+    Subscription,
     UnsupportedValueError,
     UntrackedReadError,
     query,
@@ -2086,7 +2088,7 @@ def test_concurrent_queries_across_databases_are_thread_safe() -> None:
     def double(db: Database) -> int:
         return x.read(db) * 2
 
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
     results: list[int] = []
 
     def worker(value: int) -> None:
@@ -2095,7 +2097,7 @@ def test_concurrent_queries_across_databases_are_thread_safe() -> None:
             db.set(x, value)
             for _ in range(50):
                 results.append(db.get(double))
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
@@ -2120,21 +2122,21 @@ def test_shared_database_serializes_concurrent_set_and_get() -> None:
     db = Database()
     db.set(x, 0)
 
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
     observed: list[int] = []
 
     def setter() -> None:
         try:
             for value in range(100):
                 db.set(x, value)
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
     def getter() -> None:
         try:
             for _ in range(200):
                 observed.append(db.get(read_x))
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
     threads = [
@@ -2164,7 +2166,7 @@ def test_untracked_read_still_enforced_per_thread(tmp_path: Path) -> None:
         return 1
 
     db_a = Database()
-    errors_a: list[BaseException] = []
+    errors_a: list[Exception] = []
 
     started = threading.Event()
     may_finish = threading.Event()
@@ -2288,3 +2290,322 @@ def test_guard_stack_reentrant_within_same_thread() -> None:
     assert db.get(outer) == 2
     # Stack popped cleanly: running inner by itself after outer still works.
     assert db.get(inner) == 1
+
+
+# --- Push observers (v2 development cycle) -----------------------------------
+
+
+def test_observe_fires_on_cold_execution() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 10)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    events: list[QueryChangeEvent] = []
+    sub = db.observe(events.append, doubled)
+    assert isinstance(sub, Subscription)
+    assert db.get(doubled) == 20
+    assert len(events) == 1
+    assert events[0].query_id == doubled.query_id
+    assert events[0].decision == "executed"
+    assert events[0].changed_at == events[0].verified_at
+
+
+def test_observe_fires_on_true_recompute() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+    assert db.get(doubled) == 2
+    db.set(inp, 5)
+    assert db.get(doubled) == 10
+    assert len(events) == 2
+    assert events[1].changed_at > events[0].changed_at
+
+
+def test_observe_does_not_fire_on_equal_input_update() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+    assert db.get(doubled) == 2
+    db.set(inp, 1)  # equal: ignored by the kernel, no re-execution
+    assert db.get(doubled) == 2
+    assert len(events) == 1
+
+
+def test_observe_does_not_fire_on_backdate(tmp_path: Path) -> None:
+    path = tmp_path / "src.py"
+    path.write_text("x = 1\n")
+    file_resource = FileResource()
+
+    @query(cutoff=lambda value: value.strip())
+    def trimmed(db: Database, target: Path) -> str:
+        return file_resource.read(db, target)
+
+    db = Database()
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, trimmed, path)
+    assert db.get(trimmed, path) == "x = 1\n"
+    assert len(events) == 1
+    # Whitespace-only edit → same cutoff token → backdate
+    path.write_text("x = 1\n\n")
+    assert db.get(trimmed, path) == "x = 1\n\n"
+    assert len(events) == 1, "backdate must not fire observer"
+
+
+def test_observe_does_not_fire_on_reuse() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+    assert db.get(doubled) == 2
+    # No state change at all: verified_at advances silently, no re-exec.
+    assert db.get(doubled) == 2
+    assert db.get(doubled) == 2
+    assert len(events) == 1
+
+
+def test_unsubscribe_stops_future_events() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    events: list[QueryChangeEvent] = []
+    sub = db.observe(events.append, doubled)
+    db.get(doubled)
+    assert len(events) == 1
+    sub.unsubscribe()
+    db.set(inp, 99)
+    db.get(doubled)
+    assert len(events) == 1
+    # Idempotent
+    sub.unsubscribe()
+    sub.unsubscribe()
+
+
+def test_observe_dispatch_runs_after_lock_released() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def src(db: Database) -> int:
+        return inp.read(db) * 2
+
+    @query
+    def sink(db: Database) -> int:
+        return inp.read(db) + 100
+
+    seen_during_callback: list[int] = []
+
+    def on_src_change(event: QueryChangeEvent) -> None:
+        # Callback reaches back into the database: must not deadlock and
+        # must observe committed state.
+        seen_during_callback.append(db.get(sink))
+
+    db.observe(on_src_change, src)
+    db.get(src)
+    assert seen_during_callback == [101]
+    db.set(inp, 2)
+    db.get(src)
+    assert seen_during_callback == [101, 102]
+
+
+def test_observe_exception_isolated_and_routed_to_error_hook() -> None:
+    caught: list[Exception] = []
+    db = Database(observer_error_hook=caught.append)
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    good_events: list[QueryChangeEvent] = []
+
+    def raiser(_: QueryChangeEvent) -> None:
+        raise RuntimeError("boom")
+
+    db.observe(raiser, doubled)
+    db.observe(good_events.append, doubled)
+
+    db.get(doubled)
+    assert len(good_events) == 1
+    assert len(caught) == 1
+    assert isinstance(caught[0], RuntimeError)
+    assert str(caught[0]) == "boom"
+
+
+def test_observe_unsubscribe_during_dispatch_is_safe() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    sibling_events: list[QueryChangeEvent] = []
+    sub_holder: list[Subscription] = []
+
+    def unsub_self(_: QueryChangeEvent) -> None:
+        sub_holder[0].unsubscribe()
+
+    sub_holder.append(db.observe(unsub_self, doubled))
+    db.observe(sibling_events.append, doubled)
+
+    db.get(doubled)  # both fire; unsub_self removes itself after firing
+    assert len(sibling_events) == 1
+    db.set(inp, 7)
+    db.get(doubled)  # only sibling fires now
+    assert len(sibling_events) == 2
+
+
+def test_observe_set_many_fires_once_per_downstream_get() -> None:
+    db = Database()
+    a = Input[int]("a")
+    b = Input[int]("b")
+    db.set(a, 1)
+    db.set(b, 2)
+
+    @query
+    def total(db: Database) -> int:
+        return a.read(db) + b.read(db)
+
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, total)
+    db.get(total)
+    assert len(events) == 1
+    db.set_many([(a, 10), (b, 20)])
+    db.get(total)
+    # One re-execution triggered by the single revision bump => one event
+    assert len(events) == 2
+
+
+def test_observe_rejects_non_query_and_non_callable() -> None:
+    db = Database()
+
+    @query
+    def q(db: Database) -> int:
+        return 1
+
+    with pytest.raises(TypeError):
+        db.observe(lambda e: None, cast(Any, object()))
+    with pytest.raises(TypeError):
+        db.observe(cast(Any, 42), q)
+
+
+def test_observe_args_variant_keys_independently() -> None:
+    db = Database()
+
+    @query
+    def square(db: Database, n: int) -> int:
+        return n * n
+
+    events_2: list[QueryChangeEvent] = []
+    events_3: list[QueryChangeEvent] = []
+    db.observe(events_2.append, square, 2)
+    db.observe(events_3.append, square, 3)
+    db.get(square, 2)
+    assert len(events_2) == 1
+    assert len(events_3) == 0
+    db.get(square, 3)
+    assert len(events_2) == 1
+    assert len(events_3) == 1
+
+
+def test_observers_thread_safe_under_contention() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 0)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    events_lock = threading.Lock()
+    events: list[QueryChangeEvent] = []
+
+    def record(event: QueryChangeEvent) -> None:
+        with events_lock:
+            events.append(event)
+
+    subs: list[Subscription] = []
+    for _ in range(20):
+        subs.append(db.observe(record, doubled))
+
+    stop = threading.Event()
+
+    def writer() -> None:
+        value = 0
+        while not stop.is_set():
+            value += 1
+            db.set(inp, value)
+            db.get(doubled)
+
+    def churner() -> None:
+        while not stop.is_set():
+            s = db.observe(record, doubled)
+            s.unsubscribe()
+
+    threads = [threading.Thread(target=writer) for _ in range(2)] + [
+        threading.Thread(target=churner) for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    threading.Event().wait(0.25)
+    stop.set()
+    for t in threads:
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+    # Just verify no deadlock/crash and that events did get delivered.
+    assert len(events) > 0
+    for s in subs:
+        s.unsubscribe()
+
+
+def test_observe_evicted_node_does_not_raise_and_refires_after_reload() -> None:
+    db = Database(max_query_nodes=1)
+
+    @query
+    def a(db: Database) -> int:
+        return 1
+
+    @query
+    def b(db: Database) -> int:
+        return 2
+
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, a)
+    db.get(a)  # cold: event 1
+    db.get(b)  # forces eviction of a under max_query_nodes=1
+    assert len(events) == 1
+    # a is no longer a record, but observer is still registered
+    db.get(a)  # re-executes a from scratch → event 2 fires
+    assert len(events) == 2

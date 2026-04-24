@@ -881,12 +881,12 @@ def test_watcher_callback_error_is_contained(
     with WorkspaceSession(root) as session:
         watcher = watcher_factory(session, debounce_ms=30)
         error_seen = threading.Event()
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         def on_change(_paths: tuple[str, ...]) -> None:
             raise RuntimeError("boom")
 
-        def on_error(exc: BaseException) -> None:
+        def on_error(exc: Exception) -> None:
             errors.append(exc)
             error_seen.set()
 
@@ -979,7 +979,7 @@ def test_watcher_concurrent_overlay_and_poll_preserves_mirror(
     with WorkspaceSession(root) as session:
         watcher = watcher_factory(session, debounce_ms=30)
         stop_event = threading.Event()
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
         watcher.start(lambda _paths: None, interval_s=0.01, on_error=errors.append)
         try:
             # Hammer overlays from the main thread while the watcher loops.

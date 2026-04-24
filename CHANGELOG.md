@@ -24,6 +24,20 @@ concern" notes are addressed. New entries here are part of v2.
   preserved with their first-line heading (markdown) or kind tag.
   Stdlib-only — uses `json` to decode the notebook envelope; no `nbformat`
   dependency. Resolves the v1 architectural non-goal "notebook integration".
+- **Push observers in the kernel.** New `Database.observe(callback, query,
+  *args, **kwargs) -> Subscription` registers a callback that fires when the
+  identified query node's stored value changes (decision `"executed"`).
+  Backdated and reused decisions do not fire — the stored value did not move.
+  Events are delivered as `QueryChangeEvent` frozen dataclasses carrying
+  `query_id`, `args_digest`, `decision`, `changed_at`, and `verified_at`.
+  Dispatch runs after the outermost request scope completes and the kernel
+  lock is released, so a callback may safely call back into the database;
+  callback-level exceptions are routed to an optional
+  `Database(observer_error_hook=...)` hook (default: a one-line stderr log)
+  and do not suppress sibling callbacks. `Subscription.unsubscribe()` detaches
+  a callback and is idempotent. New public names re-exported from `pyinc`:
+  `QueryChangeEvent`, `Subscription`, `ObserverCallback`, `ObserverErrorHook`.
+  Resolves the v1 architectural non-goal "push observers in the kernel".
 
 ## [1.2.1] — 2026-04-24
 
