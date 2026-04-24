@@ -705,13 +705,11 @@ def test_language_server_references_overlay_sees_edit(tmp_path: Path) -> None:
             server._session.close()
 
 
-def test_module_symbol_table_flags_type_checking_import_as_impurity(tmp_path: Path) -> None:
-    """Pins current behavior: ``if TYPE_CHECKING:`` imports are a conditional top-level
-    binding, so they are not walked into ``ModuleSymbolTable.symbols`` and instead are
-    recorded in ``impurity_reasons``. The LSP hover and goto-definition handlers
-    therefore cannot currently resolve a type-only import. This is a known limitation
-    to revisit if we want editor support for annotations that only exist under
-    ``TYPE_CHECKING``.
+def test_type_checking_imports_visible_and_lsp_hover_works(tmp_path: Path) -> None:
+    """``if TYPE_CHECKING:`` imports are walked into ``ModuleSymbolTable.symbols``
+    so LSP hover and goto-definition work for any bare identifier that matches a
+    symbol name, including identifiers that appear inside string annotations — the
+    identifier-at-position parser operates on raw source characters.
     """
 
     root = tmp_path / "workspace"
@@ -720,42 +718,62 @@ def test_module_symbol_table_flags_type_checking_import_as_impurity(tmp_path: Pa
     consumer = root / "consumer.py"
     _write(
         consumer,
-        "from typing import TYPE_CHECKING\n"
-        "\n"
-        "if TYPE_CHECKING:\n"
-        "    from helper import Foo\n"
-        "\n"
-        "def g(a: \"Foo\") -> \"Foo\":\n"
-        "    return a\n",
+        "from typing import TYPE_CHECKING\n"  # line 0
+        "\n"                                  # line 1
+        "if TYPE_CHECKING:\n"                 # line 2
+        "    from helper import Foo\n"        # line 3
+        "\n"                                  # line 4
+        "x: Foo\n"                            # line 5 — bare identifier reference
+        "\n"                                  # line 6
+        "def g(a: \"Foo\") -> \"Foo\":\n"    # line 7 — string annotation (forward-ref)
+        "    return a\n",                     # line 8
     )
 
     with WorkspaceSession(root) as session:
         analysis = session.analyze_file(consumer)
         assert analysis.symbols is not None
         qualified_names = {symbol.qualified_name for symbol in analysis.symbols.symbols}
-        assert "Foo" not in qualified_names
-        assert "conditional top-level binding" in analysis.symbols.impurity_reasons
+        assert "Foo" in qualified_names
+        assert "conditional top-level binding" not in analysis.symbols.impurity_reasons
 
     server = LanguageServer(default_root=str(root))
     try:
         server._handle_request("initialize", {"rootUri": root.as_uri()})
+
+        # Bare identifier `Foo` on line 5 — hover resolves via the symbol table.
         hover = server._handle_request(
             "textDocument/hover",
             {
                 "textDocument": {"uri": consumer.as_uri()},
-                "position": {"line": 5, "character": 10},
+                "position": {"line": 5, "character": 3},
             },
         )
-        assert hover is None
+        assert hover is not None
+        assert "Foo" in hover["contents"]["value"]
 
+        # Goto-def on the bare `Foo` follows the TYPE_CHECKING import to helper.py.
         locations = server._handle_request(
             "textDocument/definition",
             {
                 "textDocument": {"uri": consumer.as_uri()},
-                "position": {"line": 5, "character": 10},
+                "position": {"line": 5, "character": 3},
             },
         )
-        assert locations == []
+        assert len(locations) == 1
+        assert locations[0]["uri"].endswith("helper.py")
+
+        # ``"Foo"`` inside a string annotation on line 7 — the identifier-at-position
+        # parser extracts ``Foo`` from raw source characters, so hover resolves
+        # against the symbol table and returns a result here too.
+        hover_str = server._handle_request(
+            "textDocument/hover",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 7, "character": 10},
+            },
+        )
+        assert hover_str is not None
+        assert "Foo" in hover_str["contents"]["value"]
     finally:
         if server._session is not None:
             server._session.close()

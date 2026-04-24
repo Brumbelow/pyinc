@@ -228,7 +228,7 @@ Consequences:
 
 ## Supported vs. not yet supported
 
-**Supported as of v1.2.0:**
+**Supported as of v1.3.0:**
 
 - Document symbols (all eight kinds: `function`, `method`, `class`,
   `class_variable`, `variable`, `import_alias`, `from_import_alias`,
@@ -246,6 +246,12 @@ Consequences:
   `context.includeDeclaration`.
 - Threaded live polling via `PollingWorkspaceWatcher.start(...)`. LSP server
   starts one by default; opt out with `initializationOptions.pyinc.watcher.enabled=false`.
+- `if TYPE_CHECKING:` and `if typing.TYPE_CHECKING:` import blocks — the symbol
+  walker recognizes this pattern and walks its body for `import` / `from X import Y`
+  statements. Hover and goto-definition work for any bare identifier that matches
+  a symbol name, including identifiers that appear inside string annotations
+  (e.g. `x: "Foo"`), since the identifier-at-position parser operates on raw
+  source characters.
 
 **Not supported:**
 
@@ -254,10 +260,9 @@ Consequences:
 - Hover or goto-def on stdlib or installed-package symbols — resolution
   correctly classifies them as `stdlib` / `installed`, but the LSP does not
   synthesize a `Location` for out-of-workspace targets.
-- Imports inside `if TYPE_CHECKING:` or any other conditional block — the
-  symbol walker treats these as a "conditional top-level binding" impurity and
-  does not walk into them. Hover and goto-def on such names currently return
-  empty. (See `test_module_symbol_table_flags_type_checking_import_as_impurity`.)
+- Imports inside other conditional blocks (`if sys.version_info >= ...`, `try/except
+  ImportError`, etc.) — the symbol walker still treats these as a "conditional
+  top-level binding" impurity and does not walk into them.
 - Multi-hop `from X import *` chains where an intermediate uses only bare
   `from Y import *` without `__all__` or explicit re-exports. The intermediate's
   wildcard export surface is empty by design, so resolution returns `missing`.
@@ -290,7 +295,7 @@ Run `pyinc-tools analyze <root> --path <file>` and look at the `symbols` entry
 for the name in question. The LSP identifier lookup is case-sensitive and
 prefers an exact `qualified_name` match over a bare-name match. If the symbol
 isn't there at all, it may fall under a known unsupported case (see the list
-above) — most commonly a `TYPE_CHECKING` import or a multi-hop wildcard.
+above) — most commonly a conditional-block import or a multi-hop wildcard.
 
 If the symbol is there but `defining_path` is `null`, call
 `resolve_symbol` directly (or construct a `WorkspaceSession` and

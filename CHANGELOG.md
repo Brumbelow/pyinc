@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`if TYPE_CHECKING:` import support.** `symbol_resolution` now recognises
+  `if TYPE_CHECKING:` and `if typing.TYPE_CHECKING:` guard blocks at the
+  module top level and walks their bodies for `import` and `from … import`
+  statements. The collected symbols appear in `ModuleSymbolTable.symbols` with
+  the existing `import_alias` / `from_import_alias` kinds, exactly as if the
+  imports were unconditional. As a result, LSP hover and goto-definition work
+  for names that are referenced as bare identifiers (e.g. `x: Foo`) even when
+  the binding lives under a `TYPE_CHECKING` guard. The "conditional top-level
+  binding" impurity marker is no longer recorded for files whose only
+  conditional blocks are `TYPE_CHECKING` guards; other conditional blocks (e.g.
+  `if sys.version_info >= …`) still set the marker. Non-import statements inside
+  a `TYPE_CHECKING` block (unusual) are silently skipped rather than being
+  promoted to the symbol table.
+
+### Notes
+
+- Kernel contract (`src/pyinc`) unchanged. Minor version bump reflects new
+  behaviour in the `symbol_resolution` integration, which is part of the stable
+  `pyinc.integrations` public surface.
+- Remaining `find_references` limitation: forward-reference strings (`'Foo'` in
+  annotations) are not scanned during the AST name-occurrence walk, so
+  string-annotation usages are not included in reference results.
+
 ## [1.2.0] — 2026-04-22
 
 ### Added
