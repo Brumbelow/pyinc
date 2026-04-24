@@ -6,6 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+This is the start of the **v2.0.0** development cycle. v1.2.1 is the last v1
+release; v2.0.0 will ship once the items previously listed under "Version 1
+does not include" in `docs/architecture.md` and the per-integration "v2
+concern" notes are addressed. New entries here are part of v2.
+
+### Added
+
+- **`notebook` integration (Jupyter `.ipynb`).** New stable integration
+  `pyinc.integrations.notebook` exposes `notebook_analysis(db, path)` and
+  `workspace_notebook_analysis(db, root)` plus the dataclasses
+  `NotebookAnalysis`, `NotebookCell`, and `NotebookDiagnostic`. Code cells'
+  Python source is concatenated and parsed via `ast` to surface module-level
+  imports and definitions per cell, with cutoff-based backdating on the
+  parsed structure (whitespace-only / output-only edits are backdated and
+  do not invalidate downstream consumers). Markdown and raw cells are
+  preserved with their first-line heading (markdown) or kind tag.
+  Stdlib-only — uses `json` to decode the notebook envelope; no `nbformat`
+  dependency. Resolves the v1 architectural non-goal "notebook integration".
+
+## [1.2.1] — 2026-04-24
+
 ### Added
 
 - **`if TYPE_CHECKING:` import support.** `symbol_resolution` now recognises
@@ -201,3 +222,4 @@ The first stable v1 release.
 [1.1.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.1.0
 [1.1.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.1.1
 [1.2.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.2.0
+[1.2.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.2.1

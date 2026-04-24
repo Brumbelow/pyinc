@@ -71,6 +71,11 @@ Stable public surface by module:
     `resolve_symbol(db, root, path, qualified_name)`,
     `workspace_symbol_index(db, root)`,
     `find_references(db, root, path, qualified_name, *, include_declaration=True)`
+- `notebook` *(added in the v2 development cycle; resolves the v1 architectural non-goal "notebook integration")*
+  - result types: `NotebookImport`, `NotebookDefinition`, `NotebookCell`,
+    `NotebookDiagnostic`, `NotebookAnalysis`
+  - entrypoints: `notebook_analysis(db, path)`,
+    `workspace_notebook_analysis(db, root)`
 
 ## Experimental Helpers
 
@@ -380,6 +385,32 @@ Out of scope for this integration:
 - MRO / class-member override resolution
 - following into installed third-party source files (v2 concern)
 - type evaluation or static type checking
+
+## Notebook Integration Scope
+
+The `notebook` integration parses Jupyter `.ipynb` notebook files via the
+stdlib `json` module. It is intentionally narrow and stdlib-only — no
+`nbformat` dependency.
+
+Scope:
+
+- single-file notebook analysis via `notebook_analysis(db, path)`
+- workspace-root discovery of `*.ipynb` files via `workspace_notebook_analysis(db, root)`
+- per-cell extraction of: cell index, `cell_type` (`"code"`/`"markdown"`/`"raw"`/`"unknown"`), the concatenated source text, and (for markdown cells) the first heading line with leading `#` characters stripped
+- AST-based extraction of module-level imports and top-level function/class definitions for code cells (each code cell parses as its own module)
+- per-cell `syntax-error` diagnostics carrying the offending cell index
+- top-level `notebook-decode-error` and `notebook-shape-error` diagnostics for unparseable JSON or non-object cell entries
+- kernel name and language extracted from `metadata.kernelspec` (with `metadata.language_info.name` as a fallback for the language)
+- cutoff-based backdating that ignores `outputs` and `execution_count`: re-running a notebook that leaves cell sources unchanged backdates analysis nodes and never invalidates downstream consumers
+
+Out of scope for this integration:
+
+- evaluation of cell sources, magic commands, or shell escapes (`!cmd`, `%magic`)
+- output rendering, MIME bundle parsing, or attachment extraction
+- cross-cell name resolution (`from_import` chasing across cells, or shadowing semantics)
+- nbformat schema validation
+- reading or writing alternate notebook formats (`.py` percent-format, `.Rmd`, etc.)
+- following imports inside code cells to workspace files (notebook cells have no on-disk file to attribute imports to; consumers wishing to chain into `python_source` should write a thin payload-cell-as-source layer themselves)
 
 ## Cross-Integration Composition Edges
 

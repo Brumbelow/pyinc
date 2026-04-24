@@ -40,6 +40,15 @@ from .json_config import (
     json_analysis,
     workspace_json_analysis,
 )
+from .notebook import (
+    NotebookAnalysis,
+    NotebookCell,
+    NotebookDefinition,
+    NotebookDiagnostic,
+    NotebookImport,
+    notebook_analysis,
+    workspace_notebook_analysis,
+)
 from .python_source import (
     DefinitionRef,
     DependencySurface,
@@ -133,6 +142,11 @@ __all__ = [
     "ModulePathEntry",
     "ModuleSymbolTable",
     "NamespacePackage",
+    "NotebookAnalysis",
+    "NotebookCell",
+    "NotebookDefinition",
+    "NotebookDiagnostic",
+    "NotebookImport",
     "Parameter",
     "PthDirective",
     "PythonEnvironmentSnapshot",
@@ -171,6 +185,7 @@ __all__ = [
     "json_analysis",
     "module_analysis",
     "module_symbol_table",
+    "notebook_analysis",
     "requirements_analysis",
     "resolve_import_name",
     "resolve_module_path",
@@ -182,6 +197,7 @@ __all__ = [
     "workspace_dependency_check",
     "workspace_env_analysis",
     "workspace_json_analysis",
+    "workspace_notebook_analysis",
     "workspace_requirements_analysis",
     "workspace_symbol_index",
     "workspace_xml_analysis",
