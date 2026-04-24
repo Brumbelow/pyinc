@@ -136,10 +136,10 @@ class QueryChangeEvent:
 
 
 ObserverCallback = Callable[[QueryChangeEvent], None]
-ObserverErrorHook = Callable[[BaseException], None]
+ObserverErrorHook = Callable[[Exception], None]
 
 
-def _default_observer_error_hook(exc: BaseException) -> None:
+def _default_observer_error_hook(exc: Exception) -> None:
     sys.stderr.write(f"pyinc: observer callback raised {type(exc).__qualname__}: {exc}\n")
 
 
@@ -781,8 +781,8 @@ class Database:
             for callback in callbacks:
                 try:
                     callback(event)
-                except BaseException as exc:
-                    with suppress(BaseException):
+                except Exception as exc:
+                    with suppress(Exception):
                         self._observer_error_hook(exc)
 
     def _maybe_changed_after(self, key: NodeKey, revision: int) -> bool:

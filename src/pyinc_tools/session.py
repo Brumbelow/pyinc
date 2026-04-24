@@ -771,7 +771,7 @@ class PollingWorkspaceWatcher:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._on_change: Callable[[tuple[str, ...]], None] | None = None
-        self._on_error: Callable[[BaseException], None] | None = None
+        self._on_error: Callable[[Exception], None] | None = None
 
     @property
     def is_running(self) -> bool:
@@ -820,7 +820,7 @@ class PollingWorkspaceWatcher:
         on_change: Callable[[tuple[str, ...]], None],
         *,
         interval_s: float | None = None,
-        on_error: Callable[[BaseException], None] | None = None,
+        on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         if self.is_running:
             raise RuntimeError("PollingWorkspaceWatcher is already running.")
@@ -867,7 +867,7 @@ class PollingWorkspaceWatcher:
             except RuntimeError:
                 # Session was closed out from under us; exit cleanly.
                 return
-            except BaseException as exc:  # pragma: no cover - defensive
+            except Exception as exc:  # pragma: no cover - defensive
                 self._handle_error(exc)
                 ready = ()
             if ready:
@@ -875,14 +875,14 @@ class PollingWorkspaceWatcher:
                 if callback is not None:
                     try:
                         callback(ready)
-                    except BaseException as exc:
+                    except Exception as exc:
                         self._handle_error(exc)
             if self._stop_event.wait(interval_s):
                 return
 
-    def _handle_error(self, exc: BaseException) -> None:
+    def _handle_error(self, exc: Exception) -> None:
         if self._on_error is not None:
-            with contextlib.suppress(BaseException):  # pragma: no cover - defensive
+            with contextlib.suppress(Exception):  # pragma: no cover - defensive
                 self._on_error(exc)
             return
         print(

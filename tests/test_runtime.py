@@ -2088,7 +2088,7 @@ def test_concurrent_queries_across_databases_are_thread_safe() -> None:
     def double(db: Database) -> int:
         return x.read(db) * 2
 
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
     results: list[int] = []
 
     def worker(value: int) -> None:
@@ -2097,7 +2097,7 @@ def test_concurrent_queries_across_databases_are_thread_safe() -> None:
             db.set(x, value)
             for _ in range(50):
                 results.append(db.get(double))
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
@@ -2122,21 +2122,21 @@ def test_shared_database_serializes_concurrent_set_and_get() -> None:
     db = Database()
     db.set(x, 0)
 
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
     observed: list[int] = []
 
     def setter() -> None:
         try:
             for value in range(100):
                 db.set(x, value)
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
     def getter() -> None:
         try:
             for _ in range(200):
                 observed.append(db.get(read_x))
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
     threads = [
@@ -2166,7 +2166,7 @@ def test_untracked_read_still_enforced_per_thread(tmp_path: Path) -> None:
         return 1
 
     db_a = Database()
-    errors_a: list[BaseException] = []
+    errors_a: list[Exception] = []
 
     started = threading.Event()
     may_finish = threading.Event()
@@ -2438,7 +2438,7 @@ def test_observe_dispatch_runs_after_lock_released() -> None:
 
 
 def test_observe_exception_isolated_and_routed_to_error_hook() -> None:
-    caught: list[BaseException] = []
+    caught: list[Exception] = []
     db = Database(observer_error_hook=caught.append)
     inp = Input[int]("x")
     db.set(inp, 1)
