@@ -74,6 +74,14 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "JsonSection",
         "json_analysis",
         "workspace_json_analysis",
+        # notebook
+        "NotebookAnalysis",
+        "NotebookCell",
+        "NotebookDefinition",
+        "NotebookDiagnostic",
+        "NotebookImport",
+        "notebook_analysis",
+        "workspace_notebook_analysis",
         # python_source
         "DependencySurface",
         "DefinitionRef",

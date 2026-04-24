@@ -59,6 +59,7 @@ Resource node identity includes resource configuration. Built-in resources are s
 - `deep_module_resolution`
 - `requirement_evaluation`
 - `symbol_resolution`
+- `notebook` *(added in v2 development cycle; see `docs/integration-contract.md`)*
 
 Low-level payload queries, decode helpers, and resource helpers remain module-local experimental helpers. The public integration boundary is the dataclass/result layer plus the documented high-level entrypoints in `docs/integration-contract.md`.
 
@@ -84,9 +85,11 @@ Version 1 targets:
 - inline package typing via `py.typed`
 - narrow supported integrations for Python source analysis, symbol resolution, config inspection (TOML, JSON, XML, `.env`, CSV), requirements parsing and evaluation, installed package discovery, dependency validation, and deep module resolution
 
-Version 1 does not include:
+The v1 line is closed at v1.2.1; v2.0.0 ships once the items below are addressed. Items resolved during the v2 development cycle are crossed out and the cycle's release notes are tracked in `CHANGELOG.md`.
 
-- notebook integration
+Version 1 did not include — being addressed for v2.0.0:
+
+- ~~notebook integration~~ *(landed: `pyinc.integrations.notebook`)*
 - push observers in the kernel
 - schedulers or worker pools
 - content-addressed artifact storage
