@@ -572,6 +572,35 @@ def source_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 
 
+def _is_type_checking_test(test: ast.expr) -> bool:
+    """Return True if *test* is ``TYPE_CHECKING`` or ``typing.TYPE_CHECKING``."""
+    if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
+        return True
+    return (
+        isinstance(test, ast.Attribute)
+        and test.attr == "TYPE_CHECKING"
+        and isinstance(test.value, ast.Name)
+        and test.value.id == "typing"
+    )
+
+
+def _collect_import_statements(
+    body: list[ast.stmt], statements: list[ImportStatementPayload]
+) -> None:
+    for node in body:
+        if isinstance(node, ast.Import):
+            statements.extend((alias.name, "import", node.lineno, tuple()) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            statements.append(
+                (
+                    _relative_import_module(node.module, node.level),
+                    "from",
+                    node.lineno,
+                    tuple(alias.name for alias in node.names),
+                )
+            )
+
+
 @query
 def import_statements_for_file(db: Database, path: str) -> tuple[ImportStatementPayload, ...]:
     tree = _try_parse(source_text(db, path))
@@ -591,6 +620,8 @@ def import_statements_for_file(db: Database, path: str) -> tuple[ImportStatement
                     tuple(alias.name for alias in node.names),
                 )
             )
+        elif isinstance(node, ast.If) and _is_type_checking_test(node.test):
+            _collect_import_statements(node.body, statements)
     return tuple(statements)
 
 

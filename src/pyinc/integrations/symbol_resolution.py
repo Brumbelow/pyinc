@@ -367,6 +367,59 @@ def _class_body_walk(
             continue
 
 
+def _is_type_checking_test(test: ast.expr) -> bool:
+    """Return True if *test* is ``TYPE_CHECKING`` or ``typing.TYPE_CHECKING``."""
+    if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
+        return True
+    return (
+        isinstance(test, ast.Attribute)
+        and test.attr == "TYPE_CHECKING"
+        and isinstance(test.value, ast.Name)
+        and test.value.id == "typing"
+    )
+
+
+def _type_checking_block_walk(
+    body: list[ast.stmt], symbols: list[SymbolPayload]
+) -> None:
+    """Collect import symbols from the body of an ``if TYPE_CHECKING:`` block."""
+    for stmt in body:
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                bound = _bound_name_for_import(alias)
+                symbols.append(
+                    (bound, "import_alias", stmt.lineno, None, None, alias.name, None)
+                )
+        elif isinstance(stmt, ast.ImportFrom):
+            module_label = ("." * stmt.level) + (stmt.module or "")
+            for alias in stmt.names:
+                if alias.name == "*":
+                    symbols.append(
+                        (
+                            "*",
+                            "wildcard_import_stub",
+                            stmt.lineno,
+                            None,
+                            None,
+                            module_label,
+                            "*",
+                        )
+                    )
+                    continue
+                bound = _bound_name_for_from_import(alias)
+                symbols.append(
+                    (
+                        bound,
+                        "from_import_alias",
+                        stmt.lineno,
+                        None,
+                        None,
+                        module_label,
+                        alias.name,
+                    )
+                )
+
+
 def _module_symbol_walk(
     tree: ast.Module,
 ) -> tuple[tuple[SymbolPayload, ...], tuple[str, ...]]:
@@ -487,6 +540,9 @@ def _module_symbol_walk(
                 )
             continue
         if isinstance(node, (ast.Pass, ast.Expr)):
+            continue
+        if isinstance(node, ast.If) and _is_type_checking_test(node.test):
+            _type_checking_block_walk(node.body, symbols)
             continue
         _record_reason("conditional top-level binding")
 

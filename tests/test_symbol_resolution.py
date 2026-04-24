@@ -534,6 +534,100 @@ def test_conditional_top_level_binding_marked_impure(tmp_path: Path) -> None:
     root.mkdir()
     path = root / "cond.py"
     path.write_text(
+        "import sys\n"
+        "if sys.version_info >= (3, 12):\n"
+        "    x: int = 1\n"
+        "def visible() -> int:\n"
+        "    return 2\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    qnames = {sym.qualified_name for sym in table.symbols}
+    assert "visible" in qnames
+    assert "x" not in qnames
+    assert "conditional top-level binding" in table.impurity_reasons
+
+
+def test_type_checking_imports_visible_in_symbol_table(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "helper.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    path = root / "consumer.py"
+    path.write_text(
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from helper import Foo\n"
+        "    import os\n"
+        "def visible() -> int:\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    qnames = {sym.qualified_name for sym in table.symbols}
+    assert "Foo" in qnames
+    assert "os" in qnames
+    assert "visible" in qnames
+    assert "conditional top-level binding" not in table.impurity_reasons
+
+    foo_sym = next(s for s in table.symbols if s.qualified_name == "Foo")
+    assert foo_sym.kind == "from_import_alias"
+    assert foo_sym.import_source_module == "helper"
+    assert foo_sym.import_source_name == "Foo"
+
+    os_sym = next(s for s in table.symbols if s.qualified_name == "os")
+    assert os_sym.kind == "import_alias"
+    assert os_sym.import_source_module == "os"
+
+
+def test_type_checking_typing_dot_form(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "mod.py"
+    path.write_text(
+        "import typing\n"
+        "if typing.TYPE_CHECKING:\n"
+        "    from helper import Bar\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    qnames = {sym.qualified_name for sym in table.symbols}
+    assert "Bar" in qnames
+    assert "conditional top-level binding" not in table.impurity_reasons
+
+
+def test_type_checking_block_with_other_conditional_records_impurity(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "mixed.py"
+    path.write_text(
+        "import sys\n"
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from helper import Foo\n"
+        "if sys.version_info >= (3, 12):\n"
+        "    x: int = 1\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    qnames = {sym.qualified_name for sym in table.symbols}
+    assert "Foo" in qnames
+    assert "x" not in qnames
+    assert "conditional top-level binding" in table.impurity_reasons
+
+
+def test_type_checking_block_non_import_stmts_not_collected(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "mod.py"
+    path.write_text(
         "from typing import TYPE_CHECKING\n"
         "if TYPE_CHECKING:\n"
         "    def hidden() -> int:\n"
@@ -548,10 +642,26 @@ def test_conditional_top_level_binding_marked_impure(tmp_path: Path) -> None:
     qnames = {sym.qualified_name for sym in table.symbols}
     assert "visible" in qnames
     assert "hidden" not in qnames
-    assert "conditional top-level binding" in table.impurity_reasons
+    assert "conditional top-level binding" not in table.impurity_reasons
 
-    resolved = resolve_symbol(db, root, path, "hidden")
-    assert resolved.resolution == "missing"
+
+def test_resolve_symbol_from_type_checking_import(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "models.py").write_text("class User:\n    pass\n", encoding="utf-8")
+    path = root / "service.py"
+    path.write_text(
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from models import User\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    resolved = resolve_symbol(db, root, path, "User")
+    assert resolved.resolution == "workspace"
+    assert resolved.defining_module == "models"
+    assert resolved.qualified_name == "User"
 
 
 # ---------------------------------------------------------------------------
