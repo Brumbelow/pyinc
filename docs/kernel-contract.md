@@ -168,6 +168,48 @@ scratch on its next request. This is correct but may degrade performance.
   at top-level request boundaries and affects query nodes only.
 - The distributed package is PEP 561 typed via `py.typed`.
 
+### Push Observers
+
+`Database.observe(callback, query, *args, **kwargs)` registers a callback that
+fires when the identified query node's stored value changes. It returns a
+`Subscription` whose `unsubscribe()` method detaches the callback; repeated
+unsubscribes are no-ops.
+
+Fires exactly when:
+
+- the node was (re-)executed during a top-level `get` / `inspect` /
+  `inspect_fresh` call, **and**
+- the resulting decision was `"executed"` — either a cold execution (no
+  prior record) or a true recompute where the new value did not match the
+  previous one under `eq=` / `cutoff=` / semantic equality.
+
+Does **not** fire on:
+
+- `"backdated"` — recomputation produced a semantically equal value;
+- `"reused"` — dependencies were unchanged so no recomputation happened;
+- `db.set(...)` / `db.set_many(...)` — input mutation alone does not
+  execute any query. Observers fire on the next `get` that triggers
+  dependent re-execution.
+
+Dispatch model:
+
+- Events are buffered on the outermost request scope and delivered **after**
+  the kernel lock is released. A callback may therefore re-enter the
+  database (e.g. call `db.get(...)`) without risk of deadlock.
+- For each event, the callback list for that node is snapshotted once at
+  dispatch time under the state lock, then dispatched lock-free. A
+  subscription added during dispatch will not see the current batch; one
+  removed during dispatch will still receive events already snapshotted.
+- Exceptions raised by a callback are routed to the
+  `observer_error_hook` passed to `Database(...)` (default: a one-line
+  stderr log) and do not suppress sibling callbacks for the same event.
+- Subscriptions survive LRU eviction of their node: if the evicted node is
+  later re-executed, the callback fires normally.
+
+`QueryChangeEvent` is a frozen dataclass carrying the node's `query_id`,
+`args_digest`, decision (`"executed"`), and the `changed_at` / `verified_at`
+revisions at the time of execution.
+
 ### Verification
 
 The from-scratch consistency guarantee is mechanically verified by property tests

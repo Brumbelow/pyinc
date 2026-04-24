@@ -44,6 +44,7 @@ Resource node identity includes resource configuration. Built-in resources are s
 - value-boundary helpers such as `freeze`, `thaw`, `semantic_equal`, and `ValueAdapter`
 - structured inspection via `InspectionNode`, `Database.inspect(...)`, `Database.inspect_fresh(...)`, and `Database.explain(...)`
 - observability via `Database.dependency_graph()`, `Database.statistics()`, and `Database.query_profile()`
+- push observers via `Database.observe(callback, query, *args, **kwargs)` returning a `Subscription`, with `QueryChangeEvent` payloads *(added in the v2 development cycle)*
 
 `pyinc.integrations` exposes the stable dataclass/result types and high-level entrypoints from the shipped integrations:
 
@@ -90,7 +91,7 @@ The v1 line is closed at v1.2.1; v2.0.0 ships once the items below are addressed
 Version 1 did not include — being addressed for v2.0.0:
 
 - ~~notebook integration~~ *(landed: `pyinc.integrations.notebook`)*
-- push observers in the kernel
+- ~~push observers in the kernel~~ *(landed: `Database.observe(...)` and `QueryChangeEvent`)*
 - schedulers or worker pools
 - content-addressed artifact storage
 - arbitrary mutable object graphs across cached boundaries

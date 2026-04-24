@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -117,6 +117,30 @@ class QueryProfile:
     execution_count: int
     total_ns: int
     mean_ns: int
+
+
+@dataclass(frozen=True)
+class QueryChangeEvent:
+    """Delivered to observers when a subscribed query's result changes.
+
+    Fires only on the `"executed"` decision (cold execute or true recompute
+    that produced a new value). `"reused"` and `"backdated"` decisions do
+    not fire — the stored value did not move.
+    """
+
+    query_id: str
+    args_digest: str
+    decision: str
+    changed_at: int
+    verified_at: int
+
+
+ObserverCallback = Callable[[QueryChangeEvent], None]
+ObserverErrorHook = Callable[[BaseException], None]
+
+
+def _default_observer_error_hook(exc: BaseException) -> None:
+    sys.stderr.write(f"pyinc: observer callback raised {type(exc).__qualname__}: {exc}\n")
 
 
 _ACTIVE_GUARDS: ContextVar[tuple[Database, ...]] = ContextVar(
@@ -260,6 +284,30 @@ class _GuardedEnviron(MutableMapping[str, str]):
         return key in self._wrapped
 
 
+class Subscription:
+    """Handle returned by `Database.observe(...)`.
+
+    Calling `unsubscribe()` detaches the callback from the subscribed
+    query node. Repeated unsubscribes are no-ops. Subscriptions do not
+    keep the observed node alive under LRU eviction; if the node is
+    evicted and later re-executed, the callback fires as normal.
+    """
+
+    __slots__ = ("_database", "_key", "_callback", "_active")
+
+    def __init__(self, database: Database, key: NodeKey, callback: ObserverCallback) -> None:
+        self._database = database
+        self._key = key
+        self._callback = callback
+        self._active = True
+
+    def unsubscribe(self) -> None:
+        if not self._active:
+            return
+        self._active = False
+        self._database._unregister_observer(self._key, self._callback)
+
+
 class Database:
     def __init__(
         self,
@@ -267,6 +315,7 @@ class Database:
         *,
         adapters: Mapping[type[Any], ValueAdapter] | None = None,
         max_query_nodes: int | None = None,
+        observer_error_hook: ObserverErrorHook | None = None,
     ) -> None:
         if mode not in {"strict", "checked", "fast"}:
             raise ValueError("mode must be one of: strict, checked, fast")
@@ -301,6 +350,13 @@ class Database:
         self._query_timings: dict[str, list[int]] = {}
         self._module_identity_cache: dict[tuple[str, str, int, int], Any] = {}
         self._state_lock = threading.RLock()
+        self._observers: dict[NodeKey, list[ObserverCallback]] = {}
+        self._observer_error_hook: ObserverErrorHook = (
+            observer_error_hook if observer_error_hook is not None else _default_observer_error_hook
+        )
+        self._pending_events: ContextVar[list[tuple[NodeKey, QueryChangeEvent]] | None] = ContextVar(
+            "pyinc_pending_events", default=None
+        )
         _install_guards_once()
 
     @property
@@ -485,11 +541,13 @@ class Database:
 
         if not isinstance(query, Query):
             raise TypeError("db.get() expects a @query-decorated callable.")
-        with self._state_lock, self._request_scope():
+        with self._state_lock, self._request_scope() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
             self._record_dependency(key)
             self._ensure_query(query, key, call_snapshot)
-            return cast(T, self._expose_boundary_snapshot(self._records[key].snapshot))
+            result = cast(T, self._expose_boundary_snapshot(self._records[key].snapshot))
+        self._dispatch_events(pending)
+        return result
 
     def explain(self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> str:
         from .core import Query
@@ -503,21 +561,56 @@ class Database:
 
         if not isinstance(query, Query):
             raise TypeError("db.inspect() expects a @query-decorated callable.")
-        with self._state_lock, self._request_scope():
+        with self._state_lock, self._request_scope() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
             if key not in self._records:
                 self._ensure_query(query, key, call_snapshot)
-            return self._inspect_record(key)
+            node = self._inspect_record(key)
+        self._dispatch_events(pending)
+        return node
 
     def inspect_fresh(self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> InspectionNode:
         from .core import Query
 
         if not isinstance(query, Query):
             raise TypeError("db.inspect_fresh() expects a @query-decorated callable.")
-        with self._state_lock, self._request_scope():
+        with self._state_lock, self._request_scope() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
             self._ensure_query(query, key, call_snapshot)
-            return self._inspect_record(key)
+            node = self._inspect_record(key)
+        self._dispatch_events(pending)
+        return node
+
+    def observe(
+        self,
+        callback: ObserverCallback,
+        query: Query[P, Any],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> Subscription:
+        """Register `callback` to fire whenever the query node's value changes.
+
+        Observer callbacks fire once per top-level `get` / `inspect` /
+        `inspect_fresh` call in which the node was re-executed and produced a
+        new value (decision `"executed"`). Backdated and reused decisions do
+        not fire — by definition the stored value did not move.
+
+        Callbacks run after the request scope completes and the kernel lock is
+        released, so a callback may safely call back into the database.
+        Exceptions from a callback are routed to the `observer_error_hook`
+        (default: a one-line stderr log) and do not suppress sibling callbacks
+        or corrupt kernel state.
+        """
+        from .core import Query
+
+        if not isinstance(query, Query):
+            raise TypeError("db.observe() expects a @query-decorated callable.")
+        if not callable(callback):
+            raise TypeError("db.observe() expects a callable as its first argument.")
+        with self._state_lock:
+            key, _ = self._query_key(query, args, kwargs)
+            self._observers.setdefault(key, []).append(callback)
+        return Subscription(self, key, callback)
 
     def report_untracked_read(self, reason: str) -> None:
         frame = self._current_frame()
@@ -641,8 +734,56 @@ class Database:
                 self._stats["query_backdates"] += 1
             else:
                 self._stats["query_executions"] += 1
+                self._enqueue_observer_event(query, key, record)
         finally:
             self._execution_stack.reset(token)
+
+    def _enqueue_observer_event(self, query: Any, key: NodeKey, record: NodeRecord) -> None:
+        if key not in self._observers:
+            return
+        pending = self._pending_events.get()
+        if pending is None:
+            return
+        pending.append((
+            key,
+            QueryChangeEvent(
+                query_id=query.query_id,
+                args_digest=key.args_digest,
+                decision="executed",
+                changed_at=record.changed_at,
+                verified_at=record.verified_at,
+            ),
+        ))
+
+    def _unregister_observer(self, key: NodeKey, callback: ObserverCallback) -> None:
+        with self._state_lock:
+            callbacks = self._observers.get(key)
+            if callbacks is None:
+                return
+            try:
+                callbacks.remove(callback)
+            except ValueError:
+                return
+            if not callbacks:
+                del self._observers[key]
+
+    def _dispatch_events(
+        self, events: list[tuple[NodeKey, QueryChangeEvent]] | None
+    ) -> None:
+        if not events:
+            return
+        with self._state_lock:
+            snapshots = [
+                (event, tuple(self._observers.get(key, ())))
+                for key, event in events
+            ]
+        for event, callbacks in snapshots:
+            for callback in callbacks:
+                try:
+                    callback(event)
+                except BaseException as exc:
+                    with suppress(BaseException):
+                        self._observer_error_hook(exc)
 
     def _maybe_changed_after(self, key: NodeKey, revision: int) -> bool:
         record = self._records.get(key)
@@ -1060,16 +1201,21 @@ class Database:
         return all(callable(getattr(value, name, None)) for name in ("label", "probe", "load"))
 
     @contextmanager
-    def _request_scope(self) -> Iterator[None]:
+    def _request_scope(
+        self,
+    ) -> Iterator[list[tuple[NodeKey, QueryChangeEvent]] | None]:
         current = self._request_token.get()
         if current is not None:
-            yield
+            yield None
             return
         self._request_counter += 1
         token = self._request_token.set(self._request_counter)
+        pending: list[tuple[NodeKey, QueryChangeEvent]] = []
+        events_token = self._pending_events.set(pending)
         try:
-            yield
+            yield pending
         finally:
+            self._pending_events.reset(events_token)
             self._request_token.reset(token)
             self._evict_query_nodes_if_needed()
 
