@@ -178,7 +178,11 @@ def _get_stdlib_modules() -> tuple[str, ...]:
 def _site_packages_dirs(db: Database) -> tuple[str, ...]:
     """Discover site-packages directories. Marks sys.path as untracked."""
     db.report_untracked_read("sys.path is a mutable runtime list")
-    return _get_site_packages_dirs()
+    # site.getsitepackages() and site.getusersitepackages() check os.environ
+    # (e.g. VIRTUAL_ENV) internally on Python 3.11+. Since this query already
+    # declares all its reads as untracked, suppress the environ guard here.
+    with db._allow_raw_open():
+        return _get_site_packages_dirs()
 
 
 @query
