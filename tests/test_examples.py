@@ -34,3 +34,45 @@ def test_untracked_escape_hatch_demo_runs(capsys: pytest.CaptureFixture[str]) ->
     assert "first=" in output
     assert "second=" in output
     assert "untracked_reasons=" in output
+
+
+def test_observers_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    _run_example("observers_demo.py")
+    output = capsys.readouterr().out
+    assert "event_count=3" in output
+    assert "decision=executed" in output
+    assert "final_decision=executed" in output
+
+
+def test_artifact_store_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    _run_example("artifact_store_demo.py")
+    output = capsys.readouterr().out
+    assert "result=('ALPHA', 'BETA', 'GAMMA')" in output
+    assert "in_memory_object_count=" in output
+    assert "on_disk_object_count=" in output
+    assert "round_trip=('hello', 'world')" in output
+    assert "round_trip_equal=True" in output
+
+
+def test_frozen_graph_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    _run_example("frozen_graph_demo.py")
+    output = capsys.readouterr().out
+    assert "tree_is_FrozenGraph=False" in output
+    assert "shared_is_FrozenGraph=True" in output
+    assert "shared_left_is_right=True" in output
+    assert "shared_after_mutation_right=[10, 20, 30]" in output
+    assert "cycle_is_FrozenGraph=True" in output
+    assert "cycle_self_referential=True" in output
+
+
+def test_notebook_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    _run_example("notebook_demo.py")
+    output = capsys.readouterr().out
+    assert "kernel_name=python3" in output
+    assert "language=python" in output
+    assert "cell_count=2" in output
+    assert "heading='Daily ETL'" in output
+    assert "imports=('pandas',)" in output
+    assert "definitions=('load',)" in output
+    assert "output_only_edit_backdated=True" in output
+    assert "analysis_unchanged=True" in output

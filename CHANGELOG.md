@@ -8,7 +8,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Items in this section are queued for the next v2.x release.
 
-## [2.0.0] — TBD
+## [2.0.0]
 
 This is the v2.0.0 release. v1.2.1 was the last v1 release. Items previously
 listed under "Version 1 did not include" in `docs/architecture.md` are
