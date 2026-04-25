@@ -8,6 +8,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Items in this section are queued for the next v2.x release.
 
+## [2.1.0] — 2026-04-25
+
+### Added
+
+- **`try/except ImportError` import support.** `symbol_resolution` now
+  recognises `try: … except ImportError:` and `try: … except
+  ModuleNotFoundError:` (and the tuple form `except (ImportError,
+  ModuleNotFoundError):`) guard blocks at the module top level and walks
+  their bodies for `import` and `from … import` statements. The collected
+  symbols appear in `ModuleSymbolTable.symbols` with the existing
+  `import_alias` / `from_import_alias` kinds, exactly as if the imports
+  were unconditional. The "conditional top-level binding" impurity marker
+  is no longer recorded for files whose only conditional blocks are
+  recognised import-error guards. `python_source` likewise collects import
+  statements and bound names from such blocks, so that
+  `import_statements_for_file` and the module binding analysis agree with
+  the symbol table. Bare `except:` handlers (and handlers for other
+  exception types) still set the impurity marker.
+- **Durable checkpoint API (Scope-B).** `Database.save_checkpoint(store=None)
+  -> str` serialises all current query and resource node records (plus their
+  dependency edges and snapshot bytes) to an `ArtifactStore` and returns a
+  content-addressed checkpoint key prefixed with `"ck"`. A subsequent
+  `Database.load_checkpoint(key, store=None)` in a fresh process reads the
+  manifest back, verifies that all declared input digests and resource probe
+  hints still match, and pre-warms the node record cache so that the next
+  `db.get(query)` reuses the stored result without re-executing the query
+  function. If any dependency is stale the affected query is silently
+  re-executed and the new result is compared against the stored snapshot for
+  backdating (from-scratch consistency is maintained). Both methods accept an
+  optional `store=` kwarg for call-site store injection; `save_checkpoint`
+  also writes all referenced snapshot bytes to the store, making it
+  self-contained. The checkpoint key is content-addressed: identical database
+  state always produces the same key. Completes the "content-addressed
+  artifact storage" feature first partially delivered in v2.0.0 (Scope-A).
+
+### Notes
+
+- Kernel contract (`src/pyinc`) updated: `Database` gains two new public
+  methods (`save_checkpoint`, `load_checkpoint`). The `ArtifactStore`
+  protocol and the snapshot serialisation format are unchanged.
+- `pyinc.integrations` stable surface extended: `symbol_resolution` and
+  `python_source` now handle `try/except ImportError` blocks; results for
+  files using this pattern may change from previous releases (the impurity
+  marker was previously set; it is now cleared and the symbols are visible).
+
 ## [2.0.0]
 
 This is the v2.0.0 release. v1.2.1 was the last v1 release. Items previously

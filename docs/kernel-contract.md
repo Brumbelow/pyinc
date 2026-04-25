@@ -104,10 +104,20 @@ In v2.0.0, an outbound `ArtifactStore` (`InMemoryArtifactStore` /
 freezes, keyed by its `fingerprint_snapshot` digest, via
 `Database(store=...)`. Bytes are produced by `serialize_snapshot` and consumed
 by `deserialize_snapshot`; both round-trip the full snapshot grammar including
-`FrozenGraph` / `FrozenRef`. External tools may use this for cross-run
-sharing, but the kernel itself does not read from the store to skip query
-execution — full cross-run cache reuse with node-record persistence is a
-v2.1 (Scope-B) deliverable.
+`FrozenGraph` / `FrozenRef`.
+
+In v2.1.0, the Scope-B checkpoint API completes cross-run cache reuse:
+`Database.save_checkpoint(store=None) -> str` serialises all current node
+records and their snapshot bytes to the store, returning a content-addressed
+key (64-character SHA-256 prefixed with `"ck"`). `Database.load_checkpoint(key,
+store=None)` reads the manifest back, verifies that all declared input digests
+and resource probe hints still match the current database state, and pre-warms
+the record cache so that the next `db.get(query)` reuses stored results without
+re-executing the function. Stale or unverifiable records are silently skipped
+and the affected queries re-execute (from-scratch consistency is maintained).
+Both methods accept an optional `store=` kwarg for call-site store injection;
+the store passed to `load_checkpoint` is also used for subsequent snapshot
+loading if the Database was not constructed with a `store=` argument.
 
 Within a process, `Database` is thread-safe for concurrent use both across
 independent instances and on a single shared instance. Each `Database` holds

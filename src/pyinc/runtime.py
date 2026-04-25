@@ -4,6 +4,7 @@ import builtins
 import hashlib
 import inspect
 import io
+import json
 import marshal
 import os
 import sys
@@ -29,6 +30,7 @@ from .value import (
     Snapshot,
     ValueAdapter,
     assert_not_mutated,
+    deserialize_snapshot,
     fingerprint,
     fingerprint_snapshot,
     freeze,
@@ -70,6 +72,7 @@ class NodeRecord:
     untracked_reasons: list[str] = field(default_factory=list)
     probe: Any = None
     checked_in_request: int = -1
+    checkpoint_loaded: bool = False
 
     @property
     def is_untracked(self) -> bool:
@@ -361,6 +364,10 @@ class Database:
         self._pending_events: ContextVar[list[tuple[NodeKey, QueryChangeEvent]] | None] = ContextVar(
             "pyinc_pending_events", default=None
         )
+        # Scope-B: checkpoint records loaded from a durable store for cross-run reuse.
+        self._checkpoint_query_records: dict[NodeKey, dict[str, Any]] = {}
+        self._checkpoint_resource_probes: dict[NodeKey, tuple[Any, str]] = {}
+        self._checkpoint_load_store: ArtifactStore | None = None
         _install_guards_once()
 
     @property
@@ -548,6 +555,8 @@ class Database:
         with self._state_lock, self._request_scope() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
             self._record_dependency(key)
+            if key not in self._records and self._checkpoint_query_records:
+                self._try_warm_from_checkpoint(query, key, call_snapshot)
             self._ensure_query(query, key, call_snapshot)
             result = cast(T, self._expose_boundary_snapshot(self._records[key].snapshot))
         self._dispatch_events(pending)
@@ -621,6 +630,312 @@ class Database:
         if frame is None:
             raise RuntimeError("db.report_untracked_read() must be called while a query is executing.")
         frame.untracked_reasons.append(reason)
+
+    # ------------------------------------------------------------------
+    # Scope-B: durable checkpoint save / load
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(self, store: ArtifactStore | None = None) -> str:
+        """Serialize all current node records to the ArtifactStore.
+
+        Returns a checkpoint key that can be passed to :meth:`load_checkpoint`
+        in a future process.  All snapshot values are also written under their
+        ``fingerprint_snapshot`` digests so the store is self-contained.
+
+        The returned key is content-addressed: the same database state always
+        produces the same key.  Each subsequent call after mutations produces a
+        fresh key.
+
+        Inputs must be set before saving so that input digests are captured in
+        the checkpoint's dependency records.
+
+        Raises ``ValueError`` if no ``ArtifactStore`` is available (either
+        passed directly or configured via ``Database(store=...)``).
+        """
+        _store = store if store is not None else self._store
+        if _store is None:
+            raise ValueError(
+                "save_checkpoint() requires an ArtifactStore. "
+                "Pass store= or construct Database(store=...) first."
+            )
+        with self._state_lock:
+            return self._save_checkpoint_locked(_store)
+
+    def load_checkpoint(self, key: str, store: ArtifactStore | None = None) -> None:
+        """Load previously saved node records from the ArtifactStore.
+
+        After loading, calls to :meth:`get` will verify dependencies and reuse
+        cached results without re-executing queries whose inputs and resources
+        are unchanged.  All ``Input`` values that the checkpoint depends on
+        must be set before calling this method.
+
+        Checkpoint records that cannot be verified (missing snapshot bytes,
+        changed inputs, changed resource probes) are silently skipped; the
+        affected queries will re-execute on the next :meth:`get` call and the
+        results will be compared against the stored snapshots for backdating.
+
+        Raises ``ValueError`` if no ``ArtifactStore`` is available.
+        Raises ``KeyError`` if *key* is not found in the store.
+        """
+        _store = store if store is not None else self._store
+        if _store is None:
+            raise ValueError(
+                "load_checkpoint() requires an ArtifactStore. "
+                "Pass store= or construct Database(store=...) first."
+            )
+        with self._state_lock:
+            self._load_checkpoint_locked(key, _store)
+
+    def _save_checkpoint_locked(self, store: ArtifactStore) -> str:
+        records_list: list[dict[str, Any]] = []
+        for key, record in self._records.items():
+            if key.kind not in ("query", "resource"):
+                continue
+            self._persist_snapshot_to(record.snapshot, store)
+            deps: list[dict[str, Any]] = []
+            for dep_key in record.dependencies:
+                dep_record = self._records.get(dep_key)
+                if dep_record is None:
+                    continue
+                if dep_key.kind == "input":
+                    deps.append({
+                        "kind": "input",
+                        "name": self._input_name_for_key(dep_key),
+                        "label": dep_key.label,
+                        "digest": dep_record.digest,
+                    })
+                elif dep_key.kind == "query":
+                    deps.append({
+                        "kind": "query",
+                        "identity": dep_key.identity,
+                        "args_digest": dep_key.args_digest,
+                        "label": dep_key.label,
+                        "digest": dep_record.digest,
+                    })
+                elif dep_key.kind == "resource":
+                    deps.append({
+                        "kind": "resource",
+                        "identity": dep_key.identity,
+                        "args_digest": dep_key.args_digest,
+                        "label": dep_key.label,
+                        "digest": dep_record.digest,
+                    })
+            entry: dict[str, Any] = {
+                "kind": key.kind,
+                "identity": key.identity,
+                "args_digest": key.args_digest,
+                "label": key.label,
+                "snapshot_digest": record.digest,
+                "deps": deps,
+                "changed_order": record.changed_at,
+                "is_untracked": record.is_untracked,
+            }
+            if key.kind == "resource" and record.probe is not None:
+                try:
+                    probe_snapshot = freeze(record.probe)
+                    entry["probe_bytes"] = serialize_snapshot(probe_snapshot).hex()
+                except (UnsupportedValueError, TypeError):
+                    pass
+            records_list.append(entry)
+
+        manifest = {
+            "pyinc_ckpt_version": 2,
+            "records": records_list,
+        }
+        manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+        # "ck" prefix ensures the checkpoint key never matches a snapshot digest
+        # (snapshot digests are 64 hex chars; this is 66 chars with "ck" prefix).
+        checkpoint_key = "ck" + hashlib.sha256(manifest_bytes).hexdigest()
+        with self._allow_raw_reads_scope():
+            store.put(checkpoint_key, manifest_bytes)
+        return checkpoint_key
+
+    def _load_checkpoint_locked(self, key: str, store: ArtifactStore) -> None:
+        with self._allow_raw_reads_scope():
+            manifest_bytes = store.get(key)
+        if manifest_bytes is None:
+            raise KeyError(f"Checkpoint key {key!r} not found in the ArtifactStore.")
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        if manifest.get("pyinc_ckpt_version") != 2:
+            raise ValueError(
+                f"Unsupported checkpoint version {manifest.get('pyinc_ckpt_version')!r}; "
+                "expected 2."
+            )
+        self._checkpoint_load_store = store
+        self._checkpoint_query_records.clear()
+        self._checkpoint_resource_probes.clear()
+        for record_dict in manifest["records"]:
+            kind = record_dict["kind"]
+            ck_key = NodeKey(
+                kind=kind,
+                identity=record_dict["identity"],
+                args_digest=record_dict["args_digest"],
+                label=record_dict["label"],
+            )
+            if kind == "query":
+                self._checkpoint_query_records[ck_key] = record_dict
+            elif kind == "resource":
+                probe_bytes_hex = record_dict.get("probe_bytes")
+                if probe_bytes_hex:
+                    try:
+                        probe_snapshot = deserialize_snapshot(bytes.fromhex(probe_bytes_hex))
+                        probe_value = thaw(probe_snapshot)
+                        self._checkpoint_resource_probes[ck_key] = (
+                            probe_value,
+                            record_dict["snapshot_digest"],
+                        )
+                    except (UnsupportedValueError, ValueError):
+                        pass
+
+    def _try_warm_from_checkpoint(
+        self, query: Any, key: NodeKey, call_snapshot: Any
+    ) -> bool:
+        """Try to warm *key* from the checkpoint. Returns True if the record was loaded."""
+        ckpt = self._checkpoint_query_records.get(key)
+        if ckpt is None:
+            return False
+        if ckpt.get("is_untracked"):
+            return False
+        for dep in ckpt["deps"]:
+            if not self._verify_checkpoint_dep(dep):
+                return False
+        snapshot = self._load_snapshot_from_store(ckpt["snapshot_digest"])
+        if snapshot is None:
+            return False
+        changed_order: int = ckpt["changed_order"]
+        self._records[key] = NodeRecord(
+            key=key,
+            label=key.label,
+            snapshot=snapshot,
+            digest=ckpt["snapshot_digest"],
+            changed_at=changed_order,
+            verified_at=self._revision,
+            last_decision="reused",
+            last_recompute="reused",
+            reason="restored from checkpoint",
+            checked_in_request=self._current_request_id(),
+        )
+        self._query_records.add(key)
+        self._query_objects()[key.identity] = query
+        self._call_snapshots()[key] = call_snapshot
+        return True
+
+    def _warm_checkpoint_dep_query(self, dep_key: NodeKey) -> bool:
+        """Warm a checkpoint query dep without having its Query callable."""
+        if dep_key in self._records:
+            return True
+        ckpt = self._checkpoint_query_records.get(dep_key)
+        if ckpt is None:
+            return False
+        if ckpt.get("is_untracked"):
+            return False
+        for dep in ckpt["deps"]:
+            if not self._verify_checkpoint_dep(dep):
+                return False
+        snapshot = self._load_snapshot_from_store(ckpt["snapshot_digest"])
+        if snapshot is None:
+            return False
+        changed_order = ckpt["changed_order"]
+        self._records[dep_key] = NodeRecord(
+            key=dep_key,
+            label=dep_key.label,
+            snapshot=snapshot,
+            digest=ckpt["snapshot_digest"],
+            changed_at=changed_order,
+            verified_at=changed_order,
+            last_decision="reused",
+            last_recompute="reused",
+            reason="restored from checkpoint (dep)",
+            checked_in_request=-1,
+            checkpoint_loaded=True,
+        )
+        self._query_records.add(dep_key)
+        return True
+
+    def _verify_checkpoint_dep(self, dep: dict[str, Any]) -> bool:
+        dep_kind = dep["kind"]
+        if dep_kind == "input":
+            return self._verify_checkpoint_input_dep(dep)
+        if dep_kind == "query":
+            return self._verify_checkpoint_query_dep(dep)
+        if dep_kind == "resource":
+            return self._verify_checkpoint_resource_dep(dep)
+        return False
+
+    def _verify_checkpoint_input_dep(self, dep: dict[str, Any]) -> bool:
+        input_key = self._find_input_node_by_name(dep["name"])
+        if input_key is None:
+            return False
+        record = self._records.get(input_key)
+        if record is None:
+            return False
+        return record.digest == dep["digest"]
+
+    def _verify_checkpoint_query_dep(self, dep: dict[str, Any]) -> bool:
+        dep_key = NodeKey(
+            kind="query",
+            identity=dep["identity"],
+            args_digest=dep["args_digest"],
+            label=dep["label"],
+        )
+        record = self._records.get(dep_key)
+        if record is not None:
+            return record.digest == dep["digest"]
+        return self._warm_checkpoint_dep_query(dep_key) and (
+            self._records[dep_key].digest == dep["digest"]
+        )
+
+    def _verify_checkpoint_resource_dep(self, dep: dict[str, Any]) -> bool:
+        dep_key = NodeKey(
+            kind="resource",
+            identity=dep["identity"],
+            args_digest=dep["args_digest"],
+            label=dep["label"],
+        )
+        record = self._records.get(dep_key)
+        if record is not None:
+            return record.digest == dep["digest"]
+        # A probe hint is available — actual probe verification happens lazily
+        # inside _refresh_resource when the resource is first accessed.
+        return dep_key in self._checkpoint_resource_probes
+
+    def _load_snapshot_from_store(self, digest: str) -> Snapshot | None:
+        store = self._store or self._checkpoint_load_store
+        if store is None:
+            return None
+        with self._allow_raw_reads_scope():
+            payload = store.get(digest)
+        if payload is None:
+            return None
+        try:
+            return deserialize_snapshot(payload)
+        except (UnsupportedValueError, ValueError):
+            return None
+
+    def _persist_snapshot_to(self, snapshot: Snapshot, store: ArtifactStore) -> None:
+        digest = fingerprint_snapshot(snapshot)
+        if store.contains(digest):
+            return
+        payload = serialize_snapshot(snapshot)
+        with self._allow_raw_reads_scope():
+            store.put(digest, payload)
+
+    def _find_input_node_by_name(self, name: str) -> NodeKey | None:
+        from .core import Input
+        for input_obj, key in self._input_records.items():
+            if isinstance(input_obj, Input) and input_obj.name == name:
+                return key
+        return None
+
+    def _input_name_for_key(self, key: NodeKey) -> str:
+        from .core import Input
+        for input_obj, nk in self._input_records.items():
+            if nk == key and isinstance(input_obj, Input):
+                return input_obj.name
+        label = key.label
+        if label.startswith("input[") and label.endswith("]"):
+            return label[6:-1]
+        return label
 
     def _read_input(self, input_key: Input[T]) -> T:
         key = self._input_key(input_key)
@@ -794,12 +1109,15 @@ class Database:
         if record is None:
             return True
         if key.kind == "query":
-            query = record.key.identity
-            query_obj = self._query_objects().get(query)
+            query_obj = self._query_objects().get(key.identity)
             call_snapshot = self._call_snapshots().get(key)
             if query_obj is None or call_snapshot is None:
-                return True
-            self._ensure_query(query_obj, key, call_snapshot)
+                # If the record was warmed from a checkpoint without a Query object it was
+                # pre-verified at warm time — rely on changed_at comparison below.
+                if not record.checkpoint_loaded:
+                    return True
+            else:
+                self._ensure_query(query_obj, key, call_snapshot)
         elif key.kind == "resource":
             resource_pair = self._resource_objects().get(key)
             if resource_pair is None:
@@ -828,6 +1146,28 @@ class Database:
             record.checked_in_request = current_request
             self._stats["resource_probe_hits"] += 1
             return
+        # Scope-B: if this resource has a checkpoint probe hint and the probe matches,
+        # restore its snapshot from the store without performing a full load.
+        if record is None and key in self._checkpoint_resource_probes:
+            expected_probe, expected_digest = self._checkpoint_resource_probes[key]
+            if probe == expected_probe:
+                snapshot = self._load_snapshot_from_store(expected_digest)
+                if snapshot is not None:
+                    self._records[key] = NodeRecord(
+                        key=key,
+                        label=key.label,
+                        snapshot=snapshot,
+                        digest=expected_digest,
+                        changed_at=self._revision,
+                        verified_at=self._revision,
+                        last_decision="reused",
+                        last_recompute="reused",
+                        reason="restored from checkpoint",
+                        probe=probe,
+                        checked_in_request=current_request,
+                    )
+                    self._stats["resource_probe_hits"] += 1
+                    return
         if record is None:
             changed_at = self._revision
         else:
