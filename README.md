@@ -9,11 +9,33 @@
 pip install pyinc
 ```
 
-Python is mutable by default, identity-heavy, and full of hidden side effects. These properties make incremental computation unsound in practice: cached results silently depend on mutated state, untracked file reads, and object identity that the cache cannot see.
+`pyinc` is a pull-based incremental query kernel for Python. It memoizes the
+results of decorated functions, captures their dependencies as they execute,
+and on the next request re-runs only the work whose declared inputs actually
+changed. The design space is the one occupied by Salsa, Jane Street
+Incremental, and Bazel/Skyframe, adapted to the constraints of Python:
+mutable defaults, hidden ambient I/O, and pervasive object identity.
 
-`pyinc` is a correctness-first incremental computation engine that solves this problem. It is a pure-Python, stdlib-only query kernel in the design space of Salsa, Jane Street Incremental, and Bazel/Skyframe — but designed specifically for the challenges Python creates.
+The library is pure-Python and stdlib-only, with zero runtime dependencies.
 
-The `pyinc` v1.x line is stable. `pyinc` 1.0.1 ships the stable v1 kernel contract and public integration surface under semver, within the soundness envelope documented in [docs/kernel-contract.md](docs/kernel-contract.md).
+## What pyinc is for
+
+Programs in Python that cache derived results usually invalidate by hand: a
+watcher that clears a dict, a hash compared at the start of a function, a
+"stale?" boolean updated at known points. Every shortcut of that shape has a
+failure mode in which a real input changed but the cache did not notice, and
+the program silently uses a stale value.
+
+`pyinc` exists so that class of problem can be solved without the caller
+having to reason about invalidation. The user declares base inputs, declares
+resources for external state (files, environment variables, directories),
+and writes queries as ordinary Python functions decorated with `@query`. The
+runtime captures the dependency graph as queries execute, stores frozen
+snapshots of every value crossing a cached boundary, and re-validates
+dependencies top-down on each request. Anything whose recorded dependencies
+are unchanged is reused. Anything whose recomputation produces a
+semantically equal result is *backdated*, so downstream consumers stay valid
+without re-running.
 
 ## Quick example
 
@@ -41,87 +63,193 @@ result = db.get(parse_names, "/tmp/names.txt")   # reuses memo — file unchange
 # In strict mode, returned values are frozen — mutation raises TypeError.
 ```
 
-See `examples/correctness_demo.py` for a full walkthrough of backdating (early cutoff), mutation protection, untracked read enforcement, and provenance inspection. `examples/undeclared_imports.py`, `examples/applicable_requirements.py`, and `examples/symbol_lookup.py` demonstrate shipped integrations end-to-end on self-contained tempdir workspaces.
+See `examples/correctness_demo.py` for a walkthrough of backdating, mutation
+protection, untracked-read enforcement, and provenance inspection. The
+`examples/` directory also contains focused scripts for the push-observer
+and artifact-store APIs, the mutable-graph boundary, and several shipped
+integrations.
 
 ## What pyinc guarantees
 
-pyinc guarantees **from-scratch consistency** — the result of incremental evaluation matches a fresh evaluation on the same declared inputs and resources — when:
+`pyinc` guarantees **from-scratch consistency**: the result of incremental
+evaluation matches a fresh evaluation on the same declared inputs and
+resources. The guarantee holds when, and only when, three conditions hold:
 
-1. **Value boundary ownership**: all values crossing cached boundaries are snapshot-safe (frozen)
-2. **Tracked ambient reads**: all external state reads go through the Resource API
-3. **Deterministic queries**: given the same tracked dependencies, queries return semantically equal values
+1. **Value boundary ownership** — every value crossing a cached boundary is
+   snapshot-safe: an immutable scalar, a tuple, a container that `freeze`
+   can deep-convert (`list` → `tuple`, `dict` → `FrozenDict`, `set` →
+   `frozenset`, dataclass → `FrozenRecord`), or a value handled by a
+   registered `ValueAdapter`. Mutable graphs with shared identity or cycles
+   are supported via `FrozenGraph` / `FrozenRef` and round-trip through the
+   boundary without losing aliasing.
+2. **Tracked ambient reads** — every read of external state inside a query
+   goes through a `Resource` (or is explicitly declared via
+   `db.report_untracked_read(reason)`). The runtime intercepts
+   `builtins.open`, `io.open`, `os.getenv`, `os.environ`, `os.listdir`,
+   `os.scandir`, and `Path.iterdir` while a query is executing, and raises
+   `UntrackedReadError` on uses that escape this protocol.
+3. **Deterministic queries** — given the same tracked dependencies, a query
+   returns a semantically equal value. Mutable closure or global captures in
+   a query definition are rejected at decoration time so memo reuse cannot
+   silently depend on hidden Python object mutation.
 
-The full contract, including explicit limitations and escape hatches, is in [docs/kernel-contract.md](docs/kernel-contract.md).
+The full contract — the soundness envelope, the three execution modes, the
+explicit out-of-scope cases, and the documented escape hatches — is in
+[docs/kernel-contract.md](docs/kernel-contract.md).
 
-## Current scope
+## Kernel surface
 
-- `@query` for derived values, `Input` for explicit base leaves
-- optional `eq=` and `cutoff=` policies for custom equivalence and backdating (early cutoff)
-- `ValueAdapter` for custom snapshot-safe boundary types
-- `FileResource`, `FileStatResource`, `EnvResource`, and `DirectoryResource` for tracked external reads
-- pull-based recomputation with revisions, dependency capture, red-green verification, and backdating (early cutoff)
-- `strict`, `checked`, and `fast` execution modes with explicit boundary semantics
-- optional bounded query memoization via `Database(max_query_nodes=...)`
-- `Database.set_many(...)` for atomic batch invalidation of multiple inputs (single revision bump)
-- `Database.dependency_graph()` for machine-readable graph export of all nodes and edges
-- `Database.inspect(...)` for structured provenance and `Database.explain(...)` for human-readable formatting
-- `Database.statistics()` for aggregate counters and `Database.query_profile()` for per-query timing
+- `@query` for derived values, `Input` for explicit base leaves, optional
+  `eq=` / `cutoff=` policies for custom equivalence and backdating, and
+  `ValueAdapter` for custom snapshot-safe boundary types.
+- `FileResource`, `FileStatResource`, `EnvResource`, and `DirectoryResource`
+  for tracked external reads.
+- Pull-based recomputation with revisions, dependency capture, red-green
+  verification, and backdating (early cutoff) on semantic equality.
+- `strict`, `checked`, and `fast` execution modes with explicit boundary
+  semantics.
+- Bounded query memoization via `Database(max_query_nodes=...)` (LRU at
+  top-level request boundaries; inputs and resources stay resident).
+- Atomic batch invalidation via `Database.set_many(...)` (single revision
+  bump for any number of input updates).
+- `Database.dependency_graph()` for a machine-readable export of all nodes
+  and edges; `Database.inspect(...)` and `Database.explain(...)` for
+  per-node provenance, observational and human-readable respectively;
+  `Database.statistics()` and `Database.query_profile()` for aggregate
+  counters and per-query timing.
+- `Database.observe(callback, query, *args, **kwargs)` for push observers
+  on query nodes. Events are delivered as `QueryChangeEvent` after the
+  outermost request scope completes (so callbacks may safely re-enter the
+  database) and fire only on `executed` decisions; `reused` and
+  `backdated` decisions do not fire because the stored value did not move.
+- Mutable object graphs across cached boundaries via `FrozenGraph` and
+  `FrozenRef` snapshot variants. `freeze` memoizes mutable containers by
+  id; `thaw` reconstructs identity faithfully via two-pass
+  allocate-then-fill so a list-with-itself round-trips to an actual
+  self-referential list. Pure trees pay no overhead and retain the flat
+  snapshot shape.
+- Content-addressed artifact storage via the `ArtifactStore` Protocol, with
+  `InMemoryArtifactStore` and `FileSystemArtifactStore` implementations.
+  Passing `Database(store=...)` writes the serialized snapshot bytes for
+  every value crossing the membrane, keyed by its `fingerprint_snapshot`
+  digest. `serialize_snapshot` and `deserialize_snapshot` expose the byte
+  form to external callers and round-trip the full snapshot grammar.
+- `Database` is thread-safe for concurrent use across instances and on a
+  single shared instance. The ambient-read guard is installed once globally
+  and dispatches per-context, so threads inside queries on different
+  databases do not interfere with each other's enforcement.
 
 ## Integrations
 
-- `pyinc.integrations.python_source` — workspace-local module discovery, top-level imports/definitions, simple assignment tracking for export surfaces, conservative import resolution with `workspace`/`stdlib`/`installed`/`missing`/`ambiguous` outcomes (stdlib and installed classification via composition with `installed_packages`; installed imports' `resolved_path` is populated via `deep_module_resolution`).
-- `pyinc.integrations.toml_config` — single-file TOML inspection: section/key extraction, dependency and optional-dependency discovery, tool config discovery.
-- `pyinc.integrations.requirements_txt` — narrow requirements parsing: normalized requirement specs, file references, index directives, editable installs, URL requirements. Includes `deep_requirements_analysis` for recursive `-r`/`--requirement` file following with cycle detection.
-- `pyinc.integrations.installed_packages` — installed package discovery via `importlib.metadata`-compatible `.dist-info` directories, stdlib module identification via `sys.stdlib_module_names`, and import name resolution (`stdlib`/`installed`/`unknown`).
-- `pyinc.integrations.deep_module_resolution` — deep module path resolution: `sys.path` walking, `.pth` file processing with backdating on whitespace/comment edits, PEP 420 namespace package collection, and dotted-name → file resolution. Exposes `resolve_module_path` for per-module queries and `deep_module_resolution_analysis` for a workspace-wide snapshot.
-- `pyinc.integrations.json_config` — single-file JSON inspection: section/key extraction with type detection, nested object traversal, parse error diagnostics.
-- `pyinc.integrations.dependency_check` — cross-integration dependency validation: composes `installed_packages` and `python_source` to detect undeclared imports and missing packages.
-- `pyinc.integrations.env_file` — `.env` file parsing: key-value extraction with quoted/unquoted values, `export` prefix handling, interpolation reference detection.
-- `pyinc.integrations.xml_config` — XML file inspection via `xml.etree.ElementTree`: element/attribute extraction, dot-path traversal, namespace-aware tag normalization.
-- `pyinc.integrations.csv_data` — CSV/TSV structural analysis via stdlib `csv`: header detection, column discovery, delimiter sniffing, row counting, inconsistent column diagnostics.
-- `pyinc.integrations.requirement_evaluation` — PEP 440 version specifier satisfaction and PEP 508 environment marker evaluation; composes with `requirements_txt` and `installed_packages` to surface the effective applicable/satisfied requirement set for the current Python environment. Exposes `evaluate_markers`, `evaluate_version_specifier`, and `applicable_requirements`.
-- `pyinc.integrations.symbol_resolution` — workspace-wide symbol tables (module-level + class-level), cross-module re-export following with cycle detection, type-annotation text extraction via `ast.unparse` (no type evaluation), and a workspace-wide reverse-reference index for a given qualified name. Exposes `module_symbol_table`, `resolve_symbol`, `workspace_symbol_index`, and `find_references`.
-- `pyinc.integrations.notebook` — Jupyter `.ipynb` analysis via stdlib `json`: per-cell type/source/heading extraction, per-cell AST imports/definitions for code cells, and cutoff-based backdating that ignores `outputs` and `execution_count` so re-running cells does not invalidate downstream consumers. Exposes `notebook_analysis` and `workspace_notebook_analysis`. Added in the v2 development cycle.
+`pyinc.integrations` ships narrow, stdlib-only integrations that compose at
+the query layer. The kernel tracks cross-integration calls as ordinary
+dependency edges; no extra wiring is required.
 
-`pyinc.integrations` re-exports only the stable dataclass/result types and high-level entrypoints for these integrations. Low-level payload queries, decode helpers, and resource helpers remain experimental in their defining submodules.
+- `python_source` — workspace-local module discovery, top-level imports and
+  definitions, simple assignment tracking for export surfaces, and
+  conservative import resolution with `workspace` / `stdlib` / `installed` /
+  `missing` / `ambiguous` outcomes (stdlib and installed classification via
+  composition with `installed_packages`; installed imports'
+  `resolved_path` populated via `deep_module_resolution`).
+- `toml_config` — single-file TOML inspection: section and key extraction,
+  dependency and optional-dependency discovery, and tool-config discovery.
+- `requirements_txt` — requirements parsing: normalized requirement specs,
+  file references, index directives, editable installs, URL requirements,
+  and `deep_requirements_analysis` for recursive `-r` / `--requirement`
+  file following with cycle detection.
+- `installed_packages` — installed package discovery via
+  `importlib.metadata`-compatible `.dist-info` directories, stdlib module
+  identification via `sys.stdlib_module_names`, and import-name resolution
+  (`stdlib` / `installed` / `unknown`).
+- `deep_module_resolution` — `sys.path` walking, `.pth` file processing
+  with backdating on whitespace and comment-only edits, PEP 420 namespace
+  package collection, and dotted-name → file resolution. Exposes
+  `resolve_module_path` and `deep_module_resolution_analysis`.
+- `json_config` — single-file JSON inspection: section and key extraction
+  with type detection, nested-object traversal, and parse-error
+  diagnostics.
+- `dependency_check` — cross-integration dependency validation: composes
+  `installed_packages` and `python_source` to detect undeclared imports
+  and missing or version-mismatched packages.
+- `env_file` — `.env` file parsing: key/value extraction with quoted and
+  unquoted values, `export` prefix handling, and interpolation-reference
+  detection.
+- `xml_config` — XML inspection via `xml.etree.ElementTree`: element and
+  attribute extraction, dot-path traversal, and namespace-aware tag
+  normalization.
+- `csv_data` — CSV/TSV structural analysis via stdlib `csv`: header
+  detection, column discovery, delimiter sniffing, row counting, and
+  inconsistent-column diagnostics.
+- `requirement_evaluation` — PEP 440 version-specifier satisfaction and
+  PEP 508 environment-marker evaluation; composes with `requirements_txt`
+  and `installed_packages` to surface the effective applicable and
+  satisfied requirement set for the current Python environment.
+- `symbol_resolution` — workspace-wide symbol tables (module-level and
+  class-level), cross-module re-export following with cycle detection,
+  type-annotation text extraction via `ast.unparse` (no type evaluation),
+  and a workspace-wide reverse-reference index for a given qualified
+  name.
+- `notebook` — Jupyter `.ipynb` analysis via stdlib `json`: per-cell
+  type, source, and heading extraction; per-cell AST imports and
+  definitions for code cells; and cutoff-based backdating that ignores
+  `outputs` and `execution_count`, so re-running cells does not invalidate
+  downstream consumers.
+
+`pyinc.integrations` re-exports only the stable dataclass and result types
+and the high-level entrypoints. Low-level payload queries, decode helpers,
+and resource helpers remain experimental in their defining submodules.
 
 ## Verification
 
-- The runtime contract is summarized in [docs/kernel-contract.md](docs/kernel-contract.md).
-- The repo includes dedicated test modules for value semantics, runtime behavior, provenance/explanation formatting, property-based from-scratch consistency, and each shipped integration.
-- The integration suites exercise `strict`, `checked`, and `fast` modes and compare incremental results against fresh recomputation over edit sequences.
+- The kernel contract is summarized in
+  [docs/kernel-contract.md](docs/kernel-contract.md).
+- The repository includes dedicated test modules for value semantics,
+  runtime behavior, provenance and explanation formatting, property-based
+  from-scratch consistency checks, and each shipped integration.
+- The integration suites exercise `strict`, `checked`, and `fast` modes
+  and compare incremental results against fresh recomputation over edit
+  sequences.
 
-The integration boundary is summarized in [docs/integration-contract.md](docs/integration-contract.md).
+The integration boundary is summarized in
+[docs/integration-contract.md](docs/integration-contract.md).
 
 ## Diagnostics and escape hatches
 
-- `Database.inspect(...)` is observational. It returns the last recorded provenance tree for that query key and does not force a fresh revalidation pass by itself. Use `Database.inspect_fresh(...)` when you need the tree after re-verification. See `examples/inspect_fresh_demo.py`.
-- Query identity includes the function definition payload. If you capture ambient values, those captures are part of the query fingerprint, and mutable closure/global captures are rejected. Run `pyinc.explain_query_captures(fn)` before the first `db.get(...)` to see how each capture will be classified. See `examples/capture_diagnostics.py`.
-- `Database.report_untracked_read(...)` is an explicit impurity escape hatch. It marks that query as always re-executing and disables backdating for that node, which is the right trade when a dependency is real but not resource-trackable. See `examples/untracked_escape_hatch.py`.
-- Unsupported ambient-capture failures now point back to `pyinc.explain_query_captures(...)` so you can diagnose the rejection before rewriting the query shape.
+- `Database.inspect(...)` is observational: it returns the last recorded
+  provenance tree for a query key without forcing a fresh revalidation
+  pass. `Database.inspect_fresh(...)` runs verification first and then
+  returns the tree. See `examples/inspect_fresh_demo.py`.
+- Query identity includes the function-definition payload. Captured
+  ambient values contribute to the query fingerprint; mutable closure or
+  global captures are rejected. Run `pyinc.explain_query_captures(fn)`
+  before the first `db.get(...)` to see how each capture will be
+  classified. See `examples/capture_diagnostics.py`.
+- `Database.report_untracked_read(reason)` is an explicit impurity escape
+  hatch. It marks the current query as always re-executing and disables
+  backdating for that node, which is the right trade-off when a dependency
+  is real but not resource-trackable. See
+  `examples/untracked_escape_hatch.py`.
 - The package ships inline typing metadata via `py.typed`.
 
-## Not supported (in the kernel)
+## Consumer tooling
 
-- LSP wiring inside `src/pyinc`
-- Push-based filesystem watchers inside `src/pyinc`
+LSP wiring and push-based filesystem watchers are deliberately out of scope
+for the kernel package. They live in a separate consumer layer,
+`pyinc_tools`, that builds only on the stable `pyinc.integrations` public
+surface:
 
-These are architectural non-goals for v1. pyinc is a pull-based kernel; LSP servers
-and push-based watchers belong to a consumer tool built on top of pyinc, not to the
-kernel itself. See [docs/architecture.md](docs/architecture.md) for the v1 scope boundary.
+- `pyinc-tools analyze <root>` runs one-shot or threaded `--watch`
+  workspace analysis via a polling watcher.
+- `pyinc-tools lsp` runs a stdio LSP server with document and workspace
+  symbols, diagnostics, hover, goto-definition, and find-references, all
+  backed by `pyinc.integrations.symbol_resolution`. The server starts a
+  threaded filesystem watcher by default so external edits (e.g.
+  `git pull`, formatter scripts) publish fresh diagnostics even when the
+  editor does not emit `workspace/didChangeWatchedFiles`.
 
-The repository ships that consumer boundary as a separate tooling layer in
-`pyinc_tools`, not in `src/pyinc`. Use `pyinc-tools analyze ...` for one-shot or
-threaded `--watch` analysis via the polling watcher, or `pyinc-tools lsp` for
-stdio LSP with document symbols, workspace symbols, diagnostics, hover,
-goto-definition, and find-references (all backed by
-`pyinc.integrations.symbol_resolution` for cross-module re-export following).
-The LSP server starts a threaded filesystem watcher by default so external
-edits (git pull, formatter scripts) publish fresh diagnostics even when the
-editor does not emit `workspace/didChangeWatchedFiles`. See
-[docs/pyinc-tools-guide.md](docs/pyinc-tools-guide.md) for install, editor
-wiring (Neovim, Emacs, VS Code note), the overlay model, and a
-supported-vs.-not-yet reference.
+See [docs/pyinc-tools-guide.md](docs/pyinc-tools-guide.md) for install,
+editor wiring, the overlay model, and the supported-vs.-not-yet feature
+table.
 
 ## Development
 
@@ -135,4 +263,9 @@ python3 -m mypy src tests
 python3 -m ruff check src tests
 ```
 
-The runtime contract is summarized in [docs/kernel-contract.md](docs/kernel-contract.md). Integration API boundaries are summarized in [docs/integration-contract.md](docs/integration-contract.md). A guide for building new integrations is at [docs/integration-authoring.md](docs/integration-authoring.md).
+The kernel contract is summarized in
+[docs/kernel-contract.md](docs/kernel-contract.md). Integration API
+boundaries are summarized in
+[docs/integration-contract.md](docs/integration-contract.md). A guide to
+authoring new integrations is at
+[docs/integration-authoring.md](docs/integration-authoring.md).
