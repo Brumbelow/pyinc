@@ -317,10 +317,11 @@ def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
                 if isinstance(stmt, ast.Import):
                     for alias in stmt.names:
                         bound_names.add(_bound_name_for_import(alias))
-                elif isinstance(stmt, ast.ImportFrom):
-                    if not any(alias.name == "*" for alias in stmt.names):
-                        for alias in stmt.names:
-                            bound_names.add(_bound_name_for_from_import(alias))
+                elif isinstance(stmt, ast.ImportFrom) and not any(
+                    alias.name == "*" for alias in stmt.names
+                ):
+                    for alias in stmt.names:
+                        bound_names.add(_bound_name_for_from_import(alias))
             continue
 
         if _contains_name(node, "__all__"):
@@ -647,9 +648,9 @@ def import_statements_for_file(db: Database, path: str) -> tuple[ImportStatement
                     tuple(alias.name for alias in node.names),
                 )
             )
-        elif isinstance(node, ast.If) and _is_type_checking_test(node.test):
-            _collect_import_statements(node.body, statements)
-        elif isinstance(node, ast.Try) and _has_import_error_handler(node.handlers):
+        elif (isinstance(node, ast.If) and _is_type_checking_test(node.test)) or (
+            isinstance(node, ast.Try) and _has_import_error_handler(node.handlers)
+        ):
             _collect_import_statements(node.body, statements)
     return tuple(statements)
 

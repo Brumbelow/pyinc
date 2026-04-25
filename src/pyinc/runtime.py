@@ -869,7 +869,8 @@ class Database:
         record = self._records.get(input_key)
         if record is None:
             return False
-        return record.digest == dep["digest"]
+        expected_digest: str = dep["digest"]
+        return record.digest == expected_digest
 
     def _verify_checkpoint_query_dep(self, dep: dict[str, Any]) -> bool:
         dep_key = NodeKey(
@@ -878,11 +879,12 @@ class Database:
             args_digest=dep["args_digest"],
             label=dep["label"],
         )
+        expected_digest: str = dep["digest"]
         record = self._records.get(dep_key)
         if record is not None:
-            return record.digest == dep["digest"]
+            return record.digest == expected_digest
         return self._warm_checkpoint_dep_query(dep_key) and (
-            self._records[dep_key].digest == dep["digest"]
+            self._records[dep_key].digest == expected_digest
         )
 
     def _verify_checkpoint_resource_dep(self, dep: dict[str, Any]) -> bool:
@@ -892,9 +894,10 @@ class Database:
             args_digest=dep["args_digest"],
             label=dep["label"],
         )
+        expected_digest: str = dep["digest"]
         record = self._records.get(dep_key)
         if record is not None:
-            return record.digest == dep["digest"]
+            return record.digest == expected_digest
         # A probe hint is available — actual probe verification happens lazily
         # inside _refresh_resource when the resource is first accessed.
         return dep_key in self._checkpoint_resource_probes
