@@ -273,3 +273,162 @@ def test_filesystem_store_atomic_write_uses_temporary_file(tmp_path: Path) -> No
     # No temp files should remain after the put completes.
     leftover = [name for name in os.listdir(target_dir) if name.startswith(".tmp-") or name.startswith("tmp")]
     assert leftover == []
+
+
+# ---------------------------------------------------------------------------
+# Group F: Scope-B checkpoint API (save_checkpoint / load_checkpoint)
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_save_requires_store() -> None:
+    db = Database()
+    with pytest.raises(ValueError, match="ArtifactStore"):
+        db.save_checkpoint()
+
+
+def test_checkpoint_load_requires_store() -> None:
+    db = Database()
+    with pytest.raises(ValueError, match="ArtifactStore"):
+        db.load_checkpoint("ck" + "0" * 64)
+
+
+def test_checkpoint_load_missing_key_raises_key_error() -> None:
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+    with pytest.raises(KeyError):
+        db.load_checkpoint("ck" + "0" * 64)
+
+
+def test_checkpoint_basic_round_trip() -> None:
+    p = Input[int]("ckp_num")
+
+    @query
+    def ckp_doubled(db: Database) -> int:
+        return p.read(db) * 2
+
+    store = InMemoryArtifactStore()
+    db1 = Database(store=store)
+    db1.set(p, 21)
+    assert db1.get(ckp_doubled) == 42
+
+    ck_key = db1.save_checkpoint()
+    assert ck_key.startswith("ck")
+
+    db2 = Database(store=store)
+    db2.set(p, 21)
+    db2.load_checkpoint(ck_key)
+    assert db2.get(ckp_doubled) == 42
+
+    node = db2.inspect(ckp_doubled)
+    assert node.last_recompute == "reused"
+
+
+def test_checkpoint_invalidated_by_changed_input() -> None:
+    p = Input[int]("ckp_seed")
+
+    @query
+    def ckp_tripled(db: Database) -> int:
+        return p.read(db) * 3
+
+    store = InMemoryArtifactStore()
+    db1 = Database(store=store)
+    db1.set(p, 7)
+    assert db1.get(ckp_tripled) == 21
+    ck_key = db1.save_checkpoint()
+
+    db2 = Database(store=store)
+    db2.set(p, 8)  # different input
+    db2.load_checkpoint(ck_key)
+    assert db2.get(ckp_tripled) == 24  # re-executed with new input
+
+    node = db2.inspect(ckp_tripled)
+    assert node.last_recompute == "executed"
+
+
+def test_checkpoint_key_is_content_addressed() -> None:
+    p = Input[int]("ckp_x")
+
+    @query
+    def ckp_identity(db: Database) -> int:
+        return p.read(db)
+
+    store = InMemoryArtifactStore()
+
+    db1 = Database(store=store)
+    db1.set(p, 5)
+    db1.get(ckp_identity)
+    key1 = db1.save_checkpoint()
+
+    db2 = Database(store=store)
+    db2.set(p, 5)
+    db2.get(ckp_identity)
+    key2 = db2.save_checkpoint()
+
+    assert key1 == key2
+
+
+def test_checkpoint_filesystem_store_cross_instance(tmp_path: Path) -> None:
+    p = Input[str]("ckp_text")
+
+    @query
+    def ckp_upper(db: Database) -> str:
+        return p.read(db).upper()
+
+    store = FileSystemArtifactStore(tmp_path)
+    db1 = Database(store=store)
+    db1.set(p, "hello")
+    assert db1.get(ckp_upper) == "HELLO"
+    ck_key = db1.save_checkpoint()
+
+    store2 = FileSystemArtifactStore(tmp_path)
+    db2 = Database(store=store2)
+    db2.set(p, "hello")
+    db2.load_checkpoint(ck_key)
+    assert db2.get(ckp_upper) == "HELLO"
+    assert db2.inspect(ckp_upper).last_recompute == "reused"
+
+
+def test_checkpoint_chain_of_queries() -> None:
+    p = Input[int]("ckp_base")
+
+    @query
+    def ckp_step1(db: Database) -> int:
+        return p.read(db) + 1
+
+    @query
+    def ckp_step2(db: Database) -> int:
+        return ckp_step1(db) * 10
+
+    store = InMemoryArtifactStore()
+    db1 = Database(store=store)
+    db1.set(p, 4)
+    assert db1.get(ckp_step2) == 50  # (4+1)*10
+    ck_key = db1.save_checkpoint()
+
+    db2 = Database(store=store)
+    db2.set(p, 4)
+    db2.load_checkpoint(ck_key)
+    assert db2.get(ckp_step2) == 50
+
+    assert db2.inspect(ckp_step2).last_recompute == "reused"
+    assert db2.inspect(ckp_step1).last_recompute == "reused"
+
+
+def test_checkpoint_store_passed_to_save_and_load_directly() -> None:
+    p = Input[int]("ckp_direct")
+
+    @query
+    def ckp_sq(db: Database) -> int:
+        return p.read(db) ** 2
+
+    store = InMemoryArtifactStore()
+    db1 = Database()  # no store configured
+    db1.set(p, 6)
+    db1.get(ckp_sq)
+    ck_key = db1.save_checkpoint(store=store)
+
+    db2 = Database()  # no store configured
+    db2.set(p, 6)
+    db2.load_checkpoint(ck_key, store=store)
+    assert db2.get(ckp_sq) == 36
+    assert db2.inspect(ckp_sq).last_recompute == "reused"

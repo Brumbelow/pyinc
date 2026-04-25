@@ -312,6 +312,18 @@ def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
         if isinstance(node, ast.Pass):
             continue
 
+        if isinstance(node, ast.Try) and _has_import_error_handler(node.handlers):
+            for stmt in node.body:
+                if isinstance(stmt, ast.Import):
+                    for alias in stmt.names:
+                        bound_names.add(_bound_name_for_import(alias))
+                elif isinstance(stmt, ast.ImportFrom) and not any(
+                    alias.name == "*" for alias in stmt.names
+                ):
+                    for alias in stmt.names:
+                        bound_names.add(_bound_name_for_from_import(alias))
+            continue
+
         if _contains_name(node, "__all__"):
             static_all_names = None
             _append_unique(impurity_reasons, "dynamic __all__")
@@ -584,6 +596,22 @@ def _is_type_checking_test(test: ast.expr) -> bool:
     )
 
 
+def _has_import_error_handler(handlers: list[ast.ExceptHandler]) -> bool:
+    """Return True if any handler catches ImportError or ModuleNotFoundError."""
+    for handler in handlers:
+        exc_type = handler.type
+        if exc_type is None:
+            continue
+        if isinstance(exc_type, ast.Name) and exc_type.id in ("ImportError", "ModuleNotFoundError"):
+            return True
+        if isinstance(exc_type, ast.Tuple) and any(
+            isinstance(elt, ast.Name) and elt.id in ("ImportError", "ModuleNotFoundError")
+            for elt in exc_type.elts
+        ):
+            return True
+    return False
+
+
 def _collect_import_statements(
     body: list[ast.stmt], statements: list[ImportStatementPayload]
 ) -> None:
@@ -620,7 +648,9 @@ def import_statements_for_file(db: Database, path: str) -> tuple[ImportStatement
                     tuple(alias.name for alias in node.names),
                 )
             )
-        elif isinstance(node, ast.If) and _is_type_checking_test(node.test):
+        elif (isinstance(node, ast.If) and _is_type_checking_test(node.test)) or (
+            isinstance(node, ast.Try) and _has_import_error_handler(node.handlers)
+        ):
             _collect_import_statements(node.body, statements)
     return tuple(statements)
 

@@ -379,10 +379,29 @@ def _is_type_checking_test(test: ast.expr) -> bool:
     )
 
 
+def _has_import_error_handler(handlers: list[ast.ExceptHandler]) -> bool:
+    """Return True if any handler catches ImportError or ModuleNotFoundError."""
+    for handler in handlers:
+        exc_type = handler.type
+        if exc_type is None:
+            continue
+        if isinstance(exc_type, ast.Name) and exc_type.id in (
+            "ImportError",
+            "ModuleNotFoundError",
+        ):
+            return True
+        if isinstance(exc_type, ast.Tuple) and any(
+            isinstance(elt, ast.Name) and elt.id in ("ImportError", "ModuleNotFoundError")
+            for elt in exc_type.elts
+        ):
+            return True
+    return False
+
+
 def _type_checking_block_walk(
     body: list[ast.stmt], symbols: list[SymbolPayload]
 ) -> None:
-    """Collect import symbols from the body of an ``if TYPE_CHECKING:`` block."""
+    """Collect import symbols from a block — used for TYPE_CHECKING and try/except ImportError."""
     for stmt in body:
         if isinstance(stmt, ast.Import):
             for alias in stmt.names:
@@ -542,6 +561,9 @@ def _module_symbol_walk(
         if isinstance(node, (ast.Pass, ast.Expr)):
             continue
         if isinstance(node, ast.If) and _is_type_checking_test(node.test):
+            _type_checking_block_walk(node.body, symbols)
+            continue
+        if isinstance(node, ast.Try) and _has_import_error_handler(node.handlers):
             _type_checking_block_walk(node.body, symbols)
             continue
         _record_reason("conditional top-level binding")

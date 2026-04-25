@@ -1029,3 +1029,146 @@ def test_workspace_name_occurrence_index_skips_missing_syntax(tmp_path: Path) ->
     good_names = {entry[0] for entry in mapping[str(root / "good.py")]}
     assert "x" in good_names
     assert "print" in good_names
+
+
+# ---------------------------------------------------------------------------
+# try/except ImportError support
+# ---------------------------------------------------------------------------
+
+
+def test_import_error_try_imports_visible_in_symbol_table(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "mod.py"
+    path.write_text(
+        "try:\n"
+        "    import ujson\n"
+        "    from msgpack import pack\n"
+        "except ImportError:\n"
+        "    pass\n"
+        "def visible() -> int:\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    qnames = {sym.qualified_name for sym in table.symbols}
+    assert "ujson" in qnames
+    assert "pack" in qnames
+    assert "visible" in qnames
+    assert "conditional top-level binding" not in table.impurity_reasons
+
+    ujson_sym = next(s for s in table.symbols if s.qualified_name == "ujson")
+    assert ujson_sym.kind == "import_alias"
+    assert ujson_sym.import_source_module == "ujson"
+
+    pack_sym = next(s for s in table.symbols if s.qualified_name == "pack")
+    assert pack_sym.kind == "from_import_alias"
+    assert pack_sym.import_source_module == "msgpack"
+    assert pack_sym.import_source_name == "pack"
+
+
+def test_import_error_try_module_not_found_error(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "mod.py"
+    path.write_text(
+        "try:\n"
+        "    import tomllib\n"
+        "except ModuleNotFoundError:\n"
+        "    import tomli as tomllib\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    qnames = {sym.qualified_name for sym in table.symbols}
+    assert "tomllib" in qnames
+    assert "conditional top-level binding" not in table.impurity_reasons
+
+
+def test_import_error_try_tuple_handler(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "mod.py"
+    path.write_text(
+        "try:\n"
+        "    import rapidjson as json_impl\n"
+        "except (ImportError, ModuleNotFoundError):\n"
+        "    import json as json_impl\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    qnames = {sym.qualified_name for sym in table.symbols}
+    assert "json_impl" in qnames
+    assert "conditional top-level binding" not in table.impurity_reasons
+
+
+def test_import_error_try_with_other_conditional_still_records_impurity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "mod.py"
+    path.write_text(
+        "import sys\n"
+        "try:\n"
+        "    import ujson\n"
+        "except ImportError:\n"
+        "    pass\n"
+        "if sys.version_info >= (3, 12):\n"
+        "    x: int = 1\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    qnames = {sym.qualified_name for sym in table.symbols}
+    assert "ujson" in qnames
+    assert "x" not in qnames
+    assert "conditional top-level binding" in table.impurity_reasons
+
+
+def test_import_error_try_bare_except_records_impurity(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "mod.py"
+    path.write_text(
+        "try:\n"
+        "    import ujson\n"
+        "except:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    assert "conditional top-level binding" in table.impurity_reasons
+
+
+def test_resolve_symbol_from_import_error_try(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "helper.py").write_text("class FastParser:\n    pass\n", encoding="utf-8")
+    path = root / "consumer.py"
+    path.write_text(
+        "try:\n"
+        "    from helper import FastParser\n"
+        "except ImportError:\n"
+        "    FastParser = None  # type: ignore\n"
+        "def use_parser() -> None:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    table = module_symbol_table(db, root, path)
+    qnames = {sym.qualified_name for sym in table.symbols}
+    assert "FastParser" in qnames
+
+    result = resolve_symbol(db, root, path, "FastParser")
+    assert result.resolution == "workspace"
+    assert result.defining_path == str(root / "helper.py")

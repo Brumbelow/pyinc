@@ -96,7 +96,7 @@ Those names remain importable from their defining submodules, but they are exper
 
 - workspace-local module discovery rooted at the supplied directory
 - traversal is cycle-safe and constrained to real paths under the supplied root
-- top-level imports, top-level definitions, and simple top-level assignments for export-surface tracking
+- top-level imports, top-level definitions, and simple top-level assignments for export-surface tracking; imports inside `if TYPE_CHECKING:` and `try: … except ImportError/ModuleNotFoundError:` guard blocks at module top level are also collected
 - syntax diagnostics only
 - dependency invalidation based on resolved module export surfaces, including conservative static support for `from x import *`
 - import resolution with `workspace`, `stdlib`, `installed`, `missing`, and `ambiguous` outcomes
@@ -371,7 +371,9 @@ Scope:
 - type-annotation *text* extraction via `ast.unparse` (no type evaluation, no type checking)
 - installed-package lookups stop at the import boundary (`resolution="installed"`, `distribution_name`, `distribution_version`, `defining_path=None`)
 - dynamic `__all__` on the wildcard-provider side → `"ambiguous"` with `db.report_untracked_read`
-- conditional top-level binding (`if TYPE_CHECKING:`, top-level `For`, `While`, `Try`, `With`) → `impurity_reasons` includes `"conditional top-level binding"` and the binding produces no symbol
+- `if TYPE_CHECKING:` / `if typing.TYPE_CHECKING:` guard blocks at module top level: imports inside are collected as regular symbols; no impurity marker is set
+- `try: … except ImportError:` / `except ModuleNotFoundError:` / `except (ImportError, ModuleNotFoundError):` guard blocks at module top level: imports inside are collected as regular symbols; no impurity marker is set
+- other conditional top-level bindings (`if sys.version_info >= …`, top-level `For`, `While`, `Try` without recognised handler, `With`) → `impurity_reasons` includes `"conditional top-level binding"` and the binding produces no symbol
 - workspace-wide reference index composed over `name_occurrences_for_file` (full-AST `Name`/`Attribute` walk) and verified through `resolve_symbol_payload`; only workspace-resolved targets are indexed (stdlib / installed / ambiguous return empty with `ResolvedSymbol` carried)
 - entrypoints: `module_symbol_table`, `resolve_symbol`, `workspace_symbol_index`, `find_references`
 - result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`, `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`, `Reference`, `ReferenceQueryResult`
