@@ -38,7 +38,6 @@ from .value import (
 
 if TYPE_CHECKING:
     from .core import Input, Query
-    from .explain import InspectionNode
 
 
 Mode = str
