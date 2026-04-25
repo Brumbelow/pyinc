@@ -18,7 +18,6 @@ from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast, overload
 
 from .errors import CycleError, UnsupportedValueError, UntrackedReadError
-from .explain import InspectionNode, format_explanation
 from .store import ArtifactStore
 from .value import (
     FrozenAdapterValue,
@@ -39,6 +38,7 @@ from .value import (
 
 if TYPE_CHECKING:
     from .core import Input, Query
+    from .explain import InspectionNode
 
 
 Mode = str
