@@ -735,6 +735,10 @@ class Database:
                     probe_snapshot = freeze(record.probe)
                     entry["probe_bytes"] = serialize_snapshot(probe_snapshot).hex()
                 except (UnsupportedValueError, TypeError):
+                    # Probe hint is best-effort: if a resource's probe value
+                    # can't be serialised, the checkpoint still records the
+                    # snapshot digest and the resource will be re-probed on
+                    # load instead of relying on the cached probe match.
                     pass
             records_list.append(entry)
 
@@ -785,6 +789,9 @@ class Database:
                             record_dict["snapshot_digest"],
                         )
                     except (UnsupportedValueError, ValueError):
+                        # Skip unreadable probe hints; the resource will be
+                        # re-probed and the snapshot re-read at next access,
+                        # which is correct (just slower than reusing the hint).
                         pass
 
     def _try_warm_from_checkpoint(
