@@ -336,11 +336,39 @@ def test_fast_mode_uses_owned_values_without_mutation_detection() -> None:
         _, right = payload.read(db)
         return right["x"]
 
+    # Two independent dicts at the boundary — each thaws to its own owned copy
+    # in fast mode, so a mutation through `left` cannot reach `right`.
+    db = Database(mode="fast")
+    db.set(payload, ({"x": 1}, {"x": 1}))
+
+    assert db.get(mutate_left) == 1
+    assert db.get(read_right) == 1
+
+
+def test_fast_mode_preserves_shared_identity_across_boundary() -> None:
+    payload = Input[tuple[dict[str, int], dict[str, int]]]("payload")
+
+    @query
+    def mutate_left(db: Database) -> int:
+        left, right = payload.read(db)
+        left["x"] = 99
+        return right["x"]
+
+    @query
+    def read_right(db: Database) -> int:
+        _, right = payload.read(db)
+        return right["x"]
+
+    # In v2.0.0 the value membrane preserves shared identity across cached
+    # boundaries. Two slots pointing at the same dict thaw to the same dict, so
+    # an in-query mutation through one alias is observable through the other —
+    # the kernel's stored snapshot remains uncorrupted.
     shared = {"x": 1}
     db = Database(mode="fast")
     db.set(payload, (shared, shared))
 
-    assert db.get(mutate_left) == 1
+    assert db.get(mutate_left) == 99
+    # A separate query thaws fresh — the prior in-query mutation is gone.
     assert db.get(read_right) == 1
 
 

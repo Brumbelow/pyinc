@@ -24,19 +24,29 @@ from .runtime import (
     QueryProfile,
     Subscription,
 )
+from .store import (
+    ArtifactStore,
+    FileSystemArtifactStore,
+    InMemoryArtifactStore,
+)
 from .value import (
     FrozenAdapterValue,
     FrozenDict,
+    FrozenGraph,
     FrozenList,
     FrozenRecord,
+    FrozenRef,
     FrozenSet,
     ValueAdapter,
+    deserialize_snapshot,
     freeze,
     semantic_equal,
+    serialize_snapshot,
     thaw,
 )
 
 __all__ = [
+    "ArtifactStore",
     "CaptureInfo",
     "CycleError",
     "Database",
@@ -47,11 +57,15 @@ __all__ = [
     "FileResource",
     "FileStatResource",
     "FileStatSnapshot",
+    "FileSystemArtifactStore",
     "FrozenAdapterValue",
     "FrozenDict",
+    "FrozenGraph",
     "FrozenList",
     "FrozenRecord",
+    "FrozenRef",
     "FrozenSet",
+    "InMemoryArtifactStore",
     "Input",
     "InspectionNode",
     "MutationError",
@@ -64,9 +78,11 @@ __all__ = [
     "UnsupportedValueError",
     "UntrackedReadError",
     "ValueAdapter",
+    "deserialize_snapshot",
     "explain_query_captures",
     "freeze",
     "query",
     "semantic_equal",
+    "serialize_snapshot",
     "thaw",
 ]

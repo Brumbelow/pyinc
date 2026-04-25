@@ -206,10 +206,43 @@ def test_aliasing_mutation_boundaries_behave_by_mode(mode: str, values: list[int
 
     db = Database(mode=mode)
     for value in values:
+        # Two independent dicts at the boundary — identity is not preserved across
+        # the membrane unless the caller deliberately shared the input. See the
+        # companion test that exercises the shared-identity case.
+        db.set(payload, ({"x": value}, {"x": value}))
+        if mode == "fast":
+            assert db.get(mutate_left) == value
+            assert db.get(read_right) == value
+        else:
+            with pytest.raises((MutationError, TypeError, AttributeError)):
+                db.get(mutate_left)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=20, deadline=None)
+@given(values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=10))
+def test_shared_identity_preserved_across_boundary_in_fast_mode(mode: str, values: list[int]) -> None:
+    payload = Input[tuple[dict[str, int], dict[str, int]]]("payload")
+
+    @query
+    def mutate_left(db: Database) -> int:
+        left, right = payload.read(db)
+        left["x"] = left["x"] + 1
+        return right["x"]
+
+    @query
+    def read_right(db: Database) -> int:
+        _, right = payload.read(db)
+        return right["x"]
+
+    db = Database(mode=mode)
+    for value in values:
         shared = {"x": value}
         db.set(payload, (shared, shared))
         if mode == "fast":
-            assert db.get(mutate_left) == value
+            # left is right after the boundary — mutation propagates within the call.
+            assert db.get(mutate_left) == value + 1
+            # A separate query thaws fresh; the in-query mutation is not persisted.
             assert db.get(read_right) == value
         else:
             with pytest.raises((MutationError, TypeError, AttributeError)):
