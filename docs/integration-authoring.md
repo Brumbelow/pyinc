@@ -25,7 +25,7 @@ in a loop over discovered Python files.
 
 **Layer 3 -- High-level entrypoints.** Non-query functions that call `db.get()` and
 decode tuple payloads into frozen dataclasses. These are the public API. Examples:
-`file_analysis` (python_source.py:896), `workspace_analysis` (python_source.py:921).
+`file_analysis` (python_source.py:927), `workspace_analysis` (python_source.py:952).
 
 **Why this layering?** The kernel caches and compares tuple payloads efficiently (they are
 snapshot-safe and hashable by default). The decode layer converts to ergonomic dataclasses
@@ -59,8 +59,8 @@ ImportPayload: TypeAlias = tuple[str, ImportKind, int]
 
 Each layer has a `_decode_*` function that reconstructs the dataclass from its payload.
 Reference: `ImportPayload` (python_source.py:28), `FileAnalysisPayload`
-(python_source.py:55), `_decode_import` (python_source.py:826), `_decode_file_analysis`
-(python_source.py:873).
+(python_source.py:55), `_decode_import` (python_source.py:857), `_decode_file_analysis`
+(python_source.py:904).
 
 **Why?** Tuples are snapshot-safe and hashable by default -- zero-cost for the kernel's
 caching and comparison. The `TypeAlias` makes the bidirectional conversion self-documenting.

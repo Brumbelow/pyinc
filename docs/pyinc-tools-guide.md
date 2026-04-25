@@ -131,7 +131,7 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     "definitionProvider": true,
     "referencesProvider": true
   },
-  "serverInfo": { "name": "pyinc-tools", "version": "1.2.0" }
+  "serverInfo": { "name": "pyinc-tools", "version": "2.0.0" }
 }
 ```
 
@@ -228,7 +228,7 @@ Consequences:
 
 ## Supported vs. not yet supported
 
-**Supported as of v1.3.0:**
+**Supported (current as of v2.0.0):**
 
 - Document symbols (all eight kinds: `function`, `method`, `class`,
   `class_variable`, `variable`, `import_alias`, `from_import_alias`,
