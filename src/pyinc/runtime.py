@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast, overload
 
 from .errors import CycleError, UnsupportedValueError, UntrackedReadError
 from .explain import InspectionNode, format_explanation
+from .store import ArtifactStore
 from .value import (
     FrozenAdapterValue,
     FrozenDict,
@@ -32,6 +33,7 @@ from .value import (
     fingerprint_snapshot,
     freeze,
     semantic_equal,
+    serialize_snapshot,
     thaw,
 )
 
@@ -316,6 +318,7 @@ class Database:
         adapters: Mapping[type[Any], ValueAdapter] | None = None,
         max_query_nodes: int | None = None,
         observer_error_hook: ObserverErrorHook | None = None,
+        store: ArtifactStore | None = None,
     ) -> None:
         if mode not in {"strict", "checked", "fast"}:
             raise ValueError("mode must be one of: strict, checked, fast")
@@ -324,6 +327,7 @@ class Database:
         self.mode = mode
         self.max_query_nodes = max_query_nodes
         self._adapters = dict(adapters or {})
+        self._store = store
         self._revision = 0
         self._records: dict[NodeKey, NodeRecord] = {}
         self._input_records: dict[Any, NodeKey] = {}
@@ -1251,7 +1255,24 @@ class Database:
         return stack[-1]
 
     def _freeze_value(self, value: Any) -> Snapshot:
-        return freeze(value, adapters=self._adapters)
+        snapshot = freeze(value, adapters=self._adapters)
+        if self._store is not None:
+            self._persist_snapshot(snapshot)
+        return snapshot
+
+    def _persist_snapshot(self, snapshot: Snapshot) -> None:
+        """Write the snapshot's serialized bytes to the configured ArtifactStore.
+        Raw filesystem I/O runs under the raw-read allow scope so a `FileSystemArtifactStore`
+        used while a query frame is active is not rejected by the global guard."""
+        store = self._store
+        if store is None:
+            return
+        digest = fingerprint_snapshot(snapshot)
+        if store.contains(digest):
+            return
+        payload = serialize_snapshot(snapshot)
+        with self._allow_raw_reads_scope():
+            store.put(digest, payload)
 
     def _thaw_value(self, value: Any) -> Any:
         return thaw(value, adapters=self._adapters)

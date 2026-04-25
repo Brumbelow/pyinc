@@ -9,12 +9,16 @@ import pytest
 from pyinc import (
     Database,
     FrozenAdapterValue,
+    FrozenGraph,
+    FrozenRef,
     Input,
     MutationError,
     UnsupportedValueError,
     ValueAdapter,
+    deserialize_snapshot,
     freeze,
     query,
+    serialize_snapshot,
     thaw,
 )
 from pyinc.value import (
@@ -69,12 +73,19 @@ class KeyAdapter(ValueAdapter):
         return Key(name=thaw(data["name"]))
 
 
-def test_freeze_rejects_cyclic_values() -> None:
+def test_freeze_handles_self_referential_list_via_frozen_graph() -> None:
     payload: list[object] = []
     payload.append(payload)
 
-    with pytest.raises(UnsupportedValueError, match="Cyclic values"):
-        freeze(payload)
+    snapshot = freeze(payload)
+    assert isinstance(snapshot, FrozenGraph)
+    assert len(snapshot.nodes) == 1
+    assert snapshot.root == FrozenRef(0)
+    assert snapshot.nodes[0] == FrozenList(items=(FrozenRef(0),))
+
+    thawed = thaw(snapshot)
+    assert isinstance(thawed, list)
+    assert thawed[0] is thawed
 
 
 def test_freeze_uses_canonical_sorting_without_repr() -> None:
@@ -259,6 +270,8 @@ def test_freeze_already_frozen_values_pass_through() -> None:
     fs = FrozenSet(kind="set", items=(1,))
     fr = FrozenRecord(type_name="R", entries=(("x", 1),))
     fa = FrozenAdapterValue(adapter_key="test:T", payload="data")
+    fref = FrozenRef(index=0)
+    fg = FrozenGraph(nodes=(FrozenList(items=(FrozenRef(0),)),), root=FrozenRef(0))
 
     # Already-frozen values hit the early return — identity preserved.
     assert freeze(fl) is fl
@@ -266,6 +279,8 @@ def test_freeze_already_frozen_values_pass_through() -> None:
     assert freeze(fs) is fs
     assert freeze(fr) is fr
     assert freeze(fa) is fa
+    assert freeze(fref) is fref
+    assert freeze(fg) is fg
 
 
 # ---------------------------------------------------------------------------
@@ -332,25 +347,25 @@ def test_fingerprint_determinism() -> None:
 
 
 CANONICAL_FINGERPRINTS: dict[str, tuple[Any, str]] = {
-    "none": (None, "28859e345f55ce45426724100617830af221bdf3e01f4333ee34ba58d2df4429"),
-    "true": (True, "2b37f1bd8ab8bcc2250382d39155fa1b139c784a9a0e475c63ed1439951bd4bd"),
-    "false": (False, "3b6dac53d9671a502027e128bb59ad0d4ab2d3ecf950f82c82374dadc6001f25"),
-    "int-zero": (0, "fd1b3408926f09f933b81c68493c2a2a180f5dcabedc5c9c81da0f89e6a5cb29"),
-    "int-one": (1, "abca15a9056c7cb1e0aadc77e02e1507845304b010bee10bd5b83ad66db4f210"),
-    "int-neg-one": (-1, "58187bf57d9c055e9674352317ab812235d3c5f9dc18a5d8d9c51e7a52345790"),
-    "float-1.5": (1.5, "9900351fd014bde471ca0191fa198cadba1ed1b7e360f61939cb2e6a8f914a28"),
-    "str-empty": ("", "4a44ca33cb2ab92e0983a99b93ed982e7681f376253b3d3574c2a76b9e433c83"),
-    "str-hello": ("hello", "660503a64caf47b9ee37c4dad85a47c4e90ff958c115dcc0f7b7b51622f740e7"),
-    "bytes-empty": (b"", "14c3b16893b53fc99a2f05056511e16d23254bf6c01ce52b5dc9cbc8bb6acb5a"),
-    "bytes-deadbeef": (b"\xde\xad\xbe\xef", "15fba55305f5c7181328b3ec23196790181eb93c35e9e323065b25896713620d"),
-    "tuple-1-2": ((1, 2), "99725380f4eff3c51ec4d11882adb8e6d12fe2c6763f4ed0a72c0516e70f4c9e"),
-    "frozenlist-1-2": (FrozenList((1, 2)), "9dccbf0605900933a327ce55f18c69592cd0b74ce652a47f7268e8b727820201"),
-    "frozendict-a1-b2": (FrozenDict((("a", 1), ("b", 2))), "95bbdb13cbbf32404273f0cb62c337910aab7e467babe5ae7d954db5ac557a17"),
-    "frozenset-set-1-2": (FrozenSet("set", (1, 2)), "6dadb07a5bd7e26b0c36e060b073c297d6c959b99c5163ae1a123fcc3f644398"),
-    "frozenset-frozenset-1-2": (FrozenSet("frozenset", (1, 2)), "02591c74d3248987533119c463a27065fe166f59f1b63b91330883079e33c621"),
-    "frozenrecord-point-x1-y2": (FrozenRecord("Point", (("x", 1), ("y", 2))), "c248ff9e7917f1d6ef963123e2d12761bc5ddfd457e2ffb2e00633c284ae435e"),
-    "frozenadapter-mod-pt-1": (FrozenAdapterValue("mod:Pt", 1), "dc304df151d02c2a33476bafbdda649e22c4592877e3893614152704b2d1b47a"),
-    "complex-1+2j": (complex(1, 2), "7db3a1d42f7e302819d565050789c5f34ebb613d399a753252165227ba6236eb"),
+    "none": (None, "bc84a14378e233c608ccc17f177919a6595f9d6331b9a5c5d8ffd0eade02bb87"),
+    "true": (True, "d84c15ea4d5e0080d8dbabc5ce68dbd742fbbd0499d4df57ef079c53d8871b45"),
+    "false": (False, "3f05aff300785adb8cdb12bb9993f3b494b7e1de18042e42a5f5e863e49cc5f8"),
+    "int-zero": (0, "1f5fe91ed5208d6477e3d13cca2812d9c1c42defb7dab70d784f45f65565b8fd"),
+    "int-one": (1, "ec187eb76b8d83f7e32bd0b232f69735d1a65a8a78529b0654411717920e53cf"),
+    "int-neg-one": (-1, "2d47fa0bc94ee71387d24889f9db1d68fb766b5c62d76709386c07ae630b94c6"),
+    "float-1.5": (1.5, "dd96a811716c46538b4197ff3950edf3f49ae9d60768708c746a752dadf10c56"),
+    "str-empty": ("", "482975b5aa2860a276737cba6db568490b691439406fbb367f3b604bb5210ba3"),
+    "str-hello": ("hello", "fc322c5025dd198cb3fb82b6bcd16933f825fbd6991e27c11f52159ce3196aff"),
+    "bytes-empty": (b"", "37591557e2971f9d22a13734870a227c1f09fa2db90410e374d5398b41458998"),
+    "bytes-deadbeef": (b"\xde\xad\xbe\xef", "2e7517169495c8c68748b8a7e4b5d65edda8e3f147186cbcb91f558ac5d1c1c8"),
+    "tuple-1-2": ((1, 2), "5c7369e88f8c1ac8aa9c6d40293d9bca89c7eefc7be95171520a7c26a420e17f"),
+    "frozenlist-1-2": (FrozenList((1, 2)), "cda055499f3951671946049d2351b5fd9cd819ddbadb4cd29196263ab2e3fea0"),
+    "frozendict-a1-b2": (FrozenDict((("a", 1), ("b", 2))), "a2314b9c7615be9706387bd492849f94b88a62c02a6f9d9efd7f65bc5947b4f4"),
+    "frozenset-set-1-2": (FrozenSet("set", (1, 2)), "ee2eaaecaa7809412de0bfa62e9c0911dc43d6ae94f5de8d56241764023b817e"),
+    "frozenset-frozenset-1-2": (FrozenSet("frozenset", (1, 2)), "a4fd14bb2105db0058518e6646536c1ff566c058e2d52da333485a0507c355b2"),
+    "frozenrecord-point-x1-y2": (FrozenRecord("Point", (("x", 1), ("y", 2))), "54d491b759c0fce6fd77da828a7a8b4dc0f2d8954109834a479b3ba5030758ed"),
+    "frozenadapter-mod-pt-1": (FrozenAdapterValue("mod:Pt", 1), "af0c41f8d3007f00c9a7ea5933f30f1b45fd4bef98a5f5d828fae6964a19da16"),
+    "complex-1+2j": (complex(1, 2), "7d5cd6c5ec8d30c14912b51d052e79e2e88752d5d815f43559a7cdc5a09eaa45"),
 }
 
 
@@ -449,3 +464,157 @@ def test_adapter_registry_for_value_returns_none_for_unknown_type() -> None:
     registry = _AdapterRegistry({Point: PointAdapter()})
     assert registry.for_value("a string") is None
     assert registry.for_value(42) is None
+
+
+# ---------------------------------------------------------------------------
+# Group G: Mutable graph support — shared identity and cycles via FrozenGraph
+# ---------------------------------------------------------------------------
+
+
+def test_freeze_preserves_shared_identity_in_list() -> None:
+    inner = [1, 2, 3]
+    payload = [inner, inner]
+
+    snapshot = freeze(payload)
+    assert isinstance(snapshot, FrozenGraph)
+
+    thawed = thaw(snapshot)
+    assert isinstance(thawed, list)
+    assert thawed[0] is thawed[1]
+    assert thawed[0] == [1, 2, 3]
+
+
+def test_freeze_preserves_shared_identity_in_dict_value() -> None:
+    shared = {"k": "v"}
+    payload = {"a": shared, "b": shared}
+
+    snapshot = freeze(payload)
+    assert isinstance(snapshot, FrozenGraph)
+
+    thawed = thaw(snapshot)
+    assert isinstance(thawed, dict)
+    assert thawed["a"] is thawed["b"]
+
+
+def test_freeze_handles_mutual_reference_cycle() -> None:
+    a: list[Any] = []
+    b: list[Any] = []
+    a.append(b)
+    b.append(a)
+
+    snapshot = freeze(a)
+    assert isinstance(snapshot, FrozenGraph)
+
+    thawed = thaw(snapshot)
+    assert isinstance(thawed, list)
+    # Walk the cycle: a → b → a
+    assert thawed[0][0] is thawed
+
+
+def test_freeze_handles_deep_mutual_graph_round_trips() -> None:
+    nodes: list[list[Any]] = [[] for _ in range(10)]
+    for i in range(10):
+        nodes[i].append(nodes[(i + 1) % 10])
+
+    snapshot = freeze(nodes[0])
+    assert isinstance(snapshot, FrozenGraph)
+
+    thawed = thaw(snapshot)
+    cur = thawed
+    for _ in range(20):
+        cur = cur[0]
+    # 20 hops on a 10-cycle starting from thawed-nodes[0] returns to thawed-nodes[0].
+    assert cur is thawed
+
+
+def test_freeze_pure_tree_does_not_wrap_in_frozen_graph() -> None:
+    # Plain tree — no shared subtrees, no cycles. Existing flat shape preserved
+    # so the common case stays zero-overhead.
+    snapshot = freeze([1, [2, [3]]])
+    assert isinstance(snapshot, FrozenList)
+
+
+def test_frozen_graph_digest_is_deterministic_across_construction_orders() -> None:
+    a: list[Any] = []
+    a.append(a)
+    digest_a = fingerprint(a)
+
+    b: list[Any] = []
+    b.append(b)
+    digest_b = fingerprint(b)
+
+    assert digest_a == digest_b
+
+
+# ---------------------------------------------------------------------------
+# Group H: Serialize/deserialize and K2 fingerprint prefix
+# ---------------------------------------------------------------------------
+
+
+def test_kernel_fingerprint_prefix_is_k2() -> None:
+    # The serialized byte form (which is also the digest input) must carry a
+    # version prefix so older durable caches cannot be silently accepted.
+    payload = serialize_snapshot(freeze("hello"))
+    assert payload.startswith(b"K2;")
+
+
+def test_serialize_deserialize_round_trip_scalars() -> None:
+    for value in (None, True, False, 0, 1, -1, 1.5, "", "hello", b"", b"\xde\xad", complex(1, 2)):
+        payload = serialize_snapshot(freeze(value))
+        assert deserialize_snapshot(payload) == freeze(value)
+
+
+def test_serialize_deserialize_round_trip_containers() -> None:
+    samples: list[Any] = [
+        [1, 2, 3],
+        {"b": 2, "a": 1},
+        {1, 2, 3},
+        frozenset({4, 5}),
+        (1, "two", True),
+    ]
+    for value in samples:
+        snapshot = freeze(value)
+        payload = serialize_snapshot(snapshot)
+        assert deserialize_snapshot(payload) == snapshot
+
+
+def test_serialize_deserialize_round_trip_dataclass() -> None:
+    @dataclass(frozen=True)
+    class Cfg:
+        name: str
+        values: tuple[int, ...]
+
+    snapshot = freeze(Cfg("x", (1, 2)))
+    assert deserialize_snapshot(serialize_snapshot(snapshot)) == snapshot
+
+
+def test_serialize_deserialize_round_trip_adapter_value() -> None:
+    adapters = {Point: PointAdapter()}
+    snapshot = freeze(Point(1, 2), adapters=adapters)
+    assert deserialize_snapshot(serialize_snapshot(snapshot)) == snapshot
+
+
+def test_serialize_deserialize_round_trip_frozen_graph_with_cycle() -> None:
+    payload: list[Any] = []
+    payload.append(payload)
+    snapshot = freeze(payload)
+    assert isinstance(snapshot, FrozenGraph)
+
+    bytes_payload = serialize_snapshot(snapshot)
+    decoded = deserialize_snapshot(bytes_payload)
+    assert decoded == snapshot
+
+
+def test_deserialize_rejects_payload_without_k2_prefix() -> None:
+    with pytest.raises(UnsupportedValueError, match="kernel fingerprint version"):
+        deserialize_snapshot(b"K1;N;")
+    with pytest.raises(UnsupportedValueError, match="kernel fingerprint version"):
+        deserialize_snapshot(b"N;")
+    with pytest.raises(UnsupportedValueError, match="kernel fingerprint version"):
+        deserialize_snapshot(b"")
+
+
+def test_deserialize_rejects_trailing_garbage() -> None:
+    payload = serialize_snapshot(freeze(42))
+    with pytest.raises(UnsupportedValueError, match="trailing"):
+        deserialize_snapshot(payload + b"junk")
