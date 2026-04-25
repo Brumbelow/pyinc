@@ -6,10 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-This is the start of the **v2.0.0** development cycle. v1.2.1 is the last v1
-release; v2.0.0 will ship once the items previously listed under "Version 1
-does not include" in `docs/architecture.md` and the per-integration "v2
-concern" notes are addressed. New entries here are part of v2.
+Items in this section are queued for the next v2.x release.
+
+## [2.0.0] — TBD
+
+This is the v2.0.0 release. v1.2.1 was the last v1 release. Items previously
+listed under "Version 1 did not include" in `docs/architecture.md` are
+resolved here, except for the still-deferred *schedulers or worker pools* and
+the Scope-B half of *content-addressed artifact storage*.
 
 ### Added
 
@@ -38,6 +42,67 @@ concern" notes are addressed. New entries here are part of v2.
   a callback and is idempotent. New public names re-exported from `pyinc`:
   `QueryChangeEvent`, `Subscription`, `ObserverCallback`, `ObserverErrorHook`.
   Resolves the v1 architectural non-goal "push observers in the kernel".
+- **Mutable object graphs across cached boundaries.** `freeze` / `thaw` now
+  memoize shared object identity and reconstruct cyclic structures via the
+  new `FrozenGraph(nodes, root)` envelope and `FrozenRef(index)` pointer
+  snapshot variants. Previously the boundary raised
+  `UnsupportedValueError("Cyclic values cannot cross cached boundaries.")`
+  and silently dropped shared identity. Pure-tree inputs continue to produce
+  the v1 flat snapshot shape (zero overhead in the common case); only inputs
+  with actual sharing or cycles are wrapped in `FrozenGraph`. `thaw` runs a
+  two-pass allocate-then-fill so a list-with-itself round-trips to an actual
+  self-referential list and shared sub-objects retain identity. Resolves the
+  v1 architectural non-goal "arbitrary mutable object graphs across cached
+  boundaries". New public names re-exported from `pyinc`: `FrozenGraph`,
+  `FrozenRef`.
+- **Content-addressed artifact storage (Scope-A).** New `ArtifactStore`
+  Protocol and two shipped implementations: `InMemoryArtifactStore`
+  (dict-backed) and `FileSystemArtifactStore` (git-style two-character
+  fan-out under `<root>/objects/<digest[:2]>/<digest[2:]>` with atomic
+  `tempfile`+`os.replace` writes). `Database(store=...)` writes the
+  serialized snapshot bytes for every value crossing the membrane, keyed by
+  the `fingerprint_snapshot` digest. New `serialize_snapshot(snapshot)` and
+  `deserialize_snapshot(payload)` helpers expose the byte form to external
+  callers; both round-trip the full snapshot grammar including `FrozenGraph`
+  / `FrozenRef`. Scope-A is **write-mostly** — the kernel does not yet read
+  the store to skip query execution; full cross-run cache reuse with durable
+  node records is a Scope-B / v2.1 deliverable. New public names re-exported
+  from `pyinc`: `ArtifactStore`, `InMemoryArtifactStore`,
+  `FileSystemArtifactStore`, `serialize_snapshot`, `deserialize_snapshot`.
+  Partial resolution of the v1 architectural non-goal "content-addressed
+  artifact storage".
+- **Kernel digest format bump (`K2;`).** The `fingerprint_snapshot` encoder
+  prefixes its byte form with `K2;` so older `K1;` / unprefixed payloads in
+  any external durable cache cannot be silently accepted. In-memory state
+  across a process restart is unaffected. This is the standard
+  encoder-change-requires-identity-bump path documented in
+  `docs/kernel-contract.md`.
+
+### Changed
+
+- **Value boundary preserves shared identity.** When the same mutable
+  container appears at two slots of an input value, both reads from the
+  thawed copy in `checked` / `fast` mode now refer to the same Python object
+  rather than two independent copies. This is consistent with the new mutable
+  graph support. The kernel's stored snapshot remains immutable and safe; the
+  mode table (strict / checked / fast) is unchanged. Tests that previously
+  asserted v1's silent identity-drop behavior have been split: the
+  v1-shaped *independent inputs* test continues to verify that two separately
+  constructed dicts thaw independently, and a new companion test exercises
+  the v2 *shared input* case explicitly.
+- **`docs/kernel-contract.md` limitation #4 amended** to describe the
+  outbound `ArtifactStore` and clarify that Scope-A delivers byte-stable
+  persistence but not yet cross-run cache reuse.
+- **`pyinc-tools` LSP `serverInfo.version`** bumped from `"1.2.0"` to
+  `"2.0.0"` to align with the kernel.
+
+### Documentation
+
+- Updated `docs/integration-authoring.md` line citations into
+  `python_source.py` to the current line numbers.
+- Removed the phantom v1.3.0 reference in `docs/pyinc-tools-guide.md`; the
+  features described there shipped across v1.2.0 and v1.2.1 and continue in
+  v2.0.0.
 
 ## [1.2.1] — 2026-04-24
 
@@ -237,3 +302,4 @@ The first stable v1 release.
 [1.1.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.1.1
 [1.2.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.2.0
 [1.2.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.2.1
+[2.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.0.0

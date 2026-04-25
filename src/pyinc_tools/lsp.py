@@ -317,7 +317,7 @@ class LanguageServer:
                 "definitionProvider": True,
                 "referencesProvider": True,
             },
-            "serverInfo": {"name": "pyinc-tools", "version": "1.2.0"},
+            "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
         }
 
     def _on_watcher_change(self, _changed: tuple[str, ...]) -> None:

@@ -27,6 +27,14 @@ The kernel stores frozen snapshots internally and exposes fresh owned copies
 external alias to a value that has crossed the boundary can influence cached
 state; each `db.get()` call returns an independent copy.
 
+Cyclic and shared object graphs are supported via the `FrozenGraph` /
+`FrozenRef` snapshot variants: `freeze` memoizes mutable containers (`list`,
+`dict`, `set`, dataclass) by id and emits a `FrozenGraph(nodes, root)` envelope
+when shared identity or back-edges are detected. `thaw` reconstructs identity
+faithfully via two-pass allocate-then-fill so a list-with-itself round-trips to
+an actual self-referential list. Pure trees pay no overhead — they continue to
+return the bare flat snapshot shape.
+
 **2. Tracked ambient reads.**
 All reads of external state within a query must go through the Resource API
 (`FileResource`, `FileStatResource`, `EnvResource`, `DirectoryResource`) or a
@@ -88,8 +96,18 @@ for mutation safety.
 
 **4. Cross-process or cross-run persistence.**
 The kernel is in-memory. Code fingerprints include the Python implementation
-and version tuple but not all possible build configuration differences. There
-is no durable cache.
+and version tuple but not all possible build configuration differences. The
+kernel does not yet trust a durable cache for from-scratch consistency.
+
+In v2.0.0, an outbound `ArtifactStore` (`InMemoryArtifactStore` /
+`FileSystemArtifactStore`) optionally accepts every snapshot the kernel
+freezes, keyed by its `fingerprint_snapshot` digest, via
+`Database(store=...)`. Bytes are produced by `serialize_snapshot` and consumed
+by `deserialize_snapshot`; both round-trip the full snapshot grammar including
+`FrozenGraph` / `FrozenRef`. External tools may use this for cross-run
+sharing, but the kernel itself does not read from the store to skip query
+execution — full cross-run cache reuse with node-record persistence is a
+v2.1 (Scope-B) deliverable.
 
 Within a process, `Database` is thread-safe for concurrent use both across
 independent instances and on a single shared instance. Each `Database` holds
@@ -105,12 +123,15 @@ parallel.
 
 `fingerprint_snapshot(snapshot)` is a deterministic, stable function of the
 `Snapshot` union (scalars, `FrozenList`, `FrozenDict`, `FrozenSet`,
-`FrozenRecord`, `FrozenAdapterValue`, tuples of the same). Digests are an
-injective-by-construction length-prefixed, type-tagged encoding finalized with
-sha256. They are stable across CPython minor versions and safe to persist if a
-durable cache is added later. Any change to the encoder counts as a cache-key
-break and must be accompanied by a bump of the kernel identity so older
-fingerprints are rejected rather than silently reused.
+`FrozenRecord`, `FrozenAdapterValue`, `FrozenGraph`, `FrozenRef`, tuples of
+the same). Digests are an injective-by-construction length-prefixed,
+type-tagged encoding finalized with sha256, prefixed with the kernel
+fingerprint version (`K2;` in v2.0.0). They are stable across CPython minor
+versions and safe to persist via `serialize_snapshot` /
+`deserialize_snapshot` into an `ArtifactStore`. Any change to the encoder
+counts as a cache-key break and must be accompanied by a bump of the kernel
+identity prefix so older fingerprints are rejected rather than silently
+reused.
 
 **5. Cycle-adjacent partial state.**
 When a `CycleError` is raised, the dependency graph may contain partial state from

@@ -35,6 +35,14 @@ Query identity includes the supported function definition payload, so ambient im
 
 Resource node identity includes resource configuration. Built-in resources are snapshot-safe dataclasses, and custom resources must either be snapshot-safe themselves or expose an `identity()` payload for keying.
 
+Mutable object graphs with shared or cyclic references are supported in v2.0.0 via the `FrozenGraph` / `FrozenRef` snapshot variants. `freeze` memoizes mutable containers by id; pure trees retain the v1 flat shape. `thaw` runs a two-pass allocate-then-fill so cycles and shared identity are preserved across the boundary.
+
+## Durable Cache
+
+`Database(store=...)` accepts any object satisfying the `ArtifactStore` protocol (`InMemoryArtifactStore` and `FileSystemArtifactStore` ship in `pyinc.store`). The kernel writes serialized snapshot bytes for every value crossing the membrane, keyed by its `fingerprint_snapshot` digest. Bytes are produced by `serialize_snapshot` and consumed by `deserialize_snapshot`; both round-trip the full snapshot grammar including `FrozenGraph` / `FrozenRef`. External tools may use this for cross-run sharing.
+
+Scope-A (write-mostly outbound persistence) ships in v2.0.0. Scope-B — durable node records that let a fresh `Database` skip query execution by reading the store — is deferred to v2.1 because it requires careful invariants around captured-module identities and dependency-edge persistence.
+
 ## Package Shape Today
 
 `pyinc` exposes a stable kernel surface from the top-level package:
@@ -45,6 +53,8 @@ Resource node identity includes resource configuration. Built-in resources are s
 - structured inspection via `InspectionNode`, `Database.inspect(...)`, `Database.inspect_fresh(...)`, and `Database.explain(...)`
 - observability via `Database.dependency_graph()`, `Database.statistics()`, and `Database.query_profile()`
 - push observers via `Database.observe(callback, query, *args, **kwargs)` returning a `Subscription`, with `QueryChangeEvent` payloads *(added in the v2 development cycle)*
+- mutable graph support via `FrozenGraph` / `FrozenRef` and the byte-stable `serialize_snapshot` / `deserialize_snapshot` helpers *(v2.0.0)*
+- content-addressed artifact storage via `ArtifactStore`, `InMemoryArtifactStore`, `FileSystemArtifactStore`, and `Database(store=...)` *(v2.0.0, Scope-A)*
 
 `pyinc.integrations` exposes the stable dataclass/result types and high-level entrypoints from the shipped integrations:
 
@@ -92,8 +102,8 @@ Version 1 did not include — being addressed for v2.0.0:
 
 - ~~notebook integration~~ *(landed: `pyinc.integrations.notebook`)*
 - ~~push observers in the kernel~~ *(landed: `Database.observe(...)` and `QueryChangeEvent`)*
+- ~~arbitrary mutable object graphs across cached boundaries~~ *(landed: `FrozenGraph` / `FrozenRef` snapshot variants)*
+- ~~content-addressed artifact storage~~ *(landed Scope-A: `ArtifactStore` protocol with in-memory + filesystem implementations and `Database(store=...)`; Scope-B durable node-record reuse deferred to v2.1)*
 - schedulers or worker pools
-- content-addressed artifact storage
-- arbitrary mutable object graphs across cached boundaries
 
 Watcher loops, mirror workspaces, and LSP adapters belong to consumer tooling above the kernel. They can live in the repository, but they do not widen `src/pyinc`'s semver contract unless a concrete correctness gap forces a kernel change. The v1.2.0 additions — `textDocument/references` (workspace-wide reverse-reference index) and the threaded `PollingWorkspaceWatcher.start()` live polling mode — land entirely in `pyinc_tools` on top of stable `pyinc.integrations` entrypoints; `src/pyinc` is unchanged.

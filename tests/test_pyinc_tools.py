@@ -518,7 +518,7 @@ def test_language_server_references_local_function_returns_declaration_and_call(
     try:
         init = server._handle_request("initialize", {"rootUri": root.as_uri()})
         assert init["capabilities"]["referencesProvider"] is True
-        assert init["serverInfo"]["version"] == "1.2.0"
+        assert init["serverInfo"]["version"] == "2.0.0"
 
         locations = server._handle_request(
             "textDocument/references",
