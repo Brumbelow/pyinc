@@ -8,57 +8,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Items in this section are queued for the next v2.x release.
 
-## [2.1.0] — 2026-04-25
-
-### Added
-
-- **`try/except ImportError` import support.** `symbol_resolution` now
-  recognises `try: … except ImportError:` and `try: … except
-  ModuleNotFoundError:` (and the tuple form `except (ImportError,
-  ModuleNotFoundError):`) guard blocks at the module top level and walks
-  their bodies for `import` and `from … import` statements. The collected
-  symbols appear in `ModuleSymbolTable.symbols` with the existing
-  `import_alias` / `from_import_alias` kinds, exactly as if the imports
-  were unconditional. The "conditional top-level binding" impurity marker
-  is no longer recorded for files whose only conditional blocks are
-  recognised import-error guards. `python_source` likewise collects import
-  statements and bound names from such blocks, so that
-  `import_statements_for_file` and the module binding analysis agree with
-  the symbol table. Bare `except:` handlers (and handlers for other
-  exception types) still set the impurity marker.
-- **Durable checkpoint API (Scope-B).** `Database.save_checkpoint(store=None)
-  -> str` serialises all current query and resource node records (plus their
-  dependency edges and snapshot bytes) to an `ArtifactStore` and returns a
-  content-addressed checkpoint key prefixed with `"ck"`. A subsequent
-  `Database.load_checkpoint(key, store=None)` in a fresh process reads the
-  manifest back, verifies that all declared input digests and resource probe
-  hints still match, and pre-warms the node record cache so that the next
-  `db.get(query)` reuses the stored result without re-executing the query
-  function. If any dependency is stale the affected query is silently
-  re-executed and the new result is compared against the stored snapshot for
-  backdating (from-scratch consistency is maintained). Both methods accept an
-  optional `store=` kwarg for call-site store injection; `save_checkpoint`
-  also writes all referenced snapshot bytes to the store, making it
-  self-contained. The checkpoint key is content-addressed: identical database
-  state always produces the same key. Completes the "content-addressed
-  artifact storage" feature first partially delivered in v2.0.0 (Scope-A).
-
-### Notes
-
-- Kernel contract (`src/pyinc`) updated: `Database` gains two new public
-  methods (`save_checkpoint`, `load_checkpoint`). The `ArtifactStore`
-  protocol and the snapshot serialisation format are unchanged.
-- `pyinc.integrations` stable surface extended: `symbol_resolution` and
-  `python_source` now handle `try/except ImportError` blocks; results for
-  files using this pattern may change from previous releases (the impurity
-  marker was previously set; it is now cleared and the symbols are visible).
-
 ## [2.0.0]
 
-This is the v2.0.0 release. v1.2.1 was the last v1 release. Items previously
-listed under "Version 1 did not include" in `docs/architecture.md` are
-resolved here, except for the still-deferred *schedulers or worker pools* and
-the Scope-B half of *content-addressed artifact storage*.
+This is the v2.0.0 release (still in development; not yet tagged). v1.2.1 was
+the last v1 release. Items previously listed under "Version 1 did not include"
+in `docs/architecture.md` are resolved here, except for the still-deferred
+*schedulers or worker pools*.
 
 ### Added
 
@@ -100,22 +55,48 @@ the Scope-B half of *content-addressed artifact storage*.
   v1 architectural non-goal "arbitrary mutable object graphs across cached
   boundaries". New public names re-exported from `pyinc`: `FrozenGraph`,
   `FrozenRef`.
-- **Content-addressed artifact storage (Scope-A).** New `ArtifactStore`
-  Protocol and two shipped implementations: `InMemoryArtifactStore`
-  (dict-backed) and `FileSystemArtifactStore` (git-style two-character
-  fan-out under `<root>/objects/<digest[:2]>/<digest[2:]>` with atomic
-  `tempfile`+`os.replace` writes). `Database(store=...)` writes the
-  serialized snapshot bytes for every value crossing the membrane, keyed by
-  the `fingerprint_snapshot` digest. New `serialize_snapshot(snapshot)` and
-  `deserialize_snapshot(payload)` helpers expose the byte form to external
-  callers; both round-trip the full snapshot grammar including `FrozenGraph`
-  / `FrozenRef`. Scope-A is **write-mostly** — the kernel does not yet read
-  the store to skip query execution; full cross-run cache reuse with durable
-  node records is a Scope-B / v2.1 deliverable. New public names re-exported
-  from `pyinc`: `ArtifactStore`, `InMemoryArtifactStore`,
-  `FileSystemArtifactStore`, `serialize_snapshot`, `deserialize_snapshot`.
-  Partial resolution of the v1 architectural non-goal "content-addressed
-  artifact storage".
+- **Content-addressed artifact storage.** New `ArtifactStore` Protocol and
+  two shipped implementations: `InMemoryArtifactStore` (dict-backed) and
+  `FileSystemArtifactStore` (git-style two-character fan-out under
+  `<root>/objects/<digest[:2]>/<digest[2:]>` with atomic `tempfile`+`os.replace`
+  writes). `Database(store=...)` writes the serialized snapshot bytes for
+  every value crossing the membrane, keyed by the `fingerprint_snapshot`
+  digest. New `serialize_snapshot(snapshot)` and `deserialize_snapshot(payload)`
+  helpers expose the byte form to external callers; both round-trip the full
+  snapshot grammar including `FrozenGraph` / `FrozenRef`. Cross-run cache
+  reuse is delivered via the durable checkpoint API:
+  `Database.save_checkpoint(store=None) -> str` serialises all current query
+  and resource node records (plus their dependency edges and snapshot bytes)
+  to an `ArtifactStore` and returns a content-addressed checkpoint key
+  prefixed with `"ck"`. A subsequent `Database.load_checkpoint(key, store=None)`
+  in a fresh process reads the manifest back, verifies that all declared
+  input digests and resource probe hints still match, and pre-warms the node
+  record cache so that the next `db.get(query)` reuses the stored result
+  without re-executing the query function. If any dependency is stale the
+  affected query is silently re-executed and the new result is compared
+  against the stored snapshot for backdating (from-scratch consistency is
+  maintained). Both methods accept an optional `store=` kwarg for call-site
+  store injection; `save_checkpoint` also writes all referenced snapshot
+  bytes to the store, making it self-contained. The checkpoint key is
+  content-addressed: identical database state always produces the same key.
+  New public names re-exported from `pyinc`: `ArtifactStore`,
+  `InMemoryArtifactStore`, `FileSystemArtifactStore`, `serialize_snapshot`,
+  `deserialize_snapshot`. Resolves the v1 architectural non-goal
+  "content-addressed artifact storage".
+- **`try/except ImportError` import support.** `symbol_resolution` now
+  recognises `try: … except ImportError:` and `try: … except
+  ModuleNotFoundError:` (and the tuple form `except (ImportError,
+  ModuleNotFoundError):`) guard blocks at the module top level and walks
+  their bodies for `import` and `from … import` statements. The collected
+  symbols appear in `ModuleSymbolTable.symbols` with the existing
+  `import_alias` / `from_import_alias` kinds, exactly as if the imports
+  were unconditional. The "conditional top-level binding" impurity marker
+  is no longer recorded for files whose only conditional blocks are
+  recognised import-error guards. `python_source` likewise collects import
+  statements and bound names from such blocks, so that
+  `import_statements_for_file` and the module binding analysis agree with
+  the symbol table. Bare `except:` handlers (and handlers for other
+  exception types) still set the impurity marker.
 - **Kernel digest format bump (`K2;`).** The `fingerprint_snapshot` encoder
   prefixes its byte form with `K2;` so older `K1;` / unprefixed payloads in
   any external durable cache cannot be silently accepted. In-memory state
@@ -136,8 +117,8 @@ the Scope-B half of *content-addressed artifact storage*.
   constructed dicts thaw independently, and a new companion test exercises
   the v2 *shared input* case explicitly.
 - **`docs/kernel-contract.md` limitation #4 amended** to describe the
-  outbound `ArtifactStore` and clarify that Scope-A delivers byte-stable
-  persistence but not yet cross-run cache reuse.
+  outbound `ArtifactStore` and the durable `save_checkpoint` /
+  `load_checkpoint` flow.
 - **`pyinc-tools` LSP `serverInfo.version`** bumped from `"1.2.0"` to
   `"2.0.0"` to align with the kernel.
 

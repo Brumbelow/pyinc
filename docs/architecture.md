@@ -41,7 +41,7 @@ Mutable object graphs with shared or cyclic references are supported in v2.0.0 v
 
 `Database(store=...)` accepts any object satisfying the `ArtifactStore` protocol (`InMemoryArtifactStore` and `FileSystemArtifactStore` ship in `pyinc.store`). The kernel writes serialized snapshot bytes for every value crossing the membrane, keyed by its `fingerprint_snapshot` digest. Bytes are produced by `serialize_snapshot` and consumed by `deserialize_snapshot`; both round-trip the full snapshot grammar including `FrozenGraph` / `FrozenRef`. External tools may use this for cross-run sharing.
 
-Scope-A (write-mostly outbound persistence) shipped in v2.0.0. Scope-B — durable node records that let a fresh `Database` skip query execution by reading the store — landed in v2.1.0 via `Database.save_checkpoint(store=None) -> str` and `Database.load_checkpoint(key, store=None)`. Inputs must be set before loading; stale or unverifiable checkpoint records are silently skipped and the affected queries re-execute, preserving from-scratch consistency.
+Cross-run cache reuse ships in v2.0.0 via `Database.save_checkpoint(store=None) -> str` and `Database.load_checkpoint(key, store=None)`: the former serialises all current node records (plus snapshot bytes and dependency edges) to the store and returns a content-addressed key prefixed with `"ck"`; the latter reads the manifest back, verifies declared input digests and resource probe hints, and pre-warms the record cache so that the next `db.get(query)` reuses the stored result without re-executing the query function. Inputs must be set before loading; stale or unverifiable checkpoint records are silently skipped and the affected queries re-execute, preserving from-scratch consistency.
 
 ## Package Shape Today
 
@@ -54,8 +54,7 @@ Scope-A (write-mostly outbound persistence) shipped in v2.0.0. Scope-B — durab
 - observability via `Database.dependency_graph()`, `Database.statistics()`, and `Database.query_profile()`
 - push observers via `Database.observe(callback, query, *args, **kwargs)` returning a `Subscription`, with `QueryChangeEvent` payloads *(added in the v2 development cycle)*
 - mutable graph support via `FrozenGraph` / `FrozenRef` and the byte-stable `serialize_snapshot` / `deserialize_snapshot` helpers *(v2.0.0)*
-- content-addressed artifact storage via `ArtifactStore`, `InMemoryArtifactStore`, `FileSystemArtifactStore`, and `Database(store=...)` *(v2.0.0, Scope-A)*
-- durable checkpoint API via `Database.save_checkpoint(store=None)` and `Database.load_checkpoint(key, store=None)` for cross-run cache reuse *(v2.1.0, Scope-B)*
+- content-addressed artifact storage via `ArtifactStore`, `InMemoryArtifactStore`, `FileSystemArtifactStore`, and `Database(store=...)`, plus the durable checkpoint API `Database.save_checkpoint(store=None)` / `Database.load_checkpoint(key, store=None)` for cross-run cache reuse *(v2.0.0)*
 
 `pyinc.integrations` exposes the stable dataclass/result types and high-level entrypoints from the shipped integrations:
 
@@ -104,7 +103,7 @@ Version 1 did not include — being addressed for v2.0.0:
 - ~~notebook integration~~ *(landed: `pyinc.integrations.notebook`)*
 - ~~push observers in the kernel~~ *(landed: `Database.observe(...)` and `QueryChangeEvent`)*
 - ~~arbitrary mutable object graphs across cached boundaries~~ *(landed: `FrozenGraph` / `FrozenRef` snapshot variants)*
-- ~~content-addressed artifact storage~~ *(landed Scope-A in v2.0.0: `ArtifactStore` protocol with in-memory + filesystem implementations and `Database(store=...)`; landed Scope-B in v2.1.0: `Database.save_checkpoint()` / `load_checkpoint()` for durable node-record reuse)*
+- ~~content-addressed artifact storage~~ *(landed in v2.0.0: `ArtifactStore` protocol with in-memory + filesystem implementations, `Database(store=...)`, and the durable `Database.save_checkpoint()` / `load_checkpoint()` API for cross-run node-record reuse)*
 - schedulers or worker pools
 
 Watcher loops, mirror workspaces, and LSP adapters belong to consumer tooling above the kernel. They can live in the repository, but they do not widen `src/pyinc`'s semver contract unless a concrete correctness gap forces a kernel change. The v1.2.0 additions — `textDocument/references` (workspace-wide reverse-reference index) and the threaded `PollingWorkspaceWatcher.start()` live polling mode — land entirely in `pyinc_tools` on top of stable `pyinc.integrations` entrypoints; `src/pyinc` is unchanged.
