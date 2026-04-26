@@ -1,10 +1,11 @@
-"""Content-addressed artifact storage (Scope-A).
+"""Content-addressed artifact storage.
 
 The kernel writes serialized snapshot bytes keyed on `fingerprint_snapshot`
 digests so external tools can persist or share kernel-produced values across
-runs. Scope-A only writes outbound; the kernel does not yet trust durable bytes
-for from-scratch consistency. Scope-B (full node-record reuse) is deferred to
-v2.1.
+runs. The durable checkpoint API (`Database.save_checkpoint` /
+`Database.load_checkpoint`) extends this with full node-record reuse: a
+fresh process can reload a checkpoint and skip re-executing queries whose
+declared inputs and resource probes are unchanged.
 """
 
 from __future__ import annotations
