@@ -16,7 +16,7 @@ Integrations use a layered query architecture:
 
 **Layer 1 -- Payload queries.** `@query`-decorated functions that return tuple-typed
 payloads. These are the kernel-level cached nodes. They read resources, parse data, and
-return simple hashable structures. Examples: `source_text` (python_source.py:571),
+return simple hashable structures. Examples: `source_text` (python_source.py:583),
 `imports_for_file`, `definitions_for_file`.
 
 **Layer 2 -- Composition queries.** Queries that call other queries and assemble richer
@@ -25,7 +25,7 @@ in a loop over discovered Python files.
 
 **Layer 3 -- High-level entrypoints.** Non-query functions that call `db.get()` and
 decode tuple payloads into frozen dataclasses. These are the public API. Examples:
-`file_analysis` (python_source.py:927), `workspace_analysis` (python_source.py:952).
+`file_analysis` (python_source.py:957), `workspace_analysis` (python_source.py:982).
 
 **Why this layering?** The kernel caches and compares tuple payloads efficiently (they are
 snapshot-safe and hashable by default). The decode layer converts to ergonomic dataclasses
@@ -59,8 +59,8 @@ ImportPayload: TypeAlias = tuple[str, ImportKind, int]
 
 Each layer has a `_decode_*` function that reconstructs the dataclass from its payload.
 Reference: `ImportPayload` (python_source.py:28), `FileAnalysisPayload`
-(python_source.py:55), `_decode_import` (python_source.py:857), `_decode_file_analysis`
-(python_source.py:904).
+(python_source.py:55), `_decode_import` (python_source.py:887), `_decode_file_analysis`
+(python_source.py:934).
 
 **Why?** Tuples are snapshot-safe and hashable by default -- zero-cost for the kernel's
 caching and comparison. The `TypeAlias` makes the bidirectional conversion self-documenting.
@@ -84,7 +84,7 @@ frozen dataclass (or class with `identity()`) implementing four methods:
 - `load(db, key)` -- performs the actual I/O under `db._allow_raw_open()`. Called only
   when `probe` detects a change.
 
-Reference: `_SourceTextResource` (python_source.py:132-158) uses SHA-256 content hashing
+Reference: `_SourceTextResource` (python_source.py:132-159) uses SHA-256 content hashing
 in `probe` for precise invalidation beyond stat-based detection.
 
 Instantiate resources as **module-level singletons**: `_FILES = _SourceTextResource()`,
@@ -101,13 +101,13 @@ Two principles for maintaining the soundness guarantee:
 **Prefer conservative outcomes over optimistic reuse.** When your integration cannot
 determine a dependency statically, return `ambiguous` or `missing` rather than guessing.
 Optimistic reuse risks from-scratch inconsistency. Reference:
-`_resolve_workspace_module` (python_source.py:417) returns `"ambiguous"` when multiple
+`_resolve_workspace_module` (python_source.py:429) returns `"ambiguous"` when multiple
 paths match a module prefix.
 
 **Mark unsupported cases as untracked.** When static analysis hits a pattern it cannot
 handle deterministically, call `db.report_untracked_read(reason)`. This forces
 re-execution on every request but preserves correctness. Reference:
-`module_export_surface` (python_source.py:760) marks dynamic `__all__` as untracked.
+`module_export_surface` (python_source.py:821) marks dynamic `__all__` as untracked.
 
 **Why?** From-scratch consistency is the kernel's primary guarantee. Re-execution is
 always safe; stale reuse is never safe. An integration that guesses wrong about reuse
@@ -126,7 +126,7 @@ def _source_cutoff_token(source: str) -> tuple[str, str]:
         return ("source", source)
 ```
 
-Reference: `source_text` (python_source.py:571) uses `_source_cutoff_token`
+Reference: `source_text` (python_source.py:583) uses `_source_cutoff_token`
 (python_source.py:186). A comment-only edit produces the same AST dump, so the kernel
 backdates `source_text` and downstream queries are reused without re-execution.
 
@@ -141,7 +141,7 @@ When your integration traverses directory trees or recursive structures:
 - Track a `visited` set of canonical (resolved) paths.
 - Use `Path.resolve()` to canonicalize before comparing.
 - Check root containment before recursing to prevent escaping the workspace.
-- Reference: `_collect_python_files` (python_source.py:534-567) uses
+- Reference: `_collect_python_files` (python_source.py:546-579) uses
   `visited_directories`, `_canonical_path`, and `_is_within_root` for safe traversal.
 
 ### Stable API Surface
@@ -150,7 +150,7 @@ Define the public boundary explicitly:
 
 1. Add `__all__` to your integration module listing stable dataclass types,
    high-level entrypoints, and any payload/composition queries other integrations
-   depend on at the query layer. Reference: python_source.py:934-952 lists 8 types
+   depend on at the query layer. Reference: python_source.py:995-1013 lists 8 types
    and 9 functions (4 high-level entrypoints plus 5 composition-layer queries used
    by `symbol_resolution` and others).
 2. Add re-exports in `src/pyinc/integrations/__init__.py` for only those stable
@@ -177,7 +177,7 @@ query's result changes, the downstream query is re-verified and re-executed as n
   user-facing entrypoints.
 
 **Reference:** `python_source` imports `environment_index` from `installed_packages`
-(python_source.py:12) and calls it during import resolution (python_source.py:683)
+(python_source.py:12) and calls it during import resolution (python_source.py:744)
 to classify non-workspace imports as `stdlib`, `installed`, or `missing`.
 
 ### Testing

@@ -16,9 +16,11 @@ from pyinc.integrations.python_source import (
     directory_analysis,
     file_analysis,
     file_analysis_payload,
+    import_statements_for_file,
     imports_for_file,
     module_analysis,
     module_analysis_payload,
+    module_binding_analysis_payload,
     module_export_surface,
     module_wildcard_export_surface,
     source_text,
@@ -981,3 +983,72 @@ def test_resolved_import_ref_distribution_fields_none_for_non_installed(tmp_path
     assert stdlib_ref.resolution == "stdlib"
     assert stdlib_ref.distribution_name is None
     assert stdlib_ref.distribution_version is None
+
+
+# --- try/except ImportError import support (v2.0.0) --------------------------
+
+
+def test_import_statements_for_file_collects_try_except_import_error(tmp_path: Path) -> None:
+    mod = tmp_path / "mod.py"
+    mod.write_text(
+        "import os\n"
+        "try:\n"
+        "    import ujson\n"
+        "except ImportError:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    db = Database(mode="strict")
+    stmts = import_statements_for_file(db, str(mod))
+    modules = [s[0] for s in stmts]
+    assert "os" in modules
+    assert "ujson" in modules
+
+
+def test_import_statements_for_file_collects_try_except_module_not_found(tmp_path: Path) -> None:
+    mod = tmp_path / "mod.py"
+    mod.write_text(
+        "try:\n"
+        "    from fast_lib import speed\n"
+        "except ModuleNotFoundError:\n"
+        "    speed = None\n",
+        encoding="utf-8",
+    )
+    db = Database(mode="strict")
+    stmts = import_statements_for_file(db, str(mod))
+    assert len(stmts) == 1
+    assert stmts[0][0] == "fast_lib"
+    assert stmts[0][1] == "from"
+
+
+def test_module_binding_analysis_no_impurity_for_try_except_import_error(tmp_path: Path) -> None:
+    mod = tmp_path / "mod.py"
+    mod.write_text(
+        "x = 1\n"
+        "try:\n"
+        "    import ujson as json\n"
+        "except ImportError:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    db = Database(mode="strict")
+    explicit, _wildcard, impurity = module_binding_analysis_payload(db, str(mod))
+    assert "json" in explicit
+    assert not any("unsupported" in r for r in impurity), (
+        f"unexpected impurity reasons: {impurity}"
+    )
+
+
+def test_import_statements_for_file_collects_tuple_handler_try_block(tmp_path: Path) -> None:
+    mod = tmp_path / "mod.py"
+    mod.write_text(
+        "try:\n"
+        "    from fast_lib import Encoder\n"
+        "except (ImportError, ModuleNotFoundError):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    db = Database(mode="strict")
+    stmts = import_statements_for_file(db, str(mod))
+    collected_modules = {s[0] for s in stmts}
+    assert "fast_lib" in collected_modules
