@@ -129,6 +129,16 @@ in `docs/architecture.md` are resolved here, except for the still-deferred
 - Removed the phantom v1.3.0 reference in `docs/pyinc-tools-guide.md`; the
   features described there shipped across v1.2.0 and v1.2.1 and continue in
   v2.0.0.
+- Fixed `docs/pyinc-tools-guide.md` to list `try: … except ImportError:` guard
+  blocks under "Supported" (they were added to the `symbol_resolution` walker in
+  this release) and removed them from the "Not supported" conditional-blocks
+  bullet, which now correctly names only `if sys.version_info >= …` style guards.
+- Updated `docs/architecture.md` "Scope" section to replace the crossed-out
+  development-cycle tracking list with a clean summary of what v2.0.0 resolved.
+- Added `examples/checkpoint_demo.py` showing `save_checkpoint` /
+  `load_checkpoint` cross-run cache reuse with `FileSystemArtifactStore`: three
+  simulated runs demonstrating cold execution, full checkpoint reuse, and partial
+  reuse when one input changes.
 
 ## [1.2.1] — 2026-04-24
 

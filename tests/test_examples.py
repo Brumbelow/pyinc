@@ -76,3 +76,16 @@ def test_notebook_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "definitions=('load',)" in output
     assert "output_only_edit_backdated=True" in output
     assert "analysis_unchanged=True" in output
+
+
+def test_checkpoint_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    _run_example("checkpoint_demo.py")
+    output = capsys.readouterr().out
+    assert "run1_result=15" in output
+    assert "run1_executions=3" in output
+    assert "run2_result=15" in output
+    assert "run2_decision=reused" in output
+    assert "run2_executions=0" in output
+    assert "run3_result=50" in output
+    assert "run3_decision=executed" in output
+    assert "run3_executions=1" in output
