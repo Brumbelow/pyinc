@@ -252,6 +252,12 @@ Consequences:
   a symbol name, including identifiers that appear inside string annotations
   (e.g. `x: "Foo"`), since the identifier-at-position parser operates on raw
   source characters.
+- `try: … except ImportError:` / `except ModuleNotFoundError:` / `except (ImportError,
+  ModuleNotFoundError):` guard blocks at module top level — the symbol walker
+  recognizes these patterns and walks their bodies for `import` / `from X import Y`
+  statements. Symbols bound inside these guards appear in hover and goto-definition
+  exactly as unconditional imports do; no "conditional top-level binding" impurity
+  marker is recorded for files whose only conditional blocks are import-error guards.
 
 **Not supported:**
 
@@ -260,9 +266,9 @@ Consequences:
 - Hover or goto-def on stdlib or installed-package symbols — resolution
   correctly classifies them as `stdlib` / `installed`, but the LSP does not
   synthesize a `Location` for out-of-workspace targets.
-- Imports inside other conditional blocks (`if sys.version_info >= ...`, `try/except
-  ImportError`, etc.) — the symbol walker still treats these as a "conditional
-  top-level binding" impurity and does not walk into them.
+- Imports inside other conditional blocks (`if sys.version_info >= ...`, etc.) — the
+  symbol walker treats these as a "conditional top-level binding" impurity and does
+  not walk into them.
 - Multi-hop `from X import *` chains where an intermediate uses only bare
   `from Y import *` without `__all__` or explicit re-exports. The intermediate's
   wildcard export surface is empty by design, so resolution returns `missing`.

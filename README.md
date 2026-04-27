@@ -66,8 +66,8 @@ result = db.get(parse_names, "/tmp/names.txt")   # reuses memo — file unchange
 See `examples/correctness_demo.py` for a walkthrough of backdating, mutation
 protection, untracked-read enforcement, and provenance inspection. The
 `examples/` directory also contains focused scripts for the push-observer
-and artifact-store APIs, the mutable-graph boundary, and several shipped
-integrations.
+and artifact-store APIs, the mutable-graph boundary, the cross-run checkpoint
+API, the Jupyter notebook integration, and several shipped integrations.
 
 ## What pyinc guarantees
 

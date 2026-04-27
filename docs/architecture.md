@@ -96,14 +96,13 @@ Version 1 targets:
 - inline package typing via `py.typed`
 - narrow supported integrations for Python source analysis, symbol resolution, config inspection (TOML, JSON, XML, `.env`, CSV), requirements parsing and evaluation, installed package discovery, dependency validation, and deep module resolution
 
-The v1 line is closed at v1.2.1; v2.0.0 ships once the items below are addressed. Items resolved during the v2 development cycle are crossed out and the cycle's release notes are tracked in `CHANGELOG.md`.
+The v1 line is closed at v1.2.1. v2.0.0 resolves the items that were deferred from v1, except for schedulers and worker pools which remain out of scope:
 
-Version 1 did not include — being addressed for v2.0.0:
+- **notebook integration** — landed as `pyinc.integrations.notebook`
+- **push observers in the kernel** — landed as `Database.observe(...)` returning a `Subscription`, with `QueryChangeEvent` payloads
+- **arbitrary mutable object graphs across cached boundaries** — landed as `FrozenGraph` / `FrozenRef` snapshot variants
+- **content-addressed artifact storage** — landed as the `ArtifactStore` protocol with `InMemoryArtifactStore` and `FileSystemArtifactStore` implementations, `Database(store=...)`, and the durable checkpoint API (`Database.save_checkpoint()` / `load_checkpoint()`) for cross-run node-record reuse
 
-- ~~notebook integration~~ *(landed: `pyinc.integrations.notebook`)*
-- ~~push observers in the kernel~~ *(landed: `Database.observe(...)` and `QueryChangeEvent`)*
-- ~~arbitrary mutable object graphs across cached boundaries~~ *(landed: `FrozenGraph` / `FrozenRef` snapshot variants)*
-- ~~content-addressed artifact storage~~ *(landed in v2.0.0: `ArtifactStore` protocol with in-memory + filesystem implementations, `Database(store=...)`, and the durable `Database.save_checkpoint()` / `load_checkpoint()` API for cross-run node-record reuse)*
-- schedulers or worker pools
+Schedulers and worker pools remain out of scope for v2.
 
 Watcher loops, mirror workspaces, and LSP adapters belong to consumer tooling above the kernel. They can live in the repository, but they do not widen `src/pyinc`'s semver contract unless a concrete correctness gap forces a kernel change. The v1.2.0 additions — `textDocument/references` (workspace-wide reverse-reference index) and the threaded `PollingWorkspaceWatcher.start()` live polling mode — land entirely in `pyinc_tools` on top of stable `pyinc.integrations` entrypoints; `src/pyinc` is unchanged.
