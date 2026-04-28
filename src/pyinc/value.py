@@ -135,14 +135,25 @@ Snapshot = (
 )
 
 IMMUTABLE_SCALARS = (str, bytes, int, float, bool, NoneType, complex)
-_FROZEN_TYPES = (FrozenList, FrozenDict, FrozenSet, FrozenRecord, FrozenAdapterValue, FrozenRef, FrozenGraph)
+_FROZEN_TYPES = (
+    FrozenList,
+    FrozenDict,
+    FrozenSet,
+    FrozenRecord,
+    FrozenAdapterValue,
+    FrozenRef,
+    FrozenGraph,
+)
 AdapterMap = Mapping[type[Any], ValueAdapter]
 
 
 class _AdapterRegistry:
     def __init__(self, adapters: AdapterMap | None = None) -> None:
         self._adapters = dict(adapters or {})
-        self._adapters_by_key = {_adapter_key(value_type): adapter for value_type, adapter in self._adapters.items()}
+        self._adapters_by_key = {
+            _adapter_key(value_type): adapter
+            for value_type, adapter in self._adapters.items()
+        }
         if len(self._adapters_by_key) != len(self._adapters):
             raise ValueError("Adapter registry contains duplicate type identifiers.")
 
@@ -168,7 +179,9 @@ class _FreezeState:
     live_refs: list[Any] = field(default_factory=list)
 
 
-def freeze(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> Snapshot:
+def freeze(
+    value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None
+) -> Snapshot:
     registry = _coerce_registry(adapters)
     state = _FreezeState()
     snapshot = _freeze(value, registry, state)
@@ -196,28 +209,38 @@ def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snap
             return FrozenAdapterValue(adapter_key, _freeze(payload, registry, state))
     if isinstance(value, list):
         return _freeze_via_memo(
-            value, state, lambda: FrozenList(tuple(_freeze(item, registry, state) for item in value))
+            value,
+            state,
+            lambda: FrozenList(tuple(_freeze(item, registry, state) for item in value)),
         )
     if isinstance(value, frozenset):
         with _active_guard(value, state):
             return FrozenSet("frozenset", _freeze_unordered(value, registry, state))
     if isinstance(value, set):
         return _freeze_via_memo(
-            value, state, lambda: FrozenSet("set", _freeze_unordered(value, registry, state))
+            value,
+            state,
+            lambda: FrozenSet("set", _freeze_unordered(value, registry, state)),
         )
     if isinstance(value, Mapping):
-        return _freeze_via_memo(value, state, lambda: _freeze_mapping(value, registry, state))
+        return _freeze_via_memo(
+            value, state, lambda: _freeze_mapping(value, registry, state)
+        )
     if isinstance(value, tuple):
         with _active_guard(value, state):
             return tuple(_freeze(item, registry, state) for item in value)
     if isinstance(value, os.PathLike):
         return cast(str | bytes, os.fspath(value))
     if is_dataclass(value) and not isinstance(value, type):
-        return _freeze_via_memo(value, state, lambda: _freeze_dataclass(value, registry, state))
+        return _freeze_via_memo(
+            value, state, lambda: _freeze_dataclass(value, registry, state)
+        )
     if isinstance(value, range):
         return ("range", value.start, value.stop, value.step)
     if isinstance(value, Iterator):
-        raise UnsupportedValueError("Iterators and generators cannot cross cached boundaries.")
+        raise UnsupportedValueError(
+            "Iterators and generators cannot cross cached boundaries."
+        )
     if isinstance(value, Iterable) and not isinstance(value, Sequence):
         raise UnsupportedValueError(
             f"Unsupported iterable boundary value {type(value).__qualname__}; "
@@ -229,7 +252,9 @@ def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snap
     )
 
 
-def _freeze_via_memo(value: Any, state: _FreezeState, build: Callable[[], Snapshot]) -> Snapshot:
+def _freeze_via_memo(
+    value: Any, state: _FreezeState, build: Callable[[], Snapshot]
+) -> Snapshot:
     obj_id = id(value)
     if obj_id in state.memo:
         state.has_back_edge = True
@@ -247,20 +272,30 @@ def _freeze_via_memo(value: Any, state: _FreezeState, build: Callable[[], Snapsh
     return FrozenRef(idx)
 
 
-def _freeze_mapping(value: Mapping[Any, Any], registry: _AdapterRegistry, state: _FreezeState) -> FrozenDict:
+def _freeze_mapping(
+    value: Mapping[Any, Any], registry: _AdapterRegistry, state: _FreezeState
+) -> FrozenDict:
     frozen_items = tuple(
         sorted(
-            ((_freeze(key, registry, state), _freeze(item, registry, state)) for key, item in value.items()),
+            (
+                (_freeze(key, registry, state), _freeze(item, registry, state))
+                for key, item in value.items()
+            ),
             key=lambda item: _canonical_sort_key(item[0]),
         )
     )
     return FrozenDict(frozen_items)
 
 
-def _freeze_dataclass(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> FrozenRecord:
+def _freeze_dataclass(
+    value: Any, registry: _AdapterRegistry, state: _FreezeState
+) -> FrozenRecord:
     frozen_items = cast(
         tuple[tuple[str, Any], ...],
-        tuple((field_def.name, _freeze(getattr(value, field_def.name), registry, state)) for field_def in fields(value)),
+        tuple(
+            (field_def.name, _freeze(getattr(value, field_def.name), registry, state))
+            for field_def in fields(value)
+        ),
     )
     return FrozenRecord(type(value).__qualname__, frozen_items)
 
@@ -272,12 +307,20 @@ def _inline_refs(value: Snapshot, nodes: list[Any]) -> Snapshot:
     if isinstance(value, FrozenList):
         return FrozenList(tuple(_inline_refs(item, nodes) for item in value.items))
     if isinstance(value, FrozenDict):
-        return FrozenDict(tuple((_inline_refs(k, nodes), _inline_refs(v, nodes)) for k, v in value.entries))
+        return FrozenDict(
+            tuple(
+                (_inline_refs(k, nodes), _inline_refs(v, nodes))
+                for k, v in value.entries
+            )
+        )
     if isinstance(value, FrozenSet):
-        return FrozenSet(value.kind, tuple(_inline_refs(item, nodes) for item in value.items))
+        return FrozenSet(
+            value.kind, tuple(_inline_refs(item, nodes) for item in value.items)
+        )
     if isinstance(value, FrozenRecord):
         return FrozenRecord(
-            value.type_name, tuple((k, _inline_refs(v, nodes)) for k, v in value.entries)
+            value.type_name,
+            tuple((k, _inline_refs(v, nodes)) for k, v in value.entries),
         )
     if isinstance(value, FrozenAdapterValue):
         return FrozenAdapterValue(value.adapter_key, _inline_refs(value.payload, nodes))
@@ -299,7 +342,9 @@ def thaw(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -
 def _thaw(value: Any, registry: _AdapterRegistry, env: list[Any] | None) -> Any:
     if isinstance(value, FrozenRef):
         if env is None:
-            raise UnsupportedValueError("FrozenRef encountered outside a FrozenGraph context.")
+            raise UnsupportedValueError(
+                "FrozenRef encountered outside a FrozenGraph context."
+            )
         return env[value.index]
     if isinstance(value, FrozenAdapterValue):
         adapter = registry.for_key(value.adapter_key)
@@ -311,7 +356,10 @@ def _thaw(value: Any, registry: _AdapterRegistry, env: list[Any] | None) -> Any:
     if isinstance(value, FrozenList):
         return [_thaw(item, registry, env) for item in value.items]
     if isinstance(value, FrozenDict):
-        return {_thaw(key, registry, env): _thaw(item, registry, env) for key, item in value.entries}
+        return {
+            _thaw(key, registry, env): _thaw(item, registry, env)
+            for key, item in value.entries
+        }
     if isinstance(value, FrozenSet):
         thawed_items = tuple(_thaw(item, registry, env) for item in value.items)
         if value.kind == "frozenset":
@@ -348,7 +396,9 @@ def _allocate_shell(node: Any, registry: _AdapterRegistry) -> Any:
     )
 
 
-def _fill_shell(shell: Any, node: Any, registry: _AdapterRegistry, env: list[Any]) -> None:
+def _fill_shell(
+    shell: Any, node: Any, registry: _AdapterRegistry, env: list[Any]
+) -> None:
     if isinstance(node, FrozenList):
         for item in node.items:
             shell.append(_thaw(item, registry, env))
@@ -379,7 +429,9 @@ def _fill_shell(shell: Any, node: Any, registry: _AdapterRegistry, env: list[Any
         return
 
 
-def fingerprint(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> str:
+def fingerprint(
+    value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None
+) -> str:
     snapshot = freeze(value, adapters=adapters)
     return fingerprint_snapshot(snapshot)
 
@@ -404,9 +456,13 @@ def deserialize_snapshot(payload: bytes) -> Snapshot:
         raise UnsupportedValueError(
             f"Payload does not carry the expected kernel fingerprint version prefix {_KERNEL_FINGERPRINT_PREFIX!r}."
         )
-    snapshot, offset = _decode_snapshot(memoryview(payload), len(_KERNEL_FINGERPRINT_PREFIX))
+    snapshot, offset = _decode_snapshot(
+        memoryview(payload), len(_KERNEL_FINGERPRINT_PREFIX)
+    )
     if offset != len(payload):
-        raise UnsupportedValueError("Payload contains trailing bytes after a complete snapshot.")
+        raise UnsupportedValueError(
+            "Payload contains trailing bytes after a complete snapshot."
+        )
     return snapshot
 
 
@@ -554,7 +610,7 @@ def _encode_snapshot(value: Any, buf: bytearray) -> None:
 
 def _decode_snapshot(buf: memoryview, offset: int) -> tuple[Snapshot, int]:
     """Inverse of `_encode_snapshot`. Returns the decoded snapshot and the new offset."""
-    tag = bytes(buf[offset:offset + 1])
+    tag = bytes(buf[offset : offset + 1])
     if tag == b"N":
         _expect(buf, offset + 1, b";")
         return None, offset + 2
@@ -577,7 +633,13 @@ def _decode_snapshot(buf: memoryview, offset: int) -> tuple[Snapshot, int]:
         _expect(buf, real_end, b",")
         imag_body, imag_end = _read_length_prefixed(buf, real_end + 1)
         _expect(buf, imag_end, b";")
-        return complex(float.fromhex(real_body.decode("ascii")), float.fromhex(imag_body.decode("ascii"))), imag_end + 1
+        return (
+            complex(
+                float.fromhex(real_body.decode("ascii")),
+                float.fromhex(imag_body.decode("ascii")),
+            ),
+            imag_end + 1,
+        )
     if tag == b"s":
         body, end = _read_length_prefixed(buf, offset + 1)
         _expect(buf, end, b";")
@@ -662,7 +724,7 @@ def _decode_snapshot(buf: memoryview, offset: int) -> tuple[Snapshot, int]:
 
 
 def _expect(buf: memoryview, offset: int, expected: bytes) -> None:
-    if bytes(buf[offset:offset + len(expected)]) != expected:
+    if bytes(buf[offset : offset + len(expected)]) != expected:
         raise UnsupportedValueError(
             f"Expected {expected!r} at offset {offset}, got {bytes(buf[offset:offset + len(expected)])!r}."
         )
@@ -675,7 +737,7 @@ def _read_length_prefixed(buf: memoryview, offset: int) -> tuple[bytes, int]:
         raise UnsupportedValueError(f"Missing ':' length separator at offset {offset}.")
     length = int(bytes(buf[offset:sep]).decode("ascii"))
     end = sep + 1 + length
-    return bytes(buf[sep + 1:end]), end
+    return bytes(buf[sep + 1 : end]), end
 
 
 def _read_length_prefixed_int(buf: memoryview, offset: int) -> tuple[int, int]:
@@ -690,7 +752,9 @@ def snapshots_equal(left: Any, right: Any) -> bool:
     return bool(left == right)
 
 
-def semantic_equal(left: Any, right: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> bool:
+def semantic_equal(
+    left: Any, right: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None
+) -> bool:
     return freeze(left, adapters=adapters) == freeze(right, adapters=adapters)
 
 
@@ -699,7 +763,9 @@ def assert_not_mutated(before: str, after: str) -> None:
         raise MutationError("Query mutated one of its boundary inputs.")
 
 
-def _freeze_unordered(values: Iterable[Any], registry: _AdapterRegistry, state: _FreezeState) -> tuple[Any, ...]:
+def _freeze_unordered(
+    values: Iterable[Any], registry: _AdapterRegistry, state: _FreezeState
+) -> tuple[Any, ...]:
     snapshots = tuple(_freeze(item, registry, state) for item in values)
     return tuple(sorted(snapshots, key=_canonical_sort_key))
 
@@ -708,7 +774,9 @@ def _canonical_sort_key(value: Any) -> str:
     return fingerprint_snapshot(value)
 
 
-def _coerce_registry(adapters: AdapterMap | _AdapterRegistry | None) -> _AdapterRegistry:
+def _coerce_registry(
+    adapters: AdapterMap | _AdapterRegistry | None,
+) -> _AdapterRegistry:
     if isinstance(adapters, _AdapterRegistry):
         return adapters
     return _AdapterRegistry(adapters)
@@ -721,7 +789,9 @@ def _active_guard(value: Any, state: _FreezeState) -> Iterator[None]:
     otherwise infinitely recurse."""
     object_id = id(value)
     if object_id in state.active_ids:
-        raise UnsupportedValueError("Cyclic values cannot cross cached boundaries through this container type.")
+        raise UnsupportedValueError(
+            "Cyclic values cannot cross cached boundaries through this container type."
+        )
     state.active_ids.add(object_id)
     try:
         yield

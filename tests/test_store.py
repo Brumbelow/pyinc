@@ -195,7 +195,9 @@ def test_database_lru_eviction_does_not_remove_from_store() -> None:
     assert store.contains(fingerprint_snapshot(freeze(200)))
 
 
-def test_database_filesystem_store_writes_through_raw_open_guard(tmp_path: Path) -> None:
+def test_database_filesystem_store_writes_through_raw_open_guard(
+    tmp_path: Path,
+) -> None:
     payload = Input[str]("p")
     store = FileSystemArtifactStore(tmp_path / "store")
     db = Database(store=store)
@@ -239,7 +241,9 @@ def test_database_persists_shared_identity_input_to_store() -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_database_with_store_under_each_mode_round_trips(mode: str, tmp_path: Path) -> None:
+def test_database_with_store_under_each_mode_round_trips(
+    mode: str, tmp_path: Path
+) -> None:
     payload = Input[dict[str, int]]("p")
     store = FileSystemArtifactStore(tmp_path)
 
@@ -271,7 +275,11 @@ def test_filesystem_store_atomic_write_uses_temporary_file(tmp_path: Path) -> No
 
     target_dir = tmp_path / "objects" / "ab"
     # No temp files should remain after the put completes.
-    leftover = [name for name in os.listdir(target_dir) if name.startswith(".tmp-") or name.startswith("tmp")]
+    leftover = [
+        name
+        for name in os.listdir(target_dir)
+        if name.startswith(".tmp-") or name.startswith("tmp")
+    ]
     assert leftover == []
 
 

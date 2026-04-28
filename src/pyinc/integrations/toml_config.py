@@ -14,7 +14,9 @@ from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
 
 ConfigKeyPayload: TypeAlias = tuple[str, str, str, str]
-ConfigSectionPayload: TypeAlias = tuple[str, tuple[ConfigKeyPayload, ...], tuple[str, ...]]
+ConfigSectionPayload: TypeAlias = tuple[
+    str, tuple[ConfigKeyPayload, ...], tuple[str, ...]
+]
 DiagnosticPayload: TypeAlias = tuple[str, str]
 ConfigAnalysisPayload: TypeAlias = tuple[
     str,
@@ -136,7 +138,14 @@ def _walk_sections(
             subsections.append(child_prefix)
             sections.extend(_walk_sections(value, child_prefix))
         else:
-            keys.append((section_name, key, _toml_value_type(value), _toml_value_to_string(value)))
+            keys.append(
+                (
+                    section_name,
+                    key,
+                    _toml_value_type(value),
+                    _toml_value_to_string(value),
+                )
+            )
 
     sections.insert(0, (section_name, tuple(keys), tuple(subsections)))
     return sections
@@ -169,7 +178,9 @@ def config_file_text(db: Database, path: str) -> str:
 
 
 @query
-def config_sections_payload(db: Database, path: str) -> tuple[ConfigSectionPayload, ...]:
+def config_sections_payload(
+    db: Database, path: str
+) -> tuple[ConfigSectionPayload, ...]:
     text = config_file_text(db, path)
     parsed = _try_parse_toml(text)
     if parsed is None:
@@ -208,7 +219,9 @@ def config_tool_configs_payload(db: Database, path: str) -> tuple[str, ...]:
 
 
 @query
-def config_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload, ...]:
+def config_diagnostics_payload(
+    db: Database, path: str
+) -> tuple[DiagnosticPayload, ...]:
     text = config_file_text(db, path)
     if not text:
         return ()
@@ -242,14 +255,19 @@ def _decode_section(payload: ConfigSectionPayload) -> ConfigSection:
     name, keys, subsections = payload
     return ConfigSection(
         name=name,
-        keys=tuple(ConfigKey(section=k[0], key=k[1], value_type=k[2], string_value=k[3]) for k in keys),
+        keys=tuple(
+            ConfigKey(section=k[0], key=k[1], value_type=k[2], string_value=k[3])
+            for k in keys
+        ),
         subsections=subsections,
     )
 
 
 def config_analysis(db: Database, path: str | os.PathLike[str]) -> ConfigAnalysis:
     normalized = os.fspath(path)
-    payload = cast(ConfigAnalysisPayload, thaw(db.get(config_analysis_payload, normalized)))
+    payload = cast(
+        ConfigAnalysisPayload, thaw(db.get(config_analysis_payload, normalized))
+    )
     path_str, sections, deps, optional_deps, tools, diagnostics = payload
     return ConfigAnalysis(
         path=path_str,
@@ -261,7 +279,9 @@ def config_analysis(db: Database, path: str | os.PathLike[str]) -> ConfigAnalysi
     )
 
 
-def workspace_config_analysis(db: Database, root: str | os.PathLike[str]) -> ConfigAnalysis | None:
+def workspace_config_analysis(
+    db: Database, root: str | os.PathLike[str]
+) -> ConfigAnalysis | None:
     normalized_root = os.fspath(root)
     entries = _DIRECTORIES.read(db, normalized_root)
     config_path = None

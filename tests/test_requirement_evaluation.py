@@ -251,9 +251,7 @@ def test_marker_empty_is_true(mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_marker_and_or_grouping(
-    mode: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_marker_and_or_grouping(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_env(monkeypatch, _fixed_env())
     db = Database(mode=mode)
 
@@ -296,9 +294,7 @@ def test_marker_in_not_in(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_marker_extras_not_modeled(
-    mode: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_marker_extras_not_modeled(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_env(monkeypatch, _fixed_env())
     db = Database(mode=mode)
 
@@ -420,10 +416,7 @@ def test_applicable_requirements_status_matrix(
 
     req_file = tmp_path / "requirements.txt"
     req_file.write_text(
-        "requests>=2.0\n"
-        "flask>=1.0\n"
-        "requests>=5.0\n"
-        "requests===2.31.0\n",
+        "requests>=2.0\n" "flask>=1.0\n" "requests>=5.0\n" "requests===2.31.0\n",
         encoding="utf-8",
     )
 

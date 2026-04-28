@@ -170,7 +170,7 @@ def test_json_analysis_handles_nested_objects(tmp_path: Path) -> None:
 
 def test_json_analysis_handles_non_object_top_level(tmp_path: Path) -> None:
     path = tmp_path / "array.json"
-    path.write_text('[1, 2, 3]', encoding="utf-8")
+    path.write_text("[1, 2, 3]", encoding="utf-8")
 
     db = Database()
     result = json_analysis(db, str(path))
@@ -302,7 +302,9 @@ def test_workspace_json_analysis_returns_none_when_missing(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_json_analysis_matches_fresh_recomputation_over_changes(mode: str, tmp_path: Path) -> None:
+def test_json_analysis_matches_fresh_recomputation_over_changes(
+    mode: str, tmp_path: Path
+) -> None:
     path = tmp_path / "config.json"
     base = json.loads(_MINIMAL_JSON)
 

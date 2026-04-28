@@ -85,7 +85,9 @@ class FileSystemArtifactStore:
 
     def _path_for(self, digest: str) -> Path:
         if len(digest) < 3:
-            raise ValueError(f"Digest {digest!r} is too short for filesystem fan-out layout.")
+            raise ValueError(
+                f"Digest {digest!r} is too short for filesystem fan-out layout."
+            )
         return self._objects / digest[:2] / digest[2:]
 
     def get(self, digest: str) -> bytes | None:

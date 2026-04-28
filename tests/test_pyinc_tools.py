@@ -41,7 +41,9 @@ def watcher_factory() -> Iterator[_WatcherFactory]:
         yield factory
     finally:
         for watcher in factory.built:
-            with contextlib.suppress(Exception):  # pragma: no cover - best-effort teardown
+            with contextlib.suppress(
+                Exception
+            ):  # pragma: no cover - best-effort teardown
                 watcher.stop(timeout=2.0)
 
 
@@ -58,7 +60,9 @@ def test_workspace_session_overlay_edits_do_not_touch_disk(tmp_path: Path) -> No
         session.set_overlay(target, "def broken(\n")
         edited = session.analyze_file(target)
 
-        assert any(diagnostic.code == "syntax-error" for diagnostic in edited.diagnostics)
+        assert any(
+            diagnostic.code == "syntax-error" for diagnostic in edited.diagnostics
+        )
         assert target.read_text(encoding="utf-8") == "def ok() -> int:\n    return 1\n"
 
 
@@ -79,10 +83,14 @@ def test_workspace_session_save_and_close_reconcile_with_disk(tmp_path: Path) ->
 
         assert saved.module is not None
         assert saved.module.definitions[0].name == "saved"
-        assert not any(diagnostic.code == "syntax-error" for diagnostic in saved.diagnostics)
+        assert not any(
+            diagnostic.code == "syntax-error" for diagnostic in saved.diagnostics
+        )
 
 
-def test_workspace_session_cross_file_invalidation_and_path_remap(tmp_path: Path) -> None:
+def test_workspace_session_cross_file_invalidation_and_path_remap(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     provider = root / "a.py"
@@ -92,18 +100,25 @@ def test_workspace_session_cross_file_invalidation_and_path_remap(tmp_path: Path
 
     with WorkspaceSession(root) as session:
         clean = session.analyze_file(consumer)
-        assert not any(diagnostic.code == "unresolved-symbol" for diagnostic in clean.diagnostics)
+        assert not any(
+            diagnostic.code == "unresolved-symbol" for diagnostic in clean.diagnostics
+        )
 
         session.set_overlay(provider, "def bar() -> int:\n    return 1\n")
         broken = session.analyze_file(consumer)
-        assert any(diagnostic.code == "unresolved-symbol" for diagnostic in broken.diagnostics)
+        assert any(
+            diagnostic.code == "unresolved-symbol" for diagnostic in broken.diagnostics
+        )
 
         workspace = session.analyze_workspace()
         module_by_path = {module.path: module for module in workspace.python.modules}
         consumer_module = module_by_path[str(consumer)]
 
         assert workspace.python.root == str(root)
-        assert all(not module.path.startswith(session.mirror_root) for module in workspace.python.modules)
+        assert all(
+            not module.path.startswith(session.mirror_root)
+            for module in workspace.python.modules
+        )
         assert consumer_module.resolved_imports[0].resolved_path == str(provider)
         assert consumer_module.dependencies[0].path == str(provider)
 
@@ -132,7 +147,10 @@ def test_polling_workspace_watcher_batches_changes(tmp_path: Path) -> None:
 
         assert set(changed) == {str(first), str(second)}
         workspace = session.analyze_workspace()
-        assert {module.path for module in workspace.python.modules} == {str(first), str(second)}
+        assert {module.path for module in workspace.python.modules} == {
+            str(first),
+            str(second),
+        }
 
 
 def test_language_server_reports_document_and_workspace_symbols(tmp_path: Path) -> None:
@@ -141,11 +159,7 @@ def test_language_server_reports_document_and_workspace_symbols(tmp_path: Path) 
     target = root / "symbols.py"
     _write(
         target,
-        "class Box:\n"
-        "    pass\n"
-        "\n"
-        "def helper() -> int:\n"
-        "    return 1\n",
+        "class Box:\n" "    pass\n" "\n" "def helper() -> int:\n" "    return 1\n",
     )
 
     server = LanguageServer(default_root=str(root))
@@ -161,7 +175,9 @@ def test_language_server_reports_document_and_workspace_symbols(tmp_path: Path) 
         )
         assert {item["name"] for item in document_symbols} == {"Box", "helper"}
 
-        workspace_symbols = server._handle_request("workspace/symbol", {"query": "help"})
+        workspace_symbols = server._handle_request(
+            "workspace/symbol", {"query": "help"}
+        )
         assert len(workspace_symbols) == 1
         assert workspace_symbols[0]["name"] == "helper"
     finally:
@@ -169,7 +185,9 @@ def test_language_server_reports_document_and_workspace_symbols(tmp_path: Path) 
             server._session.close()
 
 
-def test_language_server_hover_local_function_includes_signature(tmp_path: Path) -> None:
+def test_language_server_hover_local_function_includes_signature(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "mod.py"
@@ -237,7 +255,9 @@ def test_language_server_hover_class_shows_kind(tmp_path: Path) -> None:
             server._session.close()
 
 
-def test_language_server_definition_local_function_returns_same_file(tmp_path: Path) -> None:
+def test_language_server_definition_local_function_returns_same_file(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "mod.py"
@@ -287,7 +307,9 @@ def test_language_server_definition_follows_cross_file_reexport(tmp_path: Path) 
             server._session.close()
 
 
-def test_language_server_definition_on_unknown_identifier_returns_empty(tmp_path: Path) -> None:
+def test_language_server_definition_on_unknown_identifier_returns_empty(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "mod.py"
@@ -326,7 +348,9 @@ def _write_reexport_chain(root: Path, length: int, symbol: str) -> Path:
     return root / "hop_00.py"
 
 
-def test_language_server_definition_follows_single_level_wildcard_import(tmp_path: Path) -> None:
+def test_language_server_definition_follows_single_level_wildcard_import(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "provider.py", "def foo() -> int:\n    return 1\n")
@@ -409,7 +433,9 @@ def test_resolve_symbol_reference_max_follow_depth_boundary(tmp_path: Path) -> N
             server._session.close()
 
 
-def test_resolve_symbol_reference_cyclic_reexport_returns_ambiguous(tmp_path: Path) -> None:
+def test_resolve_symbol_reference_cyclic_reexport_returns_ambiguous(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "a.py", "from b import foo\n")
@@ -421,7 +447,9 @@ def test_resolve_symbol_reference_cyclic_reexport_returns_ambiguous(tmp_path: Pa
         assert resolved.defining_path is None
 
 
-def test_language_server_hover_on_ambiguous_wildcard_returns_none(tmp_path: Path) -> None:
+def test_language_server_hover_on_ambiguous_wildcard_returns_none(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "providers_a.py", "def foo() -> int:\n    return 1\n")
@@ -462,7 +490,9 @@ def test_language_server_hover_on_ambiguous_wildcard_returns_none(tmp_path: Path
             server._session.close()
 
 
-def test_language_server_document_symbol_surfaces_every_symbol_kind(tmp_path: Path) -> None:
+def test_language_server_document_symbol_surfaces_every_symbol_kind(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "all_kinds.py"
@@ -475,7 +505,7 @@ def test_language_server_document_symbol_surfaces_every_symbol_kind(tmp_path: Pa
         "x: int = 1\n"
         "\n"
         "class Box:\n"
-        "    attr: str = \"\"\n"
+        '    attr: str = ""\n'
         "\n"
         "    def method(self) -> int:\n"
         "        return 0\n"
@@ -719,14 +749,14 @@ def test_type_checking_imports_visible_and_lsp_hover_works(tmp_path: Path) -> No
     _write(
         consumer,
         "from typing import TYPE_CHECKING\n"  # line 0
-        "\n"                                  # line 1
-        "if TYPE_CHECKING:\n"                 # line 2
-        "    from helper import Foo\n"        # line 3
-        "\n"                                  # line 4
-        "x: Foo\n"                            # line 5 — bare identifier reference
-        "\n"                                  # line 6
-        "def g(a: \"Foo\") -> \"Foo\":\n"    # line 7 — string annotation (forward-ref)
-        "    return a\n",                     # line 8
+        "\n"  # line 1
+        "if TYPE_CHECKING:\n"  # line 2
+        "    from helper import Foo\n"  # line 3
+        "\n"  # line 4
+        "x: Foo\n"  # line 5 — bare identifier reference
+        "\n"  # line 6
+        'def g(a: "Foo") -> "Foo":\n'  # line 7 — string annotation (forward-ref)
+        "    return a\n",  # line 8
     )
 
     with WorkspaceSession(root) as session:

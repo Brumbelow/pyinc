@@ -228,21 +228,31 @@ def test_workspace_config_analysis_returns_none_when_missing(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_config_analysis_matches_fresh_recomputation_over_changes(mode: str, tmp_path: Path) -> None:
+def test_config_analysis_matches_fresh_recomputation_over_changes(
+    mode: str, tmp_path: Path
+) -> None:
     path = tmp_path / "pyproject.toml"
     steps: tuple[tuple[str, str], ...] = (
         ("initial", _MINIMAL_TOML),
         ("add comment", "# comment\n" + _MINIMAL_TOML),
-        ("change deps", _MINIMAL_TOML.replace(
-            'dependencies = ["requests>=2.0", "click"]',
-            'dependencies = ["httpx"]',
-        )),
+        (
+            "change deps",
+            _MINIMAL_TOML.replace(
+                'dependencies = ["requests>=2.0", "click"]',
+                'dependencies = ["httpx"]',
+            ),
+        ),
         ("add tool", _MINIMAL_TOML + "\n[tool.black]\nline-length = 88\n"),
-        ("change version", _MINIMAL_TOML.replace('version = "0.1.0"', 'version = "1.0.0"')),
+        (
+            "change version",
+            _MINIMAL_TOML.replace('version = "0.1.0"', 'version = "1.0.0"'),
+        ),
     )
 
     incremental = Database(mode=mode)
     for _label, content in steps:
         path.write_text(content, encoding="utf-8")
         fresh = Database(mode=mode)
-        assert config_analysis(incremental, str(path)) == config_analysis(fresh, str(path))
+        assert config_analysis(incremental, str(path)) == config_analysis(
+            fresh, str(path)
+        )

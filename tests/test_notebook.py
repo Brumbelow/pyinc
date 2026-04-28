@@ -73,7 +73,9 @@ def test_package_namespace_exports_notebook_stable_api() -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_notebook_analysis_extracts_cells_and_metadata(mode: str, tmp_path: Path) -> None:
+def test_notebook_analysis_extracts_cells_and_metadata(
+    mode: str, tmp_path: Path
+) -> None:
     nb = _notebook(
         [
             {"cell_type": "markdown", "source": ["# Title\n", "Some prose."]},

@@ -17,15 +17,23 @@ def _build_parser() -> argparse.ArgumentParser:
     analyze = subparsers.add_parser("analyze", help="Run workspace or file analysis.")
     analyze.add_argument("root", help="Workspace root to mirror and analyze.")
     analyze.add_argument("--path", help="Analyze one path under the workspace root.")
-    analyze.add_argument("--watch", action="store_true", help="Poll for file changes and re-run analysis.")
-    analyze.add_argument("--debounce-ms", type=int, default=200, help="Watcher debounce window.")
+    analyze.add_argument(
+        "--watch",
+        action="store_true",
+        help="Poll for file changes and re-run analysis.",
+    )
+    analyze.add_argument(
+        "--debounce-ms", type=int, default=200, help="Watcher debounce window."
+    )
     analyze.add_argument(
         "--poll-interval-ms",
         type=int,
         default=None,
         help="Watcher poll cadence (defaults to half the debounce window).",
     )
-    analyze.add_argument("--indent", type=int, default=2, help="JSON indentation level.")
+    analyze.add_argument(
+        "--indent", type=int, default=2, help="JSON indentation level."
+    )
 
     lsp = subparsers.add_parser("lsp", help="Start the stdio LSP adapter.")
     lsp.add_argument("--root", help="Fallback workspace root if the client omits one.")

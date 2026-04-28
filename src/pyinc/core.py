@@ -3,7 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Concatenate, Generic, ParamSpec, TypeVar, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Concatenate,
+    Generic,
+    ParamSpec,
+    TypeVar,
+    overload,
+)
 
 from .value import semantic_equal
 

@@ -19,7 +19,9 @@ from pyinc.value import thaw
 # Payload type aliases
 # ---------------------------------------------------------------------------
 
-InstalledPackagePayload: TypeAlias = tuple[str, str, tuple[str, ...], tuple[str, ...], str]
+InstalledPackagePayload: TypeAlias = tuple[
+    str, str, tuple[str, ...], tuple[str, ...], str
+]
 #                                          dist_name, version, top_level_names, requires_dist, summary
 
 DiagnosticPayload: TypeAlias = tuple[str, str]
@@ -35,8 +37,8 @@ InstalledDistributionsIndexPayload: TypeAlias = tuple[tuple[str, str], ...]
 #                                                      (normalized_dist_name, version)
 
 EnvironmentIndexPayload: TypeAlias = tuple[
-    tuple[str, ...],                       # stdlib_modules
-    tuple[tuple[str, str, str], ...],      # (top_level_name, dist_name, version)
+    tuple[str, ...],  # stdlib_modules
+    tuple[tuple[str, str, str], ...],  # (top_level_name, dist_name, version)
 ]
 
 # ---------------------------------------------------------------------------
@@ -189,13 +191,7 @@ def _site_packages_dirs(db: Database) -> tuple[str, ...]:
 def _dist_info_listing(db: Database, site_dir: str) -> tuple[str, ...]:
     """List .dist-info directories in a site-packages via DirectoryResource."""
     entries = _DIRECTORIES.read(db, site_dir)
-    return tuple(
-        sorted(
-            entry
-            for entry in entries
-            if re.match(_DIST_INFO_PAT, entry)
-        )
-    )
+    return tuple(sorted(entry for entry in entries if re.match(_DIST_INFO_PAT, entry)))
 
 
 @query(cutoff=_metadata_cutoff_token)
@@ -235,9 +231,7 @@ def _package_metadata_payload(
     top_level_raw = _top_level_text(db, top_level_file)
     if top_level_raw.strip():
         top_level_names = tuple(
-            line.strip()
-            for line in top_level_raw.strip().splitlines()
-            if line.strip()
+            line.strip() for line in top_level_raw.strip().splitlines() if line.strip()
         )
     else:
         # Fallback: derive from distribution name
@@ -267,10 +261,12 @@ def _installed_packages_payload(db: Database) -> InstalledPackagesAnalysisPayloa
             if payload is not None:
                 packages.append(payload)
             else:
-                diagnostics.append((
-                    "metadata-parse-failed",
-                    f"Could not parse metadata from {dist_info_name} in {site_dir}",
-                ))
+                diagnostics.append(
+                    (
+                        "metadata-parse-failed",
+                        f"Could not parse metadata from {dist_info_name} in {site_dir}",
+                    )
+                )
 
     packages.sort(key=lambda p: _normalize_dist_name(p[0]))
     return (tuple(packages), stdlib_modules, tuple(diagnostics))

@@ -267,15 +267,11 @@ def _parameter_payloads_from_args(args: ast.arguments) -> tuple[ParameterPayload
     for arg in args.args:
         params.append((arg.arg, _annotation_text(arg.annotation)))
     if args.vararg is not None:
-        params.append(
-            (f"*{args.vararg.arg}", _annotation_text(args.vararg.annotation))
-        )
+        params.append((f"*{args.vararg.arg}", _annotation_text(args.vararg.annotation)))
     for arg in args.kwonlyargs:
         params.append((arg.arg, _annotation_text(arg.annotation)))
     if args.kwarg is not None:
-        params.append(
-            (f"**{args.kwarg.arg}", _annotation_text(args.kwarg.annotation))
-        )
+        params.append((f"**{args.kwarg.arg}", _annotation_text(args.kwarg.annotation)))
     return tuple(params)
 
 
@@ -391,7 +387,8 @@ def _has_import_error_handler(handlers: list[ast.ExceptHandler]) -> bool:
         ):
             return True
         if isinstance(exc_type, ast.Tuple) and any(
-            isinstance(elt, ast.Name) and elt.id in ("ImportError", "ModuleNotFoundError")
+            isinstance(elt, ast.Name)
+            and elt.id in ("ImportError", "ModuleNotFoundError")
             for elt in exc_type.elts
         ):
             return True
@@ -577,9 +574,7 @@ def _module_symbol_walk(
 
 
 @query
-def module_symbol_table_payload(
-    db: Database, path: str
-) -> ModuleSymbolTablePayload:
+def module_symbol_table_payload(db: Database, path: str) -> ModuleSymbolTablePayload:
     source = source_text(db, path)
     tree = _try_parse(source)
     if tree is None:
@@ -773,7 +768,9 @@ def resolve_symbol_payload(
 ) -> ResolvedSymbolPayload:
     workspace_files = workspace_python_files(db, root)
     if path not in workspace_files:
-        return _terminal("", qualified_name, "missing", None, None, None, None, None, 0, tuple())
+        return _terminal(
+            "", qualified_name, "missing", None, None, None, None, None, 0, tuple()
+        )
 
     original_module = _module_name_for_path(root, path)
     current_path = path
@@ -790,16 +787,32 @@ def resolve_symbol_payload(
                 f"symbol resolution cycle at {current_module}:{current_qname}"
             )
             return _terminal(
-                original_module, qualified_name, "ambiguous",
-                None, None, None, None, None, depth, tuple(trail),
+                original_module,
+                qualified_name,
+                "ambiguous",
+                None,
+                None,
+                None,
+                None,
+                None,
+                depth,
+                tuple(trail),
             )
         visited.add(key)
         trail.append(f"{current_module}:{current_qname}")
 
         if depth >= MAX_FOLLOW_DEPTH:
             return _terminal(
-                original_module, qualified_name, "ambiguous",
-                None, None, None, None, None, depth, tuple(trail),
+                original_module,
+                qualified_name,
+                "ambiguous",
+                None,
+                None,
+                None,
+                None,
+                None,
+                depth,
+                tuple(trail),
             )
 
         table = module_symbol_table_for_module(db, root, current_path)
@@ -811,13 +824,29 @@ def resolve_symbol_payload(
             )
             if wildcard_outcome is None:
                 return _terminal(
-                    original_module, qualified_name, "missing",
-                    None, None, None, None, None, depth, tuple(trail),
+                    original_module,
+                    qualified_name,
+                    "missing",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    depth,
+                    tuple(trail),
                 )
             if isinstance(wildcard_outcome, str):
                 return _terminal(
-                    original_module, qualified_name, wildcard_outcome,
-                    None, None, None, None, None, depth, tuple(trail),
+                    original_module,
+                    qualified_name,
+                    wildcard_outcome,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    depth,
+                    tuple(trail),
                 )
             current_path, current_qname = wildcard_outcome
             depth += 1
@@ -828,8 +857,16 @@ def resolve_symbol_payload(
 
         if kind in _TERMINAL_SYMBOL_KINDS:
             return _terminal(
-                original_module, qualified_name, "workspace",
-                current_module, current_path, lineno, None, None, depth, tuple(trail),
+                original_module,
+                qualified_name,
+                "workspace",
+                current_module,
+                current_path,
+                lineno,
+                None,
+                None,
+                depth,
+                tuple(trail),
             )
 
         if kind in ("import_alias", "from_import_alias"):
@@ -837,52 +874,116 @@ def resolve_symbol_payload(
             source_name = symbol[6]
             if source_module is None:
                 return _terminal(
-                    original_module, qualified_name, "missing",
-                    None, None, None, None, None, depth, tuple(trail),
+                    original_module,
+                    qualified_name,
+                    "missing",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    depth,
+                    tuple(trail),
                 )
             match = _match_import(db, root, current_path, source_module, source_name)
             if match is None:
                 return _terminal(
-                    original_module, qualified_name, "missing",
-                    None, None, None, None, None, depth, tuple(trail),
+                    original_module,
+                    qualified_name,
+                    "missing",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    depth,
+                    tuple(trail),
                 )
             resolution, target_path, dist_name, dist_ver = match
 
             if resolution == "stdlib":
                 return _terminal(
-                    original_module, qualified_name, "stdlib",
-                    None, None, None, None, None, depth, tuple(trail),
+                    original_module,
+                    qualified_name,
+                    "stdlib",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    depth,
+                    tuple(trail),
                 )
             if resolution == "installed":
                 return _terminal(
-                    original_module, qualified_name, "installed",
-                    None, None, None, dist_name, dist_ver, depth, tuple(trail),
+                    original_module,
+                    qualified_name,
+                    "installed",
+                    None,
+                    None,
+                    None,
+                    dist_name,
+                    dist_ver,
+                    depth,
+                    tuple(trail),
                 )
             if resolution in ("external", "ambiguous", "missing"):
                 return _terminal(
-                    original_module, qualified_name, resolution,
-                    None, None, None, None, None, depth, tuple(trail),
+                    original_module,
+                    qualified_name,
+                    resolution,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    depth,
+                    tuple(trail),
                 )
             # resolution == "workspace"
             if target_path is None:
                 return _terminal(
-                    original_module, qualified_name, "missing",
-                    None, None, None, None, None, depth, tuple(trail),
+                    original_module,
+                    qualified_name,
+                    "missing",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    depth,
+                    tuple(trail),
                 )
 
             if kind == "import_alias":
                 target_module = _module_name_for_path(root, target_path)
                 return _terminal(
-                    original_module, qualified_name, "workspace",
-                    target_module, target_path, None, None, None, depth, tuple(trail),
+                    original_module,
+                    qualified_name,
+                    "workspace",
+                    target_module,
+                    target_path,
+                    None,
+                    None,
+                    None,
+                    depth,
+                    tuple(trail),
                 )
 
             assert source_name is not None
             if _is_module_target(root, target_path, source_name):
                 target_module = _module_name_for_path(root, target_path)
                 return _terminal(
-                    original_module, qualified_name, "workspace",
-                    target_module, target_path, None, None, None, depth, tuple(trail),
+                    original_module,
+                    qualified_name,
+                    "workspace",
+                    target_module,
+                    target_path,
+                    None,
+                    None,
+                    None,
+                    depth,
+                    tuple(trail),
                 )
             current_path = target_path
             current_qname = source_name
@@ -890,8 +991,16 @@ def resolve_symbol_payload(
             continue
 
         return _terminal(
-            original_module, qualified_name, "missing",
-            None, None, None, None, None, depth, tuple(trail),
+            original_module,
+            qualified_name,
+            "missing",
+            None,
+            None,
+            None,
+            None,
+            None,
+            depth,
+            tuple(trail),
         )
 
 
@@ -1021,9 +1130,7 @@ def find_references_payload(
                 continue
             if v_def_lineno != defining_lineno:
                 continue
-            is_declaration = (
-                file_path == defining_path and lineno == defining_lineno
-            )
+            is_declaration = file_path == defining_path and lineno == defining_lineno
             if is_declaration:
                 declaration_seen = True
             references.append(

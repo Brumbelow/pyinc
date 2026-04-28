@@ -21,7 +21,13 @@ def test_base_error_inherits_from_exception() -> None:
 
 def test_error_messages_are_preserved() -> None:
     msg = "something went wrong"
-    for cls in (PyIncError, MutationError, UntrackedReadError, UnsupportedValueError, CycleError):
+    for cls in (
+        PyIncError,
+        MutationError,
+        UntrackedReadError,
+        UnsupportedValueError,
+        CycleError,
+    ):
         err = cls(msg)
         assert str(err) == msg
 
@@ -37,7 +43,12 @@ def test_errors_are_catchable_by_base_class() -> None:
 
 
 def test_error_types_are_exported_from_package() -> None:
-    for name in ("PyIncError", "MutationError", "UntrackedReadError",
-                 "UnsupportedValueError", "CycleError"):
+    for name in (
+        "PyIncError",
+        "MutationError",
+        "UntrackedReadError",
+        "UnsupportedValueError",
+        "CycleError",
+    ):
         assert name in pyinc.__all__
         assert hasattr(pyinc, name)

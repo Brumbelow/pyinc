@@ -9,6 +9,7 @@ This demo walks through pyinc's core differentiators in sequence:
 5. Mutation protection — frozen values reject writes in strict mode
 6. Provenance inspection — structured decision trees via explain()
 """
+
 from __future__ import annotations
 
 import ast
@@ -23,6 +24,7 @@ from pyinc import Database, FileResource, UntrackedReadError, query
 # ---------------------------------------------------------------------------
 
 _FILES = FileResource()
+
 
 # A cutoff function that compares by AST structure, not raw text.
 # Comment-only edits produce the same AST → backdated (early cutoff).
@@ -47,7 +49,9 @@ def count_functions(db: Database, path: str) -> int:
         tree = ast.parse(source)
     except SyntaxError:
         return 0
-    return sum(1 for node in ast.iter_child_nodes(tree) if isinstance(node, ast.FunctionDef))
+    return sum(
+        1 for node in ast.iter_child_nodes(tree) if isinstance(node, ast.FunctionDef)
+    )
 
 
 @query

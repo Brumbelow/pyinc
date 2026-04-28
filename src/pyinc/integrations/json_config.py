@@ -125,7 +125,14 @@ def _walk_sections(
             subsections.append(child_prefix)
             sections.extend(_walk_sections(value, child_prefix))
         else:
-            keys.append((section_name, key, _json_value_type(value), _json_value_to_string(value)))
+            keys.append(
+                (
+                    section_name,
+                    key,
+                    _json_value_type(value),
+                    _json_value_to_string(value),
+                )
+            )
 
     sections.insert(0, (section_name, tuple(keys), tuple(subsections)))
     return sections
@@ -202,7 +209,10 @@ def _decode_section(payload: JsonSectionPayload) -> JsonSection:
     name, keys, subsections = payload
     return JsonSection(
         name=name,
-        keys=tuple(JsonKey(section=k[0], key=k[1], value_type=k[2], string_value=k[3]) for k in keys),
+        keys=tuple(
+            JsonKey(section=k[0], key=k[1], value_type=k[2], string_value=k[3])
+            for k in keys
+        ),
         subsections=subsections,
     )
 

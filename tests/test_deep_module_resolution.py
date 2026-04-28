@@ -309,41 +309,36 @@ def test_deep_module_resolution_matches_fresh_recomputation(
         return Database(mode=mode)
 
     # Step 1: empty
-    assert (
-        deep_module_resolution_analysis(incremental)
-        == deep_module_resolution_analysis(fresh())
-    )
+    assert deep_module_resolution_analysis(
+        incremental
+    ) == deep_module_resolution_analysis(fresh())
 
     # Step 2: add a .pth file pointing to an extra path
     extra = tmp_path / "extra"
     extra.mkdir()
     (site / "a.pth").write_text(f"{extra}\n", encoding="utf-8")
-    assert (
-        deep_module_resolution_analysis(incremental)
-        == deep_module_resolution_analysis(fresh())
-    )
+    assert deep_module_resolution_analysis(
+        incremental
+    ) == deep_module_resolution_analysis(fresh())
 
     # Step 3: add a namespace contribution under extra
     (extra / "ns").mkdir()
     (extra / "ns" / "leaf.py").write_text("", encoding="utf-8")
-    assert (
-        deep_module_resolution_analysis(incremental)
-        == deep_module_resolution_analysis(fresh())
-    )
+    assert deep_module_resolution_analysis(
+        incremental
+    ) == deep_module_resolution_analysis(fresh())
 
     # Step 4: convert the namespace into a regular package
     (extra / "ns" / "__init__.py").write_text("", encoding="utf-8")
-    assert (
-        deep_module_resolution_analysis(incremental)
-        == deep_module_resolution_analysis(fresh())
-    )
+    assert deep_module_resolution_analysis(
+        incremental
+    ) == deep_module_resolution_analysis(fresh())
 
     # Step 5: remove the .pth file
     (site / "a.pth").unlink()
-    assert (
-        deep_module_resolution_analysis(incremental)
-        == deep_module_resolution_analysis(fresh())
-    )
+    assert deep_module_resolution_analysis(
+        incremental
+    ) == deep_module_resolution_analysis(fresh())
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

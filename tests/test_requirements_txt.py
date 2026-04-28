@@ -158,7 +158,9 @@ def test_requirements_analysis_parses_environment_markers(tmp_path: Path) -> Non
 
 def test_requirements_analysis_parses_editable_installs(tmp_path: Path) -> None:
     path = tmp_path / "requirements.txt"
-    path.write_text("-e .\n-e git+https://github.com/example/pkg.git\n", encoding="utf-8")
+    path.write_text(
+        "-e .\n-e git+https://github.com/example/pkg.git\n", encoding="utf-8"
+    )
 
     db = Database()
     result = requirements_analysis(db, str(path))
@@ -262,7 +264,9 @@ def test_requirements_analysis_on_nonexistent_file(tmp_path: Path) -> None:
 
 def test_requirements_analysis_normalizes_package_names(tmp_path: Path) -> None:
     path = tmp_path / "requirements.txt"
-    path.write_text("Requests>=2.0\nmy-package==1.0\nAnother.Pkg>=3.0\n", encoding="utf-8")
+    path.write_text(
+        "Requests>=2.0\nmy-package==1.0\nAnother.Pkg>=3.0\n", encoding="utf-8"
+    )
 
     db = Database()
     result = requirements_analysis(db, str(path))
@@ -331,7 +335,9 @@ def test_semantic_edit_invalidates_downstream_requirements(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-def test_workspace_requirements_analysis_discovers_requirements_txt(tmp_path: Path) -> None:
+def test_workspace_requirements_analysis_discovers_requirements_txt(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     reqs = root / "requirements.txt"
@@ -344,7 +350,9 @@ def test_workspace_requirements_analysis_discovers_requirements_txt(tmp_path: Pa
     assert len(result.requirements) == 1
 
 
-def test_workspace_requirements_analysis_returns_none_when_missing(tmp_path: Path) -> None:
+def test_workspace_requirements_analysis_returns_none_when_missing(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "empty"
     root.mkdir()
 

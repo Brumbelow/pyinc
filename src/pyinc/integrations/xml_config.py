@@ -15,18 +15,18 @@ from pyinc.value import freeze, thaw
 
 XmlAttributePayload: TypeAlias = tuple[str, str]
 XmlElementPayload: TypeAlias = tuple[
-    str,                              # tag
-    str,                              # path
-    str,                              # text
+    str,  # tag
+    str,  # path
+    str,  # text
     tuple[XmlAttributePayload, ...],  # attributes
-    tuple[str, ...],                  # children tags
+    tuple[str, ...],  # children tags
 ]
 DiagnosticPayload: TypeAlias = tuple[str, str]
 XmlAnalysisPayload: TypeAlias = tuple[
-    str,                              # path
-    str,                              # root_tag
-    tuple[XmlElementPayload, ...],    # elements
-    tuple[DiagnosticPayload, ...],    # diagnostics
+    str,  # path
+    str,  # root_tag
+    tuple[XmlElementPayload, ...],  # elements
+    tuple[DiagnosticPayload, ...],  # diagnostics
 ]
 
 
@@ -103,7 +103,7 @@ def _strip_namespace(tag: str) -> str:
     if tag.startswith("{"):
         idx = tag.find(_NS_PAT)
         if idx >= 0:
-            return tag[idx + 1:]
+            return tag[idx + 1 :]
     return tag
 
 
@@ -119,9 +119,7 @@ def _walk_elements(
     attrs: tuple[XmlAttributePayload, ...] = tuple(
         (_strip_namespace(k), v) for k, v in sorted(elem.attrib.items())
     )
-    child_tags: tuple[str, ...] = tuple(
-        _strip_namespace(child.tag) for child in elem
-    )
+    child_tags: tuple[str, ...] = tuple(_strip_namespace(child.tag) for child in elem)
     text = (elem.text or "").strip()
 
     elements.append((local_tag, current_path, text, attrs, child_tags))
@@ -152,9 +150,7 @@ def _safe_parse(text: str) -> ET.Element:
 
     def _start_element(tag: str, attrs: dict[str, str]) -> None:
         normalised_tag = "{" + tag if "}" in tag else tag
-        normalised_attrs = {
-            ("{" + k if "}" in k else k): v for k, v in attrs.items()
-        }
+        normalised_attrs = {("{" + k if "}" in k else k): v for k, v in attrs.items()}
         builder.start(normalised_tag, normalised_attrs)
 
     def _end_element(tag: str) -> None:

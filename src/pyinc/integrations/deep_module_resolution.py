@@ -28,13 +28,13 @@ NamespacePackagePayload: TypeAlias = tuple[str, tuple[str, ...]]
 #                                           dotted_name, contributing_paths
 
 ResolvedModuleLocationPayload: TypeAlias = tuple[
-    str,                # dotted_name
-    str,                # kind
-    str | None,         # file_path
-    str | None,         # directory_path
-    tuple[str, ...],    # contributing_paths (non-empty only for namespace-package)
-    str | None,         # distribution_name
-    str | None,         # distribution_version
+    str,  # dotted_name
+    str,  # kind
+    str | None,  # file_path
+    str | None,  # directory_path
+    tuple[str, ...],  # contributing_paths (non-empty only for namespace-package)
+    str | None,  # distribution_name
+    str | None,  # distribution_version
 ]
 
 DiagnosticPayload: TypeAlias = tuple[str, str]
@@ -293,9 +293,7 @@ def _all_pth_directives_payload(db: Database) -> tuple[PthDirectivePayload, ...]
     return tuple(directives)
 
 
-def _classify_candidate(
-    db: Database, entry: str, name: str
-) -> tuple[str, str] | None:
+def _classify_candidate(db: Database, entry: str, name: str) -> tuple[str, str] | None:
     """Return ``(path, kind)`` where ``kind`` is ``package``, ``module``, or
     ``namespace-dir``, preferring the CPython precedence (package > module >
     namespace). ``None`` means nothing matches.
@@ -442,8 +440,18 @@ def resolve_module_location(
 
 
 _SKIP_NAMESPACE_SUFFIXES = (
-    ".py", ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib",
-    ".dist-info", ".egg-info", ".egg-link", ".pth", ".txt",
+    ".py",
+    ".pyc",
+    ".pyo",
+    ".pyd",
+    ".so",
+    ".dll",
+    ".dylib",
+    ".dist-info",
+    ".egg-info",
+    ".egg-link",
+    ".pth",
+    ".txt",
 )
 
 

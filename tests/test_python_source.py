@@ -165,7 +165,9 @@ def test_package_namespace_exports_only_stable_api() -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_file_analysis_reports_top_level_symbols_by_mode(mode: str, tmp_path: Path) -> None:
+def test_file_analysis_reports_top_level_symbols_by_mode(
+    mode: str, tmp_path: Path
+) -> None:
     path = tmp_path / "sample.py"
     path.write_text(
         "import os\n"
@@ -212,7 +214,9 @@ def test_file_analysis_reports_syntax_errors(mode: str, tmp_path: Path) -> None:
     assert analysis.diagnostics[0].col_offset is not None
 
 
-def test_comment_only_edit_backdates_source_and_reuses_downstream(tmp_path: Path) -> None:
+def test_comment_only_edit_backdates_source_and_reuses_downstream(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "sample.py"
     path.write_text("import os\n", encoding="utf-8")
     db = Database(mode="strict")
@@ -234,7 +238,9 @@ def test_semantic_edit_invalidates_downstream_analysis(tmp_path: Path) -> None:
     path.write_text("import os\n", encoding="utf-8")
     db = Database(mode="strict")
 
-    assert file_analysis(db, path).imports == (ImportRef(module="os", kind="import", lineno=1),)
+    assert file_analysis(db, path).imports == (
+        ImportRef(module="os", kind="import", lineno=1),
+    )
 
     path.write_text("import sys\n", encoding="utf-8")
     updated = file_analysis(db, path)
@@ -246,7 +252,9 @@ def test_semantic_edit_invalidates_downstream_analysis(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_directory_analysis_is_non_recursive_and_sorted(mode: str, tmp_path: Path) -> None:
+def test_directory_analysis_is_non_recursive_and_sorted(
+    mode: str, tmp_path: Path
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     nested = root / "nested"
@@ -265,7 +273,9 @@ def test_directory_analysis_is_non_recursive_and_sorted(mode: str, tmp_path: Pat
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_file_analysis_matches_fresh_recomputation_over_edits(mode: str, tmp_path: Path) -> None:
+def test_file_analysis_matches_fresh_recomputation_over_edits(
+    mode: str, tmp_path: Path
+) -> None:
     path = tmp_path / "sample.py"
     contents = (
         "import os\n",
@@ -283,7 +293,9 @@ def test_file_analysis_matches_fresh_recomputation_over_edits(mode: str, tmp_pat
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_directory_analysis_matches_fresh_recomputation_over_changes(mode: str, tmp_path: Path) -> None:
+def test_directory_analysis_matches_fresh_recomputation_over_changes(
+    mode: str, tmp_path: Path
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     steps: tuple[Operation, ...] = (
@@ -308,14 +320,18 @@ def test_directory_analysis_matches_fresh_recomputation_over_changes(mode: str, 
         assert directory_analysis(incremental, root) == directory_analysis(fresh, root)
 
 
-def test_workspace_analysis_discovers_recursive_modules_and_derives_names(tmp_path: Path) -> None:
+def test_workspace_analysis_discovers_recursive_modules_and_derives_names(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     pkg = root / "pkg"
     nested = pkg / "nested"
     nested.mkdir(parents=True)
     (root / "main.py").write_text("import pkg\n", encoding="utf-8")
     (pkg / "__init__.py").write_text("from .nested import util\n", encoding="utf-8")
-    (nested / "util.py").write_text("def helper() -> int:\n    return 1\n", encoding="utf-8")
+    (nested / "util.py").write_text(
+        "def helper() -> int:\n    return 1\n", encoding="utf-8"
+    )
 
     analysis = workspace_analysis(Database(mode="strict"), root)
 
@@ -327,17 +343,25 @@ def test_workspace_analysis_discovers_recursive_modules_and_derives_names(tmp_pa
             module_analysis(Database(mode="strict"), root, nested / "util.py"),
         ),
     )
-    assert tuple(item.module for item in analysis.modules) == ("main", "pkg", "pkg.nested.util")
+    assert tuple(item.module for item in analysis.modules) == (
+        "main",
+        "pkg",
+        "pkg.nested.util",
+    )
 
 
-def test_workspace_analysis_ignores_symlink_cycles_and_outside_workspace(tmp_path: Path) -> None:
+def test_workspace_analysis_ignores_symlink_cycles_and_outside_workspace(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     pkg = root / "pkg"
     root.mkdir()
     pkg.mkdir()
     (root / "main.py").write_text("import pkg\n", encoding="utf-8")
     (pkg / "__init__.py").write_text("from .helper import util\n", encoding="utf-8")
-    (pkg / "helper.py").write_text("def util() -> int:\n    return 1\n", encoding="utf-8")
+    (pkg / "helper.py").write_text(
+        "def util() -> int:\n    return 1\n", encoding="utf-8"
+    )
 
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -348,12 +372,18 @@ def test_workspace_analysis_ignores_symlink_cycles_and_outside_workspace(tmp_pat
 
     analysis = workspace_analysis(Database(mode="strict"), root)
 
-    assert tuple(item.module for item in analysis.modules) == ("main", "pkg", "pkg.helper")
+    assert tuple(item.module for item in analysis.modules) == (
+        "main",
+        "pkg",
+        "pkg.helper",
+    )
     assert all("external_link" not in item.path for item in analysis.modules)
     assert all(".loop." not in item.module for item in analysis.modules)
 
 
-def test_workspace_analysis_reuses_when_only_outside_symlink_target_changes(tmp_path: Path) -> None:
+def test_workspace_analysis_reuses_when_only_outside_symlink_target_changes(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "main.py").write_text("value = 1\n", encoding="utf-8")
@@ -382,15 +412,17 @@ def test_module_analysis_resolves_absolute_and_external_imports(tmp_path: Path) 
     consumer = root / "consumer.py"
     provider.write_text("def exported() -> int:\n    return 1\n", encoding="utf-8")
     consumer.write_text(
-        "import provider\n"
-        "import os\n"
-        "from provider import exported\n",
+        "import provider\n" "import os\n" "from provider import exported\n",
         encoding="utf-8",
     )
 
     analysis = module_analysis(Database(mode="strict"), root, consumer)
 
-    assert tuple(item.module for item in analysis.imports) == ("provider", "os", "provider")
+    assert tuple(item.module for item in analysis.imports) == (
+        "provider",
+        "os",
+        "provider",
+    )
     assert tuple(item.resolution for item in analysis.resolved_imports) == (
         "workspace",
         "stdlib",
@@ -415,14 +447,16 @@ def test_module_analysis_resolves_relative_imports(tmp_path: Path) -> None:
     (pkg / "__init__.py").write_text("", encoding="utf-8")
     helper.write_text("def util() -> int:\n    return 1\n", encoding="utf-8")
     consumer.write_text(
-        "from . import helper\n"
-        "from .helper import util\n",
+        "from . import helper\n" "from .helper import util\n",
         encoding="utf-8",
     )
 
     analysis = module_analysis(Database(mode="strict"), root, consumer)
 
-    assert tuple((item.module, item.imported_name, item.resolved_module) for item in analysis.resolved_imports) == (
+    assert tuple(
+        (item.module, item.imported_name, item.resolved_module)
+        for item in analysis.resolved_imports
+    ) == (
         (".", "helper", "pkg.helper"),
         (".helper", "util", "pkg.helper"),
     )
@@ -435,7 +469,9 @@ def test_module_analysis_resolves_relative_imports(tmp_path: Path) -> None:
     )
 
 
-def test_module_analysis_dependency_surface_tracks_reexport_aliases_and_assignments(tmp_path: Path) -> None:
+def test_module_analysis_dependency_surface_tracks_reexport_aliases_and_assignments(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     pkg = root / "pkg"
     root.mkdir()
@@ -443,7 +479,9 @@ def test_module_analysis_dependency_surface_tracks_reexport_aliases_and_assignme
     (pkg / "__init__.py").write_text("", encoding="utf-8")
     (pkg / "sub.py").write_text("value = 1\n", encoding="utf-8")
 
-    (root / "impl.py").write_text("def exported() -> int:\n    return 1\n", encoding="utf-8")
+    (root / "impl.py").write_text(
+        "def exported() -> int:\n    return 1\n", encoding="utf-8"
+    )
     provider = root / "provider.py"
     consumer = root / "consumer.py"
     provider.write_text(
@@ -471,9 +509,7 @@ def test_module_analysis_wildcard_dependency_uses_static_all(tmp_path: Path) -> 
     provider = root / "provider.py"
     consumer = root / "consumer.py"
     provider.write_text(
-        "shown = 1\n"
-        "_hidden = 2\n"
-        "__all__ = ['shown']\n",
+        "shown = 1\n" "_hidden = 2\n" "__all__ = ['shown']\n",
         encoding="utf-8",
     )
     consumer.write_text("from provider import *\n", encoding="utf-8")
@@ -510,8 +546,7 @@ def test_module_analysis_wildcard_dependency_excludes_underscore_names_without_s
     provider = root / "provider.py"
     consumer = root / "consumer.py"
     provider.write_text(
-        "shown = 1\n"
-        "_hidden = 2\n",
+        "shown = 1\n" "_hidden = 2\n",
         encoding="utf-8",
     )
     consumer.write_text("from provider import *\n", encoding="utf-8")
@@ -527,7 +562,9 @@ def test_module_analysis_wildcard_dependency_excludes_underscore_names_without_s
     )
 
 
-def test_module_analysis_prefers_workspace_submodule_for_package_imports(tmp_path: Path) -> None:
+def test_module_analysis_prefers_workspace_submodule_for_package_imports(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     pkg = root / "pkg"
     pkg.mkdir(parents=True)
@@ -572,7 +609,9 @@ def test_module_analysis_rejects_non_workspace_paths(tmp_path: Path) -> None:
         module_analysis(db, root, outside)
 
 
-def test_module_analysis_marks_file_package_conflicts_as_ambiguous(tmp_path: Path) -> None:
+def test_module_analysis_marks_file_package_conflicts_as_ambiguous(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     pkg = root / "pkg"
     pkg.mkdir(parents=True)
@@ -585,8 +624,14 @@ def test_module_analysis_marks_file_package_conflicts_as_ambiguous(tmp_path: Pat
 
     analysis = module_analysis(Database(mode="strict"), root, consumer)
 
-    assert tuple(item.resolution for item in analysis.resolved_imports) == ("ambiguous", "ambiguous")
-    assert tuple(item.resolved_module for item in analysis.resolved_imports) == (None, None)
+    assert tuple(item.resolution for item in analysis.resolved_imports) == (
+        "ambiguous",
+        "ambiguous",
+    )
+    assert tuple(item.resolved_module for item in analysis.resolved_imports) == (
+        None,
+        None,
+    )
     assert analysis.dependencies == ()
 
 
@@ -608,12 +653,20 @@ def test_workspace_analysis_reuses_dependents_when_provider_internal_edit_preser
 
     assert second == first
     assert db.inspect(source_text, str(provider)).last_recompute == "executed"
-    assert db.inspect(module_export_surface, str(root), str(provider)).last_decision == "reused"
-    assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_decision == "reused"
+    assert (
+        db.inspect(module_export_surface, str(root), str(provider)).last_decision
+        == "reused"
+    )
+    assert (
+        db.inspect(module_analysis_payload, str(root), str(consumer)).last_decision
+        == "reused"
+    )
     assert db.inspect(workspace_analysis_payload, str(root)).last_decision == "reused"
 
 
-def test_workspace_analysis_reuses_wildcard_consumer_when_exports_do_not_change(tmp_path: Path) -> None:
+def test_workspace_analysis_reuses_wildcard_consumer_when_exports_do_not_change(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     provider = root / "provider.py"
@@ -628,12 +681,22 @@ def test_workspace_analysis_reuses_wildcard_consumer_when_exports_do_not_change(
     second = workspace_analysis(db, root)
 
     assert second == first
-    assert db.inspect(module_wildcard_export_surface, str(root), str(provider)).last_decision == "reused"
-    assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_decision == "reused"
+    assert (
+        db.inspect(
+            module_wildcard_export_surface, str(root), str(provider)
+        ).last_decision
+        == "reused"
+    )
+    assert (
+        db.inspect(module_analysis_payload, str(root), str(consumer)).last_decision
+        == "reused"
+    )
     assert db.inspect(workspace_analysis_payload, str(root)).last_decision == "reused"
 
 
-def test_workspace_analysis_executes_dependents_when_provider_exports_change(tmp_path: Path) -> None:
+def test_workspace_analysis_executes_dependents_when_provider_exports_change(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     provider = root / "provider.py"
@@ -652,12 +715,22 @@ def test_workspace_analysis_executes_dependents_when_provider_exports_change(tmp
     second = workspace_analysis(db, root)
 
     assert second != first
-    assert db.inspect(module_analysis_payload, str(root), str(provider)).last_recompute == "executed"
-    assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute == "executed"
-    assert db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+    assert (
+        db.inspect(module_analysis_payload, str(root), str(provider)).last_recompute
+        == "executed"
+    )
+    assert (
+        db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute
+        == "executed"
+    )
+    assert (
+        db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+    )
 
 
-def test_workspace_analysis_executes_wildcard_consumer_when_wildcard_exports_change(tmp_path: Path) -> None:
+def test_workspace_analysis_executes_wildcard_consumer_when_wildcard_exports_change(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     provider = root / "provider.py"
@@ -672,9 +745,19 @@ def test_workspace_analysis_executes_wildcard_consumer_when_wildcard_exports_cha
     second = workspace_analysis(db, root)
 
     assert second != first
-    assert db.inspect(module_wildcard_export_surface, str(root), str(provider)).last_recompute == "executed"
-    assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute == "executed"
-    assert db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+    assert (
+        db.inspect(
+            module_wildcard_export_surface, str(root), str(provider)
+        ).last_recompute
+        == "executed"
+    )
+    assert (
+        db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute
+        == "executed"
+    )
+    assert (
+        db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+    )
 
 
 def test_dynamic_all_marks_wildcard_consumers_untracked(tmp_path: Path) -> None:
@@ -683,10 +766,7 @@ def test_dynamic_all_marks_wildcard_consumers_untracked(tmp_path: Path) -> None:
     provider = root / "provider.py"
     consumer = root / "consumer.py"
     provider.write_text(
-        "shown = 1\n"
-        "extra = 2\n"
-        "__all__ = ['shown']\n"
-        "__all__ += ['extra']\n",
+        "shown = 1\n" "extra = 2\n" "__all__ = ['shown']\n" "__all__ += ['extra']\n",
         encoding="utf-8",
     )
     consumer.write_text("from provider import *\n", encoding="utf-8")
@@ -696,7 +776,9 @@ def test_dynamic_all_marks_wildcard_consumers_untracked(tmp_path: Path) -> None:
     second = workspace_analysis(db, root)
 
     assert second == first
-    wildcard_surface = db.inspect(module_wildcard_export_surface, str(root), str(provider))
+    wildcard_surface = db.inspect(
+        module_wildcard_export_surface, str(root), str(provider)
+    )
     consumer_view = db.inspect(module_analysis_payload, str(root), str(consumer))
     assert wildcard_surface.is_untracked
     assert consumer_view.is_untracked
@@ -704,7 +786,9 @@ def test_dynamic_all_marks_wildcard_consumers_untracked(tmp_path: Path) -> None:
     assert consumer_view.last_recompute == "executed"
 
 
-def test_provider_wildcard_reexport_marks_wildcard_consumers_untracked(tmp_path: Path) -> None:
+def test_provider_wildcard_reexport_marks_wildcard_consumers_untracked(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "impl.py").write_text("shown = 1\n", encoding="utf-8")
@@ -718,7 +802,9 @@ def test_provider_wildcard_reexport_marks_wildcard_consumers_untracked(tmp_path:
     second = workspace_analysis(db, root)
 
     assert second == first
-    wildcard_surface = db.inspect(module_wildcard_export_surface, str(root), str(provider))
+    wildcard_surface = db.inspect(
+        module_wildcard_export_surface, str(root), str(provider)
+    )
     consumer_view = db.inspect(module_analysis_payload, str(root), str(consumer))
     assert wildcard_surface.is_untracked
     assert consumer_view.is_untracked
@@ -726,7 +812,9 @@ def test_provider_wildcard_reexport_marks_wildcard_consumers_untracked(tmp_path:
     assert consumer_view.last_recompute == "executed"
 
 
-def test_workspace_analysis_reexecutes_consumer_when_missing_module_is_added(tmp_path: Path) -> None:
+def test_workspace_analysis_reexecutes_consumer_when_missing_module_is_added(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     pkg = root / "pkg"
     pkg.mkdir(parents=True)
@@ -737,7 +825,9 @@ def test_workspace_analysis_reexecutes_consumer_when_missing_module_is_added(tmp
     db = Database(mode="strict")
 
     initial = workspace_analysis(db, root)
-    initial_consumer = next(item for item in initial.modules if item.module == "consumer")
+    initial_consumer = next(
+        item for item in initial.modules if item.module == "consumer"
+    )
     assert initial_consumer.resolved_imports[0].resolution == "workspace"
     assert initial_consumer.resolved_imports[0].resolved_module == "pkg"
     assert initial_consumer.dependencies == (
@@ -761,11 +851,18 @@ def test_workspace_analysis_reexecutes_consumer_when_missing_module_is_added(tmp
             exports=("util",),
         ),
     )
-    assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute == "executed"
-    assert db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+    assert (
+        db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute
+        == "executed"
+    )
+    assert (
+        db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+    )
 
 
-def test_workspace_analysis_reexecutes_consumer_when_dependency_module_is_deleted(tmp_path: Path) -> None:
+def test_workspace_analysis_reexecutes_consumer_when_dependency_module_is_deleted(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     pkg = root / "pkg"
     pkg.mkdir(parents=True)
@@ -790,7 +887,9 @@ def test_workspace_analysis_reexecutes_consumer_when_dependency_module_is_delete
     helper.unlink()
     updated = workspace_analysis(db, root)
 
-    updated_consumer = next(item for item in updated.modules if item.module == "consumer")
+    updated_consumer = next(
+        item for item in updated.modules if item.module == "consumer"
+    )
     assert updated_consumer.resolved_imports[0].resolution == "workspace"
     assert updated_consumer.resolved_imports[0].resolved_module == "pkg"
     assert updated_consumer.dependencies == (
@@ -800,22 +899,37 @@ def test_workspace_analysis_reexecutes_consumer_when_dependency_module_is_delete
             exports=(),
         ),
     )
-    assert db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute == "executed"
-    assert db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+    assert (
+        db.inspect(module_analysis_payload, str(root), str(consumer)).last_recompute
+        == "executed"
+    )
+    assert (
+        db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
+    )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_workspace_analysis_matches_fresh_recomputation_over_changes(mode: str, tmp_path: Path) -> None:
+def test_workspace_analysis_matches_fresh_recomputation_over_changes(
+    mode: str, tmp_path: Path
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     steps: tuple[Operation, ...] = (
         ("write", "provider.py", "def exported() -> int:\n    return 1\n"),
         ("write", "consumer.py", "from provider import exported\n"),
         ("write", "provider.py", "def exported() -> int:\n    return 2\n"),
-        ("write", "provider.py", "def exported() -> int:\n    return 2\n\ndef extra() -> int:\n    return 3\n"),
+        (
+            "write",
+            "provider.py",
+            "def exported() -> int:\n    return 2\n\ndef extra() -> int:\n    return 3\n",
+        ),
         ("write", "pkg/__init__.py", ""),
         ("write", "pkg/helper.py", "def helper() -> int:\n    return 1\n"),
-        ("write", "consumer.py", "from provider import exported\nfrom pkg import helper\n"),
+        (
+            "write",
+            "consumer.py",
+            "from provider import exported\nfrom pkg import helper\n",
+        ),
         ("delete", "pkg/helper.py", None),
     )
 
@@ -843,9 +957,7 @@ def test_import_resolution_classifies_stdlib_and_installed(tmp_path: Path) -> No
     root.mkdir()
     mod = root / "app.py"
     mod.write_text(
-        "import os\n"
-        "import pytest\n"
-        "import nonexistent_xyz_abc\n",
+        "import os\n" "import pytest\n" "import nonexistent_xyz_abc\n",
         encoding="utf-8",
     )
     db = Database(mode="strict")
@@ -948,7 +1060,9 @@ def test_installed_import_resolves_to_file_via_deep_module_resolution(
     value_ref = by_module[("fake_installed", "VALUE")]
     assert value_ref.resolution == "installed"
     assert value_ref.resolved_path is not None
-    assert Path(value_ref.resolved_path).resolve() == (pkg_dir / "__init__.py").resolve()
+    assert (
+        Path(value_ref.resolved_path).resolve() == (pkg_dir / "__init__.py").resolve()
+    )
 
 
 def test_relative_import_failure_stays_missing(tmp_path: Path) -> None:
@@ -966,7 +1080,9 @@ def test_relative_import_failure_stays_missing(tmp_path: Path) -> None:
     assert analysis.resolved_imports[0].distribution_name is None
 
 
-def test_resolved_import_ref_distribution_fields_none_for_non_installed(tmp_path: Path) -> None:
+def test_resolved_import_ref_distribution_fields_none_for_non_installed(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     provider = root / "provider.py"
@@ -988,7 +1104,9 @@ def test_resolved_import_ref_distribution_fields_none_for_non_installed(tmp_path
 # --- try/except ImportError import support (v2.0.0) --------------------------
 
 
-def test_import_statements_for_file_collects_try_except_import_error(tmp_path: Path) -> None:
+def test_import_statements_for_file_collects_try_except_import_error(
+    tmp_path: Path,
+) -> None:
     mod = tmp_path / "mod.py"
     mod.write_text(
         "import os\n"
@@ -1005,7 +1123,9 @@ def test_import_statements_for_file_collects_try_except_import_error(tmp_path: P
     assert "ujson" in modules
 
 
-def test_import_statements_for_file_collects_try_except_module_not_found(tmp_path: Path) -> None:
+def test_import_statements_for_file_collects_try_except_module_not_found(
+    tmp_path: Path,
+) -> None:
     mod = tmp_path / "mod.py"
     mod.write_text(
         "try:\n"
@@ -1021,7 +1141,9 @@ def test_import_statements_for_file_collects_try_except_module_not_found(tmp_pat
     assert stmts[0][1] == "from"
 
 
-def test_module_binding_analysis_no_impurity_for_try_except_import_error(tmp_path: Path) -> None:
+def test_module_binding_analysis_no_impurity_for_try_except_import_error(
+    tmp_path: Path,
+) -> None:
     mod = tmp_path / "mod.py"
     mod.write_text(
         "x = 1\n"
@@ -1034,12 +1156,14 @@ def test_module_binding_analysis_no_impurity_for_try_except_import_error(tmp_pat
     db = Database(mode="strict")
     explicit, _wildcard, impurity = module_binding_analysis_payload(db, str(mod))
     assert "json" in explicit
-    assert not any("unsupported" in r for r in impurity), (
-        f"unexpected impurity reasons: {impurity}"
-    )
+    assert not any(
+        "unsupported" in r for r in impurity
+    ), f"unexpected impurity reasons: {impurity}"
 
 
-def test_import_statements_for_file_collects_tuple_handler_try_block(tmp_path: Path) -> None:
+def test_import_statements_for_file_collects_tuple_handler_try_block(
+    tmp_path: Path,
+) -> None:
     mod = tmp_path / "mod.py"
     mod.write_text(
         "try:\n"

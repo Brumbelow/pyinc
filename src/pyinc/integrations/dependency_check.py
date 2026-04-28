@@ -106,12 +106,12 @@ def _extract_dep_name_and_spec(specifier: str) -> tuple[str, str]:
     if m is None:
         return _normalize_dep_name(stripped), ""
     name = m.group(1)
-    rest = stripped[m.end():].strip()
+    rest = stripped[m.end() :].strip()
     # Strip extras [...]
     if rest.startswith("["):
         bracket_end = rest.find("]")
         if bracket_end >= 0:
-            rest = rest[bracket_end + 1:].strip()
+            rest = rest[bracket_end + 1 :].strip()
     return _normalize_dep_name(name), rest
 
 
@@ -153,7 +153,13 @@ def dependency_check_payload(
             statuses.append((name, version_spec, "", "missing", "not installed"))
         elif not version_spec:
             statuses.append(
-                (name, version_spec, installed_version, "satisfied", "installed, no constraint")
+                (
+                    name,
+                    version_spec,
+                    installed_version,
+                    "satisfied",
+                    "installed, no constraint",
+                )
             )
         else:
             status, detail = _check_version_constraints(version_spec, installed_version)
