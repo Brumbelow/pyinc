@@ -528,17 +528,14 @@ def _resolve_import_reference(
         )
         if resolution is not None:
             return resolved_module, resolved_path, resolution, None, None
-        return (
-            None,
-            None,
-            *_missing_resolution(
-                request_module,
-                index_groups,
-                prefer_external=True,
-                stdlib_modules=stdlib_modules,
-                package_top_levels=package_top_levels,
-            ),
+        resolution, dist_name, dist_ver = _missing_resolution(
+            request_module,
+            index_groups,
+            prefer_external=True,
+            stdlib_modules=stdlib_modules,
+            package_top_levels=package_top_levels,
         )
+        return None, None, resolution, dist_name, dist_ver
 
     absolute_base = _resolve_relative_base(current_module, current_path, request_module)
     if absolute_base is None:
@@ -561,17 +558,14 @@ def _resolve_import_reference(
             return resolved_module, resolved_path, resolution, None, None
 
     requested_target = candidates[0] if candidates else absolute_base
-    return (
-        None,
-        None,
-        *_missing_resolution(
-            requested_target,
-            index_groups,
-            prefer_external=not request_module.startswith("."),
-            stdlib_modules=stdlib_modules,
-            package_top_levels=package_top_levels,
-        ),
+    resolution, dist_name, dist_ver = _missing_resolution(
+        requested_target,
+        index_groups,
+        prefer_external=not request_module.startswith("."),
+        stdlib_modules=stdlib_modules,
+        package_top_levels=package_top_levels,
     )
+    return None, None, resolution, dist_name, dist_ver
 
 
 def _collect_python_files(
