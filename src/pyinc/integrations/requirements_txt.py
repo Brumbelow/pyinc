@@ -485,6 +485,7 @@ def deep_requirements_analysis(
     Constraint files (-c) are noted as file references but not followed.
     """
     root = Path(os.fspath(path)).resolve()
+    project_root = root.parent
     all_requirements: dict[str, RequirementRef] = {}
     all_file_references: list[FileReference] = []
     all_index_directives: list[IndexDirective] = []
@@ -510,6 +511,14 @@ def deep_requirements_analysis(
                 ref_path = Path(ref.path)
                 if not ref_path.is_absolute():
                     ref_path = file_path.parent / ref_path
+                ref_path = ref_path.resolve()
+                try:
+                    ref_path.relative_to(project_root)
+                except ValueError:
+                    all_diagnostics.append(
+                        ("error", f"-r path outside project: {ref_path}")
+                    )
+                    continue
                 _walk(ref_path)
 
         for req in analysis.requirements:

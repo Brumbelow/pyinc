@@ -179,12 +179,12 @@ class LanguageServer:
             request_id = message["id"]
             try:
                 result = self._handle_request(method, params)
-            except Exception as exc:  # pragma: no cover - defensive JSON-RPC boundary
+            except Exception:  # pragma: no cover - defensive JSON-RPC boundary
                 self._send(
                     {
                         "jsonrpc": "2.0",
                         "id": request_id,
-                        "error": {"code": -32603, "message": str(exc)},
+                        "error": {"code": -32603, "message": "Internal error"},
                     }
                 )
             else:
@@ -222,7 +222,7 @@ class LanguageServer:
         if method == "textDocument/didOpen":
             document = params["textDocument"]
             self._require_session().set_overlay(
-                _uri_to_path(document["uri"]), document["text"]
+                self._require_safe_path(document["uri"]), document["text"]
             )
             self.publish_workspace_diagnostics()
             return True
@@ -233,23 +233,23 @@ class LanguageServer:
                 latest = changes[-1]
                 if "text" in latest:
                     self._require_session().set_overlay(
-                        _uri_to_path(document["uri"]), latest["text"]
+                        self._require_safe_path(document["uri"]), latest["text"]
                     )
                     self.publish_workspace_diagnostics()
             return True
         if method == "textDocument/didSave":
             document = params["textDocument"]
-            self._require_session().clear_overlay(_uri_to_path(document["uri"]))
+            self._require_session().clear_overlay(self._require_safe_path(document["uri"]))
             self.publish_workspace_diagnostics()
             return True
         if method == "textDocument/didClose":
             document = params["textDocument"]
-            self._require_session().clear_overlay(_uri_to_path(document["uri"]))
+            self._require_session().clear_overlay(self._require_safe_path(document["uri"]))
             self.publish_workspace_diagnostics()
             return True
         if method == "workspace/didChangeWatchedFiles":
             changes = params.get("changes", [])
-            paths = [_uri_to_path(item["uri"]) for item in changes if "uri" in item]
+            paths = [self._require_safe_path(item["uri"]) for item in changes if "uri" in item]
             if paths:
                 self._require_session().refresh_paths(paths)
                 self.publish_workspace_diagnostics()
@@ -354,7 +354,7 @@ class LanguageServer:
 
     def _document_symbols(self, params: Any) -> list[dict[str, Any]]:
         document = params["textDocument"]
-        result = self._require_session().analyze_file(_uri_to_path(document["uri"]))
+        result = self._require_session().analyze_file(self._require_safe_path(document["uri"]))
         if result.symbols is None:
             return []
         symbols: list[dict[str, Any]] = []
@@ -410,7 +410,7 @@ class LanguageServer:
 
     def _hover(self, params: Any) -> dict[str, Any] | None:
         session = self._require_session()
-        real_path = _uri_to_path(params["textDocument"]["uri"])
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
         position = params["position"]
         line = int(position["line"])
         character = int(position["character"])
@@ -432,7 +432,7 @@ class LanguageServer:
 
     def _definition(self, params: Any) -> list[dict[str, Any]]:
         session = self._require_session()
-        real_path = _uri_to_path(params["textDocument"]["uri"])
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
         position = params["position"]
         line = int(position["line"])
         character = int(position["character"])
@@ -461,7 +461,7 @@ class LanguageServer:
 
     def _references(self, params: Any) -> list[dict[str, Any]]:
         session = self._require_session()
-        real_path = _uri_to_path(params["textDocument"]["uri"])
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
         position = params["position"]
         line = int(position["line"])
         character = int(position["character"])
@@ -531,6 +531,13 @@ class LanguageServer:
             "code": diagnostic.code,
             "message": diagnostic.message,
         }
+
+    def _require_safe_path(self, uri: str) -> str:
+        path = _uri_to_path(uri)
+        root = Path(self._require_session().root).resolve(strict=False)
+        resolved = Path(path).resolve(strict=False)
+        resolved.relative_to(root)  # raises ValueError if path escapes workspace
+        return str(resolved)
 
     def _require_session(self) -> WorkspaceSession:
         if self._session is None:
