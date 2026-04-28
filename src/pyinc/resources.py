@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
     from .runtime import Database
 
+
 @dataclass(frozen=True)
 class FileResource:
     encoding: str = "utf-8"
@@ -29,7 +30,9 @@ class FileResource:
         with db._allow_raw_open():
             return Path(path).read_text(encoding=self.encoding)
 
-    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
+    def probe_and_load(
+        self, db: Database, path: str
+    ) -> tuple[tuple[str, str] | tuple[str], str]:
         probe, text = _file_read_snapshot(path, self.encoding)
         if text is None:
             raise FileNotFoundError(path)

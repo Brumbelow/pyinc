@@ -7,6 +7,7 @@ was originally defined.
 
 Run: ``python examples/symbol_lookup.py``
 """
+
 from __future__ import annotations
 
 import tempfile

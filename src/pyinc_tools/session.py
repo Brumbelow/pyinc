@@ -128,7 +128,9 @@ class WorkspaceSession:
 
         self.root = str(root_path)
         self.db = Database(mode=mode)
-        self._ignored_dir_names = frozenset(ignored_dir_names or DEFAULT_IGNORED_DIR_NAMES)
+        self._ignored_dir_names = frozenset(
+            ignored_dir_names or DEFAULT_IGNORED_DIR_NAMES
+        )
         self._tempdir: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(
             prefix="pyinc-tools-"
         )
@@ -207,7 +209,9 @@ class WorkspaceSession:
                 self.mirror_root,
                 dependency_inputs.declared_dependencies,
             )
-            result = self._build_file_result(real_path, dependency_inputs, dependency_check)
+            result = self._build_file_result(
+                real_path, dependency_inputs, dependency_check
+            )
             self._scheduled_paths.discard(real_path)
             return result
 
@@ -241,7 +245,9 @@ class WorkspaceSession:
                     for file_result in files
                     for diagnostic in file_result.diagnostics
                 )
-                + self._dependency_status_diagnostics(dependency_inputs, dependency_check)
+                + self._dependency_status_diagnostics(
+                    dependency_inputs, dependency_check
+                )
             )
             self._scheduled_paths.clear()
             return WorkspaceAnalysisResult(
@@ -300,7 +306,9 @@ class WorkspaceSession:
                 )
                 for ref in result.references
             )
-            return ReferenceQueryResult(target=remapped_target, references=remapped_refs)
+            return ReferenceQueryResult(
+                target=remapped_target, references=remapped_refs
+            )
 
     def source_text(self, path: str | os.PathLike[str]) -> str | None:
         real_path = self._normalize_real_path(path)
@@ -414,7 +422,8 @@ class WorkspaceSession:
             if (
                 resolved_import.resolution == "installed"
                 and resolved_import.distribution_name is not None
-                and _normalize_dependency_name(resolved_import.distribution_name) not in declared_names
+                and _normalize_dependency_name(resolved_import.distribution_name)
+                not in declared_names
             ):
                 diagnostics.append(
                     AnalysisDiagnostic(
@@ -487,7 +496,9 @@ class WorkspaceSession:
             for _, group_entries in config.optional_dependency_groups:
                 declared.extend(group_entries)
         if requirements is not None:
-            declared.extend(requirement.raw_line for requirement in requirements.requirements)
+            declared.extend(
+                requirement.raw_line for requirement in requirements.requirements
+            )
 
         return _DependencyInputs(
             config=self._remap_config_analysis(config),
@@ -511,7 +522,11 @@ class WorkspaceSession:
                     (dependency_inputs.requirements.path, requirement.lineno),
                 )
 
-        config_path = dependency_inputs.config.path if dependency_inputs.config is not None else None
+        config_path = (
+            dependency_inputs.config.path
+            if dependency_inputs.config is not None
+            else None
+        )
 
         for status in dependency_check.statuses:
             if status.status == "satisfied":
@@ -546,7 +561,9 @@ class WorkspaceSession:
                 target_path = dependency_inputs.requirements.path
             elif dependency_inputs.config is not None:
                 target_path = dependency_inputs.config.path
-            if target_path is not None and (only_path is None or target_path == only_path):
+            if target_path is not None and (
+                only_path is None or target_path == only_path
+            ):
                 for code, message in dependency_check.diagnostics:
                     diagnostics.append(
                         AnalysisDiagnostic(
@@ -577,8 +594,12 @@ class WorkspaceSession:
 
     def _copy_workspace_into_mirror(self) -> None:
         for current_root, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = [name for name in dirnames if name not in self._ignored_dir_names]
-            relative_dir = Path(current_root).resolve(strict=False).relative_to(Path(self.root))
+            dirnames[:] = [
+                name for name in dirnames if name not in self._ignored_dir_names
+            ]
+            relative_dir = (
+                Path(current_root).resolve(strict=False).relative_to(Path(self.root))
+            )
             target_dir = self._mirror_root_path / relative_dir
             target_dir.mkdir(parents=True, exist_ok=True)
             for filename in filenames:
@@ -594,7 +615,9 @@ class WorkspaceSession:
         try:
             normalized.relative_to(Path(self.root))
         except ValueError as exc:
-            raise ValueError(f"{normalized!s} is outside the workspace root {self.root!r}.") from exc
+            raise ValueError(
+                f"{normalized!s} is outside the workspace root {self.root!r}."
+            ) from exc
         return str(normalized)
 
     def _mirror_path_for_real(self, real_path: str) -> Path:
@@ -630,13 +653,19 @@ class WorkspaceSession:
                 directory.rmdir()
                 directory = directory.parent
 
-    def _remap_workspace_analysis(self, analysis: PythonWorkspaceAnalysis) -> PythonWorkspaceAnalysis:
+    def _remap_workspace_analysis(
+        self, analysis: PythonWorkspaceAnalysis
+    ) -> PythonWorkspaceAnalysis:
         return PythonWorkspaceAnalysis(
             root=self.root,
-            modules=tuple(self._remap_module_analysis(module) for module in analysis.modules),
+            modules=tuple(
+                self._remap_module_analysis(module) for module in analysis.modules
+            ),
         )
 
-    def _remap_module_analysis(self, analysis: PythonModuleAnalysis) -> PythonModuleAnalysis:
+    def _remap_module_analysis(
+        self, analysis: PythonModuleAnalysis
+    ) -> PythonModuleAnalysis:
         return PythonModuleAnalysis(
             path=self._remap_path(analysis.path) or analysis.path,
             module=analysis.module,
@@ -675,7 +704,9 @@ class WorkspaceSession:
             impurity_reasons=table.impurity_reasons,
         )
 
-    def _remap_workspace_symbol_index(self, index: WorkspaceSymbolIndex) -> WorkspaceSymbolIndex:
+    def _remap_workspace_symbol_index(
+        self, index: WorkspaceSymbolIndex
+    ) -> WorkspaceSymbolIndex:
         return WorkspaceSymbolIndex(
             root=self.root,
             entries=index.entries,
@@ -695,7 +726,9 @@ class WorkspaceSession:
             trail=symbol.trail,
         )
 
-    def _remap_config_analysis(self, analysis: ConfigAnalysis | None) -> ConfigAnalysis | None:
+    def _remap_config_analysis(
+        self, analysis: ConfigAnalysis | None
+    ) -> ConfigAnalysis | None:
         if analysis is None:
             return None
         return ConfigAnalysis(
@@ -825,7 +858,9 @@ class PollingWorkspaceWatcher:
         if self.is_running:
             raise RuntimeError("PollingWorkspaceWatcher is already running.")
         effective_interval = (
-            interval_s if interval_s is not None else max(self._debounce_seconds / 2.0, 0.05)
+            interval_s
+            if interval_s is not None
+            else max(self._debounce_seconds / 2.0, 0.05)
         )
         self._on_change = on_change
         self._on_error = on_error

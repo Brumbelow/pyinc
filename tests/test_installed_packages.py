@@ -253,9 +253,7 @@ def test_malformed_metadata_produces_diagnostic(
     assert analysis.diagnostics[0][0] == "metadata-parse-failed"
 
 
-def test_empty_site_packages(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_empty_site_packages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     monkeypatch.setattr(
@@ -369,21 +367,29 @@ def test_installed_packages_matches_fresh_recomputation(
 
     # Step 1: empty
     fresh1 = Database(mode=mode)
-    assert installed_packages_analysis(incremental) == installed_packages_analysis(fresh1)
+    assert installed_packages_analysis(incremental) == installed_packages_analysis(
+        fresh1
+    )
 
     # Step 2: add a package
     _make_dist_info(site_dir, "pkg-a", "1.0.0", top_level="pkg_a")
     fresh2 = Database(mode=mode)
-    assert installed_packages_analysis(incremental) == installed_packages_analysis(fresh2)
+    assert installed_packages_analysis(incremental) == installed_packages_analysis(
+        fresh2
+    )
 
     # Step 3: add another package
     _make_dist_info(
-        site_dir, "pkg-b", "2.0.0",
+        site_dir,
+        "pkg-b",
+        "2.0.0",
         top_level="pkg_b",
         requires_dist=("pkg-a>=1.0",),
     )
     fresh3 = Database(mode=mode)
-    assert installed_packages_analysis(incremental) == installed_packages_analysis(fresh3)
+    assert installed_packages_analysis(incremental) == installed_packages_analysis(
+        fresh3
+    )
 
     # Step 4: modify metadata (version bump)
     dist_info = site_dir / "pkg-a-1.0.0.dist-info"
@@ -392,13 +398,18 @@ def test_installed_packages_matches_fresh_recomputation(
         encoding="utf-8",
     )
     fresh4 = Database(mode=mode)
-    assert installed_packages_analysis(incremental) == installed_packages_analysis(fresh4)
+    assert installed_packages_analysis(incremental) == installed_packages_analysis(
+        fresh4
+    )
 
     # Step 5: remove a package
     import shutil
+
     shutil.rmtree(site_dir / "pkg-b-2.0.0.dist-info")
     fresh5 = Database(mode=mode)
-    assert installed_packages_analysis(incremental) == installed_packages_analysis(fresh5)
+    assert installed_packages_analysis(incremental) == installed_packages_analysis(
+        fresh5
+    )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -416,12 +427,16 @@ def test_resolve_import_matches_fresh_recomputation(
 
     # Step 1: resolve before any package exists
     fresh1 = Database(mode=mode)
-    assert resolve_import_name(incremental, "pkg_a") == resolve_import_name(fresh1, "pkg_a")
+    assert resolve_import_name(incremental, "pkg_a") == resolve_import_name(
+        fresh1, "pkg_a"
+    )
 
     # Step 2: add the package
     _make_dist_info(site_dir, "pkg-a", "1.0.0", top_level="pkg_a")
     fresh2 = Database(mode=mode)
-    assert resolve_import_name(incremental, "pkg_a") == resolve_import_name(fresh2, "pkg_a")
+    assert resolve_import_name(incremental, "pkg_a") == resolve_import_name(
+        fresh2, "pkg_a"
+    )
     assert resolve_import_name(incremental, "pkg_a").origin == "installed"
 
     # Step 3: check stdlib resolution stays correct

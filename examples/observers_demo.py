@@ -17,20 +17,20 @@ def main() -> None:
     events: list[QueryChangeEvent] = []
     subscription = db.observe(events.append, doubled)
 
-    db.get(doubled)            # cold execute → fires
-    db.get(doubled)            # reused, no event
-    db.set(COUNT, 1)           # equal input, no revision bump
-    db.get(doubled)            # reused, no event
+    db.get(doubled)  # cold execute → fires
+    db.get(doubled)  # reused, no event
+    db.set(COUNT, 1)  # equal input, no revision bump
+    db.get(doubled)  # reused, no event
 
     db.set(COUNT, 7)
-    db.get(doubled)            # executed, value moved 2 → 14, fires
+    db.get(doubled)  # executed, value moved 2 → 14, fires
 
     db.set(COUNT, 1)
-    db.get(doubled)            # executed, value moved 14 → 2, fires
+    db.get(doubled)  # executed, value moved 14 → 2, fires
 
     subscription.unsubscribe()
     db.set(COUNT, 99)
-    db.get(doubled)            # executed but unsubscribed, no event
+    db.get(doubled)  # executed but unsubscribed, no event
 
     print(f"event_count={len(events)}")
     for evt in events:

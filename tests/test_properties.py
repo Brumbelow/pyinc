@@ -37,7 +37,12 @@ def test_incremental_results_match_fresh_recomputation(
     left = Input[int]("left")
     right = Input[int]("right")
     offset = Input[int]("offset")
-    state: dict[str, int | str] = {"chooser": "left", "left": 0, "right": 0, "offset": 0}
+    state: dict[str, int | str] = {
+        "chooser": "left",
+        "left": 0,
+        "right": 0,
+        "offset": 0,
+    }
     inputs = {
         "chooser": chooser,
         "left": left,
@@ -91,7 +96,9 @@ def file_contents() -> st.SearchStrategy[list[str]]:
 
 
 def workspace_states() -> st.SearchStrategy[list[WorkspaceState]]:
-    provider_variant = st.sampled_from(["internal_a", "internal_b", "export_a", "export_b"])
+    provider_variant = st.sampled_from(
+        ["internal_a", "internal_b", "export_a", "export_b"]
+    )
     consumer_variant = st.sampled_from(
         ["provider_only", "provider_and_helper", "provider_star", "external_only"]
     )
@@ -151,7 +158,9 @@ def test_resource_backed_queries_match_fresh_recomputation(
             path.write_text(content, encoding="utf-8")
 
             fresh = Database(mode=mode, max_query_nodes=max_query_nodes)
-            assert incremental.get(diagnostics, str(path)) == fresh.get(diagnostics, str(path))
+            assert incremental.get(diagnostics, str(path)) == fresh.get(
+                diagnostics, str(path)
+            )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -179,18 +188,26 @@ def test_workspace_queries_match_fresh_recomputation(
             provider.write_text(_provider_source(provider_variant), encoding="utf-8")
             consumer.write_text(_consumer_source(consumer_variant), encoding="utf-8")
             if helper_present:
-                helper.write_text("def helper() -> int:\n    return 1\n", encoding="utf-8")
+                helper.write_text(
+                    "def helper() -> int:\n    return 1\n", encoding="utf-8"
+                )
             elif helper.exists():
                 helper.unlink()
 
             fresh = Database(mode=mode, max_query_nodes=max_query_nodes)
-            assert workspace_analysis(incremental, root) == workspace_analysis(fresh, root)
+            assert workspace_analysis(incremental, root) == workspace_analysis(
+                fresh, root
+            )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @settings(max_examples=40, deadline=None)
-@given(values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=20))
-def test_aliasing_mutation_boundaries_behave_by_mode(mode: str, values: list[int]) -> None:
+@given(
+    values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=20)
+)
+def test_aliasing_mutation_boundaries_behave_by_mode(
+    mode: str, values: list[int]
+) -> None:
     payload = Input[tuple[dict[str, int], dict[str, int]]]("payload")
 
     @query
@@ -220,8 +237,12 @@ def test_aliasing_mutation_boundaries_behave_by_mode(mode: str, values: list[int
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @settings(max_examples=20, deadline=None)
-@given(values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=10))
-def test_shared_identity_preserved_across_boundary_in_fast_mode(mode: str, values: list[int]) -> None:
+@given(
+    values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=10)
+)
+def test_shared_identity_preserved_across_boundary_in_fast_mode(
+    mode: str, values: list[int]
+) -> None:
     payload = Input[tuple[dict[str, int], dict[str, int]]]("payload")
 
     @query
@@ -249,11 +270,13 @@ def test_shared_identity_preserved_across_boundary_in_fast_mode(mode: str, value
                 db.get(mutate_left)
 
 
-def multi_level_rewiring_steps() -> st.SearchStrategy[list[tuple[str, str, int, int, int, int]]]:
+def multi_level_rewiring_steps() -> (
+    st.SearchStrategy[list[tuple[str, str, int, int, int, int]]]
+):
     return st.lists(
         st.tuples(
-            st.sampled_from(["a", "b"]),       # level0 chooser
-            st.sampled_from(["x", "y"]),       # level1 chooser
+            st.sampled_from(["a", "b"]),  # level0 chooser
+            st.sampled_from(["x", "y"]),  # level1 chooser
             st.integers(min_value=-10, max_value=10),  # a
             st.integers(min_value=-10, max_value=10),  # b
             st.integers(min_value=-10, max_value=10),  # x
@@ -279,7 +302,14 @@ def test_multi_level_rewiring_matches_fresh_recomputation(
     b = Input[int]("b")
     x = Input[int]("x")
     y = Input[int]("y")
-    inputs = {"l0_chooser": l0_chooser, "l1_chooser": l1_chooser, "a": a, "b": b, "x": x, "y": y}
+    inputs = {
+        "l0_chooser": l0_chooser,
+        "l1_chooser": l1_chooser,
+        "a": a,
+        "b": b,
+        "x": x,
+        "y": y,
+    }
 
     @query
     def level0(db: Database) -> int:
@@ -295,12 +325,21 @@ def test_multi_level_rewiring_matches_fresh_recomputation(
         return (v0, v1, "even" if (v0 + v1) % 2 == 0 else "odd")
 
     incremental = Database(mode=mode, max_query_nodes=max_query_nodes)
-    state: dict[str, int | str] = {"l0_chooser": "a", "l1_chooser": "x", "a": 0, "b": 0, "x": 0, "y": 0}
+    state: dict[str, int | str] = {
+        "l0_chooser": "a",
+        "l1_chooser": "x",
+        "a": 0,
+        "b": 0,
+        "x": 0,
+        "y": 0,
+    }
     for name, inp in inputs.items():
         incremental.set(inp, state[name])
 
     for l0c, l1c, av, bv, xv, yv in steps:
-        state.update({"l0_chooser": l0c, "l1_chooser": l1c, "a": av, "b": bv, "x": xv, "y": yv})
+        state.update(
+            {"l0_chooser": l0c, "l1_chooser": l1c, "a": av, "b": bv, "x": xv, "y": yv}
+        )
         for name, inp in inputs.items():
             incremental.set(inp, state[name])
 

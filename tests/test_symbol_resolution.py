@@ -83,7 +83,9 @@ def test_symbol_resolution_payload_helpers_are_not_re_exported() -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_module_symbol_table_captures_top_level_symbols(mode: str, tmp_path: Path) -> None:
+def test_module_symbol_table_captures_top_level_symbols(
+    mode: str, tmp_path: Path
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "sample.py"
@@ -351,12 +353,18 @@ def test_resolve_symbol_detects_cycle_between_two_modules(tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_symbol_depth_cap_terminates_at_max_follow_depth(tmp_path: Path) -> None:
+def test_resolve_symbol_depth_cap_terminates_at_max_follow_depth(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
-    (root / "m0.py").write_text("def target() -> int:\n    return 1\n", encoding="utf-8")
+    (root / "m0.py").write_text(
+        "def target() -> int:\n    return 1\n", encoding="utf-8"
+    )
     for i in range(1, 10):
-        (root / f"m{i}.py").write_text(f"from m{i - 1} import target\n", encoding="utf-8")
+        (root / f"m{i}.py").write_text(
+            f"from m{i - 1} import target\n", encoding="utf-8"
+        )
 
     db = Database(mode="strict")
     resolved = resolve_symbol(db, root, root / "m9.py", "target")
@@ -412,7 +420,9 @@ def test_resolve_symbol_with_dynamic_all_is_ambiguous(tmp_path: Path) -> None:
     resolved = resolve_symbol(db, root, consumer, "missing_name")
 
     assert resolved.resolution == "ambiguous"
-    inspection = db.inspect(resolve_symbol_payload, str(root), str(consumer), "missing_name")
+    inspection = db.inspect(
+        resolve_symbol_payload, str(root), str(consumer), "missing_name"
+    )
     assert inspection.is_untracked
 
 
@@ -512,16 +522,17 @@ def test_signature_change_triggers_downstream_reresolution(tmp_path: Path) -> No
     assert first.resolution == "workspace"
 
     a.write_text(
-        "# spacer\n"
-        "def foo(x: int) -> int:\n"
-        "    return x\n",
+        "# spacer\n" "def foo(x: int) -> int:\n" "    return x\n",
         encoding="utf-8",
     )
     second = resolve_symbol(db, root, b, "foo")
 
     assert second.defining_lineno == 2
     assert db.inspect(module_symbol_table_payload, str(a)).last_recompute == "executed"
-    assert db.inspect(resolve_symbol_payload, str(root), str(b), "foo").last_recompute == "executed"
+    assert (
+        db.inspect(resolve_symbol_payload, str(root), str(b), "foo").last_recompute
+        == "executed"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -588,9 +599,7 @@ def test_type_checking_typing_dot_form(tmp_path: Path) -> None:
     root.mkdir()
     path = root / "mod.py"
     path.write_text(
-        "import typing\n"
-        "if typing.TYPE_CHECKING:\n"
-        "    from helper import Bar\n",
+        "import typing\n" "if typing.TYPE_CHECKING:\n" "    from helper import Bar\n",
         encoding="utf-8",
     )
 
@@ -601,7 +610,9 @@ def test_type_checking_typing_dot_form(tmp_path: Path) -> None:
     assert "conditional top-level binding" not in table.impurity_reasons
 
 
-def test_type_checking_block_with_other_conditional_records_impurity(tmp_path: Path) -> None:
+def test_type_checking_block_with_other_conditional_records_impurity(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "mixed.py"
@@ -676,13 +687,11 @@ def test_workspace_symbol_index_flattens_and_sorts(tmp_path: Path) -> None:
     pkg.mkdir()
     (pkg / "__init__.py").write_text("", encoding="utf-8")
     (pkg / "helper.py").write_text(
-        "def util() -> int:\n    return 1\n"
-        "class Holder:\n    pass\n",
+        "def util() -> int:\n    return 1\n" "class Holder:\n    pass\n",
         encoding="utf-8",
     )
     (root / "main.py").write_text(
-        "from pkg.helper import util\n"
-        "flag: bool = True\n",
+        "from pkg.helper import util\n" "flag: bool = True\n",
         encoding="utf-8",
     )
 
@@ -730,7 +739,9 @@ def test_workspace_symbol_index_matches_fresh_recomputation_over_edits(
             target.unlink()
 
         fresh = Database(mode=mode)
-        assert workspace_symbol_index(incremental, root) == workspace_symbol_index(fresh, root)
+        assert workspace_symbol_index(incremental, root) == workspace_symbol_index(
+            fresh, root
+        )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -754,7 +765,9 @@ def test_resolve_symbol_matches_fresh_recomputation_over_edits(
     for content in contents_a:
         a.write_text(content, encoding="utf-8")
         fresh = Database(mode=mode)
-        assert resolve_symbol(incremental, root, b, "foo") == resolve_symbol(fresh, root, b, "foo")
+        assert resolve_symbol(incremental, root, b, "foo") == resolve_symbol(
+            fresh, root, b, "foo"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -851,7 +864,9 @@ def test_find_references_crosses_re_export(tmp_path: Path) -> None:
     assert Path(declarations[0].path).name == "a.py"
 
 
-def test_find_references_does_not_resolve_attribute_chain_on_module(tmp_path: Path) -> None:
+def test_find_references_does_not_resolve_attribute_chain_on_module(
+    tmp_path: Path,
+) -> None:
     """Pins v1.2.0 behavior: ``import a; a.foo()`` is NOT counted as a reference to
     ``foo`` because resolving the bare rightmost name ``foo`` at the call site returns
     ``missing`` (``foo`` is not bound locally). Attribute-chain reference following
@@ -872,7 +887,9 @@ def test_find_references_does_not_resolve_attribute_chain_on_module(tmp_path: Pa
     assert non_decl == []
 
 
-def test_find_references_ignores_shadowing_local_known_limitation(tmp_path: Path) -> None:
+def test_find_references_ignores_shadowing_local_known_limitation(
+    tmp_path: Path,
+) -> None:
     """Pins v1.2.0 behavior: a function-local binding that shadows a module-level
     name is still reported as a reference to the module-level target, because
     ``symbol_resolution`` does not track function-local scopes."""
@@ -904,9 +921,7 @@ def test_find_references_ignores_forward_ref_strings(tmp_path: Path) -> None:
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
     b = root / "b.py"
     b.write_text(
-        "from a import Foo\n\n"
-        "def g(a: 'Foo') -> 'Foo':\n"
-        "    return a\n",
+        "from a import Foo\n\n" "def g(a: 'Foo') -> 'Foo':\n" "    return a\n",
         encoding="utf-8",
     )
 
@@ -1137,10 +1152,7 @@ def test_import_error_try_bare_except_records_impurity(tmp_path: Path) -> None:
     root.mkdir()
     path = root / "mod.py"
     path.write_text(
-        "try:\n"
-        "    import ujson\n"
-        "except:\n"
-        "    pass\n",
+        "try:\n" "    import ujson\n" "except:\n" "    pass\n",
         encoding="utf-8",
     )
 

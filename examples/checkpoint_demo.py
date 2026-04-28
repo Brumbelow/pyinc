@@ -43,7 +43,10 @@ def scaled_word_count(db: Database, path: str) -> int:
 
 
 def main() -> None:
-    with tempfile.TemporaryDirectory() as store_root, tempfile.TemporaryDirectory() as file_root:
+    with (
+        tempfile.TemporaryDirectory() as store_root,
+        tempfile.TemporaryDirectory() as file_root,
+    ):
         data_path = f"{file_root}/data.txt"
         store = FileSystemArtifactStore(store_root)
 
@@ -69,7 +72,7 @@ def main() -> None:
         # Run 2: load the checkpoint — same inputs, all queries are reused.
         # -----------------------------------------------------------------------
         db2 = Database(store=store)
-        db2.set(MULTIPLIER, 3)           # same input as run 1
+        db2.set(MULTIPLIER, 3)  # same input as run 1
         db2.load_checkpoint(ck_key)
         result2 = db2.get(scaled_word_count, data_path)
         print(f"run2_result={result2}")  # same result: 15
@@ -85,7 +88,7 @@ def main() -> None:
         # the file content and its own dependencies are unchanged.
         # -----------------------------------------------------------------------
         db3 = Database(store=store)
-        db3.set(MULTIPLIER, 10)          # different multiplier
+        db3.set(MULTIPLIER, 10)  # different multiplier
         db3.load_checkpoint(ck_key)
         result3 = db3.get(scaled_word_count, data_path)
         print(f"run3_result={result3}")  # 5 words * 10 = 50
@@ -93,7 +96,9 @@ def main() -> None:
         node3 = db3.inspect(scaled_word_count, data_path)
         print(f"run3_decision={node3.last_recompute}")  # "executed"
         stats3 = db3.statistics()
-        print(f"run3_executions={stats3.query_executions}")  # 1 (only scaled_word_count)
+        print(
+            f"run3_executions={stats3.query_executions}"
+        )  # 1 (only scaled_word_count)
 
         assert result1 == 15
         assert result2 == 15

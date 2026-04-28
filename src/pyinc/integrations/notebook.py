@@ -271,7 +271,9 @@ def notebook_cells_payload(db: Database, path: str) -> tuple[NotebookCellPayload
 
 
 @query
-def notebook_diagnostics_payload(db: Database, path: str) -> tuple[NotebookDiagnosticPayload, ...]:
+def notebook_diagnostics_payload(
+    db: Database, path: str
+) -> tuple[NotebookDiagnosticPayload, ...]:
     text = notebook_text(db, path)
     if not text:
         return ()

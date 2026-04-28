@@ -206,7 +206,9 @@ def test_explain_query_captures_classifies_rejected_mutable_list() -> None:
     assert not by_name["_MUTABLE_LIST"].accepted
 
 
-def test_explain_query_captures_accepts_frozen_dataclass_rejects_mutable_dataclass() -> None:
+def test_explain_query_captures_accepts_frozen_dataclass_rejects_mutable_dataclass() -> (
+    None
+):
     @query
     def frozen_ok(db: Database) -> str:
         return _FROZEN_CONFIG.name
@@ -215,8 +217,12 @@ def test_explain_query_captures_accepts_frozen_dataclass_rejects_mutable_datacla
     def mutable_bad(db: Database) -> str:
         return _MUTABLE_CONFIG.name
 
-    frozen_info = {i.name: i for i in explain_query_captures(frozen_ok)}["_FROZEN_CONFIG"]
-    mutable_info = {i.name: i for i in explain_query_captures(mutable_bad)}["_MUTABLE_CONFIG"]
+    frozen_info = {i.name: i for i in explain_query_captures(frozen_ok)}[
+        "_FROZEN_CONFIG"
+    ]
+    mutable_info = {i.name: i for i in explain_query_captures(mutable_bad)}[
+        "_MUTABLE_CONFIG"
+    ]
     assert frozen_info.accepted
     assert frozen_info.kind == "value"
     assert not mutable_info.accepted
@@ -279,7 +285,9 @@ def test_runtime_capture_error_points_to_preflight_diagnostics() -> None:
 
 
 def test_capture_info_is_frozen() -> None:
-    info = CaptureInfo(name="x", origin="closure", type_name="int", accepted=True, kind="value")
+    info = CaptureInfo(
+        name="x", origin="closure", type_name="int", accepted=True, kind="value"
+    )
     with pytest.raises(FrozenInstanceError):
         info.accepted = False  # type: ignore[misc]
 

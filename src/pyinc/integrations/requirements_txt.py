@@ -191,7 +191,11 @@ def _parse_requirement_line(line: str, lineno: int) -> RequirementPayload | None
     if url_match:
         name = _normalize_name(url_match.group("name"))
         extras_str = url_match.group("extras") or ""
-        extras = tuple(e.strip() for e in extras_str.split(",") if e.strip()) if extras_str else ()
+        extras = (
+            tuple(e.strip() for e in extras_str.split(",") if e.strip())
+            if extras_str
+            else ()
+        )
         markers = (url_match.group("markers") or "").strip()
         url = url_match.group("url").strip()
         return (name, line.strip(), lineno, extras, f"@ {url}", markers, False)
@@ -202,7 +206,11 @@ def _parse_requirement_line(line: str, lineno: int) -> RequirementPayload | None
 
     name = _normalize_name(match.group("name"))
     extras_str = match.group("extras") or ""
-    extras = tuple(e.strip() for e in extras_str.split(",") if e.strip()) if extras_str else ()
+    extras = (
+        tuple(e.strip() for e in extras_str.split(",") if e.strip())
+        if extras_str
+        else ()
+    )
     version_spec = match.group("version").strip()
     markers = (match.group("markers") or "").strip()
 
@@ -225,9 +233,21 @@ def _parse_requirements(text: str) -> tuple[RequirementPayload, ...]:
                 target = editable_match.group(1).strip()
                 # Editable installs of local paths or VCS URLs are stored as-is
                 results.append(
-                    (_normalize_name(target) if not target.startswith((".", "/", "git+", "hg+", "svn+", "bzr+"))
-                     else target,
-                     stripped, lineno, (), "", "", True)
+                    (
+                        (
+                            _normalize_name(target)
+                            if not target.startswith(
+                                (".", "/", "git+", "hg+", "svn+", "bzr+")
+                            )
+                            else target
+                        ),
+                        stripped,
+                        lineno,
+                        (),
+                        "",
+                        "",
+                        True,
+                    )
                 )
             continue
         payload = _parse_requirement_line(stripped, lineno)
@@ -285,15 +305,29 @@ def _parse_diagnostics(text: str) -> tuple[DiagnosticPayload, ...]:
         if not stripped or stripped.startswith("#"):
             continue
         # Known option/directive lines are not diagnostics
-        if stripped.startswith(("-r ", "--requirement ", "-c ", "--constraint ",
-                                "-e ", "--editable ",
-                                "--index-url ", "--extra-index-url ",
-                                "-f ", "--find-links ",
-                                "--no-binary", "--only-binary",
-                                "--prefer-binary", "--require-hashes",
-                                "--pre", "--trusted-host",
-                                "--no-deps", "--global-option",
-                                "--hash=")):
+        if stripped.startswith(
+            (
+                "-r ",
+                "--requirement ",
+                "-c ",
+                "--constraint ",
+                "-e ",
+                "--editable ",
+                "--index-url ",
+                "--extra-index-url ",
+                "-f ",
+                "--find-links ",
+                "--no-binary",
+                "--only-binary",
+                "--prefer-binary",
+                "--require-hashes",
+                "--pre",
+                "--trusted-host",
+                "--no-deps",
+                "--global-option",
+                "--hash=",
+            )
+        ):
             continue
         # Try parsing as a requirement
         payload = _parse_requirement_line(stripped, lineno)
@@ -345,19 +379,25 @@ def requirements_payload(db: Database, path: str) -> tuple[RequirementPayload, .
 
 
 @query
-def file_references_payload(db: Database, path: str) -> tuple[FileReferencePayload, ...]:
+def file_references_payload(
+    db: Database, path: str
+) -> tuple[FileReferencePayload, ...]:
     text = requirements_file_text(db, path)
     return _parse_file_references(text)
 
 
 @query
-def index_directives_payload(db: Database, path: str) -> tuple[IndexDirectivePayload, ...]:
+def index_directives_payload(
+    db: Database, path: str
+) -> tuple[IndexDirectivePayload, ...]:
     text = requirements_file_text(db, path)
     return _parse_index_directives(text)
 
 
 @query
-def requirements_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload, ...]:
+def requirements_diagnostics_payload(
+    db: Database, path: str
+) -> tuple[DiagnosticPayload, ...]:
     text = requirements_file_text(db, path)
     return _parse_diagnostics(text)
 
@@ -368,7 +408,9 @@ def requirements_diagnostics_payload(db: Database, path: str) -> tuple[Diagnosti
 
 
 @query
-def requirements_analysis_payload(db: Database, path: str) -> RequirementsAnalysisPayload:
+def requirements_analysis_payload(
+    db: Database, path: str
+) -> RequirementsAnalysisPayload:
     reqs = requirements_payload(db, path)
     refs = file_references_payload(db, path)
     indices = index_directives_payload(db, path)
@@ -404,9 +446,14 @@ def _decode_index_directive(payload: IndexDirectivePayload) -> IndexDirective:
     return IndexDirective(kind=kind, url=url, lineno=lineno)
 
 
-def requirements_analysis(db: Database, path: str | os.PathLike[str]) -> RequirementsAnalysis:
+def requirements_analysis(
+    db: Database, path: str | os.PathLike[str]
+) -> RequirementsAnalysis:
     normalized = os.fspath(path)
-    payload = cast(RequirementsAnalysisPayload, thaw(db.get(requirements_analysis_payload, normalized)))
+    payload = cast(
+        RequirementsAnalysisPayload,
+        thaw(db.get(requirements_analysis_payload, normalized)),
+    )
     path_str, reqs, refs, indices, diagnostics = payload
     return RequirementsAnalysis(
         path=path_str,

@@ -138,9 +138,7 @@ def _current_python_env() -> PythonEnvironmentPayload:
 @dataclass(frozen=True)
 class _PythonEnvironmentResource:
     def read(self, db: Database) -> PythonEnvironmentPayload:
-        return cast(
-            PythonEnvironmentPayload, db._read_resource(self, "python")
-        )
+        return cast(PythonEnvironmentPayload, db._read_resource(self, "python"))
 
     def label(self, _key: str) -> str:
         return "py-env"
@@ -165,30 +163,31 @@ _VERSION_PAT = (
     r"(?:(?P<epoch>[0-9]+)!)?"
     r"(?P<release>[0-9]+(?:\.[0-9]+)*)"
     r"(?:"
-        r"[-_.]?"
-        r"(?P<pre_l>a|b|c|rc|alpha|beta|pre|preview)"
-        r"[-_.]?"
-        r"(?P<pre_n>[0-9]+)?"
+    r"[-_.]?"
+    r"(?P<pre_l>a|b|c|rc|alpha|beta|pre|preview)"
+    r"[-_.]?"
+    r"(?P<pre_n>[0-9]+)?"
     r")?"
     r"(?P<post>"
-        r"(?:-(?P<post_n1>[0-9]+))"
-        r"|"
-        r"(?:"
-            r"[-_.]?"
-            r"(?P<post_l>post|rev|r)"
-            r"[-_.]?"
-            r"(?P<post_n2>[0-9]+)?"
-        r")"
+    r"(?:-(?P<post_n1>[0-9]+))"
+    r"|"
+    r"(?:"
+    r"[-_.]?"
+    r"(?P<post_l>post|rev|r)"
+    r"[-_.]?"
+    r"(?P<post_n2>[0-9]+)?"
+    r")"
     r")?"
     r"(?:"
-        r"[-_.]?"
-        r"(?P<dev_l>dev)"
-        r"[-_.]?"
-        r"(?P<dev_n>[0-9]+)?"
+    r"[-_.]?"
+    r"(?P<dev_l>dev)"
+    r"[-_.]?"
+    r"(?P<dev_n>[0-9]+)?"
     r")?"
     r"(?:\+(?P<local>[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)*))?"
     r"$"
 )
+
 
 def _canonical_pre(letter: str) -> str | None:
     if letter in ("a", "alpha"):
@@ -254,12 +253,21 @@ def _parse_version(text: str) -> _Version | None:
             parts.append(int(comp) if comp.isdigit() else comp)
         local = tuple(parts)
 
-    return _Version(epoch=epoch, release=release, pre=pre, post=post, dev=dev, local=local)
+    return _Version(
+        epoch=epoch, release=release, pre=pre, post=post, dev=dev, local=local
+    )
 
 
 def _cmp_tuple(
     version: _Version,
-) -> tuple[int, tuple[int, ...], tuple[int, str, int], tuple[int, int], tuple[int, int], tuple[tuple[int, object], ...]]:
+) -> tuple[
+    int,
+    tuple[int, ...],
+    tuple[int, str, int],
+    tuple[int, int],
+    tuple[int, int],
+    tuple[tuple[int, object], ...],
+]:
     release = _trim_trailing_zeros(version.release)
 
     if version.pre is None:
@@ -362,7 +370,10 @@ def _satisfies_single(op: str, spec_version_str: str, version: _Version) -> bool
             dev=None,
             local=(),
         )
-        return _compare_versions(version, lower) >= 0 and _compare_versions(version, upper) < 0
+        return (
+            _compare_versions(version, lower) >= 0
+            and _compare_versions(version, upper) < 0
+        )
 
     cmp = _compare_versions(version, spec_version)
     if op == "==":
@@ -507,7 +518,9 @@ def _tokenize_marker(text: str) -> list[tuple[str, str]] | None:
             j = i + len(word)
             while j < n and text[j].isspace():
                 j += 1
-            if text[j : j + 2] == "in" and (j + 2 >= n or not text[j + 2].isalnum() and text[j + 2] != "_"):
+            if text[j : j + 2] == "in" and (
+                j + 2 >= n or not text[j + 2].isalnum() and text[j + 2] != "_"
+            ):
                 tokens.append(("OP", "not in"))
                 i = j + 2
                 continue
@@ -739,12 +752,9 @@ def _eval_compare(
     right_val, right_is_ver = resolve(node.right_kind, node.right)
     op = node.op
 
-    use_version_compare = (
-        op in ("<", "<=", ">", ">=", "==", "!=")
-        and (
-            (node.left_kind == "name" and left_is_ver)
-            or (node.right_kind == "name" and right_is_ver)
-        )
+    use_version_compare = op in ("<", "<=", ">", ">=", "==", "!=") and (
+        (node.left_kind == "name" and left_is_ver)
+        or (node.right_kind == "name" and right_is_ver)
     )
 
     if op == "in":
@@ -758,7 +768,10 @@ def _eval_compare(
         right_v = _parse_version(right_val)
         if left_v is None or right_v is None:
             diagnostics.append(
-                ("unparseable-version", f"cannot parse version in marker: {left_val} ~= {right_val}")
+                (
+                    "unparseable-version",
+                    f"cannot parse version in marker: {left_val} ~= {right_val}",
+                )
             )
             return False
         spec_set = (("~=", right_val),)
@@ -873,7 +886,15 @@ def _evaluate_requirement(
 
     if not marker_applicable:
         return (
-            (normalized, version_spec, markers, False, "", "not_applicable", "marker is false"),
+            (
+                normalized,
+                version_spec,
+                markers,
+                False,
+                "",
+                "not_applicable",
+                "marker is false",
+            ),
             tuple(diagnostics),
         )
 
@@ -887,7 +908,15 @@ def _evaluate_requirement(
         installed = installed_map.get(normalized, "")
         if installed:
             return (
-                (normalized, version_spec, markers, True, installed, "satisfied", "installed, URL requirement"),
+                (
+                    normalized,
+                    version_spec,
+                    markers,
+                    True,
+                    installed,
+                    "satisfied",
+                    "installed, URL requirement",
+                ),
                 tuple(diagnostics),
             )
         return (
@@ -904,21 +933,45 @@ def _evaluate_requirement(
 
     if not version_spec:
         return (
-            (normalized, version_spec, markers, True, installed, "satisfied", "installed, no constraint"),
+            (
+                normalized,
+                version_spec,
+                markers,
+                True,
+                installed,
+                "satisfied",
+                "installed, no constraint",
+            ),
             tuple(diagnostics),
         )
 
     spec_set = _parse_specifier_set(version_spec)
     if spec_set is None:
         return (
-            (normalized, version_spec, markers, True, installed, "ambiguous", f"cannot parse specifier: {version_spec}"),
+            (
+                normalized,
+                version_spec,
+                markers,
+                True,
+                installed,
+                "ambiguous",
+                f"cannot parse specifier: {version_spec}",
+            ),
             tuple(diagnostics),
         )
 
     for op, _v in spec_set:
         if op == "===":
             return (
-                (normalized, version_spec, markers, True, installed, "ambiguous", f"=== is not supported: {version_spec}"),
+                (
+                    normalized,
+                    version_spec,
+                    markers,
+                    True,
+                    installed,
+                    "ambiguous",
+                    f"=== is not supported: {version_spec}",
+                ),
                 tuple(diagnostics),
             )
 

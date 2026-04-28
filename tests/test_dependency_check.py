@@ -31,19 +31,13 @@ def _make_dist_info(
         f"Version: {version}",
         "Summary: A test package",
     ]
-    (dist_info / "METADATA").write_text(
-        "\n".join(meta_lines) + "\n", encoding="utf-8"
-    )
+    (dist_info / "METADATA").write_text("\n".join(meta_lines) + "\n", encoding="utf-8")
     if top_level is not None:
-        (dist_info / "top_level.txt").write_text(
-            top_level + "\n", encoding="utf-8"
-        )
+        (dist_info / "top_level.txt").write_text(top_level + "\n", encoding="utf-8")
     return dist_info
 
 
-def _patch_site(
-    monkeypatch: pytest.MonkeyPatch, site_dir: Path
-) -> None:
+def _patch_site(monkeypatch: pytest.MonkeyPatch, site_dir: Path) -> None:
     monkeypatch.setattr(
         "pyinc.integrations.installed_packages._get_site_packages_dirs",
         lambda: (str(site_dir),),
@@ -210,10 +204,22 @@ def test_wildcard_specifier(
     _patch_site(monkeypatch, site_dir)
 
     db = Database(mode=mode)
-    assert dependency_check_analysis(db, ("requests==2.*",)).statuses[0].status == "satisfied"
-    assert dependency_check_analysis(db, ("requests==3.*",)).statuses[0].status == "version_mismatch"
-    assert dependency_check_analysis(db, ("requests!=3.*",)).statuses[0].status == "satisfied"
-    assert dependency_check_analysis(db, ("requests!=2.*",)).statuses[0].status == "version_mismatch"
+    assert (
+        dependency_check_analysis(db, ("requests==2.*",)).statuses[0].status
+        == "satisfied"
+    )
+    assert (
+        dependency_check_analysis(db, ("requests==3.*",)).statuses[0].status
+        == "version_mismatch"
+    )
+    assert (
+        dependency_check_analysis(db, ("requests!=3.*",)).statuses[0].status
+        == "satisfied"
+    )
+    assert (
+        dependency_check_analysis(db, ("requests!=2.*",)).statuses[0].status
+        == "version_mismatch"
+    )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -273,9 +279,15 @@ def test_epoch_specifier(
 
     db = Database(mode=mode)
     # An older epoch spec should not match a higher epoch installed.
-    assert dependency_check_analysis(db, ("mypkg==1!2.0",)).statuses[0].status == "satisfied"
+    assert (
+        dependency_check_analysis(db, ("mypkg==1!2.0",)).statuses[0].status
+        == "satisfied"
+    )
     # Pre-epoch version cannot satisfy an epoch-bumped installed version.
-    assert dependency_check_analysis(db, ("mypkg==2.0",)).statuses[0].status == "version_mismatch"
+    assert (
+        dependency_check_analysis(db, ("mypkg==2.0",)).statuses[0].status
+        == "version_mismatch"
+    )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -289,7 +301,10 @@ def test_compatible_release_three_component(
 
     db = Database(mode=mode)
     # ~=2.31.0 means >=2.31.0, <2.32.0 — 2.31.5 satisfies.
-    assert dependency_check_analysis(db, ("requests~=2.31.0",)).statuses[0].status == "satisfied"
+    assert (
+        dependency_check_analysis(db, ("requests~=2.31.0",)).statuses[0].status
+        == "satisfied"
+    )
     # ~=2.30.0 means >=2.30.0, <2.31.0 — 2.31.5 fails.
     assert (
         dependency_check_analysis(db, ("requests~=2.30.0",)).statuses[0].status
@@ -322,9 +337,7 @@ def test_markers_stripped_from_specifier(
     _patch_site(monkeypatch, site_dir)
 
     db = Database(mode=mode)
-    result = dependency_check_analysis(
-        db, ('requests>=2.0; python_version>="3.8"',)
-    )
+    result = dependency_check_analysis(db, ('requests>=2.0; python_version>="3.8"',))
     assert result.statuses[0].status == "satisfied"
     assert result.statuses[0].name == "requests"
 
@@ -394,23 +407,23 @@ def test_dependency_check_matches_fresh_recomputation(
 
     # Step 1: both missing
     fresh1 = Database(mode=mode)
-    assert dependency_check_analysis(incremental, declared) == dependency_check_analysis(
-        fresh1, declared
-    )
+    assert dependency_check_analysis(
+        incremental, declared
+    ) == dependency_check_analysis(fresh1, declared)
 
     # Step 2: install requests
     _make_dist_info(site_dir, "requests", "2.31.0", top_level="requests")
     fresh2 = Database(mode=mode)
-    assert dependency_check_analysis(incremental, declared) == dependency_check_analysis(
-        fresh2, declared
-    )
+    assert dependency_check_analysis(
+        incremental, declared
+    ) == dependency_check_analysis(fresh2, declared)
 
     # Step 3: install flask
     _make_dist_info(site_dir, "Flask", "2.3.0", top_level="flask")
     fresh3 = Database(mode=mode)
-    assert dependency_check_analysis(incremental, declared) == dependency_check_analysis(
-        fresh3, declared
-    )
+    assert dependency_check_analysis(
+        incremental, declared
+    ) == dependency_check_analysis(fresh3, declared)
 
     # Step 4: upgrade requests
     dist_info = site_dir / "requests-2.31.0.dist-info"

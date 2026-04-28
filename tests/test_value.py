@@ -349,32 +349,77 @@ def test_fingerprint_determinism() -> None:
 CANONICAL_FINGERPRINTS: dict[str, tuple[Any, str]] = {
     "none": (None, "bc84a14378e233c608ccc17f177919a6595f9d6331b9a5c5d8ffd0eade02bb87"),
     "true": (True, "d84c15ea4d5e0080d8dbabc5ce68dbd742fbbd0499d4df57ef079c53d8871b45"),
-    "false": (False, "3f05aff300785adb8cdb12bb9993f3b494b7e1de18042e42a5f5e863e49cc5f8"),
+    "false": (
+        False,
+        "3f05aff300785adb8cdb12bb9993f3b494b7e1de18042e42a5f5e863e49cc5f8",
+    ),
     "int-zero": (0, "1f5fe91ed5208d6477e3d13cca2812d9c1c42defb7dab70d784f45f65565b8fd"),
     "int-one": (1, "ec187eb76b8d83f7e32bd0b232f69735d1a65a8a78529b0654411717920e53cf"),
-    "int-neg-one": (-1, "2d47fa0bc94ee71387d24889f9db1d68fb766b5c62d76709386c07ae630b94c6"),
-    "float-1.5": (1.5, "dd96a811716c46538b4197ff3950edf3f49ae9d60768708c746a752dadf10c56"),
-    "str-empty": ("", "482975b5aa2860a276737cba6db568490b691439406fbb367f3b604bb5210ba3"),
-    "str-hello": ("hello", "fc322c5025dd198cb3fb82b6bcd16933f825fbd6991e27c11f52159ce3196aff"),
-    "bytes-empty": (b"", "37591557e2971f9d22a13734870a227c1f09fa2db90410e374d5398b41458998"),
-    "bytes-deadbeef": (b"\xde\xad\xbe\xef", "2e7517169495c8c68748b8a7e4b5d65edda8e3f147186cbcb91f558ac5d1c1c8"),
-    "tuple-1-2": ((1, 2), "5c7369e88f8c1ac8aa9c6d40293d9bca89c7eefc7be95171520a7c26a420e17f"),
-    "frozenlist-1-2": (FrozenList((1, 2)), "cda055499f3951671946049d2351b5fd9cd819ddbadb4cd29196263ab2e3fea0"),
-    "frozendict-a1-b2": (FrozenDict((("a", 1), ("b", 2))), "a2314b9c7615be9706387bd492849f94b88a62c02a6f9d9efd7f65bc5947b4f4"),
-    "frozenset-set-1-2": (FrozenSet("set", (1, 2)), "ee2eaaecaa7809412de0bfa62e9c0911dc43d6ae94f5de8d56241764023b817e"),
-    "frozenset-frozenset-1-2": (FrozenSet("frozenset", (1, 2)), "a4fd14bb2105db0058518e6646536c1ff566c058e2d52da333485a0507c355b2"),
-    "frozenrecord-point-x1-y2": (FrozenRecord("Point", (("x", 1), ("y", 2))), "54d491b759c0fce6fd77da828a7a8b4dc0f2d8954109834a479b3ba5030758ed"),
-    "frozenadapter-mod-pt-1": (FrozenAdapterValue("mod:Pt", 1), "af0c41f8d3007f00c9a7ea5933f30f1b45fd4bef98a5f5d828fae6964a19da16"),
-    "complex-1+2j": (complex(1, 2), "7d5cd6c5ec8d30c14912b51d052e79e2e88752d5d815f43559a7cdc5a09eaa45"),
+    "int-neg-one": (
+        -1,
+        "2d47fa0bc94ee71387d24889f9db1d68fb766b5c62d76709386c07ae630b94c6",
+    ),
+    "float-1.5": (
+        1.5,
+        "dd96a811716c46538b4197ff3950edf3f49ae9d60768708c746a752dadf10c56",
+    ),
+    "str-empty": (
+        "",
+        "482975b5aa2860a276737cba6db568490b691439406fbb367f3b604bb5210ba3",
+    ),
+    "str-hello": (
+        "hello",
+        "fc322c5025dd198cb3fb82b6bcd16933f825fbd6991e27c11f52159ce3196aff",
+    ),
+    "bytes-empty": (
+        b"",
+        "37591557e2971f9d22a13734870a227c1f09fa2db90410e374d5398b41458998",
+    ),
+    "bytes-deadbeef": (
+        b"\xde\xad\xbe\xef",
+        "2e7517169495c8c68748b8a7e4b5d65edda8e3f147186cbcb91f558ac5d1c1c8",
+    ),
+    "tuple-1-2": (
+        (1, 2),
+        "5c7369e88f8c1ac8aa9c6d40293d9bca89c7eefc7be95171520a7c26a420e17f",
+    ),
+    "frozenlist-1-2": (
+        FrozenList((1, 2)),
+        "cda055499f3951671946049d2351b5fd9cd819ddbadb4cd29196263ab2e3fea0",
+    ),
+    "frozendict-a1-b2": (
+        FrozenDict((("a", 1), ("b", 2))),
+        "a2314b9c7615be9706387bd492849f94b88a62c02a6f9d9efd7f65bc5947b4f4",
+    ),
+    "frozenset-set-1-2": (
+        FrozenSet("set", (1, 2)),
+        "ee2eaaecaa7809412de0bfa62e9c0911dc43d6ae94f5de8d56241764023b817e",
+    ),
+    "frozenset-frozenset-1-2": (
+        FrozenSet("frozenset", (1, 2)),
+        "a4fd14bb2105db0058518e6646536c1ff566c058e2d52da333485a0507c355b2",
+    ),
+    "frozenrecord-point-x1-y2": (
+        FrozenRecord("Point", (("x", 1), ("y", 2))),
+        "54d491b759c0fce6fd77da828a7a8b4dc0f2d8954109834a479b3ba5030758ed",
+    ),
+    "frozenadapter-mod-pt-1": (
+        FrozenAdapterValue("mod:Pt", 1),
+        "af0c41f8d3007f00c9a7ea5933f30f1b45fd4bef98a5f5d828fae6964a19da16",
+    ),
+    "complex-1+2j": (
+        complex(1, 2),
+        "7d5cd6c5ec8d30c14912b51d052e79e2e88752d5d815f43559a7cdc5a09eaa45",
+    ),
 }
 
 
 def test_fingerprint_snapshot_pins_exact_bytes_for_canonical_values() -> None:
     for label, (value, expected_digest) in CANONICAL_FINGERPRINTS.items():
         actual = fingerprint_snapshot(value)
-        assert actual == expected_digest, (
-            f"fingerprint_snapshot drift for {label!r}: got {actual}, expected {expected_digest}"
-        )
+        assert (
+            actual == expected_digest
+        ), f"fingerprint_snapshot drift for {label!r}: got {actual}, expected {expected_digest}"
 
 
 def test_fingerprint_snapshot_distinguishes_shapes() -> None:
@@ -384,15 +429,19 @@ def test_fingerprint_snapshot_distinguishes_shapes() -> None:
     # FrozenList vs raw tuple
     assert fingerprint_snapshot(FrozenList((1, 2))) != fingerprint_snapshot((1, 2))
     # FrozenSet "set" vs "frozenset"
-    assert fingerprint_snapshot(FrozenSet("set", (1, 2))) != fingerprint_snapshot(FrozenSet("frozenset", (1, 2)))
+    assert fingerprint_snapshot(FrozenSet("set", (1, 2))) != fingerprint_snapshot(
+        FrozenSet("frozenset", (1, 2))
+    )
     # range-as-tuple vs raw tuple with same head
     assert fingerprint_snapshot(("range", 1, 10, 2)) != fingerprint_snapshot((1, 10, 2))
     # FrozenRecord differing type_name
-    assert fingerprint_snapshot(FrozenRecord("Point", (("x", 1),))) != fingerprint_snapshot(
-        FrozenRecord("Other", (("x", 1),))
-    )
+    assert fingerprint_snapshot(
+        FrozenRecord("Point", (("x", 1),))
+    ) != fingerprint_snapshot(FrozenRecord("Other", (("x", 1),)))
     # FrozenAdapterValue differing adapter_key
-    assert fingerprint_snapshot(FrozenAdapterValue("a", 1)) != fingerprint_snapshot(FrozenAdapterValue("b", 1))
+    assert fingerprint_snapshot(FrozenAdapterValue("a", 1)) != fingerprint_snapshot(
+        FrozenAdapterValue("b", 1)
+    )
     # string length-prefix must defeat concatenation collisions
     assert fingerprint_snapshot(("ab", "cd")) != fingerprint_snapshot(("a", "bcd"))
     # bytes vs str with matching ASCII content
@@ -414,7 +463,9 @@ def test_fingerprint_snapshot_equivalence_under_freeze_normalization() -> None:
     assert fingerprint_snapshot(left) == fingerprint_snapshot(right)
 
     # Sets freeze by canonical sort — ordering of input items does not affect digest.
-    assert fingerprint_snapshot(freeze({1, 2, 3})) == fingerprint_snapshot(freeze({3, 2, 1}))
+    assert fingerprint_snapshot(freeze({1, 2, 3})) == fingerprint_snapshot(
+        freeze({3, 2, 1})
+    )
 
 
 def test_assert_not_mutated_matching_passes_different_raises() -> None:
@@ -559,7 +610,20 @@ def test_kernel_fingerprint_prefix_is_k2() -> None:
 
 
 def test_serialize_deserialize_round_trip_scalars() -> None:
-    for value in (None, True, False, 0, 1, -1, 1.5, "", "hello", b"", b"\xde\xad", complex(1, 2)):
+    for value in (
+        None,
+        True,
+        False,
+        0,
+        1,
+        -1,
+        1.5,
+        "",
+        "hello",
+        b"",
+        b"\xde\xad",
+        complex(1, 2),
+    ):
         payload = serialize_snapshot(freeze(value))
         assert deserialize_snapshot(payload) == freeze(value)
 

@@ -145,7 +145,9 @@ ObserverErrorHook = Callable[[Exception], None]
 
 
 def _default_observer_error_hook(exc: Exception) -> None:
-    sys.stderr.write(f"pyinc: observer callback raised {type(exc).__qualname__}: {exc}\n")
+    sys.stderr.write(
+        f"pyinc: observer callback raised {type(exc).__qualname__}: {exc}\n"
+    )
 
 
 _ACTIVE_GUARDS: ContextVar[tuple[Database, ...]] = ContextVar(
@@ -186,15 +188,21 @@ def _install_guards_once() -> None:
         original_environ = os.environ
 
         def guarded_open(*args: Any, **kwargs: Any) -> Any:
-            _raise_if_guarded("Raw open() inside a query is untracked. Use FileResource.read().")
+            _raise_if_guarded(
+                "Raw open() inside a query is untracked. Use FileResource.read()."
+            )
             return original_builtins_open(*args, **kwargs)
 
         def guarded_io_open(*args: Any, **kwargs: Any) -> Any:
-            _raise_if_guarded("Raw open() inside a query is untracked. Use FileResource.read().")
+            _raise_if_guarded(
+                "Raw open() inside a query is untracked. Use FileResource.read()."
+            )
             return original_io_open(*args, **kwargs)
 
         def guarded_getenv(key: str, default: str | None = None) -> str | None:
-            _raise_if_guarded("Raw os.getenv() inside a query is untracked. Use EnvResource.read().")
+            _raise_if_guarded(
+                "Raw os.getenv() inside a query is untracked. Use EnvResource.read()."
+            )
             return original_os_getenv(key, default)
 
         def guarded_listdir(*args: Any, **kwargs: Any) -> Any:
@@ -233,7 +241,9 @@ def _install_guards_once() -> None:
 
 
 class _GuardedEnviron(MutableMapping[str, str]):
-    def __init__(self, wrapped: MutableMapping[str, str], check_read: Callable[[], None]) -> None:
+    def __init__(
+        self, wrapped: MutableMapping[str, str], check_read: Callable[[], None]
+    ) -> None:
         self._wrapped = wrapped
         self._check_read = check_read
 
@@ -300,7 +310,9 @@ class Subscription:
 
     __slots__ = ("_database", "_key", "_callback", "_active")
 
-    def __init__(self, database: Database, key: NodeKey, callback: ObserverCallback) -> None:
+    def __init__(
+        self, database: Database, key: NodeKey, callback: ObserverCallback
+    ) -> None:
         self._database = database
         self._key = key
         self._callback = callback
@@ -341,8 +353,12 @@ class Database:
             "pyinc_execution_stack",
             default=(),
         )
-        self._allow_raw_reads: ContextVar[bool] = ContextVar("pyinc_allow_raw_reads", default=False)
-        self._request_token: ContextVar[int | None] = ContextVar("pyinc_request_token", default=None)
+        self._allow_raw_reads: ContextVar[bool] = ContextVar(
+            "pyinc_allow_raw_reads", default=False
+        )
+        self._request_token: ContextVar[int | None] = ContextVar(
+            "pyinc_request_token", default=None
+        )
         self._request_counter = 0
         self._stats: dict[str, int] = {
             "query_executions": 0,
@@ -359,11 +375,13 @@ class Database:
         self._state_lock = threading.RLock()
         self._observers: dict[NodeKey, list[ObserverCallback]] = {}
         self._observer_error_hook: ObserverErrorHook = (
-            observer_error_hook if observer_error_hook is not None else _default_observer_error_hook
+            observer_error_hook
+            if observer_error_hook is not None
+            else _default_observer_error_hook
         )
-        self._pending_events: ContextVar[list[tuple[NodeKey, QueryChangeEvent]] | None] = ContextVar(
-            "pyinc_pending_events", default=None
-        )
+        self._pending_events: ContextVar[
+            list[tuple[NodeKey, QueryChangeEvent]] | None
+        ] = ContextVar("pyinc_pending_events", default=None)
         # Scope-B: checkpoint records loaded from a durable store for cross-run reuse.
         self._checkpoint_query_records: dict[NodeKey, dict[str, Any]] = {}
         self._checkpoint_resource_probes: dict[NodeKey, tuple[Any, str]] = {}
@@ -402,29 +420,37 @@ class Database:
         for identity, timings in sorted(self._query_timings.items()):
             total_ns = sum(timings)
             count = len(timings)
-            profiles.append(QueryProfile(
-                query_label=identity,
-                execution_count=count,
-                total_ns=total_ns,
-                mean_ns=total_ns // count,
-            ))
+            profiles.append(
+                QueryProfile(
+                    query_label=identity,
+                    execution_count=count,
+                    total_ns=total_ns,
+                    mean_ns=total_ns // count,
+                )
+            )
         return tuple(profiles)
 
     def dependency_graph(self) -> tuple[DependencyGraphNode, ...]:
         nodes: list[DependencyGraphNode] = []
         for key, record in self._records.items():
             dep_labels = tuple(
-                sorted(self._records[dep].label for dep in record.dependencies if dep in self._records)
+                sorted(
+                    self._records[dep].label
+                    for dep in record.dependencies
+                    if dep in self._records
+                )
             )
-            nodes.append(DependencyGraphNode(
-                label=record.label,
-                kind=key.kind,
-                changed_at=record.changed_at,
-                verified_at=record.verified_at,
-                last_decision=record.last_decision,
-                is_untracked=record.is_untracked,
-                dependency_labels=dep_labels,
-            ))
+            nodes.append(
+                DependencyGraphNode(
+                    label=record.label,
+                    kind=key.kind,
+                    changed_at=record.changed_at,
+                    verified_at=record.verified_at,
+                    last_decision=record.last_decision,
+                    is_untracked=record.is_untracked,
+                    dependency_labels=dep_labels,
+                )
+            )
         return tuple(sorted(nodes, key=lambda n: n.label))
 
     def set(self, input_key: Any, value: Any) -> None:
@@ -482,7 +508,9 @@ class Database:
 
         with self._state_lock:
             # Phase 1: collect and validate all updates, compute snapshots.
-            pending: list[tuple[Any, Any, NodeKey, Any, str]] = []  # (input_key, value, node_key, snapshot, digest)
+            pending: list[tuple[Any, Any, NodeKey, Any, str]] = (
+                []
+            )  # (input_key, value, node_key, snapshot, digest)
             for input_key, value in updates:
                 if not isinstance(input_key, Input):
                     raise TypeError("db.set_many() expects (Input, value) pairs.")
@@ -558,7 +586,9 @@ class Database:
             if key not in self._records and self._checkpoint_query_records:
                 self._try_warm_from_checkpoint(query, key, call_snapshot)
             self._ensure_query(query, key, call_snapshot)
-            result = cast(T, self._expose_boundary_snapshot(self._records[key].snapshot))
+            result = cast(
+                T, self._expose_boundary_snapshot(self._records[key].snapshot)
+            )
         self._dispatch_events(pending)
         return result
 
@@ -569,7 +599,9 @@ class Database:
             raise TypeError("db.explain() expects a @query-decorated callable.")
         return format_explanation(self.inspect(query, *args, **kwargs))
 
-    def inspect(self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> InspectionNode:
+    def inspect(
+        self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs
+    ) -> InspectionNode:
         from .core import Query
 
         if not isinstance(query, Query):
@@ -582,7 +614,9 @@ class Database:
         self._dispatch_events(pending)
         return node
 
-    def inspect_fresh(self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> InspectionNode:
+    def inspect_fresh(
+        self, query: Query[P, Any], *args: P.args, **kwargs: P.kwargs
+    ) -> InspectionNode:
         from .core import Query
 
         if not isinstance(query, Query):
@@ -628,7 +662,9 @@ class Database:
     def report_untracked_read(self, reason: str) -> None:
         frame = self._current_frame()
         if frame is None:
-            raise RuntimeError("db.report_untracked_read() must be called while a query is executing.")
+            raise RuntimeError(
+                "db.report_untracked_read() must be called while a query is executing."
+            )
         frame.untracked_reasons.append(reason)
 
     # ------------------------------------------------------------------
@@ -698,28 +734,34 @@ class Database:
                 if dep_record is None:
                     continue
                 if dep_key.kind == "input":
-                    deps.append({
-                        "kind": "input",
-                        "name": self._input_name_for_key(dep_key),
-                        "label": dep_key.label,
-                        "digest": dep_record.digest,
-                    })
+                    deps.append(
+                        {
+                            "kind": "input",
+                            "name": self._input_name_for_key(dep_key),
+                            "label": dep_key.label,
+                            "digest": dep_record.digest,
+                        }
+                    )
                 elif dep_key.kind == "query":
-                    deps.append({
-                        "kind": "query",
-                        "identity": dep_key.identity,
-                        "args_digest": dep_key.args_digest,
-                        "label": dep_key.label,
-                        "digest": dep_record.digest,
-                    })
+                    deps.append(
+                        {
+                            "kind": "query",
+                            "identity": dep_key.identity,
+                            "args_digest": dep_key.args_digest,
+                            "label": dep_key.label,
+                            "digest": dep_record.digest,
+                        }
+                    )
                 elif dep_key.kind == "resource":
-                    deps.append({
-                        "kind": "resource",
-                        "identity": dep_key.identity,
-                        "args_digest": dep_key.args_digest,
-                        "label": dep_key.label,
-                        "digest": dep_record.digest,
-                    })
+                    deps.append(
+                        {
+                            "kind": "resource",
+                            "identity": dep_key.identity,
+                            "args_digest": dep_key.args_digest,
+                            "label": dep_key.label,
+                            "digest": dep_record.digest,
+                        }
+                    )
             entry: dict[str, Any] = {
                 "kind": key.kind,
                 "identity": key.identity,
@@ -782,7 +824,9 @@ class Database:
                 probe_bytes_hex = record_dict.get("probe_bytes")
                 if probe_bytes_hex:
                     try:
-                        probe_snapshot = deserialize_snapshot(bytes.fromhex(probe_bytes_hex))
+                        probe_snapshot = deserialize_snapshot(
+                            bytes.fromhex(probe_bytes_hex)
+                        )
                         probe_value = thaw(probe_snapshot)
                         self._checkpoint_resource_probes[ck_key] = (
                             probe_value,
@@ -932,6 +976,7 @@ class Database:
 
     def _find_input_node_by_name(self, name: str) -> NodeKey | None:
         from .core import Input
+
         for input_obj, key in self._input_records.items():
             if isinstance(input_obj, Input) and input_obj.name == name:
                 return key
@@ -939,6 +984,7 @@ class Database:
 
     def _input_name_for_key(self, key: NodeKey) -> str:
         from .core import Input
+
         for input_obj, nk in self._input_records.items():
             if nk == key and isinstance(input_obj, Input):
                 return input_obj.name
@@ -967,7 +1013,9 @@ class Database:
         existing = self._records.get(key)
         current_request = self._current_request_id()
         if existing is None:
-            self._execute_query(query, key, call_snapshot, previous=None, reason="cold execute")
+            self._execute_query(
+                query, key, call_snapshot, previous=None, reason="cold execute"
+            )
             self._mark_query_used(key)
             return
         if existing.checked_in_request == current_request:
@@ -977,7 +1025,13 @@ class Database:
             self._mark_query_used(key)
             return
         if existing.is_untracked:
-            self._execute_query(query, key, call_snapshot, previous=existing, reason="untracked dependency")
+            self._execute_query(
+                query,
+                key,
+                call_snapshot,
+                previous=existing,
+                reason="untracked dependency",
+            )
             self._mark_query_used(key)
             return
 
@@ -994,10 +1048,19 @@ class Database:
             self._stats["query_reuses"] += 1
             self._mark_query_used(key)
             return
-        self._execute_query(query, key, call_snapshot, previous=existing, reason=dirty_reason)
+        self._execute_query(
+            query, key, call_snapshot, previous=existing, reason=dirty_reason
+        )
         self._mark_query_used(key)
 
-    def _execute_query(self, query: Any, key: NodeKey, call_snapshot: Any, previous: NodeRecord | None, reason: str) -> None:
+    def _execute_query(
+        self,
+        query: Any,
+        key: NodeKey,
+        call_snapshot: Any,
+        previous: NodeRecord | None,
+        reason: str,
+    ) -> None:
         frame = ExecutionFrame(key=key)
         stack = self._execution_stack.get()
         token = self._execution_stack.set(stack + (frame,))
@@ -1013,7 +1076,9 @@ class Database:
                 elapsed = time.perf_counter_ns() - t0
             self._query_timings.setdefault(key.label, []).append(elapsed)
             if self.mode == "checked":
-                for before, value in zip(frame.boundary_fingerprints, frame.boundary_values, strict=True):
+                for before, value in zip(
+                    frame.boundary_fingerprints, frame.boundary_values, strict=True
+                ):
                     assert_not_mutated(before, self._fingerprint_value(value))
             snapshot = self._freeze_value(result)
             digest = fingerprint_snapshot(snapshot)
@@ -1037,11 +1102,15 @@ class Database:
                 previous_changed_at = previous.changed_at
                 old_value = self._expose_snapshot(previous.snapshot)
                 new_value = self._expose_snapshot(snapshot)
-                equal = False if impure else self._compare_values(
-                    eq=query.eq,
-                    cutoff=query.cutoff,
-                    left=old_value,
-                    right=new_value,
+                equal = (
+                    False
+                    if impure
+                    else self._compare_values(
+                        eq=query.eq,
+                        cutoff=query.cutoff,
+                        left=old_value,
+                        right=new_value,
+                    )
                 )
                 record.snapshot = snapshot
                 record.digest = digest
@@ -1067,22 +1136,26 @@ class Database:
         finally:
             self._execution_stack.reset(token)
 
-    def _enqueue_observer_event(self, query: Any, key: NodeKey, record: NodeRecord) -> None:
+    def _enqueue_observer_event(
+        self, query: Any, key: NodeKey, record: NodeRecord
+    ) -> None:
         if key not in self._observers:
             return
         pending = self._pending_events.get()
         if pending is None:
             return
-        pending.append((
-            key,
-            QueryChangeEvent(
-                query_id=query.query_id,
-                args_digest=key.args_digest,
-                decision="executed",
-                changed_at=record.changed_at,
-                verified_at=record.verified_at,
-            ),
-        ))
+        pending.append(
+            (
+                key,
+                QueryChangeEvent(
+                    query_id=query.query_id,
+                    args_digest=key.args_digest,
+                    decision="executed",
+                    changed_at=record.changed_at,
+                    verified_at=record.verified_at,
+                ),
+            )
+        )
 
     def _unregister_observer(self, key: NodeKey, callback: ObserverCallback) -> None:
         with self._state_lock:
@@ -1103,8 +1176,7 @@ class Database:
             return
         with self._state_lock:
             snapshots = [
-                (event, tuple(self._observers.get(key, ())))
-                for key, event in events
+                (event, tuple(self._observers.get(key, ()))) for key, event in events
             ]
         for event, callbacks in snapshots:
             for callback in callbacks:
@@ -1134,7 +1206,9 @@ class Database:
                 return True
             resource, parameter = resource_pair
             self._refresh_resource(resource, parameter, key)
-        return self._records[key].is_untracked or self._records[key].changed_at > revision
+        return (
+            self._records[key].is_untracked or self._records[key].changed_at > revision
+        )
 
     def _refresh_resource(self, resource: Any, parameter: Any, key: NodeKey) -> None:
         atomic = hasattr(resource, "probe_and_load")
@@ -1215,7 +1289,9 @@ class Database:
         record.probe = probe
         record.checked_in_request = current_request
 
-    def _query_key(self, query: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[NodeKey, Any]:
+    def _query_key(
+        self, query: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> tuple[NodeKey, Any]:
         call_snapshot = (self._freeze_value(args), self._freeze_value(kwargs))
         args_digest = fingerprint_snapshot(call_snapshot)
         code_fingerprint = self._code_fingerprint(query.fn)
@@ -1244,7 +1320,9 @@ class Database:
     def _resource_key(self, resource: Any, parameter: Any) -> NodeKey:
         frozen_parameter = self._freeze_value(parameter)
         parameter_digest = fingerprint_snapshot(frozen_parameter)
-        resource_identity = fingerprint_snapshot(self._resource_identity_payload(resource))
+        resource_identity = fingerprint_snapshot(
+            self._resource_identity_payload(resource)
+        )
         key = NodeKey(
             kind="resource",
             identity=f"{type(resource).__module__}:{type(resource).__qualname__}:{resource_identity}",
@@ -1254,16 +1332,32 @@ class Database:
         self._resource_objects()[key] = (resource, parameter)
         return key
 
-    def _materialize_call(self, call_snapshot: Any, *, record_boundaries: bool, frame: ExecutionFrame) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    def _materialize_call(
+        self, call_snapshot: Any, *, record_boundaries: bool, frame: ExecutionFrame
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         frozen_args, frozen_kwargs = call_snapshot
-        args = tuple(self._expose_snapshot(item, boundary=True, record_boundaries=record_boundaries, frame=frame) for item in frozen_args)
+        args = tuple(
+            self._expose_snapshot(
+                item, boundary=True, record_boundaries=record_boundaries, frame=frame
+            )
+            for item in frozen_args
+        )
         kwargs = {
-            key: self._expose_snapshot(value, boundary=True, record_boundaries=record_boundaries, frame=frame)
+            key: self._expose_snapshot(
+                value, boundary=True, record_boundaries=record_boundaries, frame=frame
+            )
             for key, value in frozen_kwargs.entries
         }
         return args, kwargs
 
-    def _expose_snapshot(self, snapshot: Any, *, boundary: bool = False, record_boundaries: bool = False, frame: ExecutionFrame | None = None) -> Any:
+    def _expose_snapshot(
+        self,
+        snapshot: Any,
+        *,
+        boundary: bool = False,
+        record_boundaries: bool = False,
+        frame: ExecutionFrame | None = None,
+    ) -> Any:
         exposed = snapshot if self.mode == "strict" else self._thaw_value(snapshot)
         if boundary and record_boundaries and frame is not None:
             frame.boundary_fingerprints.append(self._fingerprint_value(exposed))
@@ -1297,7 +1391,10 @@ class Database:
             reason=record.reason,
             untracked_reasons=tuple(record.untracked_reasons),
             dependencies=tuple(
-                self._inspect_record(dependency) for dependency in sorted(record.dependencies, key=lambda item: item.label)
+                self._inspect_record(dependency)
+                for dependency in sorted(
+                    record.dependencies, key=lambda item: item.label
+                )
             ),
         )
 
@@ -1352,7 +1449,9 @@ class Database:
         )
         return fingerprint_snapshot(payload)
 
-    def _function_definition_payload(self, fn: FunctionType, seen_functions: builtins.set[int]) -> Any:
+    def _function_definition_payload(
+        self, fn: FunctionType, seen_functions: builtins.set[int]
+    ) -> Any:
         fn_id = id(fn)
         if fn_id in seen_functions:
             return ("recursive-function", fn.__module__, fn.__qualname__)
@@ -1388,7 +1487,9 @@ class Database:
                     (
                         scope_name,
                         name,
-                        self._captured_dependency_digest(name, value, seen_functions, owner=fn),
+                        self._captured_dependency_digest(
+                            name, value, seen_functions, owner=fn
+                        ),
                     )
                     for scope_name, mapping in (
                         ("nonlocal", closure_vars.nonlocals),
@@ -1419,7 +1520,10 @@ class Database:
         if isinstance(value, ModuleType):
             return ("module", value.__name__, self._module_identity_payload(value))
         if isinstance(value, FunctionType):
-            return ("function", self._function_definition_payload(value, seen_functions))
+            return (
+                "function",
+                self._function_definition_payload(value, seen_functions),
+            )
         if isinstance(value, BuiltinFunctionType):
             return ("builtin", value.__module__, value.__qualname__)
         if isinstance(value, type):
@@ -1460,7 +1564,9 @@ class Database:
 
         all_attr = getattr(module, "__all__", None)
         if isinstance(all_attr, (list, tuple)):
-            all_tuple: tuple[str, ...] | None = tuple(sorted(str(item) for item in all_attr))
+            all_tuple: tuple[str, ...] | None = tuple(
+                sorted(str(item) for item in all_attr)
+            )
         else:
             all_tuple = None
 
@@ -1474,18 +1580,33 @@ class Database:
             except OSError:
                 return (version_digest, None, all_tuple)
 
-            cache_key = (module.__name__, file_path, stat_result.st_mtime_ns, stat_result.st_size)
+            cache_key = (
+                module.__name__,
+                file_path,
+                stat_result.st_mtime_ns,
+                stat_result.st_size,
+            )
             cached = self._module_identity_cache.get(cache_key)
             if cached is None:
                 if file_path.endswith(".py"):
                     try:
                         raw = Path(file_path).read_bytes()
                     except OSError:
-                        cached = ("stat", file_path, stat_result.st_mtime_ns, stat_result.st_size)
+                        cached = (
+                            "stat",
+                            file_path,
+                            stat_result.st_mtime_ns,
+                            stat_result.st_size,
+                        )
                     else:
                         cached = ("source-sha256", hashlib.sha256(raw).hexdigest())
                 else:
-                    cached = ("stat", file_path, stat_result.st_mtime_ns, stat_result.st_size)
+                    cached = (
+                        "stat",
+                        file_path,
+                        stat_result.st_mtime_ns,
+                        stat_result.st_size,
+                    )
                 self._module_identity_cache[cache_key] = cached
 
         return (version_digest, cached, all_tuple)
@@ -1513,7 +1634,9 @@ class Database:
     def _freeze_static_capture(self, value: Any, active_ids: builtins.set[int]) -> Any:
         if isinstance(value, (str, bytes, int, float, bool, type(None), complex)):
             return value
-        if isinstance(value, (FrozenList, FrozenDict, FrozenSet, FrozenRecord, FrozenAdapterValue)):
+        if isinstance(
+            value, (FrozenList, FrozenDict, FrozenSet, FrozenRecord, FrozenAdapterValue)
+        ):
             return value
         if isinstance(value, os.PathLike):
             return os.fspath(value)
@@ -1521,27 +1644,40 @@ class Database:
             return ("range", value.start, value.stop, value.step)
         if isinstance(value, tuple):
             with self._capture_guard(value, active_ids):
-                return tuple(self._freeze_static_capture(item, active_ids) for item in value)
+                return tuple(
+                    self._freeze_static_capture(item, active_ids) for item in value
+                )
         if isinstance(value, frozenset):
             with self._capture_guard(value, active_ids):
-                items = tuple(self._freeze_static_capture(item, active_ids) for item in value)
+                items = tuple(
+                    self._freeze_static_capture(item, active_ids) for item in value
+                )
                 return ("frozenset", tuple(sorted(items, key=fingerprint_snapshot)))
         if is_dataclass(value) and not isinstance(value, type):
             params = getattr(type(value), "__dataclass_params__", None)
             if params is None or not params.frozen:
-                raise UnsupportedValueError("Mutable dataclass values cannot be captured ambiently.")
+                raise UnsupportedValueError(
+                    "Mutable dataclass values cannot be captured ambiently."
+                )
             with self._capture_guard(value, active_ids):
                 return FrozenRecord(
                     type(value).__qualname__,
                     tuple(
-                        (field.name, self._freeze_static_capture(getattr(value, field.name), active_ids))
+                        (
+                            field.name,
+                            self._freeze_static_capture(
+                                getattr(value, field.name), active_ids
+                            ),
+                        )
                         for field in fields(value)
                     ),
                 )
         raise UnsupportedValueError("Unsupported ambient capture.")
 
     @contextmanager
-    def _capture_guard(self, value: Any, active_ids: builtins.set[int]) -> Iterator[None]:
+    def _capture_guard(
+        self, value: Any, active_ids: builtins.set[int]
+    ) -> Iterator[None]:
         object_id = id(value)
         if object_id in active_ids:
             raise UnsupportedValueError("Cyclic ambient values are not supported.")
@@ -1552,7 +1688,9 @@ class Database:
             active_ids.remove(object_id)
 
     def _is_resource_handle(self, value: Any) -> bool:
-        return all(callable(getattr(value, name, None)) for name in ("label", "probe", "load"))
+        return all(
+            callable(getattr(value, name, None)) for name in ("label", "probe", "load")
+        )
 
     @contextmanager
     def _request_scope(
@@ -1582,7 +1720,10 @@ class Database:
         if limit is None:
             return
         while len(self._query_records) > limit:
-            lru_key = min(self._query_records, key=lambda item: self._query_last_used.get(item, -1))
+            lru_key = min(
+                self._query_records,
+                key=lambda item: self._query_last_used.get(item, -1),
+            )
             self._evict_query_record(lru_key)
 
     def _evict_query_record(self, key: NodeKey) -> None:
@@ -1642,7 +1783,9 @@ class Database:
         right: Any,
     ) -> bool:
         if cutoff is not None:
-            return self._freeze_cutoff_token(cutoff(left)) == self._freeze_cutoff_token(cutoff(right))
+            return self._freeze_cutoff_token(cutoff(left)) == self._freeze_cutoff_token(
+                cutoff(right)
+            )
         if eq is None:
             return self._semantic_equal(left, right)
         return eq(left, right)
@@ -1651,4 +1794,6 @@ class Database:
         try:
             return self._freeze_value(value)
         except UnsupportedValueError as exc:
-            raise UnsupportedValueError("Cutoff functions must return snapshot-safe values.") from exc
+            raise UnsupportedValueError(
+                "Cutoff functions must return snapshot-safe values."
+            ) from exc

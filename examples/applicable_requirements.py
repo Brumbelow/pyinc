@@ -9,6 +9,7 @@ distribution is not installed).
 
 Run: ``python examples/applicable_requirements.py``
 """
+
 from __future__ import annotations
 
 import sys

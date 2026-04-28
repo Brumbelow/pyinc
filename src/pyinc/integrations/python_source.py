@@ -17,7 +17,12 @@ from pyinc.value import thaw
 ImportKind: TypeAlias = Literal["import", "from"]
 DefinitionKind: TypeAlias = Literal["function", "class"]
 ImportResolution: TypeAlias = Literal[
-    "workspace", "external", "stdlib", "installed", "missing", "ambiguous",
+    "workspace",
+    "external",
+    "stdlib",
+    "installed",
+    "missing",
+    "ambiguous",
 ]
 
 ModuleBindingAnalysisPayload: TypeAlias = tuple[
@@ -238,7 +243,9 @@ def _literal_string_collection(value: ast.expr | None) -> tuple[str, ...] | None
 
 
 def _contains_name(node: ast.AST, name: str) -> bool:
-    return any(isinstance(item, ast.Name) and item.id == name for item in ast.walk(node))
+    return any(
+        isinstance(item, ast.Name) and item.id == name for item in ast.walk(node)
+    )
 
 
 def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
@@ -265,7 +272,9 @@ def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
             continue
 
         if isinstance(node, ast.Assign):
-            target_names = {name for target in node.targets for name in _target_bound_names(target)}
+            target_names = {
+                name for target in node.targets for name in _target_bound_names(target)
+            }
             bound_names.update(target_names)
             if "__all__" in target_names:
                 literal_names = _literal_string_collection(node.value)
@@ -290,13 +299,17 @@ def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
             continue
 
         if isinstance(node, ast.AugAssign):
-            if "__all__" in _target_bound_names(node.target) or _contains_name(node.value, "__all__"):
+            if "__all__" in _target_bound_names(node.target) or _contains_name(
+                node.value, "__all__"
+            ):
                 static_all_names = None
                 _append_unique(impurity_reasons, "dynamic __all__")
             continue
 
         if isinstance(node, ast.Delete):
-            deleted_names = {name for target in node.targets for name in _target_bound_names(target)}
+            deleted_names = {
+                name for target in node.targets for name in _target_bound_names(target)
+            }
             bound_names.difference_update(deleted_names)
             if "__all__" in deleted_names:
                 static_all_names = None
@@ -333,7 +346,9 @@ def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
     if static_all_names is not None:
         wildcard_exports = static_all_names
     else:
-        wildcard_exports = tuple(name for name in explicit_exports if not name.startswith("_"))
+        wildcard_exports = tuple(
+            name for name in explicit_exports if not name.startswith("_")
+        )
     return explicit_exports, wildcard_exports, tuple(impurity_reasons)
 
 
@@ -364,10 +379,7 @@ def _index_groups(
     grouped: dict[str, list[str]] = {}
     for module, path in index:
         grouped.setdefault(module, []).append(path)
-    return {
-        module: tuple(sorted(paths))
-        for module, paths in grouped.items()
-    }
+    return {module: tuple(sorted(paths)) for module, paths in grouped.items()}
 
 
 def _build_environment_lookup(
@@ -465,7 +477,9 @@ def _installed_module_candidates(
         return ()
     candidates: list[str] = []
     if imported_name is not None and imported_name != "*":
-        candidate = f"{absolute_base}.{imported_name}" if absolute_base else imported_name
+        candidate = (
+            f"{absolute_base}.{imported_name}" if absolute_base else imported_name
+        )
         candidates.append(candidate)
     if absolute_base:
         candidates.append(absolute_base)
@@ -509,12 +523,21 @@ def _resolve_import_reference(
     package_top_levels: dict[str, tuple[str, str]],
 ) -> tuple[str | None, str | None, ImportResolution, str | None, str | None]:
     if kind == "import":
-        resolved_module, resolved_path, resolution = _resolve_workspace_module(request_module, index_groups)
+        resolved_module, resolved_path, resolution = _resolve_workspace_module(
+            request_module, index_groups
+        )
         if resolution is not None:
             return resolved_module, resolved_path, resolution, None, None
-        return None, None, *_missing_resolution(
-            request_module, index_groups, prefer_external=True,
-            stdlib_modules=stdlib_modules, package_top_levels=package_top_levels,
+        return (
+            None,
+            None,
+            *_missing_resolution(
+                request_module,
+                index_groups,
+                prefer_external=True,
+                stdlib_modules=stdlib_modules,
+                package_top_levels=package_top_levels,
+            ),
         )
 
     absolute_base = _resolve_relative_base(current_module, current_path, request_module)
@@ -523,23 +546,31 @@ def _resolve_import_reference(
 
     candidates: list[str] = []
     if imported_name is not None and imported_name != "*":
-        candidate = f"{absolute_base}.{imported_name}" if absolute_base else imported_name
+        candidate = (
+            f"{absolute_base}.{imported_name}" if absolute_base else imported_name
+        )
         candidates.append(candidate)
     if absolute_base:
         candidates.append(absolute_base)
 
     for candidate in candidates:
-        resolved_module, resolved_path, resolution = _resolve_workspace_module(candidate, index_groups)
+        resolved_module, resolved_path, resolution = _resolve_workspace_module(
+            candidate, index_groups
+        )
         if resolution is not None:
             return resolved_module, resolved_path, resolution, None, None
 
     requested_target = candidates[0] if candidates else absolute_base
-    return None, None, *_missing_resolution(
-        requested_target,
-        index_groups,
-        prefer_external=not request_module.startswith("."),
-        stdlib_modules=stdlib_modules,
-        package_top_levels=package_top_levels,
+    return (
+        None,
+        None,
+        *_missing_resolution(
+            requested_target,
+            index_groups,
+            prefer_external=not request_module.startswith("."),
+            stdlib_modules=stdlib_modules,
+            package_top_levels=package_top_levels,
+        ),
     )
 
 
@@ -602,10 +633,14 @@ def _has_import_error_handler(handlers: list[ast.ExceptHandler]) -> bool:
         exc_type = handler.type
         if exc_type is None:
             continue
-        if isinstance(exc_type, ast.Name) and exc_type.id in ("ImportError", "ModuleNotFoundError"):
+        if isinstance(exc_type, ast.Name) and exc_type.id in (
+            "ImportError",
+            "ModuleNotFoundError",
+        ):
             return True
         if isinstance(exc_type, ast.Tuple) and any(
-            isinstance(elt, ast.Name) and elt.id in ("ImportError", "ModuleNotFoundError")
+            isinstance(elt, ast.Name)
+            and elt.id in ("ImportError", "ModuleNotFoundError")
             for elt in exc_type.elts
         ):
             return True
@@ -617,7 +652,9 @@ def _collect_import_statements(
 ) -> None:
     for node in body:
         if isinstance(node, ast.Import):
-            statements.extend((alias.name, "import", node.lineno, tuple()) for alias in node.names)
+            statements.extend(
+                (alias.name, "import", node.lineno, tuple()) for alias in node.names
+            )
         elif isinstance(node, ast.ImportFrom):
             statements.append(
                 (
@@ -630,7 +667,9 @@ def _collect_import_statements(
 
 
 @query
-def import_statements_for_file(db: Database, path: str) -> tuple[ImportStatementPayload, ...]:
+def import_statements_for_file(
+    db: Database, path: str
+) -> tuple[ImportStatementPayload, ...]:
     tree = _try_parse(source_text(db, path))
     if tree is None:
         return tuple()
@@ -638,7 +677,9 @@ def import_statements_for_file(db: Database, path: str) -> tuple[ImportStatement
     statements: list[ImportStatementPayload] = []
     for node in tree.body:
         if isinstance(node, ast.Import):
-            statements.extend((alias.name, "import", node.lineno, tuple()) for alias in node.names)
+            statements.extend(
+                (alias.name, "import", node.lineno, tuple()) for alias in node.names
+            )
         elif isinstance(node, ast.ImportFrom):
             statements.append(
                 (
@@ -677,7 +718,9 @@ def definitions_for_file(db: Database, path: str) -> tuple[DefinitionPayload, ..
 
 
 @query
-def syntax_diagnostics_for_file(db: Database, path: str) -> tuple[DiagnosticPayload, ...]:
+def syntax_diagnostics_for_file(
+    db: Database, path: str
+) -> tuple[DiagnosticPayload, ...]:
     source = source_text(db, path)
     try:
         ast.parse(source)
@@ -694,7 +737,9 @@ def syntax_diagnostics_for_file(db: Database, path: str) -> tuple[DiagnosticPayl
 
 
 @query
-def module_binding_analysis_payload(db: Database, path: str) -> ModuleBindingAnalysisPayload:
+def module_binding_analysis_payload(
+    db: Database, path: str
+) -> ModuleBindingAnalysisPayload:
     tree = _try_parse(source_text(db, path))
     if tree is None:
         return (tuple(), tuple(), tuple())
@@ -729,7 +774,9 @@ def workspace_python_files(db: Database, root: str) -> tuple[str, ...]:
 
 
 @query
-def workspace_module_index(db: Database, root: str) -> tuple[ModuleIndexEntryPayload, ...]:
+def workspace_module_index(
+    db: Database, root: str
+) -> tuple[ModuleIndexEntryPayload, ...]:
     return tuple(
         (_module_name_for_path(root, path), path)
         for path in workspace_python_files(db, root)
@@ -737,7 +784,9 @@ def workspace_module_index(db: Database, root: str) -> tuple[ModuleIndexEntryPay
 
 
 @query
-def resolved_imports_for_file(db: Database, root: str, path: str) -> tuple[ResolvedImportPayload, ...]:
+def resolved_imports_for_file(
+    db: Database, root: str, path: str
+) -> tuple[ResolvedImportPayload, ...]:
     current_module = _module_name_for_path(root, path)
     index_groups = _index_groups(workspace_module_index(db, root))
     statements = import_statements_for_file(db, path)
@@ -747,15 +796,17 @@ def resolved_imports_for_file(db: Database, root: str, path: str) -> tuple[Resol
     resolved: list[ResolvedImportPayload] = []
     for request_module, kind, lineno, imported_names in statements:
         if kind == "import":
-            resolved_module, resolved_path, resolution, dist_name, dist_ver = _resolve_import_reference(
-                current_module=current_module,
-                current_path=path,
-                request_module=request_module,
-                kind=kind,
-                imported_name=None,
-                index_groups=index_groups,
-                stdlib_modules=stdlib_modules,
-                package_top_levels=pkg_map,
+            resolved_module, resolved_path, resolution, dist_name, dist_ver = (
+                _resolve_import_reference(
+                    current_module=current_module,
+                    current_path=path,
+                    request_module=request_module,
+                    kind=kind,
+                    imported_name=None,
+                    index_groups=index_groups,
+                    stdlib_modules=stdlib_modules,
+                    package_top_levels=pkg_map,
+                )
             )
             if resolution == "installed" and resolved_path is None:
                 enriched_module, enriched_path = _enrich_installed_path(
@@ -772,20 +823,32 @@ def resolved_imports_for_file(db: Database, root: str, path: str) -> tuple[Resol
                 elif enriched_module is not None:
                     resolved_module = enriched_module
             resolved.append(
-                (request_module, kind, lineno, None, resolved_module, resolved_path, resolution, dist_name, dist_ver)
+                (
+                    request_module,
+                    kind,
+                    lineno,
+                    None,
+                    resolved_module,
+                    resolved_path,
+                    resolution,
+                    dist_name,
+                    dist_ver,
+                )
             )
             continue
 
         for imported_name in imported_names:
-            resolved_module, resolved_path, resolution, dist_name, dist_ver = _resolve_import_reference(
-                current_module=current_module,
-                current_path=path,
-                request_module=request_module,
-                kind=kind,
-                imported_name=imported_name,
-                index_groups=index_groups,
-                stdlib_modules=stdlib_modules,
-                package_top_levels=pkg_map,
+            resolved_module, resolved_path, resolution, dist_name, dist_ver = (
+                _resolve_import_reference(
+                    current_module=current_module,
+                    current_path=path,
+                    request_module=request_module,
+                    kind=kind,
+                    imported_name=imported_name,
+                    index_groups=index_groups,
+                    stdlib_modules=stdlib_modules,
+                    package_top_levels=pkg_map,
+                )
             )
             if resolution == "installed" and resolved_path is None:
                 enriched_module, enriched_path = _enrich_installed_path(
@@ -818,7 +881,9 @@ def resolved_imports_for_file(db: Database, root: str, path: str) -> tuple[Resol
 
 
 @query
-def module_export_surface(db: Database, root: str, path: str) -> DependencySurfacePayload:
+def module_export_surface(
+    db: Database, root: str, path: str
+) -> DependencySurfacePayload:
     module = _module_name_for_path(root, path)
     exports, _, impurity_reasons = module_binding_analysis_payload(db, path)
     for reason in impurity_reasons:
@@ -827,7 +892,9 @@ def module_export_surface(db: Database, root: str, path: str) -> DependencySurfa
 
 
 @query
-def module_wildcard_export_surface(db: Database, root: str, path: str) -> DependencySurfacePayload:
+def module_wildcard_export_surface(
+    db: Database, root: str, path: str
+) -> DependencySurfacePayload:
     module = _module_name_for_path(root, path)
     _, exports, impurity_reasons = module_binding_analysis_payload(db, path)
     for reason in impurity_reasons:
@@ -836,15 +903,31 @@ def module_wildcard_export_surface(db: Database, root: str, path: str) -> Depend
 
 
 @query
-def module_analysis_payload(db: Database, root: str, path: str) -> ModuleAnalysisPayload:
+def module_analysis_payload(
+    db: Database, root: str, path: str
+) -> ModuleAnalysisPayload:
     workspace_files = workspace_python_files(db, root)
     if path not in workspace_files:
         return _empty_module_analysis_payload(root, path)
 
     resolved_imports = resolved_imports_for_file(db, root, path)
     dependencies: dict[tuple[str, str], tuple[DependencySurfacePayload, bool]] = {}
-    for _, kind, _, imported_name, resolved_module, resolved_path, resolution, _, _ in resolved_imports:
-        if resolution != "workspace" or resolved_module is None or resolved_path is None:
+    for (
+        _,
+        kind,
+        _,
+        imported_name,
+        resolved_module,
+        resolved_path,
+        resolution,
+        _,
+        _,
+    ) in resolved_imports:
+        if (
+            resolution != "workspace"
+            or resolved_module is None
+            or resolved_path is None
+        ):
             continue
         _, _, impurity_reasons = module_binding_analysis_payload(db, resolved_path)
         for reason in impurity_reasons:
@@ -866,7 +949,12 @@ def module_analysis_payload(db: Database, root: str, path: str) -> ModuleAnalysi
         definitions_for_file(db, path),
         syntax_diagnostics_for_file(db, path),
         resolved_imports,
-        tuple(sorted((item[0] for item in dependencies.values()), key=lambda item: (item[0], item[1]))),
+        tuple(
+            sorted(
+                (item[0] for item in dependencies.values()),
+                key=lambda item: (item[0], item[1]),
+            )
+        ),
     )
 
 
@@ -900,7 +988,17 @@ def _decode_diagnostic(payload: DiagnosticPayload) -> Diagnostic:
 
 
 def _decode_resolved_import(payload: ResolvedImportPayload) -> ResolvedImportRef:
-    module, kind, lineno, imported_name, resolved_module, resolved_path, resolution, dist_name, dist_ver = payload
+    (
+        module,
+        kind,
+        lineno,
+        imported_name,
+        resolved_module,
+        resolved_path,
+        resolution,
+        dist_name,
+        dist_ver,
+    ) = payload
     return ResolvedImportRef(
         module=module,
         kind=kind,
@@ -942,36 +1040,53 @@ def _decode_file_analysis(payload: FileAnalysisPayload) -> PythonFileAnalysis:
 
 
 def _decode_module_analysis(payload: ModuleAnalysisPayload) -> PythonModuleAnalysis:
-    path, module, imports, definitions, diagnostics, resolved_imports, dependencies = payload
+    path, module, imports, definitions, diagnostics, resolved_imports, dependencies = (
+        payload
+    )
     return PythonModuleAnalysis(
         path=path,
         module=module,
         imports=tuple(_decode_import(item) for item in imports),
         definitions=tuple(_decode_definition(item) for item in definitions),
         diagnostics=tuple(_decode_diagnostic(item) for item in diagnostics),
-        resolved_imports=tuple(_decode_resolved_import(item) for item in resolved_imports),
+        resolved_imports=tuple(
+            _decode_resolved_import(item) for item in resolved_imports
+        ),
         dependencies=tuple(_decode_dependency_surface(item) for item in dependencies),
     )
 
 
 def file_analysis(db: Database, path: str | os.PathLike[str]) -> PythonFileAnalysis:
     normalized_path = _normalize_path(path)
-    payload = cast(FileAnalysisPayload, thaw(db.get(file_analysis_payload, normalized_path)))
+    payload = cast(
+        FileAnalysisPayload, thaw(db.get(file_analysis_payload, normalized_path))
+    )
     return _decode_file_analysis(payload)
 
 
-def directory_analysis(db: Database, root: str | os.PathLike[str]) -> tuple[PythonFileAnalysis, ...]:
+def directory_analysis(
+    db: Database, root: str | os.PathLike[str]
+) -> tuple[PythonFileAnalysis, ...]:
     normalized_root = _normalize_path(root)
-    payload = cast(DirectoryAnalysisPayload, thaw(db.get(directory_analysis_payload, normalized_root)))
+    payload = cast(
+        DirectoryAnalysisPayload,
+        thaw(db.get(directory_analysis_payload, normalized_root)),
+    )
     return tuple(_decode_file_analysis(item) for item in payload)
 
 
-def module_analysis(db: Database, root: str | os.PathLike[str], path: str | os.PathLike[str]) -> PythonModuleAnalysis:
+def module_analysis(
+    db: Database, root: str | os.PathLike[str], path: str | os.PathLike[str]
+) -> PythonModuleAnalysis:
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
-    workspace_files = cast(tuple[str, ...], thaw(db.get(workspace_python_files, normalized_root)))
+    workspace_files = cast(
+        tuple[str, ...], thaw(db.get(workspace_python_files, normalized_root))
+    )
     if normalized_path not in workspace_files:
-        raise ValueError(f"{normalized_path!r} is not a Python source file under {normalized_root!r}.")
+        raise ValueError(
+            f"{normalized_path!r} is not a Python source file under {normalized_root!r}."
+        )
     payload = cast(
         ModuleAnalysisPayload,
         thaw(db.get(module_analysis_payload, normalized_root, normalized_path)),
@@ -979,7 +1094,9 @@ def module_analysis(db: Database, root: str | os.PathLike[str], path: str | os.P
     return _decode_module_analysis(payload)
 
 
-def workspace_analysis(db: Database, root: str | os.PathLike[str]) -> PythonWorkspaceAnalysis:
+def workspace_analysis(
+    db: Database, root: str | os.PathLike[str]
+) -> PythonWorkspaceAnalysis:
     normalized_root = _normalize_path(root)
     payload = cast(
         WorkspaceAnalysisPayload,

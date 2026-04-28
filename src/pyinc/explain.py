@@ -64,13 +64,17 @@ def format_explanation(root: InspectionNode) -> str:
 
 
 def _is_resource_handle(value: Any) -> bool:
-    return all(callable(getattr(value, name, None)) for name in ("label", "probe", "load"))
+    return all(
+        callable(getattr(value, name, None)) for name in ("label", "probe", "load")
+    )
 
 
 def _classify_value_capture(value: Any, seen: set[int]) -> tuple[bool, str]:
     if isinstance(value, (str, bytes, int, float, bool, type(None), complex)):
         return True, ""
-    if isinstance(value, (FrozenList, FrozenDict, FrozenSet, FrozenRecord, FrozenAdapterValue)):
+    if isinstance(
+        value, (FrozenList, FrozenDict, FrozenSet, FrozenRecord, FrozenAdapterValue)
+    ):
         return True, ""
     if isinstance(value, os.PathLike):
         return True, ""
@@ -127,23 +131,47 @@ def _classify_capture(name: str, value: Any, origin: str) -> CaptureInfo:
     type_name = type(value).__qualname__
 
     if isinstance(value, Query):
-        return CaptureInfo(name=name, origin=origin, type_name=type_name, accepted=True, kind="query")
+        return CaptureInfo(
+            name=name, origin=origin, type_name=type_name, accepted=True, kind="query"
+        )
     if isinstance(value, Input):
-        return CaptureInfo(name=name, origin=origin, type_name=type_name, accepted=True, kind="input")
+        return CaptureInfo(
+            name=name, origin=origin, type_name=type_name, accepted=True, kind="input"
+        )
     if _is_resource_handle(value):
-        return CaptureInfo(name=name, origin=origin, type_name=type_name, accepted=True, kind="resource")
+        return CaptureInfo(
+            name=name,
+            origin=origin,
+            type_name=type_name,
+            accepted=True,
+            kind="resource",
+        )
     if isinstance(value, ModuleType):
-        return CaptureInfo(name=name, origin=origin, type_name=type_name, accepted=True, kind="module")
+        return CaptureInfo(
+            name=name, origin=origin, type_name=type_name, accepted=True, kind="module"
+        )
     if isinstance(value, FunctionType):
-        return CaptureInfo(name=name, origin=origin, type_name=type_name, accepted=True, kind="function")
+        return CaptureInfo(
+            name=name,
+            origin=origin,
+            type_name=type_name,
+            accepted=True,
+            kind="function",
+        )
     if isinstance(value, BuiltinFunctionType):
-        return CaptureInfo(name=name, origin=origin, type_name=type_name, accepted=True, kind="builtin")
+        return CaptureInfo(
+            name=name, origin=origin, type_name=type_name, accepted=True, kind="builtin"
+        )
     if isinstance(value, type):
-        return CaptureInfo(name=name, origin=origin, type_name=type_name, accepted=True, kind="type")
+        return CaptureInfo(
+            name=name, origin=origin, type_name=type_name, accepted=True, kind="type"
+        )
 
     accepted, reason = _classify_value_capture(value, set())
     if accepted:
-        return CaptureInfo(name=name, origin=origin, type_name=type_name, accepted=True, kind="value")
+        return CaptureInfo(
+            name=name, origin=origin, type_name=type_name, accepted=True, kind="value"
+        )
     return CaptureInfo(
         name=name,
         origin=origin,
@@ -167,7 +195,9 @@ def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
     for index, value in enumerate(target.__defaults__ or ()):
         results.append(_classify_capture(f"default[{index}]", value, "default"))
     for default_name, value in sorted((target.__kwdefaults__ or {}).items()):
-        results.append(_classify_capture(f"kwdefault[{default_name}]", value, "kwdefault"))
+        results.append(
+            _classify_capture(f"kwdefault[{default_name}]", value, "kwdefault")
+        )
 
     closure_vars = _inspect.getclosurevars(target)
     for capture_name, value in sorted(closure_vars.nonlocals.items()):

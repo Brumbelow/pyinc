@@ -17,12 +17,12 @@ CsvColumnPayload: TypeAlias = tuple[str, int]
 DiagnosticPayload: TypeAlias = tuple[str, str]
 CsvMetaPayload: TypeAlias = tuple[int, str, bool]
 CsvAnalysisPayload: TypeAlias = tuple[
-    str,                              # path
-    tuple[CsvColumnPayload, ...],     # columns
-    int,                              # row_count
-    str,                              # delimiter
-    bool,                             # has_header
-    tuple[DiagnosticPayload, ...],    # diagnostics
+    str,  # path
+    tuple[CsvColumnPayload, ...],  # columns
+    int,  # row_count
+    str,  # delimiter
+    bool,  # has_header
+    tuple[DiagnosticPayload, ...],  # diagnostics
 ]
 
 

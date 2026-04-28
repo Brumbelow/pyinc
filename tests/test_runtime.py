@@ -37,12 +37,16 @@ def read_global_box(db: Database) -> int:
     return _GLOBAL_BOX["x"]
 
 
-def _query_record(db: Database, query_fn: object, *args: object, **kwargs: object) -> Any:
+def _query_record(
+    db: Database, query_fn: object, *args: object, **kwargs: object
+) -> Any:
     key, _ = db._query_key(query_fn, args, kwargs)
     return db._records[key]
 
 
-def _inspect_node(db: Database, query_fn: Any, *args: object, **kwargs: object) -> InspectionNode:
+def _inspect_node(
+    db: Database, query_fn: Any, *args: object, **kwargs: object
+) -> InspectionNode:
     return db.inspect(query_fn, *args, **kwargs)
 
 
@@ -183,7 +187,9 @@ def test_cutoff_tokens_must_be_snapshot_safe() -> None:
 
     db = Database()
     db.set(number, 1)
-    with pytest.raises(UnsupportedValueError, match="Cutoff functions must return snapshot-safe values"):
+    with pytest.raises(
+        UnsupportedValueError, match="Cutoff functions must return snapshot-safe values"
+    ):
         db.set(number, 1)
 
 
@@ -209,8 +215,12 @@ def test_dynamic_dependencies_drop_stale_edges() -> None:
     assert db.get(branch) == 10
 
     inspection = _inspect_node(db, branch)
-    assert any(dependency.label == "input[right]" for dependency in inspection.dependencies)
-    assert all(dependency.label != "input[left]" for dependency in inspection.dependencies)
+    assert any(
+        dependency.label == "input[right]" for dependency in inspection.dependencies
+    )
+    assert all(
+        dependency.label != "input[left]" for dependency in inspection.dependencies
+    )
 
 
 def test_inspect_returns_structured_dependency_tree() -> None:
@@ -280,7 +290,9 @@ def test_inspect_fresh_on_cold_cache_returns_same_shape_as_inspect() -> None:
     assert tree_a.label == tree_b.label
     assert tree_a.kind == tree_b.kind
     assert tree_a.last_decision == tree_b.last_decision == "executed"
-    assert {dep.label for dep in tree_a.dependencies} == {dep.label for dep in tree_b.dependencies}
+    assert {dep.label for dep in tree_a.dependencies} == {
+        dep.label for dep in tree_b.dependencies
+    }
 
 
 def test_inspect_fresh_rejects_non_query() -> None:
@@ -293,7 +305,9 @@ def test_inspect_fresh_rejects_non_query() -> None:
     ("mode", "expected_type"),
     [("strict", FrozenDict), ("checked", dict), ("fast", dict)],
 )
-def test_modes_expose_expected_boundary_shapes(mode: str, expected_type: type[object]) -> None:
+def test_modes_expose_expected_boundary_shapes(
+    mode: str, expected_type: type[object]
+) -> None:
     payload = Input[dict[str, int]]("payload")
 
     @query
@@ -397,7 +411,9 @@ def test_os_getenv_is_rejected_inside_query(monkeypatch: pytest.MonkeyPatch) -> 
         Database().get(read_env)
 
 
-def test_os_environ_access_is_rejected_inside_query(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_os_environ_access_is_rejected_inside_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("PYINC_DIRECT_ENV", "value")
 
     @query
@@ -409,7 +425,9 @@ def test_os_environ_access_is_rejected_inside_query(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.parametrize("method_name", ["read_text", "read_bytes"])
-def test_path_read_helpers_are_rejected_inside_query(tmp_path: Path, method_name: str) -> None:
+def test_path_read_helpers_are_rejected_inside_query(
+    tmp_path: Path, method_name: str
+) -> None:
     path = tmp_path / "sample.txt"
     path.write_text("hello", encoding="utf-8")
 
@@ -426,7 +444,9 @@ def test_path_read_helpers_are_rejected_inside_query(tmp_path: Path, method_name
 
 
 @pytest.mark.parametrize("method_name", ["listdir", "scandir", "iterdir"])
-def test_directory_helpers_are_rejected_inside_query(tmp_path: Path, method_name: str) -> None:
+def test_directory_helpers_are_rejected_inside_query(
+    tmp_path: Path, method_name: str
+) -> None:
     path = tmp_path / "workspace"
     path.mkdir()
     (path / "a.txt").write_text("alpha", encoding="utf-8")
@@ -443,7 +463,9 @@ def test_directory_helpers_are_rejected_inside_query(tmp_path: Path, method_name
         Database().get(read_directory)
 
 
-def test_resource_reads_are_allowed_inside_query(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_resource_reads_are_allowed_inside_query(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     env = EnvResource()
     directories = DirectoryResource()
     monkeypatch.setenv("PYINC_TRACKED_ENV", "value")
@@ -459,7 +481,9 @@ def test_resource_reads_are_allowed_inside_query(monkeypatch: pytest.MonkeyPatch
     assert db.get(read_tracked, str(workspace)) == ("value", ("a.txt",))
 
 
-def test_failed_resource_reads_do_not_leave_dangling_dependencies(tmp_path: Path) -> None:
+def test_failed_resource_reads_do_not_leave_dangling_dependencies(
+    tmp_path: Path,
+) -> None:
     directories = DirectoryResource()
     path = tmp_path / "sample.py"
     path.write_text("value = 1\n", encoding="utf-8")
@@ -541,7 +565,9 @@ def test_comment_only_file_edit_backdates_parse(tmp_path: Path) -> None:
     assert inspection.last_decision == "reused"
 
 
-def test_file_resource_detects_content_changes_even_when_stat_signature_is_stable(tmp_path: Path) -> None:
+def test_file_resource_detects_content_changes_even_when_stat_signature_is_stable(
+    tmp_path: Path,
+) -> None:
     files = FileResource()
     path = tmp_path / "sample.txt"
     path.write_text("alpha", encoding="utf-8")
@@ -603,7 +629,9 @@ def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) ->
     assert _inspect_node(db, entries, str(path)).last_decision == "reused"
 
 
-def test_file_resource_atomic_probe_and_load_keeps_digest_and_text_coherent(tmp_path: Path) -> None:
+def test_file_resource_atomic_probe_and_load_keeps_digest_and_text_coherent(
+    tmp_path: Path,
+) -> None:
     import hashlib
 
     files = FileResource()
@@ -637,7 +665,9 @@ def test_file_resource_atomic_probe_and_load_keeps_digest_and_text_coherent(tmp_
     assert stored_digest_after == hashlib.sha256(updated.encode("utf-8")).hexdigest()
 
 
-def test_file_resource_coherent_under_read_race(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_file_resource_coherent_under_read_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import hashlib
 
     files = FileResource()
@@ -672,7 +702,9 @@ def test_file_resource_coherent_under_read_race(tmp_path: Path, monkeypatch: pyt
     assert probe[1] == hashlib.sha256(b"first").hexdigest()
 
 
-def test_directory_resource_distinguishes_missing_dir_from_entry_named_missing(tmp_path: Path) -> None:
+def test_directory_resource_distinguishes_missing_dir_from_entry_named_missing(
+    tmp_path: Path,
+) -> None:
     directories = DirectoryResource()
     workspace = tmp_path / "workspace"
 
@@ -695,7 +727,9 @@ def test_directory_resource_distinguishes_missing_dir_from_entry_named_missing(t
     assert _inspect_node(db, listing, str(workspace)).last_decision == "executed"
 
 
-def test_directory_resource_matches_fresh_recomputation_across_missing_toggles(tmp_path: Path) -> None:
+def test_directory_resource_matches_fresh_recomputation_across_missing_toggles(
+    tmp_path: Path,
+) -> None:
     directories = DirectoryResource()
     workspace = tmp_path / "workspace"
 
@@ -809,7 +843,9 @@ def test_file_resource_identity_includes_configuration(tmp_path: Path) -> None:
     assert db.get(read_latin1, str(path)) == "caf\xe9"
 
 
-def test_env_resource_instances_share_stable_behavior(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_resource_instances_share_stable_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     env_a = EnvResource()
     env_b = EnvResource()
     monkeypatch.setenv("PYINC_SAMPLE", "value")
@@ -1205,7 +1241,10 @@ def test_two_queries_reading_same_input_get_independent_copies(mode: str) -> Non
     # Independent objects — no shared aliases.
     assert result_a is not result_b
     assert result_a == result_b
-    assert cast(dict[str, list[int]], result_a)["items"] is not cast(dict[str, list[int]], result_b)["items"]
+    assert (
+        cast(dict[str, list[int]], result_a)["items"]
+        is not cast(dict[str, list[int]], result_b)["items"]
+    )
 
     # Mutating one must not affect the other.
     cast(dict[str, list[int]], result_a)["items"].append(4)
@@ -1642,7 +1681,10 @@ def test_statistics_returns_frozen_snapshot() -> None:
     db = Database()
     stats = db.statistics()
     assert isinstance(stats, DatabaseStatistics)
-    assert all(isinstance(getattr(stats, f.name), int) for f in stats.__dataclass_fields__.values())
+    assert all(
+        isinstance(getattr(stats, f.name), int)
+        for f in stats.__dataclass_fields__.values()
+    )
     with pytest.raises(AttributeError):
         stats.node_count = 99  # type: ignore[misc]
 
@@ -1801,7 +1843,9 @@ def test_statistics_node_counts_match_records(tmp_path: Path) -> None:
     db.get(compute)
 
     stats = db.statistics()
-    assert stats.node_count == stats.input_count + stats.query_count + stats.resource_count
+    assert (
+        stats.node_count == stats.input_count + stats.query_count + stats.resource_count
+    )
     assert stats.input_count >= 1
     assert stats.query_count >= 1
     assert stats.resource_count >= 1
@@ -1885,13 +1929,23 @@ def test_dependency_graph_diamond_structure() -> None:
 
     graph = db.dependency_graph()
 
-    combine_nodes = [n for n in graph if n.kind == "query" and len(n.dependency_labels) == 2
-                     and all(d not in [n2.label for n2 in graph if n2.kind == "input"] for d in n.dependency_labels)]
+    combine_nodes = [
+        n
+        for n in graph
+        if n.kind == "query"
+        and len(n.dependency_labels) == 2
+        and all(
+            d not in [n2.label for n2 in graph if n2.kind == "input"]
+            for d in n.dependency_labels
+        )
+    ]
     assert len(combine_nodes) == 1
     combine_node = combine_nodes[0]
 
     input_label = [n.label for n in graph if n.kind == "input"][0]
-    mid_nodes = [n for n in graph if n.kind == "query" and input_label in n.dependency_labels]
+    mid_nodes = [
+        n for n in graph if n.kind == "query" and input_label in n.dependency_labels
+    ]
     assert len(mid_nodes) == 2
     mid_labels = {n.label for n in mid_nodes}
     assert set(combine_node.dependency_labels) == mid_labels
@@ -2229,7 +2283,9 @@ def test_untracked_read_still_enforced_per_thread(tmp_path: Path) -> None:
     assert outside_reads_ok == [True]
 
 
-def test_module_capture_invalidates_on_source_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_module_capture_invalidates_on_source_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import importlib
     import sys as _sys
 
@@ -2263,7 +2319,9 @@ def test_module_capture_invalidates_on_source_change(tmp_path: Path, monkeypatch
         _sys.modules.pop("pyinc_test_f5_source_change", None)
 
 
-def test_module_capture_invalidates_on_version_attr_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_module_capture_invalidates_on_version_attr_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import importlib
     import sys as _sys
 

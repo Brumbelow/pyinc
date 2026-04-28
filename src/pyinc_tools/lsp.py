@@ -125,9 +125,11 @@ def _format_symbol_declaration(symbol: Symbol) -> str:
         return f"class {bare_name}"
     if symbol.kind in ("function", "method") and symbol.signature is not None:
         params = ", ".join(
-            f"{parameter.name}: {parameter.annotation}"
-            if parameter.annotation is not None
-            else parameter.name
+            (
+                f"{parameter.name}: {parameter.annotation}"
+                if parameter.annotation is not None
+                else parameter.name
+            )
             for parameter in symbol.signature.parameters
         )
         return_annotation = symbol.signature.return_annotation
@@ -219,7 +221,9 @@ class LanguageServer:
             return True
         if method == "textDocument/didOpen":
             document = params["textDocument"]
-            self._require_session().set_overlay(_uri_to_path(document["uri"]), document["text"])
+            self._require_session().set_overlay(
+                _uri_to_path(document["uri"]), document["text"]
+            )
             self.publish_workspace_diagnostics()
             return True
         if method == "textDocument/didChange":
@@ -228,7 +232,9 @@ class LanguageServer:
             if changes:
                 latest = changes[-1]
                 if "text" in latest:
-                    self._require_session().set_overlay(_uri_to_path(document["uri"]), latest["text"])
+                    self._require_session().set_overlay(
+                        _uri_to_path(document["uri"]), latest["text"]
+                    )
                     self.publish_workspace_diagnostics()
             return True
         if method == "textDocument/didSave":
@@ -301,7 +307,9 @@ class LanguageServer:
                 interval_s = float(interval_ms) / 1000.0
             else:
                 interval_s = None
-            self._watcher = PollingWorkspaceWatcher(self._session, debounce_ms=debounce_ms)
+            self._watcher = PollingWorkspaceWatcher(
+                self._session, debounce_ms=debounce_ms
+            )
             self._watcher.start(self._on_watcher_change, interval_s=interval_s)
 
         return {
@@ -359,7 +367,9 @@ class LanguageServer:
             symbols.append(
                 {
                     "name": symbol.qualified_name,
-                    "kind": _PYINC_SYMBOL_KIND_TO_LSP.get(symbol.kind, _LSP_SYMBOL_KINDS["variable"]),
+                    "kind": _PYINC_SYMBOL_KIND_TO_LSP.get(
+                        symbol.kind, _LSP_SYMBOL_KINDS["variable"]
+                    ),
                     "range": range_payload,
                     "selectionRange": range_payload,
                 }
@@ -369,7 +379,9 @@ class LanguageServer:
     def _workspace_symbols(self, params: Any) -> list[dict[str, Any]]:
         query = str(params.get("query", "")).lower()
         result = self._require_session().analyze_workspace()
-        module_to_path = {module.module: module.path for module in result.python.modules}
+        module_to_path = {
+            module.module: module.path for module in result.python.modules
+        }
         matches: list[dict[str, Any]] = []
         for entry in result.symbols.entries:
             if query and query not in entry.qualified_name.lower():
@@ -381,7 +393,9 @@ class LanguageServer:
             matches.append(
                 {
                     "name": entry.qualified_name,
-                    "kind": _PYINC_SYMBOL_KIND_TO_LSP.get(entry.kind, _LSP_SYMBOL_KINDS["variable"]),
+                    "kind": _PYINC_SYMBOL_KIND_TO_LSP.get(
+                        entry.kind, _LSP_SYMBOL_KINDS["variable"]
+                    ),
                     "location": {
                         "uri": _path_to_uri(path),
                         "range": {
@@ -412,7 +426,9 @@ class LanguageServer:
         symbol = _find_symbol_by_identifier(analysis.symbols.symbols, identifier)
         if symbol is None:
             return None
-        return {"contents": {"kind": "markdown", "value": _format_hover_markdown(symbol)}}
+        return {
+            "contents": {"kind": "markdown", "value": _format_hover_markdown(symbol)}
+        }
 
     def _definition(self, params: Any) -> list[dict[str, Any]]:
         session = self._require_session()
@@ -474,7 +490,10 @@ class LanguageServer:
                     "uri": _path_to_uri(reference.path),
                     "range": {
                         "start": {"line": ref_line, "character": reference.col_offset},
-                        "end": {"line": ref_line, "character": reference.end_col_offset},
+                        "end": {
+                            "line": ref_line,
+                            "character": reference.end_col_offset,
+                        },
                     },
                 }
             )
@@ -497,7 +516,9 @@ class LanguageServer:
             return str(Path(self._default_root).resolve(strict=False))
         return str(Path.cwd().resolve(strict=False))
 
-    def _analysis_diagnostic_to_lsp(self, diagnostic: AnalysisDiagnostic) -> dict[str, Any]:
+    def _analysis_diagnostic_to_lsp(
+        self, diagnostic: AnalysisDiagnostic
+    ) -> dict[str, Any]:
         line = max((diagnostic.lineno or 1) - 1, 0)
         character = max(diagnostic.col_offset or 0, 0)
         return {
