@@ -927,7 +927,7 @@ def test_find_references_counts_forward_ref_strings(tmp_path: Path) -> None:
     result = find_references(db, root, root / "a.py", "Foo")
 
     non_decl = [r for r in result.references if not r.is_declaration]
-    assert [(r.path.name, r.lineno) for r in non_decl] == [("b.py", 3), ("b.py", 3)]
+    assert [(Path(r.path).name, r.lineno) for r in non_decl] == [("b.py", 3), ("b.py", 3)]
 
 
 def test_find_references_on_stdlib_target_returns_empty_with_target_carried(
