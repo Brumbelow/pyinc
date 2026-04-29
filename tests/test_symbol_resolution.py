@@ -913,15 +913,46 @@ def test_find_references_ignores_shadowing_local_known_limitation(
     assert linenos == [5, 6]
 
 
-def test_find_references_ignores_forward_ref_strings(tmp_path: Path) -> None:
-    """Pins v1.2.0 behavior: forward-reference strings like ``'Foo'`` in annotations
-    are not AST-walked into, so they are not counted as references."""
+def test_find_references_includes_forward_ref_strings_in_param_and_return_annotation(
+    tmp_path: Path,
+) -> None:
+    """Forward-reference strings in parameter and return annotations are
+    parsed and walked; the inner names are reported as references with
+    offsets that point inside the quotes."""
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
     b = root / "b.py"
     b.write_text(
-        "from a import Foo\n\n" "def g(a: 'Foo') -> 'Foo':\n" "    return a\n",
+        "from a import Foo\n\ndef g(a: 'Foo') -> 'Foo':\n    return a\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = sorted(
+        (r for r in result.references if not r.is_declaration),
+        key=lambda r: (r.path, r.lineno, r.col_offset),
+    )
+    assert len(non_decl) == 2
+    # `def g(a: 'Foo') -> 'Foo':` — opening quotes at col 9 and 19.
+    param_ref, return_ref = non_decl
+    assert param_ref.lineno == 3
+    assert (param_ref.col_offset, param_ref.end_col_offset) == (10, 13)
+    assert return_ref.lineno == 3
+    assert (return_ref.col_offset, return_ref.end_col_offset) == (20, 23)
+
+
+def test_find_references_includes_forward_ref_strings_in_class_variable_annotation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        "from a import Foo\n\nclass C:\n    x: 'Foo'\n",
         encoding="utf-8",
     )
 
@@ -929,9 +960,246 @@ def test_find_references_ignores_forward_ref_strings(tmp_path: Path) -> None:
     result = find_references(db, root, root / "a.py", "Foo")
 
     non_decl = [r for r in result.references if not r.is_declaration]
-    # Neither ``'Foo'`` string is counted; only the import line would be, but
-    # imports don't produce Name nodes either.
+    assert len(non_decl) == 1
+    ref = non_decl[0]
+    assert ref.lineno == 4
+    # `    x: 'Foo'` — opening quote at col 7, name at cols 8-11.
+    assert (ref.col_offset, ref.end_col_offset) == (8, 11)
+
+
+def test_find_references_includes_forward_ref_strings_in_module_ann_assign(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        "from a import Foo\n\nx: 'Foo'\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert len(non_decl) == 1
+    assert non_decl[0].lineno == 3
+    assert (non_decl[0].col_offset, non_decl[0].end_col_offset) == (4, 7)
+
+
+def test_find_references_includes_forward_ref_strings_in_subscript(
+    tmp_path: Path,
+) -> None:
+    """Strings nested in subscripts like `list['Foo']` and
+    `dict[str, 'Foo']` are reached and walked."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        "from a import Foo\n\n"
+        "def g(a: list['Foo']) -> dict[str, 'Foo']:\n"
+        "    return a\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert len(non_decl) == 2
+    assert all(r.lineno == 3 for r in non_decl)
+
+
+def test_find_references_includes_forward_ref_strings_in_union(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        "from a import Foo\n\ndef g(a: 'Foo | None') -> None:\n    return None\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert len(non_decl) == 1
+    ref = non_decl[0]
+    assert ref.lineno == 3
+    # `def g(a: 'Foo | None') -> None:` — opening quote at col 9, name at 10-13.
+    assert (ref.col_offset, ref.end_col_offset) == (10, 13)
+
+
+def test_name_occurrences_for_file_extracts_attribute_inside_string_annotation(
+    tmp_path: Path,
+) -> None:
+    """Inside `'pkg.Foo'`, the rightmost attribute name is emitted as an
+    occurrence with the correct in-file offsets. (Whether `find_references`
+    counts it depends on the same name-local resolver as the unquoted
+    `pkg.Foo` chain — see
+    `test_find_references_does_not_resolve_attribute_chain_on_module`.)"""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "b.py"
+    path.write_text(
+        "import pkg\n\ndef g(a: 'pkg.Foo') -> None:\n    return None\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    occurrences = name_occurrences_for_file(db, str(path))
+
+    matching = [occ for occ in occurrences if occ[0] == "Foo"]
+    assert len(matching) == 1
+    bare_name, lineno, col_offset, end_col_offset = matching[0]
+    assert bare_name == "Foo"
+    assert lineno == 3
+    # `def g(a: 'pkg.Foo') -> None:` — `Foo` is at cols 14-17.
+    assert (col_offset, end_col_offset) == (14, 17)
+
+
+def test_find_references_includes_forward_ref_strings_double_quoted(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        'from a import Foo\n\ndef g(a: "Foo") -> None:\n    return None\n',
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert len(non_decl) == 1
+    ref = non_decl[0]
+    assert ref.lineno == 3
+    assert (ref.col_offset, ref.end_col_offset) == (10, 13)
+
+
+def test_find_references_skips_malformed_string_annotation(tmp_path: Path) -> None:
+    """A string annotation that doesn't parse as an expression is silently
+    skipped — the call doesn't raise, and no spurious reference is emitted."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        "from a import Foo\n\ndef g(a: 'this is not valid python'): ...\n"
+        "Foo()\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    # Only the unquoted `Foo()` on line 4 is reported; the malformed
+    # annotation contributes nothing (and doesn't crash).
+    assert len(non_decl) == 1
+    assert non_decl[0].lineno == 4
+
+
+def test_find_references_skips_string_annotation_with_escape_sequence(
+    tmp_path: Path,
+) -> None:
+    """A string annotation containing an escape sequence is intentionally
+    skipped — the source span and decoded value lengths differ, so offset
+    reconstruction would be ambiguous. Documented limitation."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        "from a import Foo\n\ndef g(a: 'F\\x6fo') -> None:\n    return None\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
     assert non_decl == []
+
+
+def test_find_references_skips_triple_quoted_string_annotation(
+    tmp_path: Path,
+) -> None:
+    """Triple-quoted (single- or multi-line) string annotations are
+    skipped. Vanishingly rare in real code."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        "from a import Foo\n\ndef g(a: '''Foo''') -> None:\n    return None\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert non_decl == []
+
+
+def test_find_references_skips_implicit_string_concatenation_annotation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        "from a import Foo\n\ndef g(a: 'Fo' 'o') -> None:\n    return None\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    # The implicitly-concatenated literal collapses to `'Foo'` at the AST
+    # level but the source span is longer than the decoded value; we bail.
+    assert non_decl == []
+
+
+def test_find_references_finds_type_checking_imported_name_in_string_annotation(
+    tmp_path: Path,
+) -> None:
+    """TYPE_CHECKING-imported names referenced by string annotations work:
+    the existing TYPE_CHECKING import collection plus the new string scan
+    compose without special wiring."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    b = root / "b.py"
+    b.write_text(
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from a import Foo\n\n"
+        "class C:\n"
+        "    x: 'Foo'\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert len(non_decl) == 1
+    ref = non_decl[0]
+    assert ref.lineno == 6
+    # `    x: 'Foo'` on line 6 — opening quote at col 7, name at 8-11.
+    assert (ref.col_offset, ref.end_col_offset) == (8, 11)
 
 
 def test_find_references_on_stdlib_target_returns_empty_with_target_carried(
