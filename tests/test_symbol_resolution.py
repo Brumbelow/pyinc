@@ -913,9 +913,7 @@ def test_find_references_ignores_shadowing_local_known_limitation(
     assert linenos == [5, 6]
 
 
-def test_find_references_ignores_forward_ref_strings(tmp_path: Path) -> None:
-    """Pins v1.2.0 behavior: forward-reference strings like ``'Foo'`` in annotations
-    are not AST-walked into, so they are not counted as references."""
+def test_find_references_counts_forward_ref_strings(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
@@ -929,9 +927,7 @@ def test_find_references_ignores_forward_ref_strings(tmp_path: Path) -> None:
     result = find_references(db, root, root / "a.py", "Foo")
 
     non_decl = [r for r in result.references if not r.is_declaration]
-    # Neither ``'Foo'`` string is counted; only the import line would be, but
-    # imports don't produce Name nodes either.
-    assert non_decl == []
+    assert [(r.path.name, r.lineno) for r in non_decl] == [("b.py", 3), ("b.py", 3)]
 
 
 def test_find_references_on_stdlib_target_returns_empty_with_target_carried(

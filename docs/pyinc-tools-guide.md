@@ -281,7 +281,6 @@ Consequences:
   - Attribute access to a module-level symbol only imported as a module
     (`import a; a.foo()`) is not counted because the resolver is name-local.
     Use `from a import foo` to opt in.
-  - Forward-reference strings (`'Foo'` in annotations) are not scanned.
   - Function-local shadowing is not modeled: a local `foo = 1` inside a
     function is still reported as a reference to a module-level `foo`.
     `symbol_resolution` is module/class-scope only.

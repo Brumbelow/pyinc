@@ -374,7 +374,7 @@ Scope:
 - `if TYPE_CHECKING:` / `if typing.TYPE_CHECKING:` guard blocks at module top level: imports inside are collected as regular symbols; no impurity marker is set
 - `try: … except ImportError:` / `except ModuleNotFoundError:` / `except (ImportError, ModuleNotFoundError):` guard blocks at module top level: imports inside are collected as regular symbols; no impurity marker is set
 - other conditional top-level bindings (`if sys.version_info >= …`, top-level `For`, `While`, `Try` without recognised handler, `With`) → `impurity_reasons` includes `"conditional top-level binding"` and the binding produces no symbol
-- workspace-wide reference index composed over `name_occurrences_for_file` (full-AST `Name`/`Attribute` walk) and verified through `resolve_symbol_payload`; only workspace-resolved targets are indexed (stdlib / installed / ambiguous return empty with `ResolvedSymbol` carried)
+- workspace-wide reference index composed over `name_occurrences_for_file` (full-AST `Name`/`Attribute` walk plus identifier-like string literals so forward-reference annotations such as `'Foo'` are indexed) and verified through `resolve_symbol_payload`; only workspace-resolved targets are indexed (stdlib / installed / ambiguous return empty with `ResolvedSymbol` carried)
 - entrypoints: `module_symbol_table`, `resolve_symbol`, `workspace_symbol_index`, `find_references`
 - result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`, `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`, `Reference`, `ReferenceQueryResult`
 
@@ -382,7 +382,6 @@ Out of scope for this integration:
 
 - function-local symbols (`find_references` therefore reports a local rebinding like `foo = 1` inside a function as a reference to the module-level `foo` of the same name)
 - attribute-chain reference resolution — `import a; a.foo()` is not counted as a reference to `a.foo` because the resolver is name-local at the call site
-- forward-reference strings in annotations (e.g. `'Foo'` in `def g(a: 'Foo')`)
 - decorator-induced rebinding (`@functools.cache`, `@property`, `@classmethod`, etc.)
 - MRO / class-member override resolution
 - following into installed third-party source files (v2 concern)

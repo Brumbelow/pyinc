@@ -1032,7 +1032,9 @@ def workspace_symbol_index_payload(
 # ---------------------------------------------------------------------------
 
 
-def _collect_name_occurrences(tree: ast.Module) -> tuple[NameOccurrencePayload, ...]:
+def _collect_name_occurrences(
+    tree: ast.Module, source: str
+) -> tuple[NameOccurrencePayload, ...]:
     occurrences: list[NameOccurrencePayload] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
@@ -1050,6 +1052,25 @@ def _collect_name_occurrences(tree: ast.Module) -> tuple[NameOccurrencePayload, 
             if attr_col < 0:
                 continue
             occurrences.append((node.attr, end_lineno, attr_col, end_col))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if not node.value.isidentifier():
+                continue
+            end_col = node.end_col_offset
+            if end_col is None:
+                continue
+            col_offset = node.col_offset
+            literal = ast.get_source_segment(source, node)
+            if (
+                literal is not None
+                and len(literal) >= 2
+                and literal[0] in {"'", '"'}
+                and literal[-1] == literal[0]
+            ):
+                col_offset += 1
+                end_col -= 1
+            if end_col <= col_offset:
+                continue
+            occurrences.append((node.value, node.lineno, col_offset, end_col))
     occurrences.sort(key=lambda item: (item[1], item[2]))
     return tuple(occurrences)
 
@@ -1062,7 +1083,7 @@ def name_occurrences_for_file(
     tree = _try_parse(source)
     if tree is None:
         return tuple()
-    return _collect_name_occurrences(tree)
+    return _collect_name_occurrences(tree, source)
 
 
 # ---------------------------------------------------------------------------
