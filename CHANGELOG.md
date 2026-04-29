@@ -8,6 +8,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Items in this section are queued for the next v2.x release.
 
+### Added
+
+- **Forward-reference string annotations are now scanned for references.**
+  `symbol_resolution.find_references` (and the LSP `textDocument/references`
+  it backs) now detects names inside forward-reference strings such as
+  `def g(a: 'Foo')`, `x: 'list[Foo]'`, `x: 'pkg.Foo'`, and `'Foo | None'`.
+  Internally, `name_occurrences_for_file` performs a second pass over the
+  annotation slots `AnnAssign.annotation`, `arg.annotation`, and
+  `FunctionDef`/`AsyncFunctionDef.returns`, re-parses string-valued
+  `ast.Constant` nodes via `ast.parse(value, mode="eval")`, and emits the
+  inner `Name`/`Attribute` references with offsets translated back to file
+  coordinates. Each new occurrence flows through the same
+  `resolve_symbol_payload` verification used for bare `Name`/`Attribute`
+  references, so workspace-only filtering, `MAX_FOLLOW_DEPTH`, and
+  `if TYPE_CHECKING:` / `try: except ImportError:` guard handling all
+  carry through unchanged. String annotations that span multiple lines,
+  are triple-quoted, contain escape sequences, or use implicit string
+  concatenation are skipped (offset reconstruction would be ambiguous);
+  malformed annotation strings are silently ignored. No payload shape or
+  public surface change.
+
 ## [2.0.0]
 
 This is the v2.0.0 release (still in development; not yet tagged). v1.2.1 was

@@ -243,7 +243,14 @@ Consequences:
   rightmost-attribute `Name` / `Attribute` occurrences are verified through the
   same resolver as goto-definition. Per-occurrence character ranges are
   returned, so editors can highlight each match precisely. Honors
-  `context.includeDeclaration`.
+  `context.includeDeclaration`. Forward-reference string annotations (e.g.
+  `def g(a: 'Foo')`, `x: 'list[Foo]'`, `x: 'pkg.Foo'`, `'Foo | None'`) are
+  also scanned: the walker re-parses the string with `ast.parse(..., mode="eval")`
+  and emits `Name` / `Attribute` occurrences from the inner expression with
+  offsets translated back to the file. Strings spanning multiple lines,
+  triple-quoted strings, strings containing escape sequences, and
+  implicitly-concatenated string literals are skipped to keep offset
+  reconstruction unambiguous.
 - Threaded live polling via `PollingWorkspaceWatcher.start(...)`. LSP server
   starts one by default; opt out with `initializationOptions.pyinc.watcher.enabled=false`.
 - `if TYPE_CHECKING:` and `if typing.TYPE_CHECKING:` import blocks — the symbol
@@ -277,14 +284,17 @@ Consequences:
   `resolution == "ambiguous"` and the LSP returns `[]`.
 - Cyclic re-exports. Detected and returned as
   `resolution == "ambiguous"`; the LSP returns `[]`.
-- `find_references` limitations (v1.2.0):
+- `find_references` limitations:
   - Attribute access to a module-level symbol only imported as a module
     (`import a; a.foo()`) is not counted because the resolver is name-local.
     Use `from a import foo` to opt in.
-  - Forward-reference strings (`'Foo'` in annotations) are not scanned.
   - Function-local shadowing is not modeled: a local `foo = 1` inside a
     function is still reported as a reference to a module-level `foo`.
     `symbol_resolution` is module/class-scope only.
+  - Forward-reference string annotations are scanned, but strings that span
+    multiple lines, are triple-quoted, contain escape sequences, or use
+    implicit string concatenation are skipped (offset reconstruction would
+    be ambiguous in those cases).
 
 ## Troubleshooting
 

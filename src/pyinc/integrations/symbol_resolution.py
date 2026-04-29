@@ -1032,7 +1032,104 @@ def workspace_symbol_index_payload(
 # ---------------------------------------------------------------------------
 
 
-def _collect_name_occurrences(tree: ast.Module) -> tuple[NameOccurrencePayload, ...]:
+def _collect_names_in_string_annotation(
+    constant: ast.Constant,
+    source_lines: list[str],
+    occurrences: list[NameOccurrencePayload],
+) -> None:
+    """Parse a string-valued annotation and emit Name/Attribute occurrences.
+
+    Bails on multi-line, triple-quoted, escape-bearing, or implicitly
+    concatenated string literals — offset reconstruction would be ambiguous.
+    Silent on parse errors (malformed annotation strings).
+    """
+    if not isinstance(constant.value, str):
+        return
+    if constant.lineno != constant.end_lineno:
+        return
+    if constant.end_col_offset is None:
+        return
+    line_index = constant.lineno - 1
+    if line_index < 0 or line_index >= len(source_lines):
+        return
+    line = source_lines[line_index]
+    if constant.end_col_offset > len(line):
+        return
+    literal = line[constant.col_offset : constant.end_col_offset]
+    if literal.startswith(("'''", '"""')):
+        return
+    # prefix_len is 0 if the literal opens with a quote, else 1 for a single
+    # leading letter prefix (r, R, u, U). Bytes literals never appear as str
+    # Constants, and f-strings parse as JoinedStr, not Constant — but be
+    # defensive about unexpected prefixes.
+    if literal[:1] in ("'", '"'):
+        prefix_len = 0
+    elif len(literal) >= 2 and literal[1:2] in ("'", '"'):
+        prefix_len = 1
+    else:
+        return
+    quote_len = 1
+    span = constant.end_col_offset - constant.col_offset
+    if span - prefix_len - 2 * quote_len != len(constant.value):
+        # Escape sequences, line continuations, or implicit concatenation.
+        return
+    try:
+        parsed = ast.parse(constant.value, mode="eval")
+    except (SyntaxError, ValueError):
+        return
+    base_col = constant.col_offset + prefix_len + quote_len
+    for inner in ast.walk(parsed.body):
+        if isinstance(inner, ast.Name):
+            inner_end = inner.end_col_offset
+            if inner_end is None:
+                inner_end = inner.col_offset + len(inner.id)
+            if inner.lineno != 1 or (inner.end_lineno or 1) != 1:
+                continue
+            occurrences.append(
+                (
+                    inner.id,
+                    constant.lineno,
+                    base_col + inner.col_offset,
+                    base_col + inner_end,
+                )
+            )
+            continue
+        if isinstance(inner, ast.Attribute):
+            inner_end = inner.end_col_offset
+            inner_end_lineno = inner.end_lineno
+            if inner_end is None or inner_end_lineno is None:
+                continue
+            if inner_end_lineno != 1:
+                continue
+            attr_col = inner_end - len(inner.attr)
+            if attr_col < 0:
+                continue
+            occurrences.append(
+                (
+                    inner.attr,
+                    constant.lineno,
+                    base_col + attr_col,
+                    base_col + inner_end,
+                )
+            )
+
+
+def _annotation_string_constants(node: ast.AST) -> list[ast.Constant]:
+    """Collect every string-valued ast.Constant inside an annotation expression.
+
+    Captures `'Foo'` directly, plus strings nested in `list['Foo']`,
+    `Annotated['Foo', meta]`, `dict[str, 'Foo']`, etc.
+    """
+    found: list[ast.Constant] = []
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+            found.append(inner)
+    return found
+
+
+def _collect_name_occurrences(
+    tree: ast.Module, source: str
+) -> tuple[NameOccurrencePayload, ...]:
     occurrences: list[NameOccurrencePayload] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
@@ -1050,8 +1147,30 @@ def _collect_name_occurrences(tree: ast.Module) -> tuple[NameOccurrencePayload, 
             if attr_col < 0:
                 continue
             occurrences.append((node.attr, end_lineno, attr_col, end_col))
-    occurrences.sort(key=lambda item: (item[1], item[2]))
-    return tuple(occurrences)
+
+    source_lines = source.splitlines()
+    for node in ast.walk(tree):
+        annotation: ast.expr | None = None
+        if isinstance(node, (ast.AnnAssign, ast.arg)):
+            annotation = node.annotation
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotation = node.returns
+        if annotation is None:
+            continue
+        for constant in _annotation_string_constants(annotation):
+            _collect_names_in_string_annotation(
+                constant, source_lines, occurrences
+            )
+
+    seen: set[NameOccurrencePayload] = set()
+    deduped: list[NameOccurrencePayload] = []
+    for occ in occurrences:
+        if occ in seen:
+            continue
+        seen.add(occ)
+        deduped.append(occ)
+    deduped.sort(key=lambda item: (item[1], item[2]))
+    return tuple(deduped)
 
 
 @query
@@ -1062,7 +1181,7 @@ def name_occurrences_for_file(
     tree = _try_parse(source)
     if tree is None:
         return tuple()
-    return _collect_name_occurrences(tree)
+    return _collect_name_occurrences(tree, source)
 
 
 # ---------------------------------------------------------------------------
