@@ -265,11 +265,24 @@ Consequences:
   statements. Symbols bound inside these guards appear in hover and goto-definition
   exactly as unconditional imports do; no "conditional top-level binding" impurity
   marker is recorded for files whose only conditional blocks are import-error guards.
+- Rename, via `textDocument/prepareRename` and `textDocument/rename` (advertised
+  as `renameProvider: {prepareProvider: true}`). `prepareRename` returns the
+  identifier range and a placeholder when the cursor is on a workspace symbol;
+  otherwise returns `null`. `rename` returns a `WorkspaceEdit` whose edits cover
+  every reference returned by `find_references`, the `def`/`class`/`async def`
+  declaration site (the synthetic placeholder is repaired by locating the
+  identifier offset in the source line), and every
+  `from <defining_module> import <bare_old> [as <alias>]` line in the workspace
+  (only the source-name portion is rewritten; any `as <alias>` clause is left
+  untouched). Invalid identifiers and Python keywords yield a JSON-RPC
+  `RequestFailed` error; renaming via an `import ... as` alias is refused with
+  the same error code (the user is asked to rename the canonical name instead).
+  Same-name and non-workspace targets return `null`.
 
 **Not supported:**
 
 - `textDocument/completion` (needs statement-context analysis).
-- `textDocument/rename`, `textDocument/codeAction`, `textDocument/formatting`.
+- `textDocument/codeAction`, `textDocument/formatting`.
 - Hover or goto-def on stdlib or installed-package symbols — resolution
   correctly classifies them as `stdlib` / `installed`, but the LSP does not
   synthesize a `Location` for out-of-workspace targets.
@@ -295,6 +308,21 @@ Consequences:
     multiple lines, are triple-quoted, contain escape sequences, or use
     implicit string concatenation are skipped (offset reconstruction would
     be ambiguous in those cases).
+- `rename` limitations (in addition to the `find_references` limitations
+  above, since rename is built on top of it):
+  - Renaming via an `import ... as` alias is refused — e.g. clicking on
+    `aliased` in `from a import foo as aliased` returns a `RequestFailed`
+    error with the message *"Cannot rename ... via an `import ... as`
+    alias; rename the original symbol instead."* The canonical-name rename
+    of `foo` correctly preserves any `as <alias>` clauses across the
+    workspace.
+  - Relative imports (`from . import foo`, `from ..pkg import bar`) are not
+    rewritten by rename. The resolver still resolves the symbol, but the
+    import-edit walker only handles absolute `from <defining_module>`
+    forms.
+  - `import a` plus `a.foo()` attribute access is not rewritten (consistent
+    with the resolver-is-name-local rule above). Use `from a import foo`
+    if you need rename to update the call site.
 
 ## Troubleshooting
 
