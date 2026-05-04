@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import contextlib
+import keyword
 import os
 import re
 import shutil
@@ -85,6 +87,32 @@ class WorkspaceAnalysisResult:
     dependency_check: DependencyCheckAnalysis
     files: tuple[FileAnalysisResult, ...]
     diagnostics: tuple[AnalysisDiagnostic, ...]
+
+
+RenameStatus = Literal[
+    "ok",
+    "non_workspace_target",
+    "invalid_identifier",
+    "keyword_identifier",
+    "same_name",
+    "alias_rename_unsupported",
+]
+
+
+@dataclass(frozen=True)
+class RenameEdit:
+    path: str
+    lineno: int
+    col_offset: int
+    end_col_offset: int
+    new_text: str
+
+
+@dataclass(frozen=True)
+class RenameResult:
+    target: ResolvedSymbol
+    edits: tuple[RenameEdit, ...]
+    status: RenameStatus
 
 
 @dataclass(frozen=True)
@@ -309,6 +337,186 @@ class WorkspaceSession:
             return ReferenceQueryResult(
                 target=remapped_target, references=remapped_refs
             )
+
+    def rename_symbol(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+        new_name: str,
+    ) -> RenameResult:
+        bare_old = qualified_name.rsplit(".", 1)[-1]
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            target = self._remap_resolved_symbol(
+                resolve_symbol(
+                    self.db, self.mirror_root, str(mirror_path), qualified_name
+                )
+            )
+            if not new_name.isidentifier():
+                return RenameResult(
+                    target=target, edits=(), status="invalid_identifier"
+                )
+            if keyword.iskeyword(new_name):
+                return RenameResult(
+                    target=target, edits=(), status="keyword_identifier"
+                )
+            if new_name == bare_old:
+                return RenameResult(target=target, edits=(), status="same_name")
+            if target.resolution != "workspace":
+                return RenameResult(
+                    target=target, edits=(), status="non_workspace_target"
+                )
+            defining_bare_name = self._defining_bare_name(target)
+            if defining_bare_name is not None and defining_bare_name != bare_old:
+                return RenameResult(
+                    target=target, edits=(), status="alias_rename_unsupported"
+                )
+            references = find_references(
+                self.db,
+                self.mirror_root,
+                str(mirror_path),
+                qualified_name,
+                include_declaration=True,
+            )
+            edits: list[RenameEdit] = []
+            for ref in references.references:
+                ref_real_path = self._remap_path(ref.path) or ref.path
+                col, end_col = ref.col_offset, ref.end_col_offset
+                if ref.is_declaration and col == 0 and end_col == 1:
+                    located = self._locate_def_class_name_offsets(
+                        ref_real_path, ref.lineno, bare_old
+                    )
+                    if located is None:
+                        continue
+                    col, end_col = located
+                edits.append(
+                    RenameEdit(
+                        path=ref_real_path,
+                        lineno=ref.lineno,
+                        col_offset=col,
+                        end_col_offset=end_col,
+                        new_text=new_name,
+                    )
+                )
+            if target.defining_module is not None:
+                edits.extend(
+                    self._collect_from_import_edits(
+                        defining_module=target.defining_module,
+                        bare_old=bare_old,
+                        new_name=new_name,
+                    )
+                )
+            seen: set[tuple[str, int, int, int]] = set()
+            unique_edits: list[RenameEdit] = []
+            for edit in edits:
+                key = (edit.path, edit.lineno, edit.col_offset, edit.end_col_offset)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_edits.append(edit)
+            unique_edits.sort(
+                key=lambda e: (e.path, e.lineno, e.col_offset)
+            )
+            return RenameResult(
+                target=target, edits=tuple(unique_edits), status="ok"
+            )
+
+    def _defining_bare_name(self, target: ResolvedSymbol) -> str | None:
+        """Return the bare name of `target` as bound in its defining module.
+
+        Returns None if the symbol can't be located in the defining module's
+        symbol table (e.g. resolution data is missing); callers should treat
+        None as "best-effort proceed" rather than as a mismatch.
+        """
+        if target.defining_path is None or target.defining_lineno is None:
+            return None
+        defining_mirror = self._mirror_path_for_real(target.defining_path)
+        if not defining_mirror.exists() or defining_mirror.suffix != ".py":
+            return None
+        table = module_symbol_table(
+            self.db, self.mirror_root, str(defining_mirror)
+        )
+        for symbol in table.symbols:
+            if symbol.lineno != target.defining_lineno:
+                continue
+            if "." in symbol.qualified_name:
+                continue
+            return symbol.qualified_name
+        return None
+
+    def _locate_def_class_name_offsets(
+        self, real_path: str, lineno: int, bare_old: str
+    ) -> tuple[int, int] | None:
+        source = self.source_text(real_path)
+        if source is None:
+            return None
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return None
+        for node in ast.walk(tree):
+            if (
+                isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                )
+                and node.lineno == lineno
+                and node.name == bare_old
+            ):
+                lines = source.splitlines()
+                line_idx = lineno - 1
+                if not (0 <= line_idx < len(lines)):
+                    return None
+                line = lines[line_idx]
+                pattern = re.compile(rf"\b{re.escape(bare_old)}\b")
+                match = pattern.search(line, node.col_offset)
+                if match is not None:
+                    return match.start(), match.end()
+        return None
+
+    def _collect_from_import_edits(
+        self,
+        *,
+        defining_module: str,
+        bare_old: str,
+        new_name: str,
+    ) -> list[RenameEdit]:
+        workspace = self._remap_workspace_analysis(
+            workspace_analysis(self.db, self.mirror_root)
+        )
+        edits: list[RenameEdit] = []
+        for module in workspace.modules:
+            real_path = module.path
+            source = self.source_text(real_path)
+            if source is None:
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                if node.level != 0 or node.module != defining_module:
+                    continue
+                for alias in node.names:
+                    if alias.name != bare_old:
+                        continue
+                    if alias.lineno is None or alias.col_offset is None:
+                        continue
+                    edits.append(
+                        RenameEdit(
+                            path=real_path,
+                            lineno=alias.lineno,
+                            col_offset=alias.col_offset,
+                            end_col_offset=alias.col_offset + len(bare_old),
+                            new_text=new_name,
+                        )
+                    )
+        return edits
 
     def source_text(self, path: str | os.PathLike[str]) -> str | None:
         real_path = self._normalize_real_path(path)

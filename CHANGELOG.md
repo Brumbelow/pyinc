@@ -10,6 +10,34 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/rename` (and `textDocument/prepareRename`) in `pyinc-tools`
+  LSP.** The server now advertises
+  `renameProvider: {prepareProvider: true}`. `prepareRename` returns the range
+  of the identifier under the cursor and a placeholder when the symbol resolves
+  to a workspace target (otherwise `null`). `rename` returns a `WorkspaceEdit`
+  with `changes` keyed by document URI. Edits cover (a) every `Name` /
+  `Attribute` occurrence already produced by
+  `symbol_resolution.find_references`; (b) the `def`/`class`/`async def`
+  declaration site (the `find_references` synthetic placeholder is repaired by
+  locating the actual identifier offset in the source line); and (c) every
+  `from <defining_module> import <bare_old> [as <alias>]` line in the
+  workspace, with only the source-name part rewritten so any `as <alias>`
+  clause is preserved. Invalid identifiers (`"1bad"`, `""`) and Python
+  keywords (`"class"`, `"return"`) yield a JSON-RPC `RequestFailed` (-32803)
+  error with a human-readable message; renaming a symbol via an
+  `import ... as` alias (e.g. clicking on `aliased` in
+  `from a import foo as aliased`) is refused with a `RequestFailed` error
+  directing the user to rename the canonical name instead. Same-name and
+  non-workspace targets return `null`. The consumer-layer entrypoint
+  `WorkspaceSession.rename_symbol(path, qualified_name, new_name)` returns a
+  structured `RenameResult(target, edits, status)` carrying the target's
+  `ResolvedSymbol`, a tuple of `RenameEdit(path, lineno, col_offset,
+  end_col_offset, new_text)`, and one of the statuses `"ok"`,
+  `"non_workspace_target"`, `"invalid_identifier"`, `"keyword_identifier"`,
+  `"same_name"`, or `"alias_rename_unsupported"`. New public names re-exported
+  from `pyinc_tools`: `RenameEdit`, `RenameResult`, `RenameStatus`. Lives
+  entirely on top of the stable `pyinc.integrations` surface — no kernel
+  contract change.
 - **Forward-reference string annotations are now scanned for references.**
   `symbol_resolution.find_references` (and the LSP `textDocument/references`
   it backs) now detects names inside forward-reference strings such as

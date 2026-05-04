@@ -51,6 +51,15 @@ _PYINC_SEVERITY_TO_LSP = {
 _ID_START_RE = re.compile(r"[A-Za-z_]")
 _ID_CONT_RE = re.compile(r"[A-Za-z0-9_]")
 
+_LSP_REQUEST_FAILED = -32803
+
+
+class _RequestFailed(Exception):
+    """Raised by request handlers to surface a user-facing rejection.
+
+    Mapped to the LSP `RequestFailed` (-32803) JSON-RPC error code.
+    """
+
 
 def _path_to_uri(path: str) -> str:
     return Path(path).resolve(strict=False).as_uri()
@@ -79,7 +88,9 @@ def _diagnostic_signature(diagnostic: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _identifier_at_position(source: str, line: int, character: int) -> str | None:
+def _identifier_span_at_position(
+    source: str, line: int, character: int
+) -> tuple[str, int, int] | None:
     lines = source.splitlines()
     if not (0 <= line < len(lines)):
         return None
@@ -94,7 +105,12 @@ def _identifier_at_position(source: str, line: int, character: int) -> str | Non
         end += 1
     if start == end or not _ID_START_RE.match(text[start]):
         return None
-    return text[start:end]
+    return text[start:end], start, end
+
+
+def _identifier_at_position(source: str, line: int, character: int) -> str | None:
+    span = _identifier_span_at_position(source, line, character)
+    return span[0] if span is not None else None
 
 
 def _find_symbol_by_identifier(
@@ -179,6 +195,17 @@ class LanguageServer:
             request_id = message["id"]
             try:
                 result = self._handle_request(method, params)
+            except _RequestFailed as exc:
+                self._send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": _LSP_REQUEST_FAILED,
+                            "message": str(exc),
+                        },
+                    }
+                )
             except Exception:  # pragma: no cover - defensive JSON-RPC boundary
                 self._send(
                     {
@@ -210,6 +237,10 @@ class LanguageServer:
             return self._definition(params)
         if method == "textDocument/references":
             return self._references(params)
+        if method == "textDocument/prepareRename":
+            return self._prepare_rename(params)
+        if method == "textDocument/rename":
+            return self._rename(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -324,6 +355,7 @@ class LanguageServer:
                 "hoverProvider": True,
                 "definitionProvider": True,
                 "referencesProvider": True,
+                "renameProvider": {"prepareProvider": True},
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
         }
@@ -498,6 +530,89 @@ class LanguageServer:
                 }
             )
         return locations
+
+    def _prepare_rename(self, params: Any) -> dict[str, Any] | None:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        source = session.source_text(real_path)
+        if source is None:
+            return None
+        span = _identifier_span_at_position(source, line, character)
+        if span is None:
+            return None
+        identifier, start_col, end_col = span
+        try:
+            resolved = session.resolve_symbol_reference(real_path, identifier)
+        except FileNotFoundError:
+            return None
+        if resolved.resolution != "workspace":
+            return None
+        return {
+            "range": {
+                "start": {"line": line, "character": start_col},
+                "end": {"line": line, "character": end_col},
+            },
+            "placeholder": identifier,
+        }
+
+    def _rename(self, params: Any) -> dict[str, Any] | None:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        new_name = str(params.get("newName", ""))
+
+        source = session.source_text(real_path)
+        if source is None:
+            return None
+        identifier = _identifier_at_position(source, line, character)
+        if identifier is None:
+            return None
+        try:
+            result = session.rename_symbol(real_path, identifier, new_name)
+        except FileNotFoundError:
+            return None
+
+        if result.status == "invalid_identifier":
+            raise _RequestFailed(
+                f"{new_name!r} is not a valid Python identifier."
+            )
+        if result.status == "keyword_identifier":
+            raise _RequestFailed(f"{new_name!r} is a Python keyword.")
+        if result.status == "alias_rename_unsupported":
+            raise _RequestFailed(
+                f"Cannot rename {identifier!r} via an `import ... as` alias; "
+                f"rename the original symbol instead."
+            )
+        if result.status == "same_name":
+            return None
+        if result.status != "ok":
+            return None
+
+        changes: dict[str, list[dict[str, Any]]] = {}
+        for edit in result.edits:
+            uri = _path_to_uri(edit.path)
+            edit_line = max(edit.lineno - 1, 0)
+            changes.setdefault(uri, []).append(
+                {
+                    "range": {
+                        "start": {
+                            "line": edit_line,
+                            "character": edit.col_offset,
+                        },
+                        "end": {
+                            "line": edit_line,
+                            "character": edit.end_col_offset,
+                        },
+                    },
+                    "newText": edit.new_text,
+                }
+            )
+        return {"changes": changes}
 
     def _workspace_root_from_params(self, params: Any) -> str:
         if isinstance(params, dict):

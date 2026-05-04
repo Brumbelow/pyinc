@@ -7,8 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from pyinc_tools.lsp import LanguageServer
-from pyinc_tools.session import PollingWorkspaceWatcher, WorkspaceSession
+from pyinc_tools.lsp import LanguageServer, _RequestFailed
+from pyinc_tools.session import (
+    PollingWorkspaceWatcher,
+    RenameEdit,
+    WorkspaceSession,
+)
 
 _LSP_SYMBOL_KIND_FUNCTION = 12
 _LSP_SYMBOL_KIND_METHOD = 6
@@ -1102,6 +1106,425 @@ def test_language_server_watcher_opt_out(tmp_path: Path) -> None:
             },
         )
         assert server._watcher is None
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def _apply_rename_edits(edits: tuple[RenameEdit, ...]) -> None:
+    """Apply RenameEdits to disk, right-to-left within each file."""
+    by_path: dict[str, list[RenameEdit]] = {}
+    for edit in edits:
+        by_path.setdefault(edit.path, []).append(edit)
+    for path, file_edits in by_path.items():
+        text = Path(path).read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        ordered = sorted(file_edits, key=lambda e: (-e.lineno, -e.col_offset))
+        for edit in ordered:
+            line = lines[edit.lineno - 1]
+            newline = "\n" if line.endswith("\n") else ""
+            content = line[:-1] if newline else line
+            patched = (
+                content[: edit.col_offset]
+                + edit.new_text
+                + content[edit.end_col_offset :]
+            )
+            lines[edit.lineno - 1] = patched + newline
+        Path(path).write_text("".join(lines), encoding="utf-8")
+
+
+def test_rename_symbol_function_updates_def_call_and_import_sites(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "b.py", "from a import foo\n\nfoo()\nfoo()\n")
+    _write(root / "c.py", "from a import foo as aliased\n\naliased()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(root / "b.py", "foo", "bar")
+        assert result.status == "ok"
+        edits_by_file: dict[str, list[tuple[int, int, int, str]]] = {}
+        for edit in result.edits:
+            edits_by_file.setdefault(Path(edit.path).name, []).append(
+                (edit.lineno, edit.col_offset, edit.end_col_offset, edit.new_text)
+            )
+        assert edits_by_file["a.py"] == [(1, 4, 7, "bar")]
+        assert edits_by_file["b.py"] == [
+            (1, 14, 17, "bar"),
+            (3, 0, 3, "bar"),
+            (4, 0, 3, "bar"),
+        ]
+        # The `as aliased` clause is preserved; only the source name `foo`
+        # in the import is rewritten.
+        assert edits_by_file["c.py"] == [(1, 14, 17, "bar")]
+        _apply_rename_edits(result.edits)
+
+    assert (root / "a.py").read_text() == "def bar() -> int:\n    return 1\n"
+    assert (root / "b.py").read_text() == "from a import bar\n\nbar()\nbar()\n"
+    assert (
+        root / "c.py"
+    ).read_text() == "from a import bar as aliased\n\naliased()\n"
+
+
+def test_rename_symbol_class_locates_def_offset_in_decorated_line(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "x.py", "class Widget:\n    pass\n")
+    _write(root / "y.py", "from x import Widget\n\nWidget()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(root / "x.py", "Widget", "Gadget")
+        assert result.status == "ok"
+        per_file = sorted(
+            (Path(e.path).name, e.lineno, e.col_offset, e.end_col_offset)
+            for e in result.edits
+        )
+        assert per_file == [
+            ("x.py", 1, 6, 12),
+            ("y.py", 1, 14, 20),
+            ("y.py", 3, 0, 6),
+        ]
+        _apply_rename_edits(result.edits)
+
+    assert (root / "x.py").read_text() == "class Gadget:\n    pass\n"
+    assert (
+        root / "y.py"
+    ).read_text() == "from x import Gadget\n\nGadget()\n"
+
+
+def test_rename_symbol_rejects_invalid_identifier(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(root / "a.py", "foo", "1bad")
+        assert result.status == "invalid_identifier"
+        assert result.edits == ()
+
+
+def test_rename_symbol_rejects_python_keyword(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(root / "a.py", "foo", "class")
+        assert result.status == "keyword_identifier"
+        assert result.edits == ()
+
+
+def test_rename_symbol_same_name_is_noop(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(root / "a.py", "foo", "foo")
+        assert result.status == "same_name"
+        assert result.edits == ()
+
+
+def test_rename_symbol_refuses_non_workspace_target(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "consumer.py",
+        "from json import JSONDecoder\n\nJSONDecoder()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(
+            root / "consumer.py", "JSONDecoder", "MyDecoder"
+        )
+        assert result.status == "non_workspace_target"
+        assert result.edits == ()
+
+
+def test_rename_symbol_refuses_alias_rename(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "c.py", "from a import foo as aliased\n\naliased()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(root / "c.py", "aliased", "quux")
+        assert result.status == "alias_rename_unsupported"
+        assert result.edits == ()
+
+
+def test_rename_symbol_with_overlay_uses_overlay_text(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "b.py", "from a import foo\n\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        # An overlay adds another call site on b.py that isn't on disk yet.
+        session.set_overlay(
+            root / "b.py", "from a import foo\n\nfoo()\nfoo()\n"
+        )
+        result = session.rename_symbol(root / "b.py", "foo", "bar")
+        assert result.status == "ok"
+        b_edits = sorted(
+            edit.lineno
+            for edit in result.edits
+            if Path(edit.path).name == "b.py"
+        )
+        assert b_edits == [1, 3, 4]
+
+
+def test_language_server_advertises_rename_provider(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        assert init["capabilities"]["renameProvider"] == {"prepareProvider": True}
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_prepare_rename_returns_range_for_workspace_symbol(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n\nhelper()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        prepared = server._handle_request(
+            "textDocument/prepareRename",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+        assert prepared == {
+            "range": {
+                "start": {"line": 0, "character": 4},
+                "end": {"line": 0, "character": 10},
+            },
+            "placeholder": "helper",
+        }
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_prepare_rename_returns_null_for_stdlib_symbol(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "consumer.py"
+    _write(target, "from json import JSONDecoder\n\nJSONDecoder()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        prepared = server._handle_request(
+            "textDocument/prepareRename",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 2, "character": 0},
+            },
+        )
+        assert prepared is None
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_rename_returns_workspace_edit(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "a.py"
+    consumer = root / "b.py"
+    _write(provider, "def foo() -> int:\n    return 1\n")
+    _write(consumer, "from a import foo\n\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        edit = server._handle_request(
+            "textDocument/rename",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+                "newName": "bar",
+            },
+        )
+        assert edit is not None
+        changes = edit["changes"]
+        assert set(changes.keys()) == {provider.as_uri(), consumer.as_uri()}
+        provider_changes = changes[provider.as_uri()]
+        assert provider_changes == [
+            {
+                "range": {
+                    "start": {"line": 0, "character": 4},
+                    "end": {"line": 0, "character": 7},
+                },
+                "newText": "bar",
+            }
+        ]
+        consumer_changes = sorted(
+            changes[consumer.as_uri()],
+            key=lambda c: (
+                c["range"]["start"]["line"],
+                c["range"]["start"]["character"],
+            ),
+        )
+        assert consumer_changes == [
+            {
+                "range": {
+                    "start": {"line": 0, "character": 14},
+                    "end": {"line": 0, "character": 17},
+                },
+                "newText": "bar",
+            },
+            {
+                "range": {
+                    "start": {"line": 2, "character": 0},
+                    "end": {"line": 2, "character": 3},
+                },
+                "newText": "bar",
+            },
+        ]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_rename_invalid_identifier_raises_request_failed(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        with pytest.raises(_RequestFailed):
+            server._handle_request(
+                "textDocument/rename",
+                {
+                    "textDocument": {"uri": target.as_uri()},
+                    "position": {"line": 0, "character": 5},
+                    "newName": "1bad",
+                },
+            )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_rename_keyword_raises_request_failed(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        with pytest.raises(_RequestFailed):
+            server._handle_request(
+                "textDocument/rename",
+                {
+                    "textDocument": {"uri": target.as_uri()},
+                    "position": {"line": 0, "character": 5},
+                    "newName": "class",
+                },
+            )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_rename_alias_raises_request_failed(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+    consumer = root / "c.py"
+    _write(consumer, "from a import foo as aliased\n\naliased()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        with pytest.raises(_RequestFailed):
+            server._handle_request(
+                "textDocument/rename",
+                {
+                    "textDocument": {"uri": consumer.as_uri()},
+                    "position": {"line": 2, "character": 0},
+                    "newName": "quux",
+                },
+            )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_rename_on_stdlib_symbol_returns_null(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "consumer.py"
+    _write(consumer, "from json import JSONDecoder\n\nJSONDecoder()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/rename",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 0},
+                "newName": "MyDecoder",
+            },
+        )
+        assert result is None
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_rename_same_name_returns_null(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/rename",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+                "newName": "foo",
+            },
+        )
+        assert result is None
     finally:
         if server._session is not None:
             server._session.close()
