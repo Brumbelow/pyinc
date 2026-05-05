@@ -1257,6 +1257,92 @@ def test_rename_symbol_refuses_alias_rename(tmp_path: Path) -> None:
         assert result.edits == ()
 
 
+def test_rename_symbol_rewrites_sibling_relative_import(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(pkg / "sub.py", "from .helper import foo\n\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(pkg / "helper.py", "foo", "bar")
+        assert result.status == "ok"
+        sub_edits = sorted(
+            (edit.lineno, edit.col_offset, edit.end_col_offset)
+            for edit in result.edits
+            if Path(edit.path).name == "sub.py"
+        )
+        assert sub_edits == [(1, 20, 23), (3, 0, 3)]
+        _apply_rename_edits(result.edits)
+
+    assert (pkg / "helper.py").read_text() == "def bar() -> int:\n    return 1\n"
+    assert (pkg / "sub.py").read_text() == "from .helper import bar\n\nbar()\n"
+
+
+def test_rename_symbol_rewrites_dotted_relative_import(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    sub = pkg / "sub"
+    _write(pkg / "__init__.py", "")
+    _write(sub / "__init__.py", "")
+    _write(sub / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(sub / "user.py", "from .helper import foo\n\nfoo()\n")
+    _write(pkg / "outer.py", "from .sub.helper import foo\n\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(sub / "helper.py", "foo", "bar")
+        assert result.status == "ok"
+        rewritten = sorted(Path(e.path).name for e in result.edits)
+        assert "user.py" in rewritten
+        assert "outer.py" in rewritten
+        _apply_rename_edits(result.edits)
+
+    assert (sub / "user.py").read_text() == "from .helper import bar\n\nbar()\n"
+    assert (pkg / "outer.py").read_text() == "from .sub.helper import bar\n\nbar()\n"
+
+
+def test_rename_symbol_rewrites_parent_package_relative_import(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    sub = pkg / "sub"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(sub / "__init__.py", "")
+    _write(sub / "user.py", "from ..helper import foo\n\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(pkg / "helper.py", "foo", "bar")
+        assert result.status == "ok"
+        _apply_rename_edits(result.edits)
+
+    assert (sub / "user.py").read_text() == "from ..helper import bar\n\nbar()\n"
+
+
+def test_rename_symbol_relative_import_preserves_as_alias(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(
+        pkg / "sub.py", "from .helper import foo as aliased\n\naliased()\n"
+    )
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(pkg / "helper.py", "foo", "bar")
+        assert result.status == "ok"
+        sub_edits = [e for e in result.edits if Path(e.path).name == "sub.py"]
+        # Exactly one edit on sub.py — the import-site `foo`. The `as aliased`
+        # clause is preserved and `aliased()` is not a reference to `foo`.
+        assert len(sub_edits) == 1
+        assert sub_edits[0].col_offset == 20
+        assert sub_edits[0].end_col_offset == 23
+        _apply_rename_edits(result.edits)
+
+    assert (
+        pkg / "sub.py"
+    ).read_text() == "from .helper import bar as aliased\n\naliased()\n"
+
+
 def test_rename_symbol_with_overlay_uses_overlay_text(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()

@@ -126,6 +126,25 @@ def _normalize_dependency_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def _resolve_import_from_target(
+    *,
+    importer_module: str,
+    importer_path: str,
+    level: int,
+    module: str | None,
+) -> str | None:
+    if level == 0:
+        return module
+    package_parts = [part for part in importer_module.split(".") if part]
+    if package_parts and Path(importer_path).name != "__init__.py":
+        package_parts = package_parts[:-1]
+    if level - 1 > len(package_parts):
+        return None
+    anchor = package_parts[: len(package_parts) - (level - 1)]
+    base_parts = [part for part in (module or "").split(".") if part]
+    return ".".join(anchor + base_parts)
+
+
 def _collect_filesystem_snapshot(
     root: str, ignored_dir_names: frozenset[str]
 ) -> dict[str, tuple[int, int]]:
@@ -500,7 +519,13 @@ class WorkspaceSession:
             for node in ast.walk(tree):
                 if not isinstance(node, ast.ImportFrom):
                     continue
-                if node.level != 0 or node.module != defining_module:
+                absolute_module = _resolve_import_from_target(
+                    importer_module=module.module,
+                    importer_path=real_path,
+                    level=node.level,
+                    module=node.module,
+                )
+                if absolute_module != defining_module:
                     continue
                 for alias in node.names:
                     if alias.name != bare_old:

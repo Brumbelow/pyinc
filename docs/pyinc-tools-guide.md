@@ -274,7 +274,10 @@ Consequences:
   identifier offset in the source line), and every
   `from <defining_module> import <bare_old> [as <alias>]` line in the workspace
   (only the source-name portion is rewritten; any `as <alias>` clause is left
-  untouched). Invalid identifiers and Python keywords yield a JSON-RPC
+  untouched). Both absolute (`from a import foo`) and relative (`from .a import
+  foo`, `from ..pkg.a import foo`) `from` lines are covered: each importer's
+  relative module is resolved against its own package and matched against
+  `target.defining_module`. Invalid identifiers and Python keywords yield a JSON-RPC
   `RequestFailed` error; renaming via an `import ... as` alias is refused with
   the same error code (the user is asked to rename the canonical name instead).
   Same-name and non-workspace targets return `null`.
@@ -316,10 +319,6 @@ Consequences:
     alias; rename the original symbol instead."* The canonical-name rename
     of `foo` correctly preserves any `as <alias>` clauses across the
     workspace.
-  - Relative imports (`from . import foo`, `from ..pkg import bar`) are not
-    rewritten by rename. The resolver still resolves the symbol, but the
-    import-edit walker only handles absolute `from <defining_module>`
-    forms.
   - `import a` plus `a.foo()` attribute access is not rewritten (consistent
     with the resolver-is-name-local rule above). Use `from a import foo`
     if you need rename to update the call site.
