@@ -265,8 +265,7 @@ python3 -m mypy src tests
 python3 -m ruff check src tests
 ```
 
-The kernel contract is summarized in
-[docs/kernel-contract.md](docs/kernel-contract.md). Integration API
+The kernel contract is summarized in [docs/kernel-contract.md](docs/kernel-contract.md). Integration API
 boundaries are summarized in
 [docs/integration-contract.md](docs/integration-contract.md). A guide to
 authoring new integrations is at
