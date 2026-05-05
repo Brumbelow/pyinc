@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [
-  { name = "Andrew Brumbelow", email = "andrew.brumbelow@gmail.com },
+  { name = "Andrew Brumbelow", email = "andrew.brumbelow@gmail.com }
 ]
 keywords = ["incremental-computation", "query-kernel", "salsa", "red-green", "backdating", "provenance"]
 classifiers = [
