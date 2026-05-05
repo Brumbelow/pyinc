@@ -10,6 +10,17 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **Rename now rewrites relative `from … import` lines.** The
+  `WorkspaceSession.rename_symbol` import-edit walker resolves `from .pkg
+  import name`, `from .. import name`, and `from ..sub.pkg import name`
+  forms against each importer's package and rewrites them when the
+  resolved absolute module matches `target.defining_module`. The
+  `as <alias>` clause is preserved exactly as in the absolute-import case.
+  Module-level (`__init__.py`) importers are anchored on the package
+  itself; non-package modules are anchored on their parent. Resolves the
+  documented v2.0.x rename limitation that relative imports were not
+  rewritten. `pyinc_tools`-only change; the kernel and the
+  `pyinc.integrations` public surface are unchanged.
 - **`textDocument/rename` (and `textDocument/prepareRename`) in `pyinc-tools`
   LSP.** The server now advertises
   `renameProvider: {prepareProvider: true}`. `prepareRename` returns the range
