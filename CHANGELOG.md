@@ -10,6 +10,28 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`find_references` (and rename) now follow `import M; M.foo()` attribute
+  access.** Previously the resolver was strictly name-local, so attribute
+  access on an `import` binding (`import a; a.foo()`,
+  `import a as alias; alias.foo()`) returned no references and rename did
+  not rewrite the call site — both limitations were documented in
+  `docs/pyinc-tools-guide.md` and pinned by a regression test. The
+  occurrence walker in `symbol_resolution._collect_name_occurrences` now
+  carries the LHS Name's `id` as an internal verification hint on every
+  `Attribute(value=Name(...), attr=...)` occurrence (a 5th element added
+  to the internal `NameOccurrencePayload`; not part of the public surface),
+  and `find_references_payload` routes hint-bearing occurrences through a
+  two-step verification: resolve the LHS through its `import_alias` /
+  `from_import_alias` to a workspace module, then resolve the attribute
+  inside that module so cross-module re-exports (`from c import foo`)
+  hop through transparently. Only the rightmost-attribute span is
+  reported, so rename rewrites just the attribute portion (the leading
+  `M.` / `alias.` is left intact). The same hint flows out of the
+  forward-reference string-annotation walker, so `def g(x: 'a.Foo')` is
+  also covered. Attribute access whose LHS is itself an Attribute (e.g.
+  `import pkg.subpkg; pkg.subpkg.foo()`) is still not counted; that
+  remains a documented limitation. No kernel contract change; integration
+  public surface unchanged.
 - **Rename now rewrites relative `from … import` lines.** The
   `WorkspaceSession.rename_symbol` import-edit walker resolves `from .pkg
   import name`, `from .. import name`, and `from ..sub.pkg import name`

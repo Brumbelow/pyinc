@@ -250,7 +250,14 @@ Consequences:
   offsets translated back to the file. Strings spanning multiple lines,
   triple-quoted strings, strings containing escape sequences, and
   implicitly-concatenated string literals are skipped to keep offset
-  reconstruction unambiguous.
+  reconstruction unambiguous. Module-attribute access on an `import M` /
+  `import M as alias` binding (e.g. `M.foo()`, `alias.foo()`) is also
+  counted: the occurrence walker carries the LHS Name as a hint, and the
+  verifier resolves the LHS through its `import_alias` to the target's
+  defining module before checking the attribute name. Cross-module
+  re-exports inside the imported module hop through transparently. Only
+  the rightmost-attribute span is reported (the leading `M.` is left
+  alone), so rename rewrites just the attribute portion.
 - Threaded live polling via `PollingWorkspaceWatcher.start(...)`. LSP server
   starts one by default; opt out with `initializationOptions.pyinc.watcher.enabled=false`.
 - `if TYPE_CHECKING:` and `if typing.TYPE_CHECKING:` import blocks — the symbol
@@ -301,9 +308,11 @@ Consequences:
 - Cyclic re-exports. Detected and returned as
   `resolution == "ambiguous"`; the LSP returns `[]`.
 - `find_references` limitations:
-  - Attribute access to a module-level symbol only imported as a module
-    (`import a; a.foo()`) is not counted because the resolver is name-local.
-    Use `from a import foo` to opt in.
+  - Attribute access whose LHS is itself an attribute chain
+    (`import pkg.subpkg; pkg.subpkg.foo()`) is not counted: the occurrence
+    walker only emits a verification hint when `Attribute.value` is a bare
+    `Name`. Use `from pkg import subpkg; subpkg.foo()` (or
+    `from pkg.subpkg import foo`) to opt in.
   - Function-local shadowing is not modeled: a local `foo = 1` inside a
     function is still reported as a reference to a module-level `foo`.
     `symbol_resolution` is module/class-scope only.
@@ -319,9 +328,6 @@ Consequences:
     alias; rename the original symbol instead."* The canonical-name rename
     of `foo` correctly preserves any `as <alias>` clauses across the
     workspace.
-  - `import a` plus `a.foo()` attribute access is not rewritten (consistent
-    with the resolver-is-name-local rule above). Use `from a import foo`
-    if you need rename to update the call site.
 
 ## Troubleshooting
 

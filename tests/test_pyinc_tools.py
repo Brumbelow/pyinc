@@ -1343,6 +1343,38 @@ def test_rename_symbol_relative_import_preserves_as_alias(tmp_path: Path) -> Non
     ).read_text() == "from .helper import bar as aliased\n\naliased()\n"
 
 
+def test_rename_symbol_rewrites_attribute_access_through_module_import(
+    tmp_path: Path,
+) -> None:
+    """When a consumer uses ``import a; a.foo()``, rename of ``foo`` rewrites
+    just the ``foo`` portion of ``a.foo`` (the leading ``a.`` is left intact),
+    in addition to the canonical declaration site. ``import a as alias``
+    plus ``alias.foo()`` is rewritten the same way."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "b.py", "import a\n\na.foo()\n")
+    _write(root / "c.py", "import a as alias\n\nalias.foo()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.rename_symbol(root / "a.py", "foo", "bar")
+        assert result.status == "ok"
+        per_file = sorted(
+            (Path(e.path).name, e.lineno, e.col_offset, e.end_col_offset, e.new_text)
+            for e in result.edits
+        )
+        assert per_file == [
+            ("a.py", 1, 4, 7, "bar"),
+            ("b.py", 3, 2, 5, "bar"),
+            ("c.py", 3, 6, 9, "bar"),
+        ]
+        _apply_rename_edits(result.edits)
+
+    assert (root / "a.py").read_text() == "def bar() -> int:\n    return 1\n"
+    assert (root / "b.py").read_text() == "import a\n\na.bar()\n"
+    assert (root / "c.py").read_text() == "import a as alias\n\nalias.bar()\n"
+
+
 def test_rename_symbol_with_overlay_uses_overlay_text(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
