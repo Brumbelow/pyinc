@@ -864,13 +864,15 @@ def test_find_references_crosses_re_export(tmp_path: Path) -> None:
     assert Path(declarations[0].path).name == "a.py"
 
 
-def test_find_references_does_not_resolve_attribute_chain_on_module(
+def test_find_references_resolves_attribute_chain_on_imported_module(
     tmp_path: Path,
 ) -> None:
-    """Pins v1.2.0 behavior: ``import a; a.foo()`` is NOT counted as a reference to
-    ``foo`` because resolving the bare rightmost name ``foo`` at the call site returns
-    ``missing`` (``foo`` is not bound locally). Attribute-chain reference following
-    would require a richer resolver and is out of scope for v1.2.0."""
+    """``import a; a.foo()`` is counted as a reference to ``foo``: the
+    occurrence walker remembers that ``foo`` is the rightmost attribute of a
+    ``Name``-LHS access, and the verifier resolves the LHS through the
+    ``import_alias`` to the target's defining module before checking the
+    attribute name. Only the ``foo`` portion is reported, with offsets that
+    point at the attribute span (not the leading ``a.``)."""
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text(
@@ -882,7 +884,147 @@ def test_find_references_does_not_resolve_attribute_chain_on_module(
     db = Database(mode="strict")
     result = find_references(db, root, root / "a.py", "foo")
 
-    # Only the declaration is reported; the ``a.foo()`` attribute access is not.
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert len(non_decl) == 1
+    ref = non_decl[0]
+    assert ref.lineno == 3
+    # ``a.foo()`` — the ``foo`` portion is at cols 2-5.
+    assert (ref.col_offset, ref.end_col_offset) == (2, 5)
+
+
+def test_find_references_resolves_attribute_chain_on_aliased_import(
+    tmp_path: Path,
+) -> None:
+    """``import a as alias`` followed by ``alias.foo()`` is counted: the LHS
+    ``alias`` resolves through ``import_alias`` (with `import_source_module="a"`)
+    to module ``a``."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "def foo() -> int:\n    return 1\n",
+        encoding="utf-8",
+    )
+    (root / "b.py").write_text(
+        "import a as alias\n\nalias.foo()\n", encoding="utf-8"
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert len(non_decl) == 1
+    ref = non_decl[0]
+    assert ref.lineno == 3
+    # ``alias.foo()`` — the ``foo`` portion is at cols 6-9.
+    assert (ref.col_offset, ref.end_col_offset) == (6, 9)
+
+
+def test_find_references_attribute_chain_through_module_re_export(
+    tmp_path: Path,
+) -> None:
+    """When the LHS module re-exports the target via ``from c import foo``,
+    ``M.foo()`` still resolves: the verifier resolves ``foo`` *inside* the LHS
+    module (so it follows ``from_import_alias`` to the original definition)."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "c.py").write_text(
+        "def foo() -> int:\n    return 1\n",
+        encoding="utf-8",
+    )
+    (root / "m.py").write_text("from c import foo\n", encoding="utf-8")
+    (root / "b.py").write_text("import m\n\nm.foo()\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "c.py", "foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    # The `from c import foo` line in m.py is not represented as a Name in
+    # the AST (it's an ast.alias under ast.ImportFrom), so it contributes no
+    # occurrence. The reference comes solely from ``m.foo()`` in b.py — the
+    # verifier resolves ``m`` to module m, then resolves ``foo`` inside m,
+    # which follows the from-import re-export back to the canonical c.foo.
+    assert len(non_decl) == 1
+    ref = non_decl[0]
+    assert ref.path.endswith("b.py")
+    assert ref.lineno == 3
+    assert (ref.col_offset, ref.end_col_offset) == (2, 5)
+
+
+def test_find_references_does_not_match_attribute_on_unrelated_module(
+    tmp_path: Path,
+) -> None:
+    """``import other; other.foo()`` is NOT a reference to ``a.foo`` even when
+    ``other`` also defines a top-level ``foo`` — the verification resolves
+    ``foo`` inside ``other``'s module and the resulting definition site doesn't
+    match the search target."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "def foo() -> int:\n    return 1\n",
+        encoding="utf-8",
+    )
+    (root / "other.py").write_text(
+        "def foo() -> int:\n    return 99\n",
+        encoding="utf-8",
+    )
+    (root / "b.py").write_text(
+        "import other\n\nother.foo()\n", encoding="utf-8"
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert non_decl == []
+
+
+def test_find_references_skips_attribute_on_non_module_local(
+    tmp_path: Path,
+) -> None:
+    """``x = SomeClass(); x.foo()`` is not a reference to a module-level
+    ``foo`` — the LHS ``x`` resolves to a definition site (not a module), so
+    the verifier ignores the attribute access (no false positive on the
+    rightmost attr name)."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "def foo() -> int:\n    return 1\n",
+        encoding="utf-8",
+    )
+    (root / "b.py").write_text(
+        "x = 1\n\nx.foo\n", encoding="utf-8"
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert non_decl == []
+
+
+def test_find_references_attribute_chain_on_nested_module_lhs_skipped(
+    tmp_path: Path,
+) -> None:
+    """``import pkg.subpkg`` plus ``pkg.subpkg.foo()`` is NOT counted —
+    the LHS of ``foo`` is the Attribute ``pkg.subpkg``, not a Name, and the
+    occurrence walker only emits a hint when ``Attribute.value`` is a Name.
+    Use ``from pkg import subpkg; subpkg.foo()`` (or
+    ``from pkg.subpkg import foo``) to opt in. Documented limitation."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    pkg = root / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "subpkg.py").write_text(
+        "def foo() -> int:\n    return 1\n", encoding="utf-8"
+    )
+    (root / "b.py").write_text(
+        "import pkg.subpkg\n\npkg.subpkg.foo()\n", encoding="utf-8"
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, pkg / "subpkg.py", "foo")
+
     non_decl = [r for r in result.references if not r.is_declaration]
     assert non_decl == []
 
@@ -1039,10 +1181,9 @@ def test_name_occurrences_for_file_extracts_attribute_inside_string_annotation(
     tmp_path: Path,
 ) -> None:
     """Inside `'pkg.Foo'`, the rightmost attribute name is emitted as an
-    occurrence with the correct in-file offsets. (Whether `find_references`
-    counts it depends on the same name-local resolver as the unquoted
-    `pkg.Foo` chain — see
-    `test_find_references_does_not_resolve_attribute_chain_on_module`.)"""
+    occurrence with the correct in-file offsets. The 5th payload field carries
+    the LHS Name ``"pkg"`` so the references verifier can route the lookup
+    through ``pkg``'s import binding."""
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "b.py"
@@ -1056,11 +1197,38 @@ def test_name_occurrences_for_file_extracts_attribute_inside_string_annotation(
 
     matching = [occ for occ in occurrences if occ[0] == "Foo"]
     assert len(matching) == 1
-    bare_name, lineno, col_offset, end_col_offset = matching[0]
+    bare_name, lineno, col_offset, end_col_offset, value_name_hint = matching[0]
     assert bare_name == "Foo"
     assert lineno == 3
     # `def g(a: 'pkg.Foo') -> None:` — `Foo` is at cols 14-17.
     assert (col_offset, end_col_offset) == (14, 17)
+    assert value_name_hint == "pkg"
+
+
+def test_find_references_resolves_attribute_chain_in_string_annotation(
+    tmp_path: Path,
+) -> None:
+    """``import a; def g(x: 'a.Foo'): ...`` counts as a reference to
+    ``a.Foo``: the string-annotation walker emits a hint=``"a"`` occurrence,
+    and the same import-aware verification used for unquoted attribute access
+    accepts it."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
+    (root / "b.py").write_text(
+        "import a\n\ndef g(x: 'a.Foo') -> None:\n    return None\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode="strict")
+    result = find_references(db, root, root / "a.py", "Foo")
+
+    non_decl = [r for r in result.references if not r.is_declaration]
+    assert len(non_decl) == 1
+    ref = non_decl[0]
+    assert ref.lineno == 3
+    # `def g(x: 'a.Foo') -> None:` — inside the string, `Foo` is at cols 12-15.
+    assert (ref.col_offset, ref.end_col_offset) == (12, 15)
 
 
 def test_find_references_includes_forward_ref_strings_double_quoted(

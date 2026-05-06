@@ -101,8 +101,16 @@ WorkspaceSymbolIndexPayload: TypeAlias = tuple[
 ]
 #   root, entries
 
-NameOccurrencePayload: TypeAlias = tuple[str, int, int, int]
-#                                    bare_name, lineno, col_offset, end_col_offset
+NameOccurrencePayload: TypeAlias = tuple[str, int, int, int, str | None]
+#                                    bare_name, lineno, col_offset, end_col_offset, value_name_hint
+#
+# value_name_hint carries the LHS Name's id when the occurrence comes from an
+# `Attribute(value=Name(...), attr=...)` access — e.g., for `a.foo()` the `foo`
+# occurrence stores hint="a". This lets the references verifier route the
+# lookup through the import alias bound at `a` (resolving `a.foo` rather than
+# the file-local `foo`). For bare Name occurrences and for Attribute
+# occurrences whose `value` is itself an Attribute (e.g. `pkg.subpkg.foo`),
+# the hint is None.
 
 FileNameOccurrencesPayload: TypeAlias = tuple[str, tuple[NameOccurrencePayload, ...]]
 #                                    path,  occurrences
@@ -1091,6 +1099,7 @@ def _collect_names_in_string_annotation(
                     constant.lineno,
                     base_col + inner.col_offset,
                     base_col + inner_end,
+                    None,
                 )
             )
             continue
@@ -1104,12 +1113,16 @@ def _collect_names_in_string_annotation(
             attr_col = inner_end - len(inner.attr)
             if attr_col < 0:
                 continue
+            value_hint = (
+                inner.value.id if isinstance(inner.value, ast.Name) else None
+            )
             occurrences.append(
                 (
                     inner.attr,
                     constant.lineno,
                     base_col + attr_col,
                     base_col + inner_end,
+                    value_hint,
                 )
             )
 
@@ -1136,7 +1149,7 @@ def _collect_name_occurrences(
             end_col = node.end_col_offset
             if end_col is None:
                 end_col = node.col_offset + len(node.id)
-            occurrences.append((node.id, node.lineno, node.col_offset, end_col))
+            occurrences.append((node.id, node.lineno, node.col_offset, end_col, None))
             continue
         if isinstance(node, ast.Attribute):
             end_col = node.end_col_offset
@@ -1146,7 +1159,8 @@ def _collect_name_occurrences(
             attr_col = end_col - len(node.attr)
             if attr_col < 0:
                 continue
-            occurrences.append((node.attr, end_lineno, attr_col, end_col))
+            value_hint = node.value.id if isinstance(node.value, ast.Name) else None
+            occurrences.append((node.attr, end_lineno, attr_col, end_col, value_hint))
 
     source_lines = source.splitlines()
     for node in ast.walk(tree):
@@ -1233,10 +1247,37 @@ def find_references_payload(
 
     occurrences_index = workspace_name_occurrence_index(db, root)
     for file_path, occurrences in occurrences_index:
-        for bare_name, lineno, col_offset, end_col_offset in occurrences:
+        for (
+            bare_name,
+            lineno,
+            col_offset,
+            end_col_offset,
+            value_name_hint,
+        ) in occurrences:
             if bare_name != bare_target:
                 continue
-            verify = resolve_symbol_payload(db, root, file_path, bare_name)
+            if value_name_hint is None:
+                verify = resolve_symbol_payload(db, root, file_path, bare_name)
+            else:
+                # `value_name_hint.bare_name` form (e.g., `M.foo` where `M` is
+                # bound by `import M [as alias]` or by `from pkg import M`
+                # naming a workspace module). Resolve the LHS to a workspace
+                # module, then resolve the attribute name within that module
+                # so cross-module re-exports hop through. The equality checks
+                # below confirm the result still points at the target.
+                lhs = resolve_symbol_payload(db, root, file_path, value_name_hint)
+                if lhs[2] != "workspace":
+                    continue
+                if lhs[5] is not None:
+                    # defining_lineno is set, meaning the LHS resolved to a
+                    # specific definition site (function / class / variable),
+                    # not a module. Attribute access on a non-module workspace
+                    # symbol is out of scope.
+                    continue
+                lhs_def_path = lhs[4]
+                if lhs_def_path is None:
+                    continue
+                verify = resolve_symbol_payload(db, root, lhs_def_path, bare_name)
             v_resolution = verify[2]
             v_def_module = verify[3]
             v_def_path = verify[4]
