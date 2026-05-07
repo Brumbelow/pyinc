@@ -1,5 +1,7 @@
 from .session import (
     AnalysisDiagnostic,
+    DocumentHighlight,
+    DocumentHighlightKind,
     FileAnalysisResult,
     PollingWorkspaceWatcher,
     RenameEdit,
@@ -11,6 +13,8 @@ from .session import (
 
 __all__ = [
     "AnalysisDiagnostic",
+    "DocumentHighlight",
+    "DocumentHighlightKind",
     "FileAnalysisResult",
     "PollingWorkspaceWatcher",
     "RenameEdit",

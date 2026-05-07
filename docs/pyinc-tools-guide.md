@@ -129,7 +129,8 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     "workspaceSymbolProvider": true,
     "hoverProvider": true,
     "definitionProvider": true,
-    "referencesProvider": true
+    "referencesProvider": true,
+    "documentHighlightProvider": true
   },
   "serverInfo": { "name": "pyinc-tools", "version": "2.0.0" }
 }
@@ -162,6 +163,7 @@ channels does not produce duplicate messages.
 | `textDocument/hover` | Markdown `def foo(x: int) -> int` / `class Foo` / `x: int`, plus a `*re-exported from*` line for import aliases. |
 | `textDocument/definition` | Single `Location` via `resolve_symbol`; follows cross-module re-exports bounded by `MAX_FOLLOW_DEPTH = 8`. |
 | `textDocument/references` | `Location[]` via `find_references`; honors `context.includeDeclaration`; per-occurrence `col_offset` / `end_col_offset` ranges so editors can highlight each match. Only workspace-resolved targets are indexed — stdlib / installed / ambiguous targets return `[]`. |
+| `textDocument/documentHighlight` | `DocumentHighlight[]` for the symbol under the cursor, scoped to the current file. The declaration site is reported with `kind: 3` (Write); other occurrences with `kind: 1` (Text). The synthetic `find_references` placeholder for `def`/`class` declarations is repaired to the real identifier offset, so editors highlight the actual name and not the line's first character. Cross-file references returned by `find_references` are filtered out — workspace-wide highlighting is `textDocument/references`'s job. Stdlib / installed / ambiguous targets return `[]`. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
 ## Editor wiring
@@ -258,6 +260,19 @@ Consequences:
   re-exports inside the imported module hop through transparently. Only
   the rightmost-attribute span is reported (the leading `M.` is left
   alone), so rename rewrites just the attribute portion.
+- Document highlight, via `textDocument/documentHighlight` (advertised as
+  `documentHighlightProvider: true`). Returns highlight ranges for the symbol
+  under the cursor scoped to the current file; the declaration site uses
+  `DocumentHighlightKind.Write` (3) and other occurrences use
+  `DocumentHighlightKind.Text` (1). The synthetic placeholder that
+  `find_references` emits for `def` / `class` declarations is repaired to the
+  real identifier offset so the editor highlights the actual name rather than
+  the first character of the line. Cross-file references that
+  `find_references` would return are filtered out — full workspace-wide
+  results are still available via `textDocument/references`. The consumer
+  entrypoint `WorkspaceSession.find_document_highlights(path, qualified_name)`
+  returns a tuple of `DocumentHighlight(lineno, col_offset, end_col_offset,
+  kind)` dataclasses with `kind` typed as `Literal["text", "read", "write"]`.
 - Threaded live polling via `PollingWorkspaceWatcher.start(...)`. LSP server
   starts one by default; opt out with `initializationOptions.pyinc.watcher.enabled=false`.
 - `if TYPE_CHECKING:` and `if typing.TYPE_CHECKING:` import blocks — the symbol

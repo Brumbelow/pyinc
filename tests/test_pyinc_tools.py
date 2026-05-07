@@ -739,6 +739,230 @@ def test_language_server_references_overlay_sees_edit(tmp_path: Path) -> None:
             server._session.close()
 
 
+def test_language_server_advertises_document_highlight_provider(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "mod.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        assert init["capabilities"]["documentHighlightProvider"] is True
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_document_highlight_marks_declaration_write_and_calls_text(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def foo() -> int:\n"  # line 0 — declaration
+        "    return 1\n"  # line 1
+        "\n"  # line 2
+        "foo()\n"  # line 3 — call
+        "x = foo\n",  # line 4 — bare reference
+    )
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+
+        highlights = server._handle_request(
+            "textDocument/documentHighlight",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+
+        by_line = {h["range"]["start"]["line"]: h for h in highlights}
+        assert set(by_line) == {0, 3, 4}
+
+        # Declaration is reported as Write (kind=3) with a real identifier span,
+        # not the synthetic col=0..1 placeholder that find_references emits.
+        decl = by_line[0]
+        assert decl["kind"] == 3
+        assert decl["range"]["start"]["character"] == len("def ")
+        assert decl["range"]["end"]["character"] == len("def ") + len("foo")
+
+        # Call site is Text (kind=1) and spans the identifier exactly.
+        call = by_line[3]
+        assert call["kind"] == 1
+        assert call["range"]["start"]["character"] == 0
+        assert call["range"]["end"]["character"] == len("foo")
+
+        bare = by_line[4]
+        assert bare["kind"] == 1
+        assert bare["range"]["start"]["character"] == len("x = ")
+        assert bare["range"]["end"]["character"] == len("x = ") + len("foo")
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_document_highlight_excludes_other_files(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "a.py"
+    consumer = root / "b.py"
+    _write(provider, "def foo() -> int:\n    return 1\n")
+    _write(consumer, "from a import foo\n\nfoo()\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+
+        highlights = server._handle_request(
+            "textDocument/documentHighlight",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+
+        # Only consumer.py occurrences should be returned; provider.py is in
+        # the workspace-wide reference set but is filtered out for highlight.
+        # The `from a import foo` line is an import binding (not a Name AST
+        # node) so the occurrence walker does not emit it.
+        assert len(highlights) == 2
+        lines = sorted(h["range"]["start"]["line"] for h in highlights)
+        assert lines == [2, 3]
+        for highlight in highlights:
+            assert highlight["range"]["start"]["character"] == 0
+            assert highlight["range"]["end"]["character"] == len("foo")
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_document_highlight_on_unknown_identifier_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        highlights = server._handle_request(
+            "textDocument/documentHighlight",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 3},  # cursor on `def`
+            },
+        )
+        assert highlights == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_document_highlight_on_stdlib_identifier_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "consumer.py"
+    _write(consumer, "from json import JSONDecoder\n\nJSONDecoder()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        highlights = server._handle_request(
+            "textDocument/documentHighlight",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 0},
+            },
+        )
+        assert highlights == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_document_highlight_overlay_sees_edit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        # Overlay adds two new call sites without touching disk.
+        overlay_text = "def foo() -> int:\n    return 1\n\nfoo()\nfoo()\n"
+        server._handle_notification(
+            "textDocument/didOpen",
+            {"textDocument": {"uri": target.as_uri(), "text": overlay_text}},
+        )
+
+        highlights = server._handle_request(
+            "textDocument/documentHighlight",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+        lines = sorted(h["range"]["start"]["line"] for h in highlights)
+        assert lines == [0, 3, 4]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_workspace_session_find_document_highlights_returns_dataclasses(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def foo() -> int:\n    return 1\n\nfoo()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        highlights = session.find_document_highlights(target, "foo")
+        kinds = sorted(h.kind for h in highlights)
+        # Exactly one declaration ("write") and one call site ("text").
+        assert kinds == ["text", "write"]
+        decl = next(h for h in highlights if h.kind == "write")
+        assert decl.lineno == 1
+        assert decl.col_offset == len("def ")
+        assert decl.end_col_offset == len("def ") + len("foo")
+        call = next(h for h in highlights if h.kind == "text")
+        assert call.lineno == 4
+        assert call.col_offset == 0
+        assert call.end_col_offset == len("foo")
+
+
+def test_workspace_session_find_document_highlights_non_workspace_target(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "consumer.py"
+    _write(consumer, "from json import JSONDecoder\n\nJSONDecoder()\n")
+
+    with WorkspaceSession(root) as session:
+        highlights = session.find_document_highlights(consumer, "JSONDecoder")
+        assert highlights == ()
+
+
 def test_type_checking_imports_visible_and_lsp_hover_works(tmp_path: Path) -> None:
     """``if TYPE_CHECKING:`` imports are walked into ``ModuleSymbolTable.symbols``
     so LSP hover and goto-definition work for any bare identifier that matches a

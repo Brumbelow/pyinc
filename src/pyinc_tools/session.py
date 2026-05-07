@@ -115,6 +115,17 @@ class RenameResult:
     status: RenameStatus
 
 
+DocumentHighlightKind = Literal["text", "read", "write"]
+
+
+@dataclass(frozen=True)
+class DocumentHighlight:
+    lineno: int
+    col_offset: int
+    end_col_offset: int
+    kind: DocumentHighlightKind
+
+
 @dataclass(frozen=True)
 class _DependencyInputs:
     config: ConfigAnalysis | None
@@ -356,6 +367,57 @@ class WorkspaceSession:
             return ReferenceQueryResult(
                 target=remapped_target, references=remapped_refs
             )
+
+    def find_document_highlights(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+    ) -> tuple[DocumentHighlight, ...]:
+        bare_name = qualified_name.rsplit(".", 1)[-1]
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            result = find_references(
+                self.db,
+                self.mirror_root,
+                str(mirror_path),
+                qualified_name,
+                include_declaration=True,
+            )
+            if result.target.resolution != "workspace":
+                return ()
+            highlights: list[DocumentHighlight] = []
+            seen: set[tuple[int, int, int]] = set()
+            for ref in result.references:
+                ref_real_path = self._remap_path(ref.path) or ref.path
+                if ref_real_path != real_path:
+                    continue
+                col, end_col = ref.col_offset, ref.end_col_offset
+                if ref.is_declaration and col == 0 and end_col == 1:
+                    located = self._locate_def_class_name_offsets(
+                        ref_real_path, ref.lineno, bare_name
+                    )
+                    if located is None:
+                        continue
+                    col, end_col = located
+                key = (ref.lineno, col, end_col)
+                if key in seen:
+                    continue
+                seen.add(key)
+                kind: DocumentHighlightKind = "write" if ref.is_declaration else "text"
+                highlights.append(
+                    DocumentHighlight(
+                        lineno=ref.lineno,
+                        col_offset=col,
+                        end_col_offset=end_col,
+                        kind=kind,
+                    )
+                )
+            highlights.sort(key=lambda h: (h.lineno, h.col_offset))
+            return tuple(highlights)
 
     def rename_symbol(
         self,
