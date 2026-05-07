@@ -48,6 +48,12 @@ _PYINC_SEVERITY_TO_LSP = {
     "hint": 4,
 }
 
+_DOCUMENT_HIGHLIGHT_KINDS = {
+    "text": 1,
+    "read": 2,
+    "write": 3,
+}
+
 _ID_START_RE = re.compile(r"[A-Za-z_]")
 _ID_CONT_RE = re.compile(r"[A-Za-z0-9_]")
 
@@ -237,6 +243,8 @@ class LanguageServer:
             return self._definition(params)
         if method == "textDocument/references":
             return self._references(params)
+        if method == "textDocument/documentHighlight":
+            return self._document_highlight(params)
         if method == "textDocument/prepareRename":
             return self._prepare_rename(params)
         if method == "textDocument/rename":
@@ -355,6 +363,7 @@ class LanguageServer:
                 "hoverProvider": True,
                 "definitionProvider": True,
                 "referencesProvider": True,
+                "documentHighlightProvider": True,
                 "renameProvider": {"prepareProvider": True},
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
@@ -530,6 +539,39 @@ class LanguageServer:
                 }
             )
         return locations
+
+    def _document_highlight(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        source = session.source_text(real_path)
+        if source is None:
+            return []
+        identifier = _identifier_at_position(source, line, character)
+        if identifier is None:
+            return []
+        try:
+            highlights = session.find_document_highlights(real_path, identifier)
+        except FileNotFoundError:
+            return []
+        return [
+            {
+                "range": {
+                    "start": {
+                        "line": max(highlight.lineno - 1, 0),
+                        "character": highlight.col_offset,
+                    },
+                    "end": {
+                        "line": max(highlight.lineno - 1, 0),
+                        "character": highlight.end_col_offset,
+                    },
+                },
+                "kind": _DOCUMENT_HIGHLIGHT_KINDS[highlight.kind],
+            }
+            for highlight in highlights
+        ]
 
     def _prepare_rename(self, params: Any) -> dict[str, Any] | None:
         session = self._require_session()

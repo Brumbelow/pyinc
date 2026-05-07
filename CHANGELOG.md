@@ -10,6 +10,26 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/documentHighlight` in `pyinc-tools` LSP.** The server now
+  advertises `documentHighlightProvider: true` and returns
+  `DocumentHighlight[]` ranges for the symbol under the cursor, scoped to the
+  current file. The declaration site is reported with `kind: 3` (Write); all
+  other occurrences with `kind: 1` (Text). The synthetic
+  `(col=0, end_col=1)` placeholder that `find_references` emits for
+  `def` / `class` / `async def` declaration lines is repaired by locating the
+  real identifier offset on the line (the same repair already used by
+  `textDocument/rename`), so editors highlight the actual identifier rather
+  than the first character of the line. Cross-file references that
+  `find_references` would return are intentionally filtered out — workspace-
+  wide highlighting remains `textDocument/references`'s job. Stdlib /
+  installed / ambiguous targets return `[]`. New consumer-layer entrypoint
+  `WorkspaceSession.find_document_highlights(path, qualified_name)` returns a
+  tuple of `DocumentHighlight(lineno, col_offset, end_col_offset, kind)`
+  dataclasses with `kind` typed as `Literal["text", "read", "write"]`.
+  New public names re-exported from `pyinc_tools`: `DocumentHighlight`,
+  `DocumentHighlightKind`. Lives entirely on top of the stable
+  `pyinc.integrations.find_references` entrypoint — no kernel contract change
+  and no new integration-layer surface.
 - **`find_references` (and rename) now follow `import M; M.foo()` attribute
   access.** Previously the resolver was strictly name-local, so attribute
   access on an `import` binding (`import a; a.foo()`,
