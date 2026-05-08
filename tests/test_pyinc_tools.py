@@ -1870,3 +1870,265 @@ def test_language_server_rename_same_name_returns_null(tmp_path: Path) -> None:
     finally:
         if server._session is not None:
             server._session.close()
+
+
+def test_signature_help_at_local_function_active_first_param(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def helper(x: int, y: int) -> int:\n"
+        "    return x + y\n"
+        "\n"
+        "helper()\n",
+    )
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=3, character=7)
+        assert signature_help is not None
+        assert signature_help.label == "def helper(x: int, y: int) -> int"
+        assert signature_help.active_parameter == 0
+        assert tuple(
+            (p.label, p.label_offset_start, p.label_offset_end)
+            for p in signature_help.parameters
+        ) == (
+            ("x: int", 11, 17),
+            ("y: int", 19, 25),
+        )
+
+
+def test_signature_help_at_advances_active_parameter_after_comma(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def helper(a: int, b: int, c: int) -> int:\n"
+        "    return a + b + c\n"
+        "\n"
+        "helper(1, 2, 3)\n",
+    )
+    with WorkspaceSession(root) as session:
+        # Just inside `(`: arg 0.
+        first = session.signature_help_at(target, line=3, character=7)
+        # After "1, ": arg 1.
+        second = session.signature_help_at(target, line=3, character=10)
+        # After "1, 2, ": arg 2.
+        third = session.signature_help_at(target, line=3, character=13)
+    assert first is not None and first.active_parameter == 0
+    assert second is not None and second.active_parameter == 1
+    assert third is not None and third.active_parameter == 2
+
+
+def test_signature_help_at_returns_none_outside_call(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper(x: int) -> int:\n    return x\n")
+    with WorkspaceSession(root) as session:
+        assert session.signature_help_at(target, line=0, character=5) is None
+
+
+def test_signature_help_at_skips_call_in_string_literal(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def helper(x: int) -> int:\n"
+        "    return x\n"
+        "\n"
+        "value = \"foo(\" + str(\n",
+    )
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=3, character=21)
+    assert signature_help is None
+
+
+def test_signature_help_at_nested_call_picks_innermost(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def outer(x: int) -> int:\n"
+        "    return x\n"
+        "\n"
+        "def inner(y: int, z: int) -> int:\n"
+        "    return y + z\n"
+        "\n"
+        "outer(inner(1, ))\n",
+    )
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=6, character=15)
+    assert signature_help is not None
+    assert signature_help.label.startswith("def inner(")
+    assert signature_help.active_parameter == 1
+
+
+def test_signature_help_at_resolves_cross_module_reexport(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "a.py"
+    consumer = root / "b.py"
+    _write(provider, "def helper(x: int, y: int) -> int:\n    return x + y\n")
+    _write(consumer, "from a import helper\n\nhelper(1, 2)\n")
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(consumer, line=2, character=10)
+    assert signature_help is not None
+    assert signature_help.label == "def helper(x: int, y: int) -> int"
+    assert signature_help.active_parameter == 1
+
+
+def test_signature_help_at_class_uses_init_without_self(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "class Box:\n"
+        "    def __init__(self, width: int, height: int) -> None:\n"
+        "        self.width = width\n"
+        "        self.height = height\n"
+        "\n"
+        "Box()\n",
+    )
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=5, character=4)
+    assert signature_help is not None
+    assert signature_help.label == "def Box(width: int, height: int)"
+    assert signature_help.active_parameter == 0
+
+
+def test_signature_help_at_class_without_init_returns_empty_signature(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "class Bare:\n    pass\n\nBare()\n")
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=3, character=5)
+    assert signature_help is not None
+    assert signature_help.label == "def Bare()"
+    assert signature_help.active_parameter is None
+    assert signature_help.parameters == ()
+
+
+def test_signature_help_at_stdlib_target_returns_none(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "from json import dumps\n\ndumps(\n")
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=2, character=6)
+    assert signature_help is None
+
+
+def test_signature_help_at_def_definition_header_is_not_a_call(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper(x: int) -> int:\n    return x\n")
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=0, character=11)
+    assert signature_help is None
+
+
+def test_signature_help_at_overlay_sees_edit(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper(x: int) -> int:\n    return x\n\nhelper(1)\n")
+    with WorkspaceSession(root) as session:
+        overlay_text = (
+            "def helper(a: int, b: int) -> int:\n"
+            "    return a + b\n"
+            "\n"
+            "helper(1, 2)\n"
+        )
+        session.set_overlay(target, overlay_text)
+        signature_help = session.signature_help_at(target, line=3, character=11)
+    assert signature_help is not None
+    assert signature_help.label == "def helper(a: int, b: int) -> int"
+    assert signature_help.active_parameter == 1
+
+
+def test_language_server_advertises_signature_help_provider(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        assert init["capabilities"]["signatureHelpProvider"] == {
+            "triggerCharacters": ["(", ","],
+            "retriggerCharacters": [","],
+        }
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_signature_help_returns_lsp_payload(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def helper(x: int, y: int) -> int:\n"
+        "    return x + y\n"
+        "\n"
+        "helper(1, )\n",
+    )
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/signatureHelp",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 3, "character": 10},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is not None
+    assert result["activeSignature"] == 0
+    assert result["activeParameter"] == 1
+    signatures = result["signatures"]
+    assert len(signatures) == 1
+    assert signatures[0]["label"] == "def helper(x: int, y: int) -> int"
+    assert signatures[0]["parameters"] == [
+        {"label": [11, 17]},
+        {"label": [19, 25]},
+    ]
+
+
+def test_language_server_signature_help_outside_call_returns_none(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper(x: int) -> int:\n    return x\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/signatureHelp",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 0},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is None

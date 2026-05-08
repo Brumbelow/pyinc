@@ -130,7 +130,11 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     "hoverProvider": true,
     "definitionProvider": true,
     "referencesProvider": true,
-    "documentHighlightProvider": true
+    "documentHighlightProvider": true,
+    "signatureHelpProvider": {
+      "triggerCharacters": ["(", ","],
+      "retriggerCharacters": [","]
+    }
   },
   "serverInfo": { "name": "pyinc-tools", "version": "2.0.0" }
 }
@@ -164,6 +168,7 @@ channels does not produce duplicate messages.
 | `textDocument/definition` | Single `Location` via `resolve_symbol`; follows cross-module re-exports bounded by `MAX_FOLLOW_DEPTH = 8`. |
 | `textDocument/references` | `Location[]` via `find_references`; honors `context.includeDeclaration`; per-occurrence `col_offset` / `end_col_offset` ranges so editors can highlight each match. Only workspace-resolved targets are indexed — stdlib / installed / ambiguous targets return `[]`. |
 | `textDocument/documentHighlight` | `DocumentHighlight[]` for the symbol under the cursor, scoped to the current file. The declaration site is reported with `kind: 3` (Write); other occurrences with `kind: 1` (Text). The synthetic `find_references` placeholder for `def`/`class` declarations is repaired to the real identifier offset, so editors highlight the actual name and not the line's first character. Cross-file references returned by `find_references` are filtered out — workspace-wide highlighting is `textDocument/references`'s job. Stdlib / installed / ambiguous targets return `[]`. |
+| `textDocument/signatureHelp` | `SignatureHelp` for the call expression enclosing the cursor. A forward source scanner finds the topmost open `(` whose preceding token is a usable identifier, counts top-level commas to derive `activeParameter`, and resolves the identifier through `symbol_resolution.resolve_symbol`. Functions surface their declared signature; classes surface `<Class>.__init__` with a leading `self` / `cls` stripped, or an empty constructor signature when no `__init__` is defined. Stdlib / installed / ambiguous targets, attribute calls (`obj.method(`), subscripted calls (`factory[T](`), and `def`/`class` definition headers all return `null`. Parameters use LSP `[start, end]` substring offsets into the signature label. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
 ## Editor wiring
@@ -287,6 +292,22 @@ Consequences:
   statements. Symbols bound inside these guards appear in hover and goto-definition
   exactly as unconditional imports do; no "conditional top-level binding" impurity
   marker is recorded for files whose only conditional blocks are import-error guards.
+- Signature help, via `textDocument/signatureHelp` (advertised as
+  `signatureHelpProvider: {triggerCharacters: ["(", ","],
+  retriggerCharacters: [","]}`). A forward source scanner skips comments and
+  string literals (single, double, and triple-quoted) and tracks a stack of
+  open brackets; the topmost open `(` whose preceding token is a usable
+  identifier identifies the function being called, and the accumulated
+  comma count yields `activeParameter`. The identifier is resolved through
+  `symbol_resolution.resolve_symbol`, so cross-module re-exports hop through
+  transparently. Functions surface their declared signature; classes surface
+  `<Class>.__init__`'s signature with a leading `self` / `cls` stripped, or
+  an empty constructor signature when no `__init__` is defined. Parameters
+  are reported with LSP `[start, end]` substring offsets into the signature
+  label so editors can highlight the active parameter precisely. The
+  consumer entrypoint `WorkspaceSession.signature_help_at(path, line,
+  character)` returns a `SignatureHelp(label, parameters, active_parameter)`
+  dataclass.
 - Rename, via `textDocument/prepareRename` and `textDocument/rename` (advertised
   as `renameProvider: {prepareProvider: true}`). `prepareRename` returns the
   identifier range and a placeholder when the cursor is on a workspace symbol;
@@ -308,6 +329,16 @@ Consequences:
 
 - `textDocument/completion` (needs statement-context analysis).
 - `textDocument/codeAction`, `textDocument/formatting`.
+- `textDocument/signatureHelp` limitations:
+  - Attribute calls (`obj.method(`) and subscripted calls
+    (`factory[T](`) are not detected — the call-site scanner only looks
+    for a bare identifier immediately before `(`.
+  - Same-file calls whose enclosing `(` is still unclosed leave the file
+    unparseable, so symbol extraction returns no signature. Cross-file
+    calls keep working in this case because the *defining* file is
+    independent of the consumer's parse status.
+  - Default values are not part of the signature label
+    (`symbol_resolution.Parameter` carries only `name` and `annotation`).
 - Hover or goto-def on stdlib or installed-package symbols — resolution
   correctly classifies them as `stdlib` / `installed`, but the LSP does not
   synthesize a `Location` for out-of-workspace targets.

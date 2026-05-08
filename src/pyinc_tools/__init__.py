@@ -7,6 +7,8 @@ from .session import (
     RenameEdit,
     RenameResult,
     RenameStatus,
+    SignatureHelp,
+    SignatureParameterInfo,
     WorkspaceAnalysisResult,
     WorkspaceSession,
 )
@@ -20,6 +22,8 @@ __all__ = [
     "RenameEdit",
     "RenameResult",
     "RenameStatus",
+    "SignatureHelp",
+    "SignatureParameterInfo",
     "WorkspaceAnalysisResult",
     "WorkspaceSession",
 ]
