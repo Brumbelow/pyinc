@@ -10,6 +10,35 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/signatureHelp` in `pyinc-tools` LSP.** The server now
+  advertises `signatureHelpProvider: {triggerCharacters: ["(", ","],
+  retriggerCharacters: [","]}` and returns a `SignatureHelp` payload for the
+  call expression enclosing the cursor. A forward source scanner skips
+  comments and string literals (single, double, and triple-quoted) and tracks
+  a stack of open brackets; the topmost open `(` whose preceding token is a
+  usable identifier identifies the function being called, and the
+  accumulated comma count yields `activeParameter`. `def name(` and
+  `class Name(` definition headers and Python-keyword-prefixed `(` are
+  rejected so the cursor never lands on a non-call site. The detected
+  identifier is resolved through the existing
+  `symbol_resolution.resolve_symbol` pipeline (so cross-module re-exports
+  hop through transparently); only workspace-resolved targets produce a
+  signature. Functions surface their declared `Signature` directly; classes
+  surface `<Class>.__init__`'s signature with a leading `self`/`cls`
+  parameter stripped, or an empty constructor signature when no `__init__`
+  is defined. Stdlib/installed/ambiguous targets, attribute calls
+  (`obj.method(`), subscripted calls (`factory[T](`), and same-file calls
+  whose enclosing `(` is still unclosed (which makes the file unparseable
+  for symbol extraction) all return `null`. Each signature reports
+  parameters as LSP `[start, end]` substring offsets into the signature
+  label so editors can highlight the active parameter precisely. New
+  consumer-layer entrypoint `WorkspaceSession.signature_help_at(path, line,
+  character)` returns a `SignatureHelp(label, parameters,
+  active_parameter)` dataclass with `parameters` typed as
+  `tuple[SignatureParameterInfo, ...]`. New public names re-exported from
+  `pyinc_tools`: `SignatureHelp`, `SignatureParameterInfo`. Lives entirely
+  on top of the stable `pyinc.integrations` public surface — no kernel
+  contract change and no new integration-layer surface.
 - **`textDocument/documentHighlight` in `pyinc-tools` LSP.** The server now
   advertises `documentHighlightProvider: true` and returns
   `DocumentHighlight[]` ranges for the symbol under the cursor, scoped to the

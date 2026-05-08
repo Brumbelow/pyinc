@@ -29,6 +29,7 @@ from pyinc.integrations import (
     RequirementsAnalysis,
     ResolvedImportRef,
     ResolvedSymbol,
+    Signature,
     WorkspaceSymbolIndex,
     find_references,
     module_analysis,
@@ -127,6 +128,20 @@ class DocumentHighlight:
 
 
 @dataclass(frozen=True)
+class SignatureParameterInfo:
+    label: str
+    label_offset_start: int
+    label_offset_end: int
+
+
+@dataclass(frozen=True)
+class SignatureHelp:
+    label: str
+    parameters: tuple[SignatureParameterInfo, ...]
+    active_parameter: int | None
+
+
+@dataclass(frozen=True)
 class _DependencyInputs:
     config: ConfigAnalysis | None
     requirements: RequirementsAnalysis | None
@@ -154,6 +169,155 @@ def _resolve_import_from_target(
     anchor = package_parts[: len(package_parts) - (level - 1)]
     base_parts = [part for part in (module or "").split(".") if part]
     return ".".join(anchor + base_parts)
+
+
+def _line_char_to_offset(source: str, line: int, character: int) -> int | None:
+    pos = 0
+    current_line = 0
+    while current_line < line:
+        nl = source.find("\n", pos)
+        if nl == -1:
+            return None
+        pos = nl + 1
+        current_line += 1
+    line_end = source.find("\n", pos)
+    if line_end == -1:
+        line_end = len(source)
+    return pos + min(character, line_end - pos)
+
+
+def _identifier_immediately_before(source: str, paren_pos: int) -> str | None:
+    """Return the identifier appearing immediately before `(` at `paren_pos`.
+
+    Returns None when the preceding token is not a usable identifier — for
+    example a closing bracket, a literal, a Python keyword, or the name of
+    a `def` / `class` definition header (which is not a call site).
+    """
+    j = paren_pos - 1
+    while j >= 0 and source[j] in " \t":
+        j -= 1
+    if j < 0 or not (source[j].isalnum() or source[j] == "_"):
+        return None
+    end = j + 1
+    while j >= 0 and (source[j].isalnum() or source[j] == "_"):
+        j -= 1
+    start = j + 1
+    name = source[start:end]
+    if not name or name[0].isdigit():
+        return None
+    if keyword.iskeyword(name):
+        return None
+    k = start - 1
+    while k >= 0 and source[k] in " \t":
+        k -= 1
+    if k >= 0 and (source[k].isalnum() or source[k] == "_"):
+        prev_end = k + 1
+        prev_start = prev_end
+        while prev_start > 0 and (
+            source[prev_start - 1].isalnum() or source[prev_start - 1] == "_"
+        ):
+            prev_start -= 1
+        if source[prev_start:prev_end] in ("def", "class"):
+            return None
+    return name
+
+
+def _find_call_at_position(
+    source: str, line: int, character: int
+) -> tuple[str, int] | None:
+    """Locate the call-expression enclosing the cursor.
+
+    Returns ``(function_name, active_parameter_index)`` or ``None``.
+
+    The scanner runs forward over `source`, skipping comments and string
+    literals, and tracks a stack of open brackets. The topmost open `(`
+    whose preceding token is a usable identifier is the enclosing call;
+    its accumulated comma count yields the active parameter index. Only
+    bare-name calls are detected — attribute calls (``obj.method(``) and
+    subscripted calls (``factory[T](``) are not recognised.
+    """
+    target = _line_char_to_offset(source, line, character)
+    if target is None:
+        return None
+
+    stack: list[tuple[str, str | None, int]] = []
+    n = len(source)
+    i = 0
+    while i < n and i < target:
+        c = source[i]
+        if c == "#":
+            j = source.find("\n", i)
+            i = n if j == -1 else j + 1
+            continue
+        if c in ('"', "'"):
+            triple = c * 3
+            if source[i : i + 3] == triple:
+                end = source.find(triple, i + 3)
+                i = n if end == -1 else end + 3
+                continue
+            j = i + 1
+            while j < n:
+                ch = source[j]
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == c:
+                    j += 1
+                    break
+                if ch == "\n":
+                    j += 1
+                    break
+                j += 1
+            i = j
+            continue
+        if c in "([{":
+            name = _identifier_immediately_before(source, i) if c == "(" else None
+            stack.append((c, name, 0))
+            i += 1
+            continue
+        if c in ")]}":
+            opener = "(" if c == ")" else ("[" if c == "]" else "{")
+            if stack and stack[-1][0] == opener:
+                stack.pop()
+            i += 1
+            continue
+        if c == "," and stack:
+            opener_top, name_top, commas = stack[-1]
+            stack[-1] = (opener_top, name_top, commas + 1)
+        i += 1
+
+    for opener, name, commas in reversed(stack):
+        if opener == "(" and name is not None:
+            return name, commas
+    return None
+
+
+def _build_signature_label(
+    name: str, signature: Signature
+) -> tuple[str, tuple[SignatureParameterInfo, ...]]:
+    parts: list[str] = [f"def {name}("]
+    info: list[SignatureParameterInfo] = []
+    for index, parameter in enumerate(signature.parameters):
+        if index > 0:
+            parts.append(", ")
+        text = (
+            f"{parameter.name}: {parameter.annotation}"
+            if parameter.annotation is not None
+            else parameter.name
+        )
+        offset = sum(len(piece) for piece in parts)
+        parts.append(text)
+        info.append(
+            SignatureParameterInfo(
+                label=text,
+                label_offset_start=offset,
+                label_offset_end=offset + len(text),
+            )
+        )
+    parts.append(")")
+    if signature.return_annotation is not None:
+        parts.append(f" -> {signature.return_annotation}")
+    return "".join(parts), tuple(info)
 
 
 def _collect_filesystem_snapshot(
@@ -418,6 +582,89 @@ class WorkspaceSession:
                 )
             highlights.sort(key=lambda h: (h.lineno, h.col_offset))
             return tuple(highlights)
+
+    def signature_help_at(
+        self,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+    ) -> SignatureHelp | None:
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return None
+            located = _find_call_at_position(source, line, character)
+            if located is None:
+                return None
+            function_name, active_index = located
+            resolved = self._remap_resolved_symbol(
+                resolve_symbol(
+                    self.db, self.mirror_root, str(mirror_path), function_name
+                )
+            )
+            if resolved.resolution != "workspace":
+                return None
+            callable_info = self._lookup_callable_signature(resolved)
+            if callable_info is None:
+                return None
+            display_name, signature = callable_info
+            label, parameters = _build_signature_label(display_name, signature)
+            active_parameter = (
+                active_index if 0 <= active_index < len(parameters) else None
+            )
+            return SignatureHelp(
+                label=label,
+                parameters=parameters,
+                active_parameter=active_parameter,
+            )
+
+    def _lookup_callable_signature(
+        self, target: ResolvedSymbol
+    ) -> tuple[str, Signature] | None:
+        if target.defining_path is None or target.defining_lineno is None:
+            return None
+        defining_mirror = self._mirror_path_for_real(target.defining_path)
+        if not defining_mirror.exists() or defining_mirror.suffix != ".py":
+            return None
+        table = module_symbol_table(
+            self.db, self.mirror_root, str(defining_mirror)
+        )
+        matched = None
+        for symbol in table.symbols:
+            if symbol.lineno == target.defining_lineno and "." not in symbol.qualified_name:
+                matched = symbol
+                break
+        if matched is None:
+            return None
+        if matched.kind == "function" and matched.signature is not None:
+            return (matched.qualified_name, matched.signature)
+        if matched.kind == "class":
+            init_qualified = f"{matched.qualified_name}.__init__"
+            for inner in table.symbols:
+                if (
+                    inner.qualified_name == init_qualified
+                    and inner.signature is not None
+                ):
+                    init_params = inner.signature.parameters
+                    if init_params and init_params[0].name in ("self", "cls"):
+                        init_params = init_params[1:]
+                    return (
+                        matched.qualified_name,
+                        Signature(
+                            parameters=init_params,
+                            return_annotation=None,
+                        ),
+                    )
+            return (
+                matched.qualified_name,
+                Signature(parameters=(), return_annotation=None),
+            )
+        return None
 
     def rename_symbol(
         self,

@@ -249,6 +249,8 @@ class LanguageServer:
             return self._prepare_rename(params)
         if method == "textDocument/rename":
             return self._rename(params)
+        if method == "textDocument/signatureHelp":
+            return self._signature_help(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -365,6 +367,10 @@ class LanguageServer:
                 "referencesProvider": True,
                 "documentHighlightProvider": True,
                 "renameProvider": {"prepareProvider": True},
+                "signatureHelpProvider": {
+                    "triggerCharacters": ["(", ","],
+                    "retriggerCharacters": [","],
+                },
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
         }
@@ -655,6 +661,38 @@ class LanguageServer:
                 }
             )
         return {"changes": changes}
+
+    def _signature_help(self, params: Any) -> dict[str, Any] | None:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        try:
+            signature_help = session.signature_help_at(real_path, line, character)
+        except FileNotFoundError:
+            return None
+        if signature_help is None:
+            return None
+        signature_info: dict[str, Any] = {
+            "label": signature_help.label,
+            "parameters": [
+                {
+                    "label": [
+                        parameter.label_offset_start,
+                        parameter.label_offset_end,
+                    ],
+                }
+                for parameter in signature_help.parameters
+            ],
+        }
+        result: dict[str, Any] = {
+            "signatures": [signature_info],
+            "activeSignature": 0,
+        }
+        if signature_help.active_parameter is not None:
+            result["activeParameter"] = signature_help.active_parameter
+        return result
 
     def _workspace_root_from_params(self, params: Any) -> str:
         if isinstance(params, dict):
