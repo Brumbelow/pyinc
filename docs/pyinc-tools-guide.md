@@ -134,7 +134,8 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     "signatureHelpProvider": {
       "triggerCharacters": ["(", ","],
       "retriggerCharacters": [","]
-    }
+    },
+    "foldingRangeProvider": true
   },
   "serverInfo": { "name": "pyinc-tools", "version": "2.0.0" }
 }
@@ -168,6 +169,7 @@ channels does not produce duplicate messages.
 | `textDocument/definition` | Single `Location` via `resolve_symbol`; follows cross-module re-exports bounded by `MAX_FOLLOW_DEPTH = 8`. |
 | `textDocument/references` | `Location[]` via `find_references`; honors `context.includeDeclaration`; per-occurrence `col_offset` / `end_col_offset` ranges so editors can highlight each match. Only workspace-resolved targets are indexed — stdlib / installed / ambiguous targets return `[]`. |
 | `textDocument/documentHighlight` | `DocumentHighlight[]` for the symbol under the cursor, scoped to the current file. The declaration site is reported with `kind: 3` (Write); other occurrences with `kind: 1` (Text). The synthetic `find_references` placeholder for `def`/`class` declarations is repaired to the real identifier offset, so editors highlight the actual name and not the line's first character. Cross-file references returned by `find_references` are filtered out — workspace-wide highlighting is `textDocument/references`'s job. Stdlib / installed / ambiguous targets return `[]`. |
+| `textDocument/foldingRange` | `FoldingRange[]` for the requested document. AST-walked: `def`/`async def`/`class` blocks emit a generic-region fold (no `kind` field) starting at the header line — or the first decorator line if any decorators are attached — and ending at the AST `end_lineno`; class bodies recurse so methods fold independently. Consecutive top-level `import` / `from … import` statements are coalesced into one `kind: "imports"` fold; multi-line parenthesised imports collapse on their own. Single-line definitions and single-line single imports emit no fold. Files that fail to parse return `[]`. |
 | `textDocument/signatureHelp` | `SignatureHelp` for the call expression enclosing the cursor. A forward source scanner finds the topmost open `(` whose preceding token is a usable identifier, counts top-level commas to derive `activeParameter`, and resolves the identifier through `symbol_resolution.resolve_symbol`. Functions surface their declared signature; classes surface `<Class>.__init__` with a leading `self` / `cls` stripped, or an empty constructor signature when no `__init__` is defined. Stdlib / installed / ambiguous targets, attribute calls (`obj.method(`), subscripted calls (`factory[T](`), and `def`/`class` definition headers all return `null`. Parameters use LSP `[start, end]` substring offsets into the signature label. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
@@ -308,6 +310,21 @@ Consequences:
   consumer entrypoint `WorkspaceSession.signature_help_at(path, line,
   character)` returns a `SignatureHelp(label, parameters, active_parameter)`
   dataclass.
+- Folding ranges, via `textDocument/foldingRange` (advertised as
+  `foldingRangeProvider: true`). The server parses the document (overlay or
+  on-disk) once with `ast.parse` and emits a fold for every
+  `def` / `async def` / `class` block (header line — or the first decorator
+  line if any decorators are attached — kept visible, body folds), recursing
+  into class bodies so methods fold independently of their enclosing class.
+  Top-level `import` / `from … import` runs are coalesced into a single
+  `kind: "imports"` fold spanning the first to the last line of the run;
+  multi-line parenthesised imports collapse on their own. Single-line
+  definitions and single-line single imports emit no fold. Files that fail to
+  parse return `[]`. The consumer entrypoint
+  `WorkspaceSession.folding_ranges_for_file(path)` returns a tuple of
+  `FoldingRange(start_line, end_line, kind)` dataclasses with `kind` typed as
+  `Literal["imports", "comment", "region"]` (`start_line` / `end_line` are
+  1-based AST linenos; the LSP layer subtracts 1 for the LSP 0-based shape).
 - Rename, via `textDocument/prepareRename` and `textDocument/rename` (advertised
   as `renameProvider: {prepareProvider: true}`). `prepareRename` returns the
   identifier range and a placeholder when the cursor is on a workspace symbol;

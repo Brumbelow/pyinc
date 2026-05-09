@@ -54,6 +54,12 @@ _DOCUMENT_HIGHLIGHT_KINDS = {
     "write": 3,
 }
 
+_FOLDING_RANGE_KINDS = {
+    "comment": "comment",
+    "imports": "imports",
+    "region": "region",
+}
+
 _ID_START_RE = re.compile(r"[A-Za-z_]")
 _ID_CONT_RE = re.compile(r"[A-Za-z0-9_]")
 
@@ -251,6 +257,8 @@ class LanguageServer:
             return self._rename(params)
         if method == "textDocument/signatureHelp":
             return self._signature_help(params)
+        if method == "textDocument/foldingRange":
+            return self._folding_range(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -371,6 +379,7 @@ class LanguageServer:
                     "triggerCharacters": ["(", ","],
                     "retriggerCharacters": [","],
                 },
+                "foldingRangeProvider": True,
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
         }
@@ -693,6 +702,24 @@ class LanguageServer:
         if signature_help.active_parameter is not None:
             result["activeParameter"] = signature_help.active_parameter
         return result
+
+    def _folding_range(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        try:
+            ranges = session.folding_ranges_for_file(real_path)
+        except FileNotFoundError:
+            return []
+        payload: list[dict[str, Any]] = []
+        for fold in ranges:
+            entry: dict[str, Any] = {
+                "startLine": max(fold.start_line - 1, 0),
+                "endLine": max(fold.end_line - 1, 0),
+            }
+            if fold.kind != "region":
+                entry["kind"] = _FOLDING_RANGE_KINDS[fold.kind]
+            payload.append(entry)
+        return payload
 
     def _workspace_root_from_params(self, params: Any) -> str:
         if isinstance(params, dict):
