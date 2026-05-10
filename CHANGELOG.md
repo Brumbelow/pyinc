@@ -10,6 +10,32 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/foldingRange` in `pyinc-tools` LSP.** The server now
+  advertises `foldingRangeProvider: true` and returns `FoldingRange[]` for the
+  requested document. The implementation parses the file's source (overlay or
+  on-disk) once with `ast.parse` and walks the tree for foldable spans:
+  every `def` / `async def` / `class` block becomes a `region` fold whose
+  `startLine` is the header line (or the first decorator line if any
+  decorators are attached) and whose `endLine` is the AST `end_lineno`,
+  recursing into class bodies so methods fold independently of their
+  enclosing class. In addition, runs of consecutive top-level
+  `import` / `from … import` statements are coalesced into a single
+  `imports` fold spanning the first to the last line of the run; multi-line
+  parenthesised imports (`from x import (\n    a,\n    b,\n)`) collapse on
+  their own. Single-line definitions and single-line single imports emit no
+  fold (a fold of one line is a no-op for the editor). Files that fail to
+  parse return `[]`, mirroring how other LSP requests degrade on syntax
+  errors. The LSP `kind` field is omitted for generic `region` folds and
+  emitted as `"imports"` for the import-group case so older clients that
+  only recognise `"imports"` / `"comment"` still work. New consumer-layer
+  entrypoint `WorkspaceSession.folding_ranges_for_file(path)` returns a tuple
+  of `FoldingRange(start_line, end_line, kind)` dataclasses with `kind` typed
+  as `Literal["imports", "comment", "region"]` (1-based AST linenos so the
+  shape matches sibling entrypoints like `find_document_highlights`); the
+  LSP layer subtracts 1 to produce the LSP 0-based `startLine` / `endLine`.
+  New public names re-exported from `pyinc_tools`: `FoldingRange`,
+  `FoldingRangeKind`. Lives entirely on top of the stable `pyinc.integrations`
+  surface — no kernel contract change and no new integration-layer surface.
 - **`textDocument/signatureHelp` in `pyinc-tools` LSP.** The server now
   advertises `signatureHelpProvider: {triggerCharacters: ["(", ","],
   retriggerCharacters: [","]}` and returns a `SignatureHelp` payload for the

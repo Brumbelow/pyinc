@@ -141,6 +141,16 @@ class SignatureHelp:
     active_parameter: int | None
 
 
+FoldingRangeKind = Literal["imports", "comment", "region"]
+
+
+@dataclass(frozen=True)
+class FoldingRange:
+    start_line: int
+    end_line: int
+    kind: FoldingRangeKind
+
+
 @dataclass(frozen=True)
 class _DependencyInputs:
     config: ConfigAnalysis | None
@@ -318,6 +328,83 @@ def _build_signature_label(
     if signature.return_annotation is not None:
         parts.append(f" -> {signature.return_annotation}")
     return "".join(parts), tuple(info)
+
+
+def _compute_folding_ranges(source: str) -> tuple[FoldingRange, ...]:
+    """Walk the AST of `source` and emit `FoldingRange` entries.
+
+    Folds:
+    - `def`, `async def`, and `class` blocks (header line stays visible, body
+      folds). Decorated definitions start at the first decorator line so the
+      decorator block + def + body collapse together below that line.
+    - Runs of consecutive top-level `import` / `from ... import` statements
+      that span more than one source line in total. Mixed `import` and
+      `from-import` lines without a blank line between them are grouped.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ()
+
+    ranges: list[FoldingRange] = []
+
+    def walk_definitions(nodes: list[ast.stmt]) -> None:
+        for node in nodes:
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                if node.decorator_list:
+                    start = min(dec.lineno for dec in node.decorator_list)
+                else:
+                    start = node.lineno
+                end = node.end_lineno or node.lineno
+                if end > start:
+                    ranges.append(
+                        FoldingRange(
+                            start_line=start,
+                            end_line=end,
+                            kind="region",
+                        )
+                    )
+                walk_definitions(list(node.body))
+            elif isinstance(node, (ast.If, ast.For, ast.While, ast.With, ast.Try)):
+                walk_definitions(list(node.body))
+                walk_definitions(list(getattr(node, "orelse", []) or []))
+                walk_definitions(list(getattr(node, "finalbody", []) or []))
+                for handler in getattr(node, "handlers", []) or []:
+                    walk_definitions(list(handler.body))
+
+    walk_definitions(list(tree.body))
+
+    run_start: int | None = None
+    run_end: int | None = None
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if run_start is None:
+                run_start = node.lineno
+            run_end = node.end_lineno or node.lineno
+        else:
+            if run_start is not None and run_end is not None and run_end > run_start:
+                ranges.append(
+                    FoldingRange(
+                        start_line=run_start,
+                        end_line=run_end,
+                        kind="imports",
+                    )
+                )
+            run_start = None
+            run_end = None
+    if run_start is not None and run_end is not None and run_end > run_start:
+        ranges.append(
+            FoldingRange(
+                start_line=run_start,
+                end_line=run_end,
+                kind="imports",
+            )
+        )
+
+    ranges.sort(key=lambda r: (r.start_line, r.end_line))
+    return tuple(ranges)
 
 
 def _collect_filesystem_snapshot(
@@ -622,6 +709,21 @@ class WorkspaceSession:
                 parameters=parameters,
                 active_parameter=active_parameter,
             )
+
+    def folding_ranges_for_file(
+        self,
+        path: str | os.PathLike[str],
+    ) -> tuple[FoldingRange, ...]:
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            return _compute_folding_ranges(source)
 
     def _lookup_callable_signature(
         self, target: ResolvedSymbol

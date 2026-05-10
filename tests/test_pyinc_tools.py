@@ -9,6 +9,7 @@ import pytest
 
 from pyinc_tools.lsp import LanguageServer, _RequestFailed
 from pyinc_tools.session import (
+    FoldingRange,
     PollingWorkspaceWatcher,
     RenameEdit,
     WorkspaceSession,
@@ -2132,3 +2133,206 @@ def test_language_server_signature_help_outside_call_returns_none(
         if server._session is not None:
             server._session.close()
     assert result is None
+
+
+def test_folding_ranges_cover_function_class_and_method_bodies(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def foo(x: int) -> int:\n"
+        "    if x:\n"
+        "        return 1\n"
+        "    return 2\n"
+        "\n"
+        "class Box:\n"
+        "    def method(self) -> int:\n"
+        "        return 1\n"
+        "\n"
+        "    def other(self) -> int:\n"
+        "        return 2\n",
+    )
+    with WorkspaceSession(root) as session:
+        ranges = session.folding_ranges_for_file(target)
+    assert FoldingRange(start_line=1, end_line=4, kind="region") in ranges
+    assert FoldingRange(start_line=6, end_line=11, kind="region") in ranges
+    assert FoldingRange(start_line=7, end_line=8, kind="region") in ranges
+    assert FoldingRange(start_line=10, end_line=11, kind="region") in ranges
+
+
+def test_folding_ranges_decorated_function_starts_at_first_decorator(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "@first\n"
+        "@second\n"
+        "def decorated(x: int) -> int:\n"
+        "    return x\n",
+    )
+    with WorkspaceSession(root) as session:
+        ranges = session.folding_ranges_for_file(target)
+    assert ranges == (FoldingRange(start_line=1, end_line=4, kind="region"),)
+
+
+def test_folding_ranges_group_consecutive_top_level_imports(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "import a\n"
+        "import b\n"
+        "from c import d\n"
+        "\n"
+        "def main() -> int:\n"
+        "    return 0\n",
+    )
+    with WorkspaceSession(root) as session:
+        ranges = session.folding_ranges_for_file(target)
+    assert FoldingRange(start_line=1, end_line=3, kind="imports") in ranges
+    assert FoldingRange(start_line=5, end_line=6, kind="region") in ranges
+
+
+def test_folding_ranges_collapse_multi_line_from_import(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "from c import (\n"
+        "    d,\n"
+        "    e,\n"
+        ")\n",
+    )
+    with WorkspaceSession(root) as session:
+        ranges = session.folding_ranges_for_file(target)
+    assert ranges == (FoldingRange(start_line=1, end_line=4, kind="imports"),)
+
+
+def test_folding_ranges_skip_single_line_definitions(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "import a\nx = 1\n")
+    with WorkspaceSession(root) as session:
+        ranges = session.folding_ranges_for_file(target)
+    assert ranges == ()
+
+
+def test_folding_ranges_invalid_syntax_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def broken(\n")
+    with WorkspaceSession(root) as session:
+        ranges = session.folding_ranges_for_file(target)
+    assert ranges == ()
+
+
+def test_folding_ranges_overlay_sees_edit(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n")
+    with WorkspaceSession(root) as session:
+        before = session.folding_ranges_for_file(target)
+        assert FoldingRange(start_line=1, end_line=2, kind="region") in before
+
+        session.set_overlay(
+            target,
+            "def foo() -> int:\n"
+            "    if True:\n"
+            "        return 1\n"
+            "    return 2\n",
+        )
+        after = session.folding_ranges_for_file(target)
+    assert FoldingRange(start_line=1, end_line=4, kind="region") in after
+
+
+def test_folding_ranges_for_missing_file_raises_filenotfound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with WorkspaceSession(root) as session, pytest.raises(FileNotFoundError):
+        session.folding_ranges_for_file(root / "missing.py")
+
+
+def test_language_server_advertises_folding_range_provider(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        assert init["capabilities"]["foldingRangeProvider"] is True
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_folding_range_returns_lsp_payload(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "import a\n"
+        "import b\n"
+        "\n"
+        "def foo() -> int:\n"
+        "    return 1\n"
+        "\n"
+        "class Box:\n"
+        "    def method(self) -> int:\n"
+        "        return 2\n",
+    )
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/foldingRange",
+            {"textDocument": {"uri": target.as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert {"startLine": 0, "endLine": 1, "kind": "imports"} in result
+    assert {"startLine": 3, "endLine": 4} in result
+    assert {"startLine": 6, "endLine": 8} in result
+    assert {"startLine": 7, "endLine": 8} in result
+    for entry in result:
+        assert "kind" not in entry or entry["kind"] in ("imports", "comment", "region")
+
+
+def test_language_server_folding_range_for_unparseable_file_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def broken(\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/foldingRange",
+            {"textDocument": {"uri": target.as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result == []
