@@ -152,6 +152,14 @@ class FoldingRange:
 
 
 @dataclass(frozen=True)
+class SelectionRange:
+    start_line: int
+    start_character: int
+    end_line: int
+    end_character: int
+
+
+@dataclass(frozen=True)
 class _DependencyInputs:
     config: ConfigAnalysis | None
     requirements: RequirementsAnalysis | None
@@ -405,6 +413,100 @@ def _compute_folding_ranges(source: str) -> tuple[FoldingRange, ...]:
 
     ranges.sort(key=lambda r: (r.start_line, r.end_line))
     return tuple(ranges)
+
+
+def _compute_selection_chain(
+    source: str, line: int, character: int
+) -> tuple[SelectionRange, ...]:
+    """Walk the AST of `source` and return a chain of nested ranges around the cursor.
+
+    The chain is ordered innermost-first; each subsequent entry strictly contains its
+    predecessor. Coordinates are 0-based (LSP-style) for both line and character.
+    Returns `()` when the file fails to parse, the cursor is out of bounds, or no AST
+    node contains the cursor.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ()
+
+    line_starts = [0]
+    for index, char in enumerate(source):
+        if char == "\n":
+            line_starts.append(index + 1)
+    line_count = len(line_starts)
+
+    if line < 0 or line >= line_count:
+        return ()
+    line_start = line_starts[line]
+    line_end = line_starts[line + 1] - 1 if line + 1 < line_count else len(source)
+    if character < 0 or line_start + character > line_end + 1:
+        return ()
+    cursor = line_start + character
+
+    candidates: set[tuple[int, int]] = set()
+    for node in ast.walk(tree):
+        start_lineno = getattr(node, "lineno", None)
+        start_col = getattr(node, "col_offset", None)
+        end_lineno = getattr(node, "end_lineno", None)
+        end_col = getattr(node, "end_col_offset", None)
+        if (
+            start_lineno is None
+            or start_col is None
+            or end_lineno is None
+            or end_col is None
+        ):
+            continue
+        if start_lineno < 1 or start_lineno > line_count:
+            continue
+        if end_lineno < 1 or end_lineno > line_count:
+            continue
+        start_offset = line_starts[start_lineno - 1] + start_col
+        end_offset = line_starts[end_lineno - 1] + end_col
+        if start_offset <= cursor <= end_offset and start_offset != end_offset:
+            candidates.add((start_offset, end_offset))
+
+    if not candidates:
+        return ()
+
+    sorted_candidates = sorted(candidates, key=lambda pair: (pair[1] - pair[0], pair[0]))
+
+    chain: list[tuple[int, int]] = []
+    for start_offset, end_offset in sorted_candidates:
+        if not chain:
+            chain.append((start_offset, end_offset))
+            continue
+        prev_start, prev_end = chain[-1]
+        if (
+            start_offset <= prev_start
+            and end_offset >= prev_end
+            and (start_offset < prev_start or end_offset > prev_end)
+        ):
+            chain.append((start_offset, end_offset))
+
+    def offset_to_position(offset: int) -> tuple[int, int]:
+        lo, hi = 0, line_count - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if line_starts[mid] <= offset:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo, offset - line_starts[lo]
+
+    selection_ranges: list[SelectionRange] = []
+    for start_offset, end_offset in chain:
+        sl, sc = offset_to_position(start_offset)
+        el, ec = offset_to_position(end_offset)
+        selection_ranges.append(
+            SelectionRange(
+                start_line=sl,
+                start_character=sc,
+                end_line=el,
+                end_character=ec,
+            )
+        )
+    return tuple(selection_ranges)
 
 
 def _collect_filesystem_snapshot(
@@ -724,6 +826,23 @@ class WorkspaceSession:
             if source is None:
                 return ()
             return _compute_folding_ranges(source)
+
+    def selection_ranges_at(
+        self,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+    ) -> tuple[SelectionRange, ...]:
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            return _compute_selection_chain(source, line, character)
 
     def _lookup_callable_signature(
         self, target: ResolvedSymbol

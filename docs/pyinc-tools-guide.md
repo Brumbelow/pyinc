@@ -135,7 +135,8 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
       "triggerCharacters": ["(", ","],
       "retriggerCharacters": [","]
     },
-    "foldingRangeProvider": true
+    "foldingRangeProvider": true,
+    "selectionRangeProvider": true
   },
   "serverInfo": { "name": "pyinc-tools", "version": "2.0.0" }
 }
@@ -170,6 +171,7 @@ channels does not produce duplicate messages.
 | `textDocument/references` | `Location[]` via `find_references`; honors `context.includeDeclaration`; per-occurrence `col_offset` / `end_col_offset` ranges so editors can highlight each match. Only workspace-resolved targets are indexed — stdlib / installed / ambiguous targets return `[]`. |
 | `textDocument/documentHighlight` | `DocumentHighlight[]` for the symbol under the cursor, scoped to the current file. The declaration site is reported with `kind: 3` (Write); other occurrences with `kind: 1` (Text). The synthetic `find_references` placeholder for `def`/`class` declarations is repaired to the real identifier offset, so editors highlight the actual name and not the line's first character. Cross-file references returned by `find_references` are filtered out — workspace-wide highlighting is `textDocument/references`'s job. Stdlib / installed / ambiguous targets return `[]`. |
 | `textDocument/foldingRange` | `FoldingRange[]` for the requested document. AST-walked: `def`/`async def`/`class` blocks emit a generic-region fold (no `kind` field) starting at the header line — or the first decorator line if any decorators are attached — and ending at the AST `end_lineno`; class bodies recurse so methods fold independently. Consecutive top-level `import` / `from … import` statements are coalesced into one `kind: "imports"` fold; multi-line parenthesised imports collapse on their own. Single-line definitions and single-line single imports emit no fold. Files that fail to parse return `[]`. |
+| `textDocument/selectionRange` | `SelectionRange[]` (one entry per requested position). Each entry is a chain of nested ranges encoded via the recursive `parent` field: innermost first, each parent strictly contains its child. The chain is computed by parsing the document (overlay or on-disk) once with `ast.parse` and collecting every AST node whose `(lineno, col_offset)`–`(end_lineno, end_col_offset)` span contains the cursor; duplicates are collapsed and the result is filtered to a strict containment chain ordered by length. Files that fail to parse, positions outside the source, or positions that no AST node covers fall back to a single zero-width range at the cursor so the LSP result length always matches `params.positions` length. |
 | `textDocument/signatureHelp` | `SignatureHelp` for the call expression enclosing the cursor. A forward source scanner finds the topmost open `(` whose preceding token is a usable identifier, counts top-level commas to derive `activeParameter`, and resolves the identifier through `symbol_resolution.resolve_symbol`. Functions surface their declared signature; classes surface `<Class>.__init__` with a leading `self` / `cls` stripped, or an empty constructor signature when no `__init__` is defined. Stdlib / installed / ambiguous targets, attribute calls (`obj.method(`), subscripted calls (`factory[T](`), and `def`/`class` definition headers all return `null`. Parameters use LSP `[start, end]` substring offsets into the signature label. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
@@ -325,6 +327,24 @@ Consequences:
   `FoldingRange(start_line, end_line, kind)` dataclasses with `kind` typed as
   `Literal["imports", "comment", "region"]` (`start_line` / `end_line` are
   1-based AST linenos; the LSP layer subtracts 1 for the LSP 0-based shape).
+- Selection ranges, via `textDocument/selectionRange` (advertised as
+  `selectionRangeProvider: true`). For each requested cursor position the
+  server returns a chain of nested ranges (innermost-first, encoded via the
+  recursive `parent` field) that powers the editor's "expand selection" /
+  "shrink selection" command. The chain is computed by parsing the document
+  (overlay or on-disk) once with `ast.parse` and collecting every AST node
+  whose `(lineno, col_offset)`–`(end_lineno, end_col_offset)` span contains
+  the cursor; duplicate-span nodes are collapsed and the result is reduced to
+  a strict containment chain ordered by length so each parent is strictly
+  larger than its child. Files that fail to parse, positions outside the
+  source, or positions that no AST node covers fall back to a single
+  zero-width range at the cursor so the LSP result length always matches
+  the requested `params.positions` length. The consumer entrypoint
+  `WorkspaceSession.selection_ranges_at(path, line, character)` returns a
+  flat tuple of `SelectionRange(start_line, start_character, end_line,
+  end_character)` dataclasses with all four fields 0-based (LSP-style), or
+  an empty tuple when no chain can be computed; the LSP layer threads the
+  flat tuple into the recursive `parent` shape.
 - Rename, via `textDocument/prepareRename` and `textDocument/rename` (advertised
   as `renameProvider: {prepareProvider: true}`). `prepareRename` returns the
   identifier range and a placeholder when the cursor is on a workspace symbol;

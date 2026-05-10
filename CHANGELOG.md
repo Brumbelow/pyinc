@@ -10,6 +10,27 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/selectionRange` in `pyinc-tools` LSP.** The server now
+  advertises `selectionRangeProvider: true` and returns one `SelectionRange`
+  chain per requested position, encoded innermost-first via the recursive
+  `parent` field. The chain is computed by parsing the document (overlay or
+  on-disk) once with `ast.parse`, collecting every AST node whose
+  `(lineno, col_offset)`–`(end_lineno, end_col_offset)` span contains the
+  cursor, deduplicating identical spans, and reducing the candidates to a
+  strict containment chain ordered by length so each parent is strictly
+  larger than its child. The cursor offset is computed against a precomputed
+  table of line starts so multi-line spans (function bodies, class bodies,
+  multi-statement blocks) are mapped correctly. Files that fail to parse,
+  positions outside the source, or positions that no AST node covers all
+  fall back to a single zero-width range at the cursor so the LSP result
+  length always matches `params.positions` length. New consumer-layer
+  entrypoint `WorkspaceSession.selection_ranges_at(path, line, character)`
+  returns a flat tuple of `SelectionRange(start_line, start_character,
+  end_line, end_character)` dataclasses with all four fields 0-based
+  (LSP-style); the LSP handler threads that flat tuple into the recursive
+  `parent` shape. New public name re-exported from `pyinc_tools`:
+  `SelectionRange`. Lives entirely on top of the stable `pyinc.integrations`
+  surface — no kernel contract change and no new integration-layer surface.
 - **`textDocument/foldingRange` in `pyinc-tools` LSP.** The server now
   advertises `foldingRangeProvider: true` and returns `FoldingRange[]` for the
   requested document. The implementation parses the file's source (overlay or

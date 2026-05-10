@@ -259,6 +259,8 @@ class LanguageServer:
             return self._signature_help(params)
         if method == "textDocument/foldingRange":
             return self._folding_range(params)
+        if method == "textDocument/selectionRange":
+            return self._selection_range(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -380,6 +382,7 @@ class LanguageServer:
                     "retriggerCharacters": [","],
                 },
                 "foldingRangeProvider": True,
+                "selectionRangeProvider": True,
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
         }
@@ -720,6 +723,49 @@ class LanguageServer:
                 entry["kind"] = _FOLDING_RANGE_KINDS[fold.kind]
             payload.append(entry)
         return payload
+
+    def _selection_range(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        positions = params.get("positions") or []
+        results: list[dict[str, Any]] = []
+        for position in positions:
+            line = int(position["line"])
+            character = int(position["character"])
+            try:
+                chain = session.selection_ranges_at(real_path, line, character)
+            except FileNotFoundError:
+                chain = ()
+            if not chain:
+                results.append(
+                    {
+                        "range": {
+                            "start": {"line": line, "character": character},
+                            "end": {"line": line, "character": character},
+                        }
+                    }
+                )
+                continue
+            payload: dict[str, Any] | None = None
+            for entry in reversed(chain):
+                node: dict[str, Any] = {
+                    "range": {
+                        "start": {
+                            "line": entry.start_line,
+                            "character": entry.start_character,
+                        },
+                        "end": {
+                            "line": entry.end_line,
+                            "character": entry.end_character,
+                        },
+                    }
+                }
+                if payload is not None:
+                    node["parent"] = payload
+                payload = node
+            assert payload is not None
+            results.append(payload)
+        return results
 
     def _workspace_root_from_params(self, params: Any) -> str:
         if isinstance(params, dict):

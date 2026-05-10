@@ -12,6 +12,7 @@ from pyinc_tools.session import (
     FoldingRange,
     PollingWorkspaceWatcher,
     RenameEdit,
+    SelectionRange,
     WorkspaceSession,
 )
 
@@ -2336,3 +2337,238 @@ def test_language_server_folding_range_for_unparseable_file_returns_empty(
         if server._session is not None:
             server._session.close()
     assert result == []
+
+
+def test_selection_ranges_chain_innermost_to_outermost(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def foo(x: int) -> int:\n"
+        "    return x + 1\n",
+    )
+    with WorkspaceSession(root) as session:
+        # cursor on the `x` in `return x + 1` (line 1, character 11)
+        chain = session.selection_ranges_at(target, 1, 11)
+
+    assert len(chain) >= 3
+    # Innermost is the bare Name `x`.
+    assert chain[0] == SelectionRange(
+        start_line=1, start_character=11, end_line=1, end_character=12
+    )
+    # Each subsequent range strictly contains its predecessor.
+    for inner, outer in zip(chain, chain[1:], strict=False):
+        assert (outer.start_line, outer.start_character) <= (
+            inner.start_line,
+            inner.start_character,
+        )
+        assert (outer.end_line, outer.end_character) >= (
+            inner.end_line,
+            inner.end_character,
+        )
+        assert (outer.start_line, outer.start_character, outer.end_line, outer.end_character) != (
+            inner.start_line,
+            inner.start_character,
+            inner.end_line,
+            inner.end_character,
+        )
+    # Outermost reaches the function definition (line 0..1).
+    outermost = chain[-1]
+    assert outermost.start_line == 0
+    assert outermost.end_line == 1
+
+
+def test_selection_ranges_for_attribute_access_picks_up_each_subexpression(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "v = a.b.c\n")
+    with WorkspaceSession(root) as session:
+        # cursor on the `c` in `a.b.c` (line 0, character 9)
+        chain = session.selection_ranges_at(target, 0, 8)
+
+    starts_and_ends = [(r.start_character, r.end_character) for r in chain]
+    # Expect at least: `c` (8,9), `a.b.c` (4,9), full assignment (0,9).
+    assert (0, 9) in starts_and_ends
+    assert (4, 9) in starts_and_ends
+
+
+def test_selection_ranges_for_invalid_syntax_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def broken(\n")
+    with WorkspaceSession(root) as session:
+        chain = session.selection_ranges_at(target, 0, 4)
+    assert chain == ()
+
+
+def test_selection_ranges_for_position_out_of_bounds_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "x = 1\n")
+    with WorkspaceSession(root) as session:
+        assert session.selection_ranges_at(target, 99, 0) == ()
+        assert session.selection_ranges_at(target, -1, 0) == ()
+        assert session.selection_ranges_at(target, 0, 99) == ()
+
+
+def test_selection_ranges_overlay_sees_edit(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "x = 1\n")
+    with WorkspaceSession(root) as session:
+        before = session.selection_ranges_at(target, 0, 4)
+        assert any(r.end_character == 5 for r in before)
+
+        session.set_overlay(target, "x = 1 + 2 + 3\n")
+        after = session.selection_ranges_at(target, 0, 4)
+    assert any(r.end_character == 13 for r in after)
+
+
+def test_selection_ranges_for_missing_file_raises_filenotfound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with WorkspaceSession(root) as session, pytest.raises(FileNotFoundError):
+        session.selection_ranges_at(root / "missing.py", 0, 0)
+
+
+def test_language_server_advertises_selection_range_provider(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        assert init["capabilities"]["selectionRangeProvider"] is True
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_selection_range_returns_lsp_payload(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def foo(x: int) -> int:\n"
+        "    return x + 1\n",
+    )
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/selectionRange",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "positions": [{"line": 1, "character": 11}],
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert isinstance(result, list)
+    assert len(result) == 1
+    head = result[0]
+    # Innermost: bare Name `x`.
+    assert head["range"] == {
+        "start": {"line": 1, "character": 11},
+        "end": {"line": 1, "character": 12},
+    }
+    # Walk parent chain — each parent must contain its child.
+    current = head
+    seen = 1
+    while "parent" in current:
+        parent = current["parent"]
+        assert (
+            parent["range"]["start"]["line"],
+            parent["range"]["start"]["character"],
+        ) <= (
+            current["range"]["start"]["line"],
+            current["range"]["start"]["character"],
+        )
+        assert (
+            parent["range"]["end"]["line"],
+            parent["range"]["end"]["character"],
+        ) >= (
+            current["range"]["end"]["line"],
+            current["range"]["end"]["character"],
+        )
+        current = parent
+        seen += 1
+    assert seen >= 3
+
+
+def test_language_server_selection_range_emits_zero_width_for_unparseable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def broken(\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/selectionRange",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "positions": [{"line": 0, "character": 4}],
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result == [
+        {
+            "range": {
+                "start": {"line": 0, "character": 4},
+                "end": {"line": 0, "character": 4},
+            }
+        }
+    ]
+
+
+def test_language_server_selection_range_handles_multiple_positions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "x = 1\ny = 2\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/selectionRange",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "positions": [
+                    {"line": 0, "character": 0},
+                    {"line": 1, "character": 0},
+                ],
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert isinstance(result, list)
+    assert len(result) == 2
+    # Each entry contains its own first range starting at (line, 0).
+    assert result[0]["range"]["start"] == {"line": 0, "character": 0}
+    assert result[1]["range"]["start"] == {"line": 1, "character": 0}
