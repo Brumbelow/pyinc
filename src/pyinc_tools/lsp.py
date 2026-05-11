@@ -261,6 +261,8 @@ class LanguageServer:
             return self._folding_range(params)
         if method == "textDocument/selectionRange":
             return self._selection_range(params)
+        if method == "textDocument/documentLink":
+            return self._document_link(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -383,6 +385,7 @@ class LanguageServer:
                 },
                 "foldingRangeProvider": True,
                 "selectionRangeProvider": True,
+                "documentLinkProvider": {"resolveProvider": False},
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
         }
@@ -766,6 +769,30 @@ class LanguageServer:
             assert payload is not None
             results.append(payload)
         return results
+
+    def _document_link(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        try:
+            links = session.document_links_for_file(real_path)
+        except FileNotFoundError:
+            return []
+        return [
+            {
+                "range": {
+                    "start": {
+                        "line": link.start_line,
+                        "character": link.start_character,
+                    },
+                    "end": {
+                        "line": link.end_line,
+                        "character": link.end_character,
+                    },
+                },
+                "target": _path_to_uri(link.target_path),
+            }
+            for link in links
+        ]
 
     def _workspace_root_from_params(self, params: Any) -> str:
         if isinstance(params, dict):

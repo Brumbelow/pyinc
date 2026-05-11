@@ -136,7 +136,8 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
       "retriggerCharacters": [","]
     },
     "foldingRangeProvider": true,
-    "selectionRangeProvider": true
+    "selectionRangeProvider": true,
+    "documentLinkProvider": { "resolveProvider": false }
   },
   "serverInfo": { "name": "pyinc-tools", "version": "2.0.0" }
 }
@@ -172,6 +173,7 @@ channels does not produce duplicate messages.
 | `textDocument/documentHighlight` | `DocumentHighlight[]` for the symbol under the cursor, scoped to the current file. The declaration site is reported with `kind: 3` (Write); other occurrences with `kind: 1` (Text). The synthetic `find_references` placeholder for `def`/`class` declarations is repaired to the real identifier offset, so editors highlight the actual name and not the line's first character. Cross-file references returned by `find_references` are filtered out — workspace-wide highlighting is `textDocument/references`'s job. Stdlib / installed / ambiguous targets return `[]`. |
 | `textDocument/foldingRange` | `FoldingRange[]` for the requested document. AST-walked: `def`/`async def`/`class` blocks emit a generic-region fold (no `kind` field) starting at the header line — or the first decorator line if any decorators are attached — and ending at the AST `end_lineno`; class bodies recurse so methods fold independently. Consecutive top-level `import` / `from … import` statements are coalesced into one `kind: "imports"` fold; multi-line parenthesised imports collapse on their own. Single-line definitions and single-line single imports emit no fold. Files that fail to parse return `[]`. |
 | `textDocument/selectionRange` | `SelectionRange[]` (one entry per requested position). Each entry is a chain of nested ranges encoded via the recursive `parent` field: innermost first, each parent strictly contains its child. The chain is computed by parsing the document (overlay or on-disk) once with `ast.parse` and collecting every AST node whose `(lineno, col_offset)`–`(end_lineno, end_col_offset)` span contains the cursor; duplicates are collapsed and the result is filtered to a strict containment chain ordered by length. Files that fail to parse, positions outside the source, or positions that no AST node covers fall back to a single zero-width range at the cursor so the LSP result length always matches `params.positions` length. |
+| `textDocument/documentLink` | `DocumentLink[]` for the requested document. The server walks the document's AST and emits one link per `ast.alias` whose enclosing `Import` / `ImportFrom` resolves to a workspace file. For `import M [as alias]` the link spans the whole `M [as alias]` clause and points at `M`'s resolved file; for `from M import a, b` each imported name is linked individually to its own resolved path (a submodule import like `from pkg import child` resolves to `child.py`, not `pkg/__init__.py`). Stdlib / installed / missing / ambiguous targets and `from M import *` emit no link. Files that fail to parse return `[]`. |
 | `textDocument/signatureHelp` | `SignatureHelp` for the call expression enclosing the cursor. A forward source scanner finds the topmost open `(` whose preceding token is a usable identifier, counts top-level commas to derive `activeParameter`, and resolves the identifier through `symbol_resolution.resolve_symbol`. Functions surface their declared signature; classes surface `<Class>.__init__` with a leading `self` / `cls` stripped, or an empty constructor signature when no `__init__` is defined. Stdlib / installed / ambiguous targets, attribute calls (`obj.method(`), subscripted calls (`factory[T](`), and `def`/`class` definition headers all return `null`. Parameters use LSP `[start, end]` substring offsets into the signature label. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
@@ -345,6 +347,26 @@ Consequences:
   end_character)` dataclasses with all four fields 0-based (LSP-style), or
   an empty tuple when no chain can be computed; the LSP layer threads the
   flat tuple into the recursive `parent` shape.
+- Document links, via `textDocument/documentLink` (advertised as
+  `documentLinkProvider: {resolveProvider: false}`). For each
+  `import` / `from … import` statement that resolves to a workspace file,
+  the server emits a `DocumentLink` whose range covers the relevant alias
+  span and whose target points at the resolved file. `import M [as alias]`
+  emits a single link spanning the whole `M [as alias]` clause that targets
+  `M`'s resolved file; `from M import a, b` emits one link per imported
+  name, each targeting that name's own resolved path (so a submodule import
+  like `from pkg import child` jumps to `child.py`, not `pkg/__init__.py`).
+  Stdlib / installed / missing / ambiguous targets and `from M import *`
+  emit no link, matching the LSP's existing scope of navigating only to
+  workspace-resolved targets. Imports inside `if TYPE_CHECKING:` and
+  `try: … except ImportError:` guard blocks are linked since
+  `resolved_imports_for_file` walks into both. Files that fail to parse
+  return `[]`. The consumer entrypoint
+  `WorkspaceSession.document_links_for_file(path)` returns a tuple of
+  `DocumentLink(start_line, start_character, end_line, end_character,
+  target_path)` dataclasses with all four position fields 0-based
+  (LSP-style); `target_path` is already remapped from the mirror root back
+  to the real workspace root.
 - Rename, via `textDocument/prepareRename` and `textDocument/rename` (advertised
   as `renameProvider: {prepareProvider: true}`). `prepareRename` returns the
   identifier range and a placeholder when the cursor is on a workspace symbol;

@@ -9,6 +9,7 @@ import pytest
 
 from pyinc_tools.lsp import LanguageServer, _RequestFailed
 from pyinc_tools.session import (
+    DocumentLink,
     FoldingRange,
     PollingWorkspaceWatcher,
     RenameEdit,
@@ -2572,3 +2573,257 @@ def test_language_server_selection_range_handles_multiple_positions(
     # Each entry contains its own first range starting at (line, 0).
     assert result[0]["range"]["start"] == {"line": 0, "character": 0}
     assert result[1]["range"]["start"] == {"line": 1, "character": 0}
+
+
+def test_document_links_for_plain_import_targets_module_file(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def greet() -> str:\n    return 'hi'\n")
+    consumer = root / "app.py"
+    _write(consumer, "import helper\n\nprint(helper.greet())\n")
+
+    with WorkspaceSession(root) as session:
+        links = session.document_links_for_file(consumer)
+
+    assert links == (
+        DocumentLink(
+            start_line=0,
+            start_character=len("import "),
+            end_line=0,
+            end_character=len("import ") + len("helper"),
+            target_path=str(root / "helper.py"),
+        ),
+    )
+
+
+def test_document_links_for_import_as_covers_alias_span(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "x = 1\n")
+    consumer = root / "app.py"
+    _write(consumer, "import helper as h\n")
+
+    with WorkspaceSession(root) as session:
+        links = session.document_links_for_file(consumer)
+
+    # The AST alias span covers `helper as h` end-to-end, which matches what most
+    # LSP clients underline.
+    assert len(links) == 1
+    link = links[0]
+    assert link.start_line == 0
+    assert link.start_character == len("import ")
+    assert link.end_character == len("import helper as h")
+    assert link.target_path == str(root / "helper.py")
+
+
+def test_document_links_for_from_import_link_each_alias(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "ALPHA = 1\nBETA = 2\n")
+    consumer = root / "app.py"
+    _write(consumer, "from helper import ALPHA, BETA\n")
+
+    with WorkspaceSession(root) as session:
+        links = session.document_links_for_file(consumer)
+
+    assert len(links) == 2
+    by_char = sorted(links, key=lambda link: link.start_character)
+    alpha, beta = by_char
+    assert alpha.start_character == len("from helper import ")
+    assert alpha.end_character == len("from helper import ALPHA")
+    assert alpha.target_path == str(root / "helper.py")
+    assert beta.start_character == len("from helper import ALPHA, ")
+    assert beta.end_character == len("from helper import ALPHA, BETA")
+    assert beta.target_path == str(root / "helper.py")
+
+
+def test_document_links_for_from_import_submodule_targets_submodule(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    pkg = root / "pkg"
+    pkg.mkdir()
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "child.py", "x = 1\n")
+    consumer = root / "app.py"
+    _write(consumer, "from pkg import child\n")
+
+    with WorkspaceSession(root) as session:
+        links = session.document_links_for_file(consumer)
+
+    # `from pkg import child` resolves `child` to the submodule file, not to
+    # `pkg/__init__.py`, so clicking the alias jumps directly to child.py.
+    assert links == (
+        DocumentLink(
+            start_line=0,
+            start_character=len("from pkg import "),
+            end_line=0,
+            end_character=len("from pkg import child"),
+            target_path=str(pkg / "child.py"),
+        ),
+    )
+
+
+def test_document_links_skip_stdlib_and_missing_imports(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "app.py"
+    _write(consumer, "import os\nimport nonexistent_xyz\n")
+
+    with WorkspaceSession(root) as session:
+        links = session.document_links_for_file(consumer)
+
+    # Stdlib and unresolved targets do not get links — the LSP only navigates
+    # to workspace targets.
+    assert links == ()
+
+
+def test_document_links_skip_wildcard_imports(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "__all__ = ['x']\nx = 1\n")
+    consumer = root / "app.py"
+    _write(consumer, "from helper import *\n")
+
+    with WorkspaceSession(root) as session:
+        links = session.document_links_for_file(consumer)
+
+    # `*` is not a navigable target; skip it.
+    assert links == ()
+
+
+def test_document_links_for_multiline_from_import(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "A = 1\nB = 2\n")
+    consumer = root / "app.py"
+    _write(consumer, "from helper import (\n    A,\n    B,\n)\n")
+
+    with WorkspaceSession(root) as session:
+        links = session.document_links_for_file(consumer)
+
+    assert len(links) == 2
+    by_line = {link.start_line: link for link in links}
+    assert set(by_line) == {1, 2}
+    assert by_line[1].start_character == 4
+    assert by_line[1].end_character == 5
+    assert by_line[2].start_character == 4
+    assert by_line[2].end_character == 5
+    for link in links:
+        assert link.target_path == str(root / "helper.py")
+
+
+def test_document_links_invalid_syntax_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "app.py"
+    _write(consumer, "import (\n")
+
+    with WorkspaceSession(root) as session:
+        links = session.document_links_for_file(consumer)
+
+    assert links == ()
+
+
+def test_document_links_overlay_sees_edit(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "x = 1\n")
+    _write(root / "other.py", "y = 2\n")
+    consumer = root / "app.py"
+    _write(consumer, "import helper\n")
+
+    with WorkspaceSession(root) as session:
+        before = session.document_links_for_file(consumer)
+        assert len(before) == 1
+        assert before[0].target_path == str(root / "helper.py")
+
+        session.set_overlay(str(consumer), "import other\n")
+        after = session.document_links_for_file(consumer)
+        assert len(after) == 1
+        assert after[0].target_path == str(root / "other.py")
+
+
+def test_document_links_for_missing_file_raises_filenotfound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with (
+        WorkspaceSession(root) as session,
+        pytest.raises(FileNotFoundError),
+    ):
+        session.document_links_for_file(root / "absent.py")
+
+
+def test_language_server_advertises_document_link_provider(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "mod.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        provider = init["capabilities"]["documentLinkProvider"]
+        assert provider == {"resolveProvider": False}
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_document_link_returns_lsp_payload(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def greet() -> str:\n    return 'hi'\n")
+    consumer = root / "app.py"
+    _write(consumer, "from helper import greet\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/documentLink",
+            {"textDocument": {"uri": consumer.as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert result == [
+        {
+            "range": {
+                "start": {
+                    "line": 0,
+                    "character": len("from helper import "),
+                },
+                "end": {
+                    "line": 0,
+                    "character": len("from helper import greet"),
+                },
+            },
+            "target": (root / "helper.py").as_uri(),
+        }
+    ]
+
+
+def test_language_server_document_link_unparseable_file_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "import (\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/documentLink",
+            {"textDocument": {"uri": target.as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert result == []
