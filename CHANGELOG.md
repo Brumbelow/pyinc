@@ -10,6 +10,31 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/documentLink` in `pyinc-tools` LSP.** The server now
+  advertises `documentLinkProvider: {resolveProvider: false}` and returns
+  `DocumentLink[]` for the requested document. The implementation walks the
+  AST of the document (overlay or on-disk) and pairs every `ast.alias` whose
+  enclosing `Import` / `ImportFrom` resolves to a workspace file with a
+  link spanning the alias's AST `(col_offset, end_col_offset)` range. For
+  `import M` and `import M as alias` the linked span covers the whole
+  `M [as alias]` clause and points at the resolved module file; for
+  `from M import a, b` each imported name is linked individually to its
+  own resolved path — which for a submodule (`from pkg import child`)
+  is the submodule file, not `pkg/__init__.py`. Stdlib, installed,
+  missing, ambiguous, and wildcard (`from M import *`) targets emit no
+  link, matching the LSP's existing scope of navigating only to
+  workspace-resolved targets. Files that fail to parse return `[]`,
+  mirroring how other LSP requests degrade on syntax errors. Imports
+  inside `if TYPE_CHECKING:` / `try: ... except ImportError:` guard blocks
+  are linked since `resolved_imports_for_file` walks into both. New
+  consumer-layer entrypoint `WorkspaceSession.document_links_for_file(path)`
+  returns a tuple of `DocumentLink(start_line, start_character, end_line,
+  end_character, target_path)` dataclasses with all four position fields
+  0-based (LSP-style) and `target_path` already remapped from the mirror
+  root to the real workspace root. New public name re-exported from
+  `pyinc_tools`: `DocumentLink`. Lives entirely on top of the stable
+  `pyinc.integrations` surface — no kernel contract change and no new
+  integration-layer surface.
 - **`textDocument/selectionRange` in `pyinc-tools` LSP.** The server now
   advertises `selectionRangeProvider: true` and returns one `SelectionRange`
   chain per requested position, encoded innermost-first via the recursive

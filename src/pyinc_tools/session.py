@@ -160,6 +160,15 @@ class SelectionRange:
 
 
 @dataclass(frozen=True)
+class DocumentLink:
+    start_line: int
+    start_character: int
+    end_line: int
+    end_character: int
+    target_path: str
+
+
+@dataclass(frozen=True)
 class _DependencyInputs:
     config: ConfigAnalysis | None
     requirements: RequirementsAnalysis | None
@@ -509,6 +518,80 @@ def _compute_selection_chain(
     return tuple(selection_ranges)
 
 
+def _compute_document_links(
+    source: str, resolved_imports: tuple[ResolvedImportRef, ...]
+) -> tuple[DocumentLink, ...]:
+    """Walk the AST of `source` and emit one `DocumentLink` per alias whose
+    resolved import points at a workspace file.
+
+    For `import M` / `import M as alias` / `import M.x` the link spans the
+    `ast.alias` node (which covers any `as <alias>` suffix). For `from M
+    import bar [, baz]` each alias is linked to its own resolved path —
+    the same path goto-definition would jump to for the bound name. Aliases
+    whose resolution is anything other than `"workspace"` (including
+    stdlib / installed / missing / ambiguous) are skipped, mirroring the
+    LSP's existing scope.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ()
+
+    import_targets: dict[tuple[int, str], str] = {}
+    from_targets: dict[tuple[int, str], str] = {}
+    for resolved in resolved_imports:
+        if resolved.resolution != "workspace" or resolved.resolved_path is None:
+            continue
+        if resolved.kind == "import":
+            import_targets[(resolved.lineno, resolved.module)] = resolved.resolved_path
+        elif resolved.imported_name is not None:
+            from_targets[(resolved.lineno, resolved.imported_name)] = (
+                resolved.resolved_path
+            )
+
+    links: list[DocumentLink] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.end_lineno is None or alias.end_col_offset is None:
+                    continue
+                target = import_targets.get((node.lineno, alias.name))
+                if target is None:
+                    continue
+                links.append(
+                    DocumentLink(
+                        start_line=alias.lineno - 1,
+                        start_character=alias.col_offset,
+                        end_line=alias.end_lineno - 1,
+                        end_character=alias.end_col_offset,
+                        target_path=target,
+                    )
+                )
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if (
+                    alias.name == "*"
+                    or alias.end_lineno is None
+                    or alias.end_col_offset is None
+                ):
+                    continue
+                target = from_targets.get((node.lineno, alias.name))
+                if target is None:
+                    continue
+                links.append(
+                    DocumentLink(
+                        start_line=alias.lineno - 1,
+                        start_character=alias.col_offset,
+                        end_line=alias.end_lineno - 1,
+                        end_character=alias.end_col_offset,
+                        target_path=target,
+                    )
+                )
+
+    links.sort(key=lambda link: (link.start_line, link.start_character))
+    return tuple(links)
+
+
 def _collect_filesystem_snapshot(
     root: str, ignored_dir_names: frozenset[str]
 ) -> dict[str, tuple[int, int]]:
@@ -843,6 +926,24 @@ class WorkspaceSession:
             if source is None:
                 return ()
             return _compute_selection_chain(source, line, character)
+
+    def document_links_for_file(
+        self,
+        path: str | os.PathLike[str],
+    ) -> tuple[DocumentLink, ...]:
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            module = self._remap_module_analysis(
+                module_analysis(self.db, self.mirror_root, str(mirror_path))
+            )
+            return _compute_document_links(source, module.resolved_imports)
 
     def _lookup_callable_signature(
         self, target: ResolvedSymbol
