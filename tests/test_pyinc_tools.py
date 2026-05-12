@@ -9,6 +9,7 @@ import pytest
 
 from pyinc_tools.lsp import LanguageServer, _RequestFailed
 from pyinc_tools.session import (
+    CodeLens,
     DocumentLink,
     FoldingRange,
     PollingWorkspaceWatcher,
@@ -2820,6 +2821,256 @@ def test_language_server_document_link_unparseable_file_returns_empty(
         server._handle_request("initialize", {"rootUri": root.as_uri()})
         result = server._handle_request(
             "textDocument/documentLink",
+            {"textDocument": {"uri": target.as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert result == []
+
+
+def test_code_lenses_for_function_with_zero_workspace_references(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def lonely() -> int:\n    return 1\n")
+
+    with WorkspaceSession(root) as session:
+        lenses = session.code_lenses_for_file(target)
+
+    assert lenses == (
+        CodeLens(
+            start_line=0,
+            start_character=len("def "),
+            end_line=0,
+            end_character=len("def lonely"),
+            title="0 references",
+        ),
+    )
+
+
+def test_code_lenses_count_workspace_references_singular(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    _write(root / "app.py", "from helper import greet\n\nprint(greet())\n")
+
+    with WorkspaceSession(root) as session:
+        lenses = session.code_lenses_for_file(helper)
+
+    assert len(lenses) == 1
+    assert lenses[0].title == "1 reference"
+    assert lenses[0].start_line == 0
+    assert lenses[0].start_character == len("def ")
+    assert lenses[0].end_character == len("def greet")
+
+
+def test_code_lenses_count_multiple_workspace_references(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    _write(root / "a.py", "from helper import greet\n\nprint(greet())\n")
+    _write(root / "b.py", "import helper\n\nprint(helper.greet())\n")
+
+    with WorkspaceSession(root) as session:
+        lenses = session.code_lenses_for_file(helper)
+
+    assert len(lenses) == 1
+    # `from a import greet` binds the alias and one bare call site; the
+    # `import helper; helper.greet()` chain adds one attribute reference.
+    assert lenses[0].title.endswith(" references")
+    # Loose lower bound — the resolver may or may not count the import alias
+    # itself depending on `include_declaration`; we asked for declarations
+    # excluded so this is the call-site count only.
+    count = int(lenses[0].title.split(" ", 1)[0])
+    assert count >= 2
+
+
+def test_code_lenses_emit_one_lens_per_top_level_def_and_class(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def f() -> int:\n"
+        "    return 1\n"
+        "\n"
+        "async def g() -> int:\n"
+        "    return 2\n"
+        "\n"
+        "class C:\n"
+        "    def m(self) -> int:\n"
+        "        return 3\n"
+        "\n"
+        "    X = 1\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        lenses = session.code_lenses_for_file(target)
+
+    titles = {(lens.start_line, lens.title) for lens in lenses}
+    # f at line 0, g at line 3, C at line 6 — no lens for method m or class
+    # variable X (kind="method" / "class_variable" are excluded).
+    assert titles == {(0, "0 references"), (3, "0 references"), (6, "0 references")}
+
+
+def test_code_lenses_skip_methods_and_nested_classes(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        pass\n"
+        "\n"
+        "    def m(self) -> None:\n"
+        "        pass\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        lenses = session.code_lenses_for_file(target)
+
+    assert len(lenses) == 1
+    assert lenses[0].start_line == 0
+    assert lenses[0].end_character == len("class Outer")
+
+
+def test_code_lenses_for_decorated_function_use_def_header_line(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "import functools\n\n"
+        "@functools.cache\n"
+        "def cached() -> int:\n"
+        "    return 1\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        lenses = session.code_lenses_for_file(target)
+
+    assert len(lenses) == 1
+    # The lens covers the bare identifier on the `def` line, not the
+    # decorator line — the decorator's `@functools.cache` lineno would
+    # collide with `functools` identifier resolution.
+    assert lenses[0].start_line == 3
+    assert lenses[0].start_character == len("def ")
+    assert lenses[0].end_character == len("def cached")
+
+
+def test_code_lenses_for_invalid_syntax_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def (\n")
+
+    with WorkspaceSession(root) as session:
+        lenses = session.code_lenses_for_file(target)
+
+    assert lenses == ()
+
+
+def test_code_lenses_overlay_sees_edit(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def first() -> int:\n    return 1\n")
+
+    with WorkspaceSession(root) as session:
+        before = session.code_lenses_for_file(target)
+        assert len(before) == 1
+        assert before[0].end_character == len("def first")
+
+        session.set_overlay(
+            str(target),
+            "def first() -> int:\n    return 1\n\n"
+            "def second() -> int:\n    return 2\n",
+        )
+        after = session.code_lenses_for_file(target)
+        assert len(after) == 2
+        assert {lens.start_line for lens in after} == {0, 3}
+
+
+def test_code_lenses_for_missing_file_raises_filenotfound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with (
+        WorkspaceSession(root) as session,
+        pytest.raises(FileNotFoundError),
+    ):
+        session.code_lenses_for_file(root / "absent.py")
+
+
+def test_language_server_advertises_code_lens_provider(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "mod.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        provider = init["capabilities"]["codeLensProvider"]
+        assert provider == {"resolveProvider": False}
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_code_lens_returns_lsp_payload(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    _write(root / "app.py", "from helper import greet\n\nprint(greet())\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/codeLens",
+            {"textDocument": {"uri": helper.as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert result == [
+        {
+            "range": {
+                "start": {"line": 0, "character": len("def ")},
+                "end": {"line": 0, "character": len("def greet")},
+            },
+            "command": {"title": "1 reference", "command": ""},
+        }
+    ]
+
+
+def test_language_server_code_lens_unparseable_file_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def (\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/codeLens",
             {"textDocument": {"uri": target.as_uri()}},
         )
     finally:

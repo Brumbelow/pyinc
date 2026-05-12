@@ -1,5 +1,6 @@
 from .session import (
     AnalysisDiagnostic,
+    CodeLens,
     DocumentHighlight,
     DocumentHighlightKind,
     DocumentLink,
@@ -19,6 +20,7 @@ from .session import (
 
 __all__ = [
     "AnalysisDiagnostic",
+    "CodeLens",
     "DocumentHighlight",
     "DocumentHighlightKind",
     "DocumentLink",

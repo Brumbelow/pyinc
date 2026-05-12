@@ -137,7 +137,8 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     },
     "foldingRangeProvider": true,
     "selectionRangeProvider": true,
-    "documentLinkProvider": { "resolveProvider": false }
+    "documentLinkProvider": { "resolveProvider": false },
+    "codeLensProvider": { "resolveProvider": false }
   },
   "serverInfo": { "name": "pyinc-tools", "version": "2.0.0" }
 }
@@ -174,6 +175,7 @@ channels does not produce duplicate messages.
 | `textDocument/foldingRange` | `FoldingRange[]` for the requested document. AST-walked: `def`/`async def`/`class` blocks emit a generic-region fold (no `kind` field) starting at the header line — or the first decorator line if any decorators are attached — and ending at the AST `end_lineno`; class bodies recurse so methods fold independently. Consecutive top-level `import` / `from … import` statements are coalesced into one `kind: "imports"` fold; multi-line parenthesised imports collapse on their own. Single-line definitions and single-line single imports emit no fold. Files that fail to parse return `[]`. |
 | `textDocument/selectionRange` | `SelectionRange[]` (one entry per requested position). Each entry is a chain of nested ranges encoded via the recursive `parent` field: innermost first, each parent strictly contains its child. The chain is computed by parsing the document (overlay or on-disk) once with `ast.parse` and collecting every AST node whose `(lineno, col_offset)`–`(end_lineno, end_col_offset)` span contains the cursor; duplicates are collapsed and the result is filtered to a strict containment chain ordered by length. Files that fail to parse, positions outside the source, or positions that no AST node covers fall back to a single zero-width range at the cursor so the LSP result length always matches `params.positions` length. |
 | `textDocument/documentLink` | `DocumentLink[]` for the requested document. The server walks the document's AST and emits one link per `ast.alias` whose enclosing `Import` / `ImportFrom` resolves to a workspace file. For `import M [as alias]` the link spans the whole `M [as alias]` clause and points at `M`'s resolved file; for `from M import a, b` each imported name is linked individually to its own resolved path (a submodule import like `from pkg import child` resolves to `child.py`, not `pkg/__init__.py`). Stdlib / installed / missing / ambiguous targets and `from M import *` emit no link. Files that fail to parse return `[]`. |
+| `textDocument/codeLens` | `CodeLens[]` for the requested document. One lens is emitted above every top-level `def` / `async def` / `class` in the file; the range spans the bare-name identifier on the definition's header line (decorated definitions still report on the `def` line, not the decorator line). The lens's `command` is `{title: "<N> reference[s]", command: ""}`, where `N` is the count returned by `find_references` with `include_declaration=False` restricted to workspace targets. Methods (`kind: "method"`), nested classes (dotted qualified names), class variables, and import aliases emit no lens — `find_references` does not reliably resolve attribute calls on instances, so a method lens would always read 0. Non-workspace targets, unparseable files, and files with no qualifying symbols return `[]`. The empty `command` string follows pylsp's convention so the lens displays as plain hint text without binding to an editor-specific action. |
 | `textDocument/signatureHelp` | `SignatureHelp` for the call expression enclosing the cursor. A forward source scanner finds the topmost open `(` whose preceding token is a usable identifier, counts top-level commas to derive `activeParameter`, and resolves the identifier through `symbol_resolution.resolve_symbol`. Functions surface their declared signature; classes surface `<Class>.__init__` with a leading `self` / `cls` stripped, or an empty constructor signature when no `__init__` is defined. Stdlib / installed / ambiguous targets, attribute calls (`obj.method(`), subscripted calls (`factory[T](`), and `def`/`class` definition headers all return `null`. Parameters use LSP `[start, end]` substring offsets into the signature label. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
@@ -347,6 +349,20 @@ Consequences:
   end_character)` dataclasses with all four fields 0-based (LSP-style), or
   an empty tuple when no chain can be computed; the LSP layer threads the
   flat tuple into the recursive `parent` shape.
+- Code lenses, via `textDocument/codeLens` (advertised as
+  `codeLensProvider: {resolveProvider: false}`). One lens per top-level
+  `def` / `async def` / `class` in the requested document; the lens range
+  spans the bare-name identifier on the definition's header line and its
+  `command` is `{title: "<N> reference[s]", command: ""}` where `N` counts
+  workspace references returned by `find_references(include_declaration=
+  False)`. Methods, nested classes (dotted qualified names), class
+  variables, and import aliases emit no lens — references on those are
+  not reliably resolvable through the workspace resolver, so a method
+  lens would always read 0. Non-workspace targets, unparseable files, and
+  files with no qualifying symbols return `[]`. The consumer entrypoint
+  `WorkspaceSession.code_lenses_for_file(path)` returns a tuple of
+  `CodeLens(start_line, start_character, end_line, end_character, title)`
+  dataclasses with all four position fields 0-based (LSP-style).
 - Document links, via `textDocument/documentLink` (advertised as
   `documentLinkProvider: {resolveProvider: false}`). For each
   `import` / `from … import` statement that resolves to a workspace file,

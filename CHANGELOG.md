@@ -10,6 +10,30 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/codeLens` in `pyinc-tools` LSP.** The server now advertises
+  `codeLensProvider: {resolveProvider: false}` and returns one reference-count
+  `CodeLens` above every top-level `def` / `async def` / `class` in the
+  requested document. For each top-level symbol of kind `function` or `class`
+  (dotted-name nested classes and methods are excluded — `find_references`
+  does not reliably resolve attribute calls on instances), the implementation
+  locates the bare-name identifier range on the definition's header line
+  using the same `_locate_def_class_name_offsets` helper that
+  `find_document_highlights` uses, then calls `find_references` with
+  `include_declaration=False` to count the workspace references and emits a
+  `CodeLens` whose `command` is `{title: "<N> reference[s]", command: ""}`
+  (no clickable action — matching the convention used by other Python LSP
+  servers so the lens text appears above the definition without binding to
+  an editor-specific command). Non-workspace targets, unparseable files,
+  and files with no qualifying symbols return `[]`, mirroring how other LSP
+  requests degrade. Decorated definitions report the lens on the `def` line,
+  not the decorator line. New consumer-layer entrypoint
+  `WorkspaceSession.code_lenses_for_file(path)` returns a tuple of
+  `CodeLens(start_line, start_character, end_line, end_character, title)`
+  dataclasses with all four position fields 0-based (LSP-style). New public
+  name re-exported from `pyinc_tools`: `CodeLens`. Lives entirely on top of
+  the stable `pyinc.integrations` public surface (composes
+  `module_symbol_table` and `find_references`) — no kernel contract change
+  and no new integration-layer surface.
 - **`textDocument/documentLink` in `pyinc-tools` LSP.** The server now
   advertises `documentLinkProvider: {resolveProvider: false}` and returns
   `DocumentLink[]` for the requested document. The implementation walks the

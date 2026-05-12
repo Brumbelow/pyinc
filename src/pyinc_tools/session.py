@@ -169,6 +169,15 @@ class DocumentLink:
 
 
 @dataclass(frozen=True)
+class CodeLens:
+    start_line: int
+    start_character: int
+    end_line: int
+    end_character: int
+    title: str
+
+
+@dataclass(frozen=True)
 class _DependencyInputs:
     config: ConfigAnalysis | None
     requirements: RequirementsAnalysis | None
@@ -944,6 +953,66 @@ class WorkspaceSession:
                 module_analysis(self.db, self.mirror_root, str(mirror_path))
             )
             return _compute_document_links(source, module.resolved_imports)
+
+    def code_lenses_for_file(
+        self,
+        path: str | os.PathLike[str],
+    ) -> tuple[CodeLens, ...]:
+        """Return one reference-count `CodeLens` per top-level `def`/`class`.
+
+        Each lens spans the definition's bare-name identifier range on its
+        header line and carries a `title` of `"N reference"` /
+        `"N references"`, counting workspace references reported by
+        `find_references` with `include_declaration=False`. Methods, class
+        variables, import aliases, and other non-top-level symbols emit no
+        lens — references on those are not reliably resolvable through the
+        symbol resolver. Files that fail to parse or have no symbols emit
+        an empty tuple.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            table = self._remap_module_symbol_table(
+                module_symbol_table(self.db, self.mirror_root, str(mirror_path))
+            )
+            lenses: list[CodeLens] = []
+            for symbol in table.symbols:
+                if symbol.kind not in ("function", "class"):
+                    continue
+                if "." in symbol.qualified_name:
+                    continue
+                located = self._locate_def_class_name_offsets(
+                    real_path, symbol.lineno, symbol.qualified_name
+                )
+                if located is None:
+                    continue
+                start_col, end_col = located
+                result = find_references(
+                    self.db,
+                    self.mirror_root,
+                    str(mirror_path),
+                    symbol.qualified_name,
+                    include_declaration=False,
+                )
+                if result.target.resolution != "workspace":
+                    continue
+                count = len(result.references)
+                title = f"{count} reference" if count == 1 else f"{count} references"
+                line_zero = max(symbol.lineno - 1, 0)
+                lenses.append(
+                    CodeLens(
+                        start_line=line_zero,
+                        start_character=start_col,
+                        end_line=line_zero,
+                        end_character=end_col,
+                        title=title,
+                    )
+                )
+            lenses.sort(key=lambda lens: (lens.start_line, lens.start_character))
+            return tuple(lenses)
 
     def _lookup_callable_signature(
         self, target: ResolvedSymbol

@@ -263,6 +263,8 @@ class LanguageServer:
             return self._selection_range(params)
         if method == "textDocument/documentLink":
             return self._document_link(params)
+        if method == "textDocument/codeLens":
+            return self._code_lens(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -386,6 +388,7 @@ class LanguageServer:
                 "foldingRangeProvider": True,
                 "selectionRangeProvider": True,
                 "documentLinkProvider": {"resolveProvider": False},
+                "codeLensProvider": {"resolveProvider": False},
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
         }
@@ -792,6 +795,30 @@ class LanguageServer:
                 "target": _path_to_uri(link.target_path),
             }
             for link in links
+        ]
+
+    def _code_lens(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        try:
+            lenses = session.code_lenses_for_file(real_path)
+        except FileNotFoundError:
+            return []
+        return [
+            {
+                "range": {
+                    "start": {
+                        "line": lens.start_line,
+                        "character": lens.start_character,
+                    },
+                    "end": {
+                        "line": lens.end_line,
+                        "character": lens.end_character,
+                    },
+                },
+                "command": {"title": lens.title, "command": ""},
+            }
+            for lens in lenses
         ]
 
     def _workspace_root_from_params(self, params: Any) -> str:
