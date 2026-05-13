@@ -247,6 +247,8 @@ class LanguageServer:
             return self._hover(params)
         if method == "textDocument/definition":
             return self._definition(params)
+        if method == "textDocument/typeDefinition":
+            return self._type_definition(params)
         if method == "textDocument/references":
             return self._references(params)
         if method == "textDocument/documentHighlight":
@@ -378,6 +380,7 @@ class LanguageServer:
                 "workspaceSymbolProvider": True,
                 "hoverProvider": True,
                 "definitionProvider": True,
+                "typeDefinitionProvider": True,
                 "referencesProvider": True,
                 "documentHighlightProvider": True,
                 "renameProvider": {"prepareProvider": True},
@@ -522,6 +525,39 @@ class LanguageServer:
                     "end": {"line": line_zero, "character": 1},
                 },
             }
+        ]
+
+    def _type_definition(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        source = session.source_text(real_path)
+        if source is None:
+            return []
+        identifier = _identifier_at_position(source, line, character)
+        if identifier is None:
+            return []
+        try:
+            locations = session.type_definitions_at(real_path, identifier)
+        except FileNotFoundError:
+            return []
+        return [
+            {
+                "uri": _path_to_uri(location.path),
+                "range": {
+                    "start": {
+                        "line": max(location.lineno - 1, 0),
+                        "character": location.col_offset,
+                    },
+                    "end": {
+                        "line": max(location.lineno - 1, 0),
+                        "character": location.end_col_offset,
+                    },
+                },
+            }
+            for location in locations
         ]
 
     def _references(self, params: Any) -> list[dict[str, Any]]:

@@ -14,6 +14,7 @@ from .session import (
     SelectionRange,
     SignatureHelp,
     SignatureParameterInfo,
+    TypeDefinitionLocation,
     WorkspaceAnalysisResult,
     WorkspaceSession,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "SelectionRange",
     "SignatureHelp",
     "SignatureParameterInfo",
+    "TypeDefinitionLocation",
     "WorkspaceAnalysisResult",
     "WorkspaceSession",
 ]

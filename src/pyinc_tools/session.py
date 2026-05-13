@@ -30,6 +30,7 @@ from pyinc.integrations import (
     ResolvedImportRef,
     ResolvedSymbol,
     Signature,
+    Symbol,
     WorkspaceSymbolIndex,
     find_references,
     module_analysis,
@@ -175,6 +176,14 @@ class CodeLens:
     end_line: int
     end_character: int
     title: str
+
+
+@dataclass(frozen=True)
+class TypeDefinitionLocation:
+    path: str
+    lineno: int
+    col_offset: int
+    end_col_offset: int
 
 
 @dataclass(frozen=True)
@@ -354,6 +363,49 @@ def _build_signature_label(
     if signature.return_annotation is not None:
         parts.append(f" -> {signature.return_annotation}")
     return "".join(parts), tuple(info)
+
+
+def _collect_annotation_type_refs(
+    annotation: str,
+) -> tuple[tuple[str, ...], ...]:
+    """Parse `annotation` and return a tuple of type-name references.
+
+    Each entry is either ``("name", id)`` for a bare-name reference or
+    ``("attribute", lhs_id, attr)`` for an ``lhs.attr`` reference where the
+    LHS is itself a bare name. Attribute chains whose LHS is not a bare
+    `Name` (e.g. ``pkg.sub.Foo``) are skipped — only the rightmost-bare-LHS
+    shape is supported, mirroring the resolver's existing handling for
+    references.
+
+    A whole-string forward reference (``"Foo"``, ``"pkg.Foo | None"``) is
+    unwrapped exactly once before walking. Malformed annotation text returns
+    an empty tuple.
+    """
+    try:
+        tree = ast.parse(annotation, mode="eval")
+    except SyntaxError:
+        return ()
+    body = tree.body
+    if isinstance(body, ast.Constant) and isinstance(body.value, str):
+        try:
+            body = ast.parse(body.value, mode="eval").body
+        except SyntaxError:
+            return ()
+
+    refs: list[tuple[str, ...]] = []
+
+    def walk(node: ast.AST) -> None:
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            refs.append(("attribute", node.value.id, node.attr))
+            return
+        if isinstance(node, ast.Name):
+            refs.append(("name", node.id))
+            return
+        for child in ast.iter_child_nodes(node):
+            walk(child)
+
+    walk(body)
+    return tuple(refs)
 
 
 def _compute_folding_ranges(source: str) -> tuple[FoldingRange, ...]:
@@ -1013,6 +1065,144 @@ class WorkspaceSession:
                 )
             lenses.sort(key=lambda lens: (lens.start_line, lens.start_character))
             return tuple(lenses)
+
+    def type_definitions_at(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+    ) -> tuple[TypeDefinitionLocation, ...]:
+        """Resolve the type-definition locations of the symbol named `qualified_name`.
+
+        Resolves `qualified_name` against `path`'s imports to find the symbol's
+        declaration, reads the declared annotation (variable / class-variable
+        annotation, or function / method return annotation), parses it as a
+        Python expression, and resolves the contained type names against the
+        declaration's defining module. Returns one
+        `TypeDefinitionLocation(path, lineno, col_offset, end_col_offset)` per
+        workspace-resolved type, deduplicated by `(path, lineno)`.
+
+        Classes are themselves the type — clicking on a class name returns its
+        own definition location. Import aliases, `from_import` aliases,
+        wildcard-import stubs, parameters, and non-workspace targets return an
+        empty tuple. Whole-string forward references (`x: "Foo"`,
+        `def f() -> "Foo"`) are unwrapped and re-parsed once; partial string
+        annotations (`x: "Foo" | None`) and stdlib / installed / ambiguous type
+        names are skipped.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            resolved = self._remap_resolved_symbol(
+                resolve_symbol(
+                    self.db, self.mirror_root, str(mirror_path), qualified_name
+                )
+            )
+            if resolved.resolution != "workspace":
+                return ()
+            if resolved.defining_path is None or resolved.defining_lineno is None:
+                return ()
+            defining_mirror = self._mirror_path_for_real(resolved.defining_path)
+            if not defining_mirror.exists() or defining_mirror.suffix != ".py":
+                return ()
+            defining_table = module_symbol_table(
+                self.db, self.mirror_root, str(defining_mirror)
+            )
+            matched: Symbol | None = None
+            for symbol in defining_table.symbols:
+                if (
+                    symbol.lineno == resolved.defining_lineno
+                    and "." not in symbol.qualified_name
+                ):
+                    matched = symbol
+                    break
+            if matched is None:
+                return ()
+            if matched.kind == "class":
+                return (
+                    TypeDefinitionLocation(
+                        path=resolved.defining_path,
+                        lineno=resolved.defining_lineno,
+                        col_offset=0,
+                        end_col_offset=1,
+                    ),
+                )
+            if matched.kind in ("function", "method"):
+                annotation = (
+                    matched.signature.return_annotation
+                    if matched.signature is not None
+                    else None
+                )
+            elif matched.kind in ("variable", "class_variable"):
+                annotation = matched.annotation
+            else:
+                return ()
+            if annotation is None:
+                return ()
+            type_refs = _collect_annotation_type_refs(annotation)
+            locations: list[TypeDefinitionLocation] = []
+            seen: set[tuple[str, int]] = set()
+            for ref in type_refs:
+                type_resolved = self._resolve_annotation_type_ref(
+                    defining_mirror, ref
+                )
+                if type_resolved is None:
+                    continue
+                if (
+                    type_resolved.resolution != "workspace"
+                    or type_resolved.defining_path is None
+                    or type_resolved.defining_lineno is None
+                ):
+                    continue
+                key = (type_resolved.defining_path, type_resolved.defining_lineno)
+                if key in seen:
+                    continue
+                seen.add(key)
+                locations.append(
+                    TypeDefinitionLocation(
+                        path=type_resolved.defining_path,
+                        lineno=type_resolved.defining_lineno,
+                        col_offset=0,
+                        end_col_offset=1,
+                    )
+                )
+            return tuple(locations)
+
+    def _resolve_annotation_type_ref(
+        self,
+        defining_mirror: Path,
+        ref: tuple[str, ...],
+    ) -> ResolvedSymbol | None:
+        if ref[0] == "name":
+            return self._remap_resolved_symbol(
+                resolve_symbol(
+                    self.db,
+                    self.mirror_root,
+                    str(defining_mirror),
+                    ref[1],
+                )
+            )
+        # ("attribute", lhs_name, attr)
+        lhs_resolved = self._remap_resolved_symbol(
+            resolve_symbol(
+                self.db, self.mirror_root, str(defining_mirror), ref[1]
+            )
+        )
+        if (
+            lhs_resolved.resolution != "workspace"
+            or lhs_resolved.defining_path is None
+        ):
+            return None
+        lhs_mirror = self._mirror_path_for_real(lhs_resolved.defining_path)
+        if not lhs_mirror.exists() or lhs_mirror.suffix != ".py":
+            return None
+        return self._remap_resolved_symbol(
+            resolve_symbol(
+                self.db, self.mirror_root, str(lhs_mirror), ref[2]
+            )
+        )
 
     def _lookup_callable_signature(
         self, target: ResolvedSymbol

@@ -10,6 +10,41 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/typeDefinition` in `pyinc-tools` LSP.** The server now
+  advertises `typeDefinitionProvider: true` and returns `Location[]` for the
+  type-definition site(s) of the symbol under the cursor. The implementation
+  resolves the cursor's identifier to its declaring `Symbol` via the existing
+  `resolve_symbol` pipeline (so the user can stand on either the declaration
+  site or a same-name use site inside the declaring module), reads the
+  declared annotation (variable / class-variable `annotation`, or function /
+  method `signature.return_annotation`), parses it as a Python expression,
+  and walks the result for `Name` and `Attribute(value=Name(...), attr=...)`
+  nodes. Each name is resolved against the declaring module — bare `Name`
+  references through that module's imports, and `lhs.attr` references by
+  first resolving `lhs` to a workspace module and then resolving `attr`
+  inside that module — so generics (`list[Foo]`), unions (`Foo | Bar`), and
+  qualified attribute types (`pkg.Foo`, `helper.Foo | helper.Bar`) all yield
+  one location per workspace-resolved type, deduplicated by `(path, lineno)`.
+  Whole-string forward references (`x: "Foo"`, `def f() -> "Foo"`) are
+  unwrapped exactly once before walking; partial string annotations
+  (`x: "Foo" | None`) are not unwrapped and the string portion contributes
+  no location. Classes are themselves the type, so clicking on a class name
+  returns its own definition location. Stdlib / installed / ambiguous type
+  names (`int`, `list`, `typing.Optional`, etc.) are skipped via the
+  existing resolver classification; import aliases, `from_import` aliases,
+  wildcard-import stubs, unannotated variables and functions, and
+  non-workspace targets return `[]`. Attribute chains whose LHS is not a
+  bare `Name` (`pkg.subpkg.Foo`) are skipped, mirroring the resolver's
+  existing limitation for references. New consumer-layer entrypoint
+  `WorkspaceSession.type_definitions_at(path, qualified_name)` returns a
+  tuple of `TypeDefinitionLocation(path, lineno, col_offset, end_col_offset)`
+  dataclasses with `lineno` as the 1-based AST lineno (the LSP layer
+  subtracts 1) and `(col_offset, end_col_offset) = (0, 1)` matching the
+  existing `textDocument/definition` shape. New public name re-exported
+  from `pyinc_tools`: `TypeDefinitionLocation`. Lives entirely on top of
+  the stable `pyinc.integrations` public surface (`resolve_symbol`,
+  `module_symbol_table`) — no kernel contract change and no new
+  integration-layer surface.
 - **`textDocument/codeLens` in `pyinc-tools` LSP.** The server now advertises
   `codeLensProvider: {resolveProvider: false}` and returns one reference-count
   `CodeLens` above every top-level `def` / `async def` / `class` in the
