@@ -15,6 +15,7 @@ from pyinc_tools.session import (
     PollingWorkspaceWatcher,
     RenameEdit,
     SelectionRange,
+    TypeDefinitionLocation,
     WorkspaceSession,
 )
 
@@ -3078,3 +3079,328 @@ def test_language_server_code_lens_unparseable_file_returns_empty(
             server._session.close()
 
     assert result == []
+
+
+def test_type_definitions_at_variable_with_local_class(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    _write(target, "class Foo:\n    pass\n\nx: Foo = Foo()\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "x")
+    assert result == (
+        TypeDefinitionLocation(
+            path=str(target), lineno=1, col_offset=0, end_col_offset=1
+        ),
+    )
+
+
+def test_type_definitions_at_variable_resolves_through_import(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "class Foo:\n    pass\n")
+    target = root / "app.py"
+    _write(target, "from helper import Foo\n\nx: Foo = Foo()\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "x")
+    assert result == (
+        TypeDefinitionLocation(
+            path=str(root / "helper.py"),
+            lineno=1,
+            col_offset=0,
+            end_col_offset=1,
+        ),
+    )
+
+
+def test_type_definitions_at_unwraps_string_forward_reference(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    _write(target, "class Foo:\n    pass\n\nx: 'Foo' = Foo()\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "x")
+    assert result == (
+        TypeDefinitionLocation(
+            path=str(target), lineno=1, col_offset=0, end_col_offset=1
+        ),
+    )
+
+
+def test_type_definitions_at_walks_generic_subscript(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    _write(target, "class Foo:\n    pass\n\nx: list[Foo] = []\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "x")
+    assert result == (
+        TypeDefinitionLocation(
+            path=str(target), lineno=1, col_offset=0, end_col_offset=1
+        ),
+    )
+
+
+def test_type_definitions_at_union_returns_both_workspace_types(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "class Foo:\n    pass\n\nclass Bar:\n    pass\n",
+    )
+    target = root / "app.py"
+    _write(
+        target,
+        "from helper import Foo, Bar\n\nx: Foo | Bar = Foo()\n",
+    )
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "x")
+    assert result == (
+        TypeDefinitionLocation(
+            path=str(root / "helper.py"),
+            lineno=1,
+            col_offset=0,
+            end_col_offset=1,
+        ),
+        TypeDefinitionLocation(
+            path=str(root / "helper.py"),
+            lineno=4,
+            col_offset=0,
+            end_col_offset=1,
+        ),
+    )
+
+
+def test_type_definitions_at_attribute_resolves_through_module_alias(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "class Foo:\n    pass\n")
+    target = root / "app.py"
+    _write(
+        target,
+        "import helper\n\nx: helper.Foo = helper.Foo()\n",
+    )
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "x")
+    assert result == (
+        TypeDefinitionLocation(
+            path=str(root / "helper.py"),
+            lineno=1,
+            col_offset=0,
+            end_col_offset=1,
+        ),
+    )
+
+
+def test_type_definitions_at_skips_stdlib_type(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    _write(target, "x: int = 1\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "x")
+    assert result == ()
+
+
+def test_type_definitions_at_function_return_annotation(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    _write(
+        target,
+        "class Foo:\n    pass\n\ndef make() -> Foo:\n    return Foo()\n",
+    )
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "make")
+    assert result == (
+        TypeDefinitionLocation(
+            path=str(target), lineno=1, col_offset=0, end_col_offset=1
+        ),
+    )
+
+
+def test_type_definitions_at_function_no_return_annotation(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    _write(target, "def make():\n    return 1\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "make")
+    assert result == ()
+
+
+def test_type_definitions_at_class_returns_self_location(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    _write(target, "class Foo:\n    pass\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "Foo")
+    assert result == (
+        TypeDefinitionLocation(
+            path=str(target), lineno=1, col_offset=0, end_col_offset=1
+        ),
+    )
+
+
+def test_type_definitions_at_variable_without_annotation(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    _write(target, "x = 1\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "x")
+    assert result == ()
+
+
+def test_type_definitions_at_unknown_identifier_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    _write(target, "x: int = 1\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "does_not_exist")
+    assert result == ()
+
+
+def test_type_definitions_at_import_alias_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "class Foo:\n    pass\n")
+    target = root / "app.py"
+    _write(target, "import helper\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "helper")
+    assert result == ()
+
+
+def test_type_definitions_at_deduplicates_repeated_type_refs(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "class Foo:\n    pass\n")
+    target = root / "app.py"
+    _write(
+        target,
+        "from helper import Foo\n\nx: dict[Foo, Foo] = {}\n",
+    )
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "x")
+    assert result == (
+        TypeDefinitionLocation(
+            path=str(root / "helper.py"),
+            lineno=1,
+            col_offset=0,
+            end_col_offset=1,
+        ),
+    )
+
+
+def test_type_definitions_at_missing_file_raises_filenotfound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with WorkspaceSession(root) as session, pytest.raises(FileNotFoundError):
+        session.type_definitions_at(root / "missing.py", "x")
+
+
+def test_type_definitions_at_invalid_annotation_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    # Annotation text is whatever `ast.unparse` produces; we only need to
+    # cover the "annotation re-parses cleanly but contains no resolvable
+    # workspace name" path.
+    _write(target, "x: object = object()\n")
+    with WorkspaceSession(root) as session:
+        result = session.type_definitions_at(target, "x")
+    assert result == ()
+
+
+def test_language_server_type_definition_returns_lsp_location(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "class Foo:\n    pass\n")
+    target = root / "app.py"
+    _write(target, "from helper import Foo\n\nx: Foo = Foo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/typeDefinition",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 2, "character": 0},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert result == [
+        {
+            "uri": (root / "helper.py").as_uri(),
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 1},
+            },
+        }
+    ]
+
+
+def test_language_server_type_definition_position_off_identifier_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "app.py"
+    _write(target, "class Foo:\n    pass\n\nx: Foo = Foo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/typeDefinition",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                # Line 3 is "x: Foo = Foo()"; column 7 is the "=" sign with
+                # whitespace on both sides — not on any identifier.
+                "position": {"line": 3, "character": 7},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert result == []
+
+
+def test_language_server_advertises_type_definition_provider(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        result = server._handle_request(
+            "initialize", {"rootUri": root.as_uri()}
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result["capabilities"]["typeDefinitionProvider"] is True
