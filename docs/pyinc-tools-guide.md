@@ -139,7 +139,8 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     "foldingRangeProvider": true,
     "selectionRangeProvider": true,
     "documentLinkProvider": { "resolveProvider": false },
-    "codeLensProvider": { "resolveProvider": false }
+    "codeLensProvider": { "resolveProvider": false },
+    "callHierarchyProvider": true
   },
   "serverInfo": { "name": "pyinc-tools", "version": "2.0.0" }
 }
@@ -179,6 +180,9 @@ channels does not produce duplicate messages.
 | `textDocument/documentLink` | `DocumentLink[]` for the requested document. The server walks the document's AST and emits one link per `ast.alias` whose enclosing `Import` / `ImportFrom` resolves to a workspace file. For `import M [as alias]` the link spans the whole `M [as alias]` clause and points at `M`'s resolved file; for `from M import a, b` each imported name is linked individually to its own resolved path (a submodule import like `from pkg import child` resolves to `child.py`, not `pkg/__init__.py`). Stdlib / installed / missing / ambiguous targets and `from M import *` emit no link. Files that fail to parse return `[]`. |
 | `textDocument/codeLens` | `CodeLens[]` for the requested document. One lens is emitted above every top-level `def` / `async def` / `class` in the file; the range spans the bare-name identifier on the definition's header line (decorated definitions still report on the `def` line, not the decorator line). The lens's `command` is `{title: "<N> reference[s]", command: ""}`, where `N` is the count returned by `find_references` with `include_declaration=False` restricted to workspace targets. Methods (`kind: "method"`), nested classes (dotted qualified names), class variables, and import aliases emit no lens — `find_references` does not reliably resolve attribute calls on instances, so a method lens would always read 0. Non-workspace targets, unparseable files, and files with no qualifying symbols return `[]`. The empty `command` string follows pylsp's convention so the lens displays as plain hint text without binding to an editor-specific action. |
 | `textDocument/signatureHelp` | `SignatureHelp` for the call expression enclosing the cursor. A forward source scanner finds the topmost open `(` whose preceding token is a usable identifier, counts top-level commas to derive `activeParameter`, and resolves the identifier through `symbol_resolution.resolve_symbol`. Functions surface their declared signature; classes surface `<Class>.__init__` with a leading `self` / `cls` stripped, or an empty constructor signature when no `__init__` is defined. Stdlib / installed / ambiguous targets, attribute calls (`obj.method(`), subscripted calls (`factory[T](`), and `def`/`class` definition headers all return `null`. Parameters use LSP `[start, end]` substring offsets into the signature label. |
+| `textDocument/prepareCallHierarchy` | `CallHierarchyItem[]` or `null`. Resolves the identifier under the cursor through `symbol_resolution.resolve_symbol`; if the target is a workspace `function`, `method`, or `class`, returns a single item describing the declaring def/class. The item's `range` covers the whole def block (including decorator lines if any), and `selectionRange` is the bare-name span on the header line. The item's `data` field carries `{"path": str, "qualified_name": str}` which the server reads back on `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`. Variables, import aliases, `from_import` aliases, wildcard-import stubs, and stdlib / installed / ambiguous / missing targets return `null`. |
+| `callHierarchy/incomingCalls` | `CallHierarchyIncomingCall[]`. Calls `find_references(include_declaration=False)` on the item's target and groups references by their innermost enclosing workspace-known def/class in the same file (qualifier follows `module_symbol_table`'s ClassDef-only nesting scheme, so a reference inside `class C: def m(self): ...` is attributed to `C.m`). References inside nested function bodies bubble up to the next enclosing function or method that's in the symbol table; module-top-level references are dropped because there is no caller item to attribute them to. `fromRanges` are AST occurrence ranges, including the rightmost-attribute span for `M.foo()` style references. |
+| `callHierarchy/outgoingCalls` | `CallHierarchyOutgoingCall[]`. Parses the item's declaring file, locates the `def` / `async def` / `class` matching the item's qualified name, and walks its body for `ast.Call` nodes — *without* descending into nested `FunctionDef` / `AsyncFunctionDef` / `ClassDef` / `Lambda` scopes (each owns its own outgoing list). For each call: bare `Name(id=name)` resolves against the declaring module; `Name.attr` resolves the LHS through the file's imports and then `attr` inside the imported module (mirroring `find_references`'s LHS-bare-Name handling). Workspace `function` / `method` / `class` targets contribute callees; subscripted calls, deep attribute chains (`pkg.subpkg.foo()`), and lambda calls produce no callee. `fromRanges` are the call expression's name/attribute span. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
 ## Editor wiring
@@ -404,6 +408,35 @@ Consequences:
   target_path)` dataclasses with all four position fields 0-based
   (LSP-style); `target_path` is already remapped from the mirror root back
   to the real workspace root.
+- Call hierarchy, via `textDocument/prepareCallHierarchy`,
+  `callHierarchy/incomingCalls`, and `callHierarchy/outgoingCalls` (advertised
+  as `callHierarchyProvider: true`). `prepareCallHierarchy` returns a single
+  `CallHierarchyItem` for the identifier under the cursor when it resolves to
+  a workspace `function`, `method`, or `class`, and `null` otherwise; the
+  item's `range` covers the whole def block (including decorator lines if
+  any), `selectionRange` is the bare-name span on the header line, and the
+  item carries `data = {"path", "qualified_name"}` so subsequent
+  incoming/outgoing requests do not need to re-resolve. `incomingCalls`
+  groups `find_references(include_declaration=False)` results by their
+  innermost enclosing workspace-known def/class (qualifier follows
+  `module_symbol_table`'s ClassDef-only nesting); references inside nested
+  function bodies bubble up to the next enclosing top-level function or
+  class method, and module-top-level references are dropped because there
+  is no caller item to attribute them to. `outgoingCalls` parses the
+  declaring file, locates the `def` / `async def` / `class` matching the
+  item's qualified name, and walks its body for `ast.Call` nodes without
+  descending into nested `FunctionDef` / `AsyncFunctionDef` / `ClassDef` /
+  `Lambda` scopes; bare `Name(id=name)` resolves through the declaring
+  module's imports, and `Name.attr` resolves the LHS to a workspace module
+  and then `attr` inside it (mirroring `find_references`'s LHS-bare-Name
+  handling). The consumer-layer entrypoints
+  `WorkspaceSession.prepare_call_hierarchy(path, line, character)`,
+  `WorkspaceSession.call_hierarchy_incoming_calls(path, qualified_name)`,
+  and `WorkspaceSession.call_hierarchy_outgoing_calls(path, qualified_name)`
+  return tuples of `CallHierarchyItem`, `CallHierarchyIncomingCall(caller,
+  call_sites)`, and `CallHierarchyOutgoingCall(callee, call_sites)`
+  dataclasses respectively; ranges in `CallHierarchyCallSite` and on the
+  item itself are 0-based (LSP-style).
 - Rename, via `textDocument/prepareRename` and `textDocument/rename` (advertised
   as `renameProvider: {prepareProvider: true}`). `prepareRename` returns the
   identifier range and a placeholder when the cursor is on a workspace symbol;
@@ -470,6 +503,28 @@ Consequences:
     alias; rename the original symbol instead."* The canonical-name rename
     of `foo` correctly preserves any `as <alias>` clauses across the
     workspace.
+- Call hierarchy limitations:
+  - `prepareCallHierarchy` only surfaces top-level identifiers — the cursor
+    must be on a name that `resolve_symbol` can find as a module-level
+    binding (or as an `import` / `from` target that re-exports a workspace
+    function or class). Clicking on a method name inside its `def` line
+    (`class C: def m(self): ...` → cursor on `m`) does not surface a
+    `CallHierarchyItem` because `resolve_symbol` cannot reach `m` through
+    the file's module-level namespace; this mirrors the same limitation
+    that `textDocument/hover` and `textDocument/definition` have on
+    methods.
+  - `incomingCalls` inherits the
+    `find_references` limitations listed above (attribute chains whose
+    LHS is itself an attribute, function-local shadowing, and the
+    multi-line / triple-quoted / escape-sequence / implicit-concatenation
+    forward-reference-string caveats).
+  - `outgoingCalls` only resolves bare-name calls (`foo(...)`) and
+    `Name.attr` calls (`M.foo(...)`, where `M` is bound by `import M`
+    or `from pkg import M`). Subscripted calls (`factory[T](...)`), deep
+    attribute chains (`pkg.subpkg.foo(...)`), `self.method(...)` /
+    instance attribute calls, and lambda calls produce no callee.
+  - Both directions only report workspace targets. Stdlib / installed /
+    ambiguous / missing callees are omitted.
 - `textDocument/typeDefinition` limitations:
   - Function-parameter type definitions are not surfaced. The
     `symbol_resolution` integration tracks parameters only as fields on

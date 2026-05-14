@@ -1,5 +1,10 @@
 from .session import (
     AnalysisDiagnostic,
+    CallHierarchyCallSite,
+    CallHierarchyIncomingCall,
+    CallHierarchyItem,
+    CallHierarchyItemKind,
+    CallHierarchyOutgoingCall,
     CodeLens,
     DocumentHighlight,
     DocumentHighlightKind,
@@ -21,6 +26,11 @@ from .session import (
 
 __all__ = [
     "AnalysisDiagnostic",
+    "CallHierarchyCallSite",
+    "CallHierarchyIncomingCall",
+    "CallHierarchyItem",
+    "CallHierarchyItemKind",
+    "CallHierarchyOutgoingCall",
     "CodeLens",
     "DocumentHighlight",
     "DocumentHighlightKind",

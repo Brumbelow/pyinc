@@ -11,7 +11,13 @@ from urllib.request import url2pathname
 
 from pyinc.integrations import Symbol
 
-from .session import AnalysisDiagnostic, PollingWorkspaceWatcher, WorkspaceSession
+from .session import (
+    AnalysisDiagnostic,
+    CallHierarchyCallSite,
+    CallHierarchyItem,
+    PollingWorkspaceWatcher,
+    WorkspaceSession,
+)
 
 _LSP_SYMBOL_KINDS = {
     "file": 1,
@@ -147,6 +153,67 @@ def _format_hover_markdown(symbol: Symbol) -> str:
     return "\n\n".join(lines)
 
 
+_CALL_HIERARCHY_KIND_TO_LSP = {
+    "function": _LSP_SYMBOL_KINDS["function"],
+    "method": _LSP_SYMBOL_KINDS["method"],
+    "class": _LSP_SYMBOL_KINDS["class"],
+}
+
+
+def _call_hierarchy_item_to_lsp(item: CallHierarchyItem) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "name": item.name,
+        "kind": _CALL_HIERARCHY_KIND_TO_LSP[item.kind],
+        "uri": _path_to_uri(item.path),
+        "range": {
+            "start": {
+                "line": item.range_start_line,
+                "character": item.range_start_character,
+            },
+            "end": {
+                "line": item.range_end_line,
+                "character": item.range_end_character,
+            },
+        },
+        "selectionRange": {
+            "start": {
+                "line": item.selection_start_line,
+                "character": item.selection_start_character,
+            },
+            "end": {
+                "line": item.selection_end_line,
+                "character": item.selection_end_character,
+            },
+        },
+        "data": {"path": item.path, "qualified_name": item.qualified_name},
+    }
+    if item.detail is not None:
+        payload["detail"] = item.detail
+    return payload
+
+
+def _call_site_to_lsp_range(site: CallHierarchyCallSite) -> dict[str, Any]:
+    return {
+        "start": {"line": site.start_line, "character": site.start_character},
+        "end": {"line": site.end_line, "character": site.end_character},
+    }
+
+
+def _call_hierarchy_identity_from_item(
+    item: Any,
+) -> tuple[str, str] | None:
+    if not isinstance(item, dict):
+        return None
+    data = item.get("data")
+    if not isinstance(data, dict):
+        return None
+    path = data.get("path")
+    qualified_name = data.get("qualified_name")
+    if not isinstance(path, str) or not isinstance(qualified_name, str):
+        return None
+    return path, qualified_name
+
+
 def _format_symbol_declaration(symbol: Symbol) -> str:
     bare_name = symbol.qualified_name.rsplit(".", 1)[-1]
     if symbol.kind == "class":
@@ -267,6 +334,12 @@ class LanguageServer:
             return self._document_link(params)
         if method == "textDocument/codeLens":
             return self._code_lens(params)
+        if method == "textDocument/prepareCallHierarchy":
+            return self._prepare_call_hierarchy(params)
+        if method == "callHierarchy/incomingCalls":
+            return self._call_hierarchy_incoming_calls(params)
+        if method == "callHierarchy/outgoingCalls":
+            return self._call_hierarchy_outgoing_calls(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -392,6 +465,7 @@ class LanguageServer:
                 "selectionRangeProvider": True,
                 "documentLinkProvider": {"resolveProvider": False},
                 "codeLensProvider": {"resolveProvider": False},
+                "callHierarchyProvider": True,
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
         }
@@ -855,6 +929,74 @@ class LanguageServer:
                 "command": {"title": lens.title, "command": ""},
             }
             for lens in lenses
+        ]
+
+    def _prepare_call_hierarchy(self, params: Any) -> list[dict[str, Any]] | None:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        try:
+            items = session.prepare_call_hierarchy(real_path, line, character)
+        except FileNotFoundError:
+            return None
+        if not items:
+            return None
+        return [_call_hierarchy_item_to_lsp(item) for item in items]
+
+    def _call_hierarchy_incoming_calls(
+        self, params: Any
+    ) -> list[dict[str, Any]] | None:
+        ident = _call_hierarchy_identity_from_item(params.get("item"))
+        if ident is None:
+            return None
+        path, qualified_name = ident
+        try:
+            real_path = self._require_safe_path(_path_to_uri(path))
+        except (ValueError, RuntimeError):
+            return None
+        try:
+            results = self._require_session().call_hierarchy_incoming_calls(
+                real_path, qualified_name
+            )
+        except FileNotFoundError:
+            return None
+        return [
+            {
+                "from": _call_hierarchy_item_to_lsp(call.caller),
+                "fromRanges": [
+                    _call_site_to_lsp_range(site) for site in call.call_sites
+                ],
+            }
+            for call in results
+        ]
+
+    def _call_hierarchy_outgoing_calls(
+        self, params: Any
+    ) -> list[dict[str, Any]] | None:
+        ident = _call_hierarchy_identity_from_item(params.get("item"))
+        if ident is None:
+            return None
+        path, qualified_name = ident
+        try:
+            real_path = self._require_safe_path(_path_to_uri(path))
+        except (ValueError, RuntimeError):
+            return None
+        try:
+            results = self._require_session().call_hierarchy_outgoing_calls(
+                real_path, qualified_name
+            )
+        except FileNotFoundError:
+            return None
+        return [
+            {
+                "to": _call_hierarchy_item_to_lsp(call.callee),
+                "fromRanges": [
+                    _call_site_to_lsp_range(site) for site in call.call_sites
+                ],
+            }
+            for call in results
         ]
 
     def _workspace_root_from_params(self, params: Any) -> str:

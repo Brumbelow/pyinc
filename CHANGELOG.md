@@ -10,6 +10,51 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **Call hierarchy in `pyinc-tools` LSP.** The server now advertises
+  `callHierarchyProvider: true` and implements all three call-hierarchy
+  methods: `textDocument/prepareCallHierarchy`,
+  `callHierarchy/incomingCalls`, and `callHierarchy/outgoingCalls`.
+  `prepareCallHierarchy` resolves the identifier under the cursor through
+  `symbol_resolution.resolve_symbol`; when the target is a workspace
+  `function`, `method`, or `class`, it returns a single `CallHierarchyItem`
+  whose `range` covers the whole def block (including decorator lines if
+  any), whose `selectionRange` is the bare-name span on the header line,
+  and whose `data` field carries `{"path", "qualified_name"}` so the
+  incoming/outgoing follow-up calls do not need to re-resolve the cursor.
+  Variables, import aliases, `from_import` aliases, wildcard-import stubs,
+  and stdlib / installed / ambiguous / missing targets return `null`.
+  `incomingCalls` runs `find_references(include_declaration=False)` on the
+  item's target and groups references by their innermost enclosing
+  workspace-known def/class in the same file. The qualifier follows
+  `module_symbol_table`'s ClassDef-only nesting (a reference inside
+  `class C: def m(self): ...` is attributed to `C.m`); references inside a
+  nested function body bubble up to the next enclosing function or class
+  method that's in the symbol table, and module-top-level references are
+  dropped because there is no caller item to attribute them to.
+  `outgoingCalls` parses the declaring file, locates the
+  `def` / `async def` / `class` matching the item's qualified name, and
+  walks its body for `ast.Call` nodes — without descending into nested
+  `FunctionDef` / `AsyncFunctionDef` / `ClassDef` / `Lambda` scopes, each
+  of which owns its own outgoing-call list. Bare `Name(id=name)` calls are
+  resolved against the declaring module's imports; `Name.attr` calls are
+  resolved by first looking up the LHS as a workspace module and then
+  resolving `attr` inside that module (mirroring `find_references`'s
+  LHS-bare-Name handling). Subscripted calls (`factory[T](...)`), deep
+  attribute chains (`pkg.subpkg.foo(...)`), `self.method(...)` /
+  instance-attribute calls, and lambda calls produce no callee. New
+  consumer-layer entrypoints
+  `WorkspaceSession.prepare_call_hierarchy(path, line, character)`,
+  `WorkspaceSession.call_hierarchy_incoming_calls(path, qualified_name)`,
+  and `WorkspaceSession.call_hierarchy_outgoing_calls(path, qualified_name)`
+  return tuples of `CallHierarchyItem`,
+  `CallHierarchyIncomingCall(caller, call_sites)`, and
+  `CallHierarchyOutgoingCall(callee, call_sites)` dataclasses with 0-based
+  LSP-style range fields. New public names re-exported from `pyinc_tools`:
+  `CallHierarchyItem`, `CallHierarchyItemKind`, `CallHierarchyCallSite`,
+  `CallHierarchyIncomingCall`, `CallHierarchyOutgoingCall`. Lives entirely
+  on top of the stable `pyinc.integrations` public surface (composes
+  `resolve_symbol`, `module_symbol_table`, and `find_references`) — no
+  kernel contract change and no new integration-layer surface.
 - **`textDocument/typeDefinition` in `pyinc-tools` LSP.** The server now
   advertises `typeDefinitionProvider: true` and returns `Location[]` for the
   type-definition site(s) of the symbol under the cursor. The implementation
