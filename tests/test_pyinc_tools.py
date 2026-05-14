@@ -9,6 +9,10 @@ import pytest
 
 from pyinc_tools.lsp import LanguageServer, _RequestFailed
 from pyinc_tools.session import (
+    CallHierarchyCallSite,
+    CallHierarchyIncomingCall,
+    CallHierarchyItem,
+    CallHierarchyOutgoingCall,
     CodeLens,
     DocumentLink,
     FoldingRange,
@@ -3404,3 +3408,593 @@ def test_language_server_advertises_type_definition_provider(tmp_path: Path) -> 
         if server._session is not None:
             server._session.close()
     assert result["capabilities"]["typeDefinitionProvider"] is True
+
+
+# ---------------------------------------------------------------------------
+# Call hierarchy
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_call_hierarchy_top_level_function_at_call_site(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    app = root / "app.py"
+    _write(app, "from helper import greet\n\nprint(greet())\n")
+
+    with WorkspaceSession(root) as session:
+        # Cursor on `greet` inside `print(greet())` on line 2 (0-based).
+        items = session.prepare_call_hierarchy(app, 2, len("print("))
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.name == "greet"
+    assert item.kind == "function"
+    assert item.path == str(helper)
+    assert item.qualified_name == "greet"
+    assert item.detail == "helper"
+    # selectionRange is the bare identifier on the def header line.
+    assert item.selection_start_line == 0
+    assert item.selection_start_character == len("def ")
+    assert item.selection_end_line == 0
+    assert item.selection_end_character == len("def greet")
+    # range covers the whole def block (header through body's last line).
+    assert item.range_start_line == 0
+    assert item.range_start_character == 0
+    assert item.range_end_line == 1
+
+
+def test_prepare_call_hierarchy_on_class_returns_class_item(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "class Widget:\n    pass\n")
+    app = root / "app.py"
+    _write(app, "from helper import Widget\n\nWidget()\n")
+
+    with WorkspaceSession(root) as session:
+        # Cursor on the `Widget()` call on line 2.
+        items = session.prepare_call_hierarchy(app, 2, 0)
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.name == "Widget"
+    assert item.kind == "class"
+    assert item.qualified_name == "Widget"
+    assert item.path == str(helper)
+
+
+def test_prepare_call_hierarchy_off_identifier_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(app, "x = 1\n")
+    with WorkspaceSession(root) as session:
+        items = session.prepare_call_hierarchy(app, 0, 1)  # the "=" sign
+    assert items == ()
+
+
+def test_prepare_call_hierarchy_on_variable_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(app, "x: int = 1\nprint(x)\n")
+    with WorkspaceSession(root) as session:
+        # Cursor on `x` in `print(x)` — a variable, not a callable.
+        items = session.prepare_call_hierarchy(app, 1, len("print("))
+    assert items == ()
+
+
+def test_prepare_call_hierarchy_on_stdlib_target_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(app, "import json\n\njson.dumps({})\n")
+    with WorkspaceSession(root) as session:
+        items = session.prepare_call_hierarchy(app, 2, 0)  # `json`
+    assert items == ()
+
+
+def test_prepare_call_hierarchy_decorated_function_range_includes_decorator(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(
+        helper,
+        "import functools\n\n"
+        "@functools.cache\n"
+        "def cached() -> int:\n"
+        "    return 1\n",
+    )
+    app = root / "app.py"
+    _write(app, "from helper import cached\n\nprint(cached())\n")
+
+    with WorkspaceSession(root) as session:
+        items = session.prepare_call_hierarchy(app, 2, len("print("))
+
+    assert len(items) == 1
+    item = items[0]
+    # Decorator is on line 2 (0-based); range starts there.
+    assert item.range_start_line == 2
+    # selectionRange is the bare-name span on the `def` line (line 3).
+    assert item.selection_start_line == 3
+    assert item.selection_start_character == len("def ")
+    assert item.selection_end_character == len("def cached")
+
+
+def test_call_hierarchy_incoming_calls_groups_per_caller(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    app = root / "app.py"
+    _write(
+        app,
+        "from helper import greet\n"
+        "\n"
+        "def caller_one() -> str:\n"
+        "    return greet()\n"
+        "\n"
+        "def caller_two() -> str:\n"
+        "    return greet() + greet()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        calls = session.call_hierarchy_incoming_calls(helper, "greet")
+
+    assert len(calls) == 2
+    by_caller = {call.caller.qualified_name: call for call in calls}
+    assert set(by_caller) == {"caller_one", "caller_two"}
+    assert len(by_caller["caller_one"].call_sites) == 1
+    assert len(by_caller["caller_two"].call_sites) == 2
+    # The caller items point at the *consumer* file, not the helper.
+    assert by_caller["caller_one"].caller.path == str(app)
+
+
+def test_call_hierarchy_incoming_calls_inside_method_attributes_to_method(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    app = root / "app.py"
+    _write(
+        app,
+        "from helper import greet\n"
+        "\n"
+        "class Caller:\n"
+        "    def run(self) -> str:\n"
+        "        return greet()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        calls = session.call_hierarchy_incoming_calls(helper, "greet")
+
+    assert len(calls) == 1
+    assert calls[0].caller.qualified_name == "Caller.run"
+    assert calls[0].caller.kind == "method"
+
+
+def test_call_hierarchy_incoming_calls_inside_nested_function_bubbles_to_outer(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    app = root / "app.py"
+    _write(
+        app,
+        "from helper import greet\n"
+        "\n"
+        "def outer() -> str:\n"
+        "    def inner() -> str:\n"
+        "        return greet()\n"
+        "    return inner()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        calls = session.call_hierarchy_incoming_calls(helper, "greet")
+
+    # `inner` is not in the symbol table; the call is attributed to `outer`.
+    assert len(calls) == 1
+    assert calls[0].caller.qualified_name == "outer"
+
+
+def test_call_hierarchy_incoming_calls_skips_module_top_level_references(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    app = root / "app.py"
+    _write(app, "from helper import greet\n\nprint(greet())\n")
+
+    with WorkspaceSession(root) as session:
+        calls = session.call_hierarchy_incoming_calls(helper, "greet")
+
+    # The call site at module top level has no enclosing def/class, so it is
+    # dropped — there is no `CallHierarchyItem` to attribute it to.
+    assert calls == ()
+
+
+def test_call_hierarchy_incoming_calls_non_workspace_target_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(app, "x = 1\n")
+    with WorkspaceSession(root) as session:
+        calls = session.call_hierarchy_incoming_calls(app, "missing_symbol")
+    assert calls == ()
+
+
+def test_call_hierarchy_outgoing_calls_resolves_bare_and_module_attr_calls(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(
+        helper,
+        "def alpha() -> int:\n"
+        "    return 1\n"
+        "\n"
+        "def beta() -> int:\n"
+        "    return 2\n",
+    )
+    app = root / "app.py"
+    _write(
+        app,
+        "import helper\n"
+        "from helper import alpha\n"
+        "\n"
+        "def driver() -> int:\n"
+        "    return alpha() + helper.beta()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        calls = session.call_hierarchy_outgoing_calls(app, "driver")
+
+    by_callee = {call.callee.qualified_name: call for call in calls}
+    assert set(by_callee) == {"alpha", "beta"}
+    assert by_callee["alpha"].callee.path == str(helper)
+    assert by_callee["beta"].callee.path == str(helper)
+    # Each callee is called once from `driver`.
+    assert len(by_callee["alpha"].call_sites) == 1
+    assert len(by_callee["beta"].call_sites) == 1
+    # The bare `alpha()` call site spans just the identifier `alpha`.
+    alpha_site = by_callee["alpha"].call_sites[0]
+    assert alpha_site.start_line == 4
+    assert alpha_site.end_character - alpha_site.start_character == len("alpha")
+    # The attribute `helper.beta()` reports only the rightmost-attr span.
+    beta_site = by_callee["beta"].call_sites[0]
+    assert beta_site.end_character - beta_site.start_character == len("beta")
+
+
+def test_call_hierarchy_outgoing_calls_skips_nested_function_calls(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def alpha() -> int:\n    return 1\n")
+    app = root / "app.py"
+    _write(
+        app,
+        "from helper import alpha\n"
+        "\n"
+        "def outer() -> int:\n"
+        "    def inner() -> int:\n"
+        "        return alpha()\n"
+        "    return inner()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        calls = session.call_hierarchy_outgoing_calls(app, "outer")
+
+    # The `alpha()` call lives inside the nested `inner` function, which has
+    # its own outgoing-call list; `outer`'s outgoing calls only include
+    # `inner()`. `inner` is not in the symbol table, so it is also dropped.
+    assert calls == ()
+
+
+def test_call_hierarchy_outgoing_calls_aggregates_repeated_call_sites(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def alpha() -> int:\n    return 1\n")
+    app = root / "app.py"
+    _write(
+        app,
+        "from helper import alpha\n"
+        "\n"
+        "def driver() -> int:\n"
+        "    return alpha() + alpha() + alpha()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        calls = session.call_hierarchy_outgoing_calls(app, "driver")
+
+    assert len(calls) == 1
+    assert calls[0].callee.qualified_name == "alpha"
+    assert len(calls[0].call_sites) == 3
+    # Call sites are emitted in document order.
+    starts = [site.start_character for site in calls[0].call_sites]
+    assert starts == sorted(starts)
+
+
+def test_call_hierarchy_outgoing_calls_skips_stdlib_and_unresolvable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(
+        app,
+        "import json\n"
+        "\n"
+        "def driver() -> None:\n"
+        "    print(json.dumps({}))\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        calls = session.call_hierarchy_outgoing_calls(app, "driver")
+
+    # `print` is a builtin, `json.dumps` is stdlib — neither contributes a
+    # workspace callee, so the result is empty.
+    assert calls == ()
+
+
+def test_call_hierarchy_outgoing_calls_on_unparseable_file_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    broken = root / "broken.py"
+    _write(broken, "def (\n")
+    with WorkspaceSession(root) as session:
+        assert session.call_hierarchy_outgoing_calls(broken, "anything") == ()
+
+
+def test_call_hierarchy_outgoing_calls_unknown_qname_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(app, "def driver() -> int:\n    return 1\n")
+    with WorkspaceSession(root) as session:
+        assert session.call_hierarchy_outgoing_calls(app, "missing") == ()
+
+
+def test_call_hierarchy_methods_for_missing_file_raise_filenotfound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with WorkspaceSession(root) as session:
+        with pytest.raises(FileNotFoundError):
+            session.prepare_call_hierarchy(root / "absent.py", 0, 0)
+        with pytest.raises(FileNotFoundError):
+            session.call_hierarchy_incoming_calls(root / "absent.py", "x")
+        with pytest.raises(FileNotFoundError):
+            session.call_hierarchy_outgoing_calls(root / "absent.py", "x")
+
+
+def test_call_hierarchy_outgoing_overlay_sees_edit(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def alpha() -> int:\n    return 1\n")
+    app = root / "app.py"
+    _write(app, "from helper import alpha\n\ndef driver() -> int:\n    return 0\n")
+
+    with WorkspaceSession(root) as session:
+        before = session.call_hierarchy_outgoing_calls(app, "driver")
+        assert before == ()
+        session.set_overlay(
+            str(app),
+            "from helper import alpha\n\ndef driver() -> int:\n    return alpha()\n",
+        )
+        after = session.call_hierarchy_outgoing_calls(app, "driver")
+        assert len(after) == 1
+        assert after[0].callee.qualified_name == "alpha"
+
+
+def test_language_server_advertises_call_hierarchy_provider(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert init["capabilities"]["callHierarchyProvider"] is True
+
+
+def test_language_server_prepare_call_hierarchy_returns_lsp_payload(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    app = root / "app.py"
+    _write(app, "from helper import greet\n\nprint(greet())\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/prepareCallHierarchy",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": 2, "character": len("print(")},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert isinstance(result, list)
+    assert len(result) == 1
+    item = result[0]
+    assert item["name"] == "greet"
+    assert item["kind"] == _LSP_SYMBOL_KIND_FUNCTION
+    assert item["uri"] == helper.as_uri()
+    assert item["selectionRange"] == {
+        "start": {"line": 0, "character": len("def ")},
+        "end": {"line": 0, "character": len("def greet")},
+    }
+    assert item["data"] == {"path": str(helper), "qualified_name": "greet"}
+
+
+def test_language_server_prepare_call_hierarchy_off_identifier_returns_null(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(app, "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/prepareCallHierarchy",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": 0, "character": 1},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is None
+
+
+def test_language_server_call_hierarchy_incoming_outgoing_roundtrip(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    app = root / "app.py"
+    _write(
+        app,
+        "from helper import greet\n"
+        "\n"
+        "def caller() -> str:\n"
+        "    return greet()\n",
+    )
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        prepared = server._handle_request(
+            "textDocument/prepareCallHierarchy",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": 3, "character": len("    return ")},
+            },
+        )
+        assert prepared is not None and len(prepared) == 1
+        incoming = server._handle_request(
+            "callHierarchy/incomingCalls", {"item": prepared[0]}
+        )
+        prepared_caller = server._handle_request(
+            "textDocument/prepareCallHierarchy",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": 2, "character": len("def ")},
+            },
+        )
+        assert prepared_caller is not None and len(prepared_caller) == 1
+        outgoing = server._handle_request(
+            "callHierarchy/outgoingCalls", {"item": prepared_caller[0]}
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert isinstance(incoming, list)
+    assert len(incoming) == 1
+    assert incoming[0]["from"]["name"] == "caller"
+    assert incoming[0]["from"]["uri"] == app.as_uri()
+    assert len(incoming[0]["fromRanges"]) == 1
+
+    assert isinstance(outgoing, list)
+    assert len(outgoing) == 1
+    assert outgoing[0]["to"]["name"] == "greet"
+    assert outgoing[0]["to"]["uri"] == helper.as_uri()
+
+
+def test_language_server_call_hierarchy_incoming_missing_data_returns_null(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "callHierarchy/incomingCalls",
+            {"item": {"name": "foo", "kind": 12, "uri": (root / "x.py").as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is None
+
+
+def test_call_hierarchy_dataclass_exports_are_re_exported_from_pyinc_tools() -> None:
+    import pyinc_tools
+
+    for name in (
+        "CallHierarchyItem",
+        "CallHierarchyCallSite",
+        "CallHierarchyIncomingCall",
+        "CallHierarchyOutgoingCall",
+        "CallHierarchyItemKind",
+    ):
+        assert hasattr(pyinc_tools, name), name
+    # Sanity-check we can construct a frozen item.
+    item = CallHierarchyItem(
+        name="f",
+        kind="function",
+        path="/tmp/x.py",
+        qualified_name="f",
+        detail=None,
+        range_start_line=0,
+        range_start_character=0,
+        range_end_line=1,
+        range_end_character=0,
+        selection_start_line=0,
+        selection_start_character=4,
+        selection_end_line=0,
+        selection_end_character=5,
+    )
+    site = CallHierarchyCallSite(
+        start_line=0, start_character=0, end_line=0, end_character=1
+    )
+    inc = CallHierarchyIncomingCall(caller=item, call_sites=(site,))
+    out = CallHierarchyOutgoingCall(callee=item, call_sites=(site,))
+    assert inc.caller is item
+    assert out.callee is item

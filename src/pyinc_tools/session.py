@@ -186,6 +186,46 @@ class TypeDefinitionLocation:
     end_col_offset: int
 
 
+CallHierarchyItemKind = Literal["function", "method", "class"]
+
+
+@dataclass(frozen=True)
+class CallHierarchyItem:
+    name: str
+    kind: CallHierarchyItemKind
+    path: str
+    qualified_name: str
+    detail: str | None
+    range_start_line: int
+    range_start_character: int
+    range_end_line: int
+    range_end_character: int
+    selection_start_line: int
+    selection_start_character: int
+    selection_end_line: int
+    selection_end_character: int
+
+
+@dataclass(frozen=True)
+class CallHierarchyCallSite:
+    start_line: int
+    start_character: int
+    end_line: int
+    end_character: int
+
+
+@dataclass(frozen=True)
+class CallHierarchyIncomingCall:
+    caller: CallHierarchyItem
+    call_sites: tuple[CallHierarchyCallSite, ...]
+
+
+@dataclass(frozen=True)
+class CallHierarchyOutgoingCall:
+    callee: CallHierarchyItem
+    call_sites: tuple[CallHierarchyCallSite, ...]
+
+
 @dataclass(frozen=True)
 class _DependencyInputs:
     config: ConfigAnalysis | None
@@ -229,6 +269,36 @@ def _line_char_to_offset(source: str, line: int, character: int) -> int | None:
     if line_end == -1:
         line_end = len(source)
     return pos + min(character, line_end - pos)
+
+
+def _identifier_at_source_position(
+    source: str, line: int, character: int
+) -> str | None:
+    """Return the bare identifier covering ``(line, character)`` or ``None``.
+
+    Coordinates are LSP-style 0-based. Matches the identifier-lookup the LSP
+    layer applies for hover/definition: walk outward from the cursor while
+    the characters are `[A-Za-z0-9_]`, and require the leading character to
+    be `[A-Za-z_]`.
+    """
+    lines = source.splitlines()
+    if not (0 <= line < len(lines)):
+        return None
+    text = lines[line]
+    if not (0 <= character <= len(text)):
+        return None
+    start = character
+    while start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
+        start -= 1
+    end = character
+    while end < len(text) and (text[end].isalnum() or text[end] == "_"):
+        end += 1
+    if start == end:
+        return None
+    first = text[start]
+    if not (first.isalpha() or first == "_"):
+        return None
+    return text[start:end]
 
 
 def _identifier_immediately_before(source: str, paren_pos: int) -> str | None:
@@ -651,6 +721,166 @@ def _compute_document_links(
 
     links.sort(key=lambda link: (link.start_line, link.start_character))
     return tuple(links)
+
+
+_CallableNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+
+
+def _find_callable_node(
+    tree: ast.Module, qualified_name: str
+) -> _CallableNode | None:
+    """Locate the FunctionDef/AsyncFunctionDef/ClassDef matching `qualified_name`.
+
+    Matches `module_symbol_table`'s qualified-name convention: top-level
+    `def f` / `class C` resolve to ``f`` / ``C``; methods inside a class body
+    resolve to ``C.f``; nested classes inside a class body resolve to
+    ``C.Inner``. Nested functions inside another function body are not in
+    the symbol table and are therefore not matched here.
+    """
+    parts = qualified_name.split(".")
+    if not parts or any(not part for part in parts):
+        return None
+
+    def walk(
+        nodes: list[ast.stmt], remaining: list[str]
+    ) -> _CallableNode | None:
+        head = remaining[0]
+        rest = remaining[1:]
+        for node in nodes:
+            if isinstance(node, ast.ClassDef) and node.name == head:
+                if not rest:
+                    return node
+                found = walk(list(node.body), rest)
+                if found is not None:
+                    return found
+            elif (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == head
+            ):
+                if not rest:
+                    return node
+                # Nested functions are not part of the symbol-table qualifier
+                # scheme — stop descending.
+        return None
+
+    return walk(list(tree.body), parts)
+
+
+def _enclosing_callable_qname(
+    tree: ast.Module, known_qnames: frozenset[str], line: int
+) -> str | None:
+    """Innermost qualified name from `known_qnames` whose def/class span
+    contains the 1-based source `line`.
+
+    Qualifier follows the `module_symbol_table` convention: only `ClassDef`
+    nesting contributes to the dotted path; nested function bodies do not
+    extend the qualifier. Returns the deepest matching qname, or ``None`` if
+    no enclosing def/class is in `known_qnames`.
+    """
+    best: tuple[int, str] | None = None
+
+    def visit(node: ast.AST, class_qualifier: str) -> None:
+        nonlocal best
+        if isinstance(node, ast.ClassDef):
+            qname = (
+                f"{class_qualifier}.{node.name}" if class_qualifier else node.name
+            )
+            end_lineno = node.end_lineno or node.lineno
+            if node.lineno <= line <= end_lineno and qname in known_qnames:
+                span = end_lineno - node.lineno
+                if best is None or span < best[0]:
+                    best = (span, qname)
+            for body_child in node.body:
+                visit(body_child, qname)
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            qname = (
+                f"{class_qualifier}.{node.name}" if class_qualifier else node.name
+            )
+            end_lineno = node.end_lineno or node.lineno
+            if node.lineno <= line <= end_lineno and qname in known_qnames:
+                span = end_lineno - node.lineno
+                if best is None or span < best[0]:
+                    best = (span, qname)
+            # Nested defs/classes inside a function body are not in the
+            # module symbol table; reset the class qualifier for any further
+            # walk so a nested class can still be detected if it ever lands
+            # in the table.
+            for descendant in ast.iter_child_nodes(node):
+                visit(descendant, "")
+            return
+        for descendant in ast.iter_child_nodes(node):
+            visit(descendant, class_qualifier)
+
+    visit(tree, "")
+    return best[1] if best is not None else None
+
+
+def _collect_outgoing_calls(
+    body_node: _CallableNode,
+) -> tuple[ast.Call, ...]:
+    """Walk `body_node.body` for ``ast.Call`` nodes, skipping descent into
+    any nested ``FunctionDef`` / ``AsyncFunctionDef`` / ``ClassDef`` /
+    ``Lambda`` so each scope owns its own outgoing-call list.
+
+    Comprehension scopes (`ListComp`, `SetComp`, `DictComp`, `GeneratorExp`)
+    are walked through since they conceptually run inline.
+    """
+    calls: list[ast.Call] = []
+
+    def walk(node: ast.AST) -> None:
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+        ):
+            return
+        if isinstance(node, ast.Call):
+            calls.append(node)
+        for child in ast.iter_child_nodes(node):
+            walk(child)
+
+    for stmt in body_node.body:
+        walk(stmt)
+    return tuple(calls)
+
+
+def _call_func_range(call: ast.Call) -> tuple[int, int, int, int] | None:
+    """Return the LSP-style 0-based range of `call.func`'s name span.
+
+    For `Name(id=name)` it's the entire Name; for
+    `Attribute(value=Name, attr=name)` it's just the rightmost-attribute
+    span (matching `find_references`'s reporting convention). Returns
+    ``None`` for any other call shape (subscripted, deep attribute chains,
+    lambdas, etc.) so the caller can skip it.
+    """
+    func = call.func
+    if isinstance(func, ast.Name):
+        end_col = func.end_col_offset
+        end_lineno = func.end_lineno
+        if end_col is None or end_lineno is None:
+            end_col = func.col_offset + len(func.id)
+            end_lineno = func.lineno
+        return (
+            func.lineno - 1,
+            func.col_offset,
+            end_lineno - 1,
+            end_col,
+        )
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        end_col = func.end_col_offset
+        end_lineno = func.end_lineno
+        if end_col is None or end_lineno is None:
+            return None
+        attr_col = end_col - len(func.attr)
+        if attr_col < 0:
+            return None
+        return (
+            end_lineno - 1,
+            attr_col,
+            end_lineno - 1,
+            end_col,
+        )
+    return None
 
 
 def _collect_filesystem_snapshot(
@@ -1169,6 +1399,396 @@ class WorkspaceSession:
                     )
                 )
             return tuple(locations)
+
+    def prepare_call_hierarchy(
+        self,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+    ) -> tuple[CallHierarchyItem, ...]:
+        """Return the call-hierarchy item(s) for the identifier at the cursor.
+
+        Resolves the identifier under ``(line, character)`` (LSP-style 0-based
+        coordinates) through ``resolve_symbol``. If the resolved target is a
+        workspace function, method, or class, a single
+        :class:`CallHierarchyItem` describing that target is returned;
+        otherwise the result is empty. Variables, import aliases,
+        ``from_import`` aliases, wildcard-import stubs, and stdlib /
+        installed / ambiguous / missing targets all return ``()``.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            identifier = _identifier_at_source_position(source, line, character)
+            if identifier is None:
+                return ()
+            resolved = self._remap_resolved_symbol(
+                resolve_symbol(
+                    self.db, self.mirror_root, str(mirror_path), identifier
+                )
+            )
+            if resolved.resolution != "workspace":
+                return ()
+            if resolved.defining_path is None or resolved.defining_lineno is None:
+                return ()
+            defining_mirror = self._mirror_path_for_real(resolved.defining_path)
+            if not defining_mirror.exists() or defining_mirror.suffix != ".py":
+                return ()
+            defining_table = module_symbol_table(
+                self.db, self.mirror_root, str(defining_mirror)
+            )
+            matched: Symbol | None = None
+            for symbol in defining_table.symbols:
+                if (
+                    symbol.lineno == resolved.defining_lineno
+                    and symbol.qualified_name == resolved.qualified_name
+                    and symbol.kind in ("function", "method", "class")
+                ):
+                    matched = symbol
+                    break
+            if matched is None:
+                return ()
+            item = self._build_call_hierarchy_item(
+                resolved.defining_path, matched.qualified_name, defining_table.module
+            )
+            if item is None:
+                return ()
+            return (item,)
+
+    def call_hierarchy_incoming_calls(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+    ) -> tuple[CallHierarchyIncomingCall, ...]:
+        """Return callers of the symbol named ``qualified_name`` (declared in ``path``).
+
+        ``find_references(include_declaration=False)`` produces every workspace
+        reference; each reference is attributed to its innermost enclosing
+        ``def`` / ``async def`` / ``class`` in the same file whose qualified
+        name appears in that file's symbol table. References inside nested
+        function bodies bubble up to their enclosing top-level function or
+        class method (mirroring ``module_symbol_table``'s qualifier scheme);
+        references at module top level are dropped because there is no caller
+        item to attribute them to. Stdlib / installed / ambiguous / missing
+        targets, and references that don't sit inside any known def/class in
+        the workspace, return ``()``.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            result = find_references(
+                self.db,
+                self.mirror_root,
+                str(mirror_path),
+                qualified_name,
+                include_declaration=False,
+            )
+            if result.target.resolution != "workspace":
+                return ()
+
+            grouped: dict[
+                tuple[str, str], list[CallHierarchyCallSite]
+            ] = {}
+            order: list[tuple[str, str]] = []
+            tree_cache: dict[str, ast.Module | None] = {}
+            table_cache: dict[str, ModuleSymbolTable] = {}
+
+            for ref in result.references:
+                ref_real_path = self._remap_path(ref.path) or ref.path
+                ref_mirror_path = self._mirror_path_for_real(ref_real_path)
+                if not ref_mirror_path.exists() or ref_mirror_path.suffix != ".py":
+                    continue
+                if ref_real_path not in tree_cache:
+                    source = self.source_text(ref_real_path)
+                    if source is None:
+                        tree_cache[ref_real_path] = None
+                    else:
+                        try:
+                            tree_cache[ref_real_path] = ast.parse(source)
+                        except SyntaxError:
+                            tree_cache[ref_real_path] = None
+                tree = tree_cache[ref_real_path]
+                if tree is None:
+                    continue
+                if ref_real_path not in table_cache:
+                    table_cache[ref_real_path] = self._remap_module_symbol_table(
+                        module_symbol_table(
+                            self.db, self.mirror_root, str(ref_mirror_path)
+                        )
+                    )
+                table = table_cache[ref_real_path]
+                known_qnames = frozenset(
+                    symbol.qualified_name
+                    for symbol in table.symbols
+                    if symbol.kind in ("function", "method", "class")
+                )
+                caller_qname = _enclosing_callable_qname(
+                    tree, known_qnames, ref.lineno
+                )
+                if caller_qname is None:
+                    continue
+                key = (ref_real_path, caller_qname)
+                if key not in grouped:
+                    grouped[key] = []
+                    order.append(key)
+                grouped[key].append(
+                    CallHierarchyCallSite(
+                        start_line=max(ref.lineno - 1, 0),
+                        start_character=ref.col_offset,
+                        end_line=max(ref.lineno - 1, 0),
+                        end_character=ref.end_col_offset,
+                    )
+                )
+
+            incoming: list[CallHierarchyIncomingCall] = []
+            for caller_path, caller_qname in order:
+                caller_item = self._build_call_hierarchy_item(
+                    caller_path, caller_qname, module_name=None
+                )
+                if caller_item is None:
+                    continue
+                sites = sorted(
+                    grouped[(caller_path, caller_qname)],
+                    key=lambda site: (site.start_line, site.start_character),
+                )
+                incoming.append(
+                    CallHierarchyIncomingCall(
+                        caller=caller_item, call_sites=tuple(sites)
+                    )
+                )
+            incoming.sort(key=lambda call: (call.caller.path, call.caller.qualified_name))
+            return tuple(incoming)
+
+    def call_hierarchy_outgoing_calls(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+    ) -> tuple[CallHierarchyOutgoingCall, ...]:
+        """Return callees called from the body of ``qualified_name`` (declared in ``path``).
+
+        Parses the declaring file's AST once, locates the ``FunctionDef`` /
+        ``AsyncFunctionDef`` / ``ClassDef`` matching ``qualified_name``, and
+        walks its body for ``ast.Call`` nodes — without descending into
+        nested ``FunctionDef`` / ``AsyncFunctionDef`` / ``ClassDef`` /
+        ``Lambda`` scopes, each of which owns its own outgoing-call list.
+        Calls whose ``func`` is a bare ``Name`` are resolved against the
+        declaring module's imports; calls whose ``func`` is
+        ``Name.attr`` are resolved by first resolving the LHS name to a
+        workspace module and then resolving ``attr`` inside that module
+        (mirroring ``find_references``'s LHS-bare-Name handling).
+        Subscripted calls (``factory[T](``), deep attribute chains
+        (``pkg.subpkg.foo()``), and lambda calls produce no callee. Targets
+        that don't resolve to a workspace function/method/class are skipped.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                return ()
+            body_node = _find_callable_node(tree, qualified_name)
+            if body_node is None:
+                return ()
+
+            grouped: dict[
+                tuple[str, str], list[CallHierarchyCallSite]
+            ] = {}
+            order: list[tuple[str, str]] = []
+            for call in _collect_outgoing_calls(body_node):
+                func_range = _call_func_range(call)
+                if func_range is None:
+                    continue
+                target_resolved = self._resolve_call_target(
+                    mirror_path, call.func
+                )
+                if target_resolved is None:
+                    continue
+                if (
+                    target_resolved.resolution != "workspace"
+                    or target_resolved.defining_path is None
+                    or target_resolved.defining_lineno is None
+                ):
+                    continue
+                defining_mirror = self._mirror_path_for_real(
+                    target_resolved.defining_path
+                )
+                if (
+                    not defining_mirror.exists()
+                    or defining_mirror.suffix != ".py"
+                ):
+                    continue
+                defining_table = module_symbol_table(
+                    self.db, self.mirror_root, str(defining_mirror)
+                )
+                matched: Symbol | None = None
+                for symbol in defining_table.symbols:
+                    if (
+                        symbol.lineno == target_resolved.defining_lineno
+                        and symbol.qualified_name == target_resolved.qualified_name
+                        and symbol.kind in ("function", "method", "class")
+                    ):
+                        matched = symbol
+                        break
+                if matched is None:
+                    continue
+                key = (target_resolved.defining_path, matched.qualified_name)
+                if key not in grouped:
+                    grouped[key] = []
+                    order.append(key)
+                sl, sc, el, ec = func_range
+                grouped[key].append(
+                    CallHierarchyCallSite(
+                        start_line=sl,
+                        start_character=sc,
+                        end_line=el,
+                        end_character=ec,
+                    )
+                )
+
+            outgoing: list[CallHierarchyOutgoingCall] = []
+            for callee_path, callee_qname in order:
+                callee_item = self._build_call_hierarchy_item(
+                    callee_path, callee_qname, module_name=None
+                )
+                if callee_item is None:
+                    continue
+                sites = sorted(
+                    grouped[(callee_path, callee_qname)],
+                    key=lambda site: (site.start_line, site.start_character),
+                )
+                outgoing.append(
+                    CallHierarchyOutgoingCall(
+                        callee=callee_item, call_sites=tuple(sites)
+                    )
+                )
+            outgoing.sort(key=lambda call: (call.callee.path, call.callee.qualified_name))
+            return tuple(outgoing)
+
+    def _resolve_call_target(
+        self,
+        caller_mirror_path: Path,
+        func: ast.expr,
+    ) -> ResolvedSymbol | None:
+        if isinstance(func, ast.Name):
+            return self._remap_resolved_symbol(
+                resolve_symbol(
+                    self.db,
+                    self.mirror_root,
+                    str(caller_mirror_path),
+                    func.id,
+                )
+            )
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            lhs_resolved = self._remap_resolved_symbol(
+                resolve_symbol(
+                    self.db,
+                    self.mirror_root,
+                    str(caller_mirror_path),
+                    func.value.id,
+                )
+            )
+            if (
+                lhs_resolved.resolution != "workspace"
+                or lhs_resolved.defining_path is None
+            ):
+                return None
+            lhs_mirror = self._mirror_path_for_real(lhs_resolved.defining_path)
+            if not lhs_mirror.exists() or lhs_mirror.suffix != ".py":
+                return None
+            return self._remap_resolved_symbol(
+                resolve_symbol(
+                    self.db, self.mirror_root, str(lhs_mirror), func.attr
+                )
+            )
+        return None
+
+    def _build_call_hierarchy_item(
+        self,
+        real_path: str,
+        qualified_name: str,
+        module_name: str | None,
+    ) -> CallHierarchyItem | None:
+        source = self.source_text(real_path)
+        if source is None:
+            return None
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return None
+        node = _find_callable_node(tree, qualified_name)
+        if node is None:
+            return None
+        if isinstance(node, ast.ClassDef):
+            kind: CallHierarchyItemKind = "class"
+        else:
+            kind = "method" if "." in qualified_name else "function"
+        if node.decorator_list:
+            range_start_line = (
+                min(dec.lineno for dec in node.decorator_list) - 1
+            )
+            range_start_col = min(
+                dec.col_offset for dec in node.decorator_list
+            )
+        else:
+            range_start_line = node.lineno - 1
+            range_start_col = node.col_offset
+        range_end_line = (node.end_lineno or node.lineno) - 1
+        range_end_col = node.end_col_offset or 0
+
+        bare_name = qualified_name.rsplit(".", 1)[-1]
+        located = self._locate_def_class_name_offsets(
+            real_path, node.lineno, bare_name
+        )
+        if located is None:
+            return None
+        selection_start_col, selection_end_col = located
+        selection_line = node.lineno - 1
+
+        if module_name is None:
+            mirror_path = self._mirror_path_for_real(real_path)
+            if mirror_path.exists() and mirror_path.suffix == ".py":
+                table = self._remap_module_symbol_table(
+                    module_symbol_table(
+                        self.db, self.mirror_root, str(mirror_path)
+                    )
+                )
+                module_name = table.module
+
+        # Ensure the LSP invariant `selectionRange ⊆ range` even for
+        # decorated definitions: the selection line is the header line,
+        # which is always after the first decorator line and before
+        # `end_lineno`, so the range covers it.
+        return CallHierarchyItem(
+            name=bare_name,
+            kind=kind,
+            path=real_path,
+            qualified_name=qualified_name,
+            detail=module_name,
+            range_start_line=range_start_line,
+            range_start_character=range_start_col,
+            range_end_line=range_end_line,
+            range_end_character=range_end_col,
+            selection_start_line=selection_line,
+            selection_start_character=selection_start_col,
+            selection_end_line=selection_line,
+            selection_end_character=selection_end_col,
+        )
 
     def _resolve_annotation_type_ref(
         self,
