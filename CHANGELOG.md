@@ -10,6 +10,49 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/inlayHint` in `pyinc-tools` LSP.** The server now
+  advertises `inlayHintProvider: {resolveProvider: false}` and returns
+  `InlayHint[]` for parameter-name hints at call sites inside the
+  requested LSP range. The implementation walks the document's AST
+  (overlay or on-disk) once with `ast.parse` and collects every
+  `ast.Call` whose call-function span starts inside the requested range.
+  Each call's callee is resolved through the same bare-`Name` /
+  `Name.attr` resolver used by `callHierarchy/outgoingCalls`
+  (`_resolve_call_target`), and the callee's signature is looked up
+  through `_lookup_callable_signature` so class constructions surface
+  `<Class>.__init__`'s parameters with the leading `self` / `cls`
+  stripped — matching the convention already used by `signatureHelp`.
+  For each positional argument the walker pairs it with the next
+  positional parameter slot from `Signature.parameters` (walking
+  posonly/positional entries, skipping `**kwargs`, and stopping at the
+  first `*args` parameter since it absorbs the rest of the slots) and
+  emits an `InlayHint` with `label = "<paramname>:"`, `kind = "parameter"`
+  (LSP value `2`), and `paddingRight = True`. Hints are suppressed when
+  the argument is itself a bare `Name` whose identifier equals the
+  parameter name (the standard no-redundant-hint convention used by
+  other Python language servers). Iteration also stops at the first
+  `ast.Starred` argument in the call, since `*spread` consumes an
+  unknown number of slots and the pairing becomes ambiguous after that
+  point. Targets resolved as stdlib / installed / ambiguous / missing,
+  calls whose callee shape is not a bare `Name` or `Name.attr`
+  (subscripted calls `factory[T](...)`, deep attribute chains
+  `pkg.subpkg.foo(...)`, `self.method(...)` / instance-attribute calls,
+  lambdas), and files that fail to parse all return `[]`. New
+  consumer-layer entrypoint `WorkspaceSession.inlay_hints_for_file(path,
+  start_line=0, start_character=0, end_line=None, end_character=0)`
+  returns a tuple of `InlayHint(line, character, label, kind,
+  padding_left, padding_right)` dataclasses with `line` / `character`
+  0-based (LSP-style) and `kind` typed as
+  `Literal["parameter", "type"]` — only `"parameter"` is emitted in this
+  release; `"type"` is reserved for future variable-type / return-type
+  hints. Omit `end_line` to scan the whole file. New public names
+  re-exported from `pyinc_tools`: `InlayHint`, `InlayHintKind`. Lives
+  entirely on top of the stable `pyinc.integrations` public surface
+  (composes `resolve_symbol` and `module_symbol_table` via the existing
+  call-target resolver and signature lookup) — no kernel contract
+  change and no new integration-layer surface.
+- **`pyinc-tools` LSP `serverInfo.version`** bumped from `"2.0.0"` to
+  `"2.1.0"` to align with the kernel version pinned in `pyproject.toml`.
 - **Call hierarchy in `pyinc-tools` LSP.** The server now advertises
   `callHierarchyProvider: true` and implements all three call-hierarchy
   methods: `textDocument/prepareCallHierarchy`,

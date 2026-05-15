@@ -140,9 +140,10 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     "selectionRangeProvider": true,
     "documentLinkProvider": { "resolveProvider": false },
     "codeLensProvider": { "resolveProvider": false },
-    "callHierarchyProvider": true
+    "callHierarchyProvider": true,
+    "inlayHintProvider": { "resolveProvider": false }
   },
-  "serverInfo": { "name": "pyinc-tools", "version": "2.0.0" }
+  "serverInfo": { "name": "pyinc-tools", "version": "2.1.0" }
 }
 ```
 
@@ -183,6 +184,7 @@ channels does not produce duplicate messages.
 | `textDocument/prepareCallHierarchy` | `CallHierarchyItem[]` or `null`. Resolves the identifier under the cursor through `symbol_resolution.resolve_symbol`; if the target is a workspace `function`, `method`, or `class`, returns a single item describing the declaring def/class. The item's `range` covers the whole def block (including decorator lines if any), and `selectionRange` is the bare-name span on the header line. The item's `data` field carries `{"path": str, "qualified_name": str}` which the server reads back on `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`. Variables, import aliases, `from_import` aliases, wildcard-import stubs, and stdlib / installed / ambiguous / missing targets return `null`. |
 | `callHierarchy/incomingCalls` | `CallHierarchyIncomingCall[]`. Calls `find_references(include_declaration=False)` on the item's target and groups references by their innermost enclosing workspace-known def/class in the same file (qualifier follows `module_symbol_table`'s ClassDef-only nesting scheme, so a reference inside `class C: def m(self): ...` is attributed to `C.m`). References inside nested function bodies bubble up to the next enclosing function or method that's in the symbol table; module-top-level references are dropped because there is no caller item to attribute them to. `fromRanges` are AST occurrence ranges, including the rightmost-attribute span for `M.foo()` style references. |
 | `callHierarchy/outgoingCalls` | `CallHierarchyOutgoingCall[]`. Parses the item's declaring file, locates the `def` / `async def` / `class` matching the item's qualified name, and walks its body for `ast.Call` nodes — *without* descending into nested `FunctionDef` / `AsyncFunctionDef` / `ClassDef` / `Lambda` scopes (each owns its own outgoing list). For each call: bare `Name(id=name)` resolves against the declaring module; `Name.attr` resolves the LHS through the file's imports and then `attr` inside the imported module (mirroring `find_references`'s LHS-bare-Name handling). Workspace `function` / `method` / `class` targets contribute callees; subscripted calls, deep attribute chains (`pkg.subpkg.foo()`), and lambda calls produce no callee. `fromRanges` are the call expression's name/attribute span. |
+| `textDocument/inlayHint` | `InlayHint[]` for parameter-name hints at call sites inside the requested `range`. The server walks the document's AST for `ast.Call` nodes whose callee resolves (via the same bare-`Name` / `Name.attr` resolver as `callHierarchy/outgoingCalls`) to a workspace `function` or `class`, looks up the callee's signature, and emits one hint per positional argument with label `"<paramname>:"`, `kind: 2` (Parameter), and `paddingRight: true`. Class constructions surface `<Class>.__init__`'s parameters with the leading `self` / `cls` stripped, matching `signatureHelp`. Hints are suppressed when the argument is itself a bare `Name` whose identifier equals the parameter name. Iteration stops at the first `*args` parameter (it absorbs the rest of the positional slots) or at the first `ast.Starred` argument in the call (its slot count is unknown). Stdlib / installed / ambiguous targets, attribute calls on instances (`obj.method(`), subscripted calls (`factory[T](`), deep attribute chains (`pkg.subpkg.foo(`), keyword arguments (already named), and files that fail to parse all contribute no hints. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
 ## Editor wiring
@@ -453,6 +455,29 @@ Consequences:
   `RequestFailed` error; renaming via an `import ... as` alias is refused with
   the same error code (the user is asked to rename the canonical name instead).
   Same-name and non-workspace targets return `null`.
+- Inlay hints, via `textDocument/inlayHint` (advertised as
+  `inlayHintProvider: {resolveProvider: false}`). The server parses the
+  document (overlay or on-disk) once with `ast.parse` and walks every
+  `ast.Call` whose call-function span starts inside the requested LSP
+  range. For each call whose callee resolves to a workspace `function` or
+  `class` (using the same bare-`Name` / `Name.attr` resolver as
+  `callHierarchy/outgoingCalls`), the server pairs each positional
+  argument with the next positional parameter slot from the callee's
+  `Signature.parameters` and emits an `InlayHint` with
+  `label = "<paramname>:"`, `kind = "parameter"`, and
+  `padding_right = True`. Class constructions surface
+  `<Class>.__init__`'s parameters with the leading `self` / `cls`
+  stripped, matching `signatureHelp`. Hints are suppressed when the
+  argument is a bare `Name` whose identifier already equals the parameter
+  name. Iteration stops at the first `*args` parameter (it absorbs the
+  rest of the positional slots) or at the first `ast.Starred` argument in
+  the call (its slot count is unknown). The consumer entrypoint
+  `WorkspaceSession.inlay_hints_for_file(path, start_line=0,
+  start_character=0, end_line=None, end_character=0)` returns a tuple of
+  `InlayHint(line, character, label, kind, padding_left, padding_right)`
+  dataclasses with `line` / `character` 0-based (LSP-style) and `kind`
+  typed as `Literal["parameter", "type"]`; omit `end_line` to scan the
+  whole file.
 
 **Not supported:**
 
@@ -542,6 +567,28 @@ Consequences:
     `x: list["Foo"]`) are not unwrapped: only the whole-annotation string
     form (`x: "Foo"`) is re-parsed. Names inside a partial-string position
     are silently dropped.
+- `textDocument/inlayHint` limitations:
+  - Only the `parameter` kind is emitted. Variable-type hints (`x = foo()`
+    → `x: int = foo()`) and return-type hints are not synthesised in this
+    release, even though the `InlayHintKind` literal reserves a `"type"`
+    value for future use.
+  - Resolves the same call shapes as `callHierarchy/outgoingCalls`: bare
+    `Name(...)` and `Name.attr(...)` where the LHS is bound by `import M`
+    or `from pkg import M`. Subscripted calls (`factory[T](...)`), deep
+    attribute chains (`pkg.subpkg.foo(...)`), `self.method(...)` /
+    instance-attribute calls, and lambda calls produce no hints.
+  - Stdlib / installed / ambiguous / missing callees are omitted, since
+    the LSP does not navigate into out-of-workspace targets and a hint
+    label needs an authoritative parameter name.
+  - Keyword arguments and arguments past a `*spread` are not hinted
+    (`f(a, *rest, c=3)` → only the first positional gets a hint).
+  - The argument-vs-parameter pairing assumes the encoded
+    `Signature.parameters` order matches Python's call semantics — that
+    is, posonly → positional → vararg → kwonly → kwargs (see
+    `_parameter_payloads_from_args` in `symbol_resolution`). Iteration
+    stops at the first `*name` parameter entry, so positional arguments
+    consumed by `*args` and kwonly parameters that follow it are not
+    hinted.
 
 ## Troubleshooting
 
