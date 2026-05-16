@@ -66,6 +66,11 @@ _FOLDING_RANGE_KINDS = {
     "region": "region",
 }
 
+_INLAY_HINT_KINDS = {
+    "type": 1,
+    "parameter": 2,
+}
+
 _ID_START_RE = re.compile(r"[A-Za-z_]")
 _ID_CONT_RE = re.compile(r"[A-Za-z0-9_]")
 
@@ -340,6 +345,8 @@ class LanguageServer:
             return self._call_hierarchy_incoming_calls(params)
         if method == "callHierarchy/outgoingCalls":
             return self._call_hierarchy_outgoing_calls(params)
+        if method == "textDocument/inlayHint":
+            return self._inlay_hint(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -466,6 +473,7 @@ class LanguageServer:
                 "documentLinkProvider": {"resolveProvider": False},
                 "codeLensProvider": {"resolveProvider": False},
                 "callHierarchyProvider": True,
+                "inlayHintProvider": {"resolveProvider": False},
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
         }
@@ -997,6 +1005,40 @@ class LanguageServer:
                 ],
             }
             for call in results
+        ]
+
+    def _inlay_hint(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        start_line: int | None = None
+        end_line: int | None = None
+        range_param = params.get("range")
+        if isinstance(range_param, dict):
+            start = range_param.get("start")
+            end = range_param.get("end")
+            if isinstance(start, dict):
+                start_value = start.get("line")
+                if isinstance(start_value, int):
+                    start_line = start_value
+            if isinstance(end, dict):
+                end_value = end.get("line")
+                if isinstance(end_value, int):
+                    end_line = end_value
+        try:
+            hints = session.inlay_hints_for_file(
+                real_path, start_line=start_line, end_line=end_line
+            )
+        except FileNotFoundError:
+            return []
+        return [
+            {
+                "position": {"line": hint.line, "character": hint.character},
+                "label": hint.label,
+                "kind": _INLAY_HINT_KINDS[hint.kind],
+                "paddingLeft": hint.padding_left,
+                "paddingRight": hint.padding_right,
+            }
+            for hint in hints
         ]
 
     def _workspace_root_from_params(self, params: Any) -> str:

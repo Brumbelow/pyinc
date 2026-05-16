@@ -186,6 +186,19 @@ class TypeDefinitionLocation:
     end_col_offset: int
 
 
+InlayHintKind = Literal["type", "parameter"]
+
+
+@dataclass(frozen=True)
+class InlayHint:
+    line: int
+    character: int
+    label: str
+    kind: InlayHintKind
+    padding_left: bool
+    padding_right: bool
+
+
 CallHierarchyItemKind = Literal["function", "method", "class"]
 
 
@@ -844,6 +857,38 @@ def _collect_outgoing_calls(
     return tuple(calls)
 
 
+def _walk_all_calls(tree: ast.AST) -> tuple[ast.Call, ...]:
+    """Walk every ``ast.Call`` in the module, including inside nested defs.
+
+    Unlike ``_collect_outgoing_calls`` — which only collects calls inside one
+    callable's own body — this descends through everything.
+    """
+    return tuple(node for node in ast.walk(tree) if isinstance(node, ast.Call))
+
+
+def _positional_parameter_names(
+    signature: Signature,
+) -> tuple[str, ...]:
+    """Return the slot-by-positional names of ``signature``'s parameters.
+
+    ``symbol_resolution._parameter_payloads_from_args`` flattens
+    ``posonlyargs`` and ``args`` into bare names and prefixes ``vararg`` /
+    ``kwarg`` with ``*`` / ``**`` (in source order). A leading ``*<name>``
+    therefore marks the boundary past which positional arguments stop
+    binding — keyword-only params follow it; ``**<name>`` is the kwargs
+    sink. Everything before the first starred entry binds positionally and
+    is what we want to hint.
+    """
+    names: list[str] = []
+    for parameter in signature.parameters:
+        raw = parameter.name
+        if raw.startswith("*"):
+            # `*args` or `**kwargs` — and any following params bind by keyword.
+            break
+        names.append(raw)
+    return tuple(names)
+
+
 def _call_func_range(call: ast.Call) -> tuple[int, int, int, int] | None:
     """Return the LSP-style 0-based range of `call.func`'s name span.
 
@@ -1295,6 +1340,122 @@ class WorkspaceSession:
                 )
             lenses.sort(key=lambda lens: (lens.start_line, lens.start_character))
             return tuple(lenses)
+
+    def inlay_hints_for_file(
+        self,
+        path: str | os.PathLike[str],
+        start_line: int | None = None,
+        end_line: int | None = None,
+    ) -> tuple[InlayHint, ...]:
+        """Return parameter-name inlay hints for positional call arguments.
+
+        Walks the document's AST for ``ast.Call`` nodes and, for each positional
+        argument whose corresponding parameter name is known, emits an
+        ``InlayHint(line, character, label="name:", kind="parameter", ...)`` at
+        the argument's start position. The callee is resolved through the same
+        pipeline used by ``call_hierarchy_outgoing_calls``: ``Name(id=name)``
+        resolves through the file's imports; ``Attribute(value=Name(lhs),
+        attr=attr)`` resolves the LHS to a workspace module and then ``attr``
+        inside it. Calls whose callee is a subscript (``factory[T](...)``), a
+        deep attribute chain (``pkg.subpkg.foo(...)``), or any non-``Name``
+        attribute target produce no hints. Class constructors surface
+        ``__init__``'s parameters with a leading ``self``/``cls`` stripped, or
+        none at all when no ``__init__`` is defined.
+
+        For each positional argument:
+        - ``ast.Starred`` (``*args`` unpacking) and every later positional are
+          skipped — the parameter mapping is ambiguous past the unpack.
+        - Arguments that are themselves a bare ``Name`` whose ``id`` equals
+          the parameter name (``foo(name=name)``-style call without the
+          keyword) emit no hint — the parameter name is already visible.
+        - Positions beyond the number of declared positional parameters are
+          skipped, including the ``*`` boundary inside the signature; ``*args``
+          / ``**kwargs`` declared parameters absorb no positional hint.
+
+        ``start_line`` / ``end_line`` (both 0-based, LSP-style; ``end_line``
+        inclusive) optionally restrict the output to calls whose argument
+        position falls within the requested range — this lets editors request
+        hints only for the visible viewport. ``None`` means "no bound".
+
+        Files that fail to parse return ``()``. Stdlib / installed / ambiguous
+        / missing callees emit no hints. The output is sorted by
+        ``(line, character)``.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                return ()
+
+            hints: list[InlayHint] = []
+            signature_cache: dict[
+                tuple[str, str], tuple[str, ...] | None
+            ] = {}
+
+            for call in _walk_all_calls(tree):
+                target_resolved = self._resolve_call_target(
+                    mirror_path, call.func
+                )
+                if target_resolved is None:
+                    continue
+                if (
+                    target_resolved.resolution != "workspace"
+                    or target_resolved.defining_path is None
+                    or target_resolved.defining_lineno is None
+                ):
+                    continue
+                cache_key = (
+                    target_resolved.defining_path,
+                    target_resolved.qualified_name,
+                )
+                if cache_key not in signature_cache:
+                    info = self._lookup_callable_signature(target_resolved)
+                    if info is None:
+                        signature_cache[cache_key] = None
+                    else:
+                        _display, signature = info
+                        signature_cache[cache_key] = _positional_parameter_names(
+                            signature
+                        )
+                parameter_names = signature_cache[cache_key]
+                if parameter_names is None:
+                    continue
+                for index, argument in enumerate(call.args):
+                    if isinstance(argument, ast.Starred):
+                        break
+                    if index >= len(parameter_names):
+                        break
+                    param_name = parameter_names[index]
+                    if (
+                        isinstance(argument, ast.Name)
+                        and argument.id == param_name
+                    ):
+                        continue
+                    line_zero = max(argument.lineno - 1, 0)
+                    if start_line is not None and line_zero < start_line:
+                        continue
+                    if end_line is not None and line_zero > end_line:
+                        continue
+                    hints.append(
+                        InlayHint(
+                            line=line_zero,
+                            character=argument.col_offset,
+                            label=f"{param_name}:",
+                            kind="parameter",
+                            padding_left=False,
+                            padding_right=True,
+                        )
+                    )
+            hints.sort(key=lambda hint: (hint.line, hint.character))
+            return tuple(hints)
 
     def type_definitions_at(
         self,

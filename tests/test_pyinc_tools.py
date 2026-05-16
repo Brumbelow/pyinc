@@ -16,6 +16,7 @@ from pyinc_tools.session import (
     CodeLens,
     DocumentLink,
     FoldingRange,
+    InlayHint,
     PollingWorkspaceWatcher,
     RenameEdit,
     SelectionRange,
@@ -3998,3 +3999,425 @@ def test_call_hierarchy_dataclass_exports_are_re_exported_from_pyinc_tools() -> 
     out = CallHierarchyOutgoingCall(callee=item, call_sites=(site,))
     assert inc.caller is item
     assert out.callee is item
+
+
+def test_inlay_hints_for_bare_name_call_hints_positional_params(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "def greet(name: str, age: int) -> str:\n    return f'hi {name} {age}'\n",
+    )
+    consumer = root / "app.py"
+    _write(consumer, 'from helper import greet\n\ngreet("alice", 30)\n')
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    assert hints == (
+        InlayHint(
+            line=2,
+            character=len("greet("),
+            label="name:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+        InlayHint(
+            line=2,
+            character=len('greet("alice", '),
+            label="age:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+    )
+
+
+def test_inlay_hints_skip_argument_whose_name_matches_parameter(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "def greet(name: str, age: int) -> str:\n    return ''\n",
+    )
+    consumer = root / "app.py"
+    _write(consumer, "from helper import greet\n\nname = 'a'\ngreet(name, 30)\n")
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    # `name` matches the parameter name, so it gets no hint; only `age:`.
+    assert hints == (
+        InlayHint(
+            line=3,
+            character=len("greet(name, "),
+            label="age:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+    )
+
+
+def test_inlay_hints_skip_keyword_arguments(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "def greet(name: str, age: int) -> str:\n    return ''\n",
+    )
+    consumer = root / "app.py"
+    _write(consumer, 'from helper import greet\n\ngreet("a", age=30)\n')
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    # Only the positional "a" gets a hint; the keyword arg is already explicit.
+    assert hints == (
+        InlayHint(
+            line=2,
+            character=len("greet("),
+            label="name:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+    )
+
+
+def test_inlay_hints_starred_unpack_stops_iteration(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "def greet(name: str, age: int) -> str:\n    return ''\n",
+    )
+    consumer = root / "app.py"
+    _write(consumer, "from helper import greet\n\nargs = ('a', 1)\ngreet(*args)\n")
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    # `*args` makes parameter binding ambiguous from that position on.
+    assert hints == ()
+
+
+def test_inlay_hints_for_class_constructor_strips_self(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "class Greeter:\n"
+        "    def __init__(self, name: str, age: int) -> None:\n"
+        "        self.name = name\n",
+    )
+    consumer = root / "app.py"
+    _write(consumer, 'from helper import Greeter\n\nGreeter("alice", 30)\n')
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    assert hints == (
+        InlayHint(
+            line=2,
+            character=len("Greeter("),
+            label="name:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+        InlayHint(
+            line=2,
+            character=len('Greeter("alice", '),
+            label="age:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+    )
+
+
+def test_inlay_hints_for_class_without_init_returns_no_hints(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "class Greeter:\n    pass\n")
+    consumer = root / "app.py"
+    _write(consumer, "from helper import Greeter\n\nGreeter()\n")
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    assert hints == ()
+
+
+def test_inlay_hints_for_attribute_call_through_module_import(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "def greet(name: str, age: int) -> str:\n    return ''\n",
+    )
+    consumer = root / "app.py"
+    _write(consumer, 'import helper\n\nhelper.greet("alice", 30)\n')
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    assert len(hints) == 2
+    assert hints[0].label == "name:"
+    assert hints[1].label == "age:"
+
+
+def test_inlay_hints_skip_calls_to_stdlib_targets(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "app.py"
+    _write(consumer, 'print("hello")\n')
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    # `print` resolves to a stdlib target; the LSP only hints workspace calls.
+    assert hints == ()
+
+
+def test_inlay_hints_skip_subscripted_and_deep_attribute_calls(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    pkg = root / "pkg"
+    pkg.mkdir()
+    _write(pkg / "__init__.py", "")
+    _write(
+        pkg / "child.py",
+        "def greet(name: str) -> str:\n    return ''\n",
+    )
+    consumer = root / "app.py"
+    _write(
+        consumer,
+        "import pkg.child\n\npkg.child.greet('alice')\nfactory = {}\nfactory['k']('v')\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    # Deep attribute chain (`pkg.child.greet(...)`) and subscripted call
+    # (`factory['k'](...)`) both produce no hints.
+    assert hints == ()
+
+
+def test_inlay_hints_respect_range_filter(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def f(a: int, b: int) -> int:\n    return a\n")
+    consumer = root / "app.py"
+    _write(
+        consumer,
+        "from helper import f\n"
+        "\n"
+        "f(1, 2)\n"
+        "f(3, 4)\n"
+        "f(5, 6)\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        # Filter to just the middle call's line (line 3, 0-based).
+        hints = session.inlay_hints_for_file(consumer, start_line=3, end_line=3)
+
+    assert all(hint.line == 3 for hint in hints)
+    assert len(hints) == 2
+
+
+def test_inlay_hints_unparseable_file_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "app.py"
+    _write(consumer, "def broken(\n")
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    assert hints == ()
+
+
+def test_inlay_hints_overlay_sees_edit(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def f(a: int) -> int:\n    return a\n")
+    consumer = root / "app.py"
+    _write(consumer, "from helper import f\n")
+
+    with WorkspaceSession(root) as session:
+        before = session.inlay_hints_for_file(consumer)
+        assert before == ()
+
+        session.set_overlay(consumer, "from helper import f\n\nf(7)\n")
+        after = session.inlay_hints_for_file(consumer)
+        assert len(after) == 1
+        assert after[0].label == "a:"
+        assert after[0].line == 2
+
+
+def test_inlay_hints_for_missing_file_raises_filenotfound(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with WorkspaceSession(root) as session, pytest.raises(FileNotFoundError):
+        session.inlay_hints_for_file(root / "absent.py")
+
+
+def test_inlay_hints_excess_positional_args_dropped(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def f(a: int) -> int:\n    return a\n")
+    consumer = root / "app.py"
+    _write(consumer, "from helper import f\n\nf(1, 2, 3)\n")
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    # Only the first positional has a corresponding parameter slot; the rest
+    # would be a Python TypeError at runtime but we still avoid hinting them.
+    assert hints == (
+        InlayHint(
+            line=2,
+            character=len("f("),
+            label="a:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+    )
+
+
+def test_inlay_hints_skip_after_vararg_parameter(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "def f(a: int, *args: int, header: str = '') -> int:\n    return a\n",
+    )
+    consumer = root / "app.py"
+    _write(consumer, "from helper import f\n\nf(1, 2, 3)\n")
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    # Only `a:` gets a hint; the `*args` marker stops further positional hints.
+    assert hints == (
+        InlayHint(
+            line=2,
+            character=len("f("),
+            label="a:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+    )
+
+
+def test_language_server_advertises_inlay_hint_provider(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert init["capabilities"]["inlayHintProvider"] == {"resolveProvider": False}
+
+
+def test_language_server_inlay_hint_returns_lsp_payload(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "def greet(name: str, age: int) -> str:\n    return ''\n",
+    )
+    app = root / "app.py"
+    _write(app, 'from helper import greet\n\ngreet("alice", 30)\n')
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/inlayHint",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 10, "character": 0},
+                },
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert isinstance(result, list)
+    assert len(result) == 2
+    assert result[0] == {
+        "position": {"line": 2, "character": len("greet(")},
+        "label": "name:",
+        "kind": 2,
+        "paddingLeft": False,
+        "paddingRight": True,
+    }
+    assert result[1]["label"] == "age:"
+    assert result[1]["kind"] == 2
+
+
+def test_language_server_inlay_hint_honors_range_filter(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def f(a: int, b: int) -> int:\n    return a\n")
+    app = root / "app.py"
+    _write(app, "from helper import f\n\nf(1, 2)\nf(3, 4)\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/inlayHint",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "range": {
+                    "start": {"line": 3, "character": 0},
+                    "end": {"line": 3, "character": 100},
+                },
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert isinstance(result, list)
+    assert all(entry["position"]["line"] == 3 for entry in result)
+    assert len(result) == 2
+
+
+def test_inlay_hint_dataclass_re_exported_from_pyinc_tools() -> None:
+    import pyinc_tools
+
+    assert hasattr(pyinc_tools, "InlayHint")
+    assert hasattr(pyinc_tools, "InlayHintKind")
+    # Sanity-check we can construct a frozen hint.
+    hint = InlayHint(
+        line=0,
+        character=0,
+        label="name:",
+        kind="parameter",
+        padding_left=False,
+        padding_right=True,
+    )
+    assert hint.label == "name:"
