@@ -16,6 +16,7 @@ from pyinc_tools.session import (
     CodeLens,
     DocumentLink,
     FoldingRange,
+    InlayHint,
     PollingWorkspaceWatcher,
     RenameEdit,
     SelectionRange,
@@ -561,7 +562,7 @@ def test_language_server_references_local_function_returns_declaration_and_call(
     try:
         init = server._handle_request("initialize", {"rootUri": root.as_uri()})
         assert init["capabilities"]["referencesProvider"] is True
-        assert init["serverInfo"]["version"] == "2.0.0"
+        assert init["serverInfo"]["version"] == "2.1.0"
 
         locations = server._handle_request(
             "textDocument/references",
@@ -3077,6 +3078,378 @@ def test_language_server_code_lens_unparseable_file_returns_empty(
         result = server._handle_request(
             "textDocument/codeLens",
             {"textDocument": {"uri": target.as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert result == []
+
+
+def test_inlay_hints_for_local_call_emits_parameter_names(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def greet(first: str, second: int) -> None:\n"
+        "    pass\n"
+        "\n"
+        "greet('hi', 7)\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(target)
+
+    # Line 3 (0-based): `greet('hi', 7)` — args at columns 6 and 12.
+    assert hints == (
+        InlayHint(
+            line=3,
+            character=6,
+            label="first:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+        InlayHint(
+            line=3,
+            character=12,
+            label="second:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+    )
+
+
+def test_inlay_hints_suppress_redundant_when_arg_name_matches_param(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def f(name: str, count: int) -> None:\n"
+        "    pass\n"
+        "\n"
+        "name = 'x'\n"
+        "f(name, 3)\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(target)
+
+    # The first arg `name` matches the parameter name — suppressed.
+    assert hints == (
+        InlayHint(
+            line=4,
+            character=8,
+            label="count:",
+            kind="parameter",
+            padding_left=False,
+            padding_right=True,
+        ),
+    )
+
+
+def test_inlay_hints_skip_keyword_arguments(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def f(first: str, second: int) -> None:\n"
+        "    pass\n"
+        "\n"
+        "f('hi', second=2)\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(target)
+
+    # Only the positional first arg gets a hint; `second=2` is already named.
+    assert len(hints) == 1
+    assert hints[0].label == "first:"
+
+
+def test_inlay_hints_resolve_cross_module(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "def greet(message: str, times: int) -> None:\n    pass\n",
+    )
+    consumer = root / "app.py"
+    _write(consumer, "from helper import greet\n\ngreet('hi', 3)\n")
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    assert tuple(hint.label for hint in hints) == ("message:", "times:")
+
+
+def test_inlay_hints_resolve_module_attribute_call(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "helper.py",
+        "def greet(message: str, times: int) -> None:\n    pass\n",
+    )
+    consumer = root / "app.py"
+    _write(consumer, "import helper\n\nhelper.greet('hi', 3)\n")
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(consumer)
+
+    assert tuple(hint.label for hint in hints) == ("message:", "times:")
+
+
+def test_inlay_hints_class_construction_strips_self(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "class Point:\n"
+        "    def __init__(self, x: int, y: int) -> None:\n"
+        "        self.x = x\n"
+        "        self.y = y\n"
+        "\n"
+        "Point(1, 2)\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(target)
+
+    # `self` is stripped from class `__init__` signatures by
+    # `_lookup_callable_signature`.
+    assert tuple(hint.label for hint in hints) == ("x:", "y:")
+
+
+def test_inlay_hints_stop_at_starred_call_arg(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def f(a: int, b: int, c: int) -> None:\n"
+        "    pass\n"
+        "\n"
+        "items = (1, 2)\n"
+        "f(0, *items)\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(target)
+
+    # Only the first arg gets a hint; *items consumes unknown slots, so the
+    # walker stops there.
+    assert tuple(hint.label for hint in hints) == ("a:",)
+
+
+def test_inlay_hints_stop_at_varargs_parameter(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def f(first: int, *rest: int) -> None:\n"
+        "    pass\n"
+        "\n"
+        "f(1, 2, 3, 4)\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(target)
+
+    # Only the bound `first` gets a hint; the rest is absorbed by *rest.
+    assert tuple(hint.label for hint in hints) == ("first:",)
+
+
+def test_inlay_hints_skip_method_attribute_call(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "class C:\n"
+        "    def m(self, x: int) -> None:\n"
+        "        pass\n"
+        "\n"
+        "obj = C()\n"
+        "obj.m(7)\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(target)
+
+    # `obj.m(...)` is an instance-attribute call — the resolver only handles
+    # `Name.attr` where `Name` is a workspace module/class, not an instance.
+    # `C()` is a class construction with no positional args, so no hints.
+    assert hints == ()
+
+
+def test_inlay_hints_skip_stdlib_target(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "print('hello', 1)\n")
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(target)
+
+    assert hints == ()
+
+
+def test_inlay_hints_for_unparseable_file_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def (\n")
+
+    with WorkspaceSession(root) as session:
+        hints = session.inlay_hints_for_file(target)
+
+    assert hints == ()
+
+
+def test_inlay_hints_for_missing_file_raises_filenotfound(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with (
+        WorkspaceSession(root) as session,
+        pytest.raises(FileNotFoundError),
+    ):
+        session.inlay_hints_for_file(root / "absent.py")
+
+
+def test_inlay_hints_range_filter_excludes_outside_calls(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def f(first: int, second: int) -> None:\n"
+        "    pass\n"
+        "\n"
+        "f(1, 2)\n"
+        "f(3, 4)\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        # Range covering only the second call site (line 4, 0-based).
+        hints = session.inlay_hints_for_file(
+            target, start_line=4, start_character=0, end_line=5, end_character=0
+        )
+
+    assert tuple((h.line, h.label) for h in hints) == (
+        (4, "first:"),
+        (4, "second:"),
+    )
+
+
+def test_inlay_hints_overlay_sees_edit(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def f(x: int) -> None:\n    pass\n\nf(1)\n")
+
+    with WorkspaceSession(root) as session:
+        before = session.inlay_hints_for_file(target)
+        assert tuple(h.label for h in before) == ("x:",)
+
+        session.set_overlay(
+            str(target),
+            "def f(x: int, y: int) -> None:\n    pass\n\nf(1, 2)\n",
+        )
+        after = session.inlay_hints_for_file(target)
+        assert tuple(h.label for h in after) == ("x:", "y:")
+
+
+def test_language_server_advertises_inlay_hint_provider(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "mod.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        provider = init["capabilities"]["inlayHintProvider"]
+        assert provider == {"resolveProvider": False}
+        assert init["serverInfo"]["version"] == "2.1.0"
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_inlay_hint_returns_lsp_payload(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def greet(message: str, times: int) -> None:\n"
+        "    pass\n"
+        "\n"
+        "greet('hi', 3)\n",
+    )
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/inlayHint",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 10, "character": 0},
+                },
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert result == [
+        {
+            "position": {"line": 3, "character": 6},
+            "label": "message:",
+            "kind": 2,
+            "paddingLeft": False,
+            "paddingRight": True,
+        },
+        {
+            "position": {"line": 3, "character": 12},
+            "label": "times:",
+            "kind": 2,
+            "paddingLeft": False,
+            "paddingRight": True,
+        },
+    ]
+
+
+def test_language_server_inlay_hint_unparseable_file_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def (\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/inlayHint",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 10, "character": 0},
+                },
+            },
         )
     finally:
         if server._session is not None:

@@ -160,6 +160,13 @@ _CALL_HIERARCHY_KIND_TO_LSP = {
 }
 
 
+# LSP `InlayHintKind`: Type = 1, Parameter = 2.
+_INLAY_HINT_KIND_TO_LSP = {
+    "type": 1,
+    "parameter": 2,
+}
+
+
 def _call_hierarchy_item_to_lsp(item: CallHierarchyItem) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "name": item.name,
@@ -340,6 +347,8 @@ class LanguageServer:
             return self._call_hierarchy_incoming_calls(params)
         if method == "callHierarchy/outgoingCalls":
             return self._call_hierarchy_outgoing_calls(params)
+        if method == "textDocument/inlayHint":
+            return self._inlay_hint(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -466,8 +475,9 @@ class LanguageServer:
                 "documentLinkProvider": {"resolveProvider": False},
                 "codeLensProvider": {"resolveProvider": False},
                 "callHierarchyProvider": True,
+                "inlayHintProvider": {"resolveProvider": False},
             },
-            "serverInfo": {"name": "pyinc-tools", "version": "2.0.0"},
+            "serverInfo": {"name": "pyinc-tools", "version": "2.1.0"},
         }
 
     def _on_watcher_change(self, _changed: tuple[str, ...]) -> None:
@@ -997,6 +1007,38 @@ class LanguageServer:
                 ],
             }
             for call in results
+        ]
+
+    def _inlay_hint(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        lsp_range = params.get("range") or {}
+        start = lsp_range.get("start") or {}
+        end = lsp_range.get("end") or {}
+        start_line = int(start.get("line", 0))
+        start_character = int(start.get("character", 0))
+        end_line_raw = end.get("line")
+        end_line = int(end_line_raw) if end_line_raw is not None else None
+        end_character = int(end.get("character", 0))
+        try:
+            hints = session.inlay_hints_for_file(
+                real_path,
+                start_line=start_line,
+                start_character=start_character,
+                end_line=end_line,
+                end_character=end_character,
+            )
+        except FileNotFoundError:
+            return []
+        return [
+            {
+                "position": {"line": hint.line, "character": hint.character},
+                "label": hint.label,
+                "kind": _INLAY_HINT_KIND_TO_LSP[hint.kind],
+                "paddingLeft": hint.padding_left,
+                "paddingRight": hint.padding_right,
+            }
+            for hint in hints
         ]
 
     def _workspace_root_from_params(self, params: Any) -> str:

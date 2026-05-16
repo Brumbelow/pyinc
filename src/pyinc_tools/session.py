@@ -22,6 +22,7 @@ from pyinc.integrations import (
     DependencyStatus,
     DependencySurface,
     ModuleSymbolTable,
+    Parameter,
     PythonModuleAnalysis,
     PythonWorkspaceAnalysis,
     Reference,
@@ -184,6 +185,19 @@ class TypeDefinitionLocation:
     lineno: int
     col_offset: int
     end_col_offset: int
+
+
+InlayHintKind = Literal["parameter", "type"]
+
+
+@dataclass(frozen=True)
+class InlayHint:
+    line: int
+    character: int
+    label: str
+    kind: InlayHintKind
+    padding_left: bool
+    padding_right: bool
 
 
 CallHierarchyItemKind = Literal["function", "method", "class"]
@@ -883,6 +897,62 @@ def _call_func_range(call: ast.Call) -> tuple[int, int, int, int] | None:
     return None
 
 
+def _inlay_hints_for_call(
+    call: ast.Call,
+    parameters: Sequence[Parameter],
+) -> list[InlayHint]:
+    """Pair each positional argument with the next positional parameter slot
+    and emit one ``InlayHint`` with label ``"name:"`` per pair.
+
+    Walks ``parameters`` left-to-right (which mirrors `_parameter_payloads_from_args`'s
+    posonly-then-positional-then-vararg-then-kwonly-then-kwarg order). The
+    encoding prefixes vararg parameter names with ``*`` and kwargs with
+    ``**`` — both are skipped/stopped here:
+
+    - ``**name`` cannot receive positional → silently skipped (kwonly args
+      following a ``*`` are handled by the rule below).
+    - ``*name`` absorbs all remaining positional args → iteration stops.
+
+    Iteration also stops at the first ``ast.Starred`` argument in the call,
+    since a `*spread` consumes an unknown number of slots and the pairing
+    becomes ambiguous after that point. Hints are suppressed when the
+    argument is itself a bare ``Name`` whose identifier matches the
+    parameter name.
+    """
+    hints: list[InlayHint] = []
+    param_index = 0
+    for arg in call.args:
+        if isinstance(arg, ast.Starred):
+            break
+        while param_index < len(parameters):
+            name = parameters[param_index].name
+            if name.startswith("**"):
+                param_index += 1
+                continue
+            if name.startswith("*"):
+                return hints
+            break
+        if param_index >= len(parameters):
+            break
+        param_name = parameters[param_index].name
+        param_index += 1
+        if isinstance(arg, ast.Name) and arg.id == param_name:
+            continue
+        if arg.col_offset is None or arg.lineno is None:
+            continue
+        hints.append(
+            InlayHint(
+                line=arg.lineno - 1,
+                character=arg.col_offset,
+                label=f"{param_name}:",
+                kind="parameter",
+                padding_left=False,
+                padding_right=True,
+            )
+        )
+    return hints
+
+
 def _collect_filesystem_snapshot(
     root: str, ignored_dir_names: frozenset[str]
 ) -> dict[str, tuple[int, int]]:
@@ -1295,6 +1365,96 @@ class WorkspaceSession:
                 )
             lenses.sort(key=lambda lens: (lens.start_line, lens.start_character))
             return tuple(lenses)
+
+    def inlay_hints_for_file(
+        self,
+        path: str | os.PathLike[str],
+        start_line: int = 0,
+        start_character: int = 0,
+        end_line: int | None = None,
+        end_character: int = 0,
+    ) -> tuple[InlayHint, ...]:
+        """Return parameter-name `InlayHint`s for call sites in ``path``.
+
+        Walks the AST for ``ast.Call`` nodes whose call-function span starts
+        inside the half-open LSP range ``[(start_line, start_character),
+        (end_line, end_character))`` (omit ``end_line`` to scan the whole
+        file). For each call whose callee resolves to a workspace function
+        or class, positional arguments are matched against the callee's
+        positional parameters from `Signature.parameters` and a single
+        ``"name:"`` hint is emitted at each argument's start position with
+        ``kind="parameter"`` and ``padding_right=True``.
+
+        A hint is suppressed when the argument is a bare ``Name`` whose
+        identifier already equals the parameter name (the standard
+        no-redundant-hint convention used by other Python language
+        servers). Iteration stops at the first ``*args`` parameter — once a
+        positional parameter consumes a variable number of slots, slot
+        alignment for subsequent arguments is ambiguous. The first
+        ``ast.Starred`` argument similarly stops emission. ``**kwargs``-only
+        parameters are silently skipped since they cannot receive a
+        positional argument.
+
+        Targets resolved as stdlib / installed / ambiguous / missing, calls
+        whose callee shape is not a bare ``Name`` or ``Name.attr`` (e.g.
+        ``factory[T](...)``, ``pkg.subpkg.foo(...)``, ``self.method(...)``,
+        ``lambda x: x(...)``), and files that fail to parse return ``()``.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                return ()
+
+            calls: list[ast.Call] = []
+
+            def walk(node: ast.AST) -> None:
+                if isinstance(node, ast.Call):
+                    calls.append(node)
+                for child in ast.iter_child_nodes(node):
+                    walk(child)
+
+            walk(tree)
+
+            range_end_line = end_line
+            hints: list[InlayHint] = []
+            for call in calls:
+                func_range = _call_func_range(call)
+                if func_range is None:
+                    continue
+                func_start_line, func_start_col, _, _ = func_range
+                if func_start_line < start_line or (
+                    func_start_line == start_line and func_start_col < start_character
+                ):
+                    continue
+                if range_end_line is not None and (
+                    func_start_line > range_end_line
+                    or (
+                        func_start_line == range_end_line
+                        and func_start_col >= end_character
+                    )
+                ):
+                    continue
+                target = self._resolve_call_target(mirror_path, call.func)
+                if target is None or target.resolution != "workspace":
+                    continue
+                callable_info = self._lookup_callable_signature(target)
+                if callable_info is None:
+                    continue
+                _display, signature = callable_info
+                hints.extend(
+                    _inlay_hints_for_call(call, signature.parameters)
+                )
+            hints.sort(key=lambda hint: (hint.line, hint.character))
+            return tuple(hints)
 
     def type_definitions_at(
         self,
