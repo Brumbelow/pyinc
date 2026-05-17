@@ -20,6 +20,7 @@ from pyinc_tools.session import (
     PollingWorkspaceWatcher,
     RenameEdit,
     SelectionRange,
+    SemanticToken,
     TypeDefinitionLocation,
     WorkspaceSession,
 )
@@ -4371,3 +4372,292 @@ def test_call_hierarchy_dataclass_exports_are_re_exported_from_pyinc_tools() -> 
     out = CallHierarchyOutgoingCall(callee=item, call_sites=(site,))
     assert inc.caller is item
     assert out.callee is item
+
+
+def test_semantic_tokens_emits_declarations_for_function_and_parameters(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def greet(first: str, second: int) -> None:\n    pass\n")
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_for_file(target)
+
+    assert tokens == (
+        SemanticToken(
+            line=0, character=4, length=5,
+            token_type="function", token_modifiers=("declaration",),
+        ),
+        SemanticToken(
+            line=0, character=10, length=5,
+            token_type="parameter", token_modifiers=("declaration",),
+        ),
+        SemanticToken(
+            line=0, character=22, length=6,
+            token_type="parameter", token_modifiers=("declaration",),
+        ),
+    )
+
+
+def test_semantic_tokens_method_inside_class_classified_as_method(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "class Foo:\n"
+        "    def method(self, x: int) -> None:\n"
+        "        pass\n",
+    )
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_for_file(target)
+
+    types = tuple((t.line, t.character, t.token_type) for t in tokens)
+    # Class name + method name + self + x
+    assert types == (
+        (0, 6, "class"),
+        (1, 8, "method"),
+        (1, 15, "parameter"),
+        (1, 21, "parameter"),
+    )
+
+
+def test_semantic_tokens_async_def_carries_async_modifier(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "async def fetch(url: str) -> None:\n    pass\n")
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_for_file(target)
+
+    fn_token = next(t for t in tokens if t.token_type == "function")
+    assert fn_token.line == 0
+    assert fn_token.token_modifiers == ("declaration", "async")
+
+
+def test_semantic_tokens_use_site_classified_via_symbol_table(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "import json\n"
+        "\n"
+        "def greet() -> None:\n"
+        "    pass\n"
+        "\n"
+        "class Foo:\n"
+        "    pass\n"
+        "\n"
+        "value = 1\n"
+        "greet()\n"
+        "Foo()\n"
+        "json.dumps({})\n"
+        "value\n",
+    )
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_for_file(target)
+
+    use_tokens = [t for t in tokens if t.token_modifiers == ()]
+    assert {(t.line, t.token_type) for t in use_tokens} == {
+        (9, "function"),
+        (10, "class"),
+        (11, "namespace"),
+        (12, "variable"),
+    }
+
+
+def test_semantic_tokens_decorator_name_resolved_via_symbol_table(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def my_decorator(fn):\n"
+        "    return fn\n"
+        "\n"
+        "@my_decorator\n"
+        "def target():\n"
+        "    pass\n",
+    )
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_for_file(target)
+
+    # The decorator-name token has no `declaration` modifier (it's a use).
+    decorator_uses = [
+        t
+        for t in tokens
+        if t.line == 3 and t.token_type == "function" and t.token_modifiers == ()
+    ]
+    assert len(decorator_uses) == 1
+    assert decorator_uses[0].character == 1
+    assert decorator_uses[0].length == len("my_decorator")
+
+
+def test_semantic_tokens_base_class_resolves_to_class_token(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "class Base:\n    pass\n\nclass Derived(Base):\n    pass\n")
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_for_file(target)
+
+    base_uses = [
+        t for t in tokens if t.line == 3 and t.token_modifiers == ()
+    ]
+    assert base_uses == [
+        SemanticToken(
+            line=3, character=14, length=4,
+            token_type="class", token_modifiers=(),
+        ),
+    ]
+
+
+def test_semantic_tokens_unparseable_file_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def (\n")
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_for_file(target)
+    assert tokens == ()
+
+
+def test_semantic_tokens_missing_file_raises_filenotfound(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with WorkspaceSession(root) as session, pytest.raises(FileNotFoundError):
+        session.semantic_tokens_for_file(root / "nope.py")
+
+
+def test_semantic_tokens_from_import_alias_use_is_not_emitted(
+    tmp_path: Path,
+) -> None:
+    """`from helper import greet` makes ``greet`` a `from_import_alias` entry
+    in the symbol table; resolving it to its real kind requires a cross-module
+    hop. The first cut conservatively skips such uses so the editor's default
+    highlighting handles them.
+    """
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def greet() -> None:\n    pass\n")
+    consumer = root / "app.py"
+    _write(consumer, "from helper import greet\n\ngreet()\n")
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_for_file(consumer)
+    assert all(t.token_modifiers != () or t.token_type != "function" for t in tokens)
+
+
+def test_semantic_tokens_overlay_change_reflected(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def first():\n    pass\n")
+    with WorkspaceSession(root) as session:
+        session.set_overlay(target, "def second():\n    pass\n")
+        tokens = session.semantic_tokens_for_file(target)
+    function_tokens = [t for t in tokens if t.token_type == "function"]
+    assert function_tokens[0].length == len("second")
+
+
+def test_language_server_advertises_semantic_tokens_provider(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    provider = init["capabilities"]["semanticTokensProvider"]
+    assert provider["full"] is True
+    assert provider["range"] is False
+    assert provider["legend"]["tokenTypes"] == [
+        "namespace",
+        "class",
+        "function",
+        "method",
+        "parameter",
+        "variable",
+    ]
+    assert provider["legend"]["tokenModifiers"] == ["declaration", "async"]
+
+
+def test_language_server_semantic_tokens_full_delta_encodes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def greet(name: str) -> None:\n    pass\n\ngreet('hi')\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/semanticTokens/full",
+            {"textDocument": {"uri": target.as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    # Three tokens — `greet` (function, decl), `name` (parameter, decl),
+    # `greet` use on line 3.
+    # Encoding: 5 ints per token: [deltaLine, deltaStart, length, type, mods].
+    # Token type indices: function=2, parameter=4. Modifier `declaration` = bit 0 (= 1).
+    assert result == {
+        "data": [
+            # First token: greet def at (0, 4), length 5, function, declaration
+            0, 4, 5, 2, 1,
+            # Second token: name at (0, 10) — same line, delta_start = 10-4 = 6,
+            # length 4, parameter, declaration
+            0, 6, 4, 4, 1,
+            # Third token: greet use at (3, 0) — delta_line = 3, delta_start = 0,
+            # length 5, function, no modifiers
+            3, 0, 5, 2, 0,
+        ]
+    }
+
+
+def test_language_server_semantic_tokens_full_unparseable_returns_empty_data(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def (\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/semanticTokens/full",
+            {"textDocument": {"uri": target.as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result == {"data": []}
+
+
+def test_semantic_token_exports_are_re_exported_from_pyinc_tools() -> None:
+    import pyinc_tools
+
+    for name in ("SemanticToken", "SemanticTokenType", "SemanticTokenModifier"):
+        assert hasattr(pyinc_tools, name), name
+    token = SemanticToken(
+        line=0, character=0, length=3,
+        token_type="function", token_modifiers=("declaration",),
+    )
+    assert token.token_type == "function"

@@ -167,6 +167,29 @@ _INLAY_HINT_KIND_TO_LSP = {
 }
 
 
+# LSP semantic-tokens legend. The order of these tuples is the protocol
+# index — `tokens[i].tokenType` is encoded as the integer index of the
+# matching entry in `tokenTypes`. The `tokenModifiers` field is a bitmask
+# over these positions.
+_SEMANTIC_TOKEN_TYPES: tuple[str, ...] = (
+    "namespace",
+    "class",
+    "function",
+    "method",
+    "parameter",
+    "variable",
+)
+_SEMANTIC_TOKEN_TYPE_INDEX = {name: index for index, name in enumerate(_SEMANTIC_TOKEN_TYPES)}
+
+_SEMANTIC_TOKEN_MODIFIERS: tuple[str, ...] = (
+    "declaration",
+    "async",
+)
+_SEMANTIC_TOKEN_MODIFIER_BIT = {
+    name: 1 << index for index, name in enumerate(_SEMANTIC_TOKEN_MODIFIERS)
+}
+
+
 def _call_hierarchy_item_to_lsp(item: CallHierarchyItem) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "name": item.name,
@@ -349,6 +372,8 @@ class LanguageServer:
             return self._call_hierarchy_outgoing_calls(params)
         if method == "textDocument/inlayHint":
             return self._inlay_hint(params)
+        if method == "textDocument/semanticTokens/full":
+            return self._semantic_tokens_full(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -476,6 +501,14 @@ class LanguageServer:
                 "codeLensProvider": {"resolveProvider": False},
                 "callHierarchyProvider": True,
                 "inlayHintProvider": {"resolveProvider": False},
+                "semanticTokensProvider": {
+                    "legend": {
+                        "tokenTypes": list(_SEMANTIC_TOKEN_TYPES),
+                        "tokenModifiers": list(_SEMANTIC_TOKEN_MODIFIERS),
+                    },
+                    "full": True,
+                    "range": False,
+                },
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.1.0"},
         }
@@ -1040,6 +1073,35 @@ class LanguageServer:
             }
             for hint in hints
         ]
+
+    def _semantic_tokens_full(self, params: Any) -> dict[str, Any]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        try:
+            tokens = session.semantic_tokens_for_file(real_path)
+        except FileNotFoundError:
+            return {"data": []}
+        data: list[int] = []
+        prev_line = 0
+        prev_character = 0
+        for token in tokens:
+            delta_line = token.line - prev_line
+            delta_start = token.character if delta_line != 0 else token.character - prev_character
+            modifier_mask = 0
+            for modifier in token.token_modifiers:
+                modifier_mask |= _SEMANTIC_TOKEN_MODIFIER_BIT[modifier]
+            data.extend(
+                (
+                    delta_line,
+                    delta_start,
+                    token.length,
+                    _SEMANTIC_TOKEN_TYPE_INDEX[token.token_type],
+                    modifier_mask,
+                )
+            )
+            prev_line = token.line
+            prev_character = token.character
+        return {"data": data}
 
     def _workspace_root_from_params(self, params: Any) -> str:
         if isinstance(params, dict):
