@@ -200,6 +200,27 @@ class InlayHint:
     padding_right: bool
 
 
+SemanticTokenType = Literal[
+    "namespace",
+    "class",
+    "function",
+    "method",
+    "parameter",
+    "variable",
+]
+
+SemanticTokenModifier = Literal["declaration", "async"]
+
+
+@dataclass(frozen=True)
+class SemanticToken:
+    line: int
+    character: int
+    length: int
+    token_type: SemanticTokenType
+    token_modifiers: tuple[SemanticTokenModifier, ...]
+
+
 CallHierarchyItemKind = Literal["function", "method", "class"]
 
 
@@ -953,6 +974,174 @@ def _inlay_hints_for_call(
     return hints
 
 
+_SYMBOL_KIND_TO_SEMANTIC_TOKEN_TYPE: dict[str, SemanticTokenType] = {
+    "function": "function",
+    "method": "method",
+    "class": "class",
+    "variable": "variable",
+    "class_variable": "variable",
+    "import_alias": "namespace",
+}
+
+
+def _locate_def_name_offsets_on_header(
+    source_lines: Sequence[str], node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+) -> tuple[int, int, int] | None:
+    """Return ``(line, col_offset, end_col_offset)`` of ``node.name`` on the
+    definition's header line, scanning forward from ``node.col_offset``.
+
+    The AST records the header line on ``node.lineno`` (in 3.8+ that's the
+    ``def`` / ``class`` keyword line, even for decorated definitions), so the
+    name lives on that same line. Returns ``None`` when the line is missing
+    or the name cannot be located by a word-boundary search.
+    """
+    line_idx = node.lineno - 1
+    if not (0 <= line_idx < len(source_lines)):
+        return None
+    line = source_lines[line_idx]
+    pattern = re.compile(rf"\b{re.escape(node.name)}\b")
+    match = pattern.search(line, node.col_offset)
+    if match is None:
+        return None
+    return node.lineno, match.start(), match.end()
+
+
+def _iter_function_args(args: ast.arguments) -> list[ast.arg]:
+    """Return all ``ast.arg`` entries in posonly / positional / vararg /
+    kwonly / kwarg slot order — the same order
+    ``_parameter_payloads_from_args`` uses inside ``symbol_resolution``.
+    """
+    entries: list[ast.arg] = []
+    entries.extend(args.posonlyargs)
+    entries.extend(args.args)
+    if args.vararg is not None:
+        entries.append(args.vararg)
+    entries.extend(args.kwonlyargs)
+    if args.kwarg is not None:
+        entries.append(args.kwarg)
+    return entries
+
+
+def _compute_semantic_tokens(
+    source: str, symbol_table: ModuleSymbolTable
+) -> tuple[SemanticToken, ...]:
+    """Walk ``source``'s AST and emit semantic tokens for declarations
+    (function / method / class headers and function parameters) and for bare
+    ``ast.Name`` uses whose identifier matches a top-level entry in
+    ``symbol_table``.
+
+    Files that fail to parse return ``()``. Token coordinates are 0-based
+    (LSP-style); the returned tuple is sorted by ``(line, character)``.
+
+    Use-site classification covers only top-level bare-name lookups in the
+    file's own symbol table; attribute access, function-local shadowing, and
+    cross-module re-export following are intentionally out of scope (they
+    match the existing limitations of ``find_references`` / ``inlayHint``).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ()
+
+    lines = source.splitlines()
+
+    name_to_token_type: dict[str, SemanticTokenType] = {}
+    for symbol in symbol_table.symbols:
+        if "." in symbol.qualified_name:
+            continue
+        token_type = _SYMBOL_KIND_TO_SEMANTIC_TOKEN_TYPE.get(symbol.kind)
+        if token_type is None:
+            continue
+        name_to_token_type.setdefault(symbol.qualified_name, token_type)
+
+    tokens: list[SemanticToken] = []
+
+    def emit(
+        lineno: int,
+        col_offset: int,
+        length: int,
+        token_type: SemanticTokenType,
+        modifiers: tuple[SemanticTokenModifier, ...],
+    ) -> None:
+        if length <= 0 or lineno < 1:
+            return
+        tokens.append(
+            SemanticToken(
+                line=lineno - 1,
+                character=col_offset,
+                length=length,
+                token_type=token_type,
+                token_modifiers=modifiers,
+            )
+        )
+
+    def walk(node: ast.AST, inside_class: bool) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            located = _locate_def_name_offsets_on_header(lines, node)
+            if located is not None:
+                line_no, col, end_col = located
+                modifiers: tuple[SemanticTokenModifier, ...] = ("declaration",)
+                if isinstance(node, ast.AsyncFunctionDef):
+                    modifiers = modifiers + ("async",)
+                emit(
+                    line_no,
+                    col,
+                    end_col - col,
+                    "method" if inside_class else "function",
+                    modifiers,
+                )
+            for arg in _iter_function_args(node.args):
+                if arg.lineno is None or arg.col_offset is None:
+                    continue
+                emit(
+                    arg.lineno,
+                    arg.col_offset,
+                    len(arg.arg),
+                    "parameter",
+                    ("declaration",),
+                )
+            for decorator in node.decorator_list:
+                walk(decorator, inside_class=inside_class)
+            for default_expr in node.args.defaults:
+                walk(default_expr, inside_class=inside_class)
+            for kw_default in node.args.kw_defaults:
+                if kw_default is not None:
+                    walk(kw_default, inside_class=inside_class)
+            for arg in _iter_function_args(node.args):
+                if arg.annotation is not None:
+                    walk(arg.annotation, inside_class=inside_class)
+            if node.returns is not None:
+                walk(node.returns, inside_class=inside_class)
+            for body_stmt in node.body:
+                walk(body_stmt, inside_class=False)
+            return
+        if isinstance(node, ast.ClassDef):
+            located = _locate_def_name_offsets_on_header(lines, node)
+            if located is not None:
+                line_no, col, end_col = located
+                emit(line_no, col, end_col - col, "class", ("declaration",))
+            for decorator in node.decorator_list:
+                walk(decorator, inside_class=inside_class)
+            for base in node.bases:
+                walk(base, inside_class=inside_class)
+            for keyword_arg in node.keywords:
+                walk(keyword_arg.value, inside_class=inside_class)
+            for class_body_stmt in node.body:
+                walk(class_body_stmt, inside_class=True)
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            token_type = name_to_token_type.get(node.id)
+            if token_type is not None and node.lineno is not None:
+                emit(node.lineno, node.col_offset, len(node.id), token_type, ())
+            return
+        for descendant in ast.iter_child_nodes(node):
+            walk(descendant, inside_class=inside_class)
+
+    walk(tree, inside_class=False)
+    tokens.sort(key=lambda token: (token.line, token.character))
+    return tuple(tokens)
+
+
 def _collect_filesystem_snapshot(
     root: str, ignored_dir_names: frozenset[str]
 ) -> dict[str, tuple[int, int]]:
@@ -1455,6 +1644,56 @@ class WorkspaceSession:
                 )
             hints.sort(key=lambda hint: (hint.line, hint.character))
             return tuple(hints)
+
+    def semantic_tokens_for_file(
+        self,
+        path: str | os.PathLike[str],
+    ) -> tuple[SemanticToken, ...]:
+        """Return semantic-token classifications for ``path``.
+
+        Walks the document's AST once and emits one ``SemanticToken`` per:
+
+        - ``def`` / ``async def`` header — token type ``"function"`` (or
+          ``"method"`` when nested inside a ``ClassDef`` body), modifier
+          ``"declaration"`` (plus ``"async"`` for ``async def``).
+        - ``class`` header — token type ``"class"``, modifier
+          ``"declaration"``.
+        - Each function parameter (posonly / positional / vararg / kwonly /
+          kwarg) — token type ``"parameter"``, modifier ``"declaration"``.
+        - Each bare ``ast.Name`` use (Load context) whose identifier matches
+          a top-level entry in the file's ``ModuleSymbolTable``. The token
+          type follows the matched symbol's kind: ``function``,
+          ``method`` (already qualified entries are skipped),
+          ``class``, ``variable`` / ``class_variable`` → ``"variable"``, and
+          ``import_alias`` → ``"namespace"``. ``from_import_alias`` and
+          ``wildcard_import_stub`` entries are skipped (resolving them to
+          their real kind would require cross-module hops; the editor's
+          default highlighting handles them).
+
+        Tokens are sorted by ``(line, character)`` with ``line`` /
+        ``character`` 0-based (LSP-style). Files that fail to parse,
+        non-``.py`` paths, and missing files raise ``FileNotFoundError``
+        for the missing-file case and return ``()`` for the unparseable
+        case.
+
+        Function-local shadowing is not modeled (a local ``foo`` inside a
+        function that shadows a top-level ``foo`` is still reported as the
+        top-level kind), mirroring the documented ``find_references``
+        limitation.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            table = self._remap_module_symbol_table(
+                module_symbol_table(self.db, self.mirror_root, str(mirror_path))
+            )
+            return _compute_semantic_tokens(source, table)
 
     def type_definitions_at(
         self,

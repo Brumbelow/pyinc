@@ -10,6 +10,64 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/semanticTokens/full` in `pyinc-tools` LSP.** The server now
+  advertises
+  `semanticTokensProvider: {legend: {tokenTypes: [...], tokenModifiers: [...]},
+  full: true, range: false}` and returns a delta-encoded `SemanticTokens.data`
+  array for the requested document. The legend's `tokenTypes` list is
+  `["namespace", "class", "function", "method", "parameter", "variable"]`
+  and `tokenModifiers` is `["declaration", "async"]`. The implementation
+  parses the document (overlay or on-disk) once with `ast.parse` and walks
+  the tree emitting one token per:
+  - `def` / `async def` header — token type `"function"` (or `"method"` when
+    nested inside a `ClassDef` body), modifier `"declaration"` (plus
+    `"async"` for `async def`). The name span is located on the def's
+    header line using the same word-boundary scan that
+    `textDocument/rename` uses, so decorated definitions still report on
+    the `def` line, not the decorator line.
+  - `class` header — token type `"class"`, modifier `"declaration"`.
+  - Each function parameter (posonly / positional / vararg / kwonly /
+    kwarg slot, in that order) — token type `"parameter"`, modifier
+    `"declaration"`. Parameter names are read from `ast.arg.col_offset`
+    (which already points past any leading `*` / `**`).
+  - Each bare `ast.Name` use (Load context) whose identifier matches a
+    top-level entry in the file's `ModuleSymbolTable`. The token type
+    follows the matched symbol's kind: `function`, `class`, `variable` /
+    `class_variable` → `"variable"`, and `import_alias` → `"namespace"`.
+    Dotted qualified-name entries (methods / nested classes), and
+    `from_import_alias` / `wildcard_import_stub` entries are
+    intentionally skipped from the use-site lookup — resolving them to
+    their real kind would require cross-module hops; the editor's
+    default highlighting handles those names. Function-local shadowing
+    is not modeled (a local `foo` inside a function that shadows a
+    top-level `foo` is still tagged with the top-level kind), mirroring
+    the documented `find_references` / `inlayHint` limitation.
+
+  The walk explicitly recurses into decorator lists, default-value
+  expressions, parameter annotations, return annotations, and base /
+  keyword-argument class headers, so a workspace-resolved decorator
+  (`@my_decorator`), default (`= my_default`), or base class
+  (`class Derived(Base):`) all light up with the appropriate token
+  kind. Files that fail to parse return `{"data": []}`; missing files
+  raise `FileNotFoundError` from the consumer entrypoint and the LSP
+  handler converts that to `{"data": []}`.
+
+  Tokens are encoded into the LSP wire format inside the LSP handler:
+  each token contributes five integers `[deltaLine, deltaStart, length,
+  tokenType, tokenModifiers]` where `deltaLine` is relative to the
+  previous token's line, `deltaStart` is relative to the previous
+  token's start column when both are on the same line (else absolute),
+  and `tokenModifiers` is a bitmask over the legend positions. New
+  consumer-layer entrypoint `WorkspaceSession.semantic_tokens_for_file(path)`
+  returns a tuple of `SemanticToken(line, character, length, token_type,
+  token_modifiers)` dataclasses with `line` / `character` 0-based
+  (LSP-style); `token_type` is typed as `SemanticTokenType` (a `Literal`
+  over the six legend names) and `token_modifiers` as
+  `tuple[SemanticTokenModifier, ...]`. New public names re-exported
+  from `pyinc_tools`: `SemanticToken`, `SemanticTokenType`,
+  `SemanticTokenModifier`. Lives entirely on top of the stable
+  `pyinc.integrations` public surface (composes `module_symbol_table`)
+  — no kernel contract change and no new integration-layer surface.
 - **`textDocument/inlayHint` in `pyinc-tools` LSP.** The server now
   advertises `inlayHintProvider: {resolveProvider: false}` and returns
   `InlayHint[]` for parameter-name hints at call sites inside the
