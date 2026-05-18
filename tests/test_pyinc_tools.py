@@ -4583,7 +4583,7 @@ def test_language_server_advertises_semantic_tokens_provider(
 
     provider = init["capabilities"]["semanticTokensProvider"]
     assert provider["full"] is True
-    assert provider["range"] is False
+    assert provider["range"] is True
     assert provider["legend"]["tokenTypes"] == [
         "namespace",
         "class",
@@ -4661,3 +4661,194 @@ def test_semantic_token_exports_are_re_exported_from_pyinc_tools() -> None:
         token_type="function", token_modifiers=("declaration",),
     )
     assert token.token_type == "function"
+
+
+def test_semantic_tokens_range_returns_only_tokens_inside_range(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def first():\n    pass\n\ndef second():\n    pass\n\ndef third():\n    pass\n",
+    )
+    with WorkspaceSession(root) as session:
+        all_tokens = session.semantic_tokens_for_file(target)
+        # Restrict to the middle `def second` block (lines 3..4 inclusive,
+        # using 0-based LSP coords): end is exclusive at line 6, char 0.
+        middle = session.semantic_tokens_range_for_file(
+            target, start_line=3, start_character=0, end_line=6, end_character=0
+        )
+
+    # The full document has three function-declaration tokens.
+    declarations = [t for t in all_tokens if t.token_type == "function"]
+    assert [t.line for t in declarations] == [0, 3, 6]
+    # The range filter keeps only the middle one.
+    assert [(t.line, t.character, t.length) for t in middle] == [(3, 4, 6)]
+
+
+def test_semantic_tokens_range_excludes_token_on_end_line_at_end_character(
+    tmp_path: Path,
+) -> None:
+    """The range is half-open ``[start, end)``: a token whose start position
+    equals the end boundary is excluded."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def first():\n    pass\n\ndef second():\n    pass\n")
+    with WorkspaceSession(root) as session:
+        excluded = session.semantic_tokens_range_for_file(
+            target, start_line=0, start_character=0, end_line=3, end_character=4
+        )
+        included = session.semantic_tokens_range_for_file(
+            target, start_line=0, start_character=0, end_line=3, end_character=5
+        )
+    # `def second` starts at (3, 4). With end=(3, 4) it's excluded;
+    # with end=(3, 5) it's included.
+    assert all(not (t.line == 3 and t.character == 4) for t in excluded)
+    assert any(t.line == 3 and t.character == 4 for t in included)
+
+
+def test_semantic_tokens_range_omitting_end_line_scans_through_eof(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def first():\n    pass\n\ndef second():\n    pass\n")
+    with WorkspaceSession(root) as session:
+        full = session.semantic_tokens_for_file(target)
+        # Omit ``end_line``: scan from start through end-of-file.
+        same = session.semantic_tokens_range_for_file(target)
+        from_line_3 = session.semantic_tokens_range_for_file(
+            target, start_line=3, start_character=0
+        )
+    assert same == full
+    # Tokens from line 0 (the `def first` header) are excluded; the `def
+    # second` header on line 3 is included.
+    assert all(t.line >= 3 for t in from_line_3)
+    assert any(t.line == 3 and t.token_type == "function" for t in from_line_3)
+
+
+def test_semantic_tokens_range_empty_when_range_covers_no_tokens(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def first():\n    pass\n\ndef second():\n    pass\n")
+    with WorkspaceSession(root) as session:
+        # Line 1 is the body `pass` line — no symbol-table tokens there.
+        empty = session.semantic_tokens_range_for_file(
+            target, start_line=1, start_character=0, end_line=2, end_character=0
+        )
+    assert empty == ()
+
+
+def test_semantic_tokens_range_unparseable_file_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def (\n")
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_range_for_file(
+            target, start_line=0, start_character=0, end_line=100, end_character=0
+        )
+    assert tokens == ()
+
+
+def test_semantic_tokens_range_missing_file_raises_filenotfound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with WorkspaceSession(root) as session, pytest.raises(FileNotFoundError):
+        session.semantic_tokens_range_for_file(root / "nope.py")
+
+
+def test_language_server_semantic_tokens_range_delta_encodes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def first():\n    pass\n\ndef second():\n    pass\n",
+    )
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/semanticTokens/range",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "range": {
+                    "start": {"line": 3, "character": 0},
+                    "end": {"line": 4, "character": 0},
+                },
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    # Only the `def second` header token (line 3, char 4, length 6) is in
+    # range. Delta encoding resets the running cursor from (0, 0), so the
+    # first emitted token's deltaLine and deltaStart are absolute.
+    # Token type indices: function=2. Modifier `declaration` = bit 0 (= 1).
+    assert result == {"data": [3, 4, 6, 2, 1]}
+
+
+def test_language_server_semantic_tokens_range_unparseable_returns_empty_data(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "broken.py"
+    _write(target, "def (\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/semanticTokens/range",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 1, "character": 0},
+                },
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result == {"data": []}
+
+
+def test_language_server_semantic_tokens_range_missing_file_returns_empty_data(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    missing = root / "absent.py"
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/semanticTokens/range",
+            {
+                "textDocument": {"uri": missing.as_uri()},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 10, "character": 0},
+                },
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result == {"data": []}

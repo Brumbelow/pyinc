@@ -148,7 +148,7 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
         "tokenModifiers": ["declaration", "async"]
       },
       "full": true,
-      "range": false
+      "range": true
     }
   },
   "serverInfo": { "name": "pyinc-tools", "version": "2.1.0" }
@@ -194,6 +194,7 @@ channels does not produce duplicate messages.
 | `callHierarchy/outgoingCalls` | `CallHierarchyOutgoingCall[]`. Parses the item's declaring file, locates the `def` / `async def` / `class` matching the item's qualified name, and walks its body for `ast.Call` nodes — *without* descending into nested `FunctionDef` / `AsyncFunctionDef` / `ClassDef` / `Lambda` scopes (each owns its own outgoing list). For each call: bare `Name(id=name)` resolves against the declaring module; `Name.attr` resolves the LHS through the file's imports and then `attr` inside the imported module (mirroring `find_references`'s LHS-bare-Name handling). Workspace `function` / `method` / `class` targets contribute callees; subscripted calls, deep attribute chains (`pkg.subpkg.foo()`), and lambda calls produce no callee. `fromRanges` are the call expression's name/attribute span. |
 | `textDocument/inlayHint` | `InlayHint[]` for parameter-name hints at call sites inside the requested `range`. The server walks the document's AST for `ast.Call` nodes whose callee resolves (via the same bare-`Name` / `Name.attr` resolver as `callHierarchy/outgoingCalls`) to a workspace `function` or `class`, looks up the callee's signature, and emits one hint per positional argument with label `"<paramname>:"`, `kind: 2` (Parameter), and `paddingRight: true`. Class constructions surface `<Class>.__init__`'s parameters with the leading `self` / `cls` stripped, matching `signatureHelp`. Hints are suppressed when the argument is itself a bare `Name` whose identifier equals the parameter name. Iteration stops at the first `*args` parameter (it absorbs the rest of the positional slots) or at the first `ast.Starred` argument in the call (its slot count is unknown). Stdlib / installed / ambiguous targets, attribute calls on instances (`obj.method(`), subscripted calls (`factory[T](`), deep attribute chains (`pkg.subpkg.foo(`), keyword arguments (already named), and files that fail to parse all contribute no hints. |
 | `textDocument/semanticTokens/full` | `SemanticTokens` payload (`{data: int[]}`) for the requested document. The server parses the document (overlay or on-disk) once with `ast.parse` and emits one token per `def` / `async def` / `class` header (type `function` / `method` / `class`, modifier `declaration`, plus `async` for `async def`), per function parameter (type `parameter`, modifier `declaration`), and per bare `ast.Name` use whose identifier matches a top-level entry in the file's `ModuleSymbolTable`. Use-site classifications are derived from the matched symbol's kind: `function`, `class`, `variable` / `class_variable` → `"variable"`, `import_alias` → `"namespace"`; dotted entries (methods, nested classes), `from_import_alias`, and `wildcard_import_stub` entries are skipped (resolving them to their real kind needs a cross-module hop — the editor's default highlighting handles them). Tokens are emitted in `(line, character)` order and encoded into the LSP wire format as five integers per token `[deltaLine, deltaStart, length, tokenType, tokenModifiers]`, where `tokenModifiers` is a bitmask over the legend positions. Files that fail to parse return `{"data": []}`. |
+| `textDocument/semanticTokens/range` | `SemanticTokens` payload (`{data: int[]}`) for the slice of the requested document covered by the half-open LSP range `[params.range.start, params.range.end)`. Implementation reuses the same full-document AST walk as `semanticTokens/full` and then filters by token start position: a token at `(line, character)` is included iff its start is `>= range.start` and `< range.end`. The retained tokens are encoded into the wire format on their own (the delta cursor is reset, so the first emitted token's `deltaLine` / `deltaStart` are absolute). Files that fail to parse and missing files return `{"data": []}`. No server-side per-document state is held — every `range` request is independent. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
 ## Editor wiring
@@ -487,9 +488,10 @@ Consequences:
   dataclasses with `line` / `character` 0-based (LSP-style) and `kind`
   typed as `Literal["parameter", "type"]`; omit `end_line` to scan the
   whole file.
-- Semantic tokens, via `textDocument/semanticTokens/full` (advertised as
+- Semantic tokens, via `textDocument/semanticTokens/full` and
+  `textDocument/semanticTokens/range` (advertised as
   `semanticTokensProvider: {legend: {tokenTypes, tokenModifiers}, full:
-  true, range: false}`). The legend's `tokenTypes` are `["namespace",
+  true, range: true}`). The legend's `tokenTypes` are `["namespace",
   "class", "function", "method", "parameter", "variable"]` and
   `tokenModifiers` are `["declaration", "async"]`. The server parses
   the document (overlay or on-disk) once with `ast.parse` and emits one
@@ -517,7 +519,15 @@ Consequences:
   a tuple of `SemanticToken(line, character, length, token_type,
   token_modifiers)` dataclasses with all position fields 0-based
   (LSP-style); `token_type` is typed as `SemanticTokenType` and
-  `token_modifiers` as `tuple[SemanticTokenModifier, ...]`.
+  `token_modifiers` as `tuple[SemanticTokenModifier, ...]`. The
+  range-scoped variant
+  `WorkspaceSession.semantic_tokens_range_for_file(path, start_line=0,
+  start_character=0, end_line=None, end_character=0)` returns the same
+  tuple filtered to tokens whose start position falls in the half-open
+  LSP range `[(start_line, start_character), (end_line, end_character))`;
+  omit `end_line` to scan from the start position through end-of-file.
+  Both the `full` and the `range` LSP handlers share the same delta
+  encoder, and neither requires server-side per-document state.
 
 **Not supported:**
 
@@ -608,11 +618,13 @@ Consequences:
     form (`x: "Foo"`) is re-parsed. Names inside a partial-string position
     are silently dropped.
 - `textDocument/semanticTokens` limitations:
-  - Only the `full` request shape is implemented. `semanticTokens/range`
-    and `semanticTokens/full/delta` are deliberately omitted in this
-    release — the full-document walk is fast enough for typical Python
-    files and the delta-form would require server-side state per
-    document.
+  - Only the `full` and `range` request shapes are implemented.
+    `semanticTokens/full/delta` is deliberately omitted — the delta form
+    would require server-side state per document, and the full-document
+    walk is fast enough that re-sending the whole token stream on every
+    change beats the bookkeeping. The `range` handler reuses the
+    full-document walk and then filters by token start position, so it
+    is stateless on the server side too.
   - Use-site classification only covers bare `ast.Name` lookups against
     the file's own `ModuleSymbolTable`. Attribute access (`M.foo`,
     `self.method`), function-local shadowing, and cross-module re-export
