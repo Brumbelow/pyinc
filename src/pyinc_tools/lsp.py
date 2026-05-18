@@ -16,6 +16,7 @@ from .session import (
     CallHierarchyCallSite,
     CallHierarchyItem,
     PollingWorkspaceWatcher,
+    SemanticToken,
     WorkspaceSession,
 )
 
@@ -188,6 +189,39 @@ _SEMANTIC_TOKEN_MODIFIERS: tuple[str, ...] = (
 _SEMANTIC_TOKEN_MODIFIER_BIT = {
     name: 1 << index for index, name in enumerate(_SEMANTIC_TOKEN_MODIFIERS)
 }
+
+
+def _encode_semantic_tokens(tokens: tuple[SemanticToken, ...]) -> list[int]:
+    """Encode ``tokens`` into the LSP semantic-tokens wire format.
+
+    The wire format is a flat ``list[int]`` of five integers per token —
+    ``[deltaLine, deltaStart, length, tokenType, tokenModifiers]`` —
+    where ``deltaLine`` is relative to the previous token's line,
+    ``deltaStart`` is relative to the previous token's start column when
+    both tokens share a line (else absolute), and ``tokenModifiers`` is a
+    bitmask over the legend positions in ``_SEMANTIC_TOKEN_MODIFIERS``.
+    """
+    data: list[int] = []
+    prev_line = 0
+    prev_character = 0
+    for token in tokens:
+        delta_line = token.line - prev_line
+        delta_start = token.character if delta_line != 0 else token.character - prev_character
+        modifier_mask = 0
+        for modifier in token.token_modifiers:
+            modifier_mask |= _SEMANTIC_TOKEN_MODIFIER_BIT[modifier]
+        data.extend(
+            (
+                delta_line,
+                delta_start,
+                token.length,
+                _SEMANTIC_TOKEN_TYPE_INDEX[token.token_type],
+                modifier_mask,
+            )
+        )
+        prev_line = token.line
+        prev_character = token.character
+    return data
 
 
 def _call_hierarchy_item_to_lsp(item: CallHierarchyItem) -> dict[str, Any]:
@@ -374,6 +408,8 @@ class LanguageServer:
             return self._inlay_hint(params)
         if method == "textDocument/semanticTokens/full":
             return self._semantic_tokens_full(params)
+        if method == "textDocument/semanticTokens/range":
+            return self._semantic_tokens_range(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -507,7 +543,7 @@ class LanguageServer:
                         "tokenModifiers": list(_SEMANTIC_TOKEN_MODIFIERS),
                     },
                     "full": True,
-                    "range": False,
+                    "range": True,
                 },
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.1.0"},
@@ -1081,27 +1117,30 @@ class LanguageServer:
             tokens = session.semantic_tokens_for_file(real_path)
         except FileNotFoundError:
             return {"data": []}
-        data: list[int] = []
-        prev_line = 0
-        prev_character = 0
-        for token in tokens:
-            delta_line = token.line - prev_line
-            delta_start = token.character if delta_line != 0 else token.character - prev_character
-            modifier_mask = 0
-            for modifier in token.token_modifiers:
-                modifier_mask |= _SEMANTIC_TOKEN_MODIFIER_BIT[modifier]
-            data.extend(
-                (
-                    delta_line,
-                    delta_start,
-                    token.length,
-                    _SEMANTIC_TOKEN_TYPE_INDEX[token.token_type],
-                    modifier_mask,
-                )
+        return {"data": _encode_semantic_tokens(tokens)}
+
+    def _semantic_tokens_range(self, params: Any) -> dict[str, Any]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        lsp_range = params.get("range") or {}
+        start = lsp_range.get("start") or {}
+        end = lsp_range.get("end") or {}
+        start_line = int(start.get("line", 0))
+        start_character = int(start.get("character", 0))
+        end_line_raw = end.get("line")
+        end_line = int(end_line_raw) if end_line_raw is not None else None
+        end_character = int(end.get("character", 0))
+        try:
+            tokens = session.semantic_tokens_range_for_file(
+                real_path,
+                start_line=start_line,
+                start_character=start_character,
+                end_line=end_line,
+                end_character=end_character,
             )
-            prev_line = token.line
-            prev_character = token.character
-        return {"data": data}
+        except FileNotFoundError:
+            return {"data": []}
+        return {"data": _encode_semantic_tokens(tokens)}
 
     def _workspace_root_from_params(self, params: Any) -> str:
         if isinstance(params, dict):

@@ -10,6 +10,48 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/semanticTokens/range` in `pyinc-tools` LSP.** The server now
+  advertises
+  `semanticTokensProvider: {legend: {tokenTypes: [...], tokenModifiers: [...]},
+  full: true, range: true}` (previously `range: false`) and implements the
+  `textDocument/semanticTokens/range` request, returning a delta-encoded
+  `SemanticTokens.data` payload for the slice of the document covered by the
+  requested half-open LSP range `[params.range.start, params.range.end)`. The
+  implementation reuses the same full-document AST walk as
+  `textDocument/semanticTokens/full` and then filters by token start position:
+  a token at `(line, character)` is retained iff its start position is `>=
+  params.range.start` and `< params.range.end`. The retained tokens are then
+  delta-encoded on their own — the running cursor is reset, so the first
+  emitted token's `deltaLine` / `deltaStart` are absolute. No server-side
+  per-document state is held; every `range` request is independent of the
+  others and of any prior `full` request.
+
+  New consumer-layer entrypoint
+  `WorkspaceSession.semantic_tokens_range_for_file(path, start_line=0,
+  start_character=0, end_line=None, end_character=0)` returns a tuple of
+  `SemanticToken` dataclasses filtered to the same half-open range; omit
+  `end_line` to scan from the start position through end-of-file. Coordinates
+  are 0-based (LSP-style). Files that fail to parse return `()`; missing
+  files raise `FileNotFoundError` from the consumer entrypoint and the LSP
+  handler converts that to `{"data": []}`. The new method composes
+  `semantic_tokens_for_file`, so it inherits all of that walk's existing
+  classification rules and limitations (use-site classification covers only
+  bare `ast.Name` lookups against the file's own `ModuleSymbolTable`;
+  attribute access, function-local shadowing, and cross-module re-export
+  following are out of scope, matching the existing `find_references` /
+  `inlayHint` limitations).
+
+  Both the `full` and the `range` LSP handlers share a single
+  `_encode_semantic_tokens(tokens)` helper that produces the
+  `[deltaLine, deltaStart, length, tokenType, tokenModifiers]` five-tuple
+  wire encoding with `tokenModifiers` as a bitmask over the legend
+  positions, so the two endpoints are guaranteed to encode equivalent
+  tokens identically. `semanticTokens/full/delta` remains intentionally
+  unimplemented — it is the only request shape that would require
+  server-side per-document state, and re-sending the whole token stream on
+  every change is fast enough that the bookkeeping cost is not justified.
+  Lives entirely on top of the stable `pyinc.integrations` public surface
+  — no kernel contract change and no new integration-layer surface.
 - **`textDocument/semanticTokens/full` in `pyinc-tools` LSP.** The server now
   advertises
   `semanticTokensProvider: {legend: {tokenTypes: [...], tokenModifiers: [...]},

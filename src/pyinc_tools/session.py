@@ -1695,6 +1695,48 @@ class WorkspaceSession:
             )
             return _compute_semantic_tokens(source, table)
 
+    def semantic_tokens_range_for_file(
+        self,
+        path: str | os.PathLike[str],
+        start_line: int = 0,
+        start_character: int = 0,
+        end_line: int | None = None,
+        end_character: int = 0,
+    ) -> tuple[SemanticToken, ...]:
+        """Return semantic-token classifications for ``path`` filtered to the
+        half-open LSP range ``[(start_line, start_character),
+        (end_line, end_character))``.
+
+        Computes the full document's tokens via the same walk as
+        :meth:`semantic_tokens_for_file` and then filters by token start
+        position. A token at ``(line, character)`` is included when its start
+        position is ``>= (start_line, start_character)`` and (if ``end_line``
+        is provided) strictly less than ``(end_line, end_character)``. Omit
+        ``end_line`` to scan from the start position through end-of-file.
+
+        Coordinate convention matches the LSP wire format (0-based
+        ``line`` / ``character``). Missing files and non-``.py`` paths raise
+        ``FileNotFoundError``; unparseable files return ``()``.
+        """
+        all_tokens = self.semantic_tokens_for_file(path)
+        if not all_tokens:
+            return all_tokens
+        if start_line == 0 and start_character == 0 and end_line is None:
+            return all_tokens
+        filtered: list[SemanticToken] = []
+        for token in all_tokens:
+            if token.line < start_line or (
+                token.line == start_line and token.character < start_character
+            ):
+                continue
+            if end_line is not None and (
+                token.line > end_line
+                or (token.line == end_line and token.character >= end_character)
+            ):
+                continue
+            filtered.append(token)
+        return tuple(filtered)
+
     def type_definitions_at(
         self,
         path: str | os.PathLike[str],
