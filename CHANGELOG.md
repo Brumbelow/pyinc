@@ -10,6 +10,45 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`workspace/willRenameFiles` in `pyinc-tools` LSP.** The server now
+  advertises `workspace.fileOperations.willRename` with a `**/*.py` file
+  filter and handles `workspace/willRenameFiles` requests. For each
+  `{oldUri, newUri}` pair the server walks every Python file in the
+  workspace and emits a `WorkspaceEdit` that updates the `import` and
+  `from` statements which currently reference the renamed file's module
+  name:
+
+  - `import <old_module> [as alias]` — the dotted-module span is rewritten
+    to `<new_module>`. Any `as` clause is preserved.
+  - `from <old_module> import …` — the dotted-module span (including any
+    leading dots) is rewritten. When the importer's relative anchor
+    contains both the old and the new module, the existing `level` is
+    preserved and only the relative tail changes; otherwise the statement
+    is rewritten to absolute form (`from <new_module> import …`,
+    `level == 0`).
+  - `from <pkg> import <leaf> [as alias]` where `<pkg>.<leaf> == old_module`
+    — the leaf is rewritten to `<new_module>`'s leaf when `old_module` and
+    `new_module` share the same parent package. The `as` clause is left
+    alone. Cross-directory submodule rewrites of this shape are
+    intentionally skipped (they would require either rewriting every
+    `<leaf>.attr` usage site or inserting an `as <leaf>` clause, neither of
+    which is well-defined here).
+
+  Renames where either path is outside the workspace, isn't a `.py` file,
+  is `__init__.py` (package rename — separate feature), or produces an
+  unchanged module name are silently skipped; the request returns `null`
+  when no edits are needed. Multiple renames in one request are batched
+  against the *current* workspace state (no chaining is attempted — a
+  swap A↔B produces independent edits for each direction).
+
+  New consumer-layer dataclass `FileRenameEdit(path, start_line,
+  start_character, end_line, end_character, new_text)` (all position
+  fields 0-based, LSP-style) and entrypoint
+  `WorkspaceSession.import_edits_for_file_renames(renames)` accept an
+  iterable of `(old_path, new_path)` pairs and return a tuple of
+  edits sorted by `(path, start_line, start_character)`. Lives entirely
+  on top of the stable `pyinc.integrations` public surface — no kernel
+  contract change and no new integration-layer surface.
 - **`textDocument/semanticTokens/range` in `pyinc-tools` LSP.** The server now
   advertises
   `semanticTokensProvider: {legend: {tokenTypes: [...], tokenModifiers: [...]},

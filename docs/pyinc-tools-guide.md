@@ -149,6 +149,16 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
       },
       "full": true,
       "range": true
+    },
+    "workspace": {
+      "fileOperations": {
+        "willRename": {
+          "filters": [
+            { "scheme": "file",
+              "pattern": { "glob": "**/*.py", "matches": "file" } }
+          ]
+        }
+      }
     }
   },
   "serverInfo": { "name": "pyinc-tools", "version": "2.1.0" }
@@ -195,6 +205,7 @@ channels does not produce duplicate messages.
 | `textDocument/inlayHint` | `InlayHint[]` for parameter-name hints at call sites inside the requested `range`. The server walks the document's AST for `ast.Call` nodes whose callee resolves (via the same bare-`Name` / `Name.attr` resolver as `callHierarchy/outgoingCalls`) to a workspace `function` or `class`, looks up the callee's signature, and emits one hint per positional argument with label `"<paramname>:"`, `kind: 2` (Parameter), and `paddingRight: true`. Class constructions surface `<Class>.__init__`'s parameters with the leading `self` / `cls` stripped, matching `signatureHelp`. Hints are suppressed when the argument is itself a bare `Name` whose identifier equals the parameter name. Iteration stops at the first `*args` parameter (it absorbs the rest of the positional slots) or at the first `ast.Starred` argument in the call (its slot count is unknown). Stdlib / installed / ambiguous targets, attribute calls on instances (`obj.method(`), subscripted calls (`factory[T](`), deep attribute chains (`pkg.subpkg.foo(`), keyword arguments (already named), and files that fail to parse all contribute no hints. |
 | `textDocument/semanticTokens/full` | `SemanticTokens` payload (`{data: int[]}`) for the requested document. The server parses the document (overlay or on-disk) once with `ast.parse` and emits one token per `def` / `async def` / `class` header (type `function` / `method` / `class`, modifier `declaration`, plus `async` for `async def`), per function parameter (type `parameter`, modifier `declaration`), and per bare `ast.Name` use whose identifier matches a top-level entry in the file's `ModuleSymbolTable`. Use-site classifications are derived from the matched symbol's kind: `function`, `class`, `variable` / `class_variable` → `"variable"`, `import_alias` → `"namespace"`; dotted entries (methods, nested classes), `from_import_alias`, and `wildcard_import_stub` entries are skipped (resolving them to their real kind needs a cross-module hop — the editor's default highlighting handles them). Tokens are emitted in `(line, character)` order and encoded into the LSP wire format as five integers per token `[deltaLine, deltaStart, length, tokenType, tokenModifiers]`, where `tokenModifiers` is a bitmask over the legend positions. Files that fail to parse return `{"data": []}`. |
 | `textDocument/semanticTokens/range` | `SemanticTokens` payload (`{data: int[]}`) for the slice of the requested document covered by the half-open LSP range `[params.range.start, params.range.end)`. Implementation reuses the same full-document AST walk as `semanticTokens/full` and then filters by token start position: a token at `(line, character)` is included iff its start is `>= range.start` and `< range.end`. The retained tokens are encoded into the wire format on their own (the delta cursor is reset, so the first emitted token's `deltaLine` / `deltaStart` are absolute). Files that fail to parse and missing files return `{"data": []}`. No server-side per-document state is held — every `range` request is independent. |
+| `workspace/willRenameFiles` | `WorkspaceEdit` or `null`. For each `{oldUri, newUri}` pair the server walks every Python file in the workspace and emits text edits that update the `import` and `from` statements which reference the renamed file's module name. Three rewrite shapes: (1) `import <old_module> [as alias]` → the dotted-module span becomes `<new_module>` (the `as` clause is preserved); (2) `from <old_module> import …` → the dotted-module span (including any leading dots) is rewritten — the existing `level` is preserved when both old and new modules live under the same package anchor, otherwise the statement is rewritten to absolute form (`from <new_module> import …`, `level == 0`); (3) `from <pkg> import <leaf> [as alias]` where `<pkg>.<leaf> == old_module` and `old_module`/`new_module` share the same parent package → the leaf is rewritten to `new_module`'s leaf (`as` clause preserved). Renames are silently skipped when either path is outside the workspace, isn't a `.py` file, is `__init__.py` (package rename — separate feature), or yields the same module name; the request returns `null` when no edits are needed. Multiple renames in one request are batched against the *current* workspace state — no chaining is attempted. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
 ## Editor wiring
@@ -528,6 +539,28 @@ Consequences:
   omit `end_line` to scan from the start position through end-of-file.
   Both the `full` and the `range` LSP handlers share the same delta
   encoder, and neither requires server-side per-document state.
+- File-rename import updates, via `workspace/willRenameFiles` (advertised
+  as `workspace.fileOperations.willRename` with a `**/*.py` filter). When
+  the editor is about to rename one or more Python files, the server
+  returns a `WorkspaceEdit` updating every `import` / `from` statement
+  across the workspace that references the renamed files' module names.
+  Three rewrite shapes are produced: (1) `import <old_module> [as alias]`
+  → rewrite the dotted-module span to `<new_module>` (the `as` clause is
+  preserved); (2) `from <old_module> import …` → rewrite the dotted
+  module portion, preserving the existing relative `level` when both old
+  and new modules live under the same package anchor, falling back to an
+  absolute `from <new_module> import …` (`level == 0`) otherwise; (3)
+  `from <pkg> import <leaf>` where `<pkg>.<leaf> == old_module` →
+  rewrite the leaf to the new leaf when `old_module` and `new_module`
+  share the same parent package. Renames are skipped when either path is
+  outside the workspace, isn't a `.py` file, is `__init__.py` (package
+  renames are a separate feature), or yields an unchanged module name.
+  The consumer entrypoint
+  `WorkspaceSession.import_edits_for_file_renames(renames)` accepts an
+  iterable of `(old_path, new_path)` pairs and returns a tuple of
+  `FileRenameEdit(path, start_line, start_character, end_line,
+  end_character, new_text)` dataclasses with all position fields 0-based
+  (LSP-style), sorted by `(path, start_line, start_character)`.
 
 **Not supported:**
 
@@ -637,6 +670,26 @@ Consequences:
     declaration sites themselves are still tokenised when they appear as
     part of a `def` / `class` / parameter header, just not as bare-name
     uses.
+- `workspace/willRenameFiles` limitations:
+  - `__init__.py` renames (i.e. renaming a package directory by renaming
+    its package marker) are not handled. Package renames change the
+    module names of every file under the package; supporting them
+    cleanly is a separate feature.
+  - The rewrite of `import <old_module>` (with no `as` clause) preserves
+    the leading binding (`a` in `import a.helper`) but does not update
+    attribute-access usage sites (`a.helper.foo()` is not rewritten to
+    `a.utils.foo()`). Likewise, `from <pkg> import <leaf>` rewrites
+    when the parent stays the same but is intentionally skipped on
+    cross-directory moves — both shapes would need usage-site rewrites
+    that are outside the scope of a file-rename event. The user is
+    expected to follow up with a symbol rename or a manual fix as
+    needed.
+  - The renamed file's own internal imports are not rewritten: a file
+    moved to a new directory may need its relative imports updated by
+    hand. Only *consumers* of the file's module are updated.
+  - Multiple renames in one request are processed against the *current*
+    workspace state — no chaining is attempted. A swap (A↔B) produces
+    independent edits for each direction.
 - `textDocument/inlayHint` limitations:
   - Only the `parameter` kind is emitted. Variable-type hints (`x = foo()`
     → `x: int = foo()`) and return-type hints are not synthesised in this
