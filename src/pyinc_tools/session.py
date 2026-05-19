@@ -118,6 +118,21 @@ class RenameResult:
     status: RenameStatus
 
 
+@dataclass(frozen=True)
+class FileRenameEdit:
+    """A text edit returned by ``import_edits_for_file_renames``.
+
+    All position fields are 0-based (LSP-style).
+    """
+
+    path: str
+    start_line: int
+    start_character: int
+    end_line: int
+    end_character: int
+    new_text: str
+
+
 DocumentHighlightKind = Literal["text", "read", "write"]
 
 
@@ -289,6 +304,59 @@ def _resolve_import_from_target(
     anchor = package_parts[: len(package_parts) - (level - 1)]
     base_parts = [part for part in (module or "").split(".") if part]
     return ".".join(anchor + base_parts)
+
+
+def _relative_import_anchor(
+    *, importer_module: str, importer_path: str, level: int
+) -> str | None:
+    """Return the dotted-package anchor a relative import resolves against.
+
+    Mirrors :func:`_resolve_import_from_target`'s level math: starts from
+    ``importer_module``, drops the trailing component when the importer is
+    not a package (``__init__.py``), then walks up ``level - 1`` more
+    components. Returns ``None`` when ``level`` overshoots the available
+    package depth, and ``""`` for ``level == 0`` (no anchor — absolute
+    import).
+    """
+    if level == 0:
+        return ""
+    package_parts = [part for part in importer_module.split(".") if part]
+    if package_parts and Path(importer_path).name != "__init__.py":
+        package_parts = package_parts[:-1]
+    if level - 1 > len(package_parts):
+        return None
+    return ".".join(package_parts[: len(package_parts) - (level - 1)])
+
+
+def _find_from_module_span(
+    source_lines: list[str], node: ast.ImportFrom
+) -> tuple[int, int, int] | None:
+    """Locate the dotted-module span of an ``ast.ImportFrom`` in source.
+
+    Returns ``(line_index, start_column, end_column)`` — 0-based — for the
+    ``".".joinedmodule`` portion between ``from`` and ``import`` (including
+    any leading dots). Returns ``None`` when the span can't be located
+    unambiguously on the statement's header line.
+    """
+    line_idx = node.lineno - 1
+    if not (0 <= line_idx < len(source_lines)):
+        return None
+    line = source_lines[line_idx]
+    expected = ("." * node.level) + (node.module or "")
+    if not expected:
+        return None
+    cursor = node.col_offset
+    if line[cursor : cursor + 4] != "from":
+        return None
+    cursor += 4
+    while cursor < len(line) and line[cursor] in " \t":
+        cursor += 1
+    if line[cursor : cursor + len(expected)] != expected:
+        return None
+    end = cursor + len(expected)
+    if end < len(line) and (line[end].isalnum() or line[end] in "._"):
+        return None
+    return (line_idx, cursor, end)
 
 
 def _line_char_to_offset(source: str, line: int, character: int) -> int | None:
@@ -2493,6 +2561,216 @@ class WorkspaceSession:
                         )
                     )
         return edits
+
+    def import_edits_for_file_renames(
+        self,
+        renames: Sequence[
+            tuple[str | os.PathLike[str], str | os.PathLike[str]]
+        ],
+    ) -> tuple[FileRenameEdit, ...]:
+        """Compute import edits that update references to renamed Python files.
+
+        Each ``(old, new)`` pair describes a planned ``.py`` rename inside the
+        workspace. The returned edits update every ``import`` and ``from``
+        statement across the workspace that currently references one of the
+        ``old`` paths' module names, rewriting it to the corresponding ``new``
+        module name. Renames where either side is outside the workspace, is
+        not a ``.py`` file, is ``__init__.py``, or where the resulting module
+        name is unchanged are silently skipped.
+
+        Returned spans are 0-based (LSP-style) and reference the files'
+        *current* paths (the old paths for the files being renamed).
+
+        Three rewrite shapes are produced:
+
+        - ``import <old_module> [as alias]`` → replace the dotted-module span
+          with ``<new_module>``; any ``as`` clause is preserved.
+        - ``from <old_module> import ...`` → replace the dotted-module span
+          (including any leading dots). When the importer is inside the same
+          package anchor as both old and new modules, the existing ``level``
+          is preserved and only the relative tail is rewritten; otherwise the
+          statement is rewritten to absolute form (``level == 0``).
+        - ``from <pkg> import <leaf> [as alias]`` where ``<pkg>.<leaf> ==
+          old_module`` and ``old_module`` and ``new_module`` share the same
+          parent package — rewrite ``<leaf>`` to the new leaf, preserving any
+          ``as`` clause. Cross-directory submodule rewrites are intentionally
+          out of scope: they would require either rewriting usage sites or
+          inserting an ``as`` clause, neither of which is well-defined here.
+        """
+        with self._state_lock:
+            self._check_open()
+            old_to_new: dict[str, str] = {}
+            for old_path, new_path in renames:
+                pair = self._resolve_file_rename_pair(old_path, new_path)
+                if pair is None:
+                    continue
+                old_module, new_module = pair
+                if old_module == new_module:
+                    continue
+                old_to_new[old_module] = new_module
+            if not old_to_new:
+                return ()
+
+            workspace = self._remap_workspace_analysis(
+                workspace_analysis(self.db, self.mirror_root)
+            )
+            edits: list[FileRenameEdit] = []
+            for module in workspace.modules:
+                edits.extend(
+                    self._import_edits_for_one_file(
+                        importer_module=module.module,
+                        importer_path=module.path,
+                        old_to_new=old_to_new,
+                    )
+                )
+            edits.sort(
+                key=lambda e: (e.path, e.start_line, e.start_character)
+            )
+            return tuple(edits)
+
+    def _resolve_file_rename_pair(
+        self,
+        old_path: str | os.PathLike[str],
+        new_path: str | os.PathLike[str],
+    ) -> tuple[str, str] | None:
+        try:
+            old_real = self._normalize_real_path(old_path)
+            new_real = self._normalize_real_path(new_path)
+        except ValueError:
+            return None
+        if Path(old_real).suffix != ".py" or Path(new_real).suffix != ".py":
+            return None
+        if Path(old_real).name == "__init__.py" or Path(new_real).name == "__init__.py":
+            return None
+        try:
+            old_relative = Path(old_real).relative_to(Path(self.root))
+            new_relative = Path(new_real).relative_to(Path(self.root))
+        except ValueError:
+            return None
+        old_module = ".".join(old_relative.parts[:-1] + (old_relative.stem,))
+        new_module = ".".join(new_relative.parts[:-1] + (new_relative.stem,))
+        return old_module, new_module
+
+    def _import_edits_for_one_file(
+        self,
+        *,
+        importer_module: str,
+        importer_path: str,
+        old_to_new: dict[str, str],
+    ) -> list[FileRenameEdit]:
+        source = self.source_text(importer_path)
+        if source is None:
+            return []
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return []
+        source_lines = source.splitlines()
+        edits: list[FileRenameEdit] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    new_module = old_to_new.get(alias.name)
+                    if new_module is None:
+                        continue
+                    if alias.lineno is None or alias.col_offset is None:
+                        continue
+                    edits.append(
+                        FileRenameEdit(
+                            path=importer_path,
+                            start_line=alias.lineno - 1,
+                            start_character=alias.col_offset,
+                            end_line=alias.lineno - 1,
+                            end_character=alias.col_offset + len(alias.name),
+                            new_text=new_module,
+                        )
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                resolved = _resolve_import_from_target(
+                    importer_module=importer_module,
+                    importer_path=importer_path,
+                    level=node.level,
+                    module=node.module,
+                )
+                if resolved in old_to_new:
+                    span = _find_from_module_span(source_lines, node)
+                    if span is not None:
+                        new_module = old_to_new[resolved]
+                        replacement = self._rewrite_from_module(
+                            importer_module=importer_module,
+                            importer_path=importer_path,
+                            level=node.level,
+                            new_module=new_module,
+                        )
+                        line_idx, start_col, end_col = span
+                        edits.append(
+                            FileRenameEdit(
+                                path=importer_path,
+                                start_line=line_idx,
+                                start_character=start_col,
+                                end_line=line_idx,
+                                end_character=end_col,
+                                new_text=replacement,
+                            )
+                        )
+                    # Don't also try the submodule-alias rewrite when the
+                    # whole from-target matched: the from-module rewrite
+                    # already moved the statement to the new path.
+                    continue
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    candidate = (
+                        f"{resolved}.{alias.name}" if resolved else alias.name
+                    )
+                    new_module = old_to_new.get(candidate)
+                    if new_module is None:
+                        continue
+                    old_parent = candidate.rsplit(".", 1)[0] if "." in candidate else ""
+                    new_parent, _, new_leaf = new_module.rpartition(".")
+                    if old_parent != new_parent:
+                        continue
+                    if alias.lineno is None or alias.col_offset is None:
+                        continue
+                    edits.append(
+                        FileRenameEdit(
+                            path=importer_path,
+                            start_line=alias.lineno - 1,
+                            start_character=alias.col_offset,
+                            end_line=alias.lineno - 1,
+                            end_character=alias.col_offset + len(alias.name),
+                            new_text=new_leaf,
+                        )
+                    )
+        return edits
+
+    def _rewrite_from_module(
+        self,
+        *,
+        importer_module: str,
+        importer_path: str,
+        level: int,
+        new_module: str,
+    ) -> str:
+        """Produce a ``from`` clause replacement that resolves to ``new_module``.
+
+        Preserves the existing relative ``level`` when the new module lives
+        under the same package anchor; otherwise rewrites to an absolute
+        ``from <new_module>`` form (``level == 0``).
+        """
+        anchor = _relative_import_anchor(
+            importer_module=importer_module,
+            importer_path=importer_path,
+            level=level,
+        )
+        if level > 0 and anchor is not None:
+            anchor_prefix = f"{anchor}." if anchor else ""
+            if new_module == anchor:
+                return "." * level
+            if new_module.startswith(anchor_prefix):
+                tail = new_module[len(anchor_prefix) :] if anchor else new_module
+                return ("." * level) + tail
+        return new_module
 
     def source_text(self, path: str | os.PathLike[str]) -> str | None:
         real_path = self._normalize_real_path(path)

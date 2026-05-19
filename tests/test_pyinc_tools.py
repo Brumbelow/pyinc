@@ -15,6 +15,7 @@ from pyinc_tools.session import (
     CallHierarchyOutgoingCall,
     CodeLens,
     DocumentLink,
+    FileRenameEdit,
     FoldingRange,
     InlayHint,
     PollingWorkspaceWatcher,
@@ -4852,3 +4853,398 @@ def test_language_server_semantic_tokens_range_missing_file_returns_empty_data(
         if server._session is not None:
             server._session.close()
     assert result == {"data": []}
+
+
+def _apply_file_rename_edits(edits: tuple[FileRenameEdit, ...]) -> None:
+    """Apply FileRenameEdits to disk, right-to-left within each file."""
+    by_path: dict[str, list[FileRenameEdit]] = {}
+    for edit in edits:
+        by_path.setdefault(edit.path, []).append(edit)
+    for path, file_edits in by_path.items():
+        text = Path(path).read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        ordered = sorted(
+            file_edits, key=lambda e: (-e.start_line, -e.start_character)
+        )
+        for edit in ordered:
+            assert edit.start_line == edit.end_line, "multi-line edits unsupported"
+            line = lines[edit.start_line]
+            newline = "\n" if line.endswith("\n") else ""
+            content = line[:-1] if newline else line
+            patched = (
+                content[: edit.start_character]
+                + edit.new_text
+                + content[edit.end_character :]
+            )
+            lines[edit.start_line] = patched + newline
+        Path(path).write_text("".join(lines), encoding="utf-8")
+
+
+def test_file_rename_rewrites_absolute_import_and_from_import(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(
+        root / "user.py",
+        "import helper\nfrom helper import foo\n\nhelper.foo()\nfoo()\n",
+    )
+    _write(
+        root / "aliased.py",
+        "import helper as h\nfrom helper import foo as f\n\nh.foo()\nf()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_renames(
+            [(root / "helper.py", root / "utils.py")]
+        )
+
+    by_file: dict[str, list[tuple[int, int, int, str]]] = {
+        Path(e.path).name: [] for e in edits
+    }
+    for edit in edits:
+        by_file[Path(edit.path).name].append(
+            (edit.start_line, edit.start_character, edit.end_character, edit.new_text)
+        )
+    assert by_file["user.py"] == [
+        (0, 7, 13, "utils"),
+        (1, 5, 11, "utils"),
+    ]
+    assert by_file["aliased.py"] == [
+        (0, 7, 13, "utils"),
+        (1, 5, 11, "utils"),
+    ]
+
+    _apply_file_rename_edits(edits)
+    assert (root / "user.py").read_text() == (
+        "import utils\nfrom utils import foo\n\nhelper.foo()\nfoo()\n"
+    )
+    # The `as` clause is preserved; only the module portion is rewritten.
+    assert (root / "aliased.py").read_text() == (
+        "import utils as h\nfrom utils import foo as f\n\nh.foo()\nf()\n"
+    )
+
+
+def test_file_rename_preserves_relative_import_when_anchor_unchanged(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(pkg / "sub.py", "from .helper import foo\nfoo()\n")
+    _write(root / "outside.py", "from pkg.helper import foo\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_renames(
+            [(pkg / "helper.py", pkg / "utils.py")]
+        )
+
+    by_file: dict[str, list[tuple[int, int, int, str]]] = {}
+    for edit in edits:
+        by_file.setdefault(Path(edit.path).name, []).append(
+            (edit.start_line, edit.start_character, edit.end_character, edit.new_text)
+        )
+    # Relative import inside the same package keeps the leading dot.
+    assert by_file["sub.py"] == [(0, 5, 12, ".utils")]
+    # Absolute import outside the package picks up the new dotted path.
+    assert by_file["outside.py"] == [(0, 5, 15, "pkg.utils")]
+
+    _apply_file_rename_edits(edits)
+    assert (pkg / "sub.py").read_text() == "from .utils import foo\nfoo()\n"
+    assert (root / "outside.py").read_text() == (
+        "from pkg.utils import foo\nfoo()\n"
+    )
+
+
+def test_file_rename_falls_back_to_absolute_on_cross_directory_move(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    top = root / "top"
+    _write(pkg / "__init__.py", "")
+    _write(top / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(pkg / "user.py", "from .helper import foo\nfoo()\n")
+    _write(root / "other.py", "import pkg.helper\npkg.helper.foo()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_renames(
+            [(pkg / "helper.py", top / "helper.py")]
+        )
+
+    by_file: dict[str, list[tuple[int, int, int, str]]] = {}
+    for edit in edits:
+        by_file.setdefault(Path(edit.path).name, []).append(
+            (edit.start_line, edit.start_character, edit.end_character, edit.new_text)
+        )
+    # The relative import's anchor (`pkg`) no longer contains the new
+    # module, so the rewrite goes to absolute form.
+    assert by_file["user.py"] == [(0, 5, 12, "top.helper")]
+    assert by_file["other.py"] == [(0, 7, 17, "top.helper")]
+
+
+def test_file_rename_rewrites_from_pkg_import_leaf_when_parent_unchanged(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(pkg / "sibling.py", "from pkg import helper\nhelper.foo()\n")
+    _write(pkg / "sibling_alias.py", "from pkg import helper as h\nh.foo()\n")
+    _write(pkg / "rel.py", "from . import helper\nhelper.foo()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_renames(
+            [(pkg / "helper.py", pkg / "utils.py")]
+        )
+
+    by_file: dict[str, list[tuple[int, int, int, str]]] = {}
+    for edit in edits:
+        by_file.setdefault(Path(edit.path).name, []).append(
+            (edit.start_line, edit.start_character, edit.end_character, edit.new_text)
+        )
+    # `from pkg import helper` -> `from pkg import utils` (leaf rewrite)
+    assert by_file["sibling.py"] == [(0, 16, 22, "utils")]
+    # `as` clause preserved on the leaf rewrite.
+    assert by_file["sibling_alias.py"] == [(0, 16, 22, "utils")]
+    # `from . import helper` -> `from . import utils`
+    assert by_file["rel.py"] == [(0, 14, 20, "utils")]
+
+    _apply_file_rename_edits(edits)
+    assert (pkg / "sibling.py").read_text() == "from pkg import utils\nhelper.foo()\n"
+    assert (
+        pkg / "sibling_alias.py"
+    ).read_text() == "from pkg import utils as h\nh.foo()\n"
+    assert (pkg / "rel.py").read_text() == "from . import utils\nhelper.foo()\n"
+
+
+def test_file_rename_skips_from_pkg_import_leaf_on_cross_directory_move(
+    tmp_path: Path,
+) -> None:
+    # `from pkg import helper` cannot be cleanly rewritten when `helper.py`
+    # moves out of `pkg`: it would require either rewriting usages of
+    # `helper.foo()` or inserting `as helper`, neither of which is in scope.
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    top = root / "top"
+    _write(pkg / "__init__.py", "")
+    _write(top / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "consumer.py", "from pkg import helper\nhelper.foo()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_renames(
+            [(pkg / "helper.py", top / "helper.py")]
+        )
+
+    assert all(Path(e.path).name != "consumer.py" for e in edits)
+
+
+def test_file_rename_handles_multiple_renames_in_one_call(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo(): return 1\n")
+    _write(root / "b.py", "def bar(): return 2\n")
+    _write(
+        root / "user.py",
+        "import a\nfrom b import bar\n\na.foo()\nbar()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_renames(
+            [
+                (root / "a.py", root / "aa.py"),
+                (root / "b.py", root / "bb.py"),
+            ]
+        )
+
+    by_line = sorted(
+        (edit.start_line, edit.start_character, edit.end_character, edit.new_text)
+        for edit in edits
+        if Path(edit.path).name == "user.py"
+    )
+    assert by_line == [
+        (0, 7, 8, "aa"),
+        (1, 5, 6, "bb"),
+    ]
+
+
+def test_file_rename_skips_init_py(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "consumer.py", "import pkg\n")
+
+    new_init = root / "newpkg" / "__init__.py"
+    new_init.parent.mkdir(parents=True, exist_ok=True)
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_renames(
+            [(pkg / "__init__.py", new_init)]
+        )
+    assert edits == ()
+
+
+def test_file_rename_skips_no_op_rename(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "user.py", "import helper\nhelper.foo()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_renames(
+            [(root / "helper.py", root / "helper.py")]
+        )
+    assert edits == ()
+
+
+def test_file_rename_skips_paths_outside_workspace(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "user.py", "import helper\n")
+
+    outside = tmp_path / "outside" / "helper.py"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_renames(
+            [(root / "helper.py", outside)]
+        )
+    assert edits == ()
+
+
+def test_file_rename_uses_overlay_text(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo() -> int:\n    return 1\n")
+    # On disk: no import. Overlay: importing helper.
+    _write(root / "user.py", "# no import\n")
+
+    with WorkspaceSession(root) as session:
+        session.set_overlay(root / "user.py", "import helper\nhelper.foo()\n")
+        edits = session.import_edits_for_file_renames(
+            [(root / "helper.py", root / "utils.py")]
+        )
+
+    user_edits = [e for e in edits if Path(e.path).name == "user.py"]
+    assert len(user_edits) == 1
+    assert user_edits[0].new_text == "utils"
+
+
+def test_language_server_advertises_will_rename_files_capability(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+    finally:
+        if server._session is not None:
+            server._session.close()
+    file_ops = init["capabilities"]["workspace"]["fileOperations"]
+    assert "willRename" in file_ops
+    filters = file_ops["willRename"]["filters"]
+    assert filters[0]["pattern"]["glob"] == "**/*.py"
+    assert filters[0]["pattern"]["matches"] == "file"
+
+
+def test_language_server_will_rename_files_returns_workspace_edit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(pkg / "user.py", "from .helper import foo\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "workspace/willRenameFiles",
+            {
+                "files": [
+                    {
+                        "oldUri": (pkg / "helper.py").as_uri(),
+                        "newUri": (pkg / "utils.py").as_uri(),
+                    }
+                ]
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is not None
+    user_uri = (pkg / "user.py").as_uri()
+    assert user_uri in result["changes"]
+    text_edits = result["changes"][user_uri]
+    assert len(text_edits) == 1
+    edit = text_edits[0]
+    assert edit["newText"] == ".utils"
+    assert edit["range"] == {
+        "start": {"line": 0, "character": 5},
+        "end": {"line": 0, "character": 12},
+    }
+
+
+def test_language_server_will_rename_files_returns_null_when_no_edits(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "user.py", "import helper\nhelper.foo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        # Same-name rename: no edits expected.
+        result = server._handle_request(
+            "workspace/willRenameFiles",
+            {
+                "files": [
+                    {
+                        "oldUri": (root / "helper.py").as_uri(),
+                        "newUri": (root / "helper.py").as_uri(),
+                    }
+                ]
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is None
+
+
+def test_language_server_will_rename_files_ignores_unsafe_uris(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "user.py", "import helper\n")
+
+    outside = tmp_path / "outside.py"
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "workspace/willRenameFiles",
+            {
+                "files": [
+                    {
+                        "oldUri": (root / "helper.py").as_uri(),
+                        "newUri": outside.as_uri(),
+                    }
+                ]
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is None

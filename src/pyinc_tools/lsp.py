@@ -410,6 +410,8 @@ class LanguageServer:
             return self._semantic_tokens_full(params)
         if method == "textDocument/semanticTokens/range":
             return self._semantic_tokens_range(params)
+        if method == "workspace/willRenameFiles":
+            return self._will_rename_files(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -544,6 +546,21 @@ class LanguageServer:
                     },
                     "full": True,
                     "range": True,
+                },
+                "workspace": {
+                    "fileOperations": {
+                        "willRename": {
+                            "filters": [
+                                {
+                                    "scheme": "file",
+                                    "pattern": {
+                                        "glob": "**/*.py",
+                                        "matches": "file",
+                                    },
+                                }
+                            ]
+                        }
+                    }
                 },
             },
             "serverInfo": {"name": "pyinc-tools", "version": "2.1.0"},
@@ -1141,6 +1158,46 @@ class LanguageServer:
         except FileNotFoundError:
             return {"data": []}
         return {"data": _encode_semantic_tokens(tokens)}
+
+    def _will_rename_files(self, params: Any) -> dict[str, Any] | None:
+        files = params.get("files", []) if isinstance(params, dict) else []
+        session = self._require_session()
+        renames: list[tuple[str, str]] = []
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            old_uri = entry.get("oldUri")
+            new_uri = entry.get("newUri")
+            if not isinstance(old_uri, str) or not isinstance(new_uri, str):
+                continue
+            try:
+                old_path = _uri_to_path(old_uri)
+                new_path = _uri_to_path(new_uri)
+            except ValueError:
+                continue
+            renames.append((old_path, new_path))
+        edits = session.import_edits_for_file_renames(renames)
+        if not edits:
+            return None
+        changes: dict[str, list[dict[str, Any]]] = {}
+        for edit in edits:
+            uri = _path_to_uri(edit.path)
+            changes.setdefault(uri, []).append(
+                {
+                    "range": {
+                        "start": {
+                            "line": edit.start_line,
+                            "character": edit.start_character,
+                        },
+                        "end": {
+                            "line": edit.end_line,
+                            "character": edit.end_character,
+                        },
+                    },
+                    "newText": edit.new_text,
+                }
+            )
+        return {"changes": changes}
 
     def _workspace_root_from_params(self, params: Any) -> str:
         if isinstance(params, dict):
