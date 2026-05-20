@@ -15,6 +15,7 @@ from pyinc_tools.session import (
     CallHierarchyOutgoingCall,
     CodeLens,
     DocumentLink,
+    FileDeletionEdit,
     FileRenameEdit,
     FoldingRange,
     InlayHint,
@@ -5243,6 +5244,355 @@ def test_language_server_will_rename_files_ignores_unsafe_uris(
                     }
                 ]
             },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is None
+
+
+def _apply_file_deletion_edits(edits: tuple[FileDeletionEdit, ...]) -> None:
+    """Apply FileDeletionEdits to disk, right-to-left within each file."""
+    by_path: dict[str, list[FileDeletionEdit]] = {}
+    for edit in edits:
+        by_path.setdefault(edit.path, []).append(edit)
+    for path, file_edits in by_path.items():
+        text = Path(path).read_text(encoding="utf-8")
+        ordered = sorted(
+            file_edits,
+            key=lambda e: (-e.start_line, -e.start_character),
+        )
+        for edit in ordered:
+            start_offset = _offset(text, edit.start_line, edit.start_character)
+            end_offset = _offset(text, edit.end_line, edit.end_character)
+            text = text[:start_offset] + edit.new_text + text[end_offset:]
+        Path(path).write_text(text, encoding="utf-8")
+
+
+def _offset(text: str, line: int, character: int) -> int:
+    pos = 0
+    for _ in range(line):
+        nl = text.find("\n", pos)
+        if nl == -1:
+            return len(text)
+        pos = nl + 1
+    return min(pos + character, len(text))
+
+
+def test_file_deletion_removes_whole_import_statement(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(
+        root / "user.py",
+        "import helper\nfrom helper import foo\n\nhelper.foo()\nfoo()\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions([root / "helper.py"])
+
+    user_edits = [e for e in edits if Path(e.path).name == "user.py"]
+    spans = sorted(
+        (e.start_line, e.start_character, e.end_line, e.end_character)
+        for e in user_edits
+    )
+    # Both `import helper` (line 0) and `from helper import foo` (line 1)
+    # are now broken; each is removed as a whole-line edit.
+    assert spans == [(0, 0, 1, 0), (1, 0, 2, 0)]
+    assert all(e.new_text == "" for e in user_edits)
+
+    _apply_file_deletion_edits(edits)
+    assert (root / "user.py").read_text() == "\nhelper.foo()\nfoo()\n"
+
+
+def test_file_deletion_removes_relative_from_import(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(pkg / "user.py", "from .helper import foo\nfoo()\n")
+    _write(root / "outside.py", "from pkg.helper import foo\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions([pkg / "helper.py"])
+
+    by_file: dict[str, list[FileDeletionEdit]] = {}
+    for edit in edits:
+        by_file.setdefault(Path(edit.path).name, []).append(edit)
+    assert "user.py" in by_file
+    assert "outside.py" in by_file
+    assert by_file["user.py"][0].new_text == ""
+    assert by_file["outside.py"][0].new_text == ""
+
+    _apply_file_deletion_edits(edits)
+    assert (pkg / "user.py").read_text() == "foo()\n"
+    assert (root / "outside.py").read_text() == "foo()\n"
+
+
+def test_file_deletion_removes_from_pkg_import_leaf(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(pkg / "sibling.py", "from pkg import helper\nhelper.foo()\n")
+    _write(pkg / "rel.py", "from . import helper\nhelper.foo()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions([pkg / "helper.py"])
+
+    by_file: dict[str, list[FileDeletionEdit]] = {}
+    for edit in edits:
+        by_file.setdefault(Path(edit.path).name, []).append(edit)
+
+    # `from pkg import helper` (only name) → whole statement removed.
+    assert by_file["sibling.py"][0].start_line == 0
+    assert by_file["sibling.py"][0].end_line == 1
+    # `from . import helper` (only name) → whole statement removed.
+    assert by_file["rel.py"][0].start_line == 0
+    assert by_file["rel.py"][0].end_line == 1
+
+    _apply_file_deletion_edits(edits)
+    assert (pkg / "sibling.py").read_text() == "helper.foo()\n"
+    assert (pkg / "rel.py").read_text() == "helper.foo()\n"
+
+
+def test_file_deletion_partial_alias_in_multi_name_import(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo(): return 1\n")
+    _write(root / "b.py", "def bar(): return 2\n")
+    _write(root / "user.py", "import a, b\na.foo()\nb.bar()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions([root / "a.py"])
+
+    user_edits = [e for e in edits if Path(e.path).name == "user.py"]
+    # Only the `a` alias is removed; the rest of the statement survives.
+    assert len(user_edits) == 1
+    edit = user_edits[0]
+    # The span absorbs the trailing comma + whitespace up to `b`.
+    assert edit.start_line == 0
+    assert edit.start_character == 7  # column of `a` in `import a, b`
+    assert edit.end_line == 0
+    assert edit.end_character == 10  # column of `b` in `import a, b`
+
+    _apply_file_deletion_edits(edits)
+    assert (root / "user.py").read_text() == "import b\na.foo()\nb.bar()\n"
+
+
+def test_file_deletion_partial_alias_in_multi_name_from_import(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "a.py", "def foo(): return 1\n")
+    _write(pkg / "b.py", "def bar(): return 2\n")
+    _write(pkg / "user.py", "from pkg import a, b\na.foo()\nb.bar()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions([pkg / "a.py"])
+
+    user_edits = [e for e in edits if Path(e.path).name == "user.py"]
+    assert len(user_edits) == 1
+
+    _apply_file_deletion_edits(edits)
+    # The dead `a` leaf is removed; the surviving `b` stays.
+    assert (pkg / "user.py").read_text() == "from pkg import b\na.foo()\nb.bar()\n"
+
+
+def test_file_deletion_partial_alias_last_in_list_absorbs_preceding_comma(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo(): return 1\n")
+    _write(root / "b.py", "def bar(): return 2\n")
+    _write(root / "user.py", "import a, b\na.foo()\nb.bar()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions([root / "b.py"])
+
+    _apply_file_deletion_edits(edits)
+    assert (root / "user.py").read_text() == "import a\na.foo()\nb.bar()\n"
+
+
+def test_file_deletion_handles_multiple_deletions(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "def foo(): return 1\n")
+    _write(root / "b.py", "def bar(): return 2\n")
+    _write(root / "user.py", "import a\nfrom b import bar\n\na.foo()\nbar()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions(
+            [root / "a.py", root / "b.py"]
+        )
+
+    user_edits = sorted(
+        (e.start_line, e.end_line) for e in edits if Path(e.path).name == "user.py"
+    )
+    assert user_edits == [(0, 1), (1, 2)]
+
+    _apply_file_deletion_edits(edits)
+    assert (root / "user.py").read_text() == "\na.foo()\nbar()\n"
+
+
+def test_file_deletion_skips_importer_being_deleted(tmp_path: Path) -> None:
+    # A file that imports the deleted module is itself being deleted — no
+    # point in editing it.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo(): return 1\n")
+    _write(root / "user.py", "import helper\nhelper.foo()\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions(
+            [root / "helper.py", root / "user.py"]
+        )
+    # `user.py` is being deleted, so no edits are emitted for it.
+    assert all(Path(e.path).name != "user.py" for e in edits)
+
+
+def test_file_deletion_skips_init_py(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo(): return 1\n")
+    _write(root / "consumer.py", "import pkg\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions([pkg / "__init__.py"])
+    assert edits == ()
+
+
+def test_file_deletion_skips_paths_outside_workspace(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo(): return 1\n")
+    _write(root / "user.py", "import helper\n")
+
+    outside = tmp_path / "outside.py"
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions([outside])
+    assert edits == ()
+
+
+def test_file_deletion_skips_non_py_files(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo(): return 1\n")
+    _write(root / "data.txt", "hello\n")
+    _write(root / "user.py", "import helper\n")
+
+    with WorkspaceSession(root) as session:
+        edits = session.import_edits_for_file_deletions([root / "data.txt"])
+    assert edits == ()
+
+
+def test_file_deletion_uses_overlay_text(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo() -> int:\n    return 1\n")
+    # On disk: no import. Overlay: importing helper.
+    _write(root / "user.py", "# no import\n")
+
+    with WorkspaceSession(root) as session:
+        session.set_overlay(root / "user.py", "import helper\nhelper.foo()\n")
+        edits = session.import_edits_for_file_deletions([root / "helper.py"])
+
+    user_edits = [e for e in edits if Path(e.path).name == "user.py"]
+    assert len(user_edits) == 1
+    assert user_edits[0].new_text == ""
+
+
+def test_language_server_advertises_will_delete_files_capability(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+    finally:
+        if server._session is not None:
+            server._session.close()
+    file_ops = init["capabilities"]["workspace"]["fileOperations"]
+    assert "willDelete" in file_ops
+    filters = file_ops["willDelete"]["filters"]
+    assert filters[0]["pattern"]["glob"] == "**/*.py"
+    assert filters[0]["pattern"]["matches"] == "file"
+
+
+def test_language_server_will_delete_files_returns_workspace_edit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(pkg / "user.py", "from .helper import foo\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "workspace/willDeleteFiles",
+            {"files": [{"uri": (pkg / "helper.py").as_uri()}]},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is not None
+    user_uri = (pkg / "user.py").as_uri()
+    assert user_uri in result["changes"]
+    text_edits = result["changes"][user_uri]
+    assert len(text_edits) == 1
+    edit = text_edits[0]
+    assert edit["newText"] == ""
+    assert edit["range"] == {
+        "start": {"line": 0, "character": 0},
+        "end": {"line": 1, "character": 0},
+    }
+
+
+def test_language_server_will_delete_files_returns_null_when_no_edits(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "unrelated.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        # No file actually imports helper, so deleting it produces no edits.
+        result = server._handle_request(
+            "workspace/willDeleteFiles",
+            {"files": [{"uri": (root / "helper.py").as_uri()}]},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is None
+
+
+def test_language_server_will_delete_files_ignores_unsafe_uris(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "user.py", "import helper\n")
+
+    outside = tmp_path / "outside.py"
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "workspace/willDeleteFiles",
+            {"files": [{"uri": outside.as_uri()}]},
         )
     finally:
         if server._session is not None:

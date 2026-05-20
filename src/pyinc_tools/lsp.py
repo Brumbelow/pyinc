@@ -412,6 +412,8 @@ class LanguageServer:
             return self._semantic_tokens_range(params)
         if method == "workspace/willRenameFiles":
             return self._will_rename_files(params)
+        if method == "workspace/willDeleteFiles":
+            return self._will_delete_files(params)
         raise ValueError(f"Unsupported LSP request: {method}")
 
     def _handle_notification(self, method: str, params: Any) -> bool:
@@ -559,7 +561,18 @@ class LanguageServer:
                                     },
                                 }
                             ]
-                        }
+                        },
+                        "willDelete": {
+                            "filters": [
+                                {
+                                    "scheme": "file",
+                                    "pattern": {
+                                        "glob": "**/*.py",
+                                        "matches": "file",
+                                    },
+                                }
+                            ]
+                        },
                     }
                 },
             },
@@ -1177,6 +1190,43 @@ class LanguageServer:
                 continue
             renames.append((old_path, new_path))
         edits = session.import_edits_for_file_renames(renames)
+        if not edits:
+            return None
+        changes: dict[str, list[dict[str, Any]]] = {}
+        for edit in edits:
+            uri = _path_to_uri(edit.path)
+            changes.setdefault(uri, []).append(
+                {
+                    "range": {
+                        "start": {
+                            "line": edit.start_line,
+                            "character": edit.start_character,
+                        },
+                        "end": {
+                            "line": edit.end_line,
+                            "character": edit.end_character,
+                        },
+                    },
+                    "newText": edit.new_text,
+                }
+            )
+        return {"changes": changes}
+
+    def _will_delete_files(self, params: Any) -> dict[str, Any] | None:
+        files = params.get("files", []) if isinstance(params, dict) else []
+        session = self._require_session()
+        deletions: list[str] = []
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            uri = entry.get("uri")
+            if not isinstance(uri, str):
+                continue
+            try:
+                deletions.append(_uri_to_path(uri))
+            except ValueError:
+                continue
+        edits = session.import_edits_for_file_deletions(deletions)
         if not edits:
             return None
         changes: dict[str, list[dict[str, Any]]] = {}

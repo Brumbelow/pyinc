@@ -157,6 +157,12 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
             { "scheme": "file",
               "pattern": { "glob": "**/*.py", "matches": "file" } }
           ]
+        },
+        "willDelete": {
+          "filters": [
+            { "scheme": "file",
+              "pattern": { "glob": "**/*.py", "matches": "file" } }
+          ]
         }
       }
     }
@@ -206,6 +212,7 @@ channels does not produce duplicate messages.
 | `textDocument/semanticTokens/full` | `SemanticTokens` payload (`{data: int[]}`) for the requested document. The server parses the document (overlay or on-disk) once with `ast.parse` and emits one token per `def` / `async def` / `class` header (type `function` / `method` / `class`, modifier `declaration`, plus `async` for `async def`), per function parameter (type `parameter`, modifier `declaration`), and per bare `ast.Name` use whose identifier matches a top-level entry in the file's `ModuleSymbolTable`. Use-site classifications are derived from the matched symbol's kind: `function`, `class`, `variable` / `class_variable` → `"variable"`, `import_alias` → `"namespace"`; dotted entries (methods, nested classes), `from_import_alias`, and `wildcard_import_stub` entries are skipped (resolving them to their real kind needs a cross-module hop — the editor's default highlighting handles them). Tokens are emitted in `(line, character)` order and encoded into the LSP wire format as five integers per token `[deltaLine, deltaStart, length, tokenType, tokenModifiers]`, where `tokenModifiers` is a bitmask over the legend positions. Files that fail to parse return `{"data": []}`. |
 | `textDocument/semanticTokens/range` | `SemanticTokens` payload (`{data: int[]}`) for the slice of the requested document covered by the half-open LSP range `[params.range.start, params.range.end)`. Implementation reuses the same full-document AST walk as `semanticTokens/full` and then filters by token start position: a token at `(line, character)` is included iff its start is `>= range.start` and `< range.end`. The retained tokens are encoded into the wire format on their own (the delta cursor is reset, so the first emitted token's `deltaLine` / `deltaStart` are absolute). Files that fail to parse and missing files return `{"data": []}`. No server-side per-document state is held — every `range` request is independent. |
 | `workspace/willRenameFiles` | `WorkspaceEdit` or `null`. For each `{oldUri, newUri}` pair the server walks every Python file in the workspace and emits text edits that update the `import` and `from` statements which reference the renamed file's module name. Three rewrite shapes: (1) `import <old_module> [as alias]` → the dotted-module span becomes `<new_module>` (the `as` clause is preserved); (2) `from <old_module> import …` → the dotted-module span (including any leading dots) is rewritten — the existing `level` is preserved when both old and new modules live under the same package anchor, otherwise the statement is rewritten to absolute form (`from <new_module> import …`, `level == 0`); (3) `from <pkg> import <leaf> [as alias]` where `<pkg>.<leaf> == old_module` and `old_module`/`new_module` share the same parent package → the leaf is rewritten to `new_module`'s leaf (`as` clause preserved). Renames are silently skipped when either path is outside the workspace, isn't a `.py` file, is `__init__.py` (package rename — separate feature), or yields the same module name; the request returns `null` when no edits are needed. Multiple renames in one request are batched against the *current* workspace state — no chaining is attempted. |
+| `workspace/willDeleteFiles` | `WorkspaceEdit` or `null`. For each `{uri}` entry the server walks every Python file in the workspace and emits text edits that remove the `import` and `from` statements which would become broken once the file is gone. Three deletion shapes: (1) `import <deleted_module> [as alias]` → the whole statement is removed (range spans the line including its trailing newline) when it's the only alias; otherwise only the dead alias plus its adjacent comma is removed (`import a, b` with `a` deleted → `import b`); (2) `from <deleted_module> import …` → the whole statement is removed (every imported name's source module is gone); (3) `from <pkg> import <leaf> [as alias]` where `<pkg>.<leaf> == deleted_module` → the whole statement is removed when it's the only imported name, else only the dead leaf plus its adjacent comma is removed. Deletions are silently skipped when the path is outside the workspace, isn't a `.py` file, or is `__init__.py` (package delete — separate feature); the request returns `null` when no edits are needed. Importers that are themselves part of the same delete batch are skipped (no point editing a file the client is about to remove). Multiple deletions in one request are batched against the *current* workspace state. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
 
 ## Editor wiring
@@ -539,6 +546,31 @@ Consequences:
   omit `end_line` to scan from the start position through end-of-file.
   Both the `full` and the `range` LSP handlers share the same delta
   encoder, and neither requires server-side per-document state.
+- File-delete import cleanup, via `workspace/willDeleteFiles`
+  (advertised as `workspace.fileOperations.willDelete` with a `**/*.py`
+  filter, alongside the existing `willRename`). When the editor is about
+  to delete one or more Python files, the server returns a
+  `WorkspaceEdit` removing the `import` / `from` statements across the
+  workspace that would become broken once those files are gone. Three
+  deletion shapes are produced: (1) `import <deleted_module> [as alias]`
+  → remove the whole statement (range covers the line including its
+  trailing newline) when it's the only alias; otherwise remove only the
+  dead alias plus its adjacent comma (`import a, b` with `a` deleted →
+  `import b`); (2) `from <deleted_module> import …` → remove the whole
+  statement (every imported name's source module is gone); (3)
+  `from <pkg> import <leaf> [as alias]` where `<pkg>.<leaf> ==
+  deleted_module` → remove the whole statement when it's the only
+  imported name, else remove only the dead leaf plus its adjacent
+  comma. Deletions are skipped when the path is outside the workspace,
+  isn't a `.py` file, or is `__init__.py` (package deletes are a
+  separate feature). Importers that are themselves part of the same
+  delete batch are skipped — no point editing a file the client is
+  about to remove. The consumer entrypoint
+  `WorkspaceSession.import_edits_for_file_deletions(deletions)` accepts
+  an iterable of paths and returns a tuple of `FileDeletionEdit(path,
+  start_line, start_character, end_line, end_character, new_text)`
+  dataclasses with all position fields 0-based (LSP-style); `new_text`
+  is always `""`. Sorted by `(path, start_line, start_character)`.
 - File-rename import updates, via `workspace/willRenameFiles` (advertised
   as `workspace.fileOperations.willRename` with a `**/*.py` filter). When
   the editor is about to rename one or more Python files, the server
@@ -670,6 +702,25 @@ Consequences:
     declaration sites themselves are still tokenised when they appear as
     part of a `def` / `class` / parameter header, just not as bare-name
     uses.
+- `workspace/willDeleteFiles` limitations:
+  - `__init__.py` deletes (i.e. deleting a whole package directory by
+    deleting its package marker) are not handled. Package deletes would
+    need to remove every `import pkg.*` / `from pkg.* import …`
+    statement transitively; supporting them cleanly is a separate
+    feature.
+  - Attribute-access usage sites are not rewritten. Deleting `helper.py`
+    removes `import helper`, but any subsequent `helper.foo()` usage
+    sites are left alone — the user is expected to clean them up
+    separately. This mirrors the `workspace/willRenameFiles` limitation
+    on the same shape.
+  - Aliases inside a multi-name import whose `ast.alias` end positions
+    are unavailable are skipped (the surviving statement still
+    references the deleted module but at least the file is not
+    mis-edited). On Python 3.11+ — the supported matrix — `ast.alias`
+    nodes carry `end_lineno` / `end_col_offset`, so this is a defensive
+    fallback rather than something users encounter in practice.
+  - The edits assume the source compiles as Python: importers whose
+    overlay / on-disk text fails `ast.parse` are skipped entirely.
 - `workspace/willRenameFiles` limitations:
   - `__init__.py` renames (i.e. renaming a package directory by renaming
     its package marker) are not handled. Package renames change the

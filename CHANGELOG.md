@@ -10,6 +10,46 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`workspace/willDeleteFiles` in `pyinc-tools` LSP.** The server now
+  advertises `workspace.fileOperations.willDelete` with a `**/*.py` file
+  filter (alongside the existing `willRename`) and handles
+  `workspace/willDeleteFiles` requests. For each `{uri}` entry the server
+  walks every Python file in the workspace and emits a `WorkspaceEdit`
+  that removes the `import` and `from` statements which currently
+  reference the about-to-be-deleted file's module name:
+
+  - `import <deleted_module> [as alias]` — when this is the only alias in
+    the statement, the whole statement is removed (the edit range covers
+    the full statement line including its trailing newline). When the
+    statement has additional surviving aliases (`import a, b` with `a`
+    deleted), only the dead alias plus its adjacent comma is removed, so
+    the surviving aliases stay intact.
+  - `from <deleted_module> import …` — the whole statement is removed
+    (every imported name's source module is gone). Both absolute and
+    relative `from` lines are covered: relative imports are resolved
+    against the importer's own package and matched against the deleted
+    module.
+  - `from <pkg> import <leaf> [as alias]` where
+    `<pkg>.<leaf> == deleted_module` — when this is the only imported
+    name in the statement, the whole statement is removed; otherwise
+    only the dead leaf plus its adjacent comma is removed.
+
+  Deletions where the path is outside the workspace, isn't a `.py` file,
+  or is `__init__.py` (package delete — separate feature) are silently
+  skipped; the request returns `null` when no edits are needed.
+  Importers that are themselves part of the same delete batch are
+  skipped (no point editing a file the client is about to remove).
+  Multiple deletions in one request are batched against the *current*
+  workspace state.
+
+  New consumer-layer dataclass `FileDeletionEdit(path, start_line,
+  start_character, end_line, end_character, new_text)` (all position
+  fields 0-based, LSP-style; `new_text` is always `""`) and entrypoint
+  `WorkspaceSession.import_edits_for_file_deletions(deletions)` accept an
+  iterable of paths and return a tuple of edits sorted by `(path,
+  start_line, start_character)`. Lives entirely on top of the stable
+  `pyinc.integrations` public surface — no kernel contract change and no
+  new integration-layer surface.
 - **`workspace/willRenameFiles` in `pyinc-tools` LSP.** The server now
   advertises `workspace.fileOperations.willRename` with a `**/*.py` file
   filter and handles `workspace/willRenameFiles` requests. For each
