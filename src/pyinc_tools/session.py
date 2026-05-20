@@ -133,6 +133,26 @@ class FileRenameEdit:
     new_text: str
 
 
+@dataclass(frozen=True)
+class FileDeletionEdit:
+    """A text edit returned by ``import_edits_for_file_deletions``.
+
+    Represents the deletion of an ``import`` / ``from`` statement (or a
+    single alias inside one) that references a Python file that is about
+    to be removed from the workspace. The edit's range covers the source
+    span to be removed; ``new_text`` is always the empty string.
+
+    All position fields are 0-based (LSP-style).
+    """
+
+    path: str
+    start_line: int
+    start_character: int
+    end_line: int
+    end_character: int
+    new_text: str = ""
+
+
 DocumentHighlightKind = Literal["text", "read", "write"]
 
 
@@ -357,6 +377,136 @@ def _find_from_module_span(
     if end < len(line) and (line[end].isalnum() or line[end] in "._"):
         return None
     return (line_idx, cursor, end)
+
+
+def _statement_line_span(source: str, node: ast.stmt) -> tuple[int, int] | None:
+    """Return ``(start_line, end_line)`` for an import statement to delete.
+
+    Both values are 0-based LSP-style line indices. ``start_line`` is the
+    statement's first line (``node.lineno - 1``); ``end_line`` is one past
+    the statement's last source line — i.e. the line index where the next
+    statement starts. Pairing the two as ``{start: line_start, end:
+    end_line_start}`` produces an LSP ``TextEdit`` range that removes the
+    statement *including* its trailing newline, so neighbouring lines are
+    not pulled up onto the same physical line.
+
+    For an EOF-anchored statement (no trailing newline), ``end_line`` is
+    clamped to the total number of source lines and the column at the end
+    of the last line is folded back into the line index by setting
+    ``end_line == start_line + n``.
+    """
+    if node.end_lineno is None:
+        return None
+    start_line = node.lineno - 1
+    end_line = node.end_lineno
+    total_lines = source.count("\n") + 1
+    if end_line > total_lines:
+        end_line = total_lines
+    return start_line, end_line
+
+
+def _alias_list_deletion_edits(
+    *,
+    importer_path: str,
+    source: str,
+    aliases: list[ast.alias],
+    dead_indices: list[int],
+) -> list[FileDeletionEdit]:
+    """Emit edits that remove specific aliases from an alias-list import.
+
+    Used when only some aliases inside a single ``import a, b, c`` /
+    ``from M import a, b, c`` statement are dead — the surviving aliases
+    keep the statement intact. For each dead alias the edit covers the
+    alias's name + ``as`` clause span plus an adjacent comma so the list
+    stays well-formed afterwards.
+
+    Aliases whose ``end_lineno`` / ``end_col_offset`` are missing are
+    skipped (the surviving statement still references the deleted module
+    but at least the file is not mis-edited).
+    """
+    del source  # AST positions are sufficient; the source is unused here.
+    edits: list[FileDeletionEdit] = []
+    dead = set(dead_indices)
+    for i in dead_indices:
+        alias = aliases[i]
+        if (
+            alias.lineno is None
+            or alias.col_offset is None
+            or alias.end_lineno is None
+            or alias.end_col_offset is None
+        ):
+            continue
+        alias_start_line = alias.lineno - 1
+        alias_start_char = alias.col_offset
+        alias_end_line = alias.end_lineno - 1
+        alias_end_char = alias.end_col_offset
+
+        # Decide which adjacent comma to absorb.
+        prev_alive_idx: int | None = None
+        for j in range(i - 1, -1, -1):
+            if j not in dead:
+                prev_alive_idx = j
+                break
+        next_alive_idx: int | None = None
+        for j in range(i + 1, len(aliases)):
+            if j not in dead:
+                next_alive_idx = j
+                break
+
+        if next_alive_idx is not None:
+            # Absorb the trailing comma + whitespace up to the next alive
+            # alias's start, so the surviving alias slides into this slot.
+            next_alias = aliases[next_alive_idx]
+            if (
+                next_alias.lineno is None
+                or next_alias.col_offset is None
+            ):
+                continue
+            end_line = next_alias.lineno - 1
+            end_char = next_alias.col_offset
+            edits.append(
+                FileDeletionEdit(
+                    path=importer_path,
+                    start_line=alias_start_line,
+                    start_character=alias_start_char,
+                    end_line=end_line,
+                    end_character=end_char,
+                )
+            )
+        elif prev_alive_idx is not None:
+            # No surviving alias after us — absorb the preceding comma so
+            # the surviving alias before us doesn't end with a trailing `,`.
+            prev_alias = aliases[prev_alive_idx]
+            if (
+                prev_alias.end_lineno is None
+                or prev_alias.end_col_offset is None
+            ):
+                continue
+            start_line = prev_alias.end_lineno - 1
+            start_char = prev_alias.end_col_offset
+            edits.append(
+                FileDeletionEdit(
+                    path=importer_path,
+                    start_line=start_line,
+                    start_character=start_char,
+                    end_line=alias_end_line,
+                    end_character=alias_end_char,
+                )
+            )
+        else:
+            # No surviving sibling at all — caller should have routed this
+            # to the whole-statement removal path, but emit a span-only
+            # edit defensively rather than misbehaving silently.
+            edits.append(
+                FileDeletionEdit(
+                    path=importer_path,
+                    start_line=alias_start_line,
+                    start_character=alias_start_char,
+                    end_line=alias_end_line,
+                    end_character=alias_end_char,
+                )
+            )
+    return edits
 
 
 def _line_char_to_offset(source: str, line: int, character: int) -> int | None:
@@ -2771,6 +2921,221 @@ class WorkspaceSession:
                 tail = new_module[len(anchor_prefix) :] if anchor else new_module
                 return ("." * level) + tail
         return new_module
+
+    def import_edits_for_file_deletions(
+        self,
+        deletions: Sequence[str | os.PathLike[str]],
+    ) -> tuple[FileDeletionEdit, ...]:
+        """Compute import edits that remove references to deleted Python files.
+
+        Each entry in ``deletions`` is the path of a ``.py`` file that the
+        editor is about to delete from the workspace. The returned edits
+        remove every ``import`` / ``from`` statement (or single alias inside
+        one) across the workspace that currently references one of those
+        files' module names; the statements would become broken once the
+        files are gone.
+
+        Deletions are silently skipped when the path is outside the
+        workspace, is not a ``.py`` file, or is ``__init__.py`` (package
+        deletions are a separate feature). The returned edits all carry
+        ``new_text == ""``; the spans are 0-based (LSP-style) and reference
+        the importer file's *current* path.
+
+        Three rewrite shapes are produced:
+
+        - ``import <deleted_module> [as alias]`` — when this is the only
+          alias in the statement, the whole statement is removed (including
+          its trailing newline); otherwise only the dead alias plus its
+          adjacent comma is removed, leaving the surviving aliases intact.
+        - ``from <deleted_module> import ...`` — the whole statement is
+          removed; every imported name's source module is gone.
+        - ``from <pkg> import <leaf> [as alias]`` where
+          ``<pkg>.<leaf> == deleted_module`` — when this is the only
+          imported name, the whole statement is removed; otherwise only
+          the dead leaf plus its adjacent comma is removed.
+        """
+        with self._state_lock:
+            self._check_open()
+            deleted_modules: set[str] = set()
+            deleted_importer_paths: set[str] = set()
+            for path in deletions:
+                resolved = self._resolve_file_deletion(path)
+                if resolved is None:
+                    continue
+                deleted_modules.add(resolved)
+                with contextlib.suppress(ValueError):
+                    deleted_importer_paths.add(self._normalize_real_path(path))
+            if not deleted_modules:
+                return ()
+
+            workspace = self._remap_workspace_analysis(
+                workspace_analysis(self.db, self.mirror_root)
+            )
+            edits: list[FileDeletionEdit] = []
+            for analysis in workspace.modules:
+                if analysis.path in deleted_importer_paths:
+                    continue
+                edits.extend(
+                    self._import_deletion_edits_for_one_file(
+                        importer_module=analysis.module,
+                        importer_path=analysis.path,
+                        deleted_modules=deleted_modules,
+                    )
+                )
+            edits.sort(
+                key=lambda e: (e.path, e.start_line, e.start_character)
+            )
+            return tuple(edits)
+
+    def _resolve_file_deletion(
+        self, path: str | os.PathLike[str]
+    ) -> str | None:
+        try:
+            real = self._normalize_real_path(path)
+        except ValueError:
+            return None
+        if Path(real).suffix != ".py":
+            return None
+        if Path(real).name == "__init__.py":
+            return None
+        try:
+            relative = Path(real).relative_to(Path(self.root))
+        except ValueError:
+            return None
+        return ".".join(relative.parts[:-1] + (relative.stem,))
+
+    def _import_deletion_edits_for_one_file(
+        self,
+        *,
+        importer_module: str,
+        importer_path: str,
+        deleted_modules: set[str],
+    ) -> list[FileDeletionEdit]:
+        source = self.source_text(importer_path)
+        if source is None:
+            return []
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return []
+        edits: list[FileDeletionEdit] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                edits.extend(
+                    self._delete_edits_for_import(
+                        importer_path=importer_path,
+                        source=source,
+                        node=node,
+                        deleted_modules=deleted_modules,
+                    )
+                )
+            elif isinstance(node, ast.ImportFrom):
+                resolved = _resolve_import_from_target(
+                    importer_module=importer_module,
+                    importer_path=importer_path,
+                    level=node.level,
+                    module=node.module,
+                )
+                if resolved is not None and resolved in deleted_modules:
+                    span = _statement_line_span(source, node)
+                    if span is not None:
+                        start_line, end_line = span
+                        edits.append(
+                            FileDeletionEdit(
+                                path=importer_path,
+                                start_line=start_line,
+                                start_character=0,
+                                end_line=end_line,
+                                end_character=0,
+                            )
+                        )
+                    continue
+                edits.extend(
+                    self._delete_edits_for_from_aliases(
+                        importer_path=importer_path,
+                        source=source,
+                        node=node,
+                        resolved_module=resolved,
+                        deleted_modules=deleted_modules,
+                    )
+                )
+        return edits
+
+    def _delete_edits_for_import(
+        self,
+        *,
+        importer_path: str,
+        source: str,
+        node: ast.Import,
+        deleted_modules: set[str],
+    ) -> list[FileDeletionEdit]:
+        dead_indices = [
+            i for i, alias in enumerate(node.names) if alias.name in deleted_modules
+        ]
+        if not dead_indices:
+            return []
+        if len(dead_indices) == len(node.names):
+            span = _statement_line_span(source, node)
+            if span is None:
+                return []
+            start_line, end_line = span
+            return [
+                FileDeletionEdit(
+                    path=importer_path,
+                    start_line=start_line,
+                    start_character=0,
+                    end_line=end_line,
+                    end_character=0,
+                )
+            ]
+        return _alias_list_deletion_edits(
+            importer_path=importer_path,
+            source=source,
+            aliases=node.names,
+            dead_indices=dead_indices,
+        )
+
+    def _delete_edits_for_from_aliases(
+        self,
+        *,
+        importer_path: str,
+        source: str,
+        node: ast.ImportFrom,
+        resolved_module: str | None,
+        deleted_modules: set[str],
+    ) -> list[FileDeletionEdit]:
+        dead_indices: list[int] = []
+        for i, alias in enumerate(node.names):
+            if alias.name == "*":
+                continue
+            candidate = (
+                f"{resolved_module}.{alias.name}" if resolved_module else alias.name
+            )
+            if candidate not in deleted_modules:
+                continue
+            dead_indices.append(i)
+        if not dead_indices:
+            return []
+        if len(dead_indices) == len(node.names):
+            span = _statement_line_span(source, node)
+            if span is None:
+                return []
+            start_line, end_line = span
+            return [
+                FileDeletionEdit(
+                    path=importer_path,
+                    start_line=start_line,
+                    start_character=0,
+                    end_line=end_line,
+                    end_character=0,
+                )
+            ]
+        return _alias_list_deletion_edits(
+            importer_path=importer_path,
+            source=source,
+            aliases=node.names,
+            dead_indices=dead_indices,
+        )
 
     def source_text(self, path: str | os.PathLike[str]) -> str | None:
         real_path = self._normalize_real_path(path)
