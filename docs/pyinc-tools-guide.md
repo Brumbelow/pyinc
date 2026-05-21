@@ -141,6 +141,7 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     "documentLinkProvider": { "resolveProvider": false },
     "codeLensProvider": { "resolveProvider": false },
     "callHierarchyProvider": true,
+    "typeHierarchyProvider": true,
     "inlayHintProvider": { "resolveProvider": false },
     "semanticTokensProvider": {
       "legend": {
@@ -208,6 +209,9 @@ channels does not produce duplicate messages.
 | `textDocument/prepareCallHierarchy` | `CallHierarchyItem[]` or `null`. Resolves the identifier under the cursor through `symbol_resolution.resolve_symbol`; if the target is a workspace `function`, `method`, or `class`, returns a single item describing the declaring def/class. The item's `range` covers the whole def block (including decorator lines if any), and `selectionRange` is the bare-name span on the header line. The item's `data` field carries `{"path": str, "qualified_name": str}` which the server reads back on `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`. Variables, import aliases, `from_import` aliases, wildcard-import stubs, and stdlib / installed / ambiguous / missing targets return `null`. |
 | `callHierarchy/incomingCalls` | `CallHierarchyIncomingCall[]`. Calls `find_references(include_declaration=False)` on the item's target and groups references by their innermost enclosing workspace-known def/class in the same file (qualifier follows `module_symbol_table`'s ClassDef-only nesting scheme, so a reference inside `class C: def m(self): ...` is attributed to `C.m`). References inside nested function bodies bubble up to the next enclosing function or method that's in the symbol table; module-top-level references are dropped because there is no caller item to attribute them to. `fromRanges` are AST occurrence ranges, including the rightmost-attribute span for `M.foo()` style references. |
 | `callHierarchy/outgoingCalls` | `CallHierarchyOutgoingCall[]`. Parses the item's declaring file, locates the `def` / `async def` / `class` matching the item's qualified name, and walks its body for `ast.Call` nodes — *without* descending into nested `FunctionDef` / `AsyncFunctionDef` / `ClassDef` / `Lambda` scopes (each owns its own outgoing list). For each call: bare `Name(id=name)` resolves against the declaring module; `Name.attr` resolves the LHS through the file's imports and then `attr` inside the imported module (mirroring `find_references`'s LHS-bare-Name handling). Workspace `function` / `method` / `class` targets contribute callees; subscripted calls, deep attribute chains (`pkg.subpkg.foo()`), and lambda calls produce no callee. `fromRanges` are the call expression's name/attribute span. |
+| `textDocument/prepareTypeHierarchy` | `TypeHierarchyItem[]` or `null`. Resolves the identifier under the cursor through `symbol_resolution.resolve_symbol`; if the target is a workspace `class`, returns a single item describing the declaring `ClassDef`. The item's `range` covers the whole class block (including decorator lines if any), and `selectionRange` is the bare-name span on the header line. The item's `data` field carries `{"path": str, "qualified_name": str}` which the server reads back on `typeHierarchy/supertypes` and `typeHierarchy/subtypes`. Functions, methods, variables, import aliases, `from_import` aliases, wildcard-import stubs, and stdlib / installed / ambiguous / missing targets all return `null`. |
+| `typeHierarchy/supertypes` | `TypeHierarchyItem[]`. Parses the item's declaring file, locates the `ClassDef` matching the item's qualified name, and resolves each entry of its `bases` list. `Subscript` bases (`Generic[T]`, `Base[T]`) are unwrapped to their `value` once before resolution, so generic base classes still navigate. Bare `Name(id=X)` bases resolve `X` through the declaring module's imports; `Name.attr` bases resolve the LHS to a workspace module and then `attr` inside it (mirroring `find_references`'s LHS-bare-Name handling). Deep attribute chains (`pkg.subpkg.Foo`), starred bases, and call expressions produce no entry. Only workspace `class` targets contribute items; stdlib / installed / ambiguous / missing bases are dropped. Duplicates by `(path, qualified_name)` are collapsed. |
+| `typeHierarchy/subtypes` | `TypeHierarchyItem[]`. Walks the workspace once via `workspace_analysis`, visiting every `ClassDef` recursively (qualified-name nesting follows `module_symbol_table`: `Outer.Inner`). For each candidate's `bases` list, each base is unwrapped (subscript dropped) and resolved through the candidate's module imports using the same rules as `typeHierarchy/supertypes`; a candidate is a subtype iff at least one resolved base points at the target `(path, qualified_name)`. The target itself is excluded from the result. Duplicates by `(path, qualified_name)` are collapsed; output is sorted by `(path, qualified_name)`. Only direct subtypes are returned — clients drill down by calling the endpoint recursively on each result. |
 | `textDocument/inlayHint` | `InlayHint[]` for parameter-name hints at call sites inside the requested `range`. The server walks the document's AST for `ast.Call` nodes whose callee resolves (via the same bare-`Name` / `Name.attr` resolver as `callHierarchy/outgoingCalls`) to a workspace `function` or `class`, looks up the callee's signature, and emits one hint per positional argument with label `"<paramname>:"`, `kind: 2` (Parameter), and `paddingRight: true`. Class constructions surface `<Class>.__init__`'s parameters with the leading `self` / `cls` stripped, matching `signatureHelp`. Hints are suppressed when the argument is itself a bare `Name` whose identifier equals the parameter name. Iteration stops at the first `*args` parameter (it absorbs the rest of the positional slots) or at the first `ast.Starred` argument in the call (its slot count is unknown). Stdlib / installed / ambiguous targets, attribute calls on instances (`obj.method(`), subscripted calls (`factory[T](`), deep attribute chains (`pkg.subpkg.foo(`), keyword arguments (already named), and files that fail to parse all contribute no hints. |
 | `textDocument/semanticTokens/full` | `SemanticTokens` payload (`{data: int[]}`) for the requested document. The server parses the document (overlay or on-disk) once with `ast.parse` and emits one token per `def` / `async def` / `class` header (type `function` / `method` / `class`, modifier `declaration`, plus `async` for `async def`), per function parameter (type `parameter`, modifier `declaration`), and per bare `ast.Name` use whose identifier matches a top-level entry in the file's `ModuleSymbolTable`. Use-site classifications are derived from the matched symbol's kind: `function`, `class`, `variable` / `class_variable` → `"variable"`, `import_alias` → `"namespace"`; dotted entries (methods, nested classes), `from_import_alias`, and `wildcard_import_stub` entries are skipped (resolving them to their real kind needs a cross-module hop — the editor's default highlighting handles them). Tokens are emitted in `(line, character)` order and encoded into the LSP wire format as five integers per token `[deltaLine, deltaStart, length, tokenType, tokenModifiers]`, where `tokenModifiers` is a bitmask over the legend positions. Files that fail to parse return `{"data": []}`. |
 | `textDocument/semanticTokens/range` | `SemanticTokens` payload (`{data: int[]}`) for the slice of the requested document covered by the half-open LSP range `[params.range.start, params.range.end)`. Implementation reuses the same full-document AST walk as `semanticTokens/full` and then filters by token start position: a token at `(line, character)` is included iff its start is `>= range.start` and `< range.end`. The retained tokens are encoded into the wire format on their own (the delta cursor is reset, so the first emitted token's `deltaLine` / `deltaStart` are absolute). Files that fail to parse and missing files return `{"data": []}`. No server-side per-document state is held — every `range` request is independent. |
@@ -467,6 +471,35 @@ Consequences:
   call_sites)`, and `CallHierarchyOutgoingCall(callee, call_sites)`
   dataclasses respectively; ranges in `CallHierarchyCallSite` and on the
   item itself are 0-based (LSP-style).
+- Type hierarchy, via `textDocument/prepareTypeHierarchy`,
+  `typeHierarchy/supertypes`, and `typeHierarchy/subtypes` (advertised as
+  `typeHierarchyProvider: true`). `prepareTypeHierarchy` returns a single
+  `TypeHierarchyItem` for the identifier under the cursor when it resolves to
+  a workspace `class`, and `null` otherwise; the item's `range` covers the
+  whole `class` block (including decorator lines if any), `selectionRange`
+  is the bare-name span on the header line, and the item carries
+  `data = {"path", "qualified_name"}` so subsequent
+  supertypes/subtypes requests do not need to re-resolve. `supertypes`
+  walks the matched `ClassDef`'s `bases` list once: `Subscript` bases
+  (`Generic[T]`, `Base[T]`) are unwrapped to their `value` before
+  resolution so generic base classes still navigate; bare `Name(id=X)`
+  resolves through the declaring module's imports, and `Name.attr`
+  resolves the LHS to a workspace module then `attr` inside it (mirroring
+  `find_references`'s LHS-bare-Name handling). Deep attribute chains
+  (`pkg.subpkg.Foo`), starred bases, and call expressions produce no
+  entry. `subtypes` walks every Python file in the workspace via
+  `workspace_analysis` and visits every `ClassDef` recursively (qualified
+  names follow `module_symbol_table`'s `Outer.Inner` nesting convention),
+  applying the same base-expression resolver to each candidate's bases;
+  a candidate is a subtype iff at least one resolved base points at the
+  target `(path, qualified_name)`. Only direct supertypes/subtypes are
+  returned — LSP clients drill down by calling the endpoint recursively.
+  The consumer-layer entrypoints
+  `WorkspaceSession.prepare_type_hierarchy(path, line, character)`,
+  `WorkspaceSession.type_hierarchy_supertypes(path, qualified_name)`, and
+  `WorkspaceSession.type_hierarchy_subtypes(path, qualified_name)` return
+  tuples of `TypeHierarchyItem` dataclasses (always
+  `kind == "class"`), with all position fields 0-based (LSP-style).
 - Rename, via `textDocument/prepareRename` and `textDocument/rename` (advertised
   as `renameProvider: {prepareProvider: true}`). `prepareRename` returns the
   identifier range and a placeholder when the cursor is on a workspace symbol;
@@ -665,6 +698,37 @@ Consequences:
     instance attribute calls, and lambda calls produce no callee.
   - Both directions only report workspace targets. Stdlib / installed /
     ambiguous / missing callees are omitted.
+- Type hierarchy limitations:
+  - `prepareTypeHierarchy` only surfaces top-level identifiers (cursor
+    must be on a name that `resolve_symbol` can find as a module-level
+    binding or as an `import` / `from` target that re-exports a
+    workspace class). This mirrors `prepareCallHierarchy`'s limitation
+    on methods reached through their `def` line.
+  - Only workspace `class` targets contribute items. Stdlib /
+    installed / ambiguous / missing classes produce no item; this
+    means inheritance from `collections.OrderedDict`, `enum.Enum`,
+    or third-party base classes is silently dropped from the
+    supertypes view, and subclasses of such bases will not appear in
+    the workspace-class subtypes view of the base.
+  - Base-expression resolution is restricted to bare `Name` and
+    `Name.attr` (LHS is a bare `Name`), with `Subscript` unwrapped to
+    its `value`. Deep attribute chains (`pkg.subpkg.Foo`), `Starred`
+    bases (`*bases`), and call expressions in the bases list produce
+    no entry. The standard opt-in is `from pkg.subpkg import Foo` so
+    the base reads as `Foo`, or `from pkg import subpkg` so it reads
+    as `subpkg.Foo`.
+  - Only direct supertypes / subtypes are returned per call. LSP
+    clients are expected to drill down by recursively calling the
+    endpoint on each result.
+  - Metaclass relationships (`class C(metaclass=Meta)`) are not
+    reported. Metaclasses live in the `keywords` list, not `bases`,
+    and the type-hierarchy view is class-inheritance only.
+  - The subtypes walk iterates every `ClassDef` in every Python file
+    via `workspace_analysis` and re-parses each candidate file's
+    source on demand. The kernel memoises `workspace_analysis` and
+    `module_symbol_table` across requests, so steady-state cost is
+    bounded by the number of newly-changed files; cold runs on very
+    large workspaces will scale linearly with file count.
 - `textDocument/typeDefinition` limitations:
   - Function-parameter type definitions are not surfaced. The
     `symbol_resolution` integration tracks parameters only as fields on

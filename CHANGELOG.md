@@ -10,6 +10,68 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **Type hierarchy in `pyinc-tools` LSP.** The server now advertises
+  `typeHierarchyProvider: true` and implements three new requests:
+
+  - `textDocument/prepareTypeHierarchy` — resolves the identifier under
+    the cursor through `symbol_resolution.resolve_symbol`; if the target
+    is a workspace `class`, returns a single `TypeHierarchyItem`
+    describing the declaring `ClassDef`. The item's `range` spans the
+    whole `class` block (including any decorator lines), `selectionRange`
+    is the bare class-name span on the header line, and the item's
+    `data` field carries `{"path", "qualified_name"}` so subsequent
+    `supertypes` / `subtypes` requests do not need to re-resolve.
+    Functions, methods, variables, import aliases, `from_import`
+    aliases, wildcard-import stubs, and stdlib / installed / ambiguous
+    / missing targets all return `null`.
+  - `typeHierarchy/supertypes` — parses the item's declaring file,
+    locates the `ClassDef` matching the item's qualified name, and
+    resolves each entry of its `bases` list. `Subscript` bases
+    (`Generic[T]`, `Base[T]`) are unwrapped to their `value` once
+    before resolution, so generic base classes still navigate. Bare
+    `Name(id=X)` bases resolve `X` through the declaring module's
+    imports; `Name.attr` bases resolve the LHS to a workspace module
+    and then `attr` inside it (mirroring `find_references`'s
+    LHS-bare-Name handling). Deep attribute chains
+    (`pkg.subpkg.Foo`), `Starred` bases, and call expressions
+    produce no entry. Only workspace `class` targets contribute
+    items; stdlib / installed / ambiguous / missing bases are
+    dropped. Duplicates by `(path, qualified_name)` are collapsed.
+  - `typeHierarchy/subtypes` — walks the workspace once via
+    `workspace_analysis` and visits every `ClassDef` recursively
+    (qualified-name nesting follows `module_symbol_table`:
+    `Outer.Inner`). For each candidate's `bases` list, each base is
+    unwrapped (subscript dropped) and resolved through the candidate's
+    module imports using the same rules as `supertypes`; a candidate
+    is a subtype iff at least one resolved base points at the target
+    `(path, qualified_name)`. The target itself is excluded. Only
+    direct subtypes are returned — clients drill down by calling the
+    endpoint recursively. Output is sorted by
+    `(path, qualified_name)`.
+
+  New consumer-layer dataclass `TypeHierarchyItem(name, kind, path,
+  qualified_name, detail, range_start_line, range_start_character,
+  range_end_line, range_end_character, selection_start_line,
+  selection_start_character, selection_end_line,
+  selection_end_character)` (all position fields 0-based, LSP-style;
+  `kind` typed as `TypeHierarchyItemKind = Literal["class"]`) and
+  three new `WorkspaceSession` methods:
+  `prepare_type_hierarchy(path, line, character)`,
+  `type_hierarchy_supertypes(path, qualified_name)`, and
+  `type_hierarchy_subtypes(path, qualified_name)`. All three are
+  thread-safe (RLock-guarded via the same `_state_lock` used by every
+  other public mutator). Lives entirely on top of the stable
+  `pyinc.integrations` public surface (`workspace_analysis`,
+  `module_symbol_table`, `resolve_symbol`) — no kernel contract change
+  and no new integration-layer surface.
+
+  Limitations are documented in `docs/pyinc-tools-guide.md`. The main
+  ones are inherited from the existing resolver: top-level identifiers
+  only (`prepareTypeHierarchy`); workspace `class` targets only
+  (stdlib / installed base classes are dropped); deep attribute chains
+  (`pkg.subpkg.Foo`) in the `bases` list are skipped (use
+  `from pkg.subpkg import Foo` or `from pkg import subpkg` to opt in);
+  metaclass relationships are not reported.
 - **`workspace/willDeleteFiles` in `pyinc-tools` LSP.** The server now
   advertises `workspace.fileOperations.willDelete` with a `**/*.py` file
   filter (alongside the existing `willRename`) and handles
@@ -536,6 +598,17 @@ Items in this section are queued for the next v2.x release.
   concatenation are skipped (offset reconstruction would be ambiguous);
   malformed annotation strings are silently ignored. No payload shape or
   public surface change.
+
+### Fixed
+
+- **`FileDeletionEdit` is now re-exported from `pyinc_tools`.** The dataclass
+  was added to `pyinc_tools.session` alongside
+  `WorkspaceSession.import_edits_for_file_deletions` in the previous PR but
+  was missing from `pyinc_tools/__init__.py`'s re-export list, so consumers
+  who imported it from the top-level package (matching the precedent set by
+  `FileRenameEdit` and every other consumer-layer dataclass) saw an
+  `ImportError`. The symbol is now in both the module-level imports and
+  `__all__`.
 
 ## [2.0.0]
 

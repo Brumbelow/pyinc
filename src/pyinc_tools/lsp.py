@@ -17,6 +17,7 @@ from .session import (
     CallHierarchyItem,
     PollingWorkspaceWatcher,
     SemanticToken,
+    TypeHierarchyItem,
     WorkspaceSession,
 )
 
@@ -278,6 +279,55 @@ def _call_hierarchy_identity_from_item(
     return path, qualified_name
 
 
+def _type_hierarchy_item_to_lsp(item: TypeHierarchyItem) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "name": item.name,
+        "kind": _LSP_SYMBOL_KINDS["class"],
+        "uri": _path_to_uri(item.path),
+        "range": {
+            "start": {
+                "line": item.range_start_line,
+                "character": item.range_start_character,
+            },
+            "end": {
+                "line": item.range_end_line,
+                "character": item.range_end_character,
+            },
+        },
+        "selectionRange": {
+            "start": {
+                "line": item.selection_start_line,
+                "character": item.selection_start_character,
+            },
+            "end": {
+                "line": item.selection_end_line,
+                "character": item.selection_end_character,
+            },
+        },
+        "data": {"path": item.path, "qualified_name": item.qualified_name},
+    }
+    if item.detail is not None:
+        payload["detail"] = item.detail
+    return payload
+
+
+def _type_hierarchy_identity_from_item(
+    item: Any,
+) -> tuple[str, str] | None:
+    # Shape matches `_call_hierarchy_identity_from_item`; kept separate so
+    # the two endpoint families can diverge if needed.
+    if not isinstance(item, dict):
+        return None
+    data = item.get("data")
+    if not isinstance(data, dict):
+        return None
+    path = data.get("path")
+    qualified_name = data.get("qualified_name")
+    if not isinstance(path, str) or not isinstance(qualified_name, str):
+        return None
+    return path, qualified_name
+
+
 def _format_symbol_declaration(symbol: Symbol) -> str:
     bare_name = symbol.qualified_name.rsplit(".", 1)[-1]
     if symbol.kind == "class":
@@ -404,6 +454,12 @@ class LanguageServer:
             return self._call_hierarchy_incoming_calls(params)
         if method == "callHierarchy/outgoingCalls":
             return self._call_hierarchy_outgoing_calls(params)
+        if method == "textDocument/prepareTypeHierarchy":
+            return self._prepare_type_hierarchy(params)
+        if method == "typeHierarchy/supertypes":
+            return self._type_hierarchy_supertypes(params)
+        if method == "typeHierarchy/subtypes":
+            return self._type_hierarchy_subtypes(params)
         if method == "textDocument/inlayHint":
             return self._inlay_hint(params)
         if method == "textDocument/semanticTokens/full":
@@ -540,6 +596,7 @@ class LanguageServer:
                 "documentLinkProvider": {"resolveProvider": False},
                 "codeLensProvider": {"resolveProvider": False},
                 "callHierarchyProvider": True,
+                "typeHierarchyProvider": True,
                 "inlayHintProvider": {"resolveProvider": False},
                 "semanticTokensProvider": {
                     "legend": {
@@ -1107,6 +1164,58 @@ class LanguageServer:
             }
             for call in results
         ]
+
+    def _prepare_type_hierarchy(self, params: Any) -> list[dict[str, Any]] | None:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        try:
+            items = session.prepare_type_hierarchy(real_path, line, character)
+        except FileNotFoundError:
+            return None
+        if not items:
+            return None
+        return [_type_hierarchy_item_to_lsp(item) for item in items]
+
+    def _type_hierarchy_supertypes(
+        self, params: Any
+    ) -> list[dict[str, Any]] | None:
+        ident = _type_hierarchy_identity_from_item(params.get("item"))
+        if ident is None:
+            return None
+        path, qualified_name = ident
+        try:
+            real_path = self._require_safe_path(_path_to_uri(path))
+        except (ValueError, RuntimeError):
+            return None
+        try:
+            results = self._require_session().type_hierarchy_supertypes(
+                real_path, qualified_name
+            )
+        except FileNotFoundError:
+            return None
+        return [_type_hierarchy_item_to_lsp(item) for item in results]
+
+    def _type_hierarchy_subtypes(
+        self, params: Any
+    ) -> list[dict[str, Any]] | None:
+        ident = _type_hierarchy_identity_from_item(params.get("item"))
+        if ident is None:
+            return None
+        path, qualified_name = ident
+        try:
+            real_path = self._require_safe_path(_path_to_uri(path))
+        except (ValueError, RuntimeError):
+            return None
+        try:
+            results = self._require_session().type_hierarchy_subtypes(
+                real_path, qualified_name
+            )
+        except FileNotFoundError:
+            return None
+        return [_type_hierarchy_item_to_lsp(item) for item in results]
 
     def _inlay_hint(self, params: Any) -> list[dict[str, Any]]:
         session = self._require_session()
