@@ -10,6 +10,7 @@ from .session import (
     DocumentHighlightKind,
     DocumentLink,
     FileAnalysisResult,
+    FileDeletionEdit,
     FileRenameEdit,
     FoldingRange,
     FoldingRangeKind,
@@ -26,6 +27,8 @@ from .session import (
     SignatureHelp,
     SignatureParameterInfo,
     TypeDefinitionLocation,
+    TypeHierarchyItem,
+    TypeHierarchyItemKind,
     WorkspaceAnalysisResult,
     WorkspaceSession,
 )
@@ -42,6 +45,7 @@ __all__ = [
     "DocumentHighlightKind",
     "DocumentLink",
     "FileAnalysisResult",
+    "FileDeletionEdit",
     "FileRenameEdit",
     "FoldingRange",
     "FoldingRangeKind",
@@ -58,6 +62,8 @@ __all__ = [
     "SignatureHelp",
     "SignatureParameterInfo",
     "TypeDefinitionLocation",
+    "TypeHierarchyItem",
+    "TypeHierarchyItemKind",
     "WorkspaceAnalysisResult",
     "WorkspaceSession",
 ]

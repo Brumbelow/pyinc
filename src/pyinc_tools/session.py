@@ -296,6 +296,38 @@ class CallHierarchyOutgoingCall:
     call_sites: tuple[CallHierarchyCallSite, ...]
 
 
+TypeHierarchyItemKind = Literal["class"]
+
+
+@dataclass(frozen=True)
+class TypeHierarchyItem:
+    """A single class entry returned by the type-hierarchy endpoints.
+
+    The shape mirrors :class:`CallHierarchyItem`: ``range`` covers the whole
+    ``class`` block (including any decorator lines), ``selection_*`` spans
+    the bare class name on the header line, and ``qualified_name`` follows
+    the ``module_symbol_table`` convention (``Outer.Inner`` for nested
+    classes). ``detail`` is the declaring module name when known.
+
+    The ``kind`` field is fixed to ``"class"`` for now; type hierarchies
+    only surface classes, mirroring the LSP spec.
+    """
+
+    name: str
+    kind: TypeHierarchyItemKind
+    path: str
+    qualified_name: str
+    detail: str | None
+    range_start_line: int
+    range_start_character: int
+    range_end_line: int
+    range_end_character: int
+    selection_start_line: int
+    selection_start_character: int
+    selection_end_line: int
+    selection_end_character: int
+
+
 @dataclass(frozen=True)
 class _DependencyInputs:
     config: ConfigAnalysis | None
@@ -1134,6 +1166,65 @@ def _call_func_range(call: ast.Call) -> tuple[int, int, int, int] | None:
             end_col,
         )
     return None
+
+
+def _unwrap_base_expression(node: ast.expr) -> tuple[str, ...] | None:
+    """Map a ``ClassDef`` base expression to a resolver-ready tuple.
+
+    Returns ``("name", id)`` for a bare ``Name``, or
+    ``("attr", lhs_id, attr_name)`` for ``Name.attr``. ``Subscript``
+    bases (``Generic[T]``, ``Base[T]``) are unwrapped to their ``value``
+    once, so ``Base[T]`` resolves to ``Base``. ``Starred`` bases, deep
+    attribute chains (``pkg.sub.Foo``), and call expressions are
+    rejected by returning ``None`` — matching the LHS-bare-Name limit
+    that ``find_references`` and ``call_hierarchy_outgoing_calls``
+    apply.
+    """
+    if isinstance(node, ast.Subscript):
+        node = node.value
+    if isinstance(node, ast.Name):
+        return ("name", node.id)
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return ("attr", node.value.id, node.attr)
+    return None
+
+
+def _walk_class_definitions(
+    tree: ast.Module,
+) -> tuple[tuple[str, ast.ClassDef], ...]:
+    """Yield every ``ClassDef`` in ``tree`` with its dotted qualifier.
+
+    The qualifier follows ``module_symbol_table``'s scheme: only
+    ``ClassDef`` nesting contributes to the dotted path — a class
+    declared inside a function body is reported with its bare class
+    name (no function qualifier), matching how the symbol table would
+    have stored it had it been at module top level. Classes declared
+    inside another class are reported as ``Outer.Inner``. Class bodies
+    are walked recursively so arbitrary nesting depth is covered.
+    """
+    out: list[tuple[str, ast.ClassDef]] = []
+
+    def walk(node: ast.AST, class_qualifier: str) -> None:
+        if isinstance(node, ast.ClassDef):
+            qname = (
+                f"{class_qualifier}.{node.name}" if class_qualifier else node.name
+            )
+            out.append((qname, node))
+            for body_child in node.body:
+                walk(body_child, qname)
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Classes declared inside a function body are not part of the
+            # module symbol table's qualifier scheme; reset the class
+            # qualifier so any nested class re-enters at "top level".
+            for descendant in ast.iter_child_nodes(node):
+                walk(descendant, "")
+            return
+        for descendant in ast.iter_child_nodes(node):
+            walk(descendant, class_qualifier)
+
+    walk(tree, "")
+    return tuple(out)
 
 
 def _inlay_hints_for_call(
@@ -2338,6 +2429,363 @@ class WorkspaceSession:
                 )
             outgoing.sort(key=lambda call: (call.callee.path, call.callee.qualified_name))
             return tuple(outgoing)
+
+    def prepare_type_hierarchy(
+        self,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+    ) -> tuple[TypeHierarchyItem, ...]:
+        """Return the type-hierarchy item for the identifier at the cursor.
+
+        Resolves the identifier under ``(line, character)`` (LSP-style 0-based
+        coordinates) through :func:`resolve_symbol`. If the resolved target is
+        a workspace class (including a class re-exported through an
+        ``import`` / ``from … import …`` chain), a single
+        :class:`TypeHierarchyItem` describing the declaring ``ClassDef`` is
+        returned; otherwise the result is empty. Functions, methods,
+        variables, import aliases, ``from_import`` aliases, wildcard-import
+        stubs, and stdlib / installed / ambiguous / missing targets all
+        return ``()``.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            identifier = _identifier_at_source_position(source, line, character)
+            if identifier is None:
+                return ()
+            resolved = self._remap_resolved_symbol(
+                resolve_symbol(
+                    self.db, self.mirror_root, str(mirror_path), identifier
+                )
+            )
+            if resolved.resolution != "workspace":
+                return ()
+            if resolved.defining_path is None or resolved.defining_lineno is None:
+                return ()
+            defining_mirror = self._mirror_path_for_real(resolved.defining_path)
+            if not defining_mirror.exists() or defining_mirror.suffix != ".py":
+                return ()
+            defining_table = module_symbol_table(
+                self.db, self.mirror_root, str(defining_mirror)
+            )
+            matched: Symbol | None = None
+            for symbol in defining_table.symbols:
+                if (
+                    symbol.lineno == resolved.defining_lineno
+                    and symbol.qualified_name == resolved.qualified_name
+                    and symbol.kind == "class"
+                ):
+                    matched = symbol
+                    break
+            if matched is None:
+                return ()
+            item = self._build_type_hierarchy_item(
+                resolved.defining_path, matched.qualified_name, defining_table.module
+            )
+            if item is None:
+                return ()
+            return (item,)
+
+    def type_hierarchy_supertypes(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+    ) -> tuple[TypeHierarchyItem, ...]:
+        """Return the immediate base classes of ``qualified_name`` (declared in ``path``).
+
+        Parses the declaring file's AST once, locates the ``ClassDef``
+        matching ``qualified_name`` (using the same dotted-name walker as
+        ``call_hierarchy_outgoing_calls``), and resolves each entry in its
+        ``bases`` list. ``Subscript`` bases (``Generic[T]``, ``Base[T]``) are
+        unwrapped to their ``value`` before resolution, so generic base
+        classes are still navigated. Bare ``Name(id=X)`` bases resolve
+        ``X`` against the declaring module's imports; ``Name.attr`` bases
+        resolve the LHS to a workspace module and then ``attr`` inside it
+        (mirroring ``call_hierarchy_outgoing_calls``'s LHS-bare-Name rule).
+        ``Starred`` bases and deeper attribute chains (``pkg.sub.Foo``)
+        produce no entry. Only workspace ``class`` targets contribute an
+        item; stdlib / installed / ambiguous / missing bases are dropped.
+        Duplicates (same ``(path, qualified_name)``) are collapsed, and the
+        result is sorted by ``(path, qualified_name)``.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                return ()
+            class_node = _find_callable_node(tree, qualified_name)
+            if class_node is None or not isinstance(class_node, ast.ClassDef):
+                return ()
+
+            seen: set[tuple[str, str]] = set()
+            items: list[TypeHierarchyItem] = []
+            for base in class_node.bases:
+                target = _unwrap_base_expression(base)
+                if target is None:
+                    continue
+                resolved = self._resolve_class_target(mirror_path, target)
+                if resolved is None:
+                    continue
+                if (
+                    resolved.resolution != "workspace"
+                    or resolved.defining_path is None
+                    or resolved.defining_lineno is None
+                ):
+                    continue
+                key = (resolved.defining_path, resolved.qualified_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                defining_mirror = self._mirror_path_for_real(resolved.defining_path)
+                if (
+                    not defining_mirror.exists()
+                    or defining_mirror.suffix != ".py"
+                ):
+                    continue
+                defining_table = module_symbol_table(
+                    self.db, self.mirror_root, str(defining_mirror)
+                )
+                base_symbol: Symbol | None = None
+                for symbol in defining_table.symbols:
+                    if (
+                        symbol.lineno == resolved.defining_lineno
+                        and symbol.qualified_name == resolved.qualified_name
+                        and symbol.kind == "class"
+                    ):
+                        base_symbol = symbol
+                        break
+                if base_symbol is None:
+                    continue
+                item = self._build_type_hierarchy_item(
+                    resolved.defining_path,
+                    base_symbol.qualified_name,
+                    defining_table.module,
+                )
+                if item is not None:
+                    items.append(item)
+            items.sort(key=lambda hi: (hi.path, hi.qualified_name))
+            return tuple(items)
+
+    def type_hierarchy_subtypes(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+    ) -> tuple[TypeHierarchyItem, ...]:
+        """Return the immediate workspace subtypes of ``qualified_name``.
+
+        Walks the workspace once via :func:`workspace_analysis` and visits
+        every ``ClassDef`` in every Python file, recursing into class
+        bodies so nested classes are eligible subtypes (qualified-name
+        nesting follows ``module_symbol_table``: ``Outer.Inner`` for a
+        class nested inside another class). For each candidate's
+        ``bases`` list, each base expression is unwrapped (``Subscript``
+        bases drop their subscript) and resolved through the candidate
+        file's imports; a candidate is a subtype iff at least one of its
+        resolved bases points at ``(path, qualified_name)``. Resolution
+        of bases follows the same rules as :meth:`type_hierarchy_supertypes`:
+        bare ``Name`` resolves in the candidate's module, ``Name.attr``
+        resolves the LHS to a workspace module then ``attr`` inside it,
+        deeper attribute chains are skipped. Duplicates by
+        ``(path, qualified_name)`` are collapsed, and the result is
+        sorted by ``(path, qualified_name)``.
+
+        Only direct subtypes are returned; LSP clients drill down by
+        calling ``typeHierarchy/subtypes`` recursively on each result.
+        Returns ``()`` when the target itself is not a workspace class.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                return ()
+            target_node = _find_callable_node(tree, qualified_name)
+            if target_node is None or not isinstance(target_node, ast.ClassDef):
+                return ()
+
+            workspace = self._remap_workspace_analysis(
+                workspace_analysis(self.db, self.mirror_root)
+            )
+            target_key = (real_path, qualified_name)
+            seen: set[tuple[str, str]] = set()
+            items: list[TypeHierarchyItem] = []
+
+            for module in workspace.modules:
+                candidate_real_path = module.path
+                candidate_mirror = self._mirror_path_for_real(candidate_real_path)
+                if (
+                    not candidate_mirror.exists()
+                    or candidate_mirror.suffix != ".py"
+                ):
+                    continue
+                candidate_source = self.source_text(candidate_real_path)
+                if candidate_source is None:
+                    continue
+                try:
+                    candidate_tree = ast.parse(candidate_source)
+                except SyntaxError:
+                    continue
+                candidate_table: ModuleSymbolTable | None = None
+                for class_qname, class_node in _walk_class_definitions(candidate_tree):
+                    candidate_key = (candidate_real_path, class_qname)
+                    if candidate_key == target_key or candidate_key in seen:
+                        continue
+                    is_subtype = False
+                    for base in class_node.bases:
+                        base_target = _unwrap_base_expression(base)
+                        if base_target is None:
+                            continue
+                        base_resolved = self._resolve_class_target(
+                            candidate_mirror, base_target
+                        )
+                        if base_resolved is None:
+                            continue
+                        if (
+                            base_resolved.resolution == "workspace"
+                            and base_resolved.defining_path == real_path
+                            and base_resolved.qualified_name == qualified_name
+                        ):
+                            is_subtype = True
+                            break
+                    if not is_subtype:
+                        continue
+                    if candidate_table is None:
+                        candidate_table = self._remap_module_symbol_table(
+                            module_symbol_table(
+                                self.db,
+                                self.mirror_root,
+                                str(candidate_mirror),
+                            )
+                        )
+                    item = self._build_type_hierarchy_item(
+                        candidate_real_path,
+                        class_qname,
+                        candidate_table.module,
+                    )
+                    if item is None:
+                        continue
+                    seen.add(candidate_key)
+                    items.append(item)
+
+            items.sort(key=lambda hi: (hi.path, hi.qualified_name))
+            return tuple(items)
+
+    def _resolve_class_target(
+        self,
+        caller_mirror_path: Path,
+        target: tuple[str, ...],
+    ) -> ResolvedSymbol | None:
+        """Resolve a ``("name", X)`` or ``("attr", L, A)`` ref to a class.
+
+        ``("name", X)`` looks ``X`` up in ``caller_mirror_path``'s module
+        imports. ``("attr", L, A)`` resolves ``L`` to a workspace module
+        and then ``A`` inside that module. The resolved symbol is mapped
+        back from the mirror to the real workspace before being returned.
+        Mirrors :meth:`_resolve_call_target`'s shape — kept separate so
+        the two resolvers can diverge without coupling.
+        """
+        if target[0] == "name":
+            return self._remap_resolved_symbol(
+                resolve_symbol(
+                    self.db,
+                    self.mirror_root,
+                    str(caller_mirror_path),
+                    target[1],
+                )
+            )
+        # ("attr", lhs_name, attr_name)
+        lhs_resolved = self._remap_resolved_symbol(
+            resolve_symbol(
+                self.db, self.mirror_root, str(caller_mirror_path), target[1]
+            )
+        )
+        if (
+            lhs_resolved.resolution != "workspace"
+            or lhs_resolved.defining_path is None
+        ):
+            return None
+        lhs_mirror = self._mirror_path_for_real(lhs_resolved.defining_path)
+        if not lhs_mirror.exists() or lhs_mirror.suffix != ".py":
+            return None
+        return self._remap_resolved_symbol(
+            resolve_symbol(self.db, self.mirror_root, str(lhs_mirror), target[2])
+        )
+
+    def _build_type_hierarchy_item(
+        self,
+        real_path: str,
+        qualified_name: str,
+        module_name: str | None,
+    ) -> TypeHierarchyItem | None:
+        source = self.source_text(real_path)
+        if source is None:
+            return None
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return None
+        node = _find_callable_node(tree, qualified_name)
+        if node is None or not isinstance(node, ast.ClassDef):
+            return None
+        if node.decorator_list:
+            range_start_line = (
+                min(dec.lineno for dec in node.decorator_list) - 1
+            )
+            range_start_col = min(
+                dec.col_offset for dec in node.decorator_list
+            )
+        else:
+            range_start_line = node.lineno - 1
+            range_start_col = node.col_offset
+        range_end_line = (node.end_lineno or node.lineno) - 1
+        range_end_col = node.end_col_offset or 0
+
+        bare_name = qualified_name.rsplit(".", 1)[-1]
+        located = self._locate_def_class_name_offsets(
+            real_path, node.lineno, bare_name
+        )
+        if located is None:
+            return None
+        selection_start_col, selection_end_col = located
+        selection_line = node.lineno - 1
+
+        return TypeHierarchyItem(
+            name=bare_name,
+            kind="class",
+            path=real_path,
+            qualified_name=qualified_name,
+            detail=module_name,
+            range_start_line=range_start_line,
+            range_start_character=range_start_col,
+            range_end_line=range_end_line,
+            range_end_character=range_end_col,
+            selection_start_line=selection_line,
+            selection_start_character=selection_start_col,
+            selection_end_line=selection_line,
+            selection_end_character=selection_end_col,
+        )
 
     def _resolve_call_target(
         self,

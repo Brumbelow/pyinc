@@ -24,6 +24,7 @@ from pyinc_tools.session import (
     SelectionRange,
     SemanticToken,
     TypeDefinitionLocation,
+    TypeHierarchyItem,
     WorkspaceSession,
 )
 
@@ -4374,6 +4375,544 @@ def test_call_hierarchy_dataclass_exports_are_re_exported_from_pyinc_tools() -> 
     out = CallHierarchyOutgoingCall(callee=item, call_sites=(site,))
     assert inc.caller is item
     assert out.callee is item
+
+
+# ---------------------------------------------------------------------------
+# Type hierarchy
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_type_hierarchy_on_class_returns_class_item(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Base:\n    pass\n")
+    app = root / "app.py"
+    _write(app, "from base import Base\n\nclass Child(Base):\n    pass\n")
+
+    with WorkspaceSession(root) as session:
+        # Cursor on `Base` inside `class Child(Base)`.
+        items = session.prepare_type_hierarchy(
+            app, 2, len("class Child(")
+        )
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.name == "Base"
+    assert item.kind == "class"
+    assert item.qualified_name == "Base"
+    assert item.path == str(base)
+    assert item.detail == "base"
+    # selectionRange spans the bare class name on the header line.
+    assert item.selection_start_line == 0
+    assert item.selection_start_character == len("class ")
+    assert item.selection_end_character == len("class Base")
+    # range covers the whole class block.
+    assert item.range_start_line == 0
+    assert item.range_end_line == 1
+
+
+def test_prepare_type_hierarchy_on_function_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helper = root / "helper.py"
+    _write(helper, "def greet() -> str:\n    return 'hi'\n")
+    app = root / "app.py"
+    _write(app, "from helper import greet\n\nprint(greet())\n")
+
+    with WorkspaceSession(root) as session:
+        items = session.prepare_type_hierarchy(app, 2, len("print("))
+
+    assert items == ()
+
+
+def test_prepare_type_hierarchy_off_identifier_returns_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(app, "x = 1\n")
+    with WorkspaceSession(root) as session:
+        items = session.prepare_type_hierarchy(app, 0, 1)  # the "=" sign
+    assert items == ()
+
+
+def test_prepare_type_hierarchy_on_stdlib_target_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(app, "from collections import OrderedDict\n\nOrderedDict()\n")
+    with WorkspaceSession(root) as session:
+        # Cursor on `OrderedDict` at the call site — its definition lives in
+        # stdlib so the LSP refuses to surface an item.
+        items = session.prepare_type_hierarchy(app, 2, 0)
+    assert items == ()
+
+
+def test_prepare_type_hierarchy_decorated_class_range_includes_decorator(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(
+        base,
+        "from dataclasses import dataclass\n\n"
+        "@dataclass\n"
+        "class Decorated:\n"
+        "    pass\n",
+    )
+    app = root / "app.py"
+    _write(app, "from base import Decorated\n\nclass Child(Decorated):\n    pass\n")
+
+    with WorkspaceSession(root) as session:
+        items = session.prepare_type_hierarchy(
+            app, 2, len("class Child(")
+        )
+
+    assert len(items) == 1
+    item = items[0]
+    # Decorator is on line 2 (0-based) in base.py.
+    assert item.range_start_line == 2
+    # selectionRange is the bare-name span on the class header line.
+    assert item.selection_start_line == 3
+    assert item.selection_start_character == len("class ")
+    assert item.selection_end_character == len("class Decorated")
+
+
+def test_type_hierarchy_supertypes_resolves_single_base(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Base:\n    pass\n")
+    app = root / "app.py"
+    _write(app, "from base import Base\n\nclass Child(Base):\n    pass\n")
+
+    with WorkspaceSession(root) as session:
+        supers = session.type_hierarchy_supertypes(app, "Child")
+
+    assert len(supers) == 1
+    assert supers[0].name == "Base"
+    assert supers[0].qualified_name == "Base"
+    assert supers[0].path == str(base)
+
+
+def test_type_hierarchy_supertypes_resolves_multiple_bases_sorted(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Zebra:\n    pass\n\nclass Antelope:\n    pass\n")
+    app = root / "app.py"
+    _write(
+        app,
+        "from base import Zebra, Antelope\n"
+        "\n"
+        "class Hybrid(Zebra, Antelope):\n"
+        "    pass\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        supers = session.type_hierarchy_supertypes(app, "Hybrid")
+
+    # Sorted by (path, qualified_name): both bases live in base.py, so the
+    # result is alphabetical on qualified_name.
+    assert tuple(s.qualified_name for s in supers) == ("Antelope", "Zebra")
+
+
+def test_type_hierarchy_supertypes_unwraps_subscript_bases(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Container:\n    pass\n")
+    app = root / "app.py"
+    _write(
+        app,
+        "from base import Container\n"
+        "from typing import Generic, TypeVar\n"
+        "\n"
+        "T = TypeVar('T')\n"
+        "\n"
+        "class Mine(Container, Generic[T]):\n"
+        "    pass\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        supers = session.type_hierarchy_supertypes(app, "Mine")
+
+    # `Generic[T]` is stdlib; `Container` is the only workspace base. The
+    # subscript unwrap rule means `Base[T]` would still resolve — covered
+    # by the next test.
+    assert tuple(s.qualified_name for s in supers) == ("Container",)
+
+
+def test_type_hierarchy_supertypes_generic_workspace_base_via_subscript(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Box:\n    pass\n")
+    app = root / "app.py"
+    _write(
+        app,
+        "from base import Box\n"
+        "from typing import TypeVar\n"
+        "\n"
+        "T = TypeVar('T')\n"
+        "\n"
+        "class IntBox(Box[T]):\n"
+        "    pass\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        supers = session.type_hierarchy_supertypes(app, "IntBox")
+
+    # `Box[T]` unwraps to `Box`, which resolves to the workspace class.
+    assert tuple(s.qualified_name for s in supers) == ("Box",)
+
+
+def test_type_hierarchy_supertypes_resolves_attribute_base(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Base:\n    pass\n")
+    app = root / "app.py"
+    _write(app, "import base\n\nclass Child(base.Base):\n    pass\n")
+
+    with WorkspaceSession(root) as session:
+        supers = session.type_hierarchy_supertypes(app, "Child")
+
+    # `base.Base` — LHS is the bare `base` import alias, resolves to the
+    # workspace `base` module; `.Base` resolves to the workspace class.
+    assert len(supers) == 1
+    assert supers[0].qualified_name == "Base"
+
+
+def test_type_hierarchy_supertypes_skips_stdlib_and_installed_bases(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(
+        app,
+        "from collections import OrderedDict\n"
+        "\n"
+        "class Mine(OrderedDict):\n"
+        "    pass\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        supers = session.type_hierarchy_supertypes(app, "Mine")
+
+    # OrderedDict is stdlib — no workspace item to surface.
+    assert supers == ()
+
+
+def test_type_hierarchy_supertypes_deep_attribute_chain_skipped(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    pkg = root / "pkg"
+    pkg.mkdir()
+    _write(pkg / "__init__.py", "")
+    _write(pkg / "inner.py", "class Inner:\n    pass\n")
+    app = root / "app.py"
+    _write(app, "import pkg.inner\n\nclass Child(pkg.inner.Inner):\n    pass\n")
+
+    with WorkspaceSession(root) as session:
+        supers = session.type_hierarchy_supertypes(app, "Child")
+
+    # Deep attribute chain `pkg.inner.Inner` — LHS is itself an Attribute,
+    # not a bare Name, so the resolver intentionally skips it (matches
+    # `find_references` and `call_hierarchy_outgoing_calls` limits).
+    assert supers == ()
+
+
+def test_type_hierarchy_supertypes_on_non_class_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def greet() -> str:\n    return 'hi'\n")
+    with WorkspaceSession(root) as session:
+        supers = session.type_hierarchy_supertypes(target, "greet")
+    assert supers == ()
+
+
+def test_type_hierarchy_subtypes_finds_workspace_subclasses(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Base:\n    pass\n")
+    a = root / "a.py"
+    _write(a, "from base import Base\n\nclass A(Base):\n    pass\n")
+    b = root / "b.py"
+    _write(b, "import base\n\nclass B(base.Base):\n    pass\n")
+    unrelated = root / "unrelated.py"
+    _write(unrelated, "class Standalone:\n    pass\n")
+
+    with WorkspaceSession(root) as session:
+        subs = session.type_hierarchy_subtypes(base, "Base")
+
+    assert tuple((s.qualified_name, s.path) for s in subs) == (
+        ("A", str(a)),
+        ("B", str(b)),
+    )
+
+
+def test_type_hierarchy_subtypes_includes_nested_classes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Base:\n    pass\n")
+    app = root / "app.py"
+    _write(
+        app,
+        "from base import Base\n"
+        "\n"
+        "class Outer:\n"
+        "    class Inner(Base):\n"
+        "        pass\n",
+    )
+
+    with WorkspaceSession(root) as session:
+        subs = session.type_hierarchy_subtypes(base, "Base")
+
+    assert tuple(s.qualified_name for s in subs) == ("Outer.Inner",)
+
+
+def test_type_hierarchy_subtypes_excludes_self(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(
+        base,
+        "class Base:\n    pass\n\nclass Child(Base):\n    pass\n",
+    )
+    with WorkspaceSession(root) as session:
+        subs = session.type_hierarchy_subtypes(base, "Base")
+
+    # Base itself shouldn't appear among its own subtypes even though it's
+    # in the same file as Child.
+    assert tuple(s.qualified_name for s in subs) == ("Child",)
+
+
+def test_type_hierarchy_subtypes_on_non_class_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def greet() -> str:\n    return 'hi'\n")
+    with WorkspaceSession(root) as session:
+        subs = session.type_hierarchy_subtypes(target, "greet")
+    assert subs == ()
+
+
+def test_type_hierarchy_subtypes_no_subclasses_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Base:\n    pass\n")
+    with WorkspaceSession(root) as session:
+        subs = session.type_hierarchy_subtypes(base, "Base")
+    assert subs == ()
+
+
+def test_language_server_advertises_type_hierarchy_capability(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert init["capabilities"]["typeHierarchyProvider"] is True
+
+
+def test_language_server_prepare_type_hierarchy_returns_lsp_payload(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Base:\n    pass\n")
+    app = root / "app.py"
+    _write(app, "from base import Base\n\nclass Child(Base):\n    pass\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/prepareTypeHierarchy",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": 2, "character": len("class Child(")},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert isinstance(result, list)
+    assert len(result) == 1
+    item = result[0]
+    assert item["name"] == "Base"
+    assert item["kind"] == _LSP_SYMBOL_KIND_CLASS
+    assert item["uri"] == base.as_uri()
+    assert item["selectionRange"] == {
+        "start": {"line": 0, "character": len("class ")},
+        "end": {"line": 0, "character": len("class Base")},
+    }
+    assert item["data"] == {"path": str(base), "qualified_name": "Base"}
+
+
+def test_language_server_prepare_type_hierarchy_off_identifier_returns_null(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(app, "x = 1\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/prepareTypeHierarchy",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": 0, "character": 1},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is None
+
+
+def test_language_server_type_hierarchy_supertypes_subtypes_roundtrip(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    base = root / "base.py"
+    _write(base, "class Base:\n    pass\n")
+    app = root / "app.py"
+    _write(app, "from base import Base\n\nclass Child(Base):\n    pass\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        # Prepare on `Child` (the declaration itself).
+        prepared_child = server._handle_request(
+            "textDocument/prepareTypeHierarchy",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": 2, "character": len("class ")},
+            },
+        )
+        assert prepared_child is not None and len(prepared_child) == 1
+        supertypes = server._handle_request(
+            "typeHierarchy/supertypes", {"item": prepared_child[0]}
+        )
+        # Prepare on `Base` (declaration site in base.py).
+        prepared_base = server._handle_request(
+            "textDocument/prepareTypeHierarchy",
+            {
+                "textDocument": {"uri": base.as_uri()},
+                "position": {"line": 0, "character": len("class ")},
+            },
+        )
+        assert prepared_base is not None and len(prepared_base) == 1
+        subtypes = server._handle_request(
+            "typeHierarchy/subtypes", {"item": prepared_base[0]}
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert isinstance(supertypes, list)
+    assert len(supertypes) == 1
+    assert supertypes[0]["name"] == "Base"
+    assert supertypes[0]["uri"] == base.as_uri()
+    assert supertypes[0]["kind"] == _LSP_SYMBOL_KIND_CLASS
+
+    assert isinstance(subtypes, list)
+    assert len(subtypes) == 1
+    assert subtypes[0]["name"] == "Child"
+    assert subtypes[0]["uri"] == app.as_uri()
+    assert subtypes[0]["kind"] == _LSP_SYMBOL_KIND_CLASS
+
+
+def test_language_server_type_hierarchy_supertypes_missing_data_returns_null(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "typeHierarchy/supertypes",
+            {"item": {"name": "Foo", "kind": _LSP_SYMBOL_KIND_CLASS, "uri": (root / "x.py").as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is None
+
+
+def test_type_hierarchy_dataclass_exports_are_re_exported_from_pyinc_tools() -> None:
+    import pyinc_tools
+
+    for name in ("TypeHierarchyItem", "TypeHierarchyItemKind"):
+        assert hasattr(pyinc_tools, name), name
+    # Sanity-check we can construct a frozen item.
+    item = TypeHierarchyItem(
+        name="C",
+        kind="class",
+        path="/tmp/x.py",
+        qualified_name="C",
+        detail=None,
+        range_start_line=0,
+        range_start_character=0,
+        range_end_line=1,
+        range_end_character=0,
+        selection_start_line=0,
+        selection_start_character=len("class "),
+        selection_end_line=0,
+        selection_end_character=len("class C"),
+    )
+    assert item.kind == "class"
+    assert item.qualified_name == "C"
+
+
+def test_file_deletion_edit_re_exported_from_pyinc_tools() -> None:
+    # Regression: `FileDeletionEdit` was added to `pyinc_tools.session` but
+    # not added to `pyinc_tools.__init__`'s re-export list in the original
+    # PR; ensure it ships on the public surface.
+    import pyinc_tools
+
+    assert hasattr(pyinc_tools, "FileDeletionEdit")
 
 
 def test_semantic_tokens_emits_declarations_for_function_and_parameters(
