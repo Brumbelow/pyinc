@@ -129,6 +129,7 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     "workspaceSymbolProvider": true,
     "hoverProvider": true,
     "definitionProvider": true,
+    "declarationProvider": true,
     "typeDefinitionProvider": true,
     "referencesProvider": true,
     "documentHighlightProvider": true,
@@ -198,6 +199,7 @@ channels does not produce duplicate messages.
 | `workspace/symbol` | Case-insensitive substring filter over `workspace_symbol_index`. |
 | `textDocument/hover` | Markdown `def foo(x: int) -> int` / `class Foo` / `x: int`, plus a `*re-exported from*` line for import aliases. |
 | `textDocument/definition` | Single `Location` via `resolve_symbol`; follows cross-module re-exports bounded by `MAX_FOLLOW_DEPTH = 8`. |
+| `textDocument/declaration` | Single-entry `Location[]` pointing at the *binding statement* in the current file (distinct from `textDocument/definition`, which follows `import` / `from … import` chains through to the imported target's file). The cursor's identifier is looked up in the current file's `ModuleSymbolTable` (exact `qualified_name` match wins over a bare-name match against the last dotted component); the returned range spans the bare-name identifier on the matched `Symbol.lineno` line, located by a word-boundary scan. For workspace `function` / `class` / `variable` / `class_variable` / `method` symbols, the declaration coincides with the definition (the def/class/assignment line). For `import_alias` and `from_import_alias` symbols the declaration is the `import` / `from … import` statement in the current file, even when the import resolves to a stdlib / installed / missing target (so `import os` jumps to the import line where `definition` would return `[]`). Wildcard-import stubs are matched via the literal `*` entry in the symbol table, so a bare-name reference whose source is `from M import *` returns `[]` (the stub does not bind the bare name). Whitespace positions, unknown identifiers, and files outside the workspace return `[]`. |
 | `textDocument/typeDefinition` | `Location[]` pointing at the declared type of the symbol under the cursor. The cursor's identifier is resolved through the file's imports to its declaring `Symbol`; the symbol's annotation (variable / class-variable `annotation`, or function / method `signature.return_annotation`) is parsed as a Python expression and walked for `Name` and `Attribute(value=Name(...))` nodes, with each name re-resolved against the declaring module. Generics (`list[Foo]`), unions (`Foo \| Bar`), and qualified attribute types (`pkg.Foo`) all contribute one location per workspace-resolved type, deduplicated by `(path, lineno)`. Whole-string forward references (`x: "Foo"`) are unwrapped exactly once. Classes return their own definition location. Stdlib / installed / ambiguous type names (`int`, `list`, `typing.Optional`, etc.), import aliases, wildcard-import stubs, unannotated variables / functions, and non-workspace targets return `[]`. Attribute chains whose LHS is not a bare `Name` (`pkg.subpkg.Foo`) are skipped, matching `find_references`'s LHS-bare-Name limitation. |
 | `textDocument/references` | `Location[]` via `find_references`; honors `context.includeDeclaration`; per-occurrence `col_offset` / `end_col_offset` ranges so editors can highlight each match. Only workspace-resolved targets are indexed — stdlib / installed / ambiguous targets return `[]`. |
 | `textDocument/documentHighlight` | `DocumentHighlight[]` for the symbol under the cursor, scoped to the current file. The declaration site is reported with `kind: 3` (Write); other occurrences with `kind: 1` (Text). The synthetic `find_references` placeholder for `def`/`class` declarations is repaired to the real identifier offset, so editors highlight the actual name and not the line's first character. Cross-file references returned by `find_references` are filtered out — workspace-wide highlighting is `textDocument/references`'s job. Stdlib / installed / ambiguous targets return `[]`. |
@@ -294,6 +296,31 @@ Consequences:
 - Hover on local symbols.
 - Goto-definition, following `import` / `from X import Y` / single-level
   `from X import *` chains through `symbol_resolution.resolve_symbol`.
+- Goto-declaration, via `textDocument/declaration` (advertised as
+  `declarationProvider: true`). Returns the *binding statement* in the
+  current file for the symbol under the cursor — distinct from
+  `textDocument/definition`, which follows `import` / `from … import`
+  chains through to the imported target's file. The cursor's identifier
+  is looked up in the file's `ModuleSymbolTable` (exact `qualified_name`
+  match wins over a bare-name match against the last dotted component);
+  the returned range spans the bare-name identifier on the matched
+  `Symbol.lineno` line, located by a word-boundary scan. For workspace
+  `function` / `class` / `method` / `variable` / `class_variable`
+  symbols, the declaration coincides with the definition (the
+  def/class/assignment line). For `import_alias` and `from_import_alias`
+  symbols, the declaration is the `import` / `from … import` statement
+  in the current file, even when the import resolves to a stdlib /
+  installed / missing target — so clicking on `os` in a file that
+  imports it returns the `import os` line, where `definition` would
+  return `[]`. Wildcard-import stubs are matched via the literal `*`
+  entry in the symbol table; a bare-name reference whose source is
+  `from M import *` is not in the table as a bare name, so the
+  declaration returns `[]`. Unknown identifiers, whitespace cursor
+  positions, and files outside the workspace return `[]`. The consumer
+  entrypoint `WorkspaceSession.declaration_location_at(path,
+  qualified_name)` returns a `DeclarationLocation(path, lineno,
+  col_offset, end_col_offset)` dataclass (1-based `lineno`, 0-based
+  `col_offset` / `end_col_offset`) or `None` when no match is found.
 - Type definition, via `textDocument/typeDefinition` (advertised as
   `typeDefinitionProvider: true`). For the symbol under the cursor, the
   server resolves the identifier to its declaring `Symbol`, reads the
