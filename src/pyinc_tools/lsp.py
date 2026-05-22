@@ -428,6 +428,8 @@ class LanguageServer:
             return self._hover(params)
         if method == "textDocument/definition":
             return self._definition(params)
+        if method == "textDocument/declaration":
+            return self._declaration(params)
         if method == "textDocument/typeDefinition":
             return self._type_definition(params)
         if method == "textDocument/references":
@@ -583,6 +585,7 @@ class LanguageServer:
                 "workspaceSymbolProvider": True,
                 "hoverProvider": True,
                 "definitionProvider": True,
+                "declarationProvider": True,
                 "typeDefinitionProvider": True,
                 "referencesProvider": True,
                 "documentHighlightProvider": True,
@@ -763,6 +766,35 @@ class LanguageServer:
                 "range": {
                     "start": {"line": line_zero, "character": 0},
                     "end": {"line": line_zero, "character": 1},
+                },
+            }
+        ]
+
+    def _declaration(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        source = session.source_text(real_path)
+        if source is None:
+            return []
+        identifier = _identifier_at_position(source, line, character)
+        if identifier is None:
+            return []
+        try:
+            location = session.declaration_location_at(real_path, identifier)
+        except FileNotFoundError:
+            return []
+        if location is None:
+            return []
+        line_zero = max(location.lineno - 1, 0)
+        return [
+            {
+                "uri": _path_to_uri(location.path),
+                "range": {
+                    "start": {"line": line_zero, "character": location.col_offset},
+                    "end": {"line": line_zero, "character": location.end_col_offset},
                 },
             }
         ]

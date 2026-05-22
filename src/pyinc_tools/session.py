@@ -222,6 +222,30 @@ class TypeDefinitionLocation:
     end_col_offset: int
 
 
+@dataclass(frozen=True)
+class DeclarationLocation:
+    """Location where the identifier under the cursor is *declared* in the
+    current file.
+
+    Distinct from :class:`TypeDefinitionLocation` / ``textDocument/definition``:
+    ``definition`` follows ``import`` / ``from … import`` chains through to
+    the imported target's defining file, while ``declaration`` stops at the
+    binding statement in the current file. For workspace functions, classes,
+    and module-level variables the two coincide; for ``import_alias``,
+    ``from_import_alias``, and ``wildcard_import_stub`` symbols they differ.
+
+    All offsets are 1-based for ``lineno`` (matching ``Symbol.lineno`` and the
+    rest of the session API); ``col_offset`` / ``end_col_offset`` are 0-based
+    column positions, matching the rest of the session dataclasses. The LSP
+    layer subtracts 1 from ``lineno`` to produce the LSP 0-based shape.
+    """
+
+    path: str
+    lineno: int
+    col_offset: int
+    end_col_offset: int
+
+
 InlayHintKind = Literal["parameter", "type"]
 
 
@@ -2150,6 +2174,65 @@ class WorkspaceSession:
                 )
             return tuple(locations)
 
+    def declaration_location_at(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+    ) -> DeclarationLocation | None:
+        """Return the in-file declaration location of ``qualified_name``.
+
+        Looks up ``qualified_name`` in ``path``'s
+        :class:`ModuleSymbolTable` (an exact ``qualified_name`` match wins
+        over a bare-name match against the last dotted component) and
+        returns a :class:`DeclarationLocation` pointing at the binding
+        statement in ``path``. The location's ``col_offset`` /
+        ``end_col_offset`` span the bare-name identifier on the binding's
+        header line; if the identifier cannot be located on that line, the
+        offsets fall back to ``(0, 1)``.
+
+        Distinct from ``definition``: for an ``import_alias`` /
+        ``from_import_alias`` / ``wildcard_import_stub`` the declaration is
+        the ``import`` statement in the current file, while ``definition``
+        follows the import chain through to the resolved target's file.
+        For workspace functions, classes, and module-level variables the
+        two coincide.
+
+        Returns ``None`` when ``qualified_name`` is not found in ``path``'s
+        symbol table, when the file has not been mirrored, or when the
+        path is not a Python file.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            table = module_symbol_table(
+                self.db, self.mirror_root, str(mirror_path)
+            )
+            matched: Symbol | None = None
+            for symbol in table.symbols:
+                if symbol.qualified_name == qualified_name:
+                    matched = symbol
+                    break
+            if matched is None:
+                bare = qualified_name.rsplit(".", 1)[-1]
+                for symbol in table.symbols:
+                    if symbol.qualified_name.rsplit(".", 1)[-1] == bare:
+                        matched = symbol
+                        break
+            if matched is None:
+                return None
+            col_offset, end_col_offset = self._locate_symbol_name_offsets(
+                real_path, matched
+            )
+            return DeclarationLocation(
+                path=real_path,
+                lineno=matched.lineno,
+                col_offset=col_offset,
+                end_col_offset=end_col_offset,
+            )
+
     def prepare_call_hierarchy(
         self,
         path: str | os.PathLike[str],
@@ -3083,6 +3166,35 @@ class WorkspaceSession:
                 continue
             return symbol.qualified_name
         return None
+
+    def _locate_symbol_name_offsets(
+        self, real_path: str, symbol: Symbol
+    ) -> tuple[int, int]:
+        """Return ``(col_offset, end_col_offset)`` of ``symbol``'s bare name on
+        its header line.
+
+        Scans the file's line at ``symbol.lineno - 1`` for the first
+        word-boundary match of the bare-name component of
+        ``symbol.qualified_name``. Used to make declaration-style endpoints
+        report the actual identifier span rather than a column-0 placeholder.
+
+        Falls back to ``(0, 1)`` when the source is unreadable, the line is
+        out of range, or the bare name does not match on that line.
+        """
+        bare_name = symbol.qualified_name.rsplit(".", 1)[-1]
+        source = self.source_text(real_path)
+        if source is None:
+            return 0, 1
+        lines = source.splitlines()
+        line_idx = symbol.lineno - 1
+        if not (0 <= line_idx < len(lines)):
+            return 0, 1
+        line = lines[line_idx]
+        pattern = re.compile(rf"\b{re.escape(bare_name)}\b")
+        match = pattern.search(line)
+        if match is None:
+            return 0, 1
+        return match.start(), match.end()
 
     def _locate_def_class_name_offsets(
         self, real_path: str, lineno: int, bare_old: str

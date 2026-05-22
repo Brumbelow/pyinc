@@ -14,6 +14,7 @@ from pyinc_tools.session import (
     CallHierarchyItem,
     CallHierarchyOutgoingCall,
     CodeLens,
+    DeclarationLocation,
     DocumentLink,
     FileDeletionEdit,
     FileRenameEdit,
@@ -503,6 +504,369 @@ def test_language_server_hover_on_ambiguous_wildcard_returns_none(
             },
         )
         assert locations == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_advertises_declaration_provider(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        response = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        capabilities = response["capabilities"]
+        assert capabilities["declarationProvider"] is True
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_declaration_local_function_returns_def_line(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/declaration",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+        # For workspace functions, declaration coincides with definition: the
+        # def line. The range targets the bare-name `helper`.
+        assert len(locations) == 1
+        assert locations[0]["uri"] == target.as_uri()
+        assert locations[0]["range"]["start"]["line"] == 0
+        assert locations[0]["range"]["start"]["character"] == 4
+        assert locations[0]["range"]["end"]["character"] == 10
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_declaration_import_alias_points_at_import_line(
+    tmp_path: Path,
+) -> None:
+    # The point of `textDocument/declaration` vs `textDocument/definition`:
+    # the declaration of an import alias is the `import` statement itself,
+    # while the definition follows the import chain through to the imported
+    # module's file. For a stdlib import like `os`, definition returns []
+    # (stdlib targets are not surfaced), but declaration jumps to the
+    # `import os` line in the current file.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "import os\n\nos.getcwd()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        # Cursor on `os` in the body of the file.
+        decl = server._handle_request(
+            "textDocument/declaration",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+        defn = server._handle_request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+
+        assert len(decl) == 1
+        assert decl[0]["uri"] == target.as_uri()
+        assert decl[0]["range"]["start"]["line"] == 0  # `import os` line
+        # Range spans the bare `os` on the import line.
+        assert decl[0]["range"]["start"]["character"] == 7
+        assert decl[0]["range"]["end"]["character"] == 9
+
+        # `definition` does not surface a Location for stdlib targets, so the
+        # distinction is visible: declaration points at the import statement,
+        # definition is empty.
+        assert defn == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_declaration_from_import_alias_stops_at_from_line(
+    tmp_path: Path,
+) -> None:
+    # `from a import foo`: declaration is the `from … import …` line in the
+    # current file. `definition` follows the chain through to `a.py`. Both
+    # are useful and distinct.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "a.py"
+    consumer = root / "b.py"
+    _write(provider, "def foo() -> int:\n    return 1\n")
+    _write(consumer, "from a import foo\n\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        decl = server._handle_request(
+            "textDocument/declaration",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+        defn = server._handle_request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+
+        assert len(decl) == 1
+        assert decl[0]["uri"] == consumer.as_uri()  # current file
+        assert decl[0]["range"]["start"]["line"] == 0  # `from a import foo`
+        # The bare-name `foo` is at columns 14..17 on `from a import foo`.
+        assert decl[0]["range"]["start"]["character"] == 14
+        assert decl[0]["range"]["end"]["character"] == 17
+
+        # `definition` follows through to `a.py`.
+        assert len(defn) == 1
+        assert defn[0]["uri"] == provider.as_uri()
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_declaration_wildcard_stub_points_at_wildcard_line(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "provider.py", "def foo() -> int:\n    return 1\n")
+    consumer = root / "consumer.py"
+    _write(consumer, "from provider import *\n\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        # The local module_symbol_table only records a `wildcard_import_stub`
+        # for `*` — `foo` itself isn't a bare-name entry. So
+        # declaration_location_at falls through and returns None.
+        decl = server._handle_request(
+            "textDocument/declaration",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+        assert decl == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_declaration_on_unknown_identifier_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return xyz\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/declaration",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 1, "character": 12},
+            },
+        )
+        assert locations == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_declaration_on_whitespace_returns_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        # Whitespace position — no identifier under cursor.
+        locations = server._handle_request(
+            "textDocument/declaration",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 3},
+            },
+        )
+        assert locations == []
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_declaration_class_returns_class_line(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "class Box:\n    pass\n\nBox()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/declaration",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 3, "character": 1},
+            },
+        )
+        assert len(locations) == 1
+        assert locations[0]["uri"] == target.as_uri()
+        assert locations[0]["range"]["start"]["line"] == 0
+        # `Box` on the class header line spans columns 6..9.
+        assert locations[0]["range"]["start"]["character"] == 6
+        assert locations[0]["range"]["end"]["character"] == 9
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_declaration_import_with_alias_uses_alias_offsets(
+    tmp_path: Path,
+) -> None:
+    # `import os as my_os` — the bound name is `my_os`. Clicking on `my_os`
+    # should jump to the import line, and the range should span `my_os`,
+    # not the original module name `os`.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "import os as my_os\n\nmy_os.getcwd()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        locations = server._handle_request(
+            "textDocument/declaration",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 2, "character": 2},
+            },
+        )
+        assert len(locations) == 1
+        assert locations[0]["range"]["start"]["line"] == 0
+        # `my_os` on the import line spans columns 13..18.
+        assert locations[0]["range"]["start"]["character"] == 13
+        assert locations[0]["range"]["end"]["character"] == 18
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_workspace_session_declaration_location_at_returns_dataclass(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "import os\n\nos.getcwd()\n")
+
+    with WorkspaceSession(root) as session:
+        location = session.declaration_location_at(target, "os")
+
+    assert isinstance(location, DeclarationLocation)
+    assert location.path == str(target.resolve())
+    assert location.lineno == 1  # 1-based
+    assert location.col_offset == 7
+    assert location.end_col_offset == 9
+
+
+def test_workspace_session_declaration_location_at_unknown_returns_none(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n")
+
+    with WorkspaceSession(root) as session:
+        location = session.declaration_location_at(target, "nonexistent")
+
+    assert location is None
+
+
+def test_workspace_session_declaration_location_at_missing_file_raises(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "mod.py", "x = 1\n")
+    missing = root / "missing.py"
+
+    with WorkspaceSession(root) as session, pytest.raises(FileNotFoundError):
+        session.declaration_location_at(missing, "x")
+
+
+def test_language_server_declaration_overlay_sees_edit(tmp_path: Path) -> None:
+    # The overlay (editor buffer) reaches declaration just like definition.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        # Apply an overlay that introduces a new symbol `extra` on line 0.
+        server._handle_notification(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "contentChanges": [
+                    {
+                        "text": (
+                            "def extra() -> int:\n"
+                            "    return 2\n"
+                            "def helper() -> int:\n"
+                            "    return 1\n"
+                        )
+                    }
+                ],
+            },
+        )
+        locations = server._handle_request(
+            "textDocument/declaration",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+        assert len(locations) == 1
+        # Overlay declaration found at the new line 0 — disk is unchanged.
+        assert locations[0]["range"]["start"]["line"] == 0
+        assert locations[0]["range"]["start"]["character"] == 4
+        assert locations[0]["range"]["end"]["character"] == 9
     finally:
         if server._session is not None:
             server._session.close()

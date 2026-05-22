@@ -10,6 +10,46 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/declaration` in `pyinc-tools` LSP.** The server now
+  advertises `declarationProvider: true` and handles
+  `textDocument/declaration` requests, completing the goto-* family
+  (`definition`, `typeDefinition`, `references`, `declaration`). Returns a
+  single-entry `Location[]` pointing at the *binding statement* in the
+  current file for the symbol under the cursor.
+
+  This is **distinct** from `textDocument/definition`, which follows
+  `import` / `from … import` chains through to the imported target's
+  file. The cursor's identifier is looked up in the current file's
+  `ModuleSymbolTable` (exact `qualified_name` match wins over a bare-name
+  match against the last dotted component); the returned range spans the
+  bare-name identifier on the matched `Symbol.lineno` line, located by a
+  word-boundary scan. Behaviour by symbol kind:
+
+  - `function` / `class` / `method` / `variable` / `class_variable` — the
+    declaration coincides with the definition (the def/class/assignment
+    line), so `declaration` and `definition` return the same location.
+  - `import_alias` / `from_import_alias` — the declaration is the
+    `import` / `from … import` statement in the current file, even when
+    the import resolves to a stdlib / installed / missing target. For
+    example, clicking on `os` in a file that does `import os` returns the
+    `import os` line, where `definition` returns `[]` (stdlib targets
+    are not surfaced by the LSP).
+  - `wildcard_import_stub` — the local symbol table only records a literal
+    `*` entry, not the bare names brought in by the wildcard, so a
+    bare-name reference whose source is `from M import *` returns `[]`.
+
+  Unknown identifiers, whitespace cursor positions, and files outside the
+  workspace also return `[]`. New consumer-layer dataclass
+  `DeclarationLocation(path, lineno, col_offset, end_col_offset)`
+  (1-based `lineno`, 0-based `col_offset` / `end_col_offset` matching the
+  rest of the session dataclasses) and entrypoint
+  `WorkspaceSession.declaration_location_at(path, qualified_name) ->
+  DeclarationLocation | None` (thread-safe via the same `_state_lock`
+  used by every other public mutator). Lives entirely on top of the
+  stable `pyinc.integrations` public surface
+  (`module_symbol_table`) — no kernel contract change and no new
+  integration-layer surface.
+
 - **Type hierarchy in `pyinc-tools` LSP.** The server now advertises
   `typeHierarchyProvider: true` and implements three new requests:
 
