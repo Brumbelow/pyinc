@@ -1341,6 +1341,213 @@ def test_workspace_session_find_document_highlights_non_workspace_target(
         assert highlights == ()
 
 
+def test_language_server_advertises_linked_editing_range_provider(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "mod.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        assert init["capabilities"]["linkedEditingRangeProvider"] is True
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_linked_editing_range_returns_in_file_ranges(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def foo() -> int:\n"  # line 0 — declaration
+        "    return 1\n"  # line 1
+        "\n"  # line 2
+        "foo()\n"  # line 3 — call
+        "x = foo\n",  # line 4 — bare reference
+    )
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+
+        assert result["wordPattern"] == r"[A-Za-z_][A-Za-z0-9_]*"
+        ranges = result["ranges"]
+        # All three in-file occurrences (declaration name, call, bare ref).
+        by_line = {r["start"]["line"]: r for r in ranges}
+        assert set(by_line) == {0, 3, 4}
+        # The declaration range spans the real identifier, not the def keyword.
+        decl = by_line[0]
+        assert decl["start"]["character"] == len("def ")
+        assert decl["end"]["character"] == len("def ") + len("foo")
+        # Every mirrored range spans exactly the identifier (identical content).
+        source_lines = target.read_text().splitlines()
+        for editing_range in ranges:
+            text_line = source_lines[editing_range["start"]["line"]]
+            assert (
+                text_line[
+                    editing_range["start"]["character"] : editing_range["end"][
+                        "character"
+                    ]
+                ]
+                == "foo"
+            )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_linked_editing_range_excludes_other_files(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "a.py"
+    consumer = root / "b.py"
+    _write(provider, "def foo() -> int:\n    return 1\n")
+    _write(consumer, "from a import foo\n\nfoo()\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+
+        # Linked editing is in-file only — provider.py is filtered out. Use
+        # textDocument/rename for workspace-wide edits.
+        lines = sorted(r["start"]["line"] for r in result["ranges"])
+        assert lines == [2, 3]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_linked_editing_range_on_unknown_identifier_returns_none(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 3},  # cursor on `def`
+            },
+        )
+        assert result is None
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_linked_editing_range_on_stdlib_identifier_returns_none(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "consumer.py"
+    _write(consumer, "from json import JSONDecoder\n\nJSONDecoder()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 0},
+            },
+        )
+        assert result is None
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_linked_editing_range_overlay_sees_edit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        overlay_text = "def foo() -> int:\n    return 1\n\nfoo()\nfoo()\n"
+        server._handle_notification(
+            "textDocument/didOpen",
+            {"textDocument": {"uri": target.as_uri(), "text": overlay_text}},
+        )
+
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+        lines = sorted(r["start"]["line"] for r in result["ranges"])
+        assert lines == [0, 3, 4]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_workspace_session_linked_editing_ranges_at_returns_dataclasses(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        ranges = session.linked_editing_ranges_at(target, "foo")
+        assert {r.lineno for r in ranges} == {1, 4}
+        decl = next(r for r in ranges if r.lineno == 1)
+        assert decl.col_offset == len("def ")
+        assert decl.end_col_offset == len("def ") + len("foo")
+
+
+def test_workspace_session_linked_editing_ranges_at_non_workspace_target(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "consumer.py"
+    _write(consumer, "from json import JSONDecoder\n\nJSONDecoder()\n")
+
+    with WorkspaceSession(root) as session:
+        assert session.linked_editing_ranges_at(consumer, "JSONDecoder") == ()
+
+
 def test_type_checking_imports_visible_and_lsp_hover_works(tmp_path: Path) -> None:
     """``if TYPE_CHECKING:`` imports are walked into ``ModuleSymbolTable.symbols``
     so LSP hover and goto-definition work for any bare identifier that matches a

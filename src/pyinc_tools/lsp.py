@@ -71,6 +71,8 @@ _FOLDING_RANGE_KINDS = {
 _ID_START_RE = re.compile(r"[A-Za-z_]")
 _ID_CONT_RE = re.compile(r"[A-Za-z0-9_]")
 
+_LINKED_EDITING_WORD_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*"
+
 _LSP_REQUEST_FAILED = -32803
 
 
@@ -436,6 +438,8 @@ class LanguageServer:
             return self._references(params)
         if method == "textDocument/documentHighlight":
             return self._document_highlight(params)
+        if method == "textDocument/linkedEditingRange":
+            return self._linked_editing_range(params)
         if method == "textDocument/prepareRename":
             return self._prepare_rename(params)
         if method == "textDocument/rename":
@@ -589,6 +593,7 @@ class LanguageServer:
                 "typeDefinitionProvider": True,
                 "referencesProvider": True,
                 "documentHighlightProvider": True,
+                "linkedEditingRangeProvider": True,
                 "renameProvider": {"prepareProvider": True},
                 "signatureHelpProvider": {
                     "triggerCharacters": ["(", ","],
@@ -904,6 +909,41 @@ class LanguageServer:
             }
             for highlight in highlights
         ]
+
+    def _linked_editing_range(self, params: Any) -> dict[str, Any] | None:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        source = session.source_text(real_path)
+        if source is None:
+            return None
+        identifier = _identifier_at_position(source, line, character)
+        if identifier is None:
+            return None
+        try:
+            ranges = session.linked_editing_ranges_at(real_path, identifier)
+        except FileNotFoundError:
+            return None
+        if not ranges:
+            return None
+        return {
+            "ranges": [
+                {
+                    "start": {
+                        "line": max(editing_range.lineno - 1, 0),
+                        "character": editing_range.col_offset,
+                    },
+                    "end": {
+                        "line": max(editing_range.lineno - 1, 0),
+                        "character": editing_range.end_col_offset,
+                    },
+                }
+                for editing_range in ranges
+            ],
+            "wordPattern": _LINKED_EDITING_WORD_PATTERN,
+        }
 
     def _prepare_rename(self, params: Any) -> dict[str, Any] | None:
         session = self._require_session()

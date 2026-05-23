@@ -165,6 +165,13 @@ class DocumentHighlight:
 
 
 @dataclass(frozen=True)
+class LinkedEditingRange:
+    lineno: int
+    col_offset: int
+    end_col_offset: int
+
+
+@dataclass(frozen=True)
 class SignatureParameterInfo:
     label: str
     label_offset_start: int
@@ -1737,6 +1744,21 @@ class WorkspaceSession:
                 )
             highlights.sort(key=lambda h: (h.lineno, h.col_offset))
             return tuple(highlights)
+
+    def linked_editing_ranges_at(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+    ) -> tuple[LinkedEditingRange, ...]:
+        highlights = self.find_document_highlights(path, qualified_name)
+        return tuple(
+            LinkedEditingRange(
+                lineno=highlight.lineno,
+                col_offset=highlight.col_offset,
+                end_col_offset=highlight.end_col_offset,
+            )
+            for highlight in highlights
+        )
 
     def signature_help_at(
         self,

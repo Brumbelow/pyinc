@@ -10,6 +10,38 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **`textDocument/linkedEditingRange` in `pyinc-tools` LSP.** The server
+  now advertises `linkedEditingRangeProvider: true` and handles
+  `textDocument/linkedEditingRange` requests. For the symbol under the
+  cursor it returns the set of ranges in the *current file* that an editor
+  should mirror as the user types (so editing one updates them all live),
+  together with a `wordPattern` of `[A-Za-z_][A-Za-z0-9_]*` that tells the
+  client to stop mirroring once the typed text is no longer a Python
+  identifier.
+
+  The mirrored range set is exactly the file-scoped occurrences that
+  `textDocument/documentHighlight` already reports — the declaration name
+  span (repaired off the synthetic `def` / `class` placeholder that
+  `find_references` emits) plus every verified bare-name and
+  rightmost-attribute reference — so all ranges cover the same bare
+  identifier and are safe to edit simultaneously. This is **in-file only**
+  and intentionally lighter than `textDocument/rename`: it never touches
+  other files, so workspace-wide renames still go through `rename`. Unknown
+  identifiers, whitespace cursor positions, non-workspace targets (stdlib /
+  installed / ambiguous / missing), and files outside the workspace return
+  `null`.
+
+  New consumer-layer dataclass `LinkedEditingRange(lineno, col_offset,
+  end_col_offset)` (1-based `lineno`, 0-based `col_offset` /
+  `end_col_offset`, matching the rest of the session dataclasses) and
+  entrypoint `WorkspaceSession.linked_editing_ranges_at(path,
+  qualified_name) -> tuple[LinkedEditingRange, ...]` (thread-safe via the
+  same `_state_lock` used by every other public mutator, since it delegates
+  to `find_document_highlights`). Lives entirely on top of the stable
+  `pyinc.integrations` public surface (`find_references`) — no kernel
+  contract change and no new integration-layer surface. Limitations are
+  documented in `docs/pyinc-tools-guide.md`.
+
 - **`textDocument/declaration` in `pyinc-tools` LSP.** The server now
   advertises `declarationProvider: true` and handles
   `textDocument/declaration` requests, completing the goto-* family

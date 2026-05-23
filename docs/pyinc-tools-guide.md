@@ -372,6 +372,28 @@ Consequences:
   entrypoint `WorkspaceSession.find_document_highlights(path, qualified_name)`
   returns a tuple of `DocumentHighlight(lineno, col_offset, end_col_offset,
   kind)` dataclasses with `kind` typed as `Literal["text", "read", "write"]`.
+- Linked editing, via `textDocument/linkedEditingRange` (advertised as
+  `linkedEditingRangeProvider: true`). Returns the set of ranges in the
+  current file that an editor should mirror while the user types — every
+  range has identical content, so editing one updates them all live. The
+  range set is exactly the file-scoped occurrences that
+  `textDocument/documentHighlight` reports for the symbol under the cursor
+  (declaration name span repaired off the `def` / `class` placeholder, plus
+  every verified bare-name / rightmost-attribute reference), so all spans
+  cover the same bare identifier. The response also carries a `wordPattern`
+  of `[A-Za-z_][A-Za-z0-9_]*` so the client stops mirroring the moment the
+  typed text stops being a Python identifier. This is in-file only and
+  intentionally lighter than `textDocument/rename`: it does not touch other
+  files, so workspace-wide renames still go through `rename`. Unknown
+  identifiers, whitespace cursor positions, non-workspace targets (stdlib /
+  installed / ambiguous / missing), and files outside the workspace return
+  `null`. The consumer entrypoint
+  `WorkspaceSession.linked_editing_ranges_at(path, qualified_name)` returns a
+  tuple of `LinkedEditingRange(lineno, col_offset, end_col_offset)`
+  dataclasses (1-based `lineno`, 0-based `col_offset` / `end_col_offset`).
+  Lives entirely on top of the stable `pyinc.integrations` public surface
+  (via `find_references`) — no kernel contract change and no new
+  integration-layer surface.
 - Threaded live polling via `PollingWorkspaceWatcher.start(...)`. LSP server
   starts one by default; opt out with `initializationOptions.pyinc.watcher.enabled=false`.
 - `if TYPE_CHECKING:` and `if typing.TYPE_CHECKING:` import blocks — the symbol
@@ -695,6 +717,20 @@ Consequences:
     multiple lines, are triple-quoted, contain escape sequences, or use
     implicit string concatenation are skipped (offset reconstruction would
     be ambiguous in those cases).
+- `linkedEditingRange` limitations:
+  - In-file scope only. The mirrored ranges cover occurrences in the
+    current document; cross-file references are deliberately omitted (use
+    `textDocument/rename` for a workspace-wide edit). This matches
+    `textDocument/documentHighlight`'s scoping, since the two share the
+    same range set.
+  - Inherits the `find_references` limitations above (attribute chains
+    whose LHS is itself an attribute, function-local shadowing, and the
+    multi-line / triple-quoted / escape-sequence / implicit-concatenation
+    forward-reference-string caveats). A range that `find_references`
+    cannot verify is not mirrored.
+  - Only workspace symbols are mirrored. Stdlib / installed / ambiguous /
+    missing targets return `null`, matching goto-definition's
+    classification.
 - `rename` limitations (in addition to the `find_references` limitations
   above, since rename is built on top of it):
   - Renaming via an `import ... as` alias is refused — e.g. clicking on
