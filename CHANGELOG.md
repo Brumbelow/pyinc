@@ -10,6 +10,36 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **Pull diagnostics (`textDocument/diagnostic` + `workspace/diagnostic`)
+  in `pyinc-tools` LSP.** The server now advertises a `diagnosticProvider`
+  (`{"identifier": "pyinc-tools", "interFileDependencies": true,
+  "workspaceDiagnostics": true}`) and implements the LSP 3.17 pull-diagnostic
+  model alongside the existing `textDocument/publishDiagnostics` push channel.
+
+  - `textDocument/diagnostic` runs `analyze_file` on the requested document
+    and returns a full report `{"kind": "full", "resultId", "items"}` whose
+    `items` are the same `Diagnostic` objects the push channel emits for that
+    file (codes `missing-import`, `ambiguous-import`, `undeclared-import`,
+    `unresolved-symbol`, `ambiguous-symbol`, plus `pyinc.python_source` parse
+    errors). A clean file returns an empty-`items` full report; a pull for a
+    URI outside the workspace returns an empty full report instead of
+    failing the request.
+  - `workspace/diagnostic` runs `analyze_workspace` once and returns
+    `{"items": [...]}` with one report per analyzed `.py` file (plus any
+    config / requirements file that carries dependency diagnostics), sorted
+    by path. Files that are now clean still receive an empty-`items` report
+    so clients can clear stale problems. `version` is always `null`.
+  - The pull channel is **stateless**: each `resultId` is a SHA-256 over the
+    file's diagnostic signatures, so when the client echoes a matching
+    `previousResultId` (or `previousResultIds: [{uri, value}]` for the
+    workspace request) the server answers with an `unchanged` report rather
+    than resending. No server-side per-document bookkeeping is added, so the
+    push and pull channels coexist without interference.
+
+  Lives entirely on top of the stable `pyinc.integrations` surface
+  (`analyze_file` / `analyze_workspace` already drive the push channel) — no
+  kernel contract change and no new integration-layer surface. Documented in
+  `docs/pyinc-tools-guide.md`.
 - **`textDocument/declaration` in `pyinc-tools` LSP.** The server now
   advertises `declarationProvider: true` and handles
   `textDocument/declaration` requests, completing the goto-* family

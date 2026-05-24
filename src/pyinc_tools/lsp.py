@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import re
 import sys
@@ -106,6 +107,19 @@ def _diagnostic_signature(diagnostic: dict[str, Any]) -> tuple[Any, ...]:
         diagnostic.get("code"),
         diagnostic.get("message"),
     )
+
+
+def _diagnostics_result_id(items: list[dict[str, Any]]) -> str:
+    """Content-addressed identifier for a diagnostic set.
+
+    Pure function of the diagnostic signatures, so an unchanged file yields a
+    stable id across pulls (and across processes — `hash()` is salted, so a
+    SHA-256 digest is used instead) and the server can answer with an
+    `unchanged` report when the client's `previousResultId` still matches.
+    """
+    signatures = [_diagnostic_signature(item) for item in items]
+    payload = json.dumps(signatures, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _identifier_span_at_position(
@@ -468,6 +482,10 @@ class LanguageServer:
             return self._semantic_tokens_full(params)
         if method == "textDocument/semanticTokens/range":
             return self._semantic_tokens_range(params)
+        if method == "textDocument/diagnostic":
+            return self._document_diagnostic(params)
+        if method == "workspace/diagnostic":
+            return self._workspace_diagnostic(params)
         if method == "workspace/willRenameFiles":
             return self._will_rename_files(params)
         if method == "workspace/willDeleteFiles":
@@ -547,6 +565,71 @@ class LanguageServer:
             self._published_signatures.pop(stale_path, None)
         self._published_paths = current_paths
 
+    def _document_diagnostic(self, params: Any) -> dict[str, Any]:
+        document = params["textDocument"]
+        previous_result_id = params.get("previousResultId")
+        try:
+            real_path = self._require_safe_path(document["uri"])
+        except ValueError:
+            # A pull for a document outside the workspace: report no problems
+            # rather than failing the request.
+            items: list[dict[str, Any]] = []
+        else:
+            result = self._require_session().analyze_file(real_path)
+            items = [
+                self._analysis_diagnostic_to_lsp(diagnostic)
+                for diagnostic in result.diagnostics
+            ]
+        result_id = _diagnostics_result_id(items)
+        if previous_result_id is not None and previous_result_id == result_id:
+            return {"kind": "unchanged", "resultId": result_id}
+        return {"kind": "full", "resultId": result_id, "items": items}
+
+    def _workspace_diagnostic(self, params: Any) -> dict[str, Any]:
+        previous_by_uri: dict[str, Any] = {}
+        for entry in params.get("previousResultIds") or []:
+            uri = entry.get("uri")
+            if uri is not None:
+                previous_by_uri[uri] = entry.get("value")
+
+        result = self._require_session().analyze_workspace()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for diagnostic in result.diagnostics:
+            grouped.setdefault(diagnostic.path, []).append(
+                self._analysis_diagnostic_to_lsp(diagnostic)
+            )
+        # Surface every analyzed file even when it is now clean, so a client
+        # that previously saw problems receives an empty report that clears
+        # them.
+        for file_result in result.files:
+            grouped.setdefault(file_result.path, [])
+
+        reports: list[dict[str, Any]] = []
+        for path in sorted(grouped):
+            items = grouped[path]
+            uri = _path_to_uri(path)
+            result_id = _diagnostics_result_id(items)
+            if previous_by_uri.get(uri) == result_id:
+                reports.append(
+                    {
+                        "kind": "unchanged",
+                        "uri": uri,
+                        "version": None,
+                        "resultId": result_id,
+                    }
+                )
+            else:
+                reports.append(
+                    {
+                        "kind": "full",
+                        "uri": uri,
+                        "version": None,
+                        "resultId": result_id,
+                        "items": items,
+                    }
+                )
+        return {"items": reports}
+
     def _initialize(self, params: Any) -> dict[str, Any]:
         root = self._workspace_root_from_params(params)
         self._teardown_session()
@@ -608,6 +691,11 @@ class LanguageServer:
                     },
                     "full": True,
                     "range": True,
+                },
+                "diagnosticProvider": {
+                    "identifier": "pyinc-tools",
+                    "interFileDependencies": True,
+                    "workspaceDiagnostics": True,
                 },
                 "workspace": {
                     "fileOperations": {

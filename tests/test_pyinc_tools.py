@@ -6501,3 +6501,182 @@ def test_language_server_will_delete_files_ignores_unsafe_uris(
         if server._session is not None:
             server._session.close()
     assert result is None
+
+
+def test_language_server_advertises_diagnostic_provider(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+    finally:
+        if server._session is not None:
+            server._session.close()
+    provider = init["capabilities"]["diagnosticProvider"]
+    assert provider["identifier"] == "pyinc-tools"
+    assert provider["interFileDependencies"] is True
+    assert provider["workspaceDiagnostics"] is True
+
+
+def test_language_server_document_diagnostic_returns_full_report(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "user.py", "import totally_unknown_module\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        report = server._handle_request(
+            "textDocument/diagnostic",
+            {"textDocument": {"uri": (root / "user.py").as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert report["kind"] == "full"
+    assert isinstance(report["resultId"], str) and report["resultId"]
+    codes = {item["code"] for item in report["items"]}
+    assert "missing-import" in codes
+
+
+def test_language_server_document_diagnostic_clean_file_is_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "ok.py", "x = 1\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        report = server._handle_request(
+            "textDocument/diagnostic",
+            {"textDocument": {"uri": (root / "ok.py").as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert report["kind"] == "full"
+    assert report["items"] == []
+
+
+def test_language_server_document_diagnostic_unchanged_when_result_id_matches(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "user.py", "import totally_unknown_module\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        uri = (root / "user.py").as_uri()
+        first = server._handle_request(
+            "textDocument/diagnostic", {"textDocument": {"uri": uri}}
+        )
+        second = server._handle_request(
+            "textDocument/diagnostic",
+            {
+                "textDocument": {"uri": uri},
+                "previousResultId": first["resultId"],
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert second["kind"] == "unchanged"
+    assert second["resultId"] == first["resultId"]
+
+
+def test_language_server_document_diagnostic_changes_after_edit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "user.py", "import totally_unknown_module\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        uri = (root / "user.py").as_uri()
+        first = server._handle_request(
+            "textDocument/diagnostic", {"textDocument": {"uri": uri}}
+        )
+        # Fix the import via an overlay; the stale result id must no longer match.
+        server._require_session().set_overlay(str(root / "user.py"), "x = 1\n")
+        second = server._handle_request(
+            "textDocument/diagnostic",
+            {
+                "textDocument": {"uri": uri},
+                "previousResultId": first["resultId"],
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert second["kind"] == "full"
+    assert second["items"] == []
+    assert second["resultId"] != first["resultId"]
+
+
+def test_language_server_document_diagnostic_unsafe_uri_is_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    outside = tmp_path / "outside.py"
+    _write(outside, "import totally_unknown_module\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        report = server._handle_request(
+            "textDocument/diagnostic",
+            {"textDocument": {"uri": outside.as_uri()}},
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert report["kind"] == "full"
+    assert report["items"] == []
+
+
+def test_language_server_workspace_diagnostic_reports_each_file(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "bad.py", "import totally_unknown_module\n")
+    _write(root / "ok.py", "x = 1\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        report = server._handle_request("workspace/diagnostic", {})
+    finally:
+        if server._session is not None:
+            server._session.close()
+    by_uri = {item["uri"]: item for item in report["items"]}
+    bad_uri = (root / "bad.py").as_uri()
+    ok_uri = (root / "ok.py").as_uri()
+    assert by_uri[bad_uri]["kind"] == "full"
+    assert any(
+        d["code"] == "missing-import" for d in by_uri[bad_uri]["items"]
+    )
+    # The clean file still gets a report (with no items) so clients can clear.
+    assert ok_uri in by_uri
+    assert by_uri[ok_uri]["items"] == []
+
+
+def test_language_server_workspace_diagnostic_unchanged_with_previous_ids(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "bad.py", "import totally_unknown_module\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        first = server._handle_request("workspace/diagnostic", {})
+        previous = [
+            {"uri": item["uri"], "value": item["resultId"]}
+            for item in first["items"]
+        ]
+        second = server._handle_request(
+            "workspace/diagnostic", {"previousResultIds": previous}
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert second["items"]
+    assert all(item["kind"] == "unchanged" for item in second["items"])
