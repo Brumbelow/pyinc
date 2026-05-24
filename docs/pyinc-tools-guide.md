@@ -152,6 +152,11 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
       "full": true,
       "range": true
     },
+    "diagnosticProvider": {
+      "identifier": "pyinc-tools",
+      "interFileDependencies": true,
+      "workspaceDiagnostics": true
+    },
     "workspace": {
       "fileOperations": {
         "willRename": {
@@ -220,6 +225,8 @@ channels does not produce duplicate messages.
 | `workspace/willRenameFiles` | `WorkspaceEdit` or `null`. For each `{oldUri, newUri}` pair the server walks every Python file in the workspace and emits text edits that update the `import` and `from` statements which reference the renamed file's module name. Three rewrite shapes: (1) `import <old_module> [as alias]` → the dotted-module span becomes `<new_module>` (the `as` clause is preserved); (2) `from <old_module> import …` → the dotted-module span (including any leading dots) is rewritten — the existing `level` is preserved when both old and new modules live under the same package anchor, otherwise the statement is rewritten to absolute form (`from <new_module> import …`, `level == 0`); (3) `from <pkg> import <leaf> [as alias]` where `<pkg>.<leaf> == old_module` and `old_module`/`new_module` share the same parent package → the leaf is rewritten to `new_module`'s leaf (`as` clause preserved). Renames are silently skipped when either path is outside the workspace, isn't a `.py` file, is `__init__.py` (package rename — separate feature), or yields the same module name; the request returns `null` when no edits are needed. Multiple renames in one request are batched against the *current* workspace state — no chaining is attempted. |
 | `workspace/willDeleteFiles` | `WorkspaceEdit` or `null`. For each `{uri}` entry the server walks every Python file in the workspace and emits text edits that remove the `import` and `from` statements which would become broken once the file is gone. Three deletion shapes: (1) `import <deleted_module> [as alias]` → the whole statement is removed (range spans the line including its trailing newline) when it's the only alias; otherwise only the dead alias plus its adjacent comma is removed (`import a, b` with `a` deleted → `import b`); (2) `from <deleted_module> import …` → the whole statement is removed (every imported name's source module is gone); (3) `from <pkg> import <leaf> [as alias]` where `<pkg>.<leaf> == deleted_module` → the whole statement is removed when it's the only imported name, else only the dead leaf plus its adjacent comma is removed. Deletions are silently skipped when the path is outside the workspace, isn't a `.py` file, or is `__init__.py` (package delete — separate feature); the request returns `null` when no edits are needed. Importers that are themselves part of the same delete batch are skipped (no point editing a file the client is about to remove). Multiple deletions in one request are batched against the *current* workspace state. |
 | `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
+| `textDocument/diagnostic` | Pull-model (LSP 3.17) single-document report. Runs `analyze_file` on the requested document and returns a `RelatedFullDocumentDiagnosticReport` (`{kind: "full", resultId, items}`) whose `items` are the same `Diagnostic` objects the push channel emits for that file (codes: `missing-import`, `ambiguous-import`, `undeclared-import`, `unresolved-symbol`, `ambiguous-symbol`, plus `python_source` parse errors). `resultId` is a SHA-256 over the diagnostic signatures, so when the client echoes a matching `previousResultId` the server replies `{kind: "unchanged", resultId}` instead of resending. A clean file returns a full report with `items: []`; a pull for a URI outside the workspace returns an empty full report rather than failing. |
+| `workspace/diagnostic` | Pull-model (LSP 3.17) workspace report. Runs `analyze_workspace` once and returns `{items: [...]}` with one report per analyzed `.py` file (plus any config / requirements file that carries dependency diagnostics), sorted by path. Each report is a `WorkspaceFullDocumentDiagnosticReport` (`{kind: "full", uri, version: null, resultId, items}`); files that are now clean still get an empty-`items` report so the client can clear stale problems. `version` is always `null` (the session tracks overlays, not LSP document versions). When the client supplies `previousResultIds` (`[{uri, value}]`), any file whose freshly computed `resultId` matches its previous value is returned as `{kind: "unchanged", uri, version: null, resultId}`. The pull channel is stateless — `resultId`s are pure functions of the current diagnostics, so it coexists with the push channel without extra bookkeeping. |
 
 ## Editor wiring
 
@@ -292,7 +299,12 @@ Consequences:
   `wildcard_import_stub`).
 - Workspace symbols with case-insensitive substring filter.
 - Diagnostics: syntax errors, unresolved imports, undeclared dependencies from
-  `dependency_check`.
+  `dependency_check`. Delivered over both the push channel
+  (`textDocument/publishDiagnostics`) and the LSP 3.17 pull channel
+  (`textDocument/diagnostic` + `workspace/diagnostic`, advertised via
+  `diagnosticProvider`). The pull channel is stateless: `resultId`s are a
+  SHA-256 over the diagnostic signatures, so an unchanged file answers with
+  an `unchanged` report when the client echoes its `previousResultId`.
 - Hover on local symbols.
 - Goto-definition, following `import` / `from X import Y` / single-level
   `from X import *` chains through `symbol_resolution.resolve_symbol`.
