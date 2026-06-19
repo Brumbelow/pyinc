@@ -343,7 +343,7 @@ def _satisfies_single(op: str, spec_version_str: str, version: _Version) -> bool
             return None
         if op not in ("==", "!="):
             return None  # Wildcards only valid with == and !=
-        prefix = _trim_trailing_zeros(spec_version.release)
+        prefix = spec_version.release
         installed_prefix = version.release[: len(prefix)]
         padded_prefix = prefix + (0,) * max(0, len(installed_prefix) - len(prefix))
         padded_installed = installed_prefix + (0,) * max(

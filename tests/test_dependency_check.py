@@ -201,6 +201,7 @@ def test_wildcard_specifier(
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     _make_dist_info(site_dir, "requests", "2.31.0", top_level="requests")
+    _make_dist_info(site_dir, "example", "1.0.5", top_level="example")
     _patch_site(monkeypatch, site_dir)
 
     db = Database(mode=mode)
@@ -218,6 +219,22 @@ def test_wildcard_specifier(
     )
     assert (
         dependency_check_analysis(db, ("requests!=2.*",)).statuses[0].status
+        == "version_mismatch"
+    )
+    assert (
+        dependency_check_analysis(db, ("example==1.0.*",)).statuses[0].status
+        == "satisfied"
+    )
+    assert (
+        dependency_check_analysis(db, ("example==1.1.*",)).statuses[0].status
+        == "version_mismatch"
+    )
+    assert (
+        dependency_check_analysis(db, ("example!=1.1.*",)).statuses[0].status
+        == "satisfied"
+    )
+    assert (
+        dependency_check_analysis(db, ("example!=1.0.*",)).statuses[0].status
         == "version_mismatch"
     )
 
