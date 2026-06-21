@@ -1,3 +1,4 @@
+from .action import Action, Output, ReconcileResult, action
 from .core import Input, query
 from .errors import (
     CycleError,
@@ -46,6 +47,7 @@ from .value import (
 )
 
 __all__ = [
+    "Action",
     "ArtifactStore",
     "CaptureInfo",
     "CycleError",
@@ -71,13 +73,16 @@ __all__ = [
     "MutationError",
     "ObserverCallback",
     "ObserverErrorHook",
+    "Output",
     "PyIncError",
     "QueryChangeEvent",
     "QueryProfile",
+    "ReconcileResult",
     "Subscription",
     "UnsupportedValueError",
     "UntrackedReadError",
     "ValueAdapter",
+    "action",
     "deserialize_snapshot",
     "explain_query_captures",
     "freeze",

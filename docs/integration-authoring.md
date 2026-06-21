@@ -217,3 +217,16 @@ A new integration needs:
 - [ ] Contract lock test verifies `__all__` and non-export of experimental helpers
 - [ ] Mode-parametrized correctness tests cover `strict`, `checked`, and `fast`
 - [ ] From-scratch consistency test compares incremental vs fresh over edit sequences
+
+### Canonical End-to-End Example: `calc`
+
+`examples/calc/` is a deliberately small consumer that exercises this whole
+pattern end to end: a single shared `FileResource`, a `@query(cutoff=...)` parse
+layer that backdates on comment/whitespace edits, cross-file dependency tracking
+via `include`, per-name incremental evaluation (each `binding_expr` backdates so
+unaffected `evaluate_name` nodes are reused), structural cycle detection that
+avoids relying on the kernel's `CycleError`, and reconciliation of the emitted
+results to disk through the [`@action` layer](action-contract.md). It is the
+recommended worked example to read alongside `python_source` when authoring a
+new query graph or a file→file compiler. See `tests/test_calc.py` for the
+incremental, provenance, and from-scratch assertions.

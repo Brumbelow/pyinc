@@ -10,6 +10,68 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **Declared-output reconciliation layer (`@action`).** A new, domain-agnostic
+  kernel surface for turning query-derived *desired* artifacts into files on
+  disk without leaking side effects into queries. `Output(path, content)` is
+  snapshot-safe, so a `tuple[Output, ...]` can be a `@query` return and
+  participate in caching/backdating; `@action(tool=...)` wraps a pure
+  `(db, *args) -> Iterable[Output]` function, and `Action.reconcile(...)` /
+  `Action.plan(...)` apply it to the filesystem:
+
+  - writes only outputs whose on-disk bytes differ from the desired bytes
+    (the same content-hash rule repairs out-of-band edits to generated files);
+  - deletes outputs the action previously owned but no longer declares, using a
+    per-`tool` JSON ownership ledger so files the action did not write are never
+    touched;
+  - writes atomically (temp file + `os.replace`) and skips the manifest write
+    when nothing changed, so a no-op reconcile performs zero filesystem writes;
+  - supports a dry-run `plan` that reports `written` / `deleted` / `unchanged`
+    without touching disk.
+
+  Reconciliation runs at top level only and does **not** change query semantics,
+  the value membrane, untracked-read enforcement, or the modes. The kernel's
+  from-scratch guarantee lifts to the filesystem (incremental reconciles == a
+  fresh run into an empty directory). Exported from `pyinc` as `Output`,
+  `ReconcileResult`, `Action`, and `action`; documented in
+  `docs/action-contract.md`. Runnable examples:
+  `examples/action_reconcile_demo.py` and the end-to-end include-aware `calc`
+  fixture (`examples/calc/`, `examples/calc_demo.py`), the canonical worked
+  example for a query graph that reconciles outputs to disk.
+- **`pyinc_codegen` — JSON-Schema → typed-Python compiler.** A new consumer
+  package (`src/pyinc_codegen/`), the first useful file→file compiler built on
+  pyinc. It reads a JSON Schema and generates one typed model and one doc file
+  per definition plus an aggregate `__init__.py`, emitted through the `@action`
+  layer so only changed artifacts are written.
+
+  - Supported subset: local documents; `$defs` and legacy `definitions`; local
+    `$ref`; object `properties`; `required` vs optional; arrays; primitives;
+    `enum`; nullable unions; `description` (docs only); deterministic
+    diagnostics for unsupported constructs.
+  - Decomposed for output-granular incrementality: whitespace/key-reorder edits
+    backdate (zero writes); a description-only edit rewrites only the doc; a
+    property type/requiredness change rewrites the affected model and its
+    reference-graph closure (each rewritten only if its bytes change); adding or
+    removing a definition touches only that definition's files plus the index.
+  - Stdlib-only (JSON parsed with `json` + dict walking) and built on pyinc's
+    **public API only** — no JSON-Schema concept lives in `src/pyinc`. Public
+    surface: `generate`, `generate_outputs`, `schema_analysis`, and the
+    `SchemaModel` / `FieldModel` / `Diagnostic` / `SchemaAnalysis` result types.
+    Sample schema and runnable demo in `examples/`; documented in
+    `docs/codegen-guide.md`.
+- **Benchmark + correctness harness (`bench/`).** A reproducible harness (not
+  shipped in the wheel) exercising four targets — synthetic kernel query
+  graphs, the calc fixture, JSON-Schema codegen, and action reconciliation —
+  across a canonical edit sequence (cold, unchanged, unreferenced edit,
+  comment-only edit, localized edit, high-fan-out shared edit, removed
+  artifact, tampered output, checkpoint restore). It compares pyinc against
+  full recomputation, a naive per-key cache, and `joblib.Memory`, recording
+  wall-time, peak memory, dependency-graph size, and cache size, and emits a
+  CSV + markdown report under `bench/results/`. Every scenario pairs its timing
+  with a correctness assertion that pyinc's incremental output equals a fresh,
+  cache-free run; the tampered-output scenarios drive the real action reconcile
+  path. `joblib` is a new `bench` optional-dependency group, imported lazily and
+  never by `src/pyinc` or `src/pyinc_codegen`. Run with
+  `PYTHONPATH=src python -m bench.run`.
 - **Pull diagnostics (`textDocument/diagnostic` + `workspace/diagnostic`)
   in `pyinc-tools` LSP.** The server now advertises a `diagnosticProvider`
   (`{"identifier": "pyinc-tools", "interFileDependencies": true,

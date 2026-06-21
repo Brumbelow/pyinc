@@ -55,6 +55,7 @@ Cross-run cache reuse ships in v2.0.0 via `Database.save_checkpoint(store=None) 
 - push observers via `Database.observe(callback, query, *args, **kwargs)` returning a `Subscription`, with `QueryChangeEvent` payloads *(added in the v2 development cycle)*
 - mutable graph support via `FrozenGraph` / `FrozenRef` and the byte-stable `serialize_snapshot` / `deserialize_snapshot` helpers *(v2.0.0)*
 - content-addressed artifact storage via `ArtifactStore`, `InMemoryArtifactStore`, `FileSystemArtifactStore`, and `Database(store=...)`, plus the durable checkpoint API `Database.save_checkpoint(store=None)` / `Database.load_checkpoint(key, store=None)` for cross-run cache reuse *(v2.0.0)*
+- declared-output reconciliation via the `@action` layer (`Output`, `ReconcileResult`, `Action.reconcile`/`plan`): queries derive *desired* artifacts; a separate action reconciles them with the filesystem (atomic writes, content-hash change/tamper detection, ownership-ledger orphan deletion, dry-run). It is domain-agnostic and adds no query-side semantics; see [action-contract.md](action-contract.md) *(v2 development cycle)*
 
 `pyinc.integrations` exposes the stable dataclass/result types and high-level entrypoints from the shipped integrations:
 
@@ -74,7 +75,7 @@ Cross-run cache reuse ships in v2.0.0 via `Database.save_checkpoint(store=None) 
 
 Low-level payload queries, decode helpers, and resource helpers remain module-local experimental helpers. The public integration boundary is the dataclass/result layer plus the documented high-level entrypoints in `docs/integration-contract.md`.
 
-The repository also includes small examples under `examples/`, dedicated tests for kernel semantics and from-scratch consistency, and a separate consumer tooling layer under `pyinc_tools` for editor/watcher-facing behavior built on top of the stable kernel.
+The repository also includes small examples under `examples/`, dedicated tests for kernel semantics and from-scratch consistency, and two separate consumer layers built on top of the stable kernel: `pyinc_tools` for editor/watcher-facing behavior, and `pyinc_codegen`, a JSON-Schema → typed-Python compiler. `pyinc_codegen` consumes only the public surface (`@query`, `FileResource`, and the `@action`/`Output` reconciliation layer) and demonstrates dependency-decomposed file→file code generation; like `pyinc_tools` it must not widen `src/pyinc`'s semver contract, and no JSON-Schema-specific concept lives in the kernel. The include-aware `calc` fixture under `examples/calc/` is the canonical worked example of a small query graph that reconciles outputs to disk. A reproducible benchmark + correctness harness lives under `bench/` (not shipped in the wheel); it exercises the kernel, calc, codegen, and action targets across a canonical edit sequence and pairs every timing with an incremental-equals-fresh correctness assertion. Its only comparison dependency, `joblib`, sits in the `bench` optional-dependency group and is never imported by `src/pyinc` or `src/pyinc_codegen`.
 
 ## Cross-Integration Composition
 

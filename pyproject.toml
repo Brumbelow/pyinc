@@ -41,9 +41,14 @@ dev = [
   "pytest-cov>=5.0",
   "ruff>=0.4",
 ]
+# Benchmark-only comparison dependencies. Never imported by src/pyinc or
+# src/pyinc_codegen — used only by the bench/ harness.
+bench = [
+  "joblib>=1.3",
+]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pyinc", "src/pyinc_tools"]
+packages = ["src/pyinc", "src/pyinc_codegen", "src/pyinc_tools"]
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -64,6 +69,7 @@ addopts = "-q --tb=no"
 
 [tool.mypy]
 python_version = "3.11"
+mypy_path = ["examples"]
 warn_return_any = true
 strict = true
 disallow_untyped_defs = true
@@ -75,6 +81,14 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 warn_unused_configs = true
 files = ["src", "tests"]
+
+# bench/ is a benchmark harness, not shipped and not part of the gate paths
+# (`mypy src tests`). The smoke test imports it, so silence it here rather than
+# type-checking it strictly.
+[[tool.mypy.overrides]]
+module = ["bench", "bench.*"]
+ignore_missing_imports = true
+ignore_errors = true
 
 [tool.ruff]
 line-length = 100

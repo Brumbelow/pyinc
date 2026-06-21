@@ -69,7 +69,9 @@ See `examples/correctness_demo.py` for a walkthrough of backdating, mutation
 protection, untracked-read enforcement, and provenance inspection. The
 `examples/` directory also contains focused scripts for the push-observer
 and artifact-store APIs, the mutable-graph boundary, the cross-run checkpoint
-API, the Jupyter notebook integration, and several shipped integrations.
+API, the Jupyter notebook integration, the declared-output reconciliation
+layer (`action_reconcile_demo.py`), the end-to-end include-aware `calc`
+fixture (`calc_demo.py`, `examples/calc/`), and several shipped integrations.
 
 ## What pyinc guarantees
 
@@ -136,6 +138,13 @@ explicit out-of-scope cases, and the documented escape hatches — is in
   every value crossing the membrane, keyed by its `fingerprint_snapshot`
   digest. `serialize_snapshot` and `deserialize_snapshot` expose the byte
   form to external callers and round-trip the full snapshot grammar.
+- Declared-output reconciliation via the `@action` layer. Queries derive
+  *desired* artifacts (`Output(path, content)`, snapshot-safe, so a
+  `tuple[Output, ...]` can be a query return); a separate `@action`
+  reconciles them with the filesystem — atomic writes, content-hash
+  change/tamper detection, ownership-ledger orphan deletion, and a dry-run
+  `plan`. Side effects never enter a query. See
+  [docs/action-contract.md](docs/action-contract.md).
 - `Database` is thread-safe for concurrent use across instances and on a
   single shared instance. The ambient-read guard is installed once globally
   and dispatches per-context, so threads inside queries on different
@@ -252,6 +261,50 @@ surface:
 See [docs/pyinc-tools-guide.md](docs/pyinc-tools-guide.md) for install,
 editor wiring, the overlay model, and the supported-vs.-not-yet feature
 table.
+
+## Code generation
+
+`pyinc_codegen` is a reference consumer that compiles a JSON Schema document
+into typed Python models — one model and one doc file per definition plus an
+aggregate `__init__.py` — emitted through the `@action` reconciliation layer so
+only the artifacts whose content changed are rewritten. It is stdlib-only
+(JSON Schema parsed with `json` plus dict walking) and builds on pyinc's public
+API only.
+
+```python
+from pyinc import Database
+from pyinc_codegen import generate
+
+generate(Database(mode="strict"), "schema.json", "generated/")
+```
+
+Editing whitespace rewrites nothing; a description-only edit rewrites only the
+doc file; a property change rewrites the affected model (and its reference-graph
+dependents only when their output changes); adding or removing a definition
+touches only that definition's files plus the aggregate index. See
+[docs/codegen-guide.md](docs/codegen-guide.md).
+
+## Benchmarks
+
+`bench/` is a reproducible benchmark + correctness harness (not shipped in the
+wheel). It exercises four targets — synthetic kernel query graphs, the
+calc-with-includes fixture, JSON-Schema code generation, and action
+reconciliation — across a canonical edit sequence (cold, unchanged,
+unreferenced edit, comment-only edit, localized edit, high-fan-out shared edit,
+removed artifact, tampered output, checkpoint restore), comparing pyinc against
+full recomputation, a naive per-key cache, and `joblib.Memory`. It records
+wall-time, peak memory, dependency-graph size, and cache size.
+
+No performance claim ships without its harness: **every scenario pairs its
+timing with a correctness assertion that pyinc's incremental output equals a
+fresh, cache-free run.** The report (CSV + markdown) is written to
+`bench/results/`; the naive cache is included precisely to show that a shortcut
+can be fast but stale where pyinc stays correct.
+
+```bash
+pip install -e '.[bench]'    # joblib is a bench-only optional dependency
+PYTHONPATH=src python -m bench.run
+```
 
 ## Development
 

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "Status": {
+      "type": "string",
+      "enum": ["active", "inactive", "pending"],
+      "description": "Lifecycle status of an account."
+    },
+    "Address": {
+      "type": "object",
+      "description": "A postal address.",
+      "properties": {
+        "street": { "type": "string", "description": "Street line." },
+        "city": { "type": "string" },
+        "zip": { "type": ["string", "null"], "description": "Optional postal code." }
+      },
+      "required": ["street", "city"]
+    },
+    "User": {
+      "type": "object",
+      "description": "An application user.",
+      "properties": {
+        "id": { "type": "integer", "description": "Unique identifier." },
+        "name": { "type": "string" },
+        "status": { "$ref": "#/$defs/Status" },
+        "address": { "$ref": "#/$defs/Address" },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["id", "name"]
+    }
+  }
+}
