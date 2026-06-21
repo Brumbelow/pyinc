@@ -198,6 +198,28 @@ fresh-database recomputation over a sequence of state changes. Reference:
 `test_workspace_analysis_matches_fresh_recomputation_over_changes` in
 `tests/test_python_source.py`.
 
+### File-Generating Integrations
+
+Some integrations generate files (e.g. `graphql_schema`, `detection_rules`). They
+must still obey the kernel rule that **queries never perform side effects** —
+including writes. The pattern:
+
+1. Payload/composition queries compute the *desired output bytes* and return them
+   as tuple payloads (e.g. `tuple[tuple[str, bytes], ...]` of relative-path /
+   content pairs). They never call `open(..., "w")`, `os.replace`, `mkdir`, or any
+   write — only `Resource`-tracked reads of their inputs.
+2. A non-`@query` entrypoint decodes the payload into a
+   `pyinc.actions.DesiredArtifactSet` (building `DesiredArtifact` values with an
+   explicit `ToolIdentity` / `ActionIdentity`).
+3. The caller reconciles that set to disk with a `pyinc.actions.FilesystemReconciler`
+   — **outside** any `db.get(...)` call. `apply()` is rejected if invoked during
+   query evaluation (`pyinc.is_query_active()`).
+
+Use distinct `@query(cutoff=...)` tokens to keep presentation-only edits from
+rippling into code outputs (e.g. a GraphQL `description`-only edit regenerates docs
+but not client code). See `docs/action-contract.md` for the reconciliation
+contract.
+
 ### Checklist
 
 A new integration needs:

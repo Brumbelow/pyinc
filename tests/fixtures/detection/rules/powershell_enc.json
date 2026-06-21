@@ -1,0 +1,24 @@
+{
+  "id": "powershell_enc",
+  "title": "PowerShell Encoded Command",
+  "description": "Detects encoded PowerShell command lines.",
+  "severity": "high",
+  "attack": [
+    "T1059.001"
+  ],
+  "references": [
+    "https://attack.mitre.org/techniques/T1059/001/"
+  ],
+  "detection": {
+    "all": [
+      {
+        "field": "process.name",
+        "op": "equals",
+        "value": "powershell.exe"
+      },
+      {
+        "macro": "encoded_command"
+      }
+    ]
+  }
+}

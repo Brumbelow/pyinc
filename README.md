@@ -196,10 +196,52 @@ dependency edges; no extra wiring is required.
   definitions for code cells; and cutoff-based backdating that ignores
   `outputs` and `execution_count`, so re-running cells does not invalidate
   downstream consumers.
+- `graphql_schema` — GraphQL introspection-JSON → incremental code/doc
+  generator built on the action layer: typed `models/<Type>.py`,
+  `operations/<field>.py` stubs, per-type `docs/`, and aggregate indexes.
+  Separate code-shape and doc-shape cutoffs mean a `description`-only edit
+  regenerates only the affected doc; generated Python is deterministic and
+  always parses. See `examples/graphql_codegen_demo.py`.
+- `detection_rules` — a small normalized JSON detection-rule format compiled to
+  per-backend queries (Splunk/Elastic/Sentinel-like), a normalized bundle,
+  coverage fragments + matrix, docs, and deterministic rule-test results, all via
+  the action layer. A rule depends only on the field mappings/macros it
+  references, so editing an unused mapping writes nothing. Public provenance names
+  the source rule, mappings/macros, and backend. Not Sigma/YARA-compliant; see
+  `docs/detection-content-format.md` and `examples/detection_compile_demo.py`.
 
 `pyinc.integrations` re-exports only the stable dataclass and result types
 and the high-level entrypoints. Low-level payload queries, decode helpers,
 and resource helpers remain experimental in their defining submodules.
+
+## Actions — turning computed values into files
+
+`pyinc.actions` is an additive, stdlib-only layer for integrations that
+*generate* files. Queries stay pure: they compute immutable **desired
+artifacts** (relative path + bytes), and a `FilesystemReconciler` reconciles
+them to disk **outside** query evaluation.
+
+```python
+from pyinc.actions import (
+    ActionIdentity, DesiredArtifact, DesiredArtifactSet,
+    FilesystemReconciler, ToolIdentity,
+)
+
+tool = ToolIdentity(name="my-codegen", version="1.0.0", schema_version=1)
+desired = DesiredArtifactSet(
+    ActionIdentity("my-codegen", output_root=str(out_dir), tool=tool),
+    (DesiredArtifact("client.py", b"# generated\n..."),),
+)
+rec = FilesystemReconciler(out_dir, state_dir=state_dir)
+result = rec.apply(desired)   # rejected if called inside a query
+```
+
+Reconciliation is content-driven (SHA-256 of real bytes, so identical reruns
+write nothing and tampered outputs are repaired), ownership-aware (stale deletion
+is limited to files a previous run owned; foreign files are never touched),
+atomic per file, and single-writer-locked. See
+[docs/action-contract.md](docs/action-contract.md) and
+`examples/action_reconcile_demo.py`.
 
 ## Verification
 
@@ -214,6 +256,25 @@ and resource helpers remain experimental in their defining submodules.
 
 The integration boundary is summarized in
 [docs/integration-contract.md](docs/integration-contract.md).
+
+## Benchmarks
+
+A reproducible benchmark + correctness harness lives in `bench/`:
+
+```bash
+python -m pip install -e '.[bench]'   # benchmark-only deps (joblib)
+python -m bench.run --output-dir bench/results
+```
+
+It exercises the kernel, the GraphQL generator, and the detection compiler across
+fixed scenarios (cold, warm, presentation-only edit, semantic edit, high-fan-out
+edit, output tamper + repair, checkpoint restore, full recompute). **Every timed
+incremental result is compared byte-for-byte against a fresh, cache-disabled
+`Database` run** — no timing is reported without a passing correctness check. It
+emits `bench/results/benchmark.csv` and a Markdown report generated from it, with
+environment metadata and explicit capability-difference notes. Timings are
+single-machine and are not universal speed claims; nothing under `src/pyinc`
+imports the benchmark-only `joblib` dependency.
 
 ## Diagnostics and escape hatches
 

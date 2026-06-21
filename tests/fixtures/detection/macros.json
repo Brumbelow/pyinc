@@ -1,0 +1,16 @@
+{
+  "encoded_command": {
+    "any": [
+      {
+        "field": "command_line",
+        "op": "contains",
+        "value": "-enc"
+      },
+      {
+        "field": "command_line",
+        "op": "contains",
+        "value": "-EncodedCommand"
+      }
+    ]
+  }
+}

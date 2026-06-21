@@ -1,0 +1,27 @@
+{
+  "id": "suspicious_child",
+  "title": "Suspicious Office Child Process",
+  "description": "Office app spawning a shell.",
+  "severity": "medium",
+  "attack": [
+    "T1059"
+  ],
+  "references": [],
+  "detection": {
+    "all": [
+      {
+        "field": "parent.name",
+        "op": "in",
+        "value": [
+          "winword.exe",
+          "excel.exe"
+        ]
+      },
+      {
+        "field": "process.name",
+        "op": "equals",
+        "value": "cmd.exe"
+      }
+    ]
+  }
+}

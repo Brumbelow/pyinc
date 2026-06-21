@@ -40,9 +40,22 @@ Stable public surface by module:
     `DependencyCheckAnalysis`
   - entrypoints: `dependency_check_analysis(db, declared_deps)`,
     `workspace_dependency_check(db, root, declared_deps)`
+- `detection_rules`
+  - result types: `DetectionRule`, `DetectionDiagnostic`, `DetectionAnalysis`,
+    `DetectionProvenance`
+  - entrypoints: `detection_analysis(db, root)`,
+    `detection_artifacts(db, root, output_root)`,
+    `generate_detections(db, root, output_root, *, state_dir=None)`,
+    `rule_provenance(db, root, rule_id, backend)`
 - `env_file`
   - result types: `EnvEntry`, `EnvFileAnalysis`
   - entrypoints: `env_analysis(db, path)`, `workspace_env_analysis(db, root)`
+- `graphql_schema`
+  - result types: `GraphQLArgument`, `GraphQLField`, `GraphQLEnumValue`,
+    `GraphQLType`, `GraphQLSchema`, `GraphQLDiagnostic`
+  - entrypoints: `graphql_analysis(db, path)`,
+    `graphql_artifacts(db, path, output_root)`,
+    `generate_graphql(db, path, output_root, *, state_dir=None)`
 - `xml_config`
   - result types: `XmlAttribute`, `XmlElement`, `XmlAnalysis`
   - entrypoints: `xml_analysis(db, path)`,
@@ -412,6 +425,90 @@ Out of scope for this integration:
 - nbformat schema validation
 - reading or writing alternate notebook formats (`.py` percent-format, `.Rmd`, etc.)
 - following imports inside code cells to workspace files (notebook cells have no on-disk file to attribute imports to; consumers wishing to chain into `python_source` should write a thin payload-cell-as-source layer themselves)
+
+## GraphQL Schema Integration Scope
+
+The `graphql_schema` integration reads a local GraphQL **introspection JSON**
+document (the standard `__schema` shape, optionally wrapped in `{"data": ...}`)
+via stdlib `json` and produces generated artifacts through the action layer
+(`pyinc.actions`). It performs no network access and runs no GraphQL engine.
+
+Supported introspection features:
+
+- type kinds: `SCALAR`, `OBJECT`, `INTERFACE`, `INPUT_OBJECT`, `ENUM`, `UNION`
+- type-reference wrappers `NON_NULL` and `LIST`, normalized to signatures like
+  `String!`, `[Post!]!`, `Role`
+- object/interface fields with arguments; input-object input fields; enum values;
+  union/interface `possibleTypes`; implemented interfaces
+- root `queryType` and `mutationType` fields → operation/probe stubs
+- descriptions on types, fields, arguments, and enum values (documentation only)
+
+Generated outputs (granular, under one output root):
+
+- `models/<Type>.py` — frozen-dataclass / `Enum` / `Union` / scalar-alias stubs
+  (built-in scalars `ID`/`String`/`Int`/`Float`/`Boolean` map to Python builtins
+  and get no model file)
+- `operations/<field>.py` — operation/probe stub per root query/mutation field
+- `docs/types/<Type>.md` — per-type documentation (includes descriptions)
+- aggregate `models/__init__.py` and `docs/index.md`
+
+Incremental semantics: a whitespace / key-order edit performs zero output writes;
+a `description`-only edit regenerates only the affected per-type doc (code and
+operation artifacts are not even re-rendered — they depend on a description-free
+*code-shape* model); a field/argument/nullability/return-type change regenerates
+the dependent model + doc and any aggregate whose bytes necessarily change.
+Removing a type deletes only its previously owned artifacts. Generated Python is
+deterministic and always `ast.parse`-able.
+
+Entrypoints: `graphql_analysis(db, path)` returns the normalized `GraphQLSchema`
+model (with `diagnostics`); `graphql_artifacts(db, path, output_root)` returns the
+desired `DesiredArtifactSet`; `generate_graphql(db, path, output_root, *,
+state_dir=None)` reconciles it to disk outside query evaluation.
+
+Out of scope for this integration:
+
+- network fetching or executing introspection against a live endpoint
+- a runtime GraphQL client, query execution, or response validation
+- generating selection sets for operation bodies (stubs only)
+- custom-scalar semantics beyond aliasing to `str`
+- directives, deprecations, subscription operations, and schema extensions
+
+Malformed or unsupported inputs (invalid JSON, missing `__schema`, a type with an
+unsupported `kind`) produce explicit deterministic `GraphQLDiagnostic` entries
+rather than guessed output.
+
+## Detection Rules Integration Scope
+
+The `detection_rules` integration compiles a small normalized JSON detection-rule
+format into per-backend query artifacts via the action layer. It is **not** Sigma
+or YARA and claims no compliance; see `docs/detection-content-format.md` for the
+input format and the complete supported expression grammar.
+
+Scope:
+
+- normalized rules (`rules/<id>.json`), shared field mappings (`mappings.json`),
+  reusable macros (`macros.json`), and optional rule-test fixtures
+  (`tests/<id>.json`), all read through tracked resources
+- expression grammar: leaf `{field, op, value}` with operators `equals`,
+  `not_equals`, `in`, `contains`, `startswith`, `endswith`, `exists`, `gt`, `gte`,
+  `lt`, `lte`, `regex`; combinators `all` / `any` / `not`; `macro` expansion
+- three explicitly-scoped backends — `splunk` (SPL-like), `elastic`
+  (KQL/query-string-like), `sentinel` (KQL-like) — with deterministic escaping
+- generated outputs: `queries/<backend>/<id>.<ext>`, `tests/<id>.json` results,
+  `coverage/<id>.json`, `docs/<id>.md`, aggregate `bundle.json` and
+  `coverage_matrix.json`
+- precise dependency tracking: a rule depends only on the fields/macros it
+  references, so editing an unused mapping/macro performs zero writes and editing
+  a used mapping regenerates only the affected backend queries
+- public provenance via `rule_provenance` / `Database.inspect` naming the source
+  rule, referenced mappings/macros, and backend transform
+- explicit deterministic diagnostics for invalid JSON, unknown operators,
+  undefined macros, and malformed expressions (offending rules are never rendered
+  with approximated output)
+
+Out of scope: Sigma/YARA/SIEM compliance or validation, executing queries against
+a live backend, arbitrary YAML ingestion, a general template engine, and any
+network / subprocess / clock / environment access.
 
 ## Cross-Integration Composition Edges
 

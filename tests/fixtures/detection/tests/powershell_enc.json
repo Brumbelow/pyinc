@@ -1,0 +1,16 @@
+{
+  "events": [
+    {
+      "process.name": "powershell.exe",
+      "command_line": "powershell.exe -enc ZQBjAGgAbwA="
+    },
+    {
+      "process.name": "notepad.exe",
+      "command_line": "notepad.exe file.txt"
+    }
+  ],
+  "expect": [
+    true,
+    false
+  ]
+}

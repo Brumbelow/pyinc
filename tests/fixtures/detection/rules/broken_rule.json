@@ -1,0 +1,11 @@
+{
+  "id": "broken_rule",
+  "title": "Broken Rule",
+  "severity": "low",
+  "attack": [],
+  "detection": {
+    "field": "process.name",
+    "op": "matches",
+    "value": "x"
+  }
+}

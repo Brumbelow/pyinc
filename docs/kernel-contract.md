@@ -262,3 +262,14 @@ The mutation adversarial suite (`test_external_alias_mutation_after_boundary_cro
 `test_two_queries_reading_same_input_get_independent_copies`) verifies that the
 value membrane protects cached state from external mutation, deep mutation, and
 cross-query aliasing.
+
+### Actions Execute Outside Query Evaluation
+
+Queries never perform side effects. The action / reconciliation layer
+(`pyinc.actions`, see [`action-contract.md`](action-contract.md)) is additive and
+does not change any guarantee on this page: queries still compute pure desired
+*values*, and turning those values into files on disk happens in a separate
+reconciler invoked outside query evaluation. The read-only helper
+`pyinc.is_query_active()` lets the reconciler refuse to run inside a query, so the
+"no side effects during a query" rule is enforced structurally rather than by
+convention.
