@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file provides guidance to code AGENTS (claude, codex, gemini, kimi, etc.) when working with code in this repository.
+This file provides guidance to coding agents working in this repository.
 
 ## Development commands
 
@@ -19,14 +19,17 @@ Python ≥3.11 (the matrix is 3.11 / 3.12 / 3.13). `pyproject.toml` pins `target
 
 The installed console script is `pyinc-tools` (→ `pyinc_tools.cli:main`), with subcommands `analyze` and `lsp`.
 
-## Two packages, one repo — and the boundary between them
+## Packages in this repo — and the boundaries between them
 
-The repository ships **two** Python packages, built as a single wheel. Which one you're editing matters:
+The repository ships **three** Python packages, built as a single wheel. Which one you're editing matters:
 
-- **`src/pyinc/`** — the stable v1 kernel + shipped integrations. Pure-Python, stdlib-only, zero runtime dependencies. This is what carries the semver contract documented in `docs/kernel-contract.md` and `docs/integration-contract.md`.
+- **`src/pyinc/`** — the stable kernel + shipped integrations. Pure-Python, stdlib-only, zero runtime dependencies. Carries the semver contract documented in `docs/kernel-contract.md`, `docs/integration-contract.md`, and `docs/action-contract.md`. The kernel surface is the pure query runtime **plus** the `@action` declared-output reconciliation layer (`Output`, `ReconcileResult`, `Action.reconcile`/`plan`): queries derive *desired* artifacts (pure, tracked); a separate action reconciles them with the filesystem. Side effects live only in the action layer, never in a query.
 - **`src/pyinc_tools/`** — the consumer tooling layer (CLI, LSP server, polling watcher, `WorkspaceSession` with overlay/mirror). Builds **only** on the stable `pyinc.integrations` public surface.
+- **`src/pyinc_codegen/`** — a consumer compiler: JSON-Schema → typed Python models, emitted through the `@action` layer. Stdlib-only; builds **only** on pyinc's public API (`@query`, `FileResource`, `Output`/`@action`). See `docs/codegen-guide.md`.
 
-**Architectural invariant (do not violate unless the user explicitly asks you to widen the kernel contract):** LSP wiring and filesystem watchers live in `pyinc_tools`, never in `src/pyinc`. New editor-facing or watcher-facing features land on top of the stable kernel — they do not widen it. This is stated in `docs/architecture.md` and reiterated in `docs/pyinc-tools-guide.md`. If a feature seems to require a kernel change, surface that as a trade-off question instead of silently broadening `src/pyinc`.
+**Architectural invariant (do not violate unless the user explicitly asks you to widen the kernel contract):** LSP wiring and filesystem watchers live in `pyinc_tools`; JSON-Schema concepts live in `pyinc_codegen`; neither ever lands in `src/pyinc`, which stays domain-agnostic. Consumers build on the stable kernel — they do not widen it. This is stated in `docs/architecture.md` and reiterated in `docs/pyinc-tools-guide.md` / `docs/codegen-guide.md`. If a feature seems to require a kernel change, surface that as a trade-off question instead of silently broadening `src/pyinc`.
+
+A reproducible benchmark + correctness harness lives under `bench/` (not shipped in the wheel; run `PYTHONPATH=src python -m bench.run`). Its only comparison dependency, `joblib`, sits in the `bench` optional-dependency group and is never imported by `src/pyinc` or `src/pyinc_codegen`.
 
 ## Kernel contract in one page
 
@@ -57,8 +60,10 @@ Each payload shape has a `TypeAlias` matching a dataclass's field order and a `_
 ## Docs to consult before non-trivial changes
 
 - `docs/kernel-contract.md` — soundness envelope, mode table, limitations, escape hatches.
+- `docs/action-contract.md` — the `@action` declared-output reconciliation contract (atomic writes, ownership ledger, tamper repair, dry-run).
 - `docs/integration-contract.md` — per-integration stable public surface.
-- `docs/integration-authoring.md` — the three-layer integration pattern with file:line pointers.
-- `docs/architecture.md` — v1 scope and the `src/pyinc` ↔ `pyinc_tools` boundary.
+- `docs/integration-authoring.md` — the three-layer integration pattern with file:line pointers (and `examples/calc/` as the canonical end-to-end example).
+- `docs/codegen-guide.md` — the `pyinc_codegen` JSON-Schema → Python compiler (reference consumer; public-API-only boundary).
+- `docs/architecture.md` — scope and the `src/pyinc` ↔ consumer (`pyinc_tools`, `pyinc_codegen`) boundaries.
 - `docs/pyinc-tools-guide.md` — LSP capabilities, `initializationOptions`, overlay/mirror model, supported vs. unsupported features.
 - `CHANGELOG.md` — what changed per release (project adheres to SemVer + Keep a Changelog).

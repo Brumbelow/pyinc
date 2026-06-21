@@ -181,6 +181,19 @@ scratch on its next request. This is correct but may degrade performance.
   (See: `test_input_cutoff_suppresses_equal_updates`,
   `test_query_cutoff_backdates_and_skips_downstream`)
 
+### Output Reconciliation (Actions)
+
+Queries are pure and never write. The separate **action layer** (`@action`,
+`Output`, `ReconcileResult`; see [action-contract.md](action-contract.md))
+reconciles a query-derived desired-output set against the filesystem: atomic
+writes, content-hash change/tamper detection, ownership-ledger orphan deletion,
+and dry-run planning. Reconciliation runs at top level only — never inside a
+query — so it does not change query semantics, the value membrane,
+untracked-read enforcement, or the `strict`/`checked`/`fast` modes. The
+kernel's from-scratch guarantee lifts to the filesystem: an incremental
+sequence of reconciles yields the same output files as a single reconcile from
+a fresh `Database` into an empty directory.
+
 ### Additional Kernel Properties
 
 - Query identity includes the function definition payload, including supported
