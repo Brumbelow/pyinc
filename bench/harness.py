@@ -3,34 +3,10 @@
 from __future__ import annotations
 
 import csv
-import time
-import tracemalloc
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-
-@dataclass(frozen=True)
-class ScenarioResult:
-    target: str
-    scenario: str
-    engine: str
-    seconds: float
-    peak_kib: float
-    graph_size: int
-    node_count: int
-    correct: bool
-
-
-def measure(fn: Callable[[], object]) -> tuple[object, float, float]:
-    """Run ``fn`` once; return (result, seconds, peak KiB)."""
-    tracemalloc.start()
-    start = time.perf_counter()
-    value = fn()
-    elapsed = time.perf_counter() - start
-    _current, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    return value, elapsed, peak / 1024.0
+from .measure import ScenarioResult
 
 
 def run_scenarios(

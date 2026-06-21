@@ -14,18 +14,17 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from pyinc import Database, Input, InMemoryArtifactStore, query
+from pyinc import Database, InMemoryArtifactStore, Input, query
 from pyinc_codegen import generate
-from pyinc_codegen.codegen import generate_outputs
 
 _EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 if str(_EXAMPLES) not in sys.path:
     sys.path.insert(0, str(_EXAMPLES))
 
-from calc.engine import calc_emit, evaluate_name  # noqa: E402
+from calc.engine import calc_emit  # noqa: E402
 
 from .baselines import make_joblib_memory  # noqa: E402
-from .harness import ScenarioResult, measure  # noqa: E402
+from .measure import ScenarioResult, measure  # noqa: E402
 
 
 def _tree(root: Path) -> dict[str, bytes]:
