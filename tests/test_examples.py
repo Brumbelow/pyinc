@@ -78,6 +78,38 @@ def test_notebook_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "analysis_unchanged=True" in output
 
 
+def test_action_reconcile_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    _run_example("action_reconcile_demo.py")
+    output = capsys.readouterr().out
+    assert "run1_writes=('alpha.py', 'beta.py')" in output
+    assert "run2_writes=()" in output
+    assert "run2_mtime_stable=True" in output
+    assert "run3_writes=('alpha.py',)" in output
+    assert "run4_writes=('beta.py',)" in output
+    assert "run5_deletions=('beta.py',)" in output
+    assert "run5_foreign_preserved=True" in output
+
+
+def test_graphql_codegen_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    _run_example("graphql_codegen_demo.py")
+    output = capsys.readouterr().out
+    assert "cold_write_count=11" in output
+    assert "rerun_writes=()" in output
+    assert "whitespace_writes=()" in output
+    assert "description_edit_writes=('docs/types/User.md',)" in output
+
+
+def test_detection_compile_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    _run_example("detection_compile_demo.py")
+    output = capsys.readouterr().out
+    assert "cold_write_count=8" in output
+    assert "rerun_writes=()" in output
+    assert "unused_mapping_writes=()" in output
+    assert "used_mapping_writes=['queries/splunk/ps_enc.spl']" in output
+    assert "provenance_rule=ps_enc" in output
+    assert "provenance_macros=('encoded',)" in output
+
+
 def test_checkpoint_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     _run_example("checkpoint_demo.py")
     output = capsys.readouterr().out

@@ -43,6 +43,21 @@ Mutable object graphs with shared or cyclic references are supported in v2.0.0 v
 
 Cross-run cache reuse ships in v2.0.0 via `Database.save_checkpoint(store=None) -> str` and `Database.load_checkpoint(key, store=None)`: the former serialises all current node records (plus snapshot bytes and dependency edges) to the store and returns a content-addressed key prefixed with `"ck"`; the latter reads the manifest back, verifies declared input digests and resource probe hints, and pre-warms the record cache so that the next `db.get(query)` reuses the stored result without re-executing the query function. Inputs must be set before loading; stale or unverifiable checkpoint records are silently skipped and the affected queries re-execute, preserving from-scratch consistency.
 
+## Action Layer
+
+`pyinc.actions` is an additive, stdlib-only subpackage that reconciles the
+immutable values a query computes into files on disk, **outside** query
+evaluation. It does not touch `Database` evaluation internals: queries return
+snapshot-safe desired-artifact descriptions, and a `FilesystemReconciler` consumes
+a `DesiredArtifactSet` and applies create/update/delete decisions driven by
+SHA-256 of the real output bytes, bounded by a per-action ownership manifest kept
+in a state directory outside the output root. Because the new integrations
+(`graphql_schema`, `detection_rules`) must declare desired artifacts, the layer
+lives in the `pyinc` wheel below `pyinc.integrations` — not in `pyinc_tools`,
+which would invert the dependency direction. The contract is documented in
+`docs/action-contract.md`; the kernel exposes the read-only helper
+`pyinc.is_query_active()` so reconciliation can refuse to run inside a query.
+
 ## Package Shape Today
 
 `pyinc` exposes a stable kernel surface from the top-level package:
@@ -75,6 +90,8 @@ Cross-run cache reuse ships in v2.0.0 via `Database.save_checkpoint(store=None) 
 Low-level payload queries, decode helpers, and resource helpers remain module-local experimental helpers. The public integration boundary is the dataclass/result layer plus the documented high-level entrypoints in `docs/integration-contract.md`.
 
 The repository also includes small examples under `examples/`, dedicated tests for kernel semantics and from-scratch consistency, and a separate consumer tooling layer under `pyinc_tools` for editor/watcher-facing behavior built on top of the stable kernel.
+
+A reproducible benchmark + correctness harness lives in the top-level `bench/` package (`python -m bench.run --output-dir bench/results`). It exercises the kernel and the file-generating integrations across fixed scenarios, asserts every timed incremental result byte-for-byte against a fresh cache-free `Database`, and emits CSV plus a Markdown report generated from it. Its only extra dependency, `joblib`, lives in the `bench` optional-dependency group; nothing under `src/pyinc` imports it, so the shipped package stays zero-runtime-dependency.
 
 ## Cross-Integration Composition
 

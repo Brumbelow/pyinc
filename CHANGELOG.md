@@ -10,6 +10,105 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **Action / reconciliation layer (`pyinc.actions`).** A new additive,
+  stdlib-only subpackage that turns the immutable values a query computes into
+  files on disk — safely, incrementally, and **outside** query evaluation.
+  Queries compute *desired artifacts* (`DesiredArtifact` / `DesiredArtifactSet`
+  with an explicit `ToolIdentity` / `ActionIdentity`); a `FilesystemReconciler`
+  compares them against real filesystem state and applies the difference.
+
+  - **Content-driven**: SHA-256 of the actual on-disk bytes drives
+    create/update/delete/unchanged decisions, so an identical rerun performs zero
+    writes (mtimes preserved) and an externally tampered owned output is repaired
+    even when inputs are unchanged. `plan()` returns the exact dry-run plan and
+    changes nothing.
+  - **Ownership-aware**: a deterministic JSON ownership manifest (`ActionManifest`)
+    in a state directory *outside* the output root records what the action owns;
+    stale deletion is limited to previously-owned files and never touches foreign
+    files or anything outside the root.
+  - **Safe**: per-file atomic writes (`tmp` + `os.replace`) with documented
+    convergence after a mid-run crash; output-path containment rejects absolute /
+    `..` / duplicate / symlink-escaping paths; a portable `O_EXCL` lock enforces a
+    single-writer contract; `apply()` is rejected if called during query
+    evaluation. Contract documented in `docs/action-contract.md`.
+  - Adds the read-only kernel helper `pyinc.is_query_active()`. No existing kernel
+    behavior, signature, or guarantee changes.
+
+- **GraphQL introspection-driven incremental generator
+  (`pyinc.integrations.graphql_schema`).** Reads a local GraphQL introspection
+  JSON document (stdlib `json`, no network) and generates, granularly per type:
+  typed Python model stubs (`models/<Type>.py`), operation/probe stubs for root
+  query/mutation fields (`operations/<field>.py`), per-type docs
+  (`docs/types/<Type>.md`), and aggregate indexes — reconciled to disk through
+  `pyinc.actions`.
+
+  - Normalizes `NON_NULL` / `LIST` wrappers and the scalar / object / enum /
+    input-object / interface / union kinds; unsupported constructs produce
+    deterministic `GraphQLDiagnostic` entries.
+  - Separate *code-shape* and *doc-shape* models (cutoff-bearing queries): a
+    whitespace / key-order edit writes nothing; a `description`-only edit
+    regenerates only the affected per-type doc (models/operations are not even
+    re-rendered); a field/argument/nullability/return-type change regenerates the
+    dependent model + doc and unavoidable aggregates; removing a type deletes only
+    its owned artifacts. Generated Python is deterministic and always parses.
+  - Stable surface: `GraphQLArgument`, `GraphQLField`, `GraphQLEnumValue`,
+    `GraphQLType`, `GraphQLSchema`, `GraphQLDiagnostic`, and the entrypoints
+    `graphql_analysis`, `graphql_artifacts`, `generate_graphql`. Validated by an
+    incremental-vs-from-scratch edit-sequence test.
+
+- **Security detection-content compiler
+  (`pyinc.integrations.detection_rules`).** Compiles a small, normalized
+  JSON detection-rule format (rules + shared field mappings + reusable macros +
+  optional rule-test fixtures) into per-backend query artifacts, a normalized
+  bundle, per-rule coverage fragments, an aggregate coverage matrix, rule docs,
+  and deterministic rule-test results — reconciled to disk through `pyinc.actions`.
+  It is Sigma/YARA-*inspired* and claims **no** compliance with Sigma, YARA, or any
+  SIEM; no external engine is executed.
+
+  - Expression grammar: leaf `{field, op, value}` with operators `equals`,
+    `not_equals`, `in`, `contains`, `startswith`, `endswith`, `exists`, `gt`,
+    `gte`, `lt`, `lte`, `regex`; combinators `all` / `any` / `not`; `macro`
+    expansion. Unknown operators / undefined macros / malformed expressions yield
+    explicit deterministic diagnostics and are never rendered with approximated
+    output.
+  - Three explicitly-scoped backends — `splunk` (SPL-like), `elastic`
+    (KQL/query-string-like), `sentinel` (KQL-like) — with deterministic escaping.
+  - Precise dependency tracking: a rule depends only on the fields/macros it
+    references. Editing an unused mapping/macro performs zero writes; editing a
+    used field mapping regenerates only the affected backend queries; removing a
+    rule deletes only its owned outputs.
+  - Public provenance via `rule_provenance` / `Database.inspect` naming the source
+    rule, referenced mappings/macros, and backend transform.
+  - Stable surface: `DetectionRule`, `DetectionDiagnostic`, `DetectionAnalysis`,
+    `DetectionProvenance`, and the entrypoints `detection_analysis`,
+    `detection_artifacts`, `generate_detections`, `rule_provenance`. Input format
+    and grammar documented in `docs/detection-content-format.md`; validated by an
+    incremental-vs-from-scratch edit-sequence test.
+
+- **Reproducible benchmark + correctness harness (`bench/`).** A new top-level
+  harness exercising the kernel, the GraphQL generator, and the detection compiler
+  across fixed scenarios (cold, warm, presentation-only edit, localized semantic
+  edit, high-fan-out shared-dependency edit, output tampering + repair, checkpoint
+  restore in a fresh `Database`, and full recomputation).
+
+  - **Correctness is mandatory in every scenario**: each timed incremental result
+    is compared byte-for-byte against a fresh, cache-disabled `Database` run; a
+    mismatch raises and no timing is emitted without a passing correctness check.
+  - Comparison baselines — fresh full recompute, a deliberately simple naive
+    whole-input recompute, and `joblib.Memory` where its argument-based semantics
+    fit (marked `N/A` otherwise, e.g. file-tree generation). The report documents
+    capability differences and makes no universal speed claims.
+  - Measures with `time.perf_counter_ns` / `statistics` and records query
+    exec/reuse/backdate counts, output write/delete counts, dependency graph node
+    and edge counts, checkpoint bytes, and the output digest, plus environment
+    metadata (timestamp, git commit, Python impl/version, platform, CPU count,
+    pyinc + benchmark dependency versions, warmup/repetition config).
+  - Emits raw CSV and a Markdown report **generated from the CSV** under
+    `bench/results/`. Reproduce with `python -m bench.run --output-dir bench/results`.
+  - Benchmark-only `joblib` lives in a `bench` optional-dependency group; nothing
+    under `src/pyinc` imports it, so the package stays zero-runtime-dependency.
+    Adapter and report-generation tests carry no brittle timing assertions.
+
 - **Pull diagnostics (`textDocument/diagnostic` + `workspace/diagnostic`)
   in `pyinc-tools` LSP.** The server now advertises a `diagnosticProvider`
   (`{"identifier": "pyinc-tools", "interFileDependencies": true,

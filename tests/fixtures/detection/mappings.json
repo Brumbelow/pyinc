@@ -1,0 +1,22 @@
+{
+  "process.name": {
+    "splunk": "Image",
+    "elastic": "process.name",
+    "sentinel": "ProcessName"
+  },
+  "command_line": {
+    "splunk": "CommandLine",
+    "elastic": "process.command_line",
+    "sentinel": "CommandLine"
+  },
+  "parent.name": {
+    "splunk": "ParentImage",
+    "elastic": "process.parent.name",
+    "sentinel": "ParentProcessName"
+  },
+  "unused.field": {
+    "splunk": "Unused",
+    "elastic": "unused",
+    "sentinel": "Unused"
+  }
+}

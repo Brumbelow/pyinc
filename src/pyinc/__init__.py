@@ -23,6 +23,7 @@ from .runtime import (
     QueryChangeEvent,
     QueryProfile,
     Subscription,
+    is_query_active,
 )
 from .store import (
     ArtifactStore,
@@ -81,6 +82,7 @@ __all__ = [
     "deserialize_snapshot",
     "explain_query_captures",
     "freeze",
+    "is_query_active",
     "query",
     "semantic_equal",
     "serialize_snapshot",

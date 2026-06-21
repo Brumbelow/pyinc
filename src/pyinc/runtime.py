@@ -164,6 +164,19 @@ def _raise_if_guarded(message: str) -> None:
             raise UntrackedReadError(message)
 
 
+def is_query_active() -> bool:
+    """Return ``True`` if any ``Database`` is currently evaluating a query on the
+    calling context.
+
+    A read-only introspection helper for the action layer
+    (:mod:`pyinc.actions`): it lets reconciliation refuse to run inside query
+    evaluation, preserving the "no side effects during a query" invariant. It
+    only reads the active-guard ``ContextVar`` and never affects evaluation,
+    caching, or backdating in any way.
+    """
+    return any(db._current_frame() is not None for db in _ACTIVE_GUARDS.get())
+
+
 def _install_guards_once() -> None:
     """Install global wrappers around raw I/O entry points exactly once per process.
 
