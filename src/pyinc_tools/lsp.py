@@ -69,6 +69,17 @@ _FOLDING_RANGE_KINDS = {
     "region": "region",
 }
 
+# LSP CompletionItemKind enum values (LSP 3.17).
+_COMPLETION_ITEM_KIND = {
+    "method": 2,
+    "function": 3,
+    "field": 5,
+    "variable": 6,
+    "class": 7,
+    "module": 9,
+    "keyword": 14,
+}
+
 _ID_START_RE = re.compile(r"[A-Za-z_]")
 _ID_CONT_RE = re.compile(r"[A-Za-z0-9_]")
 
@@ -440,6 +451,8 @@ class LanguageServer:
             return self._workspace_symbols(params)
         if method == "textDocument/hover":
             return self._hover(params)
+        if method == "textDocument/completion":
+            return self._completion(params)
         if method == "textDocument/definition":
             return self._definition(params)
         if method == "textDocument/declaration":
@@ -667,6 +680,10 @@ class LanguageServer:
                 "documentSymbolProvider": True,
                 "workspaceSymbolProvider": True,
                 "hoverProvider": True,
+                "completionProvider": {
+                    "triggerCharacters": ["."],
+                    "resolveProvider": False,
+                },
                 "definitionProvider": True,
                 "declarationProvider": True,
                 "typeDefinitionProvider": True,
@@ -828,6 +845,28 @@ class LanguageServer:
         return {
             "contents": {"kind": "markdown", "value": _format_hover_markdown(symbol)}
         }
+
+    def _completion(self, params: Any) -> dict[str, Any]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        try:
+            items = session.completions_at(real_path, line, character)
+        except FileNotFoundError:
+            items = ()
+        payload: list[dict[str, Any]] = []
+        for item in items:
+            entry: dict[str, Any] = {"label": item.label}
+            kind = _COMPLETION_ITEM_KIND.get(item.kind)
+            if kind is not None:
+                entry["kind"] = kind
+            if item.detail is not None:
+                entry["detail"] = item.detail
+            entry["sortText"] = item.sort_text
+            payload.append(entry)
+        return {"isIncomplete": False, "items": payload}
 
     def _definition(self, params: Any) -> list[dict[str, Any]]:
         session = self._require_session()

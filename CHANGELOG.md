@@ -10,6 +10,24 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **Completion (`textDocument/completion`) in `pyinc-tools` LSP.** The server
+  now advertises a `completionProvider` (`{"triggerCharacters": ["."],
+  "resolveProvider": false}`) and serves declaration-driven completion —
+  candidates come from real `symbol_resolution` bindings and import resolution,
+  never inferred runtime types. Three contexts are recognised: a bare-name
+  prefix (current-file module-level symbols, workspace module names, and Python
+  keywords), attribute access `M.<prefix>` for a bare-name `M` that resolves to
+  a workspace module (its exports) or class (its methods and class variables),
+  and import position (`from pkg import <prefix>` → `pkg`'s names; `import
+  <prefix>` → workspace module names). Because a mid-edit buffer is usually
+  unparseable at the caret (a trailing `owner.`), the server repairs the caret
+  line to `pass` before analysis, preserving every top-level import and
+  definition for resolution. Items carry `label` / `kind` / `detail` (signature
+  label for callables, declared annotation for variables). Strings, comments,
+  non-bare-`Name` owners, and stdlib / installed targets yield nothing.
+  Consumer entrypoint: `WorkspaceSession.completions_at(path, line,
+  character)`. Lives entirely on the stable `pyinc.integrations` surface — no
+  kernel change. Documented in `docs/pyinc-tools-guide.md`.
 - **Declared-output reconciliation layer (`@action`).** A new, domain-agnostic
   kernel surface for turning query-derived *desired* artifacts into files on
   disk without leaking side effects into queries. `Output(path, content)` is
