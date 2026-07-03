@@ -298,6 +298,36 @@ Consequences:
   `class_variable`, `variable`, `import_alias`, `from_import_alias`,
   `wildcard_import_stub`).
 - Workspace symbols with case-insensitive substring filter.
+- Completion, via `textDocument/completion` (advertised as
+  `completionProvider` with `.` as the trigger character). Completion is
+  **declaration-driven**: candidates come from real `symbol_resolution`
+  bindings and import resolution, never from inferred runtime types — the same
+  stance the goto/type-definition features take. Because a mid-edit buffer is
+  often unparseable at the caret (e.g. a trailing `owner.`), the server repairs
+  the caret line to `pass` before analysis, which keeps every top-level import
+  and definition intact for resolution while leaving the rest of the file
+  untouched. Three contexts are recognised:
+  - **Bare-name prefix** (`wor|`): module-level symbols from the current file's
+    `ModuleSymbolTable`, workspace top-level module names, and Python keywords.
+  - **Attribute** `M.<prefix>` where `M` is a bare name: `M` is resolved via
+    `resolve_symbol`; if it is a **workspace module** its module-level exports
+    are offered, and if it is a **workspace class** its methods and class
+    variables are offered. Non-bare-`Name` owners (`pkg.sub.M`),
+    stdlib/installed targets, and inferred-typed expressions yield nothing —
+    the same LHS-bare-`Name` limitation as find-references / type-definition.
+  - **Import context**: `from <pkg> import <prefix>` offers the workspace
+    `pkg`'s module-level names (via `workspace_symbol_index`, so it works even
+    while the current file is unparseable); `import <prefix>` / `from <prefix>`
+    offers workspace module names.
+
+  Each item carries a `label`, a `kind` (mapped from the symbol kind:
+  function/method/class/field/variable/module/keyword), and a `detail` (the
+  signature label for callables, reused from signature help, or the declared
+  annotation for variables). A caret inside a string or line comment, or an
+  attribute owner that does not resolve to the workspace, returns no items. The
+  consumer entrypoint is `WorkspaceSession.completions_at(path, line,
+  character)`, returning a tuple of `CompletionItem(label, kind, detail,
+  sort_text)`.
 - Diagnostics: syntax errors, unresolved imports, undeclared dependencies from
   `dependency_check`. Delivered over both the push channel
   (`textDocument/publishDiagnostics`) and the LSP 3.17 pull channel
@@ -668,8 +698,26 @@ Consequences:
 
 **Not supported:**
 
-- `textDocument/completion` (needs statement-context analysis).
 - `textDocument/codeAction`, `textDocument/formatting`.
+- `completionItem/resolve` (`resolveProvider` is `false`; items are fully
+  populated in the initial response).
+- `textDocument/completion` limitations:
+  - Statement-context filtering is not applied — completion offers the same
+    declaration-driven candidate set regardless of position (e.g. it does not
+    restrict to type names after a `:` annotation).
+  - Members of stdlib / installed-package modules and classes are not
+    completed; only workspace targets resolve to a member list. `os.<caret>`
+    yields nothing.
+  - Instance / `self.` attribute completion is not modelled — the attribute
+    owner must resolve to a workspace **module** or **class**, not an
+    expression whose type would have to be inferred.
+  - Attribute owners whose LHS is not a bare `Name` (`pkg.sub.M.<caret>`) are
+    skipped, matching the resolver's LHS-bare-`Name` limitation elsewhere.
+  - Repair is caret-line-local: if a syntax error lies on a line other than
+    the caret's, local and attribute completion return nothing for that file
+    (import-context and workspace-module candidates still work, since they do
+    not depend on the current file parsing).
+  - Auto-import and snippet completions are out of scope.
 - `textDocument/signatureHelp` limitations:
   - Attribute calls (`obj.method(`) and subscripted calls
     (`factory[T](`) are not detected — the call-site scanner only looks

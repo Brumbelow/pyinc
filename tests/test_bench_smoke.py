@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import sys
 from pathlib import Path
 
@@ -29,6 +30,44 @@ def test_harness_runs_synthetic_and_asserts_correctness(tmp_path: Path) -> None:
     assert all(r.correct for r in results if r.engine == "pyinc")
     csv_path, md_path = harness.write_reports(results, tmp_path)
     assert csv_path.exists() and md_path.exists()
+
+
+def test_csv_report_has_readable_schema_and_blank_pyinc_only_cells(tmp_path: Path) -> None:
+    results = harness.run_scenarios(["synthetic"], out_dir=tmp_path, comparators=["full", "naive"])
+    csv_path, _ = harness.write_reports(results, tmp_path)
+    with csv_path.open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    # Self-describing headers replace the old cryptic ones.
+    assert set(rows[0]) == {
+        "target",
+        "scenario",
+        "engine",
+        "wall_seconds",
+        "peak_memory_kib",
+        "dep_graph_edges",
+        "memo_nodes",
+        "matches_fresh",
+    }
+    # pyinc-only structural columns are populated for pyinc and blank otherwise
+    # (not a misleading "0").
+    for row in rows:
+        if row["engine"] == "pyinc":
+            assert row["dep_graph_edges"] != "" and row["memo_nodes"] != ""
+        else:
+            assert row["dep_graph_edges"] == "" and row["memo_nodes"] == ""
+
+
+def test_markdown_report_calls_out_stale_comparators(tmp_path: Path) -> None:
+    results = harness.run_scenarios(
+        ["synthetic", "calc"], out_dir=tmp_path, comparators=["full", "naive"]
+    )
+    _, md_path = harness.write_reports(results, tmp_path)
+    text = md_path.read_text(encoding="utf-8")
+    # The "fast but stale" thesis is surfaced, not buried in a boolean column.
+    assert "Stale results" in text
+    assert "STALE" in text
+    # Readable scenario titles appear instead of only raw tokens.
+    assert "Shared edit, high fan-out" in text
 
 
 def test_all_targets_cover_edit_sequence(tmp_path: Path) -> None:

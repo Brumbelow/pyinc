@@ -10,7 +10,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -176,6 +176,25 @@ class SignatureHelp:
     label: str
     parameters: tuple[SignatureParameterInfo, ...]
     active_parameter: int | None
+
+
+CompletionItemKind = Literal[
+    "function",
+    "method",
+    "class",
+    "variable",
+    "field",
+    "module",
+    "keyword",
+]
+
+
+@dataclass(frozen=True)
+class CompletionItem:
+    label: str
+    kind: CompletionItemKind
+    detail: str | None
+    sort_text: str
 
 
 FoldingRangeKind = Literal["imports", "comment", "region"]
@@ -714,6 +733,157 @@ def _find_call_at_position(
         if opener == "(" and name is not None:
             return name, commas
     return None
+
+
+# Completion is intentionally *line-local* and declaration-driven: it never
+# infers runtime types. ``CompletionContext`` is the shape the scanner hands to
+# the session, tagged by ``kind``:
+#   ("name", prefix)                 — a bare identifier being typed
+#   ("attribute", owner, prefix)     — ``owner.<prefix>`` where owner is a bare name
+#   ("from_import", module, prefix)  — ``from <module> import <prefix>``
+#   ("import_module", prefix)        — ``import <prefix>`` / ``from <prefix>``
+CompletionContext = tuple[str, ...]
+
+_FROM_IMPORT_RE = re.compile(r"^\s*from\s+([\w.]+)\s+import\s+(.*)$")
+_FROM_MODULE_RE = re.compile(r"^\s*from\s+([\w.]*)$")
+_IMPORT_MODULE_RE = re.compile(r"^\s*import\s+(?:[\w.]+\s*,\s*)*([\w.]*)$")
+
+
+def _completion_head_in_string_or_comment(head: str) -> bool:
+    """Best-effort: is the caret inside a string or line comment on this line?
+
+    Scans the pre-caret text of the current line only. Triple-quoted strings
+    spanning lines are not modelled (documented limitation); this keeps
+    completion from firing inside ordinary single-line strings and comments.
+    """
+    quote: str | None = None
+    k = 0
+    n = len(head)
+    while k < n:
+        c = head[k]
+        if quote is not None:
+            if c == "\\":
+                k += 2
+                continue
+            if c == quote:
+                quote = None
+            k += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            k += 1
+            continue
+        if c == "#":
+            return True
+        k += 1
+    return quote is not None
+
+
+def _completion_token_before(head: str) -> str:
+    """The trailing ``[\\w.]*`` run immediately before the caret."""
+    i = len(head)
+    while i > 0 and (head[i - 1].isalnum() or head[i - 1] in "_."):
+        i -= 1
+    return head[i:]
+
+
+def _find_completion_context(
+    source: str, line: int, character: int
+) -> CompletionContext | None:
+    """Classify what the caret at ``(line, character)`` is completing.
+
+    Returns ``None`` when nothing sensible can be offered (inside a string or
+    comment, or an attribute access whose owner is not a bare name)."""
+    lines = source.splitlines()
+    if not (0 <= line < len(lines)):
+        # Allow a caret one past the last line (empty trailing line).
+        if line == len(lines):
+            head = ""
+        else:
+            return None
+    else:
+        text = lines[line]
+        head = text[: max(0, min(character, len(text)))]
+
+    if _completion_head_in_string_or_comment(head):
+        return None
+
+    from_import = _FROM_IMPORT_RE.match(head)
+    if from_import is not None:
+        module = from_import.group(1)
+        after = from_import.group(2)
+        # The identifier currently being typed is the trailing word; anything
+        # with a dot in this position is out of scope.
+        last = after.rsplit(",", 1)[-1].strip()
+        if last and not last.replace("_", "").isalnum():
+            return None
+        return ("from_import", module, last)
+
+    from_module = _FROM_MODULE_RE.match(head)
+    if from_module is not None:
+        return ("import_module", from_module.group(1))
+
+    import_module = _IMPORT_MODULE_RE.match(head)
+    if import_module is not None:
+        return ("import_module", import_module.group(1))
+
+    run = _completion_token_before(head)
+    if "." in run:
+        owner, _, prefix = run.rpartition(".")
+        if not owner.isidentifier():
+            # Attribute chains whose owner is not a bare name are out of scope,
+            # matching the resolver's LHS-bare-Name limitation elsewhere.
+            return None
+        return ("attribute", owner, prefix)
+    return ("name", run)
+
+
+_SYMBOL_TO_COMPLETION_KIND: dict[str, CompletionItemKind] = {
+    "function": "function",
+    "method": "method",
+    "class": "class",
+    "class_variable": "field",
+    "variable": "variable",
+    "import_alias": "module",
+    "from_import_alias": "variable",
+}
+
+# Upper bound on returned items so a broad, empty-prefix request stays bounded;
+# editors filter client-side as the user keeps typing.
+_COMPLETION_LIMIT = 200
+
+
+def _repair_caret_line(source: str, line: int) -> str:
+    """Return ``source`` with line ``line`` replaced by ``pass`` at its original
+    indentation.
+
+    The caret line is typically the only unparseable part of a buffer mid-edit
+    (e.g. a trailing ``owner.``). Substituting ``pass`` — rather than blanking
+    the line, which would leave an enclosing ``def``/``class`` with an empty
+    body — lets the file parse while keeping every top-level import and
+    definition intact, which is all the local symbol table and owner resolution
+    need."""
+    lines = source.split("\n")
+    if 0 <= line < len(lines):
+        indent = lines[line][: len(lines[line]) - len(lines[line].lstrip())]
+        lines[line] = f"{indent}pass"
+    return "\n".join(lines)
+
+
+def _source_parses(text: str) -> bool:
+    try:
+        ast.parse(text)
+    except SyntaxError:
+        return False
+    return True
+
+
+def _keyword_completions(prefix: str) -> list[CompletionItem]:
+    return [
+        CompletionItem(label=kw, kind="keyword", detail=None, sort_text=f"3{kw}")
+        for kw in keyword.kwlist
+        if kw.startswith(prefix)
+    ]
 
 
 def _build_signature_label(
@@ -1777,6 +1947,210 @@ class WorkspaceSession:
                 parameters=parameters,
                 active_parameter=active_parameter,
             )
+
+    def completions_at(
+        self,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+    ) -> tuple[CompletionItem, ...]:
+        """Declaration-driven completion candidates for the caret position.
+
+        Offers bare-name, attribute (``module.``/``class.``), and import
+        completions drawn from real symbol-table bindings — never inferred
+        runtime types. Returns ``()`` when the caret is inside a string/comment,
+        outside the workspace, or otherwise has nothing sensible to offer.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            context = _find_completion_context(source, line, character)
+            if context is None:
+                return ()
+
+            kind = context[0]
+            items: list[CompletionItem] = []
+            if kind == "name":
+                prefix = context[1]
+                # Local symbols need the current file to parse; the caret line is
+                # usually the only broken part, so analyse a repaired copy.
+                with self._repaired_current_file(mirror_path, source, line) as ok:
+                    if ok:
+                        items += self._local_symbol_completions(mirror_path, prefix)
+                items += self._workspace_module_completions(prefix, full=False)
+                items += _keyword_completions(prefix)
+            elif kind == "attribute":
+                owner, prefix = context[1], context[2]
+                with self._repaired_current_file(mirror_path, source, line) as ok:
+                    if ok:
+                        items += self._attribute_completions(mirror_path, owner, prefix)
+            elif kind == "from_import":
+                module, prefix = context[1], context[2]
+                items += self._module_member_completions(module, prefix)
+            elif kind == "import_module":
+                prefix = context[1]
+                items += self._workspace_module_completions(prefix, full=True)
+
+            deduped: dict[tuple[str, str], CompletionItem] = {}
+            for item in items:
+                deduped.setdefault((item.label, item.kind), item)
+            ordered = sorted(deduped.values(), key=lambda c: (c.sort_text, c.label))
+            return tuple(ordered[:_COMPLETION_LIMIT])
+
+    @contextlib.contextmanager
+    def _repaired_current_file(
+        self, mirror_path: Path, original: str, line: int
+    ) -> Iterator[bool]:
+        """Temporarily write a caret-line-repaired copy of the current file to
+        the mirror so symbol-table and resolution queries can run against a
+        parseable buffer, then restore the exact original bytes.
+
+        Yields ``True`` when a repaired, parseable buffer is in place (or the
+        original already parsed), ``False`` when even the repaired buffer is
+        unparseable. Held under ``self._state_lock`` for its whole lifetime, so
+        the transient mirror state is never observed by other threads."""
+        if _source_parses(original):
+            yield True
+            return
+        repaired = _repair_caret_line(original, line)
+        if not _source_parses(repaired):
+            yield False
+            return
+        mirror_path.write_text(repaired, encoding="utf-8")
+        try:
+            yield True
+        finally:
+            mirror_path.write_text(original, encoding="utf-8")
+
+    def _symbol_completion_item(
+        self, label: str, symbol: Symbol, sort_group: str
+    ) -> CompletionItem | None:
+        kind = _SYMBOL_TO_COMPLETION_KIND.get(symbol.kind)
+        if kind is None:
+            return None
+        detail: str | None = None
+        if symbol.kind in ("function", "method") and symbol.signature is not None:
+            detail, _ = _build_signature_label(label, symbol.signature)
+        elif symbol.annotation:
+            detail = f"{label}: {symbol.annotation}"
+        return CompletionItem(
+            label=label, kind=kind, detail=detail, sort_text=f"{sort_group}{label}"
+        )
+
+    def _local_symbol_completions(
+        self, mirror_path: Path, prefix: str
+    ) -> list[CompletionItem]:
+        table = module_symbol_table(self.db, self.mirror_root, str(mirror_path))
+        items: list[CompletionItem] = []
+        for symbol in table.symbols:
+            name = symbol.qualified_name
+            if "." in name:  # module-level bindings only
+                continue
+            if not name.startswith(prefix):
+                continue
+            item = self._symbol_completion_item(name, symbol, sort_group="0")
+            if item is not None:
+                items.append(item)
+        return items
+
+    def _workspace_module_completions(
+        self, prefix: str, *, full: bool
+    ) -> list[CompletionItem]:
+        index = workspace_symbol_index(self.db, self.mirror_root)
+        modules = {entry.module for entry in index.entries}
+        # ``full`` offers dotted module names (import position); otherwise the
+        # top-level package component (bare-name position).
+        names = modules if full else {module.split(".")[0] for module in modules}
+        items: list[CompletionItem] = []
+        for name in names:
+            if name and name.startswith(prefix):
+                items.append(
+                    CompletionItem(
+                        label=name, kind="module", detail=None, sort_text=f"2{name}"
+                    )
+                )
+        return items
+
+    def _module_member_completions(
+        self, module: str, prefix: str
+    ) -> list[CompletionItem]:
+        """Top-level names of a workspace ``module`` (for ``from M import ...``)."""
+        index = workspace_symbol_index(self.db, self.mirror_root)
+        items: list[CompletionItem] = []
+        for entry in index.entries:
+            if entry.module != module:
+                continue
+            name = entry.qualified_name
+            if "." in name or not name.startswith(prefix):
+                continue
+            kind = _SYMBOL_TO_COMPLETION_KIND.get(entry.kind, "variable")
+            detail = (
+                f"{name}: {entry.annotation}" if entry.annotation else None
+            )
+            items.append(
+                CompletionItem(
+                    label=name, kind=kind, detail=detail, sort_text=f"0{name}"
+                )
+            )
+        return items
+
+    def _attribute_completions(
+        self, mirror_path: Path, owner: str, prefix: str
+    ) -> list[CompletionItem]:
+        """Members of ``owner`` when it resolves to a workspace module or class."""
+        resolved = self._remap_resolved_symbol(
+            resolve_symbol(self.db, self.mirror_root, str(mirror_path), owner)
+        )
+        if resolved.resolution != "workspace" or resolved.defining_path is None:
+            return []
+        defining_mirror = self._mirror_path_for_real(resolved.defining_path)
+        if not defining_mirror.exists() or defining_mirror.suffix != ".py":
+            return []
+        table = module_symbol_table(self.db, self.mirror_root, str(defining_mirror))
+        owner_bare = resolved.qualified_name.rsplit(".", 1)[-1]
+        owner_symbol = next(
+            (
+                symbol
+                for symbol in table.symbols
+                if symbol.qualified_name == owner_bare
+                and "." not in symbol.qualified_name
+            ),
+            None,
+        )
+
+        items: list[CompletionItem] = []
+        if owner_symbol is None:
+            # ``owner`` is the module itself → offer its top-level bindings.
+            for symbol in table.symbols:
+                name = symbol.qualified_name
+                if "." in name or not name.startswith(prefix):
+                    continue
+                item = self._symbol_completion_item(name, symbol, sort_group="0")
+                if item is not None:
+                    items.append(item)
+            return items
+        if owner_symbol.kind == "class":
+            # ``owner`` is a class → offer its methods and class variables.
+            member_prefix = f"{owner_bare}."
+            for symbol in table.symbols:
+                qname = symbol.qualified_name
+                if not qname.startswith(member_prefix) or qname.count(".") != 1:
+                    continue
+                member = qname.split(".", 1)[1]
+                if not member.startswith(prefix):
+                    continue
+                item = self._symbol_completion_item(member, symbol, sort_group="0")
+                if item is not None:
+                    items.append(item)
+            return items
+        # Owner is a function/variable/etc — no member completion.
+        return []
 
     def folding_ranges_for_file(
         self,

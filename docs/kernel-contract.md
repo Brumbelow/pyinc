@@ -1,6 +1,8 @@
 ## Kernel Contract — Soundness Envelope
 
-`pyinc` v1 is a correctness-first, in-memory incremental query kernel.
+`pyinc` is a correctness-first, in-memory incremental query kernel. This
+document defines the guarantee it makes and the exact conditions under which the
+guarantee holds; it is the stable semver contract for `src/pyinc`.
 
 ### The Guarantee
 

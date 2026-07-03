@@ -14,6 +14,7 @@ from pyinc_tools.session import (
     CallHierarchyItem,
     CallHierarchyOutgoingCall,
     CodeLens,
+    CompletionItem,
     DeclarationLocation,
     DocumentLink,
     FileDeletionEdit,
@@ -6680,3 +6681,192 @@ def test_language_server_workspace_diagnostic_unchanged_with_previous_ids(
             server._session.close()
     assert second["items"]
     assert all(item["kind"] == "unchanged" for item in second["items"])
+
+
+# ---------------------------------------------------------------------------
+# textDocument/completion
+# ---------------------------------------------------------------------------
+
+_COMPLETION_HELPERS = (
+    "def compute() -> int:\n"
+    "    return 1\n"
+    "\n"
+    "class Widget:\n"
+    "    size: int = 3\n"
+    "    def render(self) -> str:\n"
+    "        return 'w'\n"
+    "\n"
+    "CONST = 5\n"
+)
+
+_COMPLETION_APP = (
+    "from helpers import compute, Widget\n"
+    "import helpers\n"
+    "\n"
+    "def run() -> int:\n"
+    "    return 1\n"
+)
+
+
+def _caret(text: str, marker_line: str) -> tuple[str, int, int]:
+    """Return (source, line, character) for a caret at the end of ``marker_line``.
+
+    ``marker_line`` is appended to ``text`` as a new final line; the caret sits
+    at its end, mimicking a mid-edit buffer.
+    """
+    source = text + marker_line + "\n"
+    line = source.splitlines().index(marker_line)
+    return source, line, len(marker_line)
+
+
+def _labels(items: tuple[CompletionItem, ...]) -> set[str]:
+    return {item.label for item in items}
+
+
+def test_completion_bare_name_offers_local_symbols_and_keywords(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _COMPLETION_HELPERS)
+    app = root / "app.py"
+    _write(app, _COMPLETION_APP)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(_COMPLETION_APP, "    comp")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert "compute" in _labels(items)
+
+        # A keyword prefix surfaces keyword items.
+        source, line, character = _caret(_COMPLETION_APP, "    ret")
+        session.set_overlay(app, source)
+        keyword_items = session.completions_at(app, line, character)
+        assert any(
+            item.label == "return" and item.kind == "keyword" for item in keyword_items
+        )
+
+
+def test_completion_attribute_lists_module_and_class_members(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _COMPLETION_HELPERS)
+    app = root / "app.py"
+    _write(app, _COMPLETION_APP)
+
+    with WorkspaceSession(root) as session:
+        # Module attribute access: helpers.<caret>
+        source, line, character = _caret(_COMPLETION_APP, "    helpers.")
+        session.set_overlay(app, source)
+        module_items = session.completions_at(app, line, character)
+        assert {"compute", "Widget", "CONST"} <= _labels(module_items)
+        assert any(
+            item.label == "compute" and item.kind == "function" for item in module_items
+        )
+
+        # Class attribute access: Widget.<caret>
+        source, line, character = _caret(_COMPLETION_APP, "    Widget.")
+        session.set_overlay(app, source)
+        class_items = session.completions_at(app, line, character)
+        assert _labels(class_items) == {"render", "size"}
+        assert any(
+            item.label == "render" and item.kind == "method" for item in class_items
+        )
+
+
+def test_completion_from_import_lists_workspace_module_members(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _COMPLETION_HELPERS)
+    app = root / "app.py"
+    _write(app, _COMPLETION_APP)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(_COMPLETION_APP, "from helpers import ")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert {"compute", "Widget", "CONST"} <= _labels(items)
+
+
+def test_completion_excludes_stdlib_and_strings(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _COMPLETION_HELPERS)
+    app = root / "app.py"
+    _write(app, _COMPLETION_APP)
+
+    with WorkspaceSession(root) as session:
+        # Attribute access on a stdlib module yields no workspace members.
+        stdlib_src = _COMPLETION_APP + "import os\n"
+        source, line, character = _caret(stdlib_src, "    os.")
+        session.set_overlay(app, source)
+        assert session.completions_at(app, line, character) == ()
+
+        # A caret inside a string literal offers nothing.
+        source, line, character = _caret(_COMPLETION_APP, "x = 'helpers.")
+        session.set_overlay(app, source)
+        assert session.completions_at(app, line, character) == ()
+
+
+def test_completion_rejects_outside_and_missing_paths(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _COMPLETION_HELPERS)
+    with WorkspaceSession(root) as session:
+        # A path outside the workspace root is refused, like every other
+        # position-based feature.
+        outside = tmp_path / "elsewhere.py"
+        _write(outside, "x = 1\n")
+        with pytest.raises(ValueError):
+            session.completions_at(outside, 0, 1)
+
+        # A missing in-workspace file raises FileNotFoundError.
+        with pytest.raises(FileNotFoundError):
+            session.completions_at(root / "nope.py", 0, 0)
+
+
+def test_completion_is_stable_when_unrelated_file_changes(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _COMPLETION_HELPERS)
+    other = root / "other.py"
+    _write(other, "def unrelated() -> int:\n    return 0\n")
+    app = root / "app.py"
+    _write(app, _COMPLETION_APP)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(_COMPLETION_APP, "    helpers.")
+        session.set_overlay(app, source)
+        first = session.completions_at(app, line, character)
+
+        # Editing an unrelated file must not change app.py's completions; the
+        # workspace/module symbol tables are memoized and reused across requests.
+        session.set_overlay(other, "def unrelated() -> int:\n    return 999\n")
+        second = session.completions_at(app, line, character)
+        assert first == second
+        assert {"compute", "Widget", "CONST"} <= _labels(second)
+
+
+def test_language_server_advertises_and_serves_completion(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _COMPLETION_HELPERS)
+    app = root / "app.py"
+    # The on-disk buffer is mid-edit: an attribute access with no member yet.
+    _write(app, _COMPLETION_APP + "\ndef edit() -> int:\n    helpers.\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        provider = init["capabilities"]["completionProvider"]
+        assert provider["triggerCharacters"] == ["."]
+
+        caret_line = _COMPLETION_APP.count("\n") + 2  # the "    helpers." line
+        result = server._handle_request(
+            "textDocument/completion",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": caret_line, "character": len("    helpers.")},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert result["isIncomplete"] is False
+    labels = {item["label"] for item in result["items"]}
+    assert {"compute", "Widget", "CONST"} <= labels
+    # Module kind (9) is emitted for none of these members; function/class/field
+    # kinds are present and stdlib members are absent.
+    assert "path" not in labels  # would only appear if os/stdlib were expanded
