@@ -96,29 +96,79 @@ mutating query may observe corrupted intermediate state. Use `checked` or `stric
 for mutation safety.
 (See: `test_fast_mode_uses_owned_values_without_mutation_detection`)
 
-**4. Cross-process or cross-run persistence.**
-The kernel is in-memory. Code fingerprints include the Python implementation
-and version tuple but not all possible build configuration differences. The
-kernel does not yet trust a durable cache for from-scratch consistency.
+**4. Durable cross-run cache (trusted, under stated conditions).**
+The kernel is in-memory, but a durable `ArtifactStore` checkpoint is trusted for
+from-scratch consistency across processes and runs when **all** of the following
+hold:
 
-In v2.0.0, an outbound `ArtifactStore` (`InMemoryArtifactStore` /
-`FileSystemArtifactStore`) optionally accepts every snapshot the kernel
-freezes, keyed by its `fingerprint_snapshot` digest, via
-`Database(store=...)`. Bytes are produced by `serialize_snapshot` and consumed
-by `deserialize_snapshot`; both round-trip the full snapshot grammar including
-`FrozenGraph` / `FrozenRef`. The durable checkpoint API completes cross-run
-cache reuse: `Database.save_checkpoint(store=None) -> str` serialises all
-current node records and their snapshot bytes to the store, returning a
-content-addressed key (SHA-256 prefixed with `"ck"`).
-`Database.load_checkpoint(key, store=None)` reads the manifest back, verifies
-that all declared input digests and resource probe hints still match the
-current database state, and pre-warms the record cache so that the next
-`db.get(query)` reuses stored results without re-executing the function. Stale
-or unverifiable records are silently skipped and the affected queries
-re-execute (from-scratch consistency is maintained). Both methods accept an
-optional `store=` kwarg for call-site store injection; the store passed to
-`load_checkpoint` is also used for subsequent snapshot loading if the Database
-was not constructed with a `store=` argument.
+(i) the store is accessed by one process at a time — concurrent cross-process
+access remains out of scope;
+(ii) every `Input` the checkpoint depends on is set before `load_checkpoint`,
+and `Input` objects that share a name are constructed in a deterministic order
+across runs so their per-name `seq` ordinals line up (module-level construction
+is the supported contract);
+(iii) resources satisfy the probe contract across runs — a resource's probe
+changes whenever its `load` result changes, and probe values are snapshot-safe
+and process-independent;
+(iv) adapters for any adapted snapshot type are registered in the loading
+process with unchanged `freeze`/`thaw` implementations.
+
+Under these conditions `load_checkpoint(key)` followed by `db.get(query)`
+returns the value a fresh recomputation on the same declared state would, in all
+three modes. The mechanisms that earn this:
+
+- **Query identities are recomputed live in the loading process.** A query's
+  identity pins the interpreter (implementation, version tuple, `-O` optimize
+  flag, platform / `os.name` / UTF-8 mode) and the full function-definition
+  payload — including the definitions of transitively captured queries,
+  functions, and modules — so a body edit anywhere in the captured graph, or a
+  build-configuration change, produces a different identity and the stale record
+  simply misses.
+- **Inputs and dependency edges verify exactly.** Warmed records carry their
+  real dependency edges; each input and sub-query dependency is re-checked
+  against the live graph by digest before the record is trusted.
+- **Resources are re-probed or re-executed live.** A checkpoint dependency that
+  is a resource is re-probed against the real world; a sub-query dependency that
+  cannot be warmed is re-executed from its pinned code (the execute-to-verify
+  frontier) and its result digest compared to the manifest.
+- **Bytes verify against their content addresses.** Every snapshot loaded from
+  the store is rejected unless `sha256` of its raw bytes equals the digest it was
+  keyed by, and the manifest itself is re-hashed against the checkpoint key
+  before anything is parsed out of it.
+
+Anything that cannot be verified is skipped and re-executed rather than trusted:
+query subgraphs reached only through a runtime import or dynamic dispatch (their
+code is not pinned into any identity), records marked untracked via
+`report_untracked_read()`, corrupted or missing store bytes, and adapter
+mismatches. A tampered, truncated, wrong-version, or wrong-kernel-fingerprint
+manifest is rejected loudly with `ValueError`.
+
+Residual limitations that stay outside the envelope: no concurrent multi-process
+store access (condition i); the module-monkey-patch gap of limitation 5b applies
+across runs exactly as it does in-process; and a checkpoint does not survive an
+interpreter or build-configuration change — such records miss safely (they
+re-execute) rather than being trusted.
+
+An outbound `ArtifactStore` (`InMemoryArtifactStore` / `FileSystemArtifactStore`)
+optionally accepts every snapshot the kernel freezes, keyed by its
+`fingerprint_snapshot` digest, via `Database(store=...)`. Bytes are produced by
+`serialize_snapshot` and consumed by `deserialize_snapshot`; both round-trip the
+full snapshot grammar including `FrozenGraph` / `FrozenRef`. On top of this,
+`Database.save_checkpoint(store=None) -> str` serialises the current query and
+resource records — their snapshot bytes, call snapshots, resource parameters,
+dependency edges, and per-adapter implementation digests — into a
+content-addressed manifest (schema v3), returning a key prefixed with `"ck"`.
+Records whose cached value no longer matches the live graph (a "dirty" save with
+no intervening `get`) are omitted rather than persisted stale, so a reload never
+warms a value a fresh run would not produce. `Database.load_checkpoint(key,
+store=None)` re-hashes the manifest against the requested key, rejects a foreign
+manifest schema or kernel-fingerprint version loudly, and stages the records;
+the next `db.get(query)` verifies dependencies as described above and reuses the
+stored result without re-executing when everything checks out, or re-executes
+the affected query otherwise. Both methods accept an optional `store=` kwarg for
+call-site store injection; the store passed to `load_checkpoint` is also used for
+subsequent snapshot loading if the Database was not constructed with a `store=`
+argument.
 
 Within a process, `Database` is thread-safe for concurrent use both across
 independent instances and on a single shared instance. Each `Database` holds
@@ -199,7 +249,10 @@ a fresh `Database` into an empty directory.
 ### Additional Kernel Properties
 
 - Query identity includes the function definition payload, including supported
-  captured values. Mutable closure/global captures are rejected. Use
+  captured values, the full definition payloads of transitively captured queries
+  (a body edit to a dependency query moves the parent's identity), and the build
+  configuration (Python implementation and version, `-O` optimize flag, platform,
+  `os.name`, UTF-8 mode). Mutable closure/global captures are rejected. Use
   `pyinc.explain_query_captures(fn)` to preview how each capture will be
   classified before the first `db.get()`.
 - Resource identity includes resource configuration (e.g., encoding for
@@ -277,3 +330,20 @@ The mutation adversarial suite (`test_external_alias_mutation_after_boundary_cro
 `test_two_queries_reading_same_input_get_independent_copies`) verifies that the
 value membrane protects cached state from external mutation, deep mutation, and
 cross-query aliasing.
+
+The durable cross-run guarantee (limitation 4) is mechanically verified by the
+same fresh-recomputation equivalence, extended to the checkpoint path:
+
+- `test_checkpoint_reload_matches_fresh_recomputation` (property test in
+  `tests/test_properties.py`) — reloads a checkpoint across all three modes and
+  with/without LRU eviction, comparing `load_checkpoint` + `get()` against a
+  fresh, cache-free run over the same edit sequence, and exercises the
+  dirty-graph save path directly.
+- `tests/test_checkpoint_cross_process.py` — a subprocess matrix that saves in
+  one interpreter and reloads in another, proving identities and digests line up
+  across processes.
+- `tests/test_checkpoint_trust.py` — the adversarial store and trust suite:
+  bit-flipped and truncated snapshot bytes, tampered and wrong-version
+  manifests, changed query/adapter/resource implementations, and
+  runtime-import-reached dependencies each fall back to safe re-execution or a
+  loud `ValueError` rather than serving a stale or tampered value.

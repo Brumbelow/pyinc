@@ -69,7 +69,13 @@ def main() -> None:
         print(f"run1_executions={stats1.query_executions}")  # 3 queries executed
 
         # -----------------------------------------------------------------------
-        # Run 2: load the checkpoint — same inputs, all queries are reused.
+        # Run 2: load the checkpoint — same inputs, same results.
+        #
+        # The file is unchanged, so its resource probe hint re-establishes a live
+        # record at load time (its snapshot comes straight back out of the
+        # content-addressed store).  With the resource verified against live
+        # state, the whole resource-backed query chain warms without re-running:
+        # every query reuses and nothing executes.
         # -----------------------------------------------------------------------
         db2 = Database(store=store)
         db2.set(MULTIPLIER, 3)  # same input as run 1
@@ -78,14 +84,15 @@ def main() -> None:
         print(f"run2_result={result2}")  # same result: 15
 
         node2 = db2.inspect(scaled_word_count, data_path)
-        print(f"run2_decision={node2.last_recompute}")  # "reused" — no re-execution
+        print(f"run2_decision={node2.last_recompute}")  # "reused"
         stats2 = db2.statistics()
         print(f"run2_executions={stats2.query_executions}")  # 0
 
         # -----------------------------------------------------------------------
         # Run 3: load checkpoint, change the multiplier.  Only scaled_word_count
-        # re-executes (it depends on MULTIPLIER); word_count is reused because
-        # the file content and its own dependencies are unchanged.
+        # depends on it, so it re-executes; word_count/config_text still reuse
+        # against the unchanged file.  The result lands at 50, consistent with a
+        # from-scratch run.
         # -----------------------------------------------------------------------
         db3 = Database(store=store)
         db3.set(MULTIPLIER, 10)  # different multiplier
@@ -96,9 +103,7 @@ def main() -> None:
         node3 = db3.inspect(scaled_word_count, data_path)
         print(f"run3_decision={node3.last_recompute}")  # "executed"
         stats3 = db3.statistics()
-        print(
-            f"run3_executions={stats3.query_executions}"
-        )  # 1 (only scaled_word_count)
+        print(f"run3_executions={stats3.query_executions}")  # 1
 
         assert result1 == 15
         assert result2 == 15

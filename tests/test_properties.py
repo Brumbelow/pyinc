@@ -7,11 +7,19 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from pyinc import Database, FileResource, Input, MutationError, query
+from pyinc import (
+    Database,
+    FileResource,
+    InMemoryArtifactStore,
+    Input,
+    MutationError,
+    query,
+)
 from pyinc.integrations.python_source import workspace_analysis
 
 Operation = tuple[str, int | str]
 WorkspaceState = tuple[str, str, bool]
+CheckpointOp = tuple[str, int | str]
 
 
 def operation_sequences() -> st.SearchStrategy[list[Operation]]:
@@ -348,3 +356,102 @@ def test_multi_level_rewiring_matches_fresh_recomputation(
             fresh.set(inp, state[name])
 
         assert incremental.get(combined) == fresh.get(combined)
+
+
+def checkpoint_op_sequences() -> st.SearchStrategy[list[CheckpointOp]]:
+    set_scale = st.tuples(
+        st.just("set_scale"), st.integers(min_value=-8, max_value=8)
+    )
+    set_bias = st.tuples(st.just("set_bias"), st.integers(min_value=-8, max_value=8))
+    write = st.tuples(
+        st.just("write"),
+        st.sampled_from(["", "a", "abc", "hello world", "x\ny\nz", "unicode-é"]),
+    )
+    save = st.tuples(st.just("save"), st.just(""))
+    get = st.tuples(st.just("get"), st.just(""))
+    return st.lists(
+        st.one_of(set_scale, set_bias, write, save, get),
+        min_size=1,
+        max_size=12,
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("max_query_nodes", [None, 2])
+@settings(max_examples=30, deadline=None)
+@given(steps=checkpoint_op_sequences())
+def test_checkpoint_reload_matches_fresh_recomputation(
+    mode: str,
+    max_query_nodes: int | None,
+    steps: list[CheckpointOp],
+) -> None:
+    scale = Input[int]("ckp_scale")
+    bias = Input[int]("ckp_bias")
+    files = FileResource()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "cell.txt"
+
+        @query
+        def cell_size(db: Database) -> int:
+            return len(files.read(db, str(path)))
+
+        @query
+        def combiner(db: Database) -> int:
+            return cell_size(db) * scale.read(db) + bias.read(db)
+
+        scale_value = 1
+        bias_value = 0
+        content = ""
+        path.write_text(content, encoding="utf-8")
+
+        store = InMemoryArtifactStore()
+        saver = Database(mode=mode, max_query_nodes=max_query_nodes, store=store)
+        saver.set(scale, scale_value)
+        saver.set(bias, bias_value)
+
+        last_key: str | None = None
+        for kind, payload in steps:
+            if kind == "set_scale":
+                assert isinstance(payload, int)
+                scale_value = payload
+                saver.set(scale, scale_value)
+            elif kind == "set_bias":
+                assert isinstance(payload, int)
+                bias_value = payload
+                saver.set(bias, bias_value)
+            elif kind == "write":
+                assert isinstance(payload, str)
+                content = payload
+                path.write_text(content, encoding="utf-8")
+            elif kind == "save":
+                # Save the graph as-is, whatever state it is in -- including a
+                # "dirty" graph whose inputs moved since the root was last
+                # evaluated (no get before this save). The save path omits any
+                # record whose cached value no longer matches the live graph, so
+                # reload never warms a stale value; the strongest proof that the
+                # dirty-save soundness fix holds is exercising it here directly.
+                last_key = saver.save_checkpoint()
+            elif kind == "get":
+                saver.get(combiner)
+
+        # Guarantee at least one checkpoint exists to reload from.
+        if last_key is None:
+            saver.get(combiner)
+            last_key = saver.save_checkpoint()
+
+        # Reload the LAST saved checkpoint into a brand-new database over the same
+        # store, declare the final state, and evaluate the root.
+        reloaded = Database(mode=mode, max_query_nodes=max_query_nodes, store=store)
+        reloaded.set(scale, scale_value)
+        reloaded.set(bias, bias_value)
+        reloaded.load_checkpoint(last_key)
+
+        # A completely fresh database (no store) over the same declared state is
+        # the ground truth: whatever the checkpoint restores or invalidates, the
+        # reloaded result must match it exactly.
+        fresh = Database(mode=mode, max_query_nodes=max_query_nodes)
+        fresh.set(scale, scale_value)
+        fresh.set(bias, bias_value)
+
+        assert reloaded.get(combiner) == fresh.get(combiner)
