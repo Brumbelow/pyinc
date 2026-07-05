@@ -10,6 +10,42 @@ Items in this section are queued for the next v2.x release.
 
 ### Added
 
+- **Durable cross-run cache is now a trusted guarantee.** The
+  `save_checkpoint` / `load_checkpoint` flow shipped in v2.0.0 carried only a
+  best-effort warm; the checkpoint path now earns from-scratch consistency
+  across processes and runs, under the conditions restated in
+  `docs/kernel-contract.md` limitation 4 (single-process store access; the
+  checkpoint's inputs set before load; resources honouring the probe contract;
+  adapters registered with unchanged implementations). The supporting machinery:
+
+  - **Deterministic cross-process query identities.** `Input` carries a per-name
+    `seq` ordinal so same-named inputs resolve to the correct node on reload;
+    captured queries now fold their *full* definition payload into the parent's
+    identity transitively (a body edit to any dependency query moves the
+    parent); and the code fingerprint includes the build configuration (`-O`
+    optimize flag, platform, `os.name`, UTF-8 mode) alongside the interpreter
+    and version tuple.
+  - **Execute-to-verify frontier reuse.** A checkpoint dependency that cannot be
+    warmed directly is re-executed from its pinned code — resources probed
+    against the real world — and its result digest compared to the manifest, so
+    a warmed subtree is trusted only when its frontier reproduces.
+  - **Adapter-implementation digests.** Each registered adapter's
+    `freeze`/`thaw` body is fingerprinted and recorded in the manifest; every
+    thaw-into-live path refuses a record whose adapter has changed or vanished
+    since the save, even a change to `thaw` alone.
+  - **Checkpoint manifest schema v3.** Canonically sorted and content-addressed,
+    with the kernel fingerprint version cross-checked at load.
+
+  On upgrade, checkpoint keys written before this branch cannot be loaded:
+  `load_checkpoint` rejects their older manifest schema loudly (`ValueError`),
+  so callers must drop the old key and `save_checkpoint` afresh. Within v3
+  checkpoints, records whose identities shift (interpreter, build
+  configuration, or code changes) miss safely — the affected queries
+  re-execute on the first `get` (a one-time re-execution wave) rather than
+  being trusted. Stored *snapshot* artifacts remain valid either way — the
+  `fingerprint_snapshot` encoder (`K2;`) is unchanged, so an existing object
+  store need not be rewritten. No `pyproject.toml` version bump accompanies
+  this (release hygiene is tracked separately).
 - **Completion (`textDocument/completion`) in `pyinc-tools` LSP.** The server
   now advertises a `completionProvider` (`{"triggerCharacters": ["."],
   "resolveProvider": false}`) and serves declaration-driven completion —
@@ -751,6 +787,33 @@ Items in this section are queued for the next v2.x release.
 
 ### Fixed
 
+- **Checkpoint warm path could return stale or tampered values.** The v2.0.0
+  warm restored records without their dependency edges and trusted whatever
+  bytes the store returned, so a warmed cache could serve a value a fresh run
+  would not produce. Closed on every front:
+  - restored records now carry their real dependency edges and are re-verified
+    transitively through them, replacing the old warm-time bypass;
+  - resources are re-probed — or their queries re-executed — live at reload
+    instead of the stored probe hint being trusted blindly;
+  - every snapshot read from the store is rejected unless `sha256` of its raw
+    bytes matches the digest it was keyed by, and the manifest is re-hashed
+    against the checkpoint key before anything is parsed out of it;
+  - any dependency that cannot be resolved or verified — runtime-import-reached
+    query subgraphs, untracked (`report_untracked_read`) records, missing or
+    corrupt store bytes — refuses the warm and re-executes rather than guessing.
+- **Refcount-dependent code fingerprints.** `_code_fingerprint` now marshals
+  code objects with `marshal` format 2 instead of the default. Format ≥3 encodes
+  interning / `FLAG_REF` state, so a code object's bytes could flip once one of
+  its string constants gained a reference at runtime (e.g. a regex literal
+  retained by `re`'s cache after first use), making a query's identity depend on
+  live refcounts and shift between two keyings in the same process. Format 2
+  fully encodes the code object without shared references, so identities are
+  stable within a process and reproducible across processes.
+- **Dirty-graph saves no longer persist stale records.** `save_checkpoint` omits
+  any record whose cached value no longer matches the live graph — a dependency
+  moved since the record last executed, with no intervening `get` — because
+  persisting it would bake in the dependency's *new* digest while warming the
+  *old* value on reload. Such records are simply re-executed after reload.
 - **`FileDeletionEdit` is now re-exported from `pyinc_tools`.** The dataclass
   was added to `pyinc_tools.session` alongside
   `WorkspaceSession.import_edits_for_file_deletions` in the previous PR but

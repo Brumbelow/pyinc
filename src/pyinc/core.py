@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import (
     TYPE_CHECKING,
@@ -23,16 +24,30 @@ T = TypeVar("T")
 EqFn = Callable[[Any, Any], bool]
 CutoffFn = Callable[[Any], Any]
 
+# Per-name construction ordinals for Input nodes. Two Inputs sharing a name
+# (kept distinct via eq=/cutoff=) get stable, process-reproducible ordinals so
+# their identities and checkpoint dep records survive a cross-process reload.
+# Deterministic module-level construction order is the supported contract.
+_input_seq_lock = threading.Lock()
+_input_seq_counters: dict[str, int] = {}
+
 
 @dataclass(frozen=True)
 class Input(Generic[T]):
     name: str
     eq: EqFn | None = None
     cutoff: CutoffFn | None = None
+    # seq is excluded from equality/hashing (compare=False), so Input identity
+    # semantics are unchanged; it only disambiguates same-named nodes.
+    seq: int = field(init=False, compare=False, repr=False, default=0)
 
     def __post_init__(self) -> None:
         if self.eq is not None and self.cutoff is not None:
             raise ValueError("Input() accepts either eq= or cutoff=, but not both.")
+        with _input_seq_lock:
+            next_seq = _input_seq_counters.get(self.name, 0)
+            _input_seq_counters[self.name] = next_seq + 1
+        object.__setattr__(self, "seq", next_seq)
 
     def read(self, db: Database) -> T:
         return db._read_input(self)

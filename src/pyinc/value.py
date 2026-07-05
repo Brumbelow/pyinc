@@ -329,6 +329,57 @@ def _inline_refs(value: Snapshot, nodes: list[Any]) -> Snapshot:
     return value
 
 
+def collect_adapter_keys(snapshot: Any) -> frozenset[str]:
+    """Collect every adapter key a snapshot's ``FrozenAdapterValue``s depend on.
+
+    Pure and registry-free: it walks the ``Snapshot`` union the same way
+    ``_inline_refs`` does and returns the set of adapter keys reachable in it.
+    The checkpoint path uses this to record, per manifest record, which adapter
+    implementations a snapshot's fidelity rests on, so a record frozen under a
+    since-changed (or now-missing) adapter is refused at warm time rather than
+    thawed into a value a fresh run would not have produced.
+    """
+    keys: set[str] = set()
+    _collect_adapter_keys(snapshot, keys)
+    return frozenset(keys)
+
+
+def _collect_adapter_keys(value: Any, keys: set[str]) -> None:
+    if isinstance(value, FrozenAdapterValue):
+        keys.add(value.adapter_key)
+        _collect_adapter_keys(value.payload, keys)
+        return
+    if isinstance(value, FrozenList):
+        for item in value.items:
+            _collect_adapter_keys(item, keys)
+        return
+    if isinstance(value, FrozenDict):
+        for key, item in value.entries:
+            _collect_adapter_keys(key, keys)
+            _collect_adapter_keys(item, keys)
+        return
+    if isinstance(value, FrozenSet):
+        for item in value.items:
+            _collect_adapter_keys(item, keys)
+        return
+    if isinstance(value, FrozenRecord):
+        for _key, item in value.entries:
+            _collect_adapter_keys(item, keys)
+        return
+    if isinstance(value, FrozenGraph):
+        # Every memoized value is its own node, so walking all nodes (plus the
+        # root) reaches each adapter value inline; a bare FrozenRef just points
+        # back into this table and carries no key of its own.
+        for node in value.nodes:
+            _collect_adapter_keys(node, keys)
+        _collect_adapter_keys(value.root, keys)
+        return
+    if isinstance(value, tuple):
+        for item in value:
+            _collect_adapter_keys(item, keys)
+        return
+
+
 def thaw(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> Any:
     registry = _coerce_registry(adapters)
     if isinstance(value, FrozenGraph):

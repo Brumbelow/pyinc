@@ -29,7 +29,9 @@ from .value import (
     FrozenSet,
     Snapshot,
     ValueAdapter,
+    _adapter_key,
     assert_not_mutated,
+    collect_adapter_keys,
     deserialize_snapshot,
     fingerprint,
     fingerprint_snapshot,
@@ -47,6 +49,45 @@ Mode = str
 DefaultT = TypeVar("DefaultT")
 P = ParamSpec("P")
 T = TypeVar("T")
+
+# Durable checkpoint manifest schema version. Bumped whenever the identity or
+# record layout changes so stale manifests are rejected loudly rather than
+# silently reused.
+_CHECKPOINT_MANIFEST_VERSION = 3
+# Version of the snapshot/fingerprint encoding this kernel emits, mirrored from
+# value._KERNEL_FINGERPRINT_PREFIX (b"K2;"). Recorded in the manifest and checked
+# at load so a checkpoint from a differently-encoded kernel is never trusted.
+_KERNEL_FINGERPRINT_VERSION = 2
+# marshal format used to fingerprint a code object. Pinned below 3 on purpose:
+# format >=3 (the default) encodes FLAG_REF/interning state, so the bytes for a
+# code object flip once one of its string consts gains a reference (e.g. re._cache
+# retaining a regex-pattern literal after first use). That would make a query's
+# identity depend on runtime refcounts and shift between two keyings in the same
+# process. Format 2 fully encodes the code object but never shares references, so
+# it is stable across a process's lifetime and reproducible across processes.
+_CODE_MARSHAL_VERSION = 2
+
+
+def _canonical_record_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
+    """Stable, total sort key for a manifest record, independent of dict order."""
+    return (
+        str(entry.get("kind", "")),
+        str(entry.get("identity", "")),
+        str(entry.get("args_digest", "")),
+        str(entry.get("label", "")),
+    )
+
+
+def _canonical_dep_key(dep: dict[str, Any]) -> tuple[str, str, str, str, str, str]:
+    """Stable, total sort key for a manifest dependency entry."""
+    return (
+        str(dep.get("kind", "")),
+        str(dep.get("name", "")),
+        str(dep.get("seq", "")),
+        str(dep.get("identity", "")),
+        str(dep.get("args_digest", "")),
+        str(dep.get("label", "")),
+    )
 
 
 @dataclass(frozen=True)
@@ -342,6 +383,13 @@ class Database:
         self.mode = mode
         self.max_query_nodes = max_query_nodes
         self._adapters = dict(adapters or {})
+        # Digest of each registered adapter's freeze/thaw implementation, keyed by
+        # the adapted type's key. Computed lazily and cached: _adapters is fixed at
+        # construction, so the digests never change over the database's life.
+        self._adapter_digests_cache: dict[str, str] | None = None
+        # Per-adapter-key implementation digests read from a loaded checkpoint's
+        # manifest; the warm gate compares these against the live registry.
+        self._checkpoint_adapter_digests: dict[str, str] = {}
         self._store = store
         self._revision = 0
         self._records: dict[NodeKey, NodeRecord] = {}
@@ -386,6 +434,16 @@ class Database:
         self._checkpoint_query_records: dict[NodeKey, dict[str, Any]] = {}
         self._checkpoint_resource_probes: dict[NodeKey, tuple[Any, str]] = {}
         self._checkpoint_load_store: ArtifactStore | None = None
+        # The transitive pinned-query set of the record currently being warmed.
+        # Set at the warm root and consulted while warming its dependency queries
+        # so an unpinned (non-code-pinnable) dep query is never served stale.
+        self._checkpoint_root_pinned: builtins.set[str] | None = None
+        # Companion object maps for the record currently being warmed, keyed by
+        # the same identity strings the sets carry: query_id -> Query object (for
+        # execute-to-verify) and resource identity -> resource object (for
+        # probe-hint restoration). Set at the warm root, consulted transitively.
+        self._checkpoint_root_pinned_query_objects: dict[str, Any] | None = None
+        self._checkpoint_root_pinned_resources: dict[str, Any] | None = None
         _install_guards_once()
 
     @property
@@ -706,9 +764,10 @@ class Database:
         must be set before calling this method.
 
         Checkpoint records that cannot be verified (missing snapshot bytes,
-        changed inputs, changed resource probes) are silently skipped; the
-        affected queries will re-execute on the next :meth:`get` call and the
-        results will be compared against the stored snapshots for backdating.
+        changed inputs, no live record for a resource dependency) are silently
+        skipped; the affected queries re-execute on the next :meth:`get` call.
+        A warmed record joins the loading database's own revision timeline, so
+        the usual invalidation machinery governs it from then on.
 
         Raises ``ValueError`` if no ``ArtifactStore`` is available.
         Raises ``KeyError`` if *key* is not found in the store.
@@ -722,22 +781,76 @@ class Database:
         with self._state_lock:
             self._load_checkpoint_locked(key, _store)
 
+    def _record_is_stale_for_save(self, record: NodeRecord) -> bool:
+        """True if *record*'s cached value is out of date w.r.t. its live deps.
+
+        A checkpoint may only persist records whose snapshot matches what a fresh
+        recomputation against the *current* graph would produce. When a dependency
+        (typically an ``Input``) is mutated after this record last executed but
+        before ``save_checkpoint`` -- a "dirty graph" with no intervening ``get``
+        -- the record's snapshot is stale, yet the manifest would bake in the
+        dep's *new* digest (``dep_record.digest`` is read live below), yielding a
+        record that warms the stale value on reload and violates from-scratch
+        consistency. Detect that here with the same timeline rule the warm gate
+        uses (`_maybe_changed_after`): any dep that changed after this record was
+        last verified -- or that is missing or untracked, and so can never be
+        trusted at load -- makes the record unsafe to persist.
+
+        Pure by design: this never executes a query or re-probes a resource, so a
+        save never mutates the graph. Only directly-stale records are flagged;
+        a record whose stale value is transitively caused by a stale *child* is
+        left to the load path, where the omitted child fails re-verification
+        (execute-to-verify / warm-dep) and the parent is refused rather than
+        warmed stale (see the checkpoint dep-verification path).
+        """
+        for dep_key in record.dependencies:
+            dep_record = self._records.get(dep_key)
+            if dep_record is None:
+                return True
+            if dep_record.is_untracked:
+                return True
+            if dep_record.changed_at > record.verified_at:
+                return True
+        return False
+
     def _save_checkpoint_locked(self, store: ArtifactStore) -> str:
         records_list: list[dict[str, Any]] = []
         for key, record in self._records.items():
             if key.kind not in ("query", "resource"):
                 continue
+            # Omit records whose cached value no longer matches the live graph
+            # (dirty-graph save). Persisting them would warm a stale value on
+            # reload; omitting them simply re-executes the query there instead.
+            if self._record_is_stale_for_save(record):
+                continue
             self._persist_snapshot_to(record.snapshot, store)
+            # Persist what a fresh process needs to re-execute this leaf under its
+            # own name, content-addressed by the digest already in the manifest:
+            # a query's call snapshot (keyed by its args_digest) so it can be
+            # re-run to verify, and a resource's frozen parameter (keyed by its
+            # args_digest) so its object can be re-probed live. No manifest field
+            # is added -- the digests already live on the record and its deps.
+            if key.kind == "query":
+                call_snapshot = self._call_snapshots().get(key)
+                if call_snapshot is not None:
+                    self._persist_snapshot_to(call_snapshot, store)
+            elif key.kind == "resource":
+                resource_pair = self._resource_objects().get(key)
+                if resource_pair is not None:
+                    _resource, parameter = resource_pair
+                    self._persist_snapshot_to(self._freeze_value(parameter), store)
             deps: list[dict[str, Any]] = []
             for dep_key in record.dependencies:
                 dep_record = self._records.get(dep_key)
                 if dep_record is None:
                     continue
                 if dep_key.kind == "input":
+                    dep_name, dep_seq = self._input_ident_for_key(dep_key)
                     deps.append(
                         {
                             "kind": "input",
-                            "name": self._input_name_for_key(dep_key),
+                            "name": dep_name,
+                            "seq": dep_seq,
                             "label": dep_key.label,
                             "digest": dep_record.digest,
                         }
@@ -747,6 +860,7 @@ class Database:
                         {
                             "kind": "query",
                             "identity": dep_key.identity,
+                            "query_id": self._query_id_for_key(dep_key),
                             "args_digest": dep_key.args_digest,
                             "label": dep_key.label,
                             "digest": dep_record.digest,
@@ -762,6 +876,9 @@ class Database:
                             "digest": dep_record.digest,
                         }
                     )
+            # Canonical, order-independent dep ordering so the manifest bytes (and
+            # thus the checkpoint key) do not depend on set/dict iteration order.
+            deps.sort(key=_canonical_dep_key)
             entry: dict[str, Any] = {
                 "kind": key.kind,
                 "identity": key.identity,
@@ -769,9 +886,14 @@ class Database:
                 "label": key.label,
                 "snapshot_digest": record.digest,
                 "deps": deps,
-                "changed_order": record.changed_at,
                 "is_untracked": record.is_untracked,
+                # Adapter keys this record's snapshot uses (sorted for canonical
+                # manifest bytes). The warm gate refuses the record unless every
+                # one is still present with a matching implementation digest.
+                "adapter_keys": sorted(collect_adapter_keys(record.snapshot)),
             }
+            if key.kind == "query":
+                entry["query_id"] = self._query_id_for_key(key)
             if key.kind == "resource" and record.probe is not None:
                 try:
                     probe_snapshot = freeze(record.probe)
@@ -784,8 +906,18 @@ class Database:
                     pass
             records_list.append(entry)
 
+        # Canonical record ordering keeps the manifest bytes independent of the
+        # insertion order of self._records.
+        records_list.sort(key=_canonical_record_key)
+        # Trust anchor for the warm-time adapter gate: the implementation digest
+        # each adapter key had when this checkpoint was written. Sorted by key so
+        # the manifest bytes stay independent of registry iteration order.
+        adapter_digests = self._current_adapter_digests()
+        adapters_manifest = {key: adapter_digests[key] for key in sorted(adapter_digests)}
         manifest = {
-            "pyinc_ckpt_version": 2,
+            "pyinc_ckpt_version": _CHECKPOINT_MANIFEST_VERSION,
+            "kernel_fingerprint_version": _KERNEL_FINGERPRINT_VERSION,
+            "adapters": adapters_manifest,
             "records": records_list,
         }
         manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
@@ -801,42 +933,79 @@ class Database:
             manifest_bytes = store.get(key)
         if manifest_bytes is None:
             raise KeyError(f"Checkpoint key {key!r} not found in the ArtifactStore.")
-        manifest = json.loads(manifest_bytes.decode("utf-8"))
-        if manifest.get("pyinc_ckpt_version") != 2:
+        # The manifest is the root of trust: re-derive its content address
+        # from the fetched bytes before parsing anything out of them.
+        recomputed_key = "ck" + hashlib.sha256(manifest_bytes).hexdigest()
+        if recomputed_key != key:
+            raise ValueError(
+                f"Checkpoint {key!r} failed integrity verification: stored manifest "
+                f"bytes hash to {recomputed_key!r}, not the requested key."
+            )
+        try:
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Checkpoint {key!r} manifest could not be decoded as JSON: {exc}"
+            ) from exc
+        if manifest.get("pyinc_ckpt_version") != _CHECKPOINT_MANIFEST_VERSION:
             raise ValueError(
                 f"Unsupported checkpoint version {manifest.get('pyinc_ckpt_version')!r}; "
-                "expected 2."
+                f"expected {_CHECKPOINT_MANIFEST_VERSION}."
+            )
+        manifest_kernel_version = manifest.get("kernel_fingerprint_version")
+        if manifest_kernel_version != _KERNEL_FINGERPRINT_VERSION:
+            raise ValueError(
+                f"Checkpoint {key!r} was written by kernel fingerprint version "
+                f"{manifest_kernel_version!r}, but this kernel emits version "
+                f"{_KERNEL_FINGERPRINT_VERSION}; refusing to load."
             )
         self._checkpoint_load_store = store
         self._checkpoint_query_records.clear()
         self._checkpoint_resource_probes.clear()
-        for record_dict in manifest["records"]:
-            kind = record_dict["kind"]
-            ck_key = NodeKey(
-                kind=kind,
-                identity=record_dict["identity"],
-                args_digest=record_dict["args_digest"],
-                label=record_dict["label"],
-            )
-            if kind == "query":
-                self._checkpoint_query_records[ck_key] = record_dict
-            elif kind == "resource":
-                probe_bytes_hex = record_dict.get("probe_bytes")
-                if probe_bytes_hex:
-                    try:
-                        probe_snapshot = deserialize_snapshot(
-                            bytes.fromhex(probe_bytes_hex)
-                        )
-                        probe_value = thaw(probe_snapshot)
-                        self._checkpoint_resource_probes[ck_key] = (
-                            probe_value,
-                            record_dict["snapshot_digest"],
-                        )
-                    except (UnsupportedValueError, ValueError):
-                        # Skip unreadable probe hints; the resource will be
-                        # re-probed and the snapshot re-read at next access,
-                        # which is correct (just slower than reusing the hint).
-                        pass
+        # Adapter implementation digests recorded at save; the warm gate refuses
+        # any record/snapshot whose adapter keys are missing here or disagree with
+        # the live registry. Absent/malformed map ⇒ empty ⇒ every adapted record
+        # is distrusted (safe: it re-executes under the live adapter).
+        manifest_adapters = manifest.get("adapters")
+        self._checkpoint_adapter_digests = (
+            {str(k): str(v) for k, v in manifest_adapters.items()}
+            if isinstance(manifest_adapters, dict)
+            else {}
+        )
+        try:
+            for record_dict in manifest["records"]:
+                kind = record_dict["kind"]
+                ck_key = NodeKey(
+                    kind=kind,
+                    identity=record_dict["identity"],
+                    args_digest=record_dict["args_digest"],
+                    label=record_dict["label"],
+                )
+                if kind == "query":
+                    self._checkpoint_query_records[ck_key] = record_dict
+                elif kind == "resource":
+                    probe_bytes_hex = record_dict.get("probe_bytes")
+                    if probe_bytes_hex:
+                        try:
+                            probe_snapshot = deserialize_snapshot(
+                                bytes.fromhex(probe_bytes_hex)
+                            )
+                            # Keep the FROZEN probe: a live probe is compared by
+                            # its frozen form, not against a thawed value (a
+                            # frozen dataclass thaws to a dict and never matches).
+                            self._checkpoint_resource_probes[ck_key] = (
+                                probe_snapshot,
+                                record_dict["snapshot_digest"],
+                            )
+                        except (UnsupportedValueError, ValueError):
+                            # Skip unreadable probe hints; the resource will be
+                            # re-probed and the snapshot re-read at next access,
+                            # which is correct (just slower than reusing the hint).
+                            pass
+        except KeyError as exc:
+            raise ValueError(
+                f"Checkpoint {key!r} manifest is missing required field {exc}."
+            ) from exc
 
     def _try_warm_from_checkpoint(
         self, query: Any, key: NodeKey, call_snapshot: Any
@@ -847,24 +1016,56 @@ class Database:
             return False
         if ckpt.get("is_untracked"):
             return False
-        for dep in ckpt["deps"]:
-            if not self._verify_checkpoint_dep(dep):
+        # An adapter whose implementation changed (or vanished) since the save
+        # would thaw this record's snapshot into a value a fresh run would not
+        # produce. Refuse and re-execute under the live adapter instead.
+        if not self._adapter_keys_trusted(ckpt.get("adapter_keys", ())):
+            return False
+        # The root's transitive pinned-query set governs this warm and every
+        # dependency query warmed beneath it. A dep query outside the set was
+        # reached via a runtime import or dynamic dispatch, so its code is not
+        # pinned into any identity here and it must not be served from the
+        # checkpoint -- refuse and let a fresh execution re-derive it.
+        pinned_query_objects, pinned_resource_objects = (
+            self._collect_pinned_capture_objects(query.fn)
+        )
+        pinned_queries = builtins.set(pinned_query_objects)
+        previous_pinned = self._checkpoint_root_pinned
+        previous_query_objects = self._checkpoint_root_pinned_query_objects
+        previous_resources = self._checkpoint_root_pinned_resources
+        self._checkpoint_root_pinned = pinned_queries
+        self._checkpoint_root_pinned_query_objects = pinned_query_objects
+        self._checkpoint_root_pinned_resources = pinned_resource_objects
+        try:
+            if not self._checkpoint_deps_are_pinned(ckpt["deps"], pinned_queries):
                 return False
+            dependencies = self._verify_and_resolve_checkpoint_deps(ckpt["deps"])
+        finally:
+            self._checkpoint_root_pinned = previous_pinned
+            self._checkpoint_root_pinned_query_objects = previous_query_objects
+            self._checkpoint_root_pinned_resources = previous_resources
+        if dependencies is None:
+            return False
         snapshot = self._load_snapshot_from_store(ckpt["snapshot_digest"])
         if snapshot is None:
             return False
-        changed_order: int = ckpt["changed_order"]
+        # Normalise the warmed record onto this database's timeline: its old
+        # changed_at belongs to the saving process and means nothing here.
+        # changed_at == verified_at == the current revision, plus real edges,
+        # lets the ordinary red/green machinery govern it. checked_in_request
+        # stays unset so the get that warmed it still verifies its deps.
         self._records[key] = NodeRecord(
             key=key,
             label=key.label,
             snapshot=snapshot,
             digest=ckpt["snapshot_digest"],
-            changed_at=changed_order,
+            changed_at=self._revision,
             verified_at=self._revision,
+            dependencies=dependencies,
             last_decision="reused",
             last_recompute="reused",
             reason="restored from checkpoint",
-            checked_in_request=self._current_request_id(),
+            checked_in_request=-1,
         )
         self._query_records.add(key)
         self._query_objects()[key.identity] = query
@@ -880,20 +1081,33 @@ class Database:
             return False
         if ckpt.get("is_untracked"):
             return False
-        for dep in ckpt["deps"]:
-            if not self._verify_checkpoint_dep(dep):
-                return False
+        # Same adapter-trust gate as the root warm: a dep record frozen under a
+        # since-changed adapter must not be served from the checkpoint.
+        if not self._adapter_keys_trusted(ckpt.get("adapter_keys", ())):
+            return False
+        # Apply the root's pinned-query gate transitively: a dep-of-a-dep reached
+        # only via runtime import is not code-pinned and must not warm.
+        pinned_queries = self._checkpoint_root_pinned
+        if pinned_queries is not None and not self._checkpoint_deps_are_pinned(
+            ckpt["deps"], pinned_queries
+        ):
+            return False
+        dependencies = self._verify_and_resolve_checkpoint_deps(ckpt["deps"])
+        if dependencies is None:
+            return False
         snapshot = self._load_snapshot_from_store(ckpt["snapshot_digest"])
         if snapshot is None:
             return False
-        changed_order = ckpt["changed_order"]
+        # A dep warmed without its Query object is flagged checkpoint_loaded so
+        # _maybe_changed_after re-verifies it transitively through its edges.
         self._records[dep_key] = NodeRecord(
             key=dep_key,
             label=dep_key.label,
             snapshot=snapshot,
             digest=ckpt["snapshot_digest"],
-            changed_at=changed_order,
-            verified_at=changed_order,
+            changed_at=self._revision,
+            verified_at=self._revision,
+            dependencies=dependencies,
             last_decision="reused",
             last_recompute="reused",
             reason="restored from checkpoint (dep)",
@@ -902,6 +1116,52 @@ class Database:
         )
         self._query_records.add(dep_key)
         return True
+
+    def _checkpoint_deps_are_pinned(
+        self, deps: list[dict[str, Any]], pinned_queries: builtins.set[str]
+    ) -> bool:
+        """True unless a query dep's ``query_id`` is outside the pinned set."""
+        for dep in deps:
+            if dep["kind"] == "query" and dep["query_id"] not in pinned_queries:
+                return False
+        return True
+
+    def _verify_and_resolve_checkpoint_deps(
+        self, deps: list[dict[str, Any]]
+    ) -> builtins.set[NodeKey] | None:
+        """Verify every checkpoint dep against live state and resolve its key.
+
+        Returns the resolved dependency edges (as live ``NodeKey``s) when all
+        deps verify, or ``None`` if any dep cannot be verified -- in which case
+        the caller must refuse to warm and let the query re-execute.
+        """
+        resolved: set[NodeKey] = set()
+        for dep in deps:
+            if not self._verify_checkpoint_dep(dep):
+                return None
+            dep_key = self._resolve_checkpoint_dep_key(dep)
+            if dep_key is None:
+                return None
+            resolved.add(dep_key)
+        return resolved
+
+    def _resolve_checkpoint_dep_key(self, dep: dict[str, Any]) -> NodeKey | None:
+        """Rebuild the live ``NodeKey`` for a checkpoint dep, or ``None``.
+
+        Input deps carry only a name, so they are resolved against the live
+        input node; query and resource deps carry their full identity.
+        """
+        dep_kind = dep["kind"]
+        if dep_kind == "input":
+            return self._find_input_node(dep["name"], dep["seq"])
+        if dep_kind in ("query", "resource"):
+            return NodeKey(
+                kind=dep_kind,
+                identity=dep["identity"],
+                args_digest=dep["args_digest"],
+                label=dep["label"],
+            )
+        return None
 
     def _verify_checkpoint_dep(self, dep: dict[str, Any]) -> bool:
         dep_kind = dep["kind"]
@@ -914,7 +1174,7 @@ class Database:
         return False
 
     def _verify_checkpoint_input_dep(self, dep: dict[str, Any]) -> bool:
-        input_key = self._find_input_node_by_name(dep["name"])
+        input_key = self._find_input_node(dep["name"], dep["seq"])
         if input_key is None:
             return False
         record = self._records.get(input_key)
@@ -934,9 +1194,64 @@ class Database:
         record = self._records.get(dep_key)
         if record is not None:
             return record.digest == expected_digest
-        return self._warm_checkpoint_dep_query(dep_key) and (
-            self._records[dep_key].digest == expected_digest
-        )
+        # Prefer warming the dep's subtree from the checkpoint (no execution:
+        # resources come back via probe hints). If the subtree can't be warmed
+        # -- e.g. it reaches a resource unresolvable from the pinned captures --
+        # verify the dep by re-execution instead.
+        if self._warm_checkpoint_dep_query(dep_key):
+            return self._records[dep_key].digest == expected_digest
+        return self._execute_to_verify_query_dep(dep, dep_key, expected_digest)
+
+    def _execute_to_verify_query_dep(
+        self, dep: dict[str, Any], dep_key: NodeKey, expected_digest: str
+    ) -> bool:
+        """Verify a query dep by re-executing its pinned code against live state.
+
+        Used when a query dep cannot be warmed from the checkpoint. Recovers the
+        dep's call snapshot from the store (content-addressed by its args_digest;
+        missing/corrupt ⇒ degrade to warm refusal), runs the pinned Query live --
+        so its resources are probed against the real world -- and compares the
+        resulting digest to the manifest's expectation. Equal ⇒ verified and now
+        live (downstream warming can reuse it); different ⇒ refuse.
+        """
+        pinned_objects = self._checkpoint_root_pinned_query_objects
+        if pinned_objects is None:
+            return False
+        query_obj = pinned_objects.get(dep["query_id"])
+        if query_obj is None:
+            return False
+        # The pinned map is keyed by bare query_id (first-wins), so a root that
+        # captures two same-query_id queries with divergent bodies (a factory
+        # twin) can hand back the wrong object. Registering it under the saved
+        # identity would execute the wrong body live and poison the request via
+        # the checked_in_request short-circuit. Refuse unless the live object's
+        # full identity matches the dep's -- mirroring the identity match that
+        # _resolve_checkpoint_resource applies to pinned resources. On refusal
+        # the parent re-executes and binds the correct object via _query_key.
+        live_identity = f"{query_obj.query_id}:{self._code_fingerprint(query_obj.fn)}"
+        if live_identity != dep_key.identity:
+            return False
+        # Never re-run an impure (untracked) leaf as a warm-verification step:
+        # an untracked record is never trusted; let the parent re-execute it.
+        ckpt = self._checkpoint_query_records.get(dep_key)
+        if ckpt is not None and ckpt.get("is_untracked"):
+            return False
+        call_snapshot = self._load_snapshot_from_store(dep["args_digest"])
+        if call_snapshot is None:
+            return False
+        # The call snapshot carries this dep's arguments; an adapted argument
+        # thawed under a since-changed adapter would re-run the pinned query with
+        # the wrong input. Refuse unless every adapter it uses is still trusted.
+        if not self._adapter_keys_trusted(collect_adapter_keys(call_snapshot)):
+            return False
+        # Register the pinned object and restored call snapshot so the executed
+        # dep becomes a fully live node: downstream reuse and future transitive
+        # re-verification both look it up here.
+        self._query_objects()[dep_key.identity] = query_obj
+        self._call_snapshots()[dep_key] = call_snapshot
+        self._ensure_query(query_obj, dep_key, call_snapshot)
+        record = self._records.get(dep_key)
+        return record is not None and record.digest == expected_digest
 
     def _verify_checkpoint_resource_dep(self, dep: dict[str, Any]) -> bool:
         dep_key = NodeKey(
@@ -949,9 +1264,61 @@ class Database:
         record = self._records.get(dep_key)
         if record is not None:
             return record.digest == expected_digest
-        # A probe hint is available — actual probe verification happens lazily
-        # inside _refresh_resource when the resource is first accessed.
-        return dep_key in self._checkpoint_resource_probes
+        # No live record: resolve the resource object from the root's pinned
+        # captures (identity match), thaw its parameter from the store, and probe
+        # LIVE via _refresh_resource. That takes the checkpoint probe-hint fast
+        # path when the probe still matches (snapshot restored from the store) or
+        # a full live load otherwise; either way the resulting record's digest
+        # reflects live state, so the compare below is sound. If the resource
+        # can't be resolved, refuse -- a query-level execute-to-verify may still
+        # re-establish it by re-running the reader.
+        resolved = self._resolve_checkpoint_resource(dep_key)
+        if resolved is None:
+            return False
+        resource, parameter = resolved
+        self._resource_objects()[dep_key] = (resource, parameter)
+        self._refresh_resource(resource, parameter, dep_key)
+        record = self._records.get(dep_key)
+        return record is not None and record.digest == expected_digest
+
+    def _resolve_checkpoint_resource(
+        self, dep_key: NodeKey
+    ) -> tuple[Any, Any] | None:
+        """Resolve (resource object, parameter) for a checkpoint resource dep.
+
+        The object comes from the warm root's pinned captures (matched on the
+        resource's content identity); the parameter is thawed from the store,
+        content-addressed by the dep's args_digest. Any missing piece ⇒ None,
+        which the caller treats as "cannot verify from the checkpoint".
+        """
+        pinned = self._checkpoint_root_pinned_resources
+        if pinned is None:
+            return None
+        resource = pinned.get(dep_key.identity)
+        if resource is None:
+            return None
+        parameter_snapshot = self._load_snapshot_from_store(dep_key.args_digest)
+        if parameter_snapshot is None:
+            return None
+        # A resource parameter that thaws through an adapter must do so under the
+        # same implementation that froze it; a changed thaw could hand the
+        # resource a different-shaped parameter. The round-trip guard below also
+        # catches a changed freeze, but only the digest check catches a thaw-only
+        # change, so gate here explicitly.
+        if not self._adapter_keys_trusted(collect_adapter_keys(parameter_snapshot)):
+            return None
+        parameter = self._thaw_value(parameter_snapshot)
+        # Round-trip guard: the resource must be re-probed/loaded with a parameter
+        # structurally identical to the one it was keyed by. Thawing is lossy for
+        # values with no reconstructor -- a frozen dataclass parameter thaws to a
+        # plain dict -- so re-freeze the thawed parameter and require it to hash
+        # back to this dep's args_digest (computed the same way in _resource_key).
+        # A mismatch means we would drive the resource with a different-shaped
+        # parameter (probe/load raising, or a stale value under this dep_key);
+        # refuse so the caller re-executes live with the real parameter instead.
+        if fingerprint_snapshot(self._freeze_value(parameter)) != dep_key.args_digest:
+            return None
+        return resource, parameter
 
     def _load_snapshot_from_store(self, digest: str) -> Snapshot | None:
         store = self._store or self._checkpoint_load_store
@@ -960,6 +1327,14 @@ class Database:
         with self._allow_raw_reads_scope():
             payload = store.get(digest)
         if payload is None:
+            return None
+        # A snapshot's digest is its content address: sha256 of the exact
+        # serialized bytes (see fingerprint_snapshot/serialize_snapshot in
+        # value.py, which share the same K2;-prefixed encoding). Recompute
+        # it from the raw payload before decoding anything, so corrupted or
+        # swapped bytes under a digest are rejected even when they still
+        # happen to decode into some other valid snapshot.
+        if hashlib.sha256(payload).hexdigest() != digest:
             return None
         try:
             return deserialize_snapshot(payload)
@@ -974,24 +1349,37 @@ class Database:
         with self._allow_raw_reads_scope():
             store.put(digest, payload)
 
-    def _find_input_node_by_name(self, name: str) -> NodeKey | None:
+    def _find_input_node(self, name: str, seq: int) -> NodeKey | None:
         from .core import Input
 
         for input_obj, key in self._input_records.items():
-            if isinstance(input_obj, Input) and input_obj.name == name:
+            if (
+                isinstance(input_obj, Input)
+                and input_obj.name == name
+                and input_obj.seq == seq
+            ):
                 return key
         return None
 
-    def _input_name_for_key(self, key: NodeKey) -> str:
+    def _input_ident_for_key(self, key: NodeKey) -> tuple[str, int]:
         from .core import Input
 
         for input_obj, nk in self._input_records.items():
             if nk == key and isinstance(input_obj, Input):
-                return input_obj.name
+                return input_obj.name, input_obj.seq
         label = key.label
         if label.startswith("input[") and label.endswith("]"):
-            return label[6:-1]
-        return label
+            return label[6:-1], 0
+        return label, 0
+
+    def _query_id_for_key(self, key: NodeKey) -> str:
+        query_obj = self._query_objects().get(key.identity)
+        if query_obj is not None:
+            return str(query_obj.query_id)
+        # No live Query object (e.g. a checkpoint-warmed dep re-saved): recover
+        # the query_id from the identity, which is "<query_id>:<code_fingerprint>"
+        # where the code fingerprint is a colon-free hex digest.
+        return key.identity.rsplit(":", 1)[0]
 
     def _read_input(self, input_key: Input[T]) -> T:
         key = self._input_key(input_key)
@@ -1194,9 +1582,13 @@ class Database:
             query_obj = self._query_objects().get(key.identity)
             call_snapshot = self._call_snapshots().get(key)
             if query_obj is None or call_snapshot is None:
-                # If the record was warmed from a checkpoint without a Query object it was
-                # pre-verified at warm time — rely on changed_at comparison below.
+                # A checkpoint-warmed record has no live Query object to re-run,
+                # so re-verify it transitively through its own edges instead of
+                # trusting it. Anything else with no Query object is treated as
+                # changed (we cannot prove it is not).
                 if not record.checkpoint_loaded:
+                    return True
+                if self._verify_checkpoint_loaded_record(record):
                     return True
             else:
                 self._ensure_query(query_obj, key, call_snapshot)
@@ -1209,6 +1601,20 @@ class Database:
         return (
             self._records[key].is_untracked or self._records[key].changed_at > revision
         )
+
+    def _verify_checkpoint_loaded_record(self, record: NodeRecord) -> bool:
+        """Re-verify a checkpoint-warmed record that has no live Query object.
+
+        Walks its dependency edges: if every dep is unchanged since the record
+        was last verified, the record is still good (bump ``verified_at`` and
+        report unchanged). If any dep changed, report changed so the parent
+        re-executes and re-keys this child against live state.
+        """
+        for dep_key in sorted(record.dependencies, key=lambda item: item.label):
+            if self._maybe_changed_after(dep_key, record.verified_at):
+                return True
+        record.verified_at = self._revision
+        return False
 
     def _refresh_resource(self, resource: Any, parameter: Any, key: NodeKey) -> None:
         atomic = hasattr(resource, "probe_and_load")
@@ -1231,12 +1637,25 @@ class Database:
             self._stats["resource_probe_hits"] += 1
             return
         # Scope-B: if this resource has a checkpoint probe hint and the probe matches,
-        # restore its snapshot from the store without performing a full load.
+        # restore its snapshot from the store without performing a full load. The
+        # hint is a FROZEN probe, so compare the live probe's frozen form: a live
+        # value and a thawed snapshot differ in shape (a frozen-dataclass probe
+        # thaws to a dict) and would never match.
         if record is None and key in self._checkpoint_resource_probes:
-            expected_probe, expected_digest = self._checkpoint_resource_probes[key]
-            if probe == expected_probe:
+            expected_probe_snapshot, expected_digest = self._checkpoint_resource_probes[
+                key
+            ]
+            if freeze(probe) == expected_probe_snapshot:
                 snapshot = self._load_snapshot_from_store(expected_digest)
-                if snapshot is not None:
+                # An adapter whose implementation changed (or vanished) since the
+                # save would thaw this restored snapshot into a value a fresh load
+                # never produces. The probe can stay stable while the adapter code
+                # moves, so gate the restore just like every other thaw-into-live
+                # path; on distrust fall through to the full load, which re-freezes
+                # a fresh load under the live adapter.
+                if snapshot is not None and self._adapter_keys_trusted(
+                    collect_adapter_keys(snapshot)
+                ):
                     self._records[key] = NodeRecord(
                         key=key,
                         label=key.label,
@@ -1445,6 +1864,10 @@ class Database:
             sys.implementation.name,
             getattr(sys.implementation, "cache_tag", None),
             tuple(sys.version_info[:3]),
+            # Build configuration: -O rewrites captured-module behaviour in ways
+            # invisible to source digests, and platform differences matter for a
+            # store shared across operating systems.
+            ("build", sys.flags.optimize, sys.platform, os.name, sys.flags.utf8_mode),
             self._function_definition_payload(fn, set()),
         )
         return fingerprint_snapshot(payload)
@@ -1461,7 +1884,7 @@ class Database:
             return (
                 fn.__module__,
                 fn.__qualname__,
-                marshal.dumps(fn.__code__),
+                marshal.dumps(fn.__code__, _CODE_MARSHAL_VERSION),
                 tuple(
                     self._captured_dependency_digest(
                         f"default[{index}]",
@@ -1501,6 +1924,71 @@ class Database:
         finally:
             seen_functions.remove(fn_id)
 
+    def _current_adapter_digests(self) -> dict[str, str]:
+        """Implementation digest of each registered adapter, keyed by adapted type.
+
+        Cached: ``_adapters`` is fixed at construction, so this is computed once.
+        """
+        if self._adapter_digests_cache is None:
+            self._adapter_digests_cache = {
+                _adapter_key(value_type): self._adapter_implementation_digest(adapter)
+                for value_type, adapter in self._adapters.items()
+            }
+        return self._adapter_digests_cache
+
+    def _adapter_implementation_digest(self, adapter: ValueAdapter) -> str:
+        """Fingerprint an adapter's ``freeze``/``thaw`` implementation.
+
+        Both methods' code is folded in via the same definition-payload machinery
+        that pins query bodies, so a checkpoint record frozen under one adapter is
+        refused under a changed one -- even a change to ``thaw`` alone, which
+        leaves the stored payload (and its digest) untouched. Adapters whose
+        freeze/thaw are not plain Python functions (C-implemented, wrapped) fall
+        back to the adapter type's ``module:qualname``, which still detects a
+        swapped adapter class.
+        """
+        try:
+            payload: Any = (
+                type(adapter).__module__,
+                type(adapter).__qualname__,
+                self._adapter_method_payload(adapter, "freeze"),
+                self._adapter_method_payload(adapter, "thaw"),
+            )
+        except (UnsupportedValueError, TypeError, ValueError):
+            payload = (type(adapter).__module__, type(adapter).__qualname__)
+        return fingerprint_snapshot(payload)
+
+    def _adapter_method_payload(self, adapter: ValueAdapter, method_name: str) -> Any:
+        method = getattr(adapter, method_name, None)
+        fn = getattr(method, "__func__", method)
+        if isinstance(fn, FunctionType):
+            return (method_name, self._function_definition_payload(fn, set()))
+        return (
+            method_name,
+            getattr(method, "__module__", type(adapter).__module__),
+            getattr(method, "__qualname__", type(adapter).__qualname__),
+        )
+
+    def _adapter_keys_trusted(self, adapter_keys: Iterable[str]) -> bool:
+        """True iff every adapter key was frozen by an implementation this process
+        still carries, byte-identical.
+
+        A key absent from the live registry, or one whose implementation digest
+        has moved since the checkpoint, is untrusted: the caller must refuse the
+        warm so the record re-executes and any adapted payload is re-frozen and
+        re-thawed under the live adapter.
+        """
+        if not self._checkpoint_adapter_digests and not self._adapters:
+            # Fast path: no adapters anywhere means nothing to distrust.
+            return True
+        current = self._current_adapter_digests()
+        for adapter_key in adapter_keys:
+            expected = self._checkpoint_adapter_digests.get(adapter_key)
+            live = current.get(adapter_key)
+            if expected is None or live is None or live != expected:
+                return False
+        return True
+
     def _captured_dependency_digest(
         self,
         name: str,
@@ -1512,9 +2000,17 @@ class Database:
         from .core import Input, Query
 
         if isinstance(value, Query):
-            return ("query", value.query_id)
+            # Fold the captured query's full definition into the parent's
+            # identity so a change to a dependency query's body moves the parent.
+            return (
+                "query",
+                value.query_id,
+                self._function_definition_payload(
+                    cast(FunctionType, value.fn), seen_functions
+                ),
+            )
         if isinstance(value, Input):
-            return ("input", value.name, id(value))
+            return ("input", value.name, value.seq)
         if self._is_resource_handle(value):
             return ("resource", self._resource_identity_payload(value))
         if isinstance(value, ModuleType):
@@ -1537,6 +2033,70 @@ class Database:
                 "Move mutable state behind Input/Resource nodes or use an immutable value. "
                 "Run pyinc.explain_query_captures(...) to inspect the capture set before the first db.get()."
             ) from exc
+
+    def _collect_pinned_captures(
+        self, fn: FunctionType
+    ) -> tuple[builtins.set[str], builtins.set[str]]:
+        """Collect the code-pinned query_ids and resource identities of *fn*.
+
+        A thin view over :meth:`_collect_pinned_capture_objects`: the query set
+        drives the warm-time gate (a dep query outside it was reached via a
+        runtime import / dynamic dispatch and must not be served stale); the
+        resource set is the identity space the resource gate resolves against.
+        """
+        query_objects, resource_objects = self._collect_pinned_capture_objects(fn)
+        return builtins.set(query_objects), builtins.set(resource_objects)
+
+    def _collect_pinned_capture_objects(
+        self, fn: FunctionType
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Collect the code-pinned query and resource *objects* reachable from *fn*.
+
+        Walks the same capture set as ``_function_definition_payload``
+        (defaults, kwdefaults, closure nonlocals, globals), recursing through
+        captured functions and queries. Returns ``(query_id -> Query object,
+        resource identity -> resource object)``; a query or resource reached only
+        via a runtime import or dynamic dispatch is *not* captured and never
+        appears here. The maps let the warm path re-run a pinned leaf
+        (execute-to-verify) and re-probe a pinned resource (probe-hint) by their
+        manifest identities.
+        """
+        from .core import Input, Query
+
+        query_objects: dict[str, Any] = {}
+        resource_objects: dict[str, Any] = {}
+        seen_functions: set[int] = set()
+
+        def walk_function(target: FunctionType) -> None:
+            fn_id = id(target)
+            if fn_id in seen_functions:
+                return
+            seen_functions.add(fn_id)
+            closure_vars = inspect.getclosurevars(target)
+            values: list[Any] = list(target.__defaults__ or ())
+            values.extend((target.__kwdefaults__ or {}).values())
+            values.extend(closure_vars.nonlocals.values())
+            values.extend(closure_vars.globals.values())
+            for value in values:
+                walk_value(value)
+
+        def walk_value(value: Any) -> None:
+            if isinstance(value, Query):
+                query_objects.setdefault(value.query_id, value)
+                walk_function(cast(FunctionType, value.fn))
+            elif isinstance(value, Input):
+                return
+            elif self._is_resource_handle(value):
+                identity = fingerprint_snapshot(self._resource_identity_payload(value))
+                resource_objects.setdefault(
+                    f"{type(value).__module__}:{type(value).__qualname__}:{identity}",
+                    value,
+                )
+            elif isinstance(value, FunctionType):
+                walk_function(value)
+
+        walk_function(fn)
+        return query_objects, resource_objects
 
     def _module_identity_payload(self, module: ModuleType) -> Any:
         """Compute a structural digest for a captured module.
