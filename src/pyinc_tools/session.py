@@ -10,13 +10,15 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from pyinc import Database
 from pyinc.integrations import (
+    ClassMember,
+    ClassModel,
     ConfigAnalysis,
     DependencyCheckAnalysis,
     DependencyStatus,
@@ -33,6 +35,7 @@ from pyinc.integrations import (
     Signature,
     Symbol,
     WorkspaceSymbolIndex,
+    class_model,
     find_references,
     module_analysis,
     module_symbol_table,
@@ -61,6 +64,11 @@ DEFAULT_IGNORED_DIR_NAMES = frozenset(
     }
 )
 
+# Diagnostic codes that `code_actions_for_range` can offer a quick fix for.
+_CODE_ACTION_CODES = frozenset(
+    {"unused-import", "missing-import", "unresolved-symbol"}
+)
+
 
 @dataclass(frozen=True)
 class AnalysisDiagnostic:
@@ -71,6 +79,7 @@ class AnalysisDiagnostic:
     source: str
     lineno: int | None = None
     col_offset: int | None = None
+    tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -153,6 +162,42 @@ class FileDeletionEdit:
     new_text: str = ""
 
 
+CodeActionKind = Literal["quickfix"]
+
+
+@dataclass(frozen=True)
+class CodeActionEdit:
+    """A single text edit produced by a code action.
+
+    All position fields are 0-based (LSP-style); ``new_text`` is the empty
+    string for the deletion-style fixes and the replacement text for the
+    retarget-style fixes.
+    """
+
+    path: str
+    start_line: int
+    start_character: int
+    end_line: int
+    end_character: int
+    new_text: str = ""
+
+
+@dataclass(frozen=True)
+class CodeAction:
+    """A quick fix anchored to a single diagnostic.
+
+    ``diagnostic`` is the analysis diagnostic the fix resolves; the LSP layer
+    echoes it back (converted) in the ``diagnostics`` field of the response so
+    the client can associate the action with the problem. ``edits`` are the
+    workspace text edits that apply the fix.
+    """
+
+    title: str
+    kind: CodeActionKind
+    diagnostic: AnalysisDiagnostic
+    edits: tuple[CodeActionEdit, ...]
+
+
 DocumentHighlightKind = Literal["text", "read", "write"]
 
 
@@ -162,6 +207,13 @@ class DocumentHighlight:
     col_offset: int
     end_col_offset: int
     kind: DocumentHighlightKind
+
+
+@dataclass(frozen=True)
+class LinkedEditingRange:
+    lineno: int
+    col_offset: int
+    end_col_offset: int
 
 
 @dataclass(frozen=True)
@@ -454,6 +506,66 @@ def _find_from_module_span(
     return (line_idx, cursor, end)
 
 
+def _import_node_for_line(
+    nodes: Sequence[ast.Import | ast.ImportFrom], lineno: int | None
+) -> ast.Import | ast.ImportFrom | None:
+    """Return the import statement whose line span covers ``lineno``.
+
+    Diagnostics anchor at different points: ``unused-import`` sits on the
+    individual alias line, which in a parenthesised multi-line import is
+    *not* the statement's first line, whereas ``missing-import`` /
+    ``unresolved-symbol`` sit on the statement line. A span-aware lookup
+    (``node.lineno <= lineno <= node.end_lineno``) matches all three; import
+    statements never overlap, so at most one node matches.
+    """
+    if lineno is None:
+        return None
+    for node in nodes:
+        end = node.end_lineno if node.end_lineno is not None else node.lineno
+        if node.lineno <= lineno <= end:
+            return node
+    return None
+
+
+def _static_module_all_names(tree: ast.Module) -> frozenset[str]:
+    """Names in the module's *static* ``__all__``, or empty when it has none.
+
+    Mirrors the integration's ``static_all_names`` notion: only a literal
+    ``__all__`` list / tuple / set of string constants at module scope
+    counts. A dynamically built or mutated ``__all__`` cannot be inspected
+    statically and yields the empty set (no suppression). Used to leave
+    intentional public re-exports (``from m import foo`` with ``foo`` in this
+    module's own ``__all__``) unflagged.
+    """
+    names: set[str] = set()
+    has_static = False
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+            value: ast.expr | None = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "__all__"
+            for target in targets
+        ):
+            continue
+        literal: set[str] = set()
+        if value is None or not isinstance(value, (ast.List, ast.Set, ast.Tuple)):
+            # A non-literal `__all__` is dynamic — can't confirm membership.
+            return frozenset()
+        for item in value.elts:
+            if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                return frozenset()
+            literal.add(item.value)
+        names = literal
+        has_static = True
+    return frozenset(names) if has_static else frozenset()
+
+
 def _statement_line_span(source: str, node: ast.stmt) -> tuple[int, int] | None:
     """Return ``(start_line, end_line)`` for an import statement to delete.
 
@@ -632,9 +744,13 @@ def _identifier_at_source_position(
 def _identifier_immediately_before(source: str, paren_pos: int) -> str | None:
     """Return the identifier appearing immediately before `(` at `paren_pos`.
 
-    Returns None when the preceding token is not a usable identifier — for
-    example a closing bracket, a literal, a Python keyword, or the name of
-    a `def` / `class` definition header (which is not a call site).
+    Recognises a bare identifier (``foo``) or a single-dot attribute access
+    whose left-hand side is itself a bare name (``M.foo``). Returns None when
+    the preceding token is not a usable identifier — a closing bracket, a
+    literal, a Python keyword, or the name of a `def` / `class` definition
+    header (which is not a call site). Deeper chains (``pkg.sub.foo``) and
+    non-`Name` left-hand sides fall back to the bare rightmost identifier,
+    which the caller resolves (and typically fails to resolve) as a plain name.
     """
     j = paren_pos - 1
     while j >= 0 and source[j] in " \t":
@@ -662,6 +778,27 @@ def _identifier_immediately_before(source: str, paren_pos: int) -> str | None:
             prev_start -= 1
         if source[prev_start:prev_end] in ("def", "class"):
             return None
+        return name
+    if k >= 0 and source[k] == ".":
+        # `<lhs>.name(` — capture the owner only when it is a single bare Name.
+        m = k - 1
+        while m >= 0 and source[m] in " \t":
+            m -= 1
+        if m < 0 or not (source[m].isalnum() or source[m] == "_"):
+            return name
+        lhs_end = m + 1
+        while m >= 0 and (source[m].isalnum() or source[m] == "_"):
+            m -= 1
+        lhs = source[m + 1 : lhs_end]
+        if not lhs or lhs[0].isdigit() or keyword.iskeyword(lhs):
+            return name
+        p = m
+        while p >= 0 and source[p] in " \t":
+            p -= 1
+        if p >= 0 and source[p] == ".":
+            # A deeper chain (`a.b.name(`) — LHS is not a bare Name.
+            return name
+        return f"{lhs}.{name}"
     return name
 
 
@@ -675,9 +812,10 @@ def _find_call_at_position(
     The scanner runs forward over `source`, skipping comments and string
     literals, and tracks a stack of open brackets. The topmost open `(`
     whose preceding token is a usable identifier is the enclosing call;
-    its accumulated comma count yields the active parameter index. Only
-    bare-name calls are detected — attribute calls (``obj.method(``) and
-    subscripted calls (``factory[T](``) are not recognised.
+    its accumulated comma count yields the active parameter index. Bare-name
+    calls (``foo(``) and single-dot attribute calls whose owner is a bare
+    name (``M.foo(``) are detected; deeper chains (``pkg.sub.foo(``) and
+    subscripted calls (``factory[T](``) are not.
     """
     target = _line_char_to_offset(source, line, character)
     if target is None:
@@ -830,9 +968,12 @@ def _find_completion_context(
     run = _completion_token_before(head)
     if "." in run:
         owner, _, prefix = run.rpartition(".")
-        if not owner.isidentifier():
-            # Attribute chains whose owner is not a bare name are out of scope,
-            # matching the resolver's LHS-bare-Name limitation elsewhere.
+        # Accept a bare name (``M.``) or a dotted owner whose every component
+        # is an identifier (``pkg.sub.``, ``pkg.sub.M.``); reject anything with
+        # an empty / numeric component (a leading dot, ``1.``, etc.). The
+        # session decides which dotted owners actually resolve to a workspace
+        # module or module-class.
+        if not all(part.isidentifier() for part in owner.split(".")):
             return None
         return ("attribute", owner, prefix)
     return ("name", run)
@@ -887,18 +1028,32 @@ def _keyword_completions(prefix: str) -> list[CompletionItem]:
 
 
 def _build_signature_label(
-    name: str, signature: Signature
+    name: str,
+    signature: Signature,
+    defaults: Mapping[str, str] | None = None,
 ) -> tuple[str, tuple[SignatureParameterInfo, ...]]:
+    """Render a ``def name(...)`` label and per-parameter substring offsets.
+
+    ``defaults`` maps a parameter name to the source text of its default value
+    (``ast.unparse``d); parameters absent from the mapping render without one.
+    Spacing follows PEP 8: ``name: ann = default`` when annotated, ``name=default``
+    otherwise. When ``defaults`` is ``None`` the output is byte-identical to the
+    annotation-only rendering used by hover and completion detail.
+    """
     parts: list[str] = [f"def {name}("]
     info: list[SignatureParameterInfo] = []
     for index, parameter in enumerate(signature.parameters):
         if index > 0:
             parts.append(", ")
-        text = (
-            f"{parameter.name}: {parameter.annotation}"
-            if parameter.annotation is not None
-            else parameter.name
-        )
+        default = defaults.get(parameter.name) if defaults else None
+        if parameter.annotation is not None:
+            text = f"{parameter.name}: {parameter.annotation}"
+            if default is not None:
+                text = f"{text} = {default}"
+        else:
+            text = parameter.name
+            if default is not None:
+                text = f"{text}={default}"
         offset = sum(len(piece) for piece in parts)
         parts.append(text)
         info.append(
@@ -912,6 +1067,68 @@ def _build_signature_label(
     if signature.return_annotation is not None:
         parts.append(f" -> {signature.return_annotation}")
     return "".join(parts), tuple(info)
+
+
+def _defaults_from_arguments(args: ast.arguments) -> dict[str, str]:
+    """Map parameter name → ``ast.unparse``d default expression for `args`.
+
+    Positional defaults (``args.defaults``) are tail-aligned against the
+    posonly + positional parameters; keyword-only defaults (``args.kw_defaults``)
+    zip 1:1 with ``args.kwonlyargs`` (a ``None`` slot means no default).
+    Parameters without a default are omitted.
+    """
+    defaults: dict[str, str] = {}
+    positional = [*args.posonlyargs, *args.args]
+    positional_defaults = list(args.defaults)
+    if positional_defaults:
+        for arg, default in zip(
+            positional[-len(positional_defaults) :],
+            positional_defaults,
+            strict=True,
+        ):
+            defaults[arg.arg] = ast.unparse(default)
+    for arg, kw_default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+        if kw_default is not None:
+            defaults[arg.arg] = ast.unparse(kw_default)
+    return defaults
+
+
+def _parameter_defaults_from_source(
+    source: str, lineno: int, name: str
+) -> dict[str, str] | None:
+    """Default-value expressions for the callable named `name` at `lineno`.
+
+    Parses `source` (the *defining* file) and locates the
+    ``FunctionDef`` / ``AsyncFunctionDef`` whose header is at 1-based `lineno`
+    with a matching `name`; for a ``ClassDef`` it digs into the class's
+    ``__init__``. Returns the name→default mapping (see
+    :func:`_defaults_from_arguments`), or ``None`` when the file fails to parse
+    or no matching definition is found. ``self`` / ``cls`` carry no default, so
+    the mapping already matches the self-stripped constructor signature."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.lineno == lineno
+            and node.name == name
+        ):
+            return _defaults_from_arguments(node.args)
+        if (
+            isinstance(node, ast.ClassDef)
+            and node.lineno == lineno
+            and node.name == name
+        ):
+            for stmt in node.body:
+                if (
+                    isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and stmt.name == "__init__"
+                ):
+                    return _defaults_from_arguments(stmt.args)
+            return {}
+    return None
 
 
 def _collect_annotation_type_refs(
@@ -1293,6 +1510,147 @@ def _enclosing_callable_qname(
 
     visit(tree, "")
     return best[1] if best is not None else None
+
+
+def _first_positional_param(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> str | None:
+    """Name of a callable's first positional parameter, or ``None``.
+
+    Positional-only parameters take precedence, then regular positionals; a
+    callable that takes only ``*args`` / keyword parameters has none."""
+    args = node.args
+    if args.posonlyargs:
+        return args.posonlyargs[0].arg
+    if args.args:
+        return args.args[0].arg
+    return None
+
+
+def _enclosing_method_context(
+    tree: ast.Module, line: int
+) -> tuple[str, str] | None:
+    """The class qualifier and first-parameter name of the method enclosing
+    the 1-based `line`, or ``None``.
+
+    The innermost callable containing `line` must be a ``FunctionDef`` /
+    ``AsyncFunctionDef`` that is a *direct* child of a ``ClassDef`` body — a
+    closure nested inside a method returns ``None``, as does a module-level
+    function or a caret outside any callable. The class qualifier follows
+    ``module_symbol_table``'s scheme (``Outer.Inner``; function-nested classes
+    reset). The first-parameter name is returned verbatim so the caller can
+    apply the literal ``self`` / ``cls`` rule; a method with no positional
+    parameter yields ``None``.
+    """
+    best: tuple[int, tuple[str, str] | None] | None = None
+
+    def visit(node: ast.AST, class_qualifier: str, direct_class: str | None) -> None:
+        nonlocal best
+        if isinstance(node, ast.ClassDef):
+            qname = (
+                f"{class_qualifier}.{node.name}" if class_qualifier else node.name
+            )
+            for body_child in node.body:
+                visit(body_child, qname, qname)
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end_lineno = node.end_lineno or node.lineno
+            if node.lineno <= line <= end_lineno:
+                span = end_lineno - node.lineno
+                first = _first_positional_param(node)
+                payload = (
+                    (direct_class, first)
+                    if direct_class is not None and first is not None
+                    else None
+                )
+                if best is None or span < best[0]:
+                    best = (span, payload)
+            for descendant in ast.iter_child_nodes(node):
+                visit(descendant, "", None)
+            return
+        for descendant in ast.iter_child_nodes(node):
+            visit(descendant, class_qualifier, None)
+
+    visit(tree, "", None)
+    return best[1] if best is not None else None
+
+
+def _iter_own_scope(node: ast.AST) -> Iterator[ast.AST]:
+    """Yield the descendants of `node` that share its scope.
+
+    Descends through control-flow blocks (``if`` / ``for`` / ``while`` /
+    ``with`` / ``try``) but never into nested ``def`` / ``async def`` /
+    ``class`` / ``lambda`` bodies, so a scan stays inside `node`'s own scope."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(
+            child,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+        ):
+            continue
+        yield child
+        yield from _iter_own_scope(child)
+
+
+def _annotation_expr_for_name_at(
+    tree: ast.Module, line: int, name: str
+) -> ast.expr | None:
+    """Annotation expression bound to bare ``name`` visible at 1-based `line`.
+
+    Rule A's local declaration lookup — first hit wins:
+
+    1. a parameter named ``name`` (with an annotation) of the innermost
+       function enclosing `line`;
+    2. otherwise the nearest preceding ``AnnAssign`` to bare ``Name`` ``name``
+       (``lineno <= line``) inside that same function's own scope — control-flow
+       blocks are searched, nested ``def`` / ``class`` / ``lambda`` scopes are
+       not.
+
+    Returns the annotation node, or ``None`` when neither applies. The
+    module-level fallback (priority 3) is the caller's responsibility."""
+    enclosing: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    enclosing_span: int | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = node.end_lineno or node.lineno
+            if node.lineno <= line <= end:
+                span = end - node.lineno
+                if enclosing_span is None or span < enclosing_span:
+                    enclosing = node
+                    enclosing_span = span
+    if enclosing is None:
+        return None
+
+    args = enclosing.args
+    params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+    if args.vararg is not None:
+        params.append(args.vararg)
+    if args.kwarg is not None:
+        params.append(args.kwarg)
+    for param in params:
+        if param.arg == name and param.annotation is not None:
+            return param.annotation
+
+    best: ast.expr | None = None
+    best_lineno = 0
+    for stmt in _iter_own_scope(enclosing):
+        if (
+            isinstance(stmt, ast.AnnAssign)
+            and isinstance(stmt.target, ast.Name)
+            and stmt.target.id == name
+            and stmt.lineno <= line
+            and stmt.lineno > best_lineno
+        ):
+            best = stmt.annotation
+            best_lineno = stmt.lineno
+    return best
+
+
+# self./cls. member views: `self` sees instance attributes plus everything the
+# class view sees; `cls` never sees instance attributes.
+_INSTANCE_MEMBER_KINDS: frozenset[str] = frozenset(
+    {"method", "class_variable", "instance_variable"}
+)
+_CLASS_MEMBER_KINDS: frozenset[str] = frozenset({"method", "class_variable"})
 
 
 def _collect_outgoing_calls(
@@ -1806,6 +2164,317 @@ class WorkspaceSession:
                 diagnostics=diagnostics,
             )
 
+    def code_actions_for_range(
+        self,
+        path: str | os.PathLike[str],
+        start_line: int,
+        start_character: int,
+        end_line: int,
+        end_character: int,
+    ) -> tuple[CodeAction, ...]:
+        """Quick fixes anchored to diagnostics intersecting a line range.
+
+        Anchoring is line-granular (``start_character`` / ``end_character``
+        are accepted for LSP shape parity but not used to trim the match):
+        every diagnostic whose line falls within ``[start_line, end_line]``
+        and whose code is fixable contributes its actions. The file is parsed
+        once; when it does not parse, no actions are produced (every fix needs
+        the AST). All actions are ``kind == "quickfix"``.
+        """
+        del start_character, end_character
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            result = self.analyze_file(real_path)
+            anchors = [
+                diagnostic
+                for diagnostic in result.diagnostics
+                if diagnostic.code in _CODE_ACTION_CODES
+                and start_line <= max((diagnostic.lineno or 1) - 1, 0) <= end_line
+            ]
+            if not anchors:
+                return ()
+            source = self.source_text(real_path)
+            if source is None:
+                return ()
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                return ()
+            import_nodes: list[ast.Import | ast.ImportFrom] = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+            ]
+            mirror_path = str(self._mirror_path_for_real(real_path))
+            module_result = result.module
+
+            actions: list[CodeAction] = []
+            seen: set[tuple[str, tuple[tuple[str, int, int, int, int, str], ...]]] = (
+                set()
+            )
+            for diagnostic in anchors:
+                import_node = _import_node_for_line(import_nodes, diagnostic.lineno)
+                if import_node is None:
+                    continue
+                if diagnostic.code == "unused-import":
+                    built = self._unused_import_actions(
+                        real_path, source, import_node, diagnostic
+                    )
+                elif diagnostic.code == "missing-import":
+                    built = self._missing_import_actions(
+                        real_path, module_result, source, import_node, diagnostic
+                    )
+                else:  # unresolved-symbol
+                    built = self._unresolved_symbol_actions(
+                        real_path, mirror_path, source, import_node, diagnostic
+                    )
+                for action in built:
+                    fingerprint = (
+                        action.title,
+                        tuple(
+                            (
+                                edit.path,
+                                edit.start_line,
+                                edit.start_character,
+                                edit.end_line,
+                                edit.end_character,
+                                edit.new_text,
+                            )
+                            for edit in action.edits
+                        ),
+                    )
+                    if fingerprint in seen:
+                        continue
+                    seen.add(fingerprint)
+                    actions.append(action)
+            return tuple(actions)
+
+    def _alias_removal_edits(
+        self,
+        importer_path: str,
+        source: str,
+        node: ast.Import | ast.ImportFrom,
+        dead_index: int,
+    ) -> list[CodeActionEdit]:
+        if len(node.names) == 1:
+            span = _statement_line_span(source, node)
+            if span is None:
+                return []
+            start_line, end_line = span
+            return [
+                CodeActionEdit(
+                    path=importer_path,
+                    start_line=start_line,
+                    start_character=0,
+                    end_line=end_line,
+                    end_character=0,
+                )
+            ]
+        return [
+            CodeActionEdit(
+                path=edit.path,
+                start_line=edit.start_line,
+                start_character=edit.start_character,
+                end_line=edit.end_line,
+                end_character=edit.end_character,
+            )
+            for edit in _alias_list_deletion_edits(
+                importer_path=importer_path,
+                source=source,
+                aliases=node.names,
+                dead_indices=[dead_index],
+            )
+        ]
+
+    def _whole_statement_edit(
+        self, importer_path: str, source: str, node: ast.stmt
+    ) -> CodeActionEdit | None:
+        span = _statement_line_span(source, node)
+        if span is None:
+            return None
+        start_line, end_line = span
+        return CodeActionEdit(
+            path=importer_path,
+            start_line=start_line,
+            start_character=0,
+            end_line=end_line,
+            end_character=0,
+        )
+
+    def _unused_import_actions(
+        self,
+        importer_path: str,
+        source: str,
+        node: ast.Import | ast.ImportFrom,
+        diagnostic: AnalysisDiagnostic,
+    ) -> list[CodeAction]:
+        if not isinstance(node, ast.ImportFrom):
+            return []
+        # The diagnostic anchors at the alias's (lineno, col_offset). Matching
+        # on both is required for parenthesised multi-line imports, where every
+        # alias shares one column and only the line disambiguates them.
+        dead_index = next(
+            (
+                i
+                for i, alias in enumerate(node.names)
+                if alias.lineno == diagnostic.lineno
+                and alias.col_offset == diagnostic.col_offset
+            ),
+            None,
+        )
+        if dead_index is None:
+            return []
+        alias = node.names[dead_index]
+        binding = alias.asname or alias.name
+        edits = self._alias_removal_edits(importer_path, source, node, dead_index)
+        if not edits:
+            return []
+        return [
+            CodeAction(
+                title=f"Remove unused import {binding!r}",
+                kind="quickfix",
+                diagnostic=diagnostic,
+                edits=tuple(edits),
+            )
+        ]
+
+    def _missing_import_actions(
+        self,
+        importer_path: str,
+        module_result: PythonModuleAnalysis | None,
+        source: str,
+        node: ast.Import | ast.ImportFrom,
+        diagnostic: AnalysisDiagnostic,
+    ) -> list[CodeAction]:
+        edits: list[CodeActionEdit]
+        if isinstance(node, ast.ImportFrom):
+            # The from-module itself is unresolvable — the whole statement goes.
+            edit = self._whole_statement_edit(importer_path, source, node)
+            edits = [edit] if edit is not None else []
+        else:
+            if module_result is None:
+                return []
+            missing_modules = {
+                resolved_import.module
+                for resolved_import in module_result.resolved_imports
+                if resolved_import.lineno == diagnostic.lineno
+                and resolved_import.resolution == "missing"
+            }
+            dead_indices = [
+                i for i, alias in enumerate(node.names) if alias.name in missing_modules
+            ]
+            if not dead_indices:
+                return []
+            if len(dead_indices) == len(node.names):
+                edit = self._whole_statement_edit(importer_path, source, node)
+                edits = [edit] if edit is not None else []
+            else:
+                edits = [
+                    CodeActionEdit(
+                        path=deletion.path,
+                        start_line=deletion.start_line,
+                        start_character=deletion.start_character,
+                        end_line=deletion.end_line,
+                        end_character=deletion.end_character,
+                    )
+                    for deletion in _alias_list_deletion_edits(
+                        importer_path=importer_path,
+                        source=source,
+                        aliases=node.names,
+                        dead_indices=dead_indices,
+                    )
+                ]
+        if not edits:
+            return []
+        return [
+            CodeAction(
+                title="Remove unresolvable import",
+                kind="quickfix",
+                diagnostic=diagnostic,
+                edits=tuple(edits),
+            )
+        ]
+
+    def _unresolved_symbol_actions(
+        self,
+        importer_path: str,
+        mirror_path: str,
+        source: str,
+        node: ast.Import | ast.ImportFrom,
+        diagnostic: AnalysisDiagnostic,
+    ) -> list[CodeAction]:
+        if not isinstance(node, ast.ImportFrom):
+            return []
+        actions: list[CodeAction] = []
+        for i, alias in enumerate(node.names):
+            if alias.name == "*":
+                continue
+            resolved = resolve_symbol(
+                self.db, self.mirror_root, mirror_path, alias.name
+            )
+            if resolved.resolution != "missing":
+                continue
+            binding = alias.asname or alias.name
+            removal = self._alias_removal_edits(importer_path, source, node, i)
+            if removal:
+                actions.append(
+                    CodeAction(
+                        title=f"Remove import of {binding!r}",
+                        kind="quickfix",
+                        diagnostic=diagnostic,
+                        edits=tuple(removal),
+                    )
+                )
+            retarget = self._retarget_from_module_action(
+                importer_path, source, node, alias.name, diagnostic
+            )
+            if retarget is not None:
+                actions.append(retarget)
+        return actions
+
+    def _retarget_from_module_action(
+        self,
+        importer_path: str,
+        source: str,
+        node: ast.ImportFrom,
+        name: str,
+        diagnostic: AnalysisDiagnostic,
+    ) -> CodeAction | None:
+        # Only a single-name statement can be retargeted without breaking a
+        # sibling import that still resolves against the current from-module.
+        if len(node.names) != 1:
+            return None
+        index = workspace_symbol_index(self.db, self.mirror_root)
+        modules = {
+            entry.module
+            for entry in index.entries
+            if entry.qualified_name == name
+            and "." not in entry.qualified_name
+            and entry.kind in ("function", "class", "variable")
+        }
+        if len(modules) != 1:
+            return None
+        target_module = next(iter(modules))
+        located = _find_from_module_span(source.splitlines(), node)
+        if located is None:
+            return None
+        line_idx, start_col, end_col = located
+        edit = CodeActionEdit(
+            path=importer_path,
+            start_line=line_idx,
+            start_character=start_col,
+            end_line=line_idx,
+            end_character=end_col,
+            new_text=target_module,
+        )
+        return CodeAction(
+            title=f"Import {name!r} from {target_module!r}",
+            kind="quickfix",
+            diagnostic=diagnostic,
+            edits=(edit,),
+        )
+
     def resolve_symbol_reference(
         self,
         path: str | os.PathLike[str],
@@ -1908,6 +2577,21 @@ class WorkspaceSession:
             highlights.sort(key=lambda h: (h.lineno, h.col_offset))
             return tuple(highlights)
 
+    def linked_editing_ranges_at(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+    ) -> tuple[LinkedEditingRange, ...]:
+        highlights = self.find_document_highlights(path, qualified_name)
+        return tuple(
+            LinkedEditingRange(
+                lineno=highlight.lineno,
+                col_offset=highlight.col_offset,
+                end_col_offset=highlight.end_col_offset,
+            )
+            for highlight in highlights
+        )
+
     def signature_help_at(
         self,
         path: str | os.PathLike[str],
@@ -1927,18 +2611,29 @@ class WorkspaceSession:
             if located is None:
                 return None
             function_name, active_index = located
-            resolved = self._remap_resolved_symbol(
-                resolve_symbol(
-                    self.db, self.mirror_root, str(mirror_path), function_name
+            if "." in function_name:
+                # ``M.foo(`` — resolve the LHS to a workspace module, then the
+                # attribute within it (the shared bare-Name-LHS idiom).
+                lhs, _, attr = function_name.partition(".")
+                resolved = self._resolve_attr_on_module(mirror_path, lhs, attr)
+                if resolved is None:
+                    return None
+            else:
+                resolved = self._remap_resolved_symbol(
+                    resolve_symbol(
+                        self.db, self.mirror_root, str(mirror_path), function_name
+                    )
                 )
-            )
             if resolved.resolution != "workspace":
                 return None
             callable_info = self._lookup_callable_signature(resolved)
             if callable_info is None:
                 return None
             display_name, signature = callable_info
-            label, parameters = _build_signature_label(display_name, signature)
+            defaults = self._signature_defaults(resolved, display_name)
+            label, parameters = _build_signature_label(
+                display_name, signature, defaults
+            )
             active_parameter = (
                 active_index if 0 <= active_index < len(parameters) else None
             )
@@ -1989,7 +2684,22 @@ class WorkspaceSession:
                 owner, prefix = context[1], context[2]
                 with self._repaired_current_file(mirror_path, source, line) as ok:
                     if ok:
-                        items += self._attribute_completions(mirror_path, owner, prefix)
+                        if owner in ("self", "cls"):
+                            items += self._self_or_cls_completions(
+                                mirror_path, source, line, owner, prefix
+                            )
+                        else:
+                            items += self._attribute_completions(
+                                mirror_path, owner, prefix
+                            )
+                            # Rule A: a single-component owner that the
+                            # resolve_symbol path could not turn into a
+                            # module/class may still be a locally annotated
+                            # name — follow its annotation to a workspace class.
+                            if not items and "." not in owner:
+                                items += self._annotated_name_completions(
+                                    mirror_path, source, line, owner, prefix
+                                )
             elif kind == "from_import":
                 module, prefix = context[1], context[2]
                 items += self._module_member_completions(module, prefix)
@@ -2103,7 +2813,99 @@ class WorkspaceSession:
     def _attribute_completions(
         self, mirror_path: Path, owner: str, prefix: str
     ) -> list[CompletionItem]:
-        """Members of ``owner`` when it resolves to a workspace module or class."""
+        """Members of ``owner`` when it resolves to a workspace module or class.
+
+        A single-component ``owner`` (``M.``) keeps the ``resolve_symbol`` path.
+        A dotted ``owner`` is handled longest-match-first: the whole owner as a
+        workspace module (``pkg.sub.``), else ``head.Class`` where ``head`` is a
+        workspace module and ``Class`` a class in it (``pkg.sub.C.``, ``M.C.``).
+        Instance chains (``obj.attr.``) resolve to nothing — no type inference.
+        """
+        if "." in owner:
+            return self._dotted_owner_completions(mirror_path, owner, prefix)
+        return self._bare_owner_completions(mirror_path, owner, prefix)
+
+    def _dotted_owner_completions(
+        self, mirror_path: Path, owner: str, prefix: str
+    ) -> list[CompletionItem]:
+        # Rule 1: the dotted owner is itself a workspace module.
+        if self._is_workspace_module(owner):
+            return self._module_member_completions(owner, prefix)
+        # Rule 2: ``head.Class`` — head is a workspace module, Class a class in it.
+        head, _, last = owner.rpartition(".")
+        module = self._resolve_owner_module(mirror_path, head)
+        if module is None:
+            return []
+        return self._class_member_completions_from_index(module, last, prefix)
+
+    def _is_workspace_module(self, name: str) -> bool:
+        """True when `name` is exactly a module in the workspace symbol index.
+
+        Exact match keeps dotted-owner resolution unambiguous — module names
+        are unique per path, so there is no fuzzy ``import`` guessing."""
+        index = workspace_symbol_index(self.db, self.mirror_root)
+        return any(entry.module == name for entry in index.entries)
+
+    def _resolve_owner_module(
+        self, mirror_path: Path, owner: str
+    ) -> str | None:
+        """The workspace module `owner` denotes, or ``None``.
+
+        A dotted `owner` matches a module by exact index name; a single bare
+        name is resolved through the file's imports (``resolve_symbol``) and
+        accepted only when it lands on a workspace *module* (no ``defining_lineno``
+        — a specific symbol line would mean a class / function / variable)."""
+        if self._is_workspace_module(owner):
+            return owner
+        if "." in owner:
+            return None
+        resolved = self._remap_resolved_symbol(
+            resolve_symbol(self.db, self.mirror_root, str(mirror_path), owner)
+        )
+        if (
+            resolved.resolution == "workspace"
+            and resolved.defining_lineno is None
+            and resolved.defining_module is not None
+            and self._is_workspace_module(resolved.defining_module)
+        ):
+            return resolved.defining_module
+        return None
+
+    def _class_member_completions_from_index(
+        self, module: str, class_name: str, prefix: str
+    ) -> list[CompletionItem]:
+        """Members of ``module.class_name`` drawn from the workspace index.
+
+        Returns ``[]`` unless ``class_name`` is actually a class in ``module``."""
+        index = workspace_symbol_index(self.db, self.mirror_root)
+        member_prefix = f"{class_name}."
+        is_class = False
+        items: list[CompletionItem] = []
+        for entry in index.entries:
+            if entry.module != module:
+                continue
+            qname = entry.qualified_name
+            if qname == class_name and entry.kind == "class":
+                is_class = True
+                continue
+            if not qname.startswith(member_prefix) or qname.count(".") != 1:
+                continue
+            member = qname.split(".", 1)[1]
+            if not member.startswith(prefix):
+                continue
+            kind = _SYMBOL_TO_COMPLETION_KIND.get(entry.kind, "variable")
+            detail = f"{member}: {entry.annotation}" if entry.annotation else None
+            items.append(
+                CompletionItem(
+                    label=member, kind=kind, detail=detail, sort_text=f"0{member}"
+                )
+            )
+        return items if is_class else []
+
+    def _bare_owner_completions(
+        self, mirror_path: Path, owner: str, prefix: str
+    ) -> list[CompletionItem]:
+        """Members of a single bare-name ``owner`` via ``resolve_symbol``."""
         resolved = self._remap_resolved_symbol(
             resolve_symbol(self.db, self.mirror_root, str(mirror_path), owner)
         )
@@ -2136,21 +2938,201 @@ class WorkspaceSession:
                     items.append(item)
             return items
         if owner_symbol.kind == "class":
-            # ``owner`` is a class → offer its methods and class variables.
-            member_prefix = f"{owner_bare}."
-            for symbol in table.symbols:
-                qname = symbol.qualified_name
-                if not qname.startswith(member_prefix) or qname.count(".") != 1:
+            # ``owner`` is a class → offer the flattened CLASS view (own +
+            # inherited methods and class vars, no instance attributes) from the
+            # `class_model` surface, so `Derived.` sees members from workspace
+            # bases just like `self.`/`cls.`/annotated-name completion do.
+            model = self._remap_class_model(
+                class_model(
+                    self.db, self.mirror_root, str(defining_mirror), owner_bare
+                )
+            )
+            for member in model.members:
+                if member.kind not in _CLASS_MEMBER_KINDS or not member.name.startswith(
+                    prefix
+                ):
                     continue
-                member = qname.split(".", 1)[1]
-                if not member.startswith(prefix):
-                    continue
-                item = self._symbol_completion_item(member, symbol, sort_group="0")
-                if item is not None:
-                    items.append(item)
+                items.append(self._class_member_completion_item(member))
             return items
         # Owner is a function/variable/etc — no member completion.
         return []
+
+    def _self_or_cls_completions(
+        self,
+        mirror_path: Path,
+        source: str,
+        line: int,
+        owner: str,
+        prefix: str,
+    ) -> list[CompletionItem]:
+        """Own members of the class enclosing a ``self.``/``cls.`` caret.
+
+        The enclosing method is resolved from the (caret-line-repaired) buffer;
+        the owner identifier must be the method's literal first parameter
+        (``self`` → instance view, ``cls`` → class view). The declaration-only
+        member set comes from the ``class_model`` integration surface — no type
+        inference, own members only (Stage 1)."""
+        parse_source = source if _source_parses(source) else _repair_caret_line(
+            source, line
+        )
+        try:
+            tree = ast.parse(parse_source)
+        except SyntaxError:
+            return []
+        context = _enclosing_method_context(tree, line + 1)
+        if context is None:
+            return []
+        class_qualifier, first_param = context
+        if owner != first_param:
+            return []
+        view = _INSTANCE_MEMBER_KINDS if owner == "self" else _CLASS_MEMBER_KINDS
+
+        model = self._remap_class_model(
+            class_model(self.db, self.mirror_root, str(mirror_path), class_qualifier)
+        )
+        items: list[CompletionItem] = []
+        for member in model.members:
+            if member.kind not in view or not member.name.startswith(prefix):
+                continue
+            items.append(self._class_member_completion_item(member))
+        return items
+
+    def _class_member_completion_item(self, member: ClassMember) -> CompletionItem:
+        kind: CompletionItemKind = "method" if member.kind == "method" else "field"
+        detail: str | None = None
+        if member.kind == "method" and member.signature is not None:
+            detail, _ = _build_signature_label(member.name, member.signature)
+        elif member.annotation:
+            detail = f"{member.name}: {member.annotation}"
+        return CompletionItem(
+            label=member.name,
+            kind=kind,
+            detail=detail,
+            sort_text=f"0{member.name}",
+        )
+
+    def _annotated_name_completions(
+        self,
+        mirror_path: Path,
+        source: str,
+        line: int,
+        owner: str,
+        prefix: str,
+    ) -> list[CompletionItem]:
+        """Rule A — instance-view completions for a bare, annotated ``owner``.
+
+        Applies when ``owner`` is neither ``self``/``cls`` nor resolvable by the
+        ``resolve_symbol`` attribute path: its declared annotation is followed to
+        a workspace class and that class's instance view (methods + class vars +
+        instance vars, via ``class_model``) is offered. The declaration is looked
+        up on the caret-line-repaired current buffer only — see
+        :func:`_annotation_expr_for_name_at` — falling back to the module-level
+        ``variable`` symbol's annotation. No type inference: only the annotation
+        shapes accepted by :meth:`_workspace_class_from_annotation` resolve."""
+        parse_source = (
+            source if _source_parses(source) else _repair_caret_line(source, line)
+        )
+        try:
+            tree = ast.parse(parse_source)
+        except SyntaxError:
+            return []
+        expr = _annotation_expr_for_name_at(tree, line + 1, owner)
+        if expr is not None:
+            annotation_text: str | None = ast.unparse(expr)
+        else:
+            annotation_text = self._module_variable_annotation(mirror_path, owner)
+        if annotation_text is None:
+            return []
+        resolved = self._workspace_class_from_annotation(mirror_path, annotation_text)
+        if resolved is None or resolved.defining_path is None:
+            return []
+        defining_mirror = self._mirror_path_for_real(resolved.defining_path)
+        if not defining_mirror.exists() or defining_mirror.suffix != ".py":
+            return []
+        model = self._remap_class_model(
+            class_model(
+                self.db,
+                self.mirror_root,
+                str(defining_mirror),
+                resolved.qualified_name,
+            )
+        )
+        items: list[CompletionItem] = []
+        for member in model.members:
+            if member.kind not in _INSTANCE_MEMBER_KINDS or not member.name.startswith(
+                prefix
+            ):
+                continue
+            items.append(self._class_member_completion_item(member))
+        return items
+
+    def _module_variable_annotation(
+        self, mirror_path: Path, name: str
+    ) -> str | None:
+        """Annotation text of the module-level ``variable`` symbol ``name`` in
+        the current file, or ``None`` — Rule A's priority-3 declaration lookup."""
+        table = module_symbol_table(self.db, self.mirror_root, str(mirror_path))
+        for symbol in table.symbols:
+            if (
+                symbol.qualified_name == name
+                and "." not in symbol.qualified_name
+                and symbol.kind == "variable"
+                and symbol.annotation is not None
+            ):
+                return symbol.annotation
+        return None
+
+    def _workspace_class_from_annotation(
+        self, mirror_path: Path, annotation_text: str
+    ) -> ResolvedSymbol | None:
+        """Resolve ``annotation_text`` to a verified workspace ``class`` symbol.
+
+        Accepts a bare ``Name`` (``Foo``) or a one-hop ``Attribute`` of a bare
+        ``Name`` (``mod.Foo``); a whole-string forward reference (``"Foo"``,
+        ``"mod.Foo"``) is unwrapped exactly once. Subscripted / generic / union /
+        deep-dotted / callable shapes resolve to ``None``. ``Foo`` is resolved in
+        ``mirror_path``'s module context; ``mod.Foo`` resolves ``mod`` to a
+        workspace module then ``Foo`` within it (the ``_resolve_class_target``
+        idiom). The target is confirmed a workspace class against its defining
+        file's table by the ``(lineno, qualified_name, kind == "class")`` check
+        (the ``prepare_type_hierarchy`` idiom); anything else returns ``None``."""
+        try:
+            body: ast.expr = ast.parse(annotation_text, mode="eval").body
+        except SyntaxError:
+            return None
+        if isinstance(body, ast.Constant) and isinstance(body.value, str):
+            try:
+                body = ast.parse(body.value, mode="eval").body
+            except SyntaxError:
+                return None
+        if isinstance(body, ast.Name):
+            target: tuple[str, ...] = ("name", body.id)
+        elif isinstance(body, ast.Attribute) and isinstance(body.value, ast.Name):
+            target = ("attr", body.value.id, body.attr)
+        else:
+            return None
+        resolved = self._resolve_class_target(mirror_path, target)
+        if (
+            resolved is None
+            or resolved.resolution != "workspace"
+            or resolved.defining_path is None
+            or resolved.defining_lineno is None
+        ):
+            return None
+        defining_mirror = self._mirror_path_for_real(resolved.defining_path)
+        if not defining_mirror.exists() or defining_mirror.suffix != ".py":
+            return None
+        defining_table = module_symbol_table(
+            self.db, self.mirror_root, str(defining_mirror)
+        )
+        for symbol in defining_table.symbols:
+            if (
+                symbol.lineno == resolved.defining_lineno
+                and symbol.qualified_name == resolved.qualified_name
+                and symbol.kind == "class"
+            ):
+                return resolved
+        return None
 
     def folding_ranges_for_file(
         self,
@@ -3173,22 +4155,7 @@ class WorkspaceSession:
                 )
             )
         # ("attr", lhs_name, attr_name)
-        lhs_resolved = self._remap_resolved_symbol(
-            resolve_symbol(
-                self.db, self.mirror_root, str(caller_mirror_path), target[1]
-            )
-        )
-        if (
-            lhs_resolved.resolution != "workspace"
-            or lhs_resolved.defining_path is None
-        ):
-            return None
-        lhs_mirror = self._mirror_path_for_real(lhs_resolved.defining_path)
-        if not lhs_mirror.exists() or lhs_mirror.suffix != ".py":
-            return None
-        return self._remap_resolved_symbol(
-            resolve_symbol(self.db, self.mirror_root, str(lhs_mirror), target[2])
-        )
+        return self._resolve_attr_on_module(caller_mirror_path, target[1], target[2])
 
     def _build_type_hierarchy_item(
         self,
@@ -3244,6 +4211,38 @@ class WorkspaceSession:
             selection_end_character=selection_end_col,
         )
 
+    def _resolve_attr_on_module(
+        self,
+        caller_mirror_path: Path,
+        lhs_name: str,
+        attr_name: str,
+    ) -> ResolvedSymbol | None:
+        """Resolve ``lhs_name.attr_name`` LHS-bare-`Name`-first.
+
+        Resolves ``lhs_name`` through ``caller_mirror_path``'s imports to a
+        workspace module, then ``attr_name`` inside that module. Returns
+        ``None`` when the LHS is not a workspace module (mirroring
+        ``find_references``'s LHS-bare-`Name` handling). Shared by
+        ``_resolve_call_target``, ``_resolve_class_target``, and
+        ``signature_help_at``.
+        """
+        lhs_resolved = self._remap_resolved_symbol(
+            resolve_symbol(
+                self.db, self.mirror_root, str(caller_mirror_path), lhs_name
+            )
+        )
+        if (
+            lhs_resolved.resolution != "workspace"
+            or lhs_resolved.defining_path is None
+        ):
+            return None
+        lhs_mirror = self._mirror_path_for_real(lhs_resolved.defining_path)
+        if not lhs_mirror.exists() or lhs_mirror.suffix != ".py":
+            return None
+        return self._remap_resolved_symbol(
+            resolve_symbol(self.db, self.mirror_root, str(lhs_mirror), attr_name)
+        )
+
     def _resolve_call_target(
         self,
         caller_mirror_path: Path,
@@ -3259,26 +4258,8 @@ class WorkspaceSession:
                 )
             )
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            lhs_resolved = self._remap_resolved_symbol(
-                resolve_symbol(
-                    self.db,
-                    self.mirror_root,
-                    str(caller_mirror_path),
-                    func.value.id,
-                )
-            )
-            if (
-                lhs_resolved.resolution != "workspace"
-                or lhs_resolved.defining_path is None
-            ):
-                return None
-            lhs_mirror = self._mirror_path_for_real(lhs_resolved.defining_path)
-            if not lhs_mirror.exists() or lhs_mirror.suffix != ".py":
-                return None
-            return self._remap_resolved_symbol(
-                resolve_symbol(
-                    self.db, self.mirror_root, str(lhs_mirror), func.attr
-                )
+            return self._resolve_attr_on_module(
+                caller_mirror_path, func.value.id, func.attr
             )
         return None
 
@@ -3430,6 +4411,23 @@ class WorkspaceSession:
                 Signature(parameters=(), return_annotation=None),
             )
         return None
+
+    def _signature_defaults(
+        self, resolved: ResolvedSymbol, display_name: str
+    ) -> dict[str, str] | None:
+        """Default-value expressions for `resolved`'s callable, extracted from
+        its defining file's source (`symbol_resolution.Parameter` carries no
+        default, so this is a consumer-side read). Returns ``None`` when the
+        defining source is unavailable or unparseable — defaults are then
+        simply omitted from the signature label."""
+        if resolved.defining_path is None or resolved.defining_lineno is None:
+            return None
+        defining_source = self.source_text(resolved.defining_path)
+        if defining_source is None:
+            return None
+        return _parameter_defaults_from_source(
+            defining_source, resolved.defining_lineno, display_name
+        )
 
     def rename_symbol(
         self,
@@ -4245,7 +5243,128 @@ class WorkspaceSession:
                         )
                     )
 
+        diagnostics.extend(
+            self._unused_import_diagnostics(real_path, mirror_path, module_result)
+        )
+
         return tuple(diagnostics)
+
+    def _unused_import_diagnostics(
+        self,
+        real_path: str,
+        mirror_path: str,
+        module_result: PythonModuleAnalysis,
+    ) -> list[AnalysisDiagnostic]:
+        """Flag workspace ``from M import name`` bindings that are never used.
+
+        Conservative by design (see the guide's ``unused-import``
+        limitations): only ``from`` imports whose target resolves to a
+        workspace module are considered, so that ``find_references`` can
+        actually verify usage. ``import M`` is skipped (attribute usage is
+        under-reported) and stdlib / installed targets are skipped (their
+        usage cannot be verified). ``__init__.py`` files, self-alias
+        re-exports (``from y import z as z``), names another workspace module
+        re-imports from this file, and files with syntax errors are all left
+        alone.
+        """
+        if Path(real_path).name == "__init__.py":
+            return []
+        # A parse error anywhere makes the occurrence scan unreliable.
+        if module_result.diagnostics:
+            return []
+        source = self.source_text(real_path)
+        if source is None:
+            return []
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return []
+
+        workspace_from: dict[tuple[int, str], ResolvedImportRef] = {}
+        for resolved_import in module_result.resolved_imports:
+            if (
+                resolved_import.kind == "from"
+                and resolved_import.resolution == "workspace"
+                and resolved_import.imported_name is not None
+                and resolved_import.imported_name != "*"
+            ):
+                key = (resolved_import.lineno, resolved_import.imported_name)
+                workspace_from[key] = resolved_import
+        if not workspace_from:
+            return []
+
+        reexported = self._reexported_names_for_module(
+            module_result.module, mirror_path
+        )
+        # A name listed in this module's own static `__all__` is an intentional
+        # public re-export; removing it would break the facade's API.
+        static_all = _static_module_all_names(tree)
+
+        diagnostics: list[AnalysisDiagnostic] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                if (node.lineno, alias.name) not in workspace_from:
+                    continue
+                # `from y import z as z` is the canonical explicit re-export.
+                if alias.asname is not None and alias.asname == alias.name:
+                    continue
+                binding = alias.asname or alias.name
+                if binding in reexported or "*" in reexported:
+                    continue
+                if binding in static_all:
+                    continue
+                references = self.find_references(real_path, binding)
+                # A binding that doesn't resolve to a workspace symbol is a
+                # *broken* import (its own `unresolved-symbol` diagnostic), not
+                # an unused one — leave it to that diagnostic + its quick fix.
+                if references.target.resolution != "workspace":
+                    continue
+                if any(ref.path == real_path for ref in references.references):
+                    continue
+                diagnostics.append(
+                    AnalysisDiagnostic(
+                        path=real_path,
+                        code="unused-import",
+                        message=(
+                            f"Imported name {binding!r} is not used in this module."
+                        ),
+                        severity="hint",
+                        source="pyinc.symbol_resolution",
+                        lineno=alias.lineno,
+                        col_offset=alias.col_offset,
+                        tags=("unnecessary",),
+                    )
+                )
+        return diagnostics
+
+    def _reexported_names_for_module(
+        self, file_module: str, self_mirror_path: str
+    ) -> set[str]:
+        """Names other workspace modules import ``from <file_module>``.
+
+        Removing a ``from M import name`` binding in this file is only safe
+        when the file does not itself re-export ``name`` — i.e. no *other*
+        workspace module does ``from <this_module> import name`` (or
+        ``from <this_module> import *``, which could re-export anything).
+        Reuses the already-decoded workspace analysis; no per-name queries.
+        """
+        names: set[str] = set()
+        workspace = workspace_analysis(self.db, self.mirror_root)
+        for analysis in workspace.modules:
+            if analysis.path == self_mirror_path:
+                continue
+            for resolved_import in analysis.resolved_imports:
+                if resolved_import.kind != "from":
+                    continue
+                if resolved_import.resolved_module != file_module:
+                    continue
+                if resolved_import.imported_name is not None:
+                    names.add(resolved_import.imported_name)
+        return names
 
     def _dependency_inputs(self) -> _DependencyInputs:
         config = workspace_config_analysis(self.db, self.mirror_root)
@@ -4471,6 +5590,25 @@ class WorkspaceSession:
         return WorkspaceSymbolIndex(
             root=self.root,
             entries=index.entries,
+        )
+
+    def _remap_class_model(self, model: ClassModel) -> ClassModel:
+        return ClassModel(
+            path=self._remap_path(model.path) or model.path,
+            qualified_name=model.qualified_name,
+            members=tuple(
+                ClassMember(
+                    name=member.name,
+                    kind=member.kind,
+                    lineno=member.lineno,
+                    annotation=member.annotation,
+                    signature=member.signature,
+                    defining_path=self._remap_path(member.defining_path),
+                    defining_class=member.defining_class,
+                )
+                for member in model.members
+            ),
+            unresolved_bases=model.unresolved_bases,
         )
 
     def _remap_resolved_symbol(self, symbol: ResolvedSymbol) -> ResolvedSymbol:

@@ -9,10 +9,13 @@ import pytest
 
 from pyinc_tools.lsp import LanguageServer, _RequestFailed
 from pyinc_tools.session import (
+    AnalysisDiagnostic,
     CallHierarchyCallSite,
     CallHierarchyIncomingCall,
     CallHierarchyItem,
     CallHierarchyOutgoingCall,
+    CodeAction,
+    CodeActionEdit,
     CodeLens,
     CompletionItem,
     DeclarationLocation,
@@ -931,7 +934,7 @@ def test_language_server_references_local_function_returns_declaration_and_call(
     try:
         init = server._handle_request("initialize", {"rootUri": root.as_uri()})
         assert init["capabilities"]["referencesProvider"] is True
-        assert init["serverInfo"]["version"] == "2.1.0"
+        assert init["serverInfo"]["version"] == "2.6.0"
 
         locations = server._handle_request(
             "textDocument/references",
@@ -1340,6 +1343,213 @@ def test_workspace_session_find_document_highlights_non_workspace_target(
     with WorkspaceSession(root) as session:
         highlights = session.find_document_highlights(consumer, "JSONDecoder")
         assert highlights == ()
+
+
+def test_language_server_advertises_linked_editing_range_provider(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "mod.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        assert init["capabilities"]["linkedEditingRangeProvider"] is True
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_linked_editing_range_returns_in_file_ranges(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "def foo() -> int:\n"  # line 0 — declaration
+        "    return 1\n"  # line 1
+        "\n"  # line 2
+        "foo()\n"  # line 3 — call
+        "x = foo\n",  # line 4 — bare reference
+    )
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+
+        assert result["wordPattern"] == r"[A-Za-z_][A-Za-z0-9_]*"
+        ranges = result["ranges"]
+        # All three in-file occurrences (declaration name, call, bare ref).
+        by_line = {r["start"]["line"]: r for r in ranges}
+        assert set(by_line) == {0, 3, 4}
+        # The declaration range spans the real identifier, not the def keyword.
+        decl = by_line[0]
+        assert decl["start"]["character"] == len("def ")
+        assert decl["end"]["character"] == len("def ") + len("foo")
+        # Every mirrored range spans exactly the identifier (identical content).
+        source_lines = target.read_text().splitlines()
+        for editing_range in ranges:
+            text_line = source_lines[editing_range["start"]["line"]]
+            assert (
+                text_line[
+                    editing_range["start"]["character"] : editing_range["end"][
+                        "character"
+                    ]
+                ]
+                == "foo"
+            )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_linked_editing_range_excludes_other_files(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    provider = root / "a.py"
+    consumer = root / "b.py"
+    _write(provider, "def foo() -> int:\n    return 1\n")
+    _write(consumer, "from a import foo\n\nfoo()\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 1},
+            },
+        )
+
+        # Linked editing is in-file only — provider.py is filtered out. Use
+        # textDocument/rename for workspace-wide edits.
+        lines = sorted(r["start"]["line"] for r in result["ranges"])
+        assert lines == [2, 3]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_linked_editing_range_on_unknown_identifier_returns_none(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def helper() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 3},  # cursor on `def`
+            },
+        )
+        assert result is None
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_linked_editing_range_on_stdlib_identifier_returns_none(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "consumer.py"
+    _write(consumer, "from json import JSONDecoder\n\nJSONDecoder()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": consumer.as_uri()},
+                "position": {"line": 2, "character": 0},
+            },
+        )
+        assert result is None
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_linked_editing_range_overlay_sees_edit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        overlay_text = "def foo() -> int:\n    return 1\n\nfoo()\nfoo()\n"
+        server._handle_notification(
+            "textDocument/didOpen",
+            {"textDocument": {"uri": target.as_uri(), "text": overlay_text}},
+        )
+
+        result = server._handle_request(
+            "textDocument/linkedEditingRange",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "position": {"line": 0, "character": 5},
+            },
+        )
+        lines = sorted(r["start"]["line"] for r in result["ranges"])
+        assert lines == [0, 3, 4]
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_workspace_session_linked_editing_ranges_at_returns_dataclasses(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def foo() -> int:\n    return 1\n\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        ranges = session.linked_editing_ranges_at(target, "foo")
+        assert {r.lineno for r in ranges} == {1, 4}
+        decl = next(r for r in ranges if r.lineno == 1)
+        assert decl.col_offset == len("def ")
+        assert decl.end_col_offset == len("def ") + len("foo")
+
+
+def test_workspace_session_linked_editing_ranges_at_non_workspace_target(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "consumer.py"
+    _write(consumer, "from json import JSONDecoder\n\nJSONDecoder()\n")
+
+    with WorkspaceSession(root) as session:
+        assert session.linked_editing_ranges_at(consumer, "JSONDecoder") == ()
 
 
 def test_type_checking_imports_visible_and_lsp_hover_works(tmp_path: Path) -> None:
@@ -3746,7 +3956,7 @@ def test_language_server_advertises_inlay_hint_provider(tmp_path: Path) -> None:
         init = server._handle_request("initialize", {"rootUri": root.as_uri()})
         provider = init["capabilities"]["inlayHintProvider"]
         assert provider == {"resolveProvider": False}
-        assert init["serverInfo"]["version"] == "2.1.0"
+        assert init["serverInfo"]["version"] == "2.6.0"
     finally:
         if server._session is not None:
             server._session.close()
@@ -5278,6 +5488,14 @@ def test_file_deletion_edit_re_exported_from_pyinc_tools() -> None:
     import pyinc_tools
 
     assert hasattr(pyinc_tools, "FileDeletionEdit")
+
+
+def test_code_action_types_re_exported_from_pyinc_tools() -> None:
+    import pyinc_tools
+
+    assert pyinc_tools.CodeAction is CodeAction
+    assert pyinc_tools.CodeActionEdit is CodeActionEdit
+    assert hasattr(pyinc_tools, "CodeActionKind")
 
 
 def test_semantic_tokens_emits_declarations_for_function_and_parameters(
@@ -6870,3 +7088,1340 @@ def test_language_server_advertises_and_serves_completion(tmp_path: Path) -> Non
     # Module kind (9) is emitted for none of these members; function/class/field
     # kinds are present and stdlib members are absent.
     assert "path" not in labels  # would only appear if os/stdlib were expanded
+
+
+# ---------------------------------------------------------------------------
+# Task B2 — unused-import diagnostic + textDocument/codeAction quick fixes
+# ---------------------------------------------------------------------------
+
+
+def test_find_references_does_not_count_the_import_binding_site(
+    tmp_path: Path,
+) -> None:
+    # Pins the behavior the unused-import rule relies on: a `from M import name`
+    # binding is an `ast.alias`, not an `ast.Name`, so the occurrence scan never
+    # emits a reference for the import statement itself. An unused import
+    # therefore yields zero references in its own file; a used one yields one.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "unused.py", "from m import foo\n")
+    _write(root / "used.py", "from m import foo\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        unused_refs = session.find_references(root / "unused.py", "foo")
+        used_refs = session.find_references(root / "used.py", "foo")
+
+    unused_in_file = [
+        r for r in unused_refs.references if Path(r.path).name == "unused.py"
+    ]
+    used_in_file = [
+        r for r in used_refs.references if Path(r.path).name == "used.py"
+    ]
+    assert unused_in_file == []
+    assert len(used_in_file) == 1
+
+
+def test_analysis_diagnostic_tags_default_empty() -> None:
+    diagnostic = AnalysisDiagnostic(
+        path="/x.py",
+        code="missing-import",
+        message="boom",
+        severity="error",
+        source="pyinc.python_source",
+    )
+    assert diagnostic.tags == ()
+
+
+def test_analysis_diagnostic_to_lsp_maps_unnecessary_tag(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "mod.py", "x = 1\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        tagged = AnalysisDiagnostic(
+            path=str(root / "mod.py"),
+            code="unused-import",
+            message="unused",
+            severity="hint",
+            source="pyinc.symbol_resolution",
+            lineno=1,
+            col_offset=0,
+            tags=("unnecessary",),
+        )
+        payload = server._analysis_diagnostic_to_lsp(tagged)
+        assert payload["tags"] == [1]
+        assert payload["severity"] == 4
+
+        untagged = AnalysisDiagnostic(
+            path=str(root / "mod.py"),
+            code="missing-import",
+            message="boom",
+            severity="error",
+            source="pyinc.python_source",
+            lineno=1,
+            col_offset=0,
+        )
+        # No `tags` key at all when the diagnostic carries none.
+        assert "tags" not in server._analysis_diagnostic_to_lsp(untagged)
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_diagnostic_signature_distinguishes_tags() -> None:
+    from pyinc_tools.lsp import _diagnostic_signature
+
+    base = {
+        "range": {
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 1},
+        },
+        "severity": 4,
+        "source": "pyinc.symbol_resolution",
+        "code": "unused-import",
+        "message": "unused",
+    }
+    tagged = {**base, "tags": [1]}
+    assert _diagnostic_signature(base) != _diagnostic_signature(tagged)
+
+
+def test_unused_import_diagnostic_flags_unused_workspace_from_import(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "consumer.py", "from m import foo\n\nx = 1\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "consumer.py")
+
+    unused = [d for d in result.diagnostics if d.code == "unused-import"]
+    assert len(unused) == 1
+    diag = unused[0]
+    assert diag.severity == "hint"
+    assert diag.tags == ("unnecessary",)
+    assert diag.lineno == 1
+    assert diag.col_offset == len("from m import ")
+    assert "foo" in diag.message
+
+
+def test_unused_import_diagnostic_silent_when_import_is_used(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "consumer.py", "from m import foo\n\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "consumer.py")
+
+    assert [d for d in result.diagnostics if d.code == "unused-import"] == []
+
+
+def test_unused_import_diagnostic_flags_aliased_binding(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "consumer.py", "from m import foo as bar\n\nx = 1\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "consumer.py")
+
+    unused = [d for d in result.diagnostics if d.code == "unused-import"]
+    assert len(unused) == 1
+    # The message names the local binding, not the original symbol.
+    assert "bar" in unused[0].message
+
+
+def test_unused_import_diagnostic_skips_self_alias_reexport(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    # `from m import foo as foo` is the canonical explicit re-export idiom.
+    _write(root / "consumer.py", "from m import foo as foo\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "consumer.py")
+
+    assert [d for d in result.diagnostics if d.code == "unused-import"] == []
+
+
+def test_unused_import_diagnostic_skips_init_py(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    pkg = root / "pkg"
+    _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
+    _write(pkg / "__init__.py", "from pkg.helper import foo\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(pkg / "__init__.py")
+
+    assert [d for d in result.diagnostics if d.code == "unused-import"] == []
+
+
+def test_unused_import_diagnostic_suppressed_by_cross_module_reexport(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    # `hub` imports foo from m but never uses it locally...
+    _write(root / "hub.py", "from m import foo\n")
+    # ...yet another module imports foo *from hub*, so hub re-exports it.
+    _write(root / "client.py", "from hub import foo\n\nfoo()\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "hub.py")
+
+    assert [d for d in result.diagnostics if d.code == "unused-import"] == []
+
+
+def test_unused_import_diagnostic_suppressed_by_star_reexport(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "hub.py", "from m import foo\n")
+    _write(root / "client.py", "from hub import *\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "hub.py")
+
+    assert [d for d in result.diagnostics if d.code == "unused-import"] == []
+
+
+def test_unused_import_diagnostic_not_emitted_for_broken_symbol_import(
+    tmp_path: Path,
+) -> None:
+    # `wrong` is a real workspace module but has no `foo`. That's an
+    # unresolved-symbol problem, not an unused import — the import must not be
+    # double-flagged as unused just because find_references can't verify it.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "wrong.py", "def other() -> int:\n    return 1\n")
+    _write(root / "consumer.py", "from wrong import foo\n\nx = 1\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "consumer.py")
+
+    codes = {d.code for d in result.diagnostics}
+    assert "unresolved-symbol" in codes
+    assert "unused-import" not in codes
+
+
+def test_unused_import_diagnostic_skips_stdlib_and_plain_import(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    # stdlib from-import (unverifiable) + plain `import m` (attribute usage
+    # under-reported) — neither should be flagged.
+    _write(root / "consumer.py", "import os\nfrom json import dumps\nimport m\n\nx = 1\n")
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "consumer.py")
+
+    assert [d for d in result.diagnostics if d.code == "unused-import"] == []
+
+
+def test_unused_import_diagnostic_suppressed_by_module_all_listing(
+    tmp_path: Path,
+) -> None:
+    # A facade module re-exports `tool` through its own static `__all__`.
+    # That's an intentional public re-export — removing the import would
+    # break the public API, so it must not be flagged as unused.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helpers.py", "def tool() -> int:\n    return 1\n")
+    _write(root / "facade.py", 'from helpers import tool\n\n__all__ = ["tool"]\n')
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "facade.py")
+
+    assert [d for d in result.diagnostics if d.code == "unused-import"] == []
+
+
+def test_unused_import_diagnostic_still_flagged_when_not_in_module_all(
+    tmp_path: Path,
+) -> None:
+    # `tool` is imported but absent from `__all__` (which lists a different
+    # name) and unused — the `__all__` guard must not shield it.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helpers.py", "def tool() -> int:\n    return 1\n")
+    _write(root / "facade.py", 'from helpers import tool\n\n__all__ = ["other"]\n')
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "facade.py")
+
+    unused = [d for d in result.diagnostics if d.code == "unused-import"]
+    assert len(unused) == 1
+    assert "tool" in unused[0].message
+
+
+def _apply_code_action_edits(source: str, edits: tuple[CodeActionEdit, ...]) -> str:
+    """Apply a single action's edits to a source string (right-to-left)."""
+    ordered = sorted(
+        edits, key=lambda e: (-e.start_line, -e.start_character)
+    )
+    text = source
+    for edit in ordered:
+        start = _offset(text, edit.start_line, edit.start_character)
+        end = _offset(text, edit.end_line, edit.end_character)
+        text = text[:start] + edit.new_text + text[end:]
+    return text
+
+
+def test_code_actions_unused_import_sole_alias_removes_whole_statement(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    src = "from m import foo\n\nx = 1\n"
+    _write(root / "consumer.py", src)
+
+    with WorkspaceSession(root) as session:
+        actions = session.code_actions_for_range(root / "consumer.py", 0, 0, 0, 0)
+
+    assert len(actions) == 1
+    action = actions[0]
+    assert action.kind == "quickfix"
+    assert action.diagnostic.code == "unused-import"
+    assert "foo" in action.title
+    assert _apply_code_action_edits(src, action.edits) == "\nx = 1\n"
+
+
+def test_code_actions_unused_import_one_of_several_absorbs_comma(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\ndef bar() -> int:\n    return 2\n")
+    src = "from m import foo, bar\n\nbar()\n"
+    _write(root / "consumer.py", src)
+
+    with WorkspaceSession(root) as session:
+        actions = session.code_actions_for_range(root / "consumer.py", 0, 0, 0, 0)
+
+    unused = [a for a in actions if a.diagnostic.code == "unused-import"]
+    assert len(unused) == 1
+    # Only `foo` is dead; `bar` survives with the statement intact.
+    assert _apply_code_action_edits(src, unused[0].edits) == "from m import bar\n\nbar()\n"
+
+
+def test_code_actions_for_range_removes_unused_alias_in_multiline_import(
+    tmp_path: Path,
+) -> None:
+    # In a parenthesised multi-line import the unused-import diagnostic anchors
+    # on the *alias* line, not the statement's first line. The lookup that maps
+    # a diagnostic back to its import statement has to be span-aware or no fix
+    # is offered at all.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "m.py",
+        "def foo() -> int:\n    return 1\n"
+        "def bar() -> int:\n    return 2\n"
+        "def baz() -> int:\n    return 3\n",
+    )
+    src = "from m import (\n    foo,\n    bar,\n    baz,\n)\n\nfoo()\nbaz()\n"
+    _write(root / "consumer.py", src)
+
+    with WorkspaceSession(root) as session:
+        actions = session.code_actions_for_range(root / "consumer.py", 0, 0, 8, 0)
+
+    unused = [a for a in actions if a.diagnostic.code == "unused-import"]
+    assert len(unused) == 1
+    assert "bar" in unused[0].title
+    assert (
+        _apply_code_action_edits(src, unused[0].edits)
+        == "from m import (\n    foo,\n    baz,\n)\n\nfoo()\nbaz()\n"
+    )
+
+
+def test_code_actions_for_range_removes_middle_alias_keeps_others(
+    tmp_path: Path,
+) -> None:
+    # Three aliases on one line, middle one dead → the surviving list stays
+    # comma-correct with `foo` and `baz` intact.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "m.py",
+        "def foo() -> int:\n    return 1\n"
+        "def bar() -> int:\n    return 2\n"
+        "def baz() -> int:\n    return 3\n",
+    )
+    src = "from m import foo, bar, baz\n\nfoo()\nbaz()\n"
+    _write(root / "consumer.py", src)
+
+    with WorkspaceSession(root) as session:
+        actions = session.code_actions_for_range(root / "consumer.py", 0, 0, 0, 0)
+
+    unused = [a for a in actions if a.diagnostic.code == "unused-import"]
+    assert len(unused) == 1
+    assert "bar" in unused[0].title
+    assert (
+        _apply_code_action_edits(src, unused[0].edits)
+        == "from m import foo, baz\n\nfoo()\nbaz()\n"
+    )
+
+
+def test_code_actions_missing_import_removes_statement(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    src = "import definitely_not_a_module\n\nx = 1\n"
+    _write(root / "consumer.py", src)
+
+    with WorkspaceSession(root) as session:
+        actions = session.code_actions_for_range(root / "consumer.py", 0, 0, 0, 0)
+
+    missing = [a for a in actions if a.diagnostic.code == "missing-import"]
+    assert len(missing) == 1
+    assert missing[0].title == "Remove unresolvable import"
+    assert _apply_code_action_edits(src, missing[0].edits) == "\nx = 1\n"
+
+
+def test_code_actions_unresolved_symbol_offers_removal_and_unique_retarget(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    # `foo` actually lives in `home`, not `wrong` — exactly one workspace module
+    # exposes a top-level `foo`, so a retarget is offered.
+    _write(root / "home.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "wrong.py", "def other() -> int:\n    return 1\n")
+    src = "from wrong import foo\n\nfoo()\n"
+    _write(root / "consumer.py", src)
+
+    with WorkspaceSession(root) as session:
+        actions = session.code_actions_for_range(root / "consumer.py", 0, 0, 0, 0)
+
+    titles = [a.title for a in actions]
+    assert "Remove import of 'foo'" in titles
+    assert "Import 'foo' from 'home'" in titles
+    retarget = next(a for a in actions if a.title == "Import 'foo' from 'home'")
+    assert (
+        _apply_code_action_edits(src, retarget.edits)
+        == "from home import foo\n\nfoo()\n"
+    )
+
+
+def test_code_actions_unresolved_symbol_no_retarget_when_ambiguous(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    # Two workspace modules expose a top-level `foo` → retarget is ambiguous
+    # and therefore suppressed; only the removal action remains.
+    _write(root / "one.py", "def foo() -> int:\n    return 1\n")
+    _write(root / "two.py", "def foo() -> int:\n    return 2\n")
+    _write(root / "wrong.py", "def other() -> int:\n    return 1\n")
+    src = "from wrong import foo\n\nfoo()\n"
+    _write(root / "consumer.py", src)
+
+    with WorkspaceSession(root) as session:
+        actions = session.code_actions_for_range(root / "consumer.py", 0, 0, 0, 0)
+
+    titles = [a.title for a in actions]
+    assert "Remove import of 'foo'" in titles
+    assert not any(t.startswith("Import 'foo' from") for t in titles)
+
+
+def test_code_actions_unresolved_symbol_no_retarget_when_absent(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "wrong.py", "def other() -> int:\n    return 1\n")
+    src = "from wrong import nowhere\n\nnowhere()\n"
+    _write(root / "consumer.py", src)
+
+    with WorkspaceSession(root) as session:
+        actions = session.code_actions_for_range(root / "consumer.py", 0, 0, 0, 0)
+
+    titles = [a.title for a in actions]
+    assert "Remove import of 'nowhere'" in titles
+    assert not any(t.startswith("Import 'nowhere' from") for t in titles)
+
+
+def test_code_actions_empty_when_range_misses_all_diagnostics(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    # unused import on line 0; ask for actions on line 2 (the `x = 1` line).
+    _write(root / "consumer.py", "from m import foo\n\nx = 1\n")
+
+    with WorkspaceSession(root) as session:
+        actions = session.code_actions_for_range(root / "consumer.py", 2, 0, 2, 0)
+
+    assert actions == ()
+
+
+def test_code_actions_empty_for_unparseable_file(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "broken.py", "import definitely_not_a_module\ndef (:\n")
+
+    with WorkspaceSession(root) as session:
+        actions = session.code_actions_for_range(root / "broken.py", 0, 0, 5, 0)
+
+    assert actions == ()
+
+
+def test_language_server_advertises_code_action_provider(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "mod.py", "x = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        init = server._handle_request("initialize", {"rootUri": root.as_uri()})
+        provider = init["capabilities"]["codeActionProvider"]
+        assert provider == {"codeActionKinds": ["quickfix"]}
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_language_server_code_action_returns_quickfix_with_workspace_edit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    target = root / "consumer.py"
+    _write(target, "from m import foo\n\nx = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/codeAction",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0},
+                },
+                "context": {"diagnostics": []},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert len(result) == 1
+    action = result[0]
+    assert action["kind"] == "quickfix"
+    assert "foo" in action["title"]
+    # The anchor diagnostic is echoed back, converted, with the Unnecessary tag.
+    assert len(action["diagnostics"]) == 1
+    assert action["diagnostics"][0]["code"] == "unused-import"
+    assert action["diagnostics"][0]["tags"] == [1]
+    # WorkspaceEdit shape: {"changes": {uri: [TextEdit]}}.
+    changes = action["edit"]["changes"]
+    edits = changes[target.as_uri()]
+    assert edits[0]["newText"] == ""
+    assert edits[0]["range"]["start"] == {"line": 0, "character": 0}
+
+
+def test_language_server_code_action_honors_context_only_filter(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    target = root / "consumer.py"
+    _write(target, "from m import foo\n\nx = 1\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+
+        def code_action_params(only: list[str]) -> dict[str, object]:
+            return {
+                "textDocument": {"uri": target.as_uri()},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0},
+                },
+                "context": {"diagnostics": [], "only": only},
+            }
+
+        refactor_only = server._handle_request(
+            "textDocument/codeAction", code_action_params(["refactor"])
+        )
+        quickfix_only = server._handle_request(
+            "textDocument/codeAction", code_action_params(["quickfix"])
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    # `refactor` excludes our quickfix; `quickfix` includes it.
+    assert refactor_only == []
+    assert len(quickfix_only) == 1
+
+
+def test_language_server_code_action_sees_overlay_introduced_unused_import(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo() -> int:\n    return 1\n")
+    target = root / "consumer.py"
+    # On disk the import is used; the overlay removes the use, so the import
+    # becomes unused and a quick fix must appear from the overlay text alone.
+    _write(target, "from m import foo\n\nfoo()\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        server._handle_notification(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": target.as_uri(),
+                    "text": "from m import foo\n\nx = 1\n",
+                }
+            },
+        )
+        result = server._handle_request(
+            "textDocument/codeAction",
+            {
+                "textDocument": {"uri": target.as_uri()},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0},
+                },
+                "context": {"diagnostics": []},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert len(result) == 1
+    assert result[0]["diagnostics"][0]["code"] == "unused-import"
+
+
+# ---------------------------------------------------------------------------
+# Task B3 — completion / signatureHelp polish
+#   (b) dotted attribute owners; (d1) attribute-call signatureHelp;
+#   (d2) default values in signature labels
+# ---------------------------------------------------------------------------
+
+
+def test_completion_dotted_module_owner_lists_exports(tmp_path: Path) -> None:
+    # `import pkg.sub; pkg.sub.<caret>` — the dotted owner is itself a
+    # workspace module, so its top-level exports are offered.
+    root = tmp_path / "workspace"
+    _write(root / "pkg" / "__init__.py", "")
+    _write(root / "pkg" / "sub.py", _COMPLETION_HELPERS)
+    app = root / "app.py"
+    _write(app, "import pkg.sub\n")
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret("import pkg.sub\n", "pkg.sub.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert {"compute", "Widget", "CONST"} <= _labels(items)
+        # Class members do not leak into the module-level export list.
+        assert "render" not in _labels(items)
+
+
+def test_completion_dotted_module_class_owner_lists_members(tmp_path: Path) -> None:
+    # `pkg.sub.Widget.<caret>` (dotted module head) and
+    # `helpers.Widget.<caret>` (single-component module head) both list the
+    # class's members.
+    root = tmp_path / "workspace"
+    _write(root / "pkg" / "__init__.py", "")
+    _write(root / "pkg" / "sub.py", _COMPLETION_HELPERS)
+    _write(root / "helpers.py", _COMPLETION_HELPERS)
+    app = root / "app.py"
+    _write(app, "import pkg.sub\nimport helpers\n")
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret("import pkg.sub\n", "pkg.sub.Widget.")
+        session.set_overlay(app, source)
+        dotted = session.completions_at(app, line, character)
+        assert _labels(dotted) == {"render", "size"}
+
+        source, line, character = _caret("import helpers\n", "helpers.Widget.")
+        session.set_overlay(app, source)
+        single = session.completions_at(app, line, character)
+        assert _labels(single) == {"render", "size"}
+
+
+def test_completion_stdlib_dotted_owner_is_empty(tmp_path: Path) -> None:
+    # `os.path.<caret>` — the head resolves to a stdlib module, so no members.
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _COMPLETION_HELPERS)
+    app = root / "app.py"
+    _write(app, "import os.path\n")
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret("import os.path\n", "os.path.")
+        session.set_overlay(app, source)
+        assert session.completions_at(app, line, character) == ()
+
+
+def test_completion_instance_chain_owner_is_empty(tmp_path: Path) -> None:
+    # `w.size.<caret>` — an instance-attribute chain whose type would have to
+    # be inferred stays unsupported.
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _COMPLETION_HELPERS)
+    app = root / "app.py"
+    base = "from helpers import Widget\nw = Widget()\n"
+    _write(app, base)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(base, "w.size.")
+        session.set_overlay(app, source)
+        assert session.completions_at(app, line, character) == ()
+
+
+# ---------------------------------------------------------------------------
+# Task B4 — self./cls. instance-member completion
+# ---------------------------------------------------------------------------
+
+
+_SELF_COMPLETION_SOURCE = (
+    "class Widget:\n"
+    "    size: int = 3\n"
+    "    def __init__(self) -> None:\n"
+    "        self.name = 'w'\n"
+    "        self.count = 0\n"
+    "    def render(self) -> str:\n"
+    "        return self.name\n"
+)
+
+_CLS_COMPLETION_SOURCE = (
+    "class Widget:\n"
+    "    size: int = 3\n"
+    "    def __init__(self) -> None:\n"
+    "        self.name = 'w'\n"
+    "    @classmethod\n"
+    "    def make(cls) -> 'Widget':\n"
+    "        return cls()\n"
+)
+
+
+def test_completion_self_lists_instance_and_class_members(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    app = root / "app.py"
+    _write(app, _SELF_COMPLETION_SOURCE)
+
+    with WorkspaceSession(root) as session:
+        # A caret on `self.` inside a method whose first parameter is `self`
+        # sees instance vars, class vars, and methods — the instance view.
+        source, line, character = _caret(_SELF_COMPLETION_SOURCE, "        self.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert _labels(items) == {"size", "name", "count", "__init__", "render"}
+
+        by_label = {item.label: item for item in items}
+        assert by_label["name"].kind == "field"
+        assert by_label["size"].kind == "field"
+        assert by_label["render"].kind == "method"
+
+        # Prefix filtering narrows to matching members.
+        source, line, character = _caret(_SELF_COMPLETION_SOURCE, "        self.c")
+        session.set_overlay(app, source)
+        filtered = session.completions_at(app, line, character)
+        assert _labels(filtered) == {"count"}
+
+
+def test_completion_self_outside_method_is_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    app = root / "app.py"
+    _write(app, _SELF_COMPLETION_SOURCE)
+
+    with WorkspaceSession(root) as session:
+        # `self.` at module level has no enclosing method → nothing.
+        source, line, character = _caret(_SELF_COMPLETION_SOURCE, "self.")
+        session.set_overlay(app, source)
+        assert session.completions_at(app, line, character) == ()
+
+
+def test_completion_self_in_closure_is_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    app = root / "app.py"
+    closure_src = (
+        "class Widget:\n"
+        "    def render(self) -> str:\n"
+        "        def inner() -> str:\n"
+        "            return ''\n"
+    )
+    _write(app, closure_src)
+
+    with WorkspaceSession(root) as session:
+        # The innermost enclosing callable is the closure `inner`, not a method
+        # of Widget → the self view is unavailable.
+        source, line, character = _caret(closure_src, "            self.")
+        session.set_overlay(app, source)
+        assert session.completions_at(app, line, character) == ()
+
+
+def test_completion_cls_lists_class_view_only(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    app = root / "app.py"
+    _write(app, _CLS_COMPLETION_SOURCE)
+
+    with WorkspaceSession(root) as session:
+        # `cls.` in a method whose first parameter is `cls` sees class vars and
+        # methods but NOT instance attributes.
+        source, line, character = _caret(_CLS_COMPLETION_SOURCE, "        cls.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert _labels(items) == {"size", "__init__", "make"}
+        assert "name" not in _labels(items)
+
+        # `self.` inside a `cls`-method has no bound `self` → nothing.
+        source, line, character = _caret(_CLS_COMPLETION_SOURCE, "        self.")
+        session.set_overlay(app, source)
+        assert session.completions_at(app, line, character) == ()
+
+
+def test_completion_self_reflects_overlay_added_attribute(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    app = root / "app.py"
+    _write(app, _SELF_COMPLETION_SOURCE)
+
+    with WorkspaceSession(root) as session:
+        edited = (
+            "class Widget:\n"
+            "    size: int = 3\n"
+            "    def __init__(self) -> None:\n"
+            "        self.name = 'w'\n"
+            "        self.extra = 1\n"
+            "    def render(self) -> str:\n"
+            "        return self.name\n"
+        )
+        source, line, character = _caret(edited, "        self.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert "extra" in _labels(items)
+
+
+def test_completion_self_is_stable_when_unrelated_file_changes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    other = root / "other.py"
+    _write(other, "def unrelated() -> int:\n    return 0\n")
+    app = root / "app.py"
+    _write(app, _SELF_COMPLETION_SOURCE)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(_SELF_COMPLETION_SOURCE, "        self.")
+        session.set_overlay(app, source)
+        first = session.completions_at(app, line, character)
+
+        session.set_overlay(other, "def unrelated() -> int:\n    return 999\n")
+        second = session.completions_at(app, line, character)
+        assert first == second
+        assert _labels(second) == {"size", "name", "count", "__init__", "render"}
+
+
+# ---------------------------------------------------------------------------
+# Task B4 (stage 2) — annotated-name owner completion (Rule A)
+# ---------------------------------------------------------------------------
+
+
+_ANNOT_HELPERS = (
+    "class Widget:\n"
+    "    size: int = 3\n"
+    "    def __init__(self) -> None:\n"
+    "        self.name = 'w'\n"
+    "    def render(self) -> str:\n"
+    "        return self.name\n"
+    "\n"
+    "class Gadget:\n"
+    "    weight: int = 1\n"
+    "    def spin(self) -> str:\n"
+    "        return 'g'\n"
+)
+
+# Instance view = methods + class vars + instance vars.
+_WIDGET_INSTANCE_VIEW = {"size", "name", "__init__", "render"}
+
+
+def test_completion_annotated_param_completes_instance_view(tmp_path: Path) -> None:
+    # `def f(w: Widget): w.<caret>` — the parameter's annotation resolves to the
+    # workspace class, and its instance view is offered.
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _ANNOT_HELPERS)
+    app = root / "app.py"
+    base = "from helpers import Widget\n\n\ndef f(w: Widget) -> None:\n    pass\n"
+    _write(app, base)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(base, "    w.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert _labels(items) == _WIDGET_INSTANCE_VIEW
+        by_label = {item.label: item for item in items}
+        assert by_label["name"].kind == "field"
+        assert by_label["render"].kind == "method"
+
+        # Prefix filtering narrows the instance view.
+        source, line, character = _caret(base, "    w.re")
+        session.set_overlay(app, source)
+        assert _labels(session.completions_at(app, line, character)) == {"render"}
+
+
+def test_completion_annotated_local_var_completes_instance_view(
+    tmp_path: Path,
+) -> None:
+    # A local `w: Widget = ...` annotation resolves the same as a parameter.
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _ANNOT_HELPERS)
+    app = root / "app.py"
+    base = (
+        "from helpers import Widget\n\n\n"
+        "def f() -> None:\n"
+        "    w: Widget = Widget()\n"
+    )
+    _write(app, base)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(base, "    w.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert _labels(items) == _WIDGET_INSTANCE_VIEW
+
+
+def test_completion_annotated_nearest_declaration_wins(tmp_path: Path) -> None:
+    # Two local annotations for `w`; the nearest preceding one (Widget) wins
+    # over the earlier (Gadget).
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _ANNOT_HELPERS)
+    app = root / "app.py"
+    base = (
+        "from helpers import Widget, Gadget\n\n\n"
+        "def f() -> None:\n"
+        "    w: Gadget = Gadget()\n"
+        "    w: Widget = Widget()\n"
+    )
+    _write(app, base)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(base, "    w.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert _labels(items) == _WIDGET_INSTANCE_VIEW
+        assert "spin" not in _labels(items)
+        assert "weight" not in _labels(items)
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        "list[Widget]",
+        "Optional[Widget]",
+        "Widget | None",
+        "dict[str, Widget]",
+        "Annotated[Widget, 'meta']",
+        "Callable[[], Widget]",
+    ],
+)
+def test_completion_annotated_generic_or_union_is_empty(
+    tmp_path: Path, annotation: str
+) -> None:
+    # A bounded model rejects subscripted / union / callable annotations rather
+    # than half-inferring the wrapped class.
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _ANNOT_HELPERS)
+    app = root / "app.py"
+    base = (
+        "from typing import Annotated, Callable, Optional\n"
+        "from helpers import Widget\n\n\n"
+        f"def f(w: {annotation}) -> None:\n    pass\n"
+    )
+    _write(app, base)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(base, "    w.")
+        session.set_overlay(app, source)
+        assert session.completions_at(app, line, character) == ()
+
+
+@pytest.mark.parametrize(
+    "declaration, expected",
+    [
+        ("w: Widget", _WIDGET_INSTANCE_VIEW),  # bare Name
+        ('w: "Widget"', _WIDGET_INSTANCE_VIEW),  # whole-string forward ref
+        ("w: helpers.Widget", _WIDGET_INSTANCE_VIEW),  # one-hop attribute
+        ("w: pkg.sub.Widget", set()),  # deep dotted chain → nothing
+        ("w: OrderedDict", set()),  # non-workspace (stdlib) → nothing
+    ],
+)
+def test_completion_module_level_annotation_forms(
+    tmp_path: Path, declaration: str, expected: set[str]
+) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _ANNOT_HELPERS)
+    _write(root / "pkg" / "__init__.py", "")
+    _write(root / "pkg" / "sub.py", _ANNOT_HELPERS)
+    app = root / "app.py"
+    base = (
+        "from collections import OrderedDict\n"
+        "from helpers import Widget\n"
+        "import helpers\n"
+        "import pkg.sub\n"
+        f"{declaration}\n"
+    )
+    _write(app, base)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(base, "w.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert _labels(items) == expected
+
+
+def test_completion_annotated_import_alias_precedence(tmp_path: Path) -> None:
+    # A same-named local annotation must NOT shadow an import that resolves via
+    # the existing attribute path: `Widget` resolves to the imported class, so
+    # its class-object view (no instance-only `name`) wins — Rule A never fires.
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _ANNOT_HELPERS)
+    app = root / "app.py"
+    base = (
+        "from helpers import Widget, Gadget\n\n\n"
+        "def f() -> None:\n"
+        "    Widget: Gadget = Gadget()\n"
+    )
+    _write(app, base)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(base, "    Widget.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        # Class-object view of Widget (methods + class vars), not Gadget's, and
+        # not the instance-only `name`.
+        assert _labels(items) == {"size", "render", "__init__"}
+
+
+def test_completion_annotation_outer_function_scope_not_applied(
+    tmp_path: Path,
+) -> None:
+    # An annotation on an OUTER function's parameter does not apply inside a
+    # nested function — only the innermost enclosing function is consulted.
+    root = tmp_path / "workspace"
+    _write(root / "helpers.py", _ANNOT_HELPERS)
+    app = root / "app.py"
+    base = (
+        "from helpers import Widget\n\n\n"
+        "def outer(w: Widget) -> None:\n"
+        "    def inner() -> None:\n"
+        "        pass\n"
+    )
+    _write(app, base)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(base, "        w.")
+        session.set_overlay(app, source)
+        assert session.completions_at(app, line, character) == ()
+
+
+# ---------------------------------------------------------------------------
+# Task B4 (stage 3) — inherited-member completion via flattened class_model
+# ---------------------------------------------------------------------------
+
+
+_INHERIT_BASE = (
+    "class Base:\n"
+    "    kind: str = 'b'\n"
+    "    def base_method(self) -> None:\n"
+    "        self.base_attr = 1\n"
+)
+
+_INHERIT_DERIVED = (
+    "from base import Base\n"
+    "\n"
+    "\n"
+    "class Derived(Base):\n"
+    "    size: int = 3\n"
+    "    def own(self) -> None:\n"
+    "        self.own_attr = 2\n"
+)
+
+
+def test_completion_self_includes_inherited_members(tmp_path: Path) -> None:
+    # `self.` inside a method of a subclass sees the flattened instance view:
+    # own members plus every inherited method / class var / instance var.
+    root = tmp_path / "workspace"
+    _write(root / "base.py", _INHERIT_BASE)
+    app = root / "derived.py"
+    _write(app, _INHERIT_DERIVED)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(_INHERIT_DERIVED, "        self.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        assert _labels(items) == {
+            "size",
+            "own",
+            "own_attr",
+            "kind",
+            "base_method",
+            "base_attr",
+        }
+
+
+def test_completion_derived_class_view_shows_inherited_methods(
+    tmp_path: Path,
+) -> None:
+    # `Derived.` (bare-name class owner) serves the flattened CLASS view:
+    # methods + class vars, own and inherited, but no instance attributes.
+    root = tmp_path / "workspace"
+    _write(root / "base.py", _INHERIT_BASE)
+    app = root / "derived.py"
+    _write(app, _INHERIT_DERIVED)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(_INHERIT_DERIVED, "Derived.")
+        session.set_overlay(app, source)
+        items = session.completions_at(app, line, character)
+        # Inherited `base_method` / `kind` show; instance-only attrs do not.
+        assert _labels(items) == {"size", "own", "base_method", "kind"}
+        by_label = {item.label: item for item in items}
+        assert by_label["base_method"].kind == "method"
+
+
+def test_completion_inherited_reflects_overlay_edit_to_base(tmp_path: Path) -> None:
+    # An overlay edit that adds a method to the BASE file flows through to the
+    # subclass's inherited completions — the flattened model is per-file.
+    root = tmp_path / "workspace"
+    base = root / "base.py"
+    _write(base, _INHERIT_BASE)
+    app = root / "derived.py"
+    _write(app, _INHERIT_DERIVED)
+
+    with WorkspaceSession(root) as session:
+        source, line, character = _caret(_INHERIT_DERIVED, "        self.")
+        session.set_overlay(app, source)
+        before = session.completions_at(app, line, character)
+        assert "extra_method" not in _labels(before)
+
+        edited_base = _INHERIT_BASE + "    def extra_method(self) -> None:\n        pass\n"
+        session.set_overlay(base, edited_base)
+        after = session.completions_at(app, line, character)
+        assert "extra_method" in _labels(after)
+
+
+def test_language_server_serves_self_completion(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    app = root / "app.py"
+    # The on-disk buffer is mid-edit: a bare `self.` with no member yet.
+    _write(app, _SELF_COMPLETION_SOURCE + "        self.\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        caret_line = _SELF_COMPLETION_SOURCE.count("\n")  # the "        self." line
+        result = server._handle_request(
+            "textDocument/completion",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": caret_line, "character": len("        self.")},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    assert result["isIncomplete"] is False
+    labels = {item["label"] for item in result["items"]}
+    assert {"name", "count", "size", "render"} <= labels
+
+
+def test_language_server_serves_dotted_attribute_completion(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "pkg" / "__init__.py", "")
+    _write(root / "pkg" / "sub.py", _COMPLETION_HELPERS)
+    app = root / "app.py"
+    _write(app, "import pkg.sub\npkg.sub.\n")
+
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/completion",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": 1, "character": len("pkg.sub.")},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    labels = {item["label"] for item in result["items"]}
+    assert {"compute", "Widget", "CONST"} <= labels
+
+
+def test_signature_help_at_attribute_call(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo(x: int, y: int) -> int:\n    return x + y\n")
+    consumer = root / "app.py"
+    _write(consumer, "import m\n\nm.foo(1, 2)\n")
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(consumer, line=2, character=6)
+    assert signature_help is not None
+    assert signature_help.label == "def foo(x: int, y: int) -> int"
+    assert signature_help.active_parameter == 0
+
+
+def test_signature_help_at_attribute_class_construction(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(
+        root / "m.py",
+        "class Box:\n"
+        "    def __init__(self, width: int, height: int) -> None:\n"
+        "        self.width = width\n"
+        "        self.height = height\n",
+    )
+    consumer = root / "app.py"
+    _write(consumer, "import m\n\nm.Box(1, 2)\n")
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(consumer, line=2, character=6)
+    assert signature_help is not None
+    assert signature_help.label == "def Box(width: int, height: int)"
+    assert signature_help.active_parameter == 0
+
+
+def test_signature_help_at_stdlib_attribute_call_returns_none(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    app = root / "app.py"
+    _write(app, 'import os\n\nos.getenv("X")\n')
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(app, line=2, character=10)
+    assert signature_help is None
+
+
+def test_signature_help_at_deep_attribute_chain_returns_none(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "pkg" / "__init__.py", "")
+    _write(root / "pkg" / "sub.py", "def foo(x: int) -> int:\n    return x\n")
+    consumer = root / "app.py"
+    _write(consumer, "import pkg.sub\n\npkg.sub.foo(1)\n")
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(consumer, line=2, character=12)
+    assert signature_help is None
+
+
+def test_language_server_serves_attribute_signature_help(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "m.py", "def foo(x: int, y: int) -> int:\n    return x + y\n")
+    app = root / "app.py"
+    _write(app, "import m\n\nm.foo(1, )\n")
+    server = LanguageServer(default_root=str(root))
+    try:
+        server._handle_request("initialize", {"rootUri": root.as_uri()})
+        result = server._handle_request(
+            "textDocument/signatureHelp",
+            {
+                "textDocument": {"uri": app.as_uri()},
+                "position": {"line": 2, "character": 9},
+            },
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+    assert result is not None
+    assert result["signatures"][0]["label"] == "def foo(x: int, y: int) -> int"
+    assert result["activeParameter"] == 1
+
+
+def test_signature_help_at_positional_default_in_label(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def f(x: int, y: int = 5) -> int:\n    return x + y\n\nf(1)\n")
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=3, character=2)
+    assert signature_help is not None
+    assert signature_help.label == "def f(x: int, y: int = 5) -> int"
+
+
+def test_signature_help_at_kwonly_default_in_label(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def g(a: int, *, k: int = 3) -> int:\n    return a + k\n\ng(1)\n")
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=3, character=2)
+    assert signature_help is not None
+    assert signature_help.label == "def g(a: int, k: int = 3) -> int"
+
+
+def test_signature_help_at_parameter_offsets_stay_aligned_with_defaults(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def f(a: int, b: int = 2) -> int:\n    return a + b\n\nf(1)\n")
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=3, character=2)
+    assert signature_help is not None
+    assert signature_help.label == "def f(a: int, b: int = 2) -> int"
+    assert tuple(
+        (p.label, p.label_offset_start, p.label_offset_end)
+        for p in signature_help.parameters
+    ) == (
+        ("a: int", 6, 12),
+        ("b: int = 2", 14, 24),
+    )
+    # The reported offsets must index the label back to the parameter text.
+    for parameter in signature_help.parameters:
+        assert (
+            signature_help.label[
+                parameter.label_offset_start : parameter.label_offset_end
+            ]
+            == parameter.label
+        )
+
+
+def test_signature_help_at_class_init_defaults_strip_self(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(
+        target,
+        "class Box:\n"
+        "    def __init__(self, width: int = 10, height: int = 20) -> None:\n"
+        "        self.width = width\n"
+        "        self.height = height\n"
+        "\n"
+        "Box()\n",
+    )
+    with WorkspaceSession(root) as session:
+        signature_help = session.signature_help_at(target, line=5, character=4)
+    assert signature_help is not None
+    assert signature_help.label == "def Box(width: int = 10, height: int = 20)"
+    for parameter in signature_help.parameters:
+        assert (
+            signature_help.label[
+                parameter.label_offset_start : parameter.label_offset_end
+            ]
+            == parameter.label
+        )

@@ -57,6 +57,12 @@ _PYINC_SEVERITY_TO_LSP = {
     "hint": 4,
 }
 
+# LSP DiagnosticTag enum values (LSP 3.17).
+_PYINC_DIAGNOSTIC_TAG_TO_LSP = {
+    "unnecessary": 1,
+    "deprecated": 2,
+}
+
 _DOCUMENT_HIGHLIGHT_KINDS = {
     "text": 1,
     "read": 2,
@@ -82,6 +88,8 @@ _COMPLETION_ITEM_KIND = {
 
 _ID_START_RE = re.compile(r"[A-Za-z_]")
 _ID_CONT_RE = re.compile(r"[A-Za-z0-9_]")
+
+_LINKED_EDITING_WORD_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*"
 
 _LSP_REQUEST_FAILED = -32803
 
@@ -117,6 +125,7 @@ def _diagnostic_signature(diagnostic: dict[str, Any]) -> tuple[Any, ...]:
         diagnostic.get("source"),
         diagnostic.get("code"),
         diagnostic.get("message"),
+        tuple(diagnostic.get("tags") or ()),
     )
 
 
@@ -463,10 +472,14 @@ class LanguageServer:
             return self._references(params)
         if method == "textDocument/documentHighlight":
             return self._document_highlight(params)
+        if method == "textDocument/linkedEditingRange":
+            return self._linked_editing_range(params)
         if method == "textDocument/prepareRename":
             return self._prepare_rename(params)
         if method == "textDocument/rename":
             return self._rename(params)
+        if method == "textDocument/codeAction":
+            return self._code_action(params)
         if method == "textDocument/signatureHelp":
             return self._signature_help(params)
         if method == "textDocument/foldingRange":
@@ -689,7 +702,9 @@ class LanguageServer:
                 "typeDefinitionProvider": True,
                 "referencesProvider": True,
                 "documentHighlightProvider": True,
+                "linkedEditingRangeProvider": True,
                 "renameProvider": {"prepareProvider": True},
+                "codeActionProvider": {"codeActionKinds": ["quickfix"]},
                 "signatureHelpProvider": {
                     "triggerCharacters": ["(", ","],
                     "retriggerCharacters": [","],
@@ -741,7 +756,7 @@ class LanguageServer:
                     }
                 },
             },
-            "serverInfo": {"name": "pyinc-tools", "version": "2.1.0"},
+            "serverInfo": {"name": "pyinc-tools", "version": "2.6.0"},
         }
 
     def _on_watcher_change(self, _changed: tuple[str, ...]) -> None:
@@ -1032,6 +1047,41 @@ class LanguageServer:
             for highlight in highlights
         ]
 
+    def _linked_editing_range(self, params: Any) -> dict[str, Any] | None:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        position = params["position"]
+        line = int(position["line"])
+        character = int(position["character"])
+        source = session.source_text(real_path)
+        if source is None:
+            return None
+        identifier = _identifier_at_position(source, line, character)
+        if identifier is None:
+            return None
+        try:
+            ranges = session.linked_editing_ranges_at(real_path, identifier)
+        except FileNotFoundError:
+            return None
+        if not ranges:
+            return None
+        return {
+            "ranges": [
+                {
+                    "start": {
+                        "line": max(editing_range.lineno - 1, 0),
+                        "character": editing_range.col_offset,
+                    },
+                    "end": {
+                        "line": max(editing_range.lineno - 1, 0),
+                        "character": editing_range.end_col_offset,
+                    },
+                }
+                for editing_range in ranges
+            ],
+            "wordPattern": _LINKED_EDITING_WORD_PATTERN,
+        }
+
     def _prepare_rename(self, params: Any) -> dict[str, Any] | None:
         session = self._require_session()
         real_path = self._require_safe_path(params["textDocument"]["uri"])
@@ -1114,6 +1164,60 @@ class LanguageServer:
                 }
             )
         return {"changes": changes}
+
+    def _code_action(self, params: Any) -> list[dict[str, Any]]:
+        session = self._require_session()
+        real_path = self._require_safe_path(params["textDocument"]["uri"])
+        context = params.get("context") or {}
+        only = context.get("only")
+        if only is not None and not any(
+            kind == "quickfix" or "quickfix".startswith(f"{kind}.") for kind in only
+        ):
+            return []
+        range_ = params.get("range") or {}
+        start = range_.get("start") or {}
+        end = range_.get("end") or {}
+        start_line = int(start.get("line", 0))
+        start_character = int(start.get("character", 0))
+        end_line = int(end.get("line", start_line))
+        end_character = int(end.get("character", start_character))
+        try:
+            actions = session.code_actions_for_range(
+                real_path, start_line, start_character, end_line, end_character
+            )
+        except FileNotFoundError:
+            return []
+        payload: list[dict[str, Any]] = []
+        for action in actions:
+            changes: dict[str, list[dict[str, Any]]] = {}
+            for edit in action.edits:
+                uri = _path_to_uri(edit.path)
+                changes.setdefault(uri, []).append(
+                    {
+                        "range": {
+                            "start": {
+                                "line": edit.start_line,
+                                "character": edit.start_character,
+                            },
+                            "end": {
+                                "line": edit.end_line,
+                                "character": edit.end_character,
+                            },
+                        },
+                        "newText": edit.new_text,
+                    }
+                )
+            payload.append(
+                {
+                    "title": action.title,
+                    "kind": action.kind,
+                    "diagnostics": [
+                        self._analysis_diagnostic_to_lsp(action.diagnostic)
+                    ],
+                    "edit": {"changes": changes},
+                }
+            )
+        return payload
 
     def _signature_help(self, params: Any) -> dict[str, Any] | None:
         session = self._require_session()
@@ -1539,7 +1643,7 @@ class LanguageServer:
     ) -> dict[str, Any]:
         line = max((diagnostic.lineno or 1) - 1, 0)
         character = max(diagnostic.col_offset or 0, 0)
-        return {
+        payload: dict[str, Any] = {
             "range": {
                 "start": {"line": line, "character": character},
                 "end": {"line": line, "character": character + 1},
@@ -1549,6 +1653,14 @@ class LanguageServer:
             "code": diagnostic.code,
             "message": diagnostic.message,
         }
+        tags = [
+            _PYINC_DIAGNOSTIC_TAG_TO_LSP[tag]
+            for tag in diagnostic.tags
+            if tag in _PYINC_DIAGNOSTIC_TAG_TO_LSP
+        ]
+        if tags:
+            payload["tags"] = tags
+        return payload
 
     def _require_safe_path(self, uri: str) -> str:
         path = _uri_to_path(uri)

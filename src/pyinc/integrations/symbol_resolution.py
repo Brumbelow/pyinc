@@ -126,6 +126,46 @@ ReferenceQueryResultPayload: TypeAlias = tuple[
 ]
 #   target, references
 
+ClassMemberKind: TypeAlias = Literal["method", "class_variable", "instance_variable"]
+
+ClassMemberPayload: TypeAlias = tuple[
+    str,
+    ClassMemberKind,
+    int,
+    str | None,
+    SignaturePayload | None,
+]
+#   name, kind, lineno, annotation_text, signature
+
+EncodedBasePayload: TypeAlias = tuple[str, ...]
+#   ("name", id) | ("attr", lhs_id, attr) | ("text", raw)
+
+OwnClassModelPayload: TypeAlias = tuple[
+    str,
+    tuple[EncodedBasePayload, ...],
+    tuple[ClassMemberPayload, ...],
+]
+#   qualified_name, bases, members
+
+ResolvedClassMemberPayload: TypeAlias = tuple[
+    str,
+    ClassMemberKind,
+    int,
+    str | None,
+    SignaturePayload | None,
+    str | None,
+    str | None,
+]
+#   name, kind, lineno, annotation_text, signature, defining_path, defining_class
+
+ResolvedClassModelPayload: TypeAlias = tuple[
+    str,
+    str,
+    tuple[ResolvedClassMemberPayload, ...],
+    tuple[str, ...],
+]
+#   path, qualified_name, members, unresolved_bases
+
 # ---------------------------------------------------------------------------
 # Result dataclasses (Layer 3 public API)
 # ---------------------------------------------------------------------------
@@ -206,11 +246,36 @@ class ReferenceQueryResult:
     references: tuple[Reference, ...]
 
 
+@dataclass(frozen=True)
+class ClassMember:
+    name: str
+    kind: ClassMemberKind
+    lineno: int
+    annotation: str | None
+    signature: Signature | None
+    defining_path: str | None
+    defining_class: str | None
+
+
+@dataclass(frozen=True)
+class ClassModel:
+    path: str
+    qualified_name: str
+    members: tuple[ClassMember, ...]
+    unresolved_bases: tuple[str, ...]
+
+
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
 
 MAX_FOLLOW_DEPTH = 8
+
+# Depth bound for base-class following in `resolved_class_model_payload`.
+# Mirrors `MAX_FOLLOW_DEPTH`'s trail/cap idiom: the starting class sits at depth
+# 0, so classes at depths 0..MAX_BASE_DEPTH-1 contribute members and the class
+# reached at depth MAX_BASE_DEPTH (and beyond) is not walked.
+MAX_BASE_DEPTH = 8
 
 # ---------------------------------------------------------------------------
 # Private helpers
@@ -1497,7 +1562,397 @@ def find_references(
     return ReferenceQueryResult(target=target, references=decoded)
 
 
+# ---------------------------------------------------------------------------
+# Class model (own members) — declaration-only, caret-free
+# ---------------------------------------------------------------------------
+
+
+def _first_param_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The name of a callable's first positional parameter, or ``None``.
+
+    Positional-only parameters take precedence, then regular positionals; a
+    callable that only takes ``*args`` / keyword parameters has no first
+    positional and returns ``None``.
+    """
+    args = node.args
+    if args.posonlyargs:
+        return args.posonlyargs[0].arg
+    if args.args:
+        return args.args[0].arg
+    return None
+
+
+def _encode_base(node: ast.expr) -> EncodedBasePayload:
+    """Encode a ``ClassDef`` base expression for later (Stage 3) resolution.
+
+    ``("name", id)`` for a bare ``Name``, ``("attr", lhs_id, attr)`` for
+    ``Name.attr``. A single ``Subscript`` layer is unwrapped so ``Base[T]``
+    resolves through its ``value`` (``Base``). ``Starred`` bases, deep
+    attribute chains, and call expressions fall back to
+    ``("text", ast.unparse(node))`` carrying the raw source of the whole
+    original base expression.
+    """
+    inner: ast.expr = node
+    if isinstance(inner, ast.Subscript):
+        inner = inner.value
+    if isinstance(inner, ast.Name):
+        return ("name", inner.id)
+    if isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name):
+        return ("attr", inner.value.id, inner.attr)
+    return ("text", ast.unparse(node))
+
+
+def _base_text(encoded: EncodedBasePayload) -> str:
+    """Flatten an :data:`EncodedBasePayload` to its textual base name."""
+    if encoded[0] == "attr":
+        return f"{encoded[1]}.{encoded[2]}"
+    return encoded[1]
+
+
+def _self_attribute_names(target: ast.expr) -> tuple[str, ...]:
+    """Attribute names bound by assigning to a ``self.NAME`` target.
+
+    Handles tuple / list / starred unpacking (``self.a, *self.rest = ...``)
+    recursively. Only ``Attribute`` targets whose value is the bare ``Name``
+    ``self`` contribute; anything else yields nothing.
+    """
+    if (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    ):
+        return (target.attr,)
+    if isinstance(target, ast.Starred):
+        return _self_attribute_names(target.value)
+    if isinstance(target, (ast.List, ast.Tuple)):
+        names: list[str] = []
+        for elt in target.elts:
+            names.extend(_self_attribute_names(elt))
+        return tuple(names)
+    return tuple()
+
+
+def _collect_instance_attributes(
+    method: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[tuple[str, int, str | None]]:
+    """Every ``self.NAME`` assignment in *method*'s body as ``(name, lineno,
+    annotation_text)``.
+
+    Descent stops at nested ``FunctionDef`` / ``AsyncFunctionDef`` /
+    ``ClassDef`` / ``Lambda`` scopes — a ``self.x`` inside a closure belongs to
+    that closure's binding of ``self``, not the enclosing method's. ``AugAssign``
+    (``self.x += 1``) is excluded because it presumes a pre-existing attribute
+    rather than establishing one.
+    """
+    collected: list[tuple[str, int, str | None]] = []
+
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                for name in _self_attribute_names(target):
+                    collected.append((name, node.lineno, None))
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                collected.append(
+                    (target.attr, node.lineno, _annotation_text(node.annotation))
+                )
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                child,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+            ):
+                continue
+            visit(child)
+
+    for stmt in method.body:
+        if isinstance(
+            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            continue
+        visit(stmt)
+    return collected
+
+
+def _class_member_walk(cls: ast.ClassDef) -> tuple[ClassMemberPayload, ...]:
+    """Own members of a single ``ClassDef`` in deterministic, deduped order.
+
+    Priority (first binding of a name wins): annotated class-body variables,
+    assigned class-body variables, methods, then instance attributes collected
+    from every direct method whose first parameter is literally ``self``
+    (lowest lineno kept when an attribute is bound in more than one place).
+    Nested ``ClassDef`` members belong to that class's own model and are not
+    reported here.
+    """
+    members: list[ClassMemberPayload] = []
+    seen: set[str] = set()
+
+    def add(
+        name: str,
+        kind: ClassMemberKind,
+        lineno: int,
+        annotation: str | None,
+        signature: SignaturePayload | None,
+    ) -> None:
+        if name in seen:
+            return
+        seen.add(name)
+        members.append((name, kind, lineno, annotation, signature))
+
+    for node in cls.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            add(
+                node.target.id,
+                "class_variable",
+                node.lineno,
+                _annotation_text(node.annotation),
+                None,
+            )
+    for node in cls.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                for name in _target_bound_names(target):
+                    if name == "__all__":
+                        continue
+                    add(name, "class_variable", node.lineno, None, None)
+    for node in cls.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            add(node.name, "method", node.lineno, None, _signature_payload(node))
+
+    instance: dict[str, tuple[int, str | None]] = {}
+    for node in cls.body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and _first_param_name(node) == "self"
+        ):
+            for name, lineno, annotation in _collect_instance_attributes(node):
+                existing = instance.get(name)
+                if existing is None or lineno < existing[0]:
+                    instance[name] = (lineno, annotation)
+    for name in sorted(instance, key=lambda item: (instance[item][0], item)):
+        lineno, annotation = instance[name]
+        add(name, "instance_variable", lineno, annotation, None)
+
+    return tuple(members)
+
+
+def _walk_class_defs(tree: ast.Module) -> tuple[tuple[str, ast.ClassDef], ...]:
+    """Every ``ClassDef`` in *tree* paired with its dotted qualifier.
+
+    The qualifier follows ``module_symbol_table``'s scheme: only ``ClassDef``
+    nesting extends the dotted path (``Outer.Inner``); a class declared inside
+    a function body re-enters at its bare name.
+    """
+    out: list[tuple[str, ast.ClassDef]] = []
+
+    def walk(node: ast.AST, qualifier: str) -> None:
+        if isinstance(node, ast.ClassDef):
+            qname = f"{qualifier}.{node.name}" if qualifier else node.name
+            out.append((qname, node))
+            for body_child in node.body:
+                walk(body_child, qname)
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for descendant in ast.iter_child_nodes(node):
+                walk(descendant, "")
+            return
+        for descendant in ast.iter_child_nodes(node):
+            walk(descendant, qualifier)
+
+    walk(tree, "")
+    return tuple(out)
+
+
+@query
+def class_models_for_file(db: Database, path: str) -> tuple[OwnClassModelPayload, ...]:
+    source = source_text(db, path)
+    tree = _try_parse(source)
+    if tree is None:
+        return tuple()
+    out: list[OwnClassModelPayload] = []
+    for qname, cls in _walk_class_defs(tree):
+        bases = tuple(_encode_base(base) for base in cls.bases)
+        members = _class_member_walk(cls)
+        out.append((qname, bases, members))
+    return tuple(out)
+
+
+def _class_site_from_resolved(
+    db: Database, root: str, resolved: ResolvedSymbolPayload
+) -> tuple[str, str] | None:
+    """The ``(defining_path, class_qname)`` a resolved symbol lands on when it
+    points at a workspace ``class`` — else ``None``.
+
+    The resolver returns the *original* requested name, which may be an import
+    alias; ``defining_lineno`` instead pins the class in its own module table,
+    which both confirms the target is a class and recovers its qualified name in
+    that file (nested classes included, e.g. ``Outer.Inner``)."""
+    if resolved[2] != "workspace":
+        return None
+    defining_path = resolved[4]
+    defining_lineno = resolved[5]
+    if defining_path is None or defining_lineno is None:
+        return None
+    table = module_symbol_table_for_module(db, root, defining_path)
+    for sym_qname, kind, lineno, *_rest in table[2]:
+        if lineno == defining_lineno and kind == "class":
+            return (defining_path, sym_qname)
+    return None
+
+
+def _resolve_base_to_class(
+    db: Database, root: str, path: str, encoded: EncodedBasePayload
+) -> tuple[str, str] | None:
+    """Resolve one encoded base to the ``(path, class_qname)`` of a workspace
+    class, in ``path``'s module context.
+
+    ``("name", X)`` resolves ``X`` through the file's imports (same-file class
+    qnames live in the module table, so bare local bases resolve too).
+    ``("attr", L, A)`` first tries the whole dotted name as a same-module class
+    (``Outer.Inner``), then falls back to resolving ``L`` to a workspace module
+    and ``A`` inside it (the ``_resolve_attr_on_module`` idiom). ``("text", …)``
+    bases, and anything not landing on a workspace class (stdlib / installed /
+    missing / ambiguous / non-class), return ``None`` — the caller records them
+    in ``unresolved_bases``.
+    """
+    tag = encoded[0]
+    if tag == "name":
+        return _class_site_from_resolved(
+            db, root, resolve_symbol_payload(db, root, path, encoded[1])
+        )
+    if tag == "attr":
+        lhs, attr = encoded[1], encoded[2]
+        direct = resolve_symbol_payload(db, root, path, f"{lhs}.{attr}")
+        site = _class_site_from_resolved(db, root, direct)
+        if site is not None:
+            return site
+        lhs_resolved = resolve_symbol_payload(db, root, path, lhs)
+        lhs_path = lhs_resolved[4]
+        # `defining_lineno is None` means the LHS is a module, not a symbol.
+        if lhs_resolved[2] == "workspace" and lhs_resolved[5] is None and lhs_path:
+            return _class_site_from_resolved(
+                db, root, resolve_symbol_payload(db, root, lhs_path, attr)
+            )
+    return None
+
+
+@query
+def resolved_class_model_payload(
+    db: Database, root: str, path: str, qualified_name: str
+) -> ResolvedClassModelPayload:
+    workspace_files = workspace_python_files(db, root)
+    if path not in workspace_files:
+        return (path, qualified_name, tuple(), tuple())
+
+    # Flatten the inheritance graph: DEPTH-FIRST, LEFT-TO-RIGHT,
+    # FIRST-DEFINITION-WINS by member name (derived shadows base). This is not
+    # C3 MRO. Cycles are cut by a `(path, class_qname)` visited set, and the
+    # walk is bounded by `MAX_BASE_DEPTH`. Base files are queried one at a time
+    # via `class_models_for_file`, so an edit to one base invalidates per file.
+    members: dict[str, ResolvedClassMemberPayload] = {}
+    unresolved: list[str] = []
+    seen_unresolved: set[str] = set()
+    visited: set[tuple[str, str]] = set()
+
+    def visit(cur_path: str, cur_qname: str, depth: int) -> None:
+        key = (cur_path, cur_qname)
+        if key in visited or depth >= MAX_BASE_DEPTH:
+            return
+        visited.add(key)
+        own: tuple[tuple[EncodedBasePayload, ...], tuple[ClassMemberPayload, ...]] | None
+        own = None
+        for model_qname, bases, own_members in class_models_for_file(db, cur_path):
+            if model_qname == cur_qname:
+                own = (bases, own_members)
+                break
+        if own is None:
+            return
+        cur_bases, cur_members = own
+        for name, kind, lineno, annotation, signature in cur_members:
+            if name not in members:
+                members[name] = (
+                    name,
+                    kind,
+                    lineno,
+                    annotation,
+                    signature,
+                    cur_path,
+                    cur_qname,
+                )
+        for base in cur_bases:
+            site = _resolve_base_to_class(db, root, cur_path, base)
+            if site is None:
+                text = _base_text(base)
+                if text not in seen_unresolved:
+                    seen_unresolved.add(text)
+                    unresolved.append(text)
+                continue
+            visit(site[0], site[1], depth + 1)
+
+    visit(path, qualified_name, 0)
+    return (path, qualified_name, tuple(members.values()), tuple(unresolved))
+
+
+def _decode_class_member(payload: ResolvedClassMemberPayload) -> ClassMember:
+    (
+        name,
+        kind,
+        lineno,
+        annotation,
+        signature,
+        defining_path,
+        defining_class,
+    ) = payload
+    return ClassMember(
+        name=name,
+        kind=kind,
+        lineno=lineno,
+        annotation=annotation,
+        signature=_decode_signature(signature),
+        defining_path=defining_path,
+        defining_class=defining_class,
+    )
+
+
+def _decode_class_model(payload: ResolvedClassModelPayload) -> ClassModel:
+    path, qualified_name, members, unresolved_bases = payload
+    return ClassModel(
+        path=path,
+        qualified_name=qualified_name,
+        members=tuple(_decode_class_member(item) for item in members),
+        unresolved_bases=unresolved_bases,
+    )
+
+
+def class_model(
+    db: Database,
+    root: str | os.PathLike[str],
+    path: str | os.PathLike[str],
+    qualified_name: str,
+) -> ClassModel:
+    normalized_root = _normalize_path(root)
+    normalized_path = _normalize_path(path)
+    payload = cast(
+        ResolvedClassModelPayload,
+        thaw(
+            db.get(
+                resolved_class_model_payload,
+                normalized_root,
+                normalized_path,
+                qualified_name,
+            )
+        ),
+    )
+    return _decode_class_model(payload)
+
+
 __all__ = [
+    "ClassMember",
+    "ClassModel",
     "ModuleSymbolTable",
     "Parameter",
     "Reference",
@@ -1507,6 +1962,7 @@ __all__ = [
     "Symbol",
     "WorkspaceSymbolEntry",
     "WorkspaceSymbolIndex",
+    "class_model",
     "find_references",
     "module_symbol_table",
     "resolve_symbol",

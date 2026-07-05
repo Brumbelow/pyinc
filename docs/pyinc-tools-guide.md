@@ -133,6 +133,8 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
     "typeDefinitionProvider": true,
     "referencesProvider": true,
     "documentHighlightProvider": true,
+    "linkedEditingRangeProvider": true,
+    "codeActionProvider": { "codeActionKinds": ["quickfix"] },
     "signatureHelpProvider": {
       "triggerCharacters": ["(", ","],
       "retriggerCharacters": [","]
@@ -174,7 +176,7 @@ used only if the client omits `rootUri` / `workspaceFolders` on `initialize`.
       }
     }
   },
-  "serverInfo": { "name": "pyinc-tools", "version": "2.1.0" }
+  "serverInfo": { "name": "pyinc-tools", "version": "2.6.0" }
 }
 ```
 
@@ -208,11 +210,13 @@ channels does not produce duplicate messages.
 | `textDocument/typeDefinition` | `Location[]` pointing at the declared type of the symbol under the cursor. The cursor's identifier is resolved through the file's imports to its declaring `Symbol`; the symbol's annotation (variable / class-variable `annotation`, or function / method `signature.return_annotation`) is parsed as a Python expression and walked for `Name` and `Attribute(value=Name(...))` nodes, with each name re-resolved against the declaring module. Generics (`list[Foo]`), unions (`Foo \| Bar`), and qualified attribute types (`pkg.Foo`) all contribute one location per workspace-resolved type, deduplicated by `(path, lineno)`. Whole-string forward references (`x: "Foo"`) are unwrapped exactly once. Classes return their own definition location. Stdlib / installed / ambiguous type names (`int`, `list`, `typing.Optional`, etc.), import aliases, wildcard-import stubs, unannotated variables / functions, and non-workspace targets return `[]`. Attribute chains whose LHS is not a bare `Name` (`pkg.subpkg.Foo`) are skipped, matching `find_references`'s LHS-bare-Name limitation. |
 | `textDocument/references` | `Location[]` via `find_references`; honors `context.includeDeclaration`; per-occurrence `col_offset` / `end_col_offset` ranges so editors can highlight each match. Only workspace-resolved targets are indexed — stdlib / installed / ambiguous targets return `[]`. |
 | `textDocument/documentHighlight` | `DocumentHighlight[]` for the symbol under the cursor, scoped to the current file. The declaration site is reported with `kind: 3` (Write); other occurrences with `kind: 1` (Text). The synthetic `find_references` placeholder for `def`/`class` declarations is repaired to the real identifier offset, so editors highlight the actual name and not the line's first character. Cross-file references returned by `find_references` are filtered out — workspace-wide highlighting is `textDocument/references`'s job. Stdlib / installed / ambiguous targets return `[]`. |
+| `textDocument/linkedEditingRange` | `{ranges, wordPattern}` or `null`. The range set is exactly `textDocument/documentHighlight`'s file-scoped occurrences for the symbol under the cursor (declaration span repaired off the `def`/`class` placeholder, plus every verified reference), so every range covers the same identifier and can be edited simultaneously; `wordPattern` is `[A-Za-z_][A-Za-z0-9_]*`, telling the client when to stop mirroring. In-file only — workspace-wide edits still go through `textDocument/rename`. Unknown identifiers, whitespace positions, non-workspace targets (stdlib / installed / ambiguous / missing), and files outside the workspace return `null`. |
 | `textDocument/foldingRange` | `FoldingRange[]` for the requested document. AST-walked: `def`/`async def`/`class` blocks emit a generic-region fold (no `kind` field) starting at the header line — or the first decorator line if any decorators are attached — and ending at the AST `end_lineno`; class bodies recurse so methods fold independently. Consecutive top-level `import` / `from … import` statements are coalesced into one `kind: "imports"` fold; multi-line parenthesised imports collapse on their own. Single-line definitions and single-line single imports emit no fold. Files that fail to parse return `[]`. |
 | `textDocument/selectionRange` | `SelectionRange[]` (one entry per requested position). Each entry is a chain of nested ranges encoded via the recursive `parent` field: innermost first, each parent strictly contains its child. The chain is computed by parsing the document (overlay or on-disk) once with `ast.parse` and collecting every AST node whose `(lineno, col_offset)`–`(end_lineno, end_col_offset)` span contains the cursor; duplicates are collapsed and the result is filtered to a strict containment chain ordered by length. Files that fail to parse, positions outside the source, or positions that no AST node covers fall back to a single zero-width range at the cursor so the LSP result length always matches `params.positions` length. |
 | `textDocument/documentLink` | `DocumentLink[]` for the requested document. The server walks the document's AST and emits one link per `ast.alias` whose enclosing `Import` / `ImportFrom` resolves to a workspace file. For `import M [as alias]` the link spans the whole `M [as alias]` clause and points at `M`'s resolved file; for `from M import a, b` each imported name is linked individually to its own resolved path (a submodule import like `from pkg import child` resolves to `child.py`, not `pkg/__init__.py`). Stdlib / installed / missing / ambiguous targets and `from M import *` emit no link. Files that fail to parse return `[]`. |
 | `textDocument/codeLens` | `CodeLens[]` for the requested document. One lens is emitted above every top-level `def` / `async def` / `class` in the file; the range spans the bare-name identifier on the definition's header line (decorated definitions still report on the `def` line, not the decorator line). The lens's `command` is `{title: "<N> reference[s]", command: ""}`, where `N` is the count returned by `find_references` with `include_declaration=False` restricted to workspace targets. Methods (`kind: "method"`), nested classes (dotted qualified names), class variables, and import aliases emit no lens — `find_references` does not reliably resolve attribute calls on instances, so a method lens would always read 0. Non-workspace targets, unparseable files, and files with no qualifying symbols return `[]`. The empty `command` string follows pylsp's convention so the lens displays as plain hint text without binding to an editor-specific action. |
-| `textDocument/signatureHelp` | `SignatureHelp` for the call expression enclosing the cursor. A forward source scanner finds the topmost open `(` whose preceding token is a usable identifier, counts top-level commas to derive `activeParameter`, and resolves the identifier through `symbol_resolution.resolve_symbol`. Functions surface their declared signature; classes surface `<Class>.__init__` with a leading `self` / `cls` stripped, or an empty constructor signature when no `__init__` is defined. Stdlib / installed / ambiguous targets, attribute calls (`obj.method(`), subscripted calls (`factory[T](`), and `def`/`class` definition headers all return `null`. Parameters use LSP `[start, end]` substring offsets into the signature label. |
+| `textDocument/completion` | `CompletionItem[]` (`{isIncomplete: false, items}`) for the caret, drawn only from real `symbol_resolution` bindings — never inferred runtime types. The caret line is repaired to `pass` before analysis so a mid-edit `owner.` still resolves. Contexts: bare-name prefix (current-file module-level symbols, workspace top-level module names, keywords); attribute `M.<prefix>` for a bare-name `M` resolving to a workspace module (its exports) or class (its flattened class view — methods + class vars, own and inherited); `self.` / `cls.` inside a method offering the enclosing class's instance / class view from `class_model`; an annotated bare name whose declared annotation (bare `Name`, one-hop `mod.Foo`, or whole-string forward ref) resolves to a workspace class, offering that class's instance view; dotted attribute `pkg.sub.<prefix>` when the owner is exactly a workspace module (its exports) or `pkg.sub.C.<prefix>` / `M.C.<prefix>` when the owner is `<workspace-module>.<class>` (the class's own members, via `workspace_symbol_index` exact match — not flattened); and import position (`from pkg import <prefix>`, `import <prefix>`). Class views are flattened over workspace base classes depth-first, left-to-right, first-definition-wins (not C3 MRO), bounded at `MAX_BASE_DEPTH = 8`. Instance chains (`obj.attr.<prefix>`), stdlib / installed owners, subscripted / union / deep-dotted annotations, strings, and comments yield `[]`. Each item carries `label` / `kind` / `detail` / `sortText`; `resolveProvider` is `false`. |
+| `textDocument/signatureHelp` | `SignatureHelp` for the call expression enclosing the cursor. A forward source scanner finds the topmost open `(` whose preceding token is a usable identifier, counts top-level commas to derive `activeParameter`, and resolves the identifier through `symbol_resolution.resolve_symbol`. Bare-name calls (`foo(`) and single-dot attribute calls whose owner is a bare name (`M.foo(`, resolved through the file's imports to the module then `foo` inside it, mirroring `callHierarchy/outgoingCalls`) are detected. Functions surface their declared signature; classes surface `<Class>.__init__` with a leading `self` / `cls` stripped, or an empty constructor signature when no `__init__` is defined. Parameter default values are rendered into the label (`name: ann = default` / `name=default`, extracted from the defining file's source). Stdlib / installed / ambiguous targets, deep attribute chains (`pkg.sub.foo(`), subscripted calls (`factory[T](`), and `def`/`class` definition headers all return `null`. Parameters use LSP `[start, end]` substring offsets into the signature label. |
 | `textDocument/prepareCallHierarchy` | `CallHierarchyItem[]` or `null`. Resolves the identifier under the cursor through `symbol_resolution.resolve_symbol`; if the target is a workspace `function`, `method`, or `class`, returns a single item describing the declaring def/class. The item's `range` covers the whole def block (including decorator lines if any), and `selectionRange` is the bare-name span on the header line. The item's `data` field carries `{"path": str, "qualified_name": str}` which the server reads back on `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`. Variables, import aliases, `from_import` aliases, wildcard-import stubs, and stdlib / installed / ambiguous / missing targets return `null`. |
 | `callHierarchy/incomingCalls` | `CallHierarchyIncomingCall[]`. Calls `find_references(include_declaration=False)` on the item's target and groups references by their innermost enclosing workspace-known def/class in the same file (qualifier follows `module_symbol_table`'s ClassDef-only nesting scheme, so a reference inside `class C: def m(self): ...` is attributed to `C.m`). References inside nested function bodies bubble up to the next enclosing function or method that's in the symbol table; module-top-level references are dropped because there is no caller item to attribute them to. `fromRanges` are AST occurrence ranges, including the rightmost-attribute span for `M.foo()` style references. |
 | `callHierarchy/outgoingCalls` | `CallHierarchyOutgoingCall[]`. Parses the item's declaring file, locates the `def` / `async def` / `class` matching the item's qualified name, and walks its body for `ast.Call` nodes — *without* descending into nested `FunctionDef` / `AsyncFunctionDef` / `ClassDef` / `Lambda` scopes (each owns its own outgoing list). For each call: bare `Name(id=name)` resolves against the declaring module; `Name.attr` resolves the LHS through the file's imports and then `attr` inside the imported module (mirroring `find_references`'s LHS-bare-Name handling). Workspace `function` / `method` / `class` targets contribute callees; subscripted calls, deep attribute chains (`pkg.subpkg.foo()`), and lambda calls produce no callee. `fromRanges` are the call expression's name/attribute span. |
@@ -224,8 +228,8 @@ channels does not produce duplicate messages.
 | `textDocument/semanticTokens/range` | `SemanticTokens` payload (`{data: int[]}`) for the slice of the requested document covered by the half-open LSP range `[params.range.start, params.range.end)`. Implementation reuses the same full-document AST walk as `semanticTokens/full` and then filters by token start position: a token at `(line, character)` is included iff its start is `>= range.start` and `< range.end`. The retained tokens are encoded into the wire format on their own (the delta cursor is reset, so the first emitted token's `deltaLine` / `deltaStart` are absolute). Files that fail to parse and missing files return `{"data": []}`. No server-side per-document state is held — every `range` request is independent. |
 | `workspace/willRenameFiles` | `WorkspaceEdit` or `null`. For each `{oldUri, newUri}` pair the server walks every Python file in the workspace and emits text edits that update the `import` and `from` statements which reference the renamed file's module name. Three rewrite shapes: (1) `import <old_module> [as alias]` → the dotted-module span becomes `<new_module>` (the `as` clause is preserved); (2) `from <old_module> import …` → the dotted-module span (including any leading dots) is rewritten — the existing `level` is preserved when both old and new modules live under the same package anchor, otherwise the statement is rewritten to absolute form (`from <new_module> import …`, `level == 0`); (3) `from <pkg> import <leaf> [as alias]` where `<pkg>.<leaf> == old_module` and `old_module`/`new_module` share the same parent package → the leaf is rewritten to `new_module`'s leaf (`as` clause preserved). Renames are silently skipped when either path is outside the workspace, isn't a `.py` file, is `__init__.py` (package rename — separate feature), or yields the same module name; the request returns `null` when no edits are needed. Multiple renames in one request are batched against the *current* workspace state — no chaining is attempted. |
 | `workspace/willDeleteFiles` | `WorkspaceEdit` or `null`. For each `{uri}` entry the server walks every Python file in the workspace and emits text edits that remove the `import` and `from` statements which would become broken once the file is gone. Three deletion shapes: (1) `import <deleted_module> [as alias]` → the whole statement is removed (range spans the line including its trailing newline) when it's the only alias; otherwise only the dead alias plus its adjacent comma is removed (`import a, b` with `a` deleted → `import b`); (2) `from <deleted_module> import …` → the whole statement is removed (every imported name's source module is gone); (3) `from <pkg> import <leaf> [as alias]` where `<pkg>.<leaf> == deleted_module` → the whole statement is removed when it's the only imported name, else only the dead leaf plus its adjacent comma is removed. Deletions are silently skipped when the path is outside the workspace, isn't a `.py` file, or is `__init__.py` (package delete — separate feature); the request returns `null` when no edits are needed. Importers that are themselves part of the same delete batch are skipped (no point editing a file the client is about to remove). Multiple deletions in one request are batched against the *current* workspace state. |
-| `textDocument/publishDiagnostics` | Server-pushed after every state change or watcher tick; scoped to paths currently or previously reported. Duplicate payloads for an unchanged URI are suppressed. |
-| `textDocument/diagnostic` | Pull-model (LSP 3.17) single-document report. Runs `analyze_file` on the requested document and returns a `RelatedFullDocumentDiagnosticReport` (`{kind: "full", resultId, items}`) whose `items` are the same `Diagnostic` objects the push channel emits for that file (codes: `missing-import`, `ambiguous-import`, `undeclared-import`, `unresolved-symbol`, `ambiguous-symbol`, plus `python_source` parse errors). `resultId` is a SHA-256 over the diagnostic signatures, so when the client echoes a matching `previousResultId` the server replies `{kind: "unchanged", resultId}` instead of resending. A clean file returns a full report with `items: []`; a pull for a URI outside the workspace returns an empty full report rather than failing. |
+| `textDocument/codeAction` | `CodeAction[]` (all `kind: "quickfix"`), or `[]`. The server recomputes diagnostics for the document (stateless, pull-diagnostics style), keeps those whose line falls inside the request `range` (character offsets are not used to trim — anchoring is line-granular), and turns each into a fix. Each returned action echoes its anchor `Diagnostic` in `diagnostics` and carries a `WorkspaceEdit` under `edit` (`{"changes": {uri: [TextEdit]}}`). Three anchors are handled: `unused-import` → *"Remove unused import 'name'"* (removes the alias, or the whole statement when it is the sole name); `missing-import` → *"Remove unresolvable import"* (same deletion machinery); `unresolved-symbol` → *"Remove import of 'name'"* plus, **only** when exactly one workspace module exposes a top-level `function` / `class` / `variable` of that name in `workspace_symbol_index` and the statement imports just that one name, *"Import 'name' from '<module>'"* (rewrites the from-module span). `context.only` is honored — a request that does not admit `quickfix` gets `[]`. Files that do not parse yield `[]` (every fix needs the AST). |
+| `textDocument/diagnostic` | Pull-model (LSP 3.17) single-document report. Runs `analyze_file` on the requested document and returns a `RelatedFullDocumentDiagnosticReport` (`{kind: "full", resultId, items}`) whose `items` are the same `Diagnostic` objects the push channel emits for that file (codes: `missing-import`, `ambiguous-import`, `undeclared-import`, `unresolved-symbol`, `ambiguous-symbol`, `unused-import`, plus `python_source` parse errors). The `unused-import` items carry `severity: 4` (Hint) and `tags: [1]` (Unnecessary) so editors fade the binding. `resultId` is a SHA-256 over the diagnostic signatures — including `tags`, so a diagnostic gaining or losing a tag re-issues — so when the client echoes a matching `previousResultId` the server replies `{kind: "unchanged", resultId}` instead of resending. A clean file returns a full report with `items: []`; a pull for a URI outside the workspace returns an empty full report rather than failing. |
 | `workspace/diagnostic` | Pull-model (LSP 3.17) workspace report. Runs `analyze_workspace` once and returns `{items: [...]}` with one report per analyzed `.py` file (plus any config / requirements file that carries dependency diagnostics), sorted by path. Each report is a `WorkspaceFullDocumentDiagnosticReport` (`{kind: "full", uri, version: null, resultId, items}`); files that are now clean still get an empty-`items` report so the client can clear stale problems. `version` is always `null` (the session tracks overlays, not LSP document versions). When the client supplies `previousResultIds` (`[{uri, value}]`), any file whose freshly computed `resultId` matches its previous value is returned as `{kind: "unchanged", uri, version: null, resultId}`. The pull channel is stateless — `resultId`s are pure functions of the current diagnostics, so it coexists with the push channel without extra bookkeeping. |
 
 ## Editor wiring
@@ -306,19 +310,66 @@ Consequences:
   often unparseable at the caret (e.g. a trailing `owner.`), the server repairs
   the caret line to `pass` before analysis, which keeps every top-level import
   and definition intact for resolution while leaving the rest of the file
-  untouched. Three contexts are recognised:
+  untouched. The recognised contexts are:
   - **Bare-name prefix** (`wor|`): module-level symbols from the current file's
     `ModuleSymbolTable`, workspace top-level module names, and Python keywords.
   - **Attribute** `M.<prefix>` where `M` is a bare name: `M` is resolved via
     `resolve_symbol`; if it is a **workspace module** its module-level exports
-    are offered, and if it is a **workspace class** its methods and class
-    variables are offered. Non-bare-`Name` owners (`pkg.sub.M`),
-    stdlib/installed targets, and inferred-typed expressions yield nothing —
-    the same LHS-bare-`Name` limitation as find-references / type-definition.
+    are offered, and if it is a **workspace class** its **class view** (methods
+    and class variables) is offered — flattened across workspace base classes
+    (see *inheritance*, below).
+  - **`self.` / `cls.` inside a method**: the caret's enclosing method is
+    located in the (caret-line-repaired) buffer, and the owner must be that
+    method's literal first parameter (`self` or `cls`). The enclosing class's
+    members then come from the `class_model` surface: `self.` offers the
+    **instance view** (methods + class variables + `self.x` instance
+    attributes), `cls.` offers the **class view** (methods + class variables, no
+    instance attributes). A `self.` in a `cls`-method (or at module level, or
+    inside a nested function / lambda that rebinds the first parameter) offers
+    nothing — the owner is not the innermost callable's first parameter.
+  - **Annotated bare name** (`w.<prefix>` where `w` is neither `self`/`cls` nor
+    resolvable as a module/class): the name's **declared annotation** is
+    followed to a workspace class and that class's **instance view** is offered.
+    The declaration is resolved in priority order: the enclosing function's
+    parameter annotation first, then the nearest preceding `w: T` local
+    re-annotation in that function, then a module-level annotated `variable`.
+    Only a whitelist of annotation shapes resolves: a bare `Name` (`Widget`),
+    a one-hop attribute of a bare name
+    (`helpers.Widget`), or a whole-string forward reference (`"Widget"`,
+    `"helpers.Widget"`) unwrapped exactly once. Subscripted, union, deep-dotted,
+    and callable shapes (`list[Widget]`, `Widget | None`, `pkg.sub.Widget`,
+    `Callable[[], Widget]`) resolve to nothing rather than half-inferring the
+    wrapped class. When the same bare name already resolves as a module or class
+    via the attribute path *and that class-object view yields any items*, it
+    wins and the annotation is not consulted; when the view is empty (an empty
+    class, or none of its members match `prefix`), the local annotation is
+    consulted instead.
+  - **Dotted attribute owner** `pkg.sub.<prefix>` / `pkg.sub.C.<prefix>` /
+    `M.C.<prefix>`: resolved longest-match-first. A dotted owner that is
+    exactly a **workspace module** (`workspace_symbol_index` exact match)
+    offers that module's exports; otherwise the owner is split into
+    `head.last`, and when `head` resolves to a workspace module and `last` is a
+    **class** in it, that class's own members are offered (drawn from the index,
+    not the flattened model — the dotted class path does not inherit). Module
+    lookup is exact-match only, so ambiguous resolutions never produce results.
+    Instance chains (`obj.attr.<prefix>`) and stdlib/installed owners yield
+    nothing — no runtime-type inference.
   - **Import context**: `from <pkg> import <prefix>` offers the workspace
     `pkg`'s module-level names (via `workspace_symbol_index`, so it works even
     while the current file is unparseable); `import <prefix>` / `from <prefix>`
     offers workspace module names.
+
+  **Inheritance.** The `class_model`-backed views (bare `Foo.`, `self.`, `cls.`,
+  and annotated-name owners) are **flattened** over workspace base classes. The
+  integration walks the base graph **depth-first, left-to-right**, keeping the
+  **first definition** of each member name so a derived member shadows a base
+  member of the same name (a single entry, at the derived declaration site). It
+  is deliberately **not** C3 MRO. Only bases that resolve to a workspace class
+  contribute; stdlib / installed / missing / ambiguous bases contribute nothing
+  (`class D(OrderedDict)` gains no `dict` members). A subscripted base
+  (`Base[int]`) is followed through to `Base`; a starred base (`*mixins`) is
+  never followed. Cycles are cut by a visited set and the walk is bounded at
+  `MAX_BASE_DEPTH = 8` derivations.
 
   Each item carries a `label`, a `kind` (mapped from the symbol kind:
   function/method/class/field/variable/module/keyword), and a `detail` (the
@@ -329,12 +380,29 @@ Consequences:
   character)`, returning a tuple of `CompletionItem(label, kind, detail,
   sort_text)`.
 - Diagnostics: syntax errors, unresolved imports, undeclared dependencies from
-  `dependency_check`. Delivered over both the push channel
-  (`textDocument/publishDiagnostics`) and the LSP 3.17 pull channel
-  (`textDocument/diagnostic` + `workspace/diagnostic`, advertised via
+  `dependency_check`, and unused workspace `from … import` bindings
+  (`unused-import`, severity Hint + the `Unnecessary` tag). Delivered over both
+  the push channel (`textDocument/publishDiagnostics`) and the LSP 3.17 pull
+  channel (`textDocument/diagnostic` + `workspace/diagnostic`, advertised via
   `diagnosticProvider`). The pull channel is stateless: `resultId`s are a
-  SHA-256 over the diagnostic signatures, so an unchanged file answers with
-  an `unchanged` report when the client echoes its `previousResultId`.
+  SHA-256 over the diagnostic signatures (tags included), so an unchanged file
+  answers with an `unchanged` report when the client echoes its
+  `previousResultId`.
+- Code actions, via `textDocument/codeAction` (advertised as
+  `codeActionProvider: {codeActionKinds: ["quickfix"]}`). Diagnostics-anchored
+  quick fixes only — no refactorings. The provider recomputes diagnostics for
+  the document, keeps those intersecting the requested range by line, and
+  offers: **remove an unused import** (`unused-import`), **remove an
+  unresolvable import** (`missing-import`), and for `unresolved-symbol` a
+  **remove the offending import** action plus a **retarget the from-module**
+  action when exactly one workspace module exposes a top-level symbol of that
+  name and the statement imports just it. Every action is `kind: "quickfix"`,
+  echoes its anchor diagnostic, and ships a `WorkspaceEdit`
+  (`{"changes": {uri: [TextEdit]}}`). The consumer entrypoint is
+  `WorkspaceSession.code_actions_for_range(path, start_line, start_character,
+  end_line, end_character)`, returning a tuple of `CodeAction(title, kind,
+  diagnostic, edits)` where each `CodeActionEdit(path, start_line,
+  start_character, end_line, end_character, new_text)` is 0-based (LSP-style).
 - Hover on local symbols.
 - Goto-definition, following `import` / `from X import Y` / single-level
   `from X import *` chains through `symbol_resolution.resolve_symbol`.
@@ -414,6 +482,28 @@ Consequences:
   entrypoint `WorkspaceSession.find_document_highlights(path, qualified_name)`
   returns a tuple of `DocumentHighlight(lineno, col_offset, end_col_offset,
   kind)` dataclasses with `kind` typed as `Literal["text", "read", "write"]`.
+- Linked editing, via `textDocument/linkedEditingRange` (advertised as
+  `linkedEditingRangeProvider: true`). Returns the set of ranges in the
+  current file that an editor should mirror while the user types — every
+  range has identical content, so editing one updates them all live. The
+  range set is exactly the file-scoped occurrences that
+  `textDocument/documentHighlight` reports for the symbol under the cursor
+  (declaration name span repaired off the `def` / `class` placeholder, plus
+  every verified bare-name / rightmost-attribute reference), so all spans
+  cover the same bare identifier. The response also carries a `wordPattern`
+  of `[A-Za-z_][A-Za-z0-9_]*` so the client stops mirroring the moment the
+  typed text stops being a Python identifier. This is in-file only and
+  intentionally lighter than `textDocument/rename`: it does not touch other
+  files, so workspace-wide renames still go through `rename`. Unknown
+  identifiers, whitespace cursor positions, non-workspace targets (stdlib /
+  installed / ambiguous / missing), and files outside the workspace return
+  `null`. The consumer entrypoint
+  `WorkspaceSession.linked_editing_ranges_at(path, qualified_name)` returns a
+  tuple of `LinkedEditingRange(lineno, col_offset, end_col_offset)`
+  dataclasses (1-based `lineno`, 0-based `col_offset` / `end_col_offset`).
+  Lives entirely on top of the stable `pyinc.integrations` public surface
+  (via `find_references`) — no kernel contract change and no new
+  integration-layer surface.
 - Threaded live polling via `PollingWorkspaceWatcher.start(...)`. LSP server
   starts one by default; opt out with `initializationOptions.pyinc.watcher.enabled=false`.
 - `if TYPE_CHECKING:` and `if typing.TYPE_CHECKING:` import blocks — the symbol
@@ -434,14 +524,20 @@ Consequences:
   string literals (single, double, and triple-quoted) and tracks a stack of
   open brackets; the topmost open `(` whose preceding token is a usable
   identifier identifies the function being called, and the accumulated
-  comma count yields `activeParameter`. The identifier is resolved through
-  `symbol_resolution.resolve_symbol`, so cross-module re-exports hop through
-  transparently. Functions surface their declared signature; classes surface
-  `<Class>.__init__`'s signature with a leading `self` / `cls` stripped, or
-  an empty constructor signature when no `__init__` is defined. Parameters
-  are reported with LSP `[start, end]` substring offsets into the signature
-  label so editors can highlight the active parameter precisely. The
-  consumer entrypoint `WorkspaceSession.signature_help_at(path, line,
+  comma count yields `activeParameter`. A single-dot attribute call whose
+  owner is a bare name (`M.foo(`) is also detected — the LHS is resolved
+  through the file's imports to a workspace module and then `foo` inside it,
+  the same bare-`Name`-LHS idiom `callHierarchy/outgoingCalls` uses. A
+  bare-name identifier is resolved through `symbol_resolution.resolve_symbol`,
+  so cross-module re-exports hop through transparently. Functions surface
+  their declared signature; classes surface `<Class>.__init__`'s signature
+  with a leading `self` / `cls` stripped, or an empty constructor signature
+  when no `__init__` is defined. Parameter default values are rendered into
+  the label (`name: ann = default` / `name=default`), read from the defining
+  file's source since `symbol_resolution.Parameter` carries no default.
+  Parameters are reported with LSP `[start, end]` substring offsets into the
+  signature label so editors can highlight the active parameter precisely.
+  The consumer entrypoint `WorkspaceSession.signature_help_at(path, line,
   character)` returns a `SignatureHelp(label, parameters, active_parameter)`
   dataclass.
 - Folding ranges, via `textDocument/foldingRange` (advertised as
@@ -698,36 +794,69 @@ Consequences:
 
 **Not supported:**
 
-- `textDocument/codeAction`, `textDocument/formatting`.
-- `completionItem/resolve` (`resolveProvider` is `false`; items are fully
-  populated in the initial response).
+- `textDocument/formatting`.
+- `completionItem/resolve` — a deliberate design decision, not a gap.
+  `resolveProvider` is `false`: items are fully populated in the initial
+  response (`label` / `kind` / `detail` / `sortText`), `detail` is a cheap
+  already-decoded `Signature`, and the payload is capped at
+  `_COMPLETION_LIMIT = 200`, so a lazy resolve round-trip would save nothing.
 - `textDocument/completion` limitations:
-  - Statement-context filtering is not applied — completion offers the same
-    declaration-driven candidate set regardless of position (e.g. it does not
-    restrict to type names after a `:` annotation).
+  - Statement-context filtering is **deliberately deferred**. Completion
+    offers the same declaration-driven candidate set regardless of position
+    (e.g. it does not restrict to type names after a `:` annotation).
+    Filtering by statement context would be a false-positive-prone mode that
+    risks hiding valid candidates, so it is intentionally left out for now.
   - Members of stdlib / installed-package modules and classes are not
     completed; only workspace targets resolve to a member list. `os.<caret>`
-    yields nothing.
-  - Instance / `self.` attribute completion is not modelled — the attribute
-    owner must resolve to a workspace **module** or **class**, not an
-    expression whose type would have to be inferred.
-  - Attribute owners whose LHS is not a bare `Name` (`pkg.sub.M.<caret>`) are
-    skipped, matching the resolver's LHS-bare-`Name` limitation elsewhere.
+    and `os.path.<caret>` yield nothing.
+  - Instance-expression member completion beyond a directly annotated bare name
+    is not modelled — the owner must be a workspace **module** / **class**, a
+    `self`/`cls` receiver, or a bare name whose *declared* annotation names a
+    workspace class. A chained owner whose type would have to be inferred
+    (`obj.attr.<caret>`, `factory().<caret>`) yields nothing.
+  - Only the whitelisted annotation shapes resolve for the annotated-name owner:
+    a bare `Name`, a one-hop `mod.Foo`, or a whole-string forward reference.
+    Subscripted, union, deep-dotted, and callable annotations (`list[Widget]`,
+    `Widget | None`, `pkg.sub.Widget`, `Callable[[], Widget]`) resolve to
+    nothing — the wrapped class is never half-inferred. A method's **return
+    type** is likewise not propagated to its call sites.
+  - The annotation is read only from the innermost enclosing function (or a
+    module-level annotated variable); an outer function's parameter annotation
+    does not apply inside a nested function, and a `self.x` captured in a
+    **closure** or lambda over the receiver is not an instance attribute of the
+    enclosing class.
+  - A local annotation never shadows an import that already resolves through the
+    attribute path: if the bare name resolves to a workspace module or class,
+    that class-object view wins and the same-named local annotation is ignored.
+  - Non-workspace base classes contribute no inherited members. A subclass of
+    `collections.OrderedDict`, `enum.Enum`, an installed-package class, or a
+    missing/ambiguous base sees only the members declared in the workspace part
+    of its hierarchy; the base text is reported in `ClassModel.unresolved_bases`.
+    An `AugAssign` (`self.x += 1`) does not *declare* an instance attribute —
+    only plain / annotated `self.x = …` assignments do.
+  - Dotted attribute owners are supported only for module and module-class
+    chains: `pkg.sub.<caret>` (owner is a workspace module) and
+    `pkg.sub.C.<caret>` / `M.C.<caret>` (owner is `<workspace-module>.<class>`)
+    complete via exact `workspace_symbol_index` matches, and the dotted class
+    case lists the class's **own** members only — inheritance flattening applies
+    to the bare `Foo.` / `self.` / `cls.` / annotated-name paths, not this one.
+    Anything requiring type inference on an intermediate component stays out.
   - Repair is caret-line-local: if a syntax error lies on a line other than
     the caret's, local and attribute completion return nothing for that file
     (import-context and workspace-module candidates still work, since they do
     not depend on the current file parsing).
   - Auto-import and snippet completions are out of scope.
 - `textDocument/signatureHelp` limitations:
-  - Attribute calls (`obj.method(`) and subscripted calls
-    (`factory[T](`) are not detected — the call-site scanner only looks
-    for a bare identifier immediately before `(`.
+  - Attribute calls are detected only for a single-dot owner that is a bare
+    `Name` (`M.foo(`, resolved through the file's imports). Deeper chains
+    (`pkg.sub.foo(`), instance/`self.` calls (`obj.method(`), and subscripted
+    calls (`factory[T](`) are not detected — the call-site scanner only
+    captures a bare identifier or one bare-`Name`-owner attribute access
+    immediately before `(`.
   - Same-file calls whose enclosing `(` is still unclosed leave the file
     unparseable, so symbol extraction returns no signature. Cross-file
     calls keep working in this case because the *defining* file is
     independent of the consumer's parse status.
-  - Default values are not part of the signature label
-    (`symbol_resolution.Parameter` carries only `name` and `annotation`).
 - Hover or goto-def on stdlib or installed-package symbols — resolution
   correctly classifies them as `stdlib` / `installed`, but the LSP does not
   synthesize a `Location` for out-of-workspace targets.
@@ -755,6 +884,20 @@ Consequences:
     multiple lines, are triple-quoted, contain escape sequences, or use
     implicit string concatenation are skipped (offset reconstruction would
     be ambiguous in those cases).
+- `linkedEditingRange` limitations:
+  - In-file scope only. The mirrored ranges cover occurrences in the
+    current document; cross-file references are deliberately omitted (use
+    `textDocument/rename` for a workspace-wide edit). This matches
+    `textDocument/documentHighlight`'s scoping, since the two share the
+    same range set.
+  - Inherits the `find_references` limitations above (attribute chains
+    whose LHS is itself an attribute, function-local shadowing, and the
+    multi-line / triple-quoted / escape-sequence / implicit-concatenation
+    forward-reference-string caveats). A range that `find_references`
+    cannot verify is not mirrored.
+  - Only workspace symbols are mirrored. Stdlib / installed / ambiguous /
+    missing targets return `null`, matching goto-definition's
+    classification.
 - `rename` limitations (in addition to the `find_references` limitations
   above, since rename is built on top of it):
   - Renaming via an `import ... as` alias is refused — e.g. clicking on
@@ -763,6 +906,39 @@ Consequences:
     alias; rename the original symbol instead."* The canonical-name rename
     of `foo` correctly preserves any `as <alias>` clauses across the
     workspace.
+- `unused-import` / `codeAction` limitations:
+  - Only workspace `from M import name` bindings are flagged. `import M`
+    is never flagged (attribute usage like `M.foo()` is under-reported by
+    the occurrence scan), and stdlib / installed targets are skipped
+    (`find_references` cannot verify their usage). Star imports
+    (`from M import *`) are never flagged.
+  - `__init__.py` files are skipped entirely — they routinely aggregate and
+    re-export submodule symbols that look locally unused.
+  - Explicit re-exports are protected: `from y import z as z` (self-alias)
+    is never flagged, a binding is left alone when *another* workspace
+    module does `from <this_module> import <name>` (or `import *`) — removing
+    it would break that importer — and a binding listed in this module's own
+    static `__all__` is treated as an intentional public re-export and left
+    alone. The cross-module guard reads the already-decoded workspace
+    analysis; the `__all__` guard reads a literal `__all__ = [...]` / `(...)`
+    / `{...}` of string constants (a dynamically built `__all__` cannot be
+    inspected statically and offers no protection).
+  - Usage detection inherits every `find_references` limitation above. In
+    particular a binding used **only** inside a multi-line / triple-quoted /
+    escaped / implicitly-concatenated forward-reference string annotation is
+    not seen as used and may be flagged.
+  - `codeAction` offers **quick fixes only** (no `refactor.*` / `source.*`
+    kinds). The retarget action for `unresolved-symbol` is offered only for a
+    single-name `from` statement and only when exactly one workspace module
+    exposes a top-level `function` / `class` / `variable` of that name — an
+    ambiguous or absent target yields just the removal action, and a
+    multi-name statement is never retargeted (rewriting the from-module would
+    break the sibling names that still resolve). Anchoring is line-granular:
+    the request's character offsets do not further trim which diagnostics on a
+    line contribute actions. Deferred: add-import for undefined bare names (no
+    undefined-name diagnostic exists, and scope analysis would risk false
+    positives against builtins / star-imports / locals) and `pyproject.toml`
+    edits for `undeclared-import`.
 - Call hierarchy limitations:
   - `prepareCallHierarchy` only surfaces top-level identifiers — the cursor
     must be on a name that `resolve_symbol` can find as a module-level

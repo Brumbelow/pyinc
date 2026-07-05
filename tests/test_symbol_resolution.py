@@ -8,14 +8,18 @@ import pytest
 import pyinc.integrations as integrations
 from pyinc import Database
 from pyinc.integrations.symbol_resolution import (
+    ClassMember,
     Parameter,
     Signature,
+    class_model,
+    class_models_for_file,
     find_references,
     module_symbol_table,
     module_symbol_table_payload,
     name_occurrences_for_file,
     resolve_symbol,
     resolve_symbol_payload,
+    resolved_class_model_payload,
     workspace_name_occurrence_index,
     workspace_symbol_index,
 )
@@ -32,6 +36,8 @@ def test_symbol_resolution_all_list_is_exact() -> None:
     from pyinc.integrations import symbol_resolution
 
     assert set(symbol_resolution.__all__) == {
+        "ClassMember",
+        "ClassModel",
         "ModuleSymbolTable",
         "Parameter",
         "Reference",
@@ -41,6 +47,7 @@ def test_symbol_resolution_all_list_is_exact() -> None:
         "Symbol",
         "WorkspaceSymbolEntry",
         "WorkspaceSymbolIndex",
+        "class_model",
         "find_references",
         "module_symbol_table",
         "resolve_symbol",
@@ -50,6 +57,8 @@ def test_symbol_resolution_all_list_is_exact() -> None:
 
 def test_symbol_resolution_stable_surface_on_integrations_namespace() -> None:
     for name in (
+        "ClassMember",
+        "ClassModel",
         "ModuleSymbolTable",
         "Parameter",
         "Reference",
@@ -59,6 +68,7 @@ def test_symbol_resolution_stable_surface_on_integrations_namespace() -> None:
         "Symbol",
         "WorkspaceSymbolEntry",
         "WorkspaceSymbolIndex",
+        "class_model",
         "find_references",
         "module_symbol_table",
         "resolve_symbol",
@@ -75,6 +85,8 @@ def test_symbol_resolution_payload_helpers_are_not_re_exported() -> None:
     assert not hasattr(integrations, "name_occurrences_for_file")
     assert not hasattr(integrations, "workspace_name_occurrence_index")
     assert not hasattr(integrations, "find_references_payload")
+    assert not hasattr(integrations, "class_models_for_file")
+    assert not hasattr(integrations, "resolved_class_model_payload")
 
 
 # ---------------------------------------------------------------------------
@@ -1620,3 +1632,590 @@ def test_resolve_symbol_from_import_error_try(tmp_path: Path) -> None:
     result = resolve_symbol(db, root, path, "FastParser")
     assert result.resolution == "workspace"
     assert result.defining_path == str(root / "helper.py")
+
+
+# ---------------------------------------------------------------------------
+# class_model (own members)
+# ---------------------------------------------------------------------------
+
+
+_CLASS_MODEL_SAMPLE = (
+    "class Widget(Base):\n"
+    "    size: int = 3\n"
+    "    tag = 'x'\n"
+    "\n"
+    "    def __init__(self, name: str) -> None:\n"
+    "        self.name = name\n"
+    "        self.count: int = 0\n"
+    "\n"
+    "    def render(self) -> str:\n"
+    "        self.cache = None\n"
+    "        return self.name\n"
+)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_class_model_captures_class_body_and_init_members(
+    mode: str, tmp_path: Path
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "widget.py"
+    path.write_text(_CLASS_MODEL_SAMPLE, encoding="utf-8")
+
+    model = class_model(Database(mode=mode), root, path, "Widget")
+    assert model.path == str(path)
+    assert model.qualified_name == "Widget"
+
+    by_name = {member.name: member for member in model.members}
+
+    assert by_name["size"].kind == "class_variable"
+    assert by_name["size"].lineno == 2
+    assert by_name["size"].annotation == "int"
+    assert by_name["size"].signature is None
+
+    assert by_name["tag"].kind == "class_variable"
+    assert by_name["tag"].lineno == 3
+    assert by_name["tag"].annotation is None
+
+    assert by_name["__init__"].kind == "method"
+    assert by_name["__init__"].lineno == 5
+    assert by_name["__init__"].signature == Signature(
+        parameters=(
+            Parameter(name="self", annotation=None),
+            Parameter(name="name", annotation="str"),
+        ),
+        return_annotation="None",
+    )
+
+    assert by_name["render"].kind == "method"
+    assert by_name["render"].lineno == 9
+
+    assert by_name["name"].kind == "instance_variable"
+    assert by_name["name"].lineno == 6
+    assert by_name["name"].annotation is None
+    assert by_name["count"].kind == "instance_variable"
+    assert by_name["count"].lineno == 7
+    assert by_name["count"].annotation == "int"
+    assert by_name["cache"].kind == "instance_variable"
+    assert by_name["cache"].lineno == 10
+
+    # Every own member is attributed to this file and class.
+    for member in model.members:
+        assert member.defining_path == str(path)
+        assert member.defining_class == "Widget"
+
+    # A single base is recorded but not followed in Stage 1.
+    assert model.unresolved_bases == ("Base",)
+
+
+def test_class_model_deterministic_member_order(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "widget.py"
+    path.write_text(_CLASS_MODEL_SAMPLE, encoding="utf-8")
+
+    model = class_model(Database(mode="strict"), root, path, "Widget")
+    # annotated class-body, assigned class-body, methods, then instance attrs
+    # ordered by lowest lineno.
+    assert [member.name for member in model.members] == [
+        "size",
+        "tag",
+        "__init__",
+        "render",
+        "name",
+        "count",
+        "cache",
+    ]
+
+
+def test_class_model_self_attrs_dedup_lowest_lineno_wins(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "c.py"
+    path.write_text(
+        "class C:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.x = 1\n"
+        "    def reset(self) -> None:\n"
+        "        self.x = 0\n"
+        "        self.y = 2\n",
+        encoding="utf-8",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "C")
+    by_name = {member.name: member for member in model.members}
+    assert by_name["x"].kind == "instance_variable"
+    assert by_name["x"].lineno == 3  # __init__ occurrence, not the reset() rebind
+    assert by_name["y"].lineno == 6
+
+
+def test_class_model_requires_literal_self_first_param(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "c.py"
+    path.write_text(
+        "class C:\n"
+        "    def m(this) -> None:\n"
+        "        this.z = 1\n",
+        encoding="utf-8",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "C")
+    names = {member.name for member in model.members}
+    assert names == {"m"}  # `this.z` is not an instance attribute
+
+
+def test_class_model_skips_nested_def_and_class(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "c.py"
+    path.write_text(
+        "class C:\n"
+        "    def m(self) -> None:\n"
+        "        self.a = 1\n"
+        "        def inner(self) -> None:\n"
+        "            self.b = 2\n"
+        "        class Inner:\n"
+        "            def n(self) -> None:\n"
+        "                self.c = 3\n"
+        "        helper = lambda: self.d\n"
+        "        self.e = 4\n",
+        encoding="utf-8",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "C")
+    instance_names = {
+        member.name
+        for member in model.members
+        if member.kind == "instance_variable"
+    }
+    assert instance_names == {"a", "e"}  # b, c live in nested scopes
+
+
+def test_class_model_tuple_unpacked_self_targets(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "c.py"
+    path.write_text(
+        "class C:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.a, self.b = 1, 2\n"
+        "        [self.c, self.d] = [3, 4]\n"
+        "        self.e, *self.rest = range(5)\n",
+        encoding="utf-8",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "C")
+    instance_names = {
+        member.name
+        for member in model.members
+        if member.kind == "instance_variable"
+    }
+    assert instance_names == {"a", "b", "c", "d", "e", "rest"}
+
+
+def test_class_model_records_all_base_encodings(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "c.py"
+    path.write_text(
+        "class Multi(Base, pkg.Mixin, Generic[T], *extra):\n    pass\n",
+        encoding="utf-8",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "Multi")
+    assert model.unresolved_bases == ("Base", "pkg.Mixin", "Generic", "*extra")
+
+
+def test_class_model_syntax_error_file_is_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "broken.py"
+    path.write_text("class Broken(\n", encoding="utf-8")
+
+    model = class_model(Database(mode="strict"), root, path, "Broken")
+    assert model.members == ()
+    assert model.unresolved_bases == ()
+
+
+def test_class_model_unknown_qname_is_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "widget.py"
+    path.write_text(_CLASS_MODEL_SAMPLE, encoding="utf-8")
+
+    model = class_model(Database(mode="strict"), root, path, "Missing")
+    assert model.members == ()
+    assert model.unresolved_bases == ()
+
+
+def test_class_model_nested_class_has_its_own_members(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "nested.py"
+    path.write_text(
+        "class Outer:\n"
+        "    outer_attr: int = 1\n"
+        "    class Inner:\n"
+        "        def method(self) -> None:\n"
+        "            self.inner_attr = 2\n",
+        encoding="utf-8",
+    )
+
+    outer = class_model(Database(mode="strict"), root, path, "Outer")
+    outer_names = {member.name for member in outer.members}
+    assert outer_names == {"outer_attr"}
+
+    inner = class_model(Database(mode="strict"), root, path, "Outer.Inner")
+    inner_names = {member.name: member.kind for member in inner.members}
+    assert inner_names == {"method": "method", "inner_attr": "instance_variable"}
+
+
+def test_class_models_for_file_covers_every_class(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "widget.py"
+    path.write_text(_CLASS_MODEL_SAMPLE, encoding="utf-8")
+
+    db = Database(mode="strict")
+    payload = class_models_for_file(db, str(path))
+    qnames = {model[0] for model in payload}
+    assert qnames == {"Widget"}
+
+
+def test_resolved_class_model_out_of_workspace_is_empty(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text(_CLASS_MODEL_SAMPLE, encoding="utf-8")
+
+    db = Database(mode="strict")
+    payload = resolved_class_model_payload(db, str(root), str(outside), "Widget")
+    # path, qualified_name, members, unresolved_bases
+    assert payload[2] == ()
+    assert payload[3] == ()
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_class_model_matches_fresh_recomputation_over_edits(
+    mode: str, tmp_path: Path
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "widget.py"
+
+    incremental = Database(mode=mode)
+    contents = (
+        _CLASS_MODEL_SAMPLE,
+        _CLASS_MODEL_SAMPLE + "\nclass Other:\n    pass\n",
+        "class Widget(Base, Extra):\n"
+        "    size: int = 5\n"
+        "    def __init__(self) -> None:\n"
+        "        self.name = ''\n",
+        "class Widget:\n    def render(self) -> str:\n        return ''\n",
+    )
+    for content in contents:
+        path.write_text(content, encoding="utf-8")
+        fresh = Database(mode=mode)
+        assert class_model(incremental, root, path, "Widget") == class_model(
+            fresh, root, path, "Widget"
+        )
+
+
+def test_comment_only_edit_backdates_class_models(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "widget.py"
+    path.write_text(_CLASS_MODEL_SAMPLE, encoding="utf-8")
+
+    db = Database(mode="strict")
+    first = class_model(db, root, path, "Widget")
+
+    path.write_text(_CLASS_MODEL_SAMPLE + "# trailing comment\n", encoding="utf-8")
+    second = class_model(db, root, path, "Widget")
+
+    assert first == second
+    assert db.inspect(class_models_for_file, str(path)).last_decision == "reused"
+
+
+def test_class_model_member_carries_no_class_kind(tmp_path: Path) -> None:
+    # Instance attributes must never leak into the module symbol table; the two
+    # views stay disjoint. A nested class in the body is not a `class_model`
+    # member kind.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "widget.py"
+    path.write_text(_CLASS_MODEL_SAMPLE, encoding="utf-8")
+
+    db = Database(mode="strict")
+    model = class_model(db, root, path, "Widget")
+    kinds = {member.kind for member in model.members}
+    assert kinds <= {"method", "class_variable", "instance_variable"}
+
+    # The instance attribute `name` is absent from the module symbol table.
+    table = module_symbol_table(db, root, path)
+    assert not any(sym.qualified_name == "Widget.name" for sym in table.symbols)
+    assert all(isinstance(member, ClassMember) for member in model.members)
+
+
+# ---------------------------------------------------------------------------
+# class_model (inheritance flattening — Stage 3)
+# ---------------------------------------------------------------------------
+
+
+def _write_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_class_model_inherits_members_from_workspace_base(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    base = root / "base.py"
+    _write_file(
+        base,
+        "class Base:\n"
+        "    kind: str = 'b'\n"
+        "    def shared(self) -> None:\n"
+        "        self.base_attr = 1\n",
+    )
+    derived = root / "derived.py"
+    _write_file(
+        derived,
+        "from base import Base\n\n"
+        "class Derived(Base):\n"
+        "    size: int = 3\n"
+        "    def own(self) -> None:\n"
+        "        self.own_attr = 2\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, derived, "Derived")
+    by_name = {member.name: member for member in model.members}
+
+    # Own members are attributed to the derived file/class.
+    assert by_name["size"].defining_path == str(derived)
+    assert by_name["size"].defining_class == "Derived"
+    assert by_name["own"].defining_class == "Derived"
+
+    # Inherited members carry the base's defining_path/defining_class.
+    assert by_name["shared"].kind == "method"
+    assert by_name["shared"].defining_path == str(base)
+    assert by_name["shared"].defining_class == "Base"
+    assert by_name["kind"].kind == "class_variable"
+    assert by_name["kind"].defining_class == "Base"
+    assert by_name["base_attr"].kind == "instance_variable"
+    assert by_name["base_attr"].defining_class == "Base"
+
+    # A followed workspace base does not linger in unresolved_bases.
+    assert model.unresolved_bases == ()
+
+
+def test_class_model_derived_shadows_base(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    base = root / "base.py"
+    _write_file(
+        base,
+        "class Base:\n"
+        "    def render(self) -> str:\n"
+        "        return 'base'\n",
+    )
+    derived = root / "derived.py"
+    _write_file(
+        derived,
+        "from base import Base\n\n\n"
+        "class Derived(Base):\n"
+        "    def render(self) -> str:\n"
+        "        return 'derived'\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, derived, "Derived")
+    renders = [m for m in model.members if m.name == "render"]
+    # First-definition-wins: exactly one `render`, the derived override.
+    assert len(renders) == 1
+    assert renders[0].lineno == 5  # def render in derived.py
+    assert renders[0].defining_class == "Derived"
+    assert renders[0].defining_path == str(derived)
+
+
+def test_class_model_non_workspace_base_is_unresolved(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    path = root / "d.py"
+    _write_file(
+        path,
+        "from collections import OrderedDict\n\n\n"
+        "class D(OrderedDict):\n"
+        "    def own(self) -> None:\n"
+        "        self.x = 1\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "D")
+    names = {member.name for member in model.members}
+    # No stdlib dict members leak in; only D's own members remain.
+    assert names == {"own", "x"}
+    assert model.unresolved_bases == ("OrderedDict",)
+
+
+def test_class_model_base_cycle_terminates(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    path = root / "c.py"
+    _write_file(
+        path,
+        "class A(B):\n"
+        "    def am(self) -> None:\n"
+        "        pass\n"
+        "class B(A):\n"
+        "    def bm(self) -> None:\n"
+        "        pass\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "A")
+    names = {member.name for member in model.members}
+    # Cycle guard terminates and both classes contribute their own members.
+    assert names == {"am", "bm"}
+
+
+def test_class_model_base_depth_cap(tmp_path: Path) -> None:
+    # A linear chain C0(C1(...(C9))). Traversal is bounded at MAX_BASE_DEPTH = 8:
+    # C0..C7 (depths 0..7) contribute members; C8/C9 are past the cap.
+    root = tmp_path / "workspace"
+    path = root / "chain.py"
+    lines = []
+    for i in range(10):
+        base = f"(C{i + 1})" if i < 9 else ""
+        lines.append(f"class C{i}{base}:\n    def m{i}(self) -> None:\n        pass\n")
+    _write_file(path, "".join(lines))
+
+    model = class_model(Database(mode="strict"), root, path, "C0")
+    names = {member.name for member in model.members}
+    assert "m0" in names
+    assert "m7" in names
+    assert "m8" not in names  # depth 8 is at the cap boundary
+    assert "m9" not in names
+
+
+def test_class_model_subscripted_base_unwraps(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    path = root / "g.py"
+    _write_file(
+        path,
+        "class Base:\n"
+        "    def bm(self) -> None:\n"
+        "        pass\n"
+        "class D(Base[int]):\n"
+        "    def dm(self) -> None:\n"
+        "        pass\n"
+        "class E(*mixins):\n"
+        "    def em(self) -> None:\n"
+        "        pass\n",
+    )
+    db = Database(mode="strict")
+
+    # `Base[int]` unwraps to `Base`, a workspace class, and is followed.
+    d_model = class_model(db, root, path, "D")
+    assert {m.name for m in d_model.members} == {"dm", "bm"}
+    assert d_model.unresolved_bases == ()
+
+    # `*mixins` is a starred base — encoded as text, never followed.
+    e_model = class_model(db, root, path, "E")
+    assert {m.name for m in e_model.members} == {"em"}
+    assert e_model.unresolved_bases == ("*mixins",)
+
+
+def test_class_model_same_module_nested_base(tmp_path: Path) -> None:
+    # `class Sub(Outer.Inner)` where `Outer.Inner` is a nested class in the same
+    # module resolves through the `("attr", ...)` same-module branch.
+    root = tmp_path / "workspace"
+    path = root / "n.py"
+    _write_file(
+        path,
+        "class Outer:\n"
+        "    class Inner:\n"
+        "        def inner_m(self) -> None:\n"
+        "            pass\n"
+        "class Sub(Outer.Inner):\n"
+        "    def sub_m(self) -> None:\n"
+        "        pass\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "Sub")
+    names = {member.name for member in model.members}
+    assert names == {"sub_m", "inner_m"}
+    assert model.unresolved_bases == ()
+
+
+def test_class_model_diamond_first_definition_wins(tmp_path: Path) -> None:
+    # A(B, C); B and C both define `hit`. Depth-first, left-to-right, first wins:
+    # B's `hit` is kept (B is the first base visited).
+    root = tmp_path / "workspace"
+    path = root / "diamond.py"
+    _write_file(
+        path,
+        "class B:\n"
+        "    def hit(self) -> str:\n"
+        "        return 'B'\n"
+        "class C:\n"
+        "    def hit(self) -> str:\n"
+        "        return 'C'\n"
+        "class A(B, C):\n"
+        "    pass\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "A")
+    hits = [m for m in model.members if m.name == "hit"]
+    assert len(hits) == 1
+    assert hits[0].defining_class == "B"
+
+
+def test_class_model_base_file_comment_edit_reused(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    base = root / "base.py"
+    base_src = (
+        "class Base:\n"
+        "    def shared(self) -> None:\n"
+        "        pass\n"
+    )
+    _write_file(base, base_src)
+    derived = root / "derived.py"
+    _write_file(
+        derived,
+        "from base import Base\n\n\nclass Derived(Base):\n    pass\n",
+    )
+
+    db = Database(mode="strict")
+    first = class_model(db, root, derived, "Derived")
+
+    # A trailing-comment edit to the BASE file leaves the AST attributes
+    # untouched, so class_models_for_file(base) backdates and the derived
+    # flattened model is reused unchanged.
+    base.write_text(base_src + "# trailing comment\n", encoding="utf-8")
+    second = class_model(db, root, derived, "Derived")
+
+    assert first == second
+    assert {m.name for m in second.members} == {"shared"}
+    assert db.inspect(class_models_for_file, str(base)).last_decision == "reused"
+
+
+def test_class_model_unrelated_edit_leaves_model_green(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    base = root / "base.py"
+    _write_file(
+        base,
+        "class Base:\n    def shared(self) -> None:\n        pass\n",
+    )
+    derived = root / "derived.py"
+    _write_file(
+        derived,
+        "from base import Base\n\n\nclass Derived(Base):\n    pass\n",
+    )
+    other = root / "other.py"
+    _write_file(other, "def unrelated() -> int:\n    return 0\n")
+
+    db = Database(mode="strict")
+    first = class_model(db, root, derived, "Derived")
+
+    # Editing an unrelated file's body must not disturb the derived model.
+    other.write_text("def unrelated() -> int:\n    return 999\n", encoding="utf-8")
+    second = class_model(db, root, derived, "Derived")
+
+    assert first == second
+    assert {m.name for m in second.members} == {"shared"}
