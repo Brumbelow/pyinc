@@ -84,6 +84,8 @@ from .requirements_txt import (
     workspace_requirements_analysis,
 )
 from .symbol_resolution import (
+    ClassMember,
+    ClassModel,
     ModuleSymbolTable,
     Parameter,
     Reference,
@@ -93,6 +95,7 @@ from .symbol_resolution import (
     Symbol,
     WorkspaceSymbolEntry,
     WorkspaceSymbolIndex,
+    class_model,
     find_references,
     module_symbol_table,
     resolve_symbol,
@@ -116,6 +119,8 @@ from .xml_config import (
 __all__ = [
     "ApplicableRequirement",
     "ApplicableRequirementsAnalysis",
+    "ClassMember",
+    "ClassModel",
     "ConfigAnalysis",
     "ConfigKey",
     "ConfigSection",
@@ -170,6 +175,7 @@ __all__ = [
     "XmlAttribute",
     "XmlElement",
     "applicable_requirements",
+    "class_model",
     "config_analysis",
     "csv_analysis",
     "deep_module_resolution_analysis",

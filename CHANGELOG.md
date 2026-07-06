@@ -6,10 +6,123 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Items in this section are queued for the next v2.x release.
+## [2.6.0] - 2026-07-05
 
 ### Added
 
+- **`symbol_resolution.class_model` surface.** A new integration entrypoint
+  `class_model(db, root, path, qualified_name)` returns a `ClassModel(path,
+  qualified_name, members, unresolved_bases)` — the declaration-only member set
+  of a workspace class. `ClassMember` (`method` / `class_variable` /
+  `instance_variable`, each carrying `defining_path` / `defining_class`) covers
+  class-body variables, methods, and `self.NAME` instance attributes collected
+  from methods whose first parameter is literally `self`. The model is
+  **flattened over workspace base classes** depth-first, left-to-right,
+  first-definition-wins (a derived member shadows a base member of the same
+  name), bounded by `MAX_BASE_DEPTH = 8` with a cycle guard, with base files
+  queried one at a time (`class_models_for_file`) so an edit to one base
+  invalidates per file. This is intentionally **not** C3 MRO. Bases that do not
+  resolve to a workspace class (stdlib / installed / missing / ambiguous /
+  starred) contribute no members and surface in `unresolved_bases`. `ClassMember`
+  and `ClassModel` join the stable `pyinc.integrations` surface. No kernel
+  contract change.
+- **Instance-member completion in `pyinc-tools` LSP.** Completion now serves
+  member lists that previously required type inference, all off the new
+  `symbol_resolution.class_model` surface (still declaration-driven — no runtime
+  types). `self.` / `cls.` inside a method complete the enclosing class's
+  instance / class view; a bare name whose *declared* annotation (bare `Name`,
+  one-hop `mod.Foo`, or whole-string forward reference) names a workspace class
+  completes that class's instance view; and a bare `Foo.` class owner now serves
+  the **flattened** class view, so `Derived.` and `self.` alike show members
+  inherited from workspace base classes. Subscripted / union / deep-dotted /
+  callable annotations, chained owners (`obj.attr.`), closures over the
+  receiver, and non-workspace bases contribute nothing. No kernel or
+  `pyinc.integrations` contract change beyond the `class_model` surface above.
+- **Completion / signatureHelp polish in `pyinc-tools` LSP.** Three
+  refinements to the already-shipped completion and signature-help features:
+
+  - **Dotted attribute owners in completion.** `pkg.sub.<caret>` now completes
+    when the dotted owner is exactly a workspace module (its exports), and
+    `pkg.sub.C.<caret>` / `M.C.<caret>` complete a class's members when the
+    owner is `<workspace-module>.<class>`. Owner resolution is longest-match
+    first and routes module lookup through an exact `workspace_symbol_index`
+    match so ambiguous resolutions never produce results; single-component
+    owners keep the existing `resolve_symbol` path. Instance chains
+    (`obj.attr.<caret>`) and stdlib/installed owners still yield nothing.
+  - **Attribute-call signatureHelp.** `M.foo(` and `M.C(` now surface a
+    signature: a single-dot owner that is a bare `Name` is resolved through the
+    file's imports to a workspace module and then the attribute inside it (the
+    same bare-`Name`-LHS idiom `callHierarchy/outgoingCalls` and
+    `inlayHint` use — now a shared `_resolve_attr_on_module` helper). Deep
+    chains (`pkg.sub.foo(`) and subscripted calls stay `null`.
+  - **Default values in signature labels.** Signature-help labels now render
+    parameter defaults (`name: ann = default` / `name=default`), extracted
+    from the defining file's source. `symbol_resolution.Parameter` is
+    unchanged — the contract type carries no default — so this is a
+    consumer-side read; completion `detail` and hover are untouched.
+
+  Also exports the pre-existing `CompletionItem` / `CompletionItemKind` types
+  from `pyinc_tools`. No kernel or `pyinc.integrations` contract change.
+- **`textDocument/linkedEditingRange` in `pyinc-tools` LSP.** The server
+  now advertises `linkedEditingRangeProvider: true` and handles
+  `textDocument/linkedEditingRange` requests. For the symbol under the
+  cursor it returns the set of ranges in the *current file* that an editor
+  should mirror as the user types (so editing one updates them all live),
+  together with a `wordPattern` of `[A-Za-z_][A-Za-z0-9_]*` that tells the
+  client to stop mirroring once the typed text is no longer a Python
+  identifier.
+
+  The mirrored range set is exactly the file-scoped occurrences that
+  `textDocument/documentHighlight` already reports — the declaration name
+  span (repaired off the synthetic `def` / `class` placeholder that
+  `find_references` emits) plus every verified bare-name and
+  rightmost-attribute reference — so all ranges cover the same bare
+  identifier and are safe to edit simultaneously. This is **in-file only**
+  and intentionally lighter than `textDocument/rename`: it never touches
+  other files, so workspace-wide renames still go through `rename`. Unknown
+  identifiers, whitespace cursor positions, non-workspace targets (stdlib /
+  installed / ambiguous / missing), and files outside the workspace return
+  `null`.
+
+  New consumer-layer dataclass `LinkedEditingRange(lineno, col_offset,
+  end_col_offset)` (1-based `lineno`, 0-based `col_offset` /
+  `end_col_offset`, matching the rest of the session dataclasses) and
+  entrypoint `WorkspaceSession.linked_editing_ranges_at(path,
+  qualified_name) -> tuple[LinkedEditingRange, ...]` (thread-safe via the
+  same `_state_lock` used by every other public mutator, since it delegates
+  to `find_document_highlights`). Lives entirely on top of the stable
+  `pyinc.integrations` public surface (`find_references`) — no kernel
+  contract change and no new integration-layer surface. Limitations are
+  documented in `docs/pyinc-tools-guide.md`.
+- **`unused-import` diagnostic in `pyinc-tools` LSP.** Analysis now flags a
+  workspace `from M import name [as alias]` binding when nothing in the file
+  uses it. Conservative by design: only `from` imports resolving to a
+  workspace module are considered (so `find_references` can verify usage);
+  `import M`, stdlib / installed targets, and `from M import *` are left
+  alone. `__init__.py` files, self-alias re-exports (`from y import z as z`),
+  and bindings another workspace module re-imports from this file (a
+  cross-module re-export) are never flagged. The diagnostic is severity Hint
+  and carries the LSP `Unnecessary` tag (`tags: [1]`) so editors fade the
+  binding; it rides both the push and pull diagnostic channels. New additive
+  `AnalysisDiagnostic.tags: tuple[str, ...]` field, folded into the pull-model
+  `resultId` signature so a tag change re-issues the report.
+- **`textDocument/codeAction` quick fixes in `pyinc-tools` LSP.** The server
+  now advertises `codeActionProvider: {codeActionKinds: ["quickfix"]}` and
+  answers `textDocument/codeAction` with diagnostics-anchored quick fixes (no
+  refactorings). For diagnostics intersecting the request range it offers:
+  *Remove unused import* (`unused-import`), *Remove unresolvable import*
+  (`missing-import`), and for `unresolved-symbol` a *Remove import of 'name'*
+  action plus a *Import 'name' from '<module>'* retarget when exactly one
+  workspace module exposes a top-level symbol of that name (single-name
+  statements only). Each action echoes its anchor diagnostic and carries a
+  `WorkspaceEdit` (`{"changes": {uri: [TextEdit]}}`); `context.only` is
+  honored. New consumer-layer dataclasses `CodeAction(title, kind, diagnostic,
+  edits)` and `CodeActionEdit(path, start_line, start_character, end_line,
+  end_character, new_text)` (0-based, LSP-style) and entrypoint
+  `WorkspaceSession.code_actions_for_range(path, start_line, start_character,
+  end_line, end_character)`. Reuses the existing import-deletion geometry
+  (`_statement_line_span` / `_alias_list_deletion_edits`) and
+  `workspace_symbol_index` — no kernel or integration-layer contract change.
 - **Durable cross-run cache is now a trusted guarantee.** The
   `save_checkpoint` / `load_checkpoint` flow shipped in v2.0.0 carried only a
   best-effort warm; the checkpoint path now earns from-scratch consistency
@@ -126,6 +239,49 @@ Items in this section are queued for the next v2.x release.
   path. `joblib` is a new `bench` optional-dependency group, imported lazily and
   never by `src/pyinc` or `src/pyinc_codegen`. Run with
   `PYTHONPATH=src python -m bench.run`.
+- **`pyinc-tools` LSP `serverInfo.version`** bumped from `"2.1.0"` to
+  `"2.6.0"` to align with the package version pinned in `pyproject.toml`.
+
+### Fixed
+
+- **Wildcard version-specifier prefix matching in `requirement_evaluation`.**
+  `==X.Y.*` / `!=X.Y.*` specifiers trimmed trailing zeros from the spec's
+  release before comparing, shortening the prefix — so `==1.0.*` wrongly
+  matched any `1.x` release (e.g. `1.5`). The full spec release is now used
+  as the prefix, so `==1.0.*` matches only `1.0.x`.
+
+- **Checkpoint warm path could return stale or tampered values.** The v2.0.0
+  warm restored records without their dependency edges and trusted whatever
+  bytes the store returned, so a warmed cache could serve a value a fresh run
+  would not produce. Closed on every front:
+  - restored records now carry their real dependency edges and are re-verified
+    transitively through them, replacing the old warm-time bypass;
+  - resources are re-probed — or their queries re-executed — live at reload
+    instead of the stored probe hint being trusted blindly;
+  - every snapshot read from the store is rejected unless `sha256` of its raw
+    bytes matches the digest it was keyed by, and the manifest is re-hashed
+    against the checkpoint key before anything is parsed out of it;
+  - any dependency that cannot be resolved or verified — runtime-import-reached
+    query subgraphs, untracked (`report_untracked_read`) records, missing or
+    corrupt store bytes — refuses the warm and re-executes rather than guessing.
+- **Refcount-dependent code fingerprints.** `_code_fingerprint` now marshals
+  code objects with `marshal` format 2 instead of the default. Format ≥3 encodes
+  interning / `FLAG_REF` state, so a code object's bytes could flip once one of
+  its string constants gained a reference at runtime (e.g. a regex literal
+  retained by `re`'s cache after first use), making a query's identity depend on
+  live refcounts and shift between two keyings in the same process. Format 2
+  fully encodes the code object without shared references, so identities are
+  stable within a process and reproducible across processes.
+- **Dirty-graph saves no longer persist stale records.** `save_checkpoint` omits
+  any record whose cached value no longer matches the live graph — a dependency
+  moved since the record last executed, with no intervening `get` — because
+  persisting it would bake in the dependency's *new* digest while warming the
+  *old* value on reload. Such records are simply re-executed after reload.
+
+## [2.5.0] - 2026-06-05
+
+### Added
+
 - **Pull diagnostics (`textDocument/diagnostic` + `workspace/diagnostic`)
   in `pyinc-tools` LSP.** The server now advertises a `diagnosticProvider`
   (`{"identifier": "pyinc-tools", "interFileDependencies": true,
@@ -727,6 +883,22 @@ Items in this section are queued for the next v2.x release.
   `import pkg.subpkg; pkg.subpkg.foo()`) is still not counted; that
   remains a documented limitation. No kernel contract change; integration
   public surface unchanged.
+
+### Fixed
+
+- **`FileDeletionEdit` is now re-exported from `pyinc_tools`.** The dataclass
+  was added to `pyinc_tools.session` alongside
+  `WorkspaceSession.import_edits_for_file_deletions` in the previous PR but
+  was missing from `pyinc_tools/__init__.py`'s re-export list, so consumers
+  who imported it from the top-level package (matching the precedent set by
+  `FileRenameEdit` and every other consumer-layer dataclass) saw an
+  `ImportError`. The symbol is now in both the module-level imports and
+  `__all__`.
+
+## [2.1.0] - 2026-05-05
+
+### Added
+
 - **Rename now rewrites relative `from … import` lines.** The
   `WorkspaceSession.rename_symbol` import-edit walker resolves `from .pkg
   import name`, `from .. import name`, and `from ..sub.pkg import name`
@@ -766,6 +938,11 @@ Items in this section are queued for the next v2.x release.
   from `pyinc_tools`: `RenameEdit`, `RenameResult`, `RenameStatus`. Lives
   entirely on top of the stable `pyinc.integrations` surface — no kernel
   contract change.
+
+## [2.0.1] - 2026-04-29
+
+### Added
+
 - **Forward-reference string annotations are now scanned for references.**
   `symbol_resolution.find_references` (and the LSP `textDocument/references`
   it backs) now detects names inside forward-reference strings such as
@@ -785,50 +962,11 @@ Items in this section are queued for the next v2.x release.
   malformed annotation strings are silently ignored. No payload shape or
   public surface change.
 
-### Fixed
+## [2.0.0] - 2026-04-25
 
-- **Checkpoint warm path could return stale or tampered values.** The v2.0.0
-  warm restored records without their dependency edges and trusted whatever
-  bytes the store returned, so a warmed cache could serve a value a fresh run
-  would not produce. Closed on every front:
-  - restored records now carry their real dependency edges and are re-verified
-    transitively through them, replacing the old warm-time bypass;
-  - resources are re-probed — or their queries re-executed — live at reload
-    instead of the stored probe hint being trusted blindly;
-  - every snapshot read from the store is rejected unless `sha256` of its raw
-    bytes matches the digest it was keyed by, and the manifest is re-hashed
-    against the checkpoint key before anything is parsed out of it;
-  - any dependency that cannot be resolved or verified — runtime-import-reached
-    query subgraphs, untracked (`report_untracked_read`) records, missing or
-    corrupt store bytes — refuses the warm and re-executes rather than guessing.
-- **Refcount-dependent code fingerprints.** `_code_fingerprint` now marshals
-  code objects with `marshal` format 2 instead of the default. Format ≥3 encodes
-  interning / `FLAG_REF` state, so a code object's bytes could flip once one of
-  its string constants gained a reference at runtime (e.g. a regex literal
-  retained by `re`'s cache after first use), making a query's identity depend on
-  live refcounts and shift between two keyings in the same process. Format 2
-  fully encodes the code object without shared references, so identities are
-  stable within a process and reproducible across processes.
-- **Dirty-graph saves no longer persist stale records.** `save_checkpoint` omits
-  any record whose cached value no longer matches the live graph — a dependency
-  moved since the record last executed, with no intervening `get` — because
-  persisting it would bake in the dependency's *new* digest while warming the
-  *old* value on reload. Such records are simply re-executed after reload.
-- **`FileDeletionEdit` is now re-exported from `pyinc_tools`.** The dataclass
-  was added to `pyinc_tools.session` alongside
-  `WorkspaceSession.import_edits_for_file_deletions` in the previous PR but
-  was missing from `pyinc_tools/__init__.py`'s re-export list, so consumers
-  who imported it from the top-level package (matching the precedent set by
-  `FileRenameEdit` and every other consumer-layer dataclass) saw an
-  `ImportError`. The symbol is now in both the module-level imports and
-  `__all__`.
-
-## [2.0.0]
-
-This is the v2.0.0 release (still in development; not yet tagged). v1.2.1 was
-the last v1 release. Items previously listed under "Version 1 did not include"
-in `docs/architecture.md` are resolved here, except for the still-deferred
-*schedulers or worker pools*.
+This is the v2.0.0 release. v1.2.1 was the last v1 release. Items previously
+listed under "Version 1 did not include" in `docs/architecture.md` are
+resolved here, except for the still-deferred *schedulers or worker pools*.
 
 ### Added
 
@@ -1154,3 +1292,7 @@ The first stable v1 release.
 [1.2.0]: https://github.com/Brumbelow/pyinc/releases/tag/v1.2.0
 [1.2.1]: https://github.com/Brumbelow/pyinc/releases/tag/v1.2.1
 [2.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.0.0
+[2.0.1]: https://github.com/Brumbelow/pyinc/releases/tag/v2.0.1
+[2.1.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.1.0
+[2.5.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.5.0
+[2.6.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.6.0

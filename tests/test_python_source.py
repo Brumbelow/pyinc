@@ -116,6 +116,8 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "requirements_analysis",
         "workspace_requirements_analysis",
         # symbol_resolution
+        "ClassMember",
+        "ClassModel",
         "ModuleSymbolTable",
         "Parameter",
         "Reference",
@@ -125,6 +127,7 @@ def test_package_namespace_exports_only_stable_api() -> None:
         "Symbol",
         "WorkspaceSymbolEntry",
         "WorkspaceSymbolIndex",
+        "class_model",
         "find_references",
         "module_symbol_table",
         "resolve_symbol",

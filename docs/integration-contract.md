@@ -66,11 +66,12 @@ Stable public surface by module:
 - `symbol_resolution`
   - result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`,
     `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`,
-    `Reference`, `ReferenceQueryResult`
+    `Reference`, `ReferenceQueryResult`, `ClassMember`, `ClassModel`
   - entrypoints: `module_symbol_table(db, root, path)`,
     `resolve_symbol(db, root, path, qualified_name)`,
     `workspace_symbol_index(db, root)`,
-    `find_references(db, root, path, qualified_name, *, include_declaration=True)`
+    `find_references(db, root, path, qualified_name, *, include_declaration=True)`,
+    `class_model(db, root, path, qualified_name)`
 - `notebook` *(added in the v2 development cycle; resolves the v1 architectural non-goal "notebook integration")*
   - result types: `NotebookImport`, `NotebookDefinition`, `NotebookCell`,
     `NotebookDiagnostic`, `NotebookAnalysis`
@@ -375,15 +376,17 @@ Scope:
 - `try: … except ImportError:` / `except ModuleNotFoundError:` / `except (ImportError, ModuleNotFoundError):` guard blocks at module top level: imports inside are collected as regular symbols; no impurity marker is set
 - other conditional top-level bindings (`if sys.version_info >= …`, top-level `For`, `While`, `Try` without recognised handler, `With`) → `impurity_reasons` includes `"conditional top-level binding"` and the binding produces no symbol
 - workspace-wide reference index composed over `name_occurrences_for_file` (full-AST `Name`/`Attribute` walk plus a second pass that re-parses string-valued annotations on `AnnAssign`/`arg`/`FunctionDef.returns`/`AsyncFunctionDef.returns` and walks the inner expression for nested `Name`/`Attribute` references) and verified through `resolve_symbol_payload`; only workspace-resolved targets are indexed (stdlib / installed / ambiguous return empty with `ResolvedSymbol` carried). String annotations that span multiple lines, are triple-quoted, contain escape sequences, or use implicit string concatenation are skipped (offset reconstruction would be ambiguous)
-- entrypoints: `module_symbol_table`, `resolve_symbol`, `workspace_symbol_index`, `find_references`
-- result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`, `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`, `Reference`, `ReferenceQueryResult`
+- per-class member model via `class_model(db, root, path, qualified_name)` → `ClassModel(path, qualified_name, members, unresolved_bases)`, each `ClassMember` a `method` / `class_variable` / `instance_variable` carrying `defining_path` / `defining_class`. Own members are: annotated class-body variables, assigned class-body variables, methods, then `self.NAME` instance attributes collected from every direct method whose first parameter is literally `self` (lowest lineno wins; descent stops at nested `def`/`class`/`lambda` scopes; `AugAssign` does not declare). Bases are encoded once (`("name", X)` / `("attr", L, A)` / `("text", raw)`, a single `Subscript` layer unwrapped so `Base[T]` follows `Base`)
+- inheritance flattening in `class_model`: base classes that resolve to a workspace `class` are followed **depth-first, left-to-right, first-definition-wins** (a derived member shadows a base member of the same name — a single entry at the derived site), bounded by `MAX_BASE_DEPTH = 8` with a `(path, class_qname)` visited-set cycle guard, and base files queried one at a time via `class_models_for_file` (per-file invalidation). Bases that do not land on a workspace class (stdlib / installed / missing / ambiguous / `("text", …)`) contribute no members and are reported in `unresolved_bases`
+- entrypoints: `module_symbol_table`, `resolve_symbol`, `workspace_symbol_index`, `find_references`, `class_model`
+- result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`, `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`, `Reference`, `ReferenceQueryResult`, `ClassMember`, `ClassModel`
 
 Out of scope for this integration:
 
 - function-local symbols (`find_references` therefore reports a local rebinding like `foo = 1` inside a function as a reference to the module-level `foo` of the same name)
 - attribute-chain reference resolution — `import a; a.foo()` is not counted as a reference to `a.foo` because the resolver is name-local at the call site
 - decorator-induced rebinding (`@functools.cache`, `@property`, `@classmethod`, etc.)
-- MRO / class-member override resolution
+- full C3 MRO linearization (class models flatten depth-first, left-to-right, first-definition-wins; in a shared-grandparent diamond — `A(B, C)`, `B(D)`, `C(D)` — a member defined in both `C` and `D` resolves to `D`'s definition, reached depth-first through `B`, whereas C3 would pick `C`'s)
 - following into installed third-party source files (v2 concern)
 - type evaluation or static type checking
 

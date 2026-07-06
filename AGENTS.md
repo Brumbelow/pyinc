@@ -19,6 +19,10 @@ Python ≥3.11 (the matrix is 3.11 / 3.12 / 3.13). `pyproject.toml` pins `target
 
 The installed console script is `pyinc-tools` (→ `pyinc_tools.cli:main`), with subcommands `analyze` and `lsp`.
 
+## Releasing
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the sdist + wheel and publishes to PyPI via trusted publishing (OIDC, no stored token). The tag name must equal the `pyproject.toml` `version` (e.g. `version = "2.6.0"` → `git tag v2.6.0`), and the version bump must land together with its `CHANGELOG.md` section cut in the same PR.
+
 ## Packages in this repo — and the boundaries between them
 
 The repository ships **three** Python packages, built as a single wheel. Which one you're editing matters:
