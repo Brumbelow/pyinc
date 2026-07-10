@@ -83,6 +83,15 @@ from .requirements_txt import (
     requirements_analysis,
     workspace_requirements_analysis,
 )
+from .scope_resolution import (
+    Binding,
+    Scope,
+    ScopeTree,
+    SymbolId,
+    scope_tree,
+    symbol_at,
+)
+from .source_geometry import DocumentMap, PositionEncoding, SourcePosition, SourceRange
 from .symbol_resolution import (
     ClassMember,
     ClassModel,
@@ -90,7 +99,6 @@ from .symbol_resolution import (
     Parameter,
     Reference,
     ReferenceQueryResult,
-    ResolvedSymbol,
     Signature,
     Symbol,
     WorkspaceSymbolEntry,
@@ -98,7 +106,6 @@ from .symbol_resolution import (
     class_model,
     find_references,
     module_symbol_table,
-    resolve_symbol,
     workspace_symbol_index,
 )
 from .toml_config import (
@@ -119,6 +126,7 @@ from .xml_config import (
 __all__ = [
     "ApplicableRequirement",
     "ApplicableRequirementsAnalysis",
+    "Binding",
     "ClassMember",
     "ClassModel",
     "ConfigAnalysis",
@@ -132,6 +140,7 @@ __all__ = [
     "DependencyStatus",
     "DependencySurface",
     "Diagnostic",
+    "DocumentMap",
     "EnvEntry",
     "EnvFileAnalysis",
     "FileReference",
@@ -154,6 +163,7 @@ __all__ = [
     "NotebookImport",
     "Parameter",
     "PthDirective",
+    "PositionEncoding",
     "PythonEnvironmentSnapshot",
     "PythonFileAnalysis",
     "PythonModuleAnalysis",
@@ -164,9 +174,13 @@ __all__ = [
     "RequirementsAnalysis",
     "ResolvedImportRef",
     "ResolvedModuleLocation",
-    "ResolvedSymbol",
+    "Scope",
+    "ScopeTree",
     "Signature",
+    "SourcePosition",
+    "SourceRange",
     "Symbol",
+    "SymbolId",
     "UndeclaredImport",
     "VersionSpecifierEvaluation",
     "WorkspaceSymbolEntry",
@@ -195,7 +209,8 @@ __all__ = [
     "requirements_analysis",
     "resolve_import_name",
     "resolve_module_path",
-    "resolve_symbol",
+    "scope_tree",
+    "symbol_at",
     "workspace_analysis",
     "workspace_applicable_requirements",
     "workspace_config_analysis",

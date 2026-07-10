@@ -15,13 +15,52 @@ python3 -m mypy src tests          # strict mypy (see [tool.mypy] in pyproject.t
 python3 -m ruff check src tests    # lint (E,F,I,UP,B,SIM,TID; line-length 100; E501 ignored)
 ```
 
-Python ≥3.11 (the matrix is 3.11 / 3.12 / 3.13). `pyproject.toml` pins `target-version = "py311"` and `python_version = "3.11"`.
+Python ≥3.11 (the matrix is 3.11 / 3.12 / 3.13 / 3.14). `pyproject.toml` pins `target-version = "py311"` and `python_version = "3.11"`.
 
 The installed console script is `pyinc-tools` (→ `pyinc_tools.cli:main`), with subcommands `analyze` and `lsp`.
 
 ## Releasing
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the sdist + wheel and publishes to PyPI via trusted publishing (OIDC, no stored token). The tag name must equal the `pyproject.toml` `version` (e.g. `version = "2.6.0"` → `git tag v2.6.0`), and the version bump must land together with its `CHANGELOG.md` section cut in the same PR.
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the
+sdist + wheel, validates the exact wheel in a clean environment, and publishes
+to PyPI via trusted publishing (OIDC, no stored token). The tag name must equal
+the `pyproject.toml` `version` (e.g. `version = "3.0.0rc1"` →
+`git tag -s v3.0.0rc1`), and the version bump must land together with its
+`CHANGELOG.md` section cut in the same PR. The release workflow verifies the
+annotated tag, configured signing-key fingerprint, every commit since the
+trusted baseline, and the exact project version before publishing.
+
+The 3.0 release is promoted in two stages:
+
+1. Commit `3.0.0rc1` and its changelog, verify the signed commit, create and
+   verify the signed annotated `v3.0.0rc1` tag, then push the commit and tag.
+2. After the RC is published, install its artifacts in clean environments and
+   review the benchmark/correctness report. Do not prepare the final release
+   until every pyinc result matches a fresh run.
+3. Make one direct child commit of `v3.0.0rc1` that changes only
+   `pyproject.toml` and `CHANGELOG.md`. The `3.0.0` changelog section must contain
+   this validation record, substituting the RC tag's full commit SHA:
+
+   ```markdown
+   ### Release validation
+
+   - RC candidate: `v3.0.0rc1` at `<40-character RC commit SHA>`
+   - [x] Clean installations from the published RC artifacts passed.
+   - [x] The benchmark/correctness report was reviewed; every pyinc result matched a fresh run.
+   - [x] Final promotion approved.
+   ```
+
+   Append the matching release reference after the existing changelog links:
+
+   ```markdown
+   [3.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0
+   ```
+
+4. Verify the final signed commit, create and verify the signed annotated
+   `v3.0.0` tag, then push the commit and tag. The release workflow rejects the
+   final tag unless the RC tag is signed by the configured key, the final commit
+   is the RC's direct child, only the two metadata files changed, and the
+   validation record is complete and names the exact RC commit.
 
 ## Packages in this repo — and the boundaries between them
 
@@ -41,19 +80,19 @@ A reproducible benchmark + correctness harness lives under `bench/` (not shipped
 
 1. **Value boundary ownership.** Everything crossing a cached boundary (query args, query returns, `Input` values) must be snapshot-safe: scalars, tuples, or values that `freeze` can deep-convert (`list→tuple`, `dict→FrozenDict`, `set→frozenset`, dataclass→`FrozenRecord`), plus registered `ValueAdapter`s. Public dataclasses are `@dataclass(frozen=True)` with `tuple[T, ...]` fields — never `list`/`dict`/`set`.
 2. **Tracked ambient reads.** Inside a query, the runtime intercepts `builtins.open` / `io.open`, `os.getenv`, `os.environ`, `os.listdir`, `os.scandir`, and `Path.iterdir` — any of these outside a `Resource`'s scope raises `UntrackedReadError`. For reads the guard can't see (`os.open`, C extensions, subprocess, network, time, random), the query must call `db.report_untracked_read(reason)`. The guard is installed **once globally** and dispatches per active `Database` via a `ContextVar` stack, so multiple `Database` instances across threads don't interfere.
-3. **Deterministic queries.** Same tracked inputs ⇒ semantically equal return. Mutable closure/global captures in query definitions are rejected at decoration time; preview classification via `pyinc.explain_query_captures(fn)` before the first `db.get()`. Query identity includes the supported function-definition payload (including immutable captures and the Python implementation + version tuple), so kernel digests are stable across CPython minor versions.
+3. **Deterministic queries.** Same tracked inputs ⇒ semantically equal return. Mutable closure/global captures and local/dynamically unbound type objects in query definitions are rejected when identity is established (normally the first `db.get()`); equality/cutoff policy captures and callable state must likewise be snapshot-safe. Preview classification via `pyinc.explain_query_captures(fn)` is available beforehand. Query, policy, resource, and adapter trust identities include the relevant interpreter version and build flags. Interpreter/build changes intentionally move the identity so checkpoints miss safely; only the `K2` snapshot byte grammar is cross-minor stable.
 
 Modes (`strict` / `checked` / `fast`) control only what the *caller* sees at the boundary and whether in-query mutation is detected. Untracked-read interception, mutable-capture rejection, semantic-equality cutoff, and backdating are on in **all** modes. See `docs/kernel-contract.md` for the full table and the limitations (e.g. `os.open` bypass, ambient module monkey-patching).
 
 ## Integration architecture
 
-Integrations in `src/pyinc/integrations/*.py` follow a strict three-layer shape (see `docs/integration-authoring.md` for the full pattern with file:line references into `python_source.py`):
+Integrations in `src/pyinc/integrations/*.py` follow a strict three-layer shape (see `docs/integration-authoring.md` for the full pattern):
 
 1. **Payload queries** — `@query` functions returning tuple-typed payloads. These are the kernel-cached nodes. They read via `Resource`s, parse, and return hashable tuples.
 2. **Composition queries** — `@query` functions that call other queries and assemble composite tuple payloads. The kernel tracks cross-integration dependencies automatically; no wiring is needed. Example: `python_source` depends on `installed_packages.environment_index` to classify imports as `stdlib`/`installed`/`missing`.
 3. **High-level entrypoints** — non-`@query` functions that call `db.get(...)` and decode tuples into the public frozen dataclasses.
 
-Each payload shape has a `TypeAlias` matching a dataclass's field order and a `_decode_*` helper. Tuples are snapshot-safe by default; decoding happens only at the public boundary.
+Each payload shape has a `TypeAlias` and a `_decode_*` helper. Payload fields are optimized for snapshot-safe caching and may encode public values differently—for example, internal coordinate tuples decode into `SourceRange`. Decoding happens only at the public boundary.
 
 `pyinc.integrations`' `__init__.py` re-exports **only** the stable dataclass/result types and high-level entrypoints. Low-level payload queries, decode helpers, and resource helpers are experimental and stay module-local — do not re-export them from `pyinc.integrations` without an explicit contract decision. `docs/integration-contract.md` enumerates the stable surface per integration.
 

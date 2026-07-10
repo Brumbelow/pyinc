@@ -237,7 +237,7 @@ def binding_cycles(db: Database, root_path: str) -> tuple[str, ...]:
         for nxt in sorted(refs.get(node, set())):
             state = color.get(nxt, 0)
             if state == 1:  # back-edge: nxt..top-of-stack are all cyclic
-                cyclic.update(path[path.index(nxt):])
+                cyclic.update(path[path.index(nxt) :])
             elif state == 0:
                 visit(nxt, path)
         path.pop()

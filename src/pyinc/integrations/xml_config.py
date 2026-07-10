@@ -9,9 +9,11 @@ from pathlib import Path
 from typing import TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.resources import DirectoryResource, _file_read_snapshot
+from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
+
+from ._resources import file_read_snapshot
 
 XmlAttributePayload: TypeAlias = tuple[str, str]
 XmlElementPayload: TypeAlias = tuple[
@@ -63,7 +65,7 @@ class _XmlFileResource:
     encoding: str = "utf-8"
 
     def read(self, db: Database, path: str | os.PathLike[str]) -> str:
-        return cast(str, db._read_resource(self, os.fspath(path)))
+        return cast(str, db.read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"xmlfile[{path}]"
@@ -78,13 +80,10 @@ class _XmlFileResource:
         file_path = Path(path)
         if not file_path.exists():
             return ""
-        with db._allow_raw_open():
-            return file_path.read_text(encoding=self.encoding)
+        return file_path.read_text(encoding=self.encoding)
 
-    def probe_and_load(
-        self, db: Database, path: str
-    ) -> tuple[tuple[str, str] | tuple[str], str]:
-        probe, text = _file_read_snapshot(path, self.encoding)
+    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
+        probe, text = file_read_snapshot(path, self.encoding)
         return probe, text if text is not None else ""
 
 

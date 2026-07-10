@@ -6,6 +6,93 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.0.0rc1] - 2026-07-09
+
+### Added
+
+- Stable keyed `Input` and `Query` identities, optional `@query(key=...)`, a
+  public generic `Resource` contract, `Database.read_resource`, and
+  `BinaryFileResource`.
+- Zero-based `SourcePosition` / `SourceRange` geometry, public `DocumentMap`
+  encoding conversion, plus lexical `SymbolId`, `Scope`, `Binding`, and
+  `ScopeTree` resolution shared by Python navigation and refactoring features.
+- Code-generation diagnostic severities and JSON Pointers, with
+  `SchemaGenerationError` preventing reconciliation when an error diagnostic
+  exists.
+- `pyinc-tools --version`, LSP 3.18 position-encoding negotiation, Python 3.14
+  support, and installed-wheel validation in CI.
+
+### Changed
+
+- Replaced marshal-based code identity with canonical typed code-object
+  encoding, including slice and nested-code constants, definition defaults,
+  immutable and transitive captures, comparator policies, resource/adapter
+  implementations, and relevant interpreter/build flags.
+- Unpinnable equality/cutoff policy captures and local or dynamically unbound
+  class captures are rejected instead of collapsing to name- or type-only
+  identities. Input policies, resources, and adapters now independently include
+  interpreter/build identity at their checkpoint trust boundaries.
+- Checkpoints now use fully prevalidated manifest schema v4. v1-v3 checkpoint
+  manifests are intentionally rejected; the `K2` user-value encoding remains
+  unchanged.
+- `set_many` is all-or-nothing, query execution commits records and dependency
+  rewiring only after success, all public database state operations are locked,
+  profiles use bounded timing aggregates, and evicted nodes leave no profile or
+  registry state behind.
+- `ReconcileResult.written` is replaced by `created`, `updated`, and
+  `repaired`. Action manifests use root-bound schema v2 and a SHA-256 name
+  derived from the full tool identity.
+- Python source is decoded with PEP 263/BOM rules and AST byte columns are
+  converted to Unicode-code-point ranges at the parser boundary. Unsupported
+  attribute chains now return no result instead of speculative locations or
+  edits.
+- `pyinc_tools` diagnostics, locations, highlights, edits, links, lenses,
+  semantic tokens, and hierarchy results now expose direct `SourceRange` (or
+  `SourcePosition`) fields. `WorkspaceSession.find_references` and rename use
+  resolved `SymbolId` values; name-only access and v2 coordinate aliases are
+  removed. File symlinks are rejected by the workspace mirror.
+- `pyinc_tools` now separates shared models, document geometry, pure analysis,
+  edit generation, workspace mirroring/watching, and JSON-RPC framing behind
+  the lock-owning `WorkspaceSession` façade. Tools consume the stable public
+  integration surface instead of private resolver internals.
+- Generated model packages use deferred annotations and type-checking-only
+  imports for cyclic local references. Definition/module collisions are
+  checked after Unicode normalization, snake conversion, and case folding.
+
+### Fixed
+
+- Filesystem artifact publication and action reconciliation are serialized
+  across processes. Writes are flushed, atomically published from the same
+  directory through no-follow filesystem handles where available, and
+  conflicting artifact bytes are refused.
+- Action preflight now rejects malformed manifests, unsafe or ambiguous paths,
+  symlink escapes, non-regular owned targets, malformed digests, and conflicting
+  file/directory declarations before mutation.
+- Unsafe or non-regular action and artifact lock paths now surface typed
+  `ActionPathError` / `ArtifactStoreError` failures rather than raw OS errors.
+- Workspace mirrors use content hashes, filter source/configuration inputs,
+  honor exclusion globs, retain recursively referenced requirements files
+  regardless of suffix, surface requirements-chain diagnostics, and reject
+  escaping symlinks.
+
+### Security
+
+- Release builds and validation run without OIDC publishing privileges. A
+  separate minimal trusted-publishing job receives only the verified sdist and
+  wheel artifacts.
+- Checkpoint records are validated completely before any cache warming, and
+  resource implementation changes invalidate reuse even when probes happen to
+  match.
+- Artifact-store keys are restricted to lowercase SHA-256 digests (optionally
+  checkpoint-prefixed with `ck`), preventing path traversal and platform path
+  injection.
+
+### Migration
+
+- This is a clean API and persistence break. See
+  [`docs/migration-v3.md`](docs/migration-v3.md) before upgrading and discard
+  v2 checkpoint/action ledger state as described there.
+
 ## [2.6.0] - 2026-07-05
 
 ### Added
@@ -1296,3 +1383,4 @@ The first stable v1 release.
 [2.1.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.1.0
 [2.5.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.5.0
 [2.6.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.6.0
+[3.0.0rc1]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0rc1

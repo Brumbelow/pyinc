@@ -1,7 +1,7 @@
-"""Follow a cross-module re-export chain to find a symbol's defining location.
+"""Resolve a source position through a cross-module re-export chain.
 
-Demonstrates the ``symbol_resolution`` integration: given a name exported
-from a facade module, the analysis follows ``from X import Y`` chains
+Demonstrates the ``symbol_resolution`` integration: given a position on a name
+exported from a facade module, the analysis follows ``from X import Y`` chains
 (with cycle detection and a bounded follow depth) back to where the symbol
 was originally defined.
 
@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 
 from pyinc import Database
-from pyinc.integrations import resolve_symbol
+from pyinc.integrations import SourcePosition, symbol_at
 
 ORIGIN = '''\
 """Defines the actual function."""
@@ -44,17 +44,19 @@ def main() -> None:
         facade_path.write_text(FACADE, encoding="utf-8")
 
         db = Database(mode="strict")
-        resolved = resolve_symbol(db, str(root), str(facade_path), "process")
+        symbol = symbol_at(
+            db,
+            str(root),
+            str(facade_path),
+            SourcePosition(1, 34),
+        )
+        assert symbol is not None
 
         print("Starting module:  facade")
         print("Looking up:       process")
         print()
-        print(f"Resolution kind:  {resolved.resolution}")
-        print(f"Defining module:  {resolved.defining_module}")
-        print(f"Defining path:    {resolved.defining_path}")
-        print(f"Defining line:    {resolved.defining_lineno}")
-        print(f"Follow depth:     {resolved.follow_depth}")
-        print(f"Trail:            {' -> '.join(resolved.trail)}")
+        print(f"Defining path:    {symbol.path}")
+        print(f"Defining position: {symbol.declaration.start}")
 
 
 if __name__ == "__main__":

@@ -2,28 +2,30 @@ name: CI
 
 on:
   push:
+    branches:
+      - '**'
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.11', '3.12', '3.13']
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.11', '3.12', '3.13', '3.14']
 
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Normalize Python root vars
-        run: |
-          echo "Python_ROOT_DIR=${pythonLocation}" >> "$GITHUB_ENV"
-          echo "Python3_ROOT_DIR=${pythonLocation}" >> "$GITHUB_ENV"
-          echo "Python2_ROOT_DIR=" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: |
@@ -34,14 +36,15 @@ jobs:
         run: pytest -q
 
   quality:
+    name: Static analysis and coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: '3.13'
+          python-version: '3.14'
 
       - name: Install dependencies
         run: |
@@ -53,3 +56,40 @@ jobs:
 
       - name: Lint
         run: python -m ruff check src tests
+
+      - name: Measure branch coverage
+        run: pytest --cov=pyinc --cov=pyinc_codegen --cov=pyinc_tools --cov-branch --cov-report=term-missing --cov-fail-under=90
+
+  distribution:
+    name: Build and validate installed artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14'
+
+      - name: Build distribution
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Create clean artifact environment
+        run: |
+          python -m venv .artifact-venv
+          .artifact-venv/bin/python -m pip install --no-deps dist/*.whl
+
+      - name: Validate installed packages and generated fixtures
+        run: |
+          .artifact-venv/bin/python scripts/validate_install.py
+          .artifact-venv/bin/pyinc-tools --version
+
+      - name: Execute shipped examples
+        run: |
+          .artifact-venv/bin/python examples/correctness_demo.py
+          .artifact-venv/bin/python examples/action_reconcile_demo.py
+          .artifact-venv/bin/python examples/calc_demo.py
+          .artifact-venv/bin/python examples/codegen_demo.py

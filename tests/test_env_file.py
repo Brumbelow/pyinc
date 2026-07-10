@@ -6,6 +6,7 @@ import pytest
 
 import pyinc.integrations as integrations
 from pyinc import Database
+from pyinc.integrations import SourcePosition, SourceRange
 from pyinc.integrations.env_file import (
     EnvFileAnalysis,
     env_analysis,
@@ -172,7 +173,7 @@ def test_env_analysis_missing_file(mode: str, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_env_analysis_line_numbers(mode: str, tmp_path: Path) -> None:
+def test_env_analysis_source_ranges(mode: str, tmp_path: Path) -> None:
     path = tmp_path / ".env"
     path.write_text(_MINIMAL_ENV, encoding="utf-8")
 
@@ -180,10 +181,19 @@ def test_env_analysis_line_numbers(mode: str, tmp_path: Path) -> None:
     result = env_analysis(db, str(path))
 
     by_key = {e.key: e for e in result.entries}
-    assert by_key["DB_HOST"].line_number == 2
-    assert by_key["DB_PORT"].line_number == 3
-    assert by_key["DB_NAME"].line_number == 4
-    assert by_key["SECRET_KEY"].line_number == 5
+    assert by_key["DB_HOST"].range == SourceRange(SourcePosition(1, 0), SourcePosition(1, 17))
+    assert by_key["DB_PORT"].range == SourceRange(SourcePosition(2, 0), SourcePosition(2, 12))
+    assert by_key["DB_NAME"].range == SourceRange(SourcePosition(3, 0), SourcePosition(3, 19))
+    assert by_key["SECRET_KEY"].range == SourceRange(SourcePosition(4, 0), SourcePosition(4, 25))
+
+
+def test_env_analysis_range_preserves_unicode_codepoint_columns(tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+    path.write_text("  MESSAGE=\U0001f642value  \n", encoding="utf-8")
+
+    entry = env_analysis(Database(), path).entries[0]
+
+    assert entry.range == SourceRange(SourcePosition(0, 2), SourcePosition(0, 16))
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +242,7 @@ def test_trailing_comment_edit_backdates_env(tmp_path: Path) -> None:
     db = Database()
     first = env_analysis(db, str(path))
 
-    # Change comment text after the entry — line numbers unchanged
+    # Change comment text after the entry — source range unchanged
     path.write_text("KEY=value\n# new comment\n", encoding="utf-8")
     second = env_analysis(db, str(path))
 
@@ -246,11 +256,11 @@ def test_comment_shift_does_not_backdate_env(tmp_path: Path) -> None:
     db = Database()
     first = env_analysis(db, str(path))
 
-    # Prepend a comment — shifts line numbers, should not backdate
+    # Prepend a comment — shifts the source range, so this must not backdate.
     path.write_text("# new comment\nKEY=value\n", encoding="utf-8")
     second = env_analysis(db, str(path))
 
-    assert first.entries[0].line_number != second.entries[0].line_number
+    assert first.entries[0].range != second.entries[0].range
 
 
 def test_semantic_edit_invalidates_env(tmp_path: Path) -> None:
@@ -264,6 +274,20 @@ def test_semantic_edit_invalidates_env(tmp_path: Path) -> None:
     second = env_analysis(db, str(path))
 
     assert first.entries[0].value != second.entries[0].value
+
+
+def test_diagnostic_only_edit_invalidates_env(tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+    path.write_text("GOOD=value\nBAD LINE\n", encoding="utf-8")
+    db = Database(mode="strict")
+    assert env_analysis(db, path).diagnostics[0][1].startswith("line 2:")
+
+    path.write_text("GOOD=value\n# moved diagnostic\nBAD LINE\n", encoding="utf-8")
+    incremental = env_analysis(db, path)
+    fresh = env_analysis(Database(mode="strict"), path)
+
+    assert incremental == fresh
+    assert incremental.diagnostics[0][1].startswith("line 3:")
 
 
 # ---------------------------------------------------------------------------

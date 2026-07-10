@@ -9,9 +9,11 @@ from pathlib import Path
 from typing import TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.resources import DirectoryResource, _file_read_snapshot
+from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
+
+from ._resources import file_read_snapshot
 
 CsvColumnPayload: TypeAlias = tuple[str, int]
 DiagnosticPayload: TypeAlias = tuple[str, str]
@@ -52,7 +54,7 @@ class _CsvFileResource:
     encoding: str = "utf-8"
 
     def read(self, db: Database, path: str | os.PathLike[str]) -> str:
-        return cast(str, db._read_resource(self, os.fspath(path)))
+        return cast(str, db.read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"csvfile[{path}]"
@@ -67,13 +69,10 @@ class _CsvFileResource:
         file_path = Path(path)
         if not file_path.exists():
             return ""
-        with db._allow_raw_open():
-            return file_path.read_text(encoding=self.encoding)
+        return file_path.read_text(encoding=self.encoding)
 
-    def probe_and_load(
-        self, db: Database, path: str
-    ) -> tuple[tuple[str, str] | tuple[str], str]:
-        probe, text = _file_read_snapshot(path, self.encoding)
+    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
+        probe, text = file_read_snapshot(path, self.encoding)
         return probe, text if text is not None else ""
 
 
@@ -122,9 +121,7 @@ def _parse_csv(
     if has_header:
         header_row = rows[0]
         data_rows = rows[1:]
-        columns: list[CsvColumnPayload] = [
-            (name, idx) for idx, name in enumerate(header_row)
-        ]
+        columns: list[CsvColumnPayload] = [(name, idx) for idx, name in enumerate(header_row)]
     else:
         data_rows = rows
         col_count = len(rows[0]) if rows else 0
@@ -146,8 +143,8 @@ def _parse_csv(
 
 
 def _csv_cutoff_token(text: str) -> tuple[str, str]:
-    columns, row_count, delimiter, has_header, _ = _parse_csv(text)
-    snapshot = freeze((columns, row_count, delimiter, has_header))
+    columns, row_count, delimiter, has_header, diagnostics = _parse_csv(text)
+    snapshot = freeze((columns, row_count, delimiter, has_header, diagnostics))
     return ("parsed", repr(snapshot))
 
 

@@ -1,20 +1,23 @@
-"""Public frozen result types for ``pyinc_codegen`` plus their tuple payloads.
-
-Following the pyinc integration pattern: kernel-cached query nodes pass
-snapshot-safe *tuple* payloads; the frozen dataclasses below are decoded only at
-the public boundary (``schema_analysis``). The ``*Payload`` aliases match each
-dataclass's field order.
-"""
+"""Public result types for :mod:`pyinc_codegen` and cached tuple payloads."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TypeAlias
 
-# (code, message)
-DiagnosticPayload: TypeAlias = tuple[str, str]
-# (name, type_expr, required, description)
-FieldPayload: TypeAlias = tuple[str, str, bool, str]
+
+class DiagnosticSeverity(StrEnum):
+    """Severity of a schema diagnostic."""
+
+    ERROR = "error"
+    WARNING = "warning"
+
+
+# (code, message, severity, JSON Pointer)
+DiagnosticPayload: TypeAlias = tuple[str, str, str, str]
+# (name, type_expr, required, description, type expression already allows None)
+FieldPayload: TypeAlias = tuple[str, str, bool, str, bool]
 # (name, kind, fields, enum_values, base_type, description, refs, diagnostics)
 ModelPayload: TypeAlias = tuple[
     str,
@@ -30,8 +33,16 @@ ModelPayload: TypeAlias = tuple[
 
 @dataclass(frozen=True)
 class Diagnostic:
+    """A problem found while analysing a schema.
+
+    ``json_pointer`` is an RFC 6901 pointer into the source document. The empty
+    string identifies the whole document.
+    """
+
     code: str
     message: str
+    severity: DiagnosticSeverity
+    json_pointer: str
 
 
 @dataclass(frozen=True)
@@ -44,8 +55,7 @@ class FieldModel:
 
 @dataclass(frozen=True)
 class SchemaModel:
-    """One generated model: an ``object`` (dataclass), an ``enum`` (Literal
-    alias), or an ``alias`` (type alias)."""
+    """One analysed model: an object, enum, or alias."""
 
     name: str
     kind: str  # "object" | "enum" | "alias"
@@ -63,14 +73,52 @@ class SchemaAnalysis:
     models: tuple[SchemaModel, ...]
     diagnostics: tuple[Diagnostic, ...]
 
+    @property
+    def errors(self) -> tuple[Diagnostic, ...]:
+        """Diagnostics that prevent generation."""
+
+        return tuple(
+            diagnostic
+            for diagnostic in self.diagnostics
+            if diagnostic.severity is DiagnosticSeverity.ERROR
+        )
+
+
+class SchemaGenerationError(ValueError):
+    """Raised when error diagnostics make generation unsafe.
+
+    The complete non-generating analysis remains available on ``analysis`` so
+    callers can present structured diagnostics without parsing this exception's
+    message.
+    """
+
+    def __init__(self, analysis: SchemaAnalysis) -> None:
+        self.analysis = analysis
+        self.diagnostics = analysis.errors
+        count = len(self.diagnostics)
+        noun = "error" if count == 1 else "errors"
+        details = "; ".join(
+            f"{diagnostic.json_pointer or '/'} [{diagnostic.code}] {diagnostic.message}"
+            for diagnostic in self.diagnostics
+        )
+        message = f"Cannot generate from {analysis.path!r}: {count} schema {noun}"
+        if details:
+            message = f"{message}: {details}"
+        super().__init__(message)
+
 
 def _decode_diagnostic(payload: DiagnosticPayload) -> Diagnostic:
-    code, message = payload
-    return Diagnostic(code=code, message=message)
+    code, message, severity, json_pointer = payload
+    return Diagnostic(
+        code=code,
+        message=message,
+        severity=DiagnosticSeverity(severity),
+        json_pointer=json_pointer,
+    )
 
 
 def _decode_field(payload: FieldPayload) -> FieldModel:
-    name, type_expr, required, description = payload
+    name, type_expr, required, description, _allows_none = payload
     return FieldModel(name=name, type_expr=type_expr, required=required, description=description)
 
 

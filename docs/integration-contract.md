@@ -30,6 +30,9 @@ Stable public surface by module:
   - entrypoints: `requirements_analysis(db, path)`,
     `workspace_requirements_analysis(db, root)`,
     `deep_requirements_analysis(db, path)`
+  - composition query: `requirements_payload(db, path)` with
+    `RequirementPayload`; stable in the `requirements_txt` submodule for other
+    integrations, not re-exported at the package level
 - `installed_packages`
   - result types: `InstalledPackageRef`, `ImportNameResolution`,
     `InstalledPackagesAnalysis`
@@ -63,14 +66,22 @@ Stable public surface by module:
     `evaluate_version_specifier(db, specifier, version)`,
     `applicable_requirements(db, path)`,
     `workspace_applicable_requirements(db, root)`
+- shared source geometry
+  - types: `SourcePosition`, `SourceRange`, `PositionEncoding`, `DocumentMap`
+  - `DocumentMap` converts Python AST UTF-8 byte columns to public Unicode
+    code-point positions and converts public positions to and from negotiated
+    UTF-8, UTF-16, or UTF-32 protocol coordinates
 - `symbol_resolution`
-  - result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`,
-    `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`,
-    `Reference`, `ReferenceQueryResult`, `ClassMember`, `ClassModel`
-  - entrypoints: `module_symbol_table(db, root, path)`,
-    `resolve_symbol(db, root, path, qualified_name)`,
+  - result types: `SymbolId`, `Scope`, `Binding`, `ScopeTree`, `Parameter`,
+    `Signature`, `Symbol`,
+    `ModuleSymbolTable`, `WorkspaceSymbolEntry`,
+    `WorkspaceSymbolIndex`, `Reference`, `ReferenceQueryResult`, `ClassMember`,
+    `ClassModel`
+  - entrypoints: `scope_tree(db, path)`,
+    `symbol_at(db, root, path, position)`,
+    `module_symbol_table(db, root, path)`,
     `workspace_symbol_index(db, root)`,
-    `find_references(db, root, path, qualified_name, *, include_declaration=True)`,
+    `find_references(db, root, symbol_id, *, include_declaration=True)`,
     `class_model(db, root, path, qualified_name)`
 - `notebook` *(added in the v2 development cycle; resolves the v1 architectural non-goal "notebook integration")*
   - result types: `NotebookImport`, `NotebookDefinition`, `NotebookCell`,
@@ -82,8 +93,10 @@ Stable public surface by module:
 
 Low-level query nodes, payload helpers, decode helpers, and module-local resource helpers in
 the integration submodules are retained for debugging and targeted tests. Examples include
-`source_text`, `imports_for_file`, `config_file_text`, `json_file_text`,
-`requirements_payload`, and the `*_payload` helpers.
+`source_text`, `imports_for_file`, `config_file_text`, `json_file_text`, and
+most `*_payload` helpers. A payload query used for documented cross-integration
+composition, such as `requirements_payload`, is listed in its defining
+module's `__all__` but is not re-exported from `pyinc.integrations`.
 
 Those names remain importable from their defining submodules, but they are experimental:
 
@@ -102,6 +115,10 @@ Those names remain importable from their defining submodules, but they are exper
 - dependency invalidation based on resolved module export surfaces, including conservative static support for `from x import *`
 - import resolution with `workspace`, `stdlib`, `installed`, `missing`, and `ambiguous` outcomes
 - environment-aware resolution via composition with `installed_packages` (stdlib and installed package classification)
+- Python source is decoded using BOM/PEP 263 rules
+- public source coordinates use `SourcePosition` and `SourceRange`: zero-based,
+  end-exclusive, Unicode-code-point columns. AST UTF-8 byte offsets are
+  converted at the parser boundary.
 
 When a resolution case is unsupported or structurally ambiguous, the integration must prefer
 `missing`/`ambiguous` or re-execution over optimistic dependency reuse.
@@ -155,7 +172,9 @@ The `requirements_txt` integration is intentionally narrow:
 Scope:
 
 - single-file requirements.txt parsing via `requirements_analysis(db, path)`
-- workspace-root discovery of `requirements.txt` via `workspace_requirements_analysis(db, root)`
+- workspace-root discovery of `requirements.txt` via
+  `workspace_requirements_analysis(db, root)`, including recursive `-r` files
+  through `deep_requirements_analysis`
 - PEP 508 specifier extraction: package name, extras, version constraints, environment markers
 - package name normalization per PEP 503 (lowercase, hyphens/dots to underscores)
 - file references (`-r`/`--requirement`, `-c`/`--constraint`)
@@ -164,6 +183,11 @@ Scope:
 - URL-based requirements (`name @ url`)
 - line continuation support (backslash-newline)
 - diagnostics for unparseable lines
+- `RequirementRef`, `FileReference`, and `IndexDirective` carry zero-based,
+  end-exclusive `SourceRange` values for their logical source lines
+- recursive `-r` traversal uses canonical paths, reports cycles, missing files,
+  and project-root escapes, and merges included requirements before the
+  including file so the including file wins duplicate names
 - cutoff-based backdating (comment-only and whitespace-only edits are backdated)
 
 Out of scope for this integration:
@@ -171,7 +195,8 @@ Out of scope for this integration:
 - marker expression evaluation
 - version specifier satisfaction or resolution
 - URL fetching or VCS cloning
-- recursive `-r` file inclusion (references are extracted but not followed)
+- recursive `-c` constraint inclusion (constraint references are recorded but
+  not followed)
 - pip-specific options beyond index/find-links directives
 
 ## Installed Packages Integration Scope
@@ -186,7 +211,7 @@ Scope:
 - stdlib module identification via `sys.stdlib_module_names` (Python 3.10+)
 - import name resolution: `stdlib` / `installed` / `unknown`
 - resource-tracked site-packages directory listings and metadata files
-- `db.report_untracked_read()` for `sys.path` discovery (runtime list, not interceptable)
+- a tracked environment resource for `sys.path` and site-packages discovery
 - cutoff-based backdating on metadata parsing (field-only comparison, whitespace changes backdate)
 - `installed_packages_analysis(db)` for full environment analysis
 - `resolve_import_name(db, import_name)` for single import resolution
@@ -228,8 +253,10 @@ Scope:
 - `workspace_dependency_check(db, root, declared_deps)` extends the base check with
   undeclared import detection by composing with `python_source.workspace_analysis`
   at the entrypoint layer
-- PEP 440 version matching for common operators (`==`, `!=`, `>=`, `<=`, `>`, `<`, `~=`)
-  with dotted numeric versions; unparseable specifiers return `ambiguous`
+- PEP 440 version matching for `==`, `!=`, `>=`, `<=`, `>`, `<`, and `~=`,
+  including epochs, pre/post/dev/local releases, compatible releases, and
+  wildcard equality; unparseable specifiers and arbitrary equality (`===`)
+  return `ambiguous`
 - PEP 503 distribution name normalization
 - result types: `DependencyStatus`, `UndeclaredImport`, `DependencyCheckAnalysis`
 
@@ -243,7 +270,7 @@ Cross-integration composition:
 
 Out of scope for this integration:
 
-- full PEP 440 version matching (pre-release, post-release, local, wildcard specifiers)
+- PEP 440 forms outside the documented, differentially tested subset
 - marker expression evaluation
 - transitive dependency resolution
 - lock file comparison
@@ -303,6 +330,8 @@ Scope:
 - `export` prefix handling
 - interpolation reference detection (the parser records `$VAR` / `${VAR}` references; it does not evaluate them)
 - diagnostics for malformed lines
+- each `EnvEntry` carries the exact zero-based, end-exclusive `SourceRange` of
+  its assignment line, measured in Unicode code points
 - cutoff-based backdating on structural parse
 
 Out of scope for this integration:
@@ -329,7 +358,9 @@ Cross-integration composition:
 
 - composes with `requirements_txt` payload helpers to read declared requirements
 - composes with `installed_packages.installed_distributions_index` to report satisfaction
-- shared private helpers `_parse_specifier_set` and `_satisfies` are reused by `dependency_check` (documented exception to the "public `@query` only" rule)
+- `requirement_evaluation` and `dependency_check` share the pure PEP 440 parser
+  and satisfaction primitives through the dedicated internal `_pep440` module;
+  neither imports private helpers from the other integration
 
 Out of scope for this integration:
 
@@ -362,7 +393,9 @@ Out of scope for this integration:
 
 ## Symbol Resolution Integration Scope
 
-The `symbol_resolution` integration exposes workspace-wide symbol tables and cross-module re-export resolution, intentionally narrow and stdlib-only:
+The `symbol_resolution` integration exposes workspace-wide symbol tables,
+lexical identities, and cross-module re-export resolution, intentionally
+conservative and stdlib-only:
 
 Scope:
 
@@ -375,16 +408,32 @@ Scope:
 - `if TYPE_CHECKING:` / `if typing.TYPE_CHECKING:` guard blocks at module top level: imports inside are collected as regular symbols; no impurity marker is set
 - `try: … except ImportError:` / `except ModuleNotFoundError:` / `except (ImportError, ModuleNotFoundError):` guard blocks at module top level: imports inside are collected as regular symbols; no impurity marker is set
 - other conditional top-level bindings (`if sys.version_info >= …`, top-level `For`, `While`, `Try` without recognised handler, `With`) → `impurity_reasons` includes `"conditional top-level binding"` and the binding produces no symbol
-- workspace-wide reference index composed over `name_occurrences_for_file` (full-AST `Name`/`Attribute` walk plus a second pass that re-parses string-valued annotations on `AnnAssign`/`arg`/`FunctionDef.returns`/`AsyncFunctionDef.returns` and walks the inner expression for nested `Name`/`Attribute` references) and verified through `resolve_symbol_payload`; only workspace-resolved targets are indexed (stdlib / installed / ambiguous return empty with `ResolvedSymbol` carried). String annotations that span multiple lines, are triple-quoted, contain escape sequences, or use implicit string concatenation are skipped (offset reconstruction would be ambiguous)
-- per-class member model via `class_model(db, root, path, qualified_name)` → `ClassModel(path, qualified_name, members, unresolved_bases)`, each `ClassMember` a `method` / `class_variable` / `instance_variable` carrying `defining_path` / `defining_class`. Own members are: annotated class-body variables, assigned class-body variables, methods, then `self.NAME` instance attributes collected from every direct method whose first parameter is literally `self` (lowest lineno wins; descent stops at nested `def`/`class`/`lambda` scopes; `AugAssign` does not declare). Bases are encoded once (`("name", X)` / `("attr", L, A)` / `("text", raw)`, a single `Subscript` layer unwrapped so `Base[T]` follows `Base`)
+- one shared lexical graph for module, class, function, lambda, and
+  comprehension scopes, including parameters, assignment/import/loop/with/
+  exception/pattern targets, `global`, `nonlocal`, and walrus binding rules
+- `scope_tree(db, path)` returns `ScopeTree` with stable `Scope`, `Binding`, and
+  `SymbolId` values; `symbol_at` resolves a source position rather than a bare
+  cursor name
+- `find_references(db, root, symbol_id)` compares resolved identities. Local
+  shadowing and comprehension bindings cannot leak into module references.
+- every public source-bearing record exposes an end-exclusive, zero-based
+  `range: SourceRange`; a diagnostic or resolution without a source site uses
+  `range=None`. There are no one-based line or AST-byte-column aliases.
+- attributes resolve only when every step is proven to be a workspace module,
+  class, `self`/`cls`, or a directly annotated value; other chains return no
+  target
+- per-class member model via `class_model(db, root, path, qualified_name)` → `ClassModel(path, qualified_name, members, unresolved_bases)`, each `ClassMember` a `method` / `class_variable` / `instance_variable` carrying `range`, `defining_path`, and `defining_class`. Own members are: annotated class-body variables, assigned class-body variables, methods, then `self.NAME` instance attributes collected from every direct method whose first parameter is literally `self` (the earliest source range wins; descent stops at nested `def`/`class`/`lambda` scopes; `AugAssign` does not declare). Bases are encoded once (`("name", X)` / `("attr", L, A)` / `("text", raw)`, a single `Subscript` layer unwrapped so `Base[T]` follows `Base`)
 - inheritance flattening in `class_model`: base classes that resolve to a workspace `class` are followed **depth-first, left-to-right, first-definition-wins** (a derived member shadows a base member of the same name — a single entry at the derived site), bounded by `MAX_BASE_DEPTH = 8` with a `(path, class_qname)` visited-set cycle guard, and base files queried one at a time via `class_models_for_file` (per-file invalidation). Bases that do not land on a workspace class (stdlib / installed / missing / ambiguous / `("text", …)`) contribute no members and are reported in `unresolved_bases`
-- entrypoints: `module_symbol_table`, `resolve_symbol`, `workspace_symbol_index`, `find_references`, `class_model`
-- result types: `Parameter`, `Signature`, `Symbol`, `ModuleSymbolTable`, `ResolvedSymbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex`, `Reference`, `ReferenceQueryResult`, `ClassMember`, `ClassModel`
+- entrypoints: `scope_tree`, `symbol_at`, `module_symbol_table`,
+  `workspace_symbol_index`, `find_references`, `class_model`
+- result types include `SymbolId`, `Scope`, `Binding`, `ScopeTree`, `Reference`,
+  and the declaration-oriented symbol and class-model views; every
+  source-bearing record uses the shared `SourcePosition` / `SourceRange`
+  geometry contract
 
 Out of scope for this integration:
 
-- function-local symbols (`find_references` therefore reports a local rebinding like `foo = 1` inside a function as a reference to the module-level `foo` of the same name)
-- attribute-chain reference resolution — `import a; a.foo()` is not counted as a reference to `a.foo` because the resolver is name-local at the call site
+- speculative runtime attribute or type inference
 - decorator-induced rebinding (`@functools.cache`, `@property`, `@classmethod`, etc.)
 - full C3 MRO linearization (class models flatten depth-first, left-to-right, first-definition-wins; in a shared-grandparent diamond — `A(B, C)`, `B(D)`, `C(D)` — a member defined in both `C` and `D` resolves to `D`'s definition, reached depth-first through `B`, whereas C3 would pick `C`'s)
 - following into installed third-party source files (v2 concern)
@@ -401,9 +450,14 @@ Scope:
 - single-file notebook analysis via `notebook_analysis(db, path)`
 - workspace-root discovery of `*.ipynb` files via `workspace_notebook_analysis(db, root)`
 - per-cell extraction of: cell index, `cell_type` (`"code"`/`"markdown"`/`"raw"`/`"unknown"`), the concatenated source text, and (for markdown cells) the first heading line with leading `#` characters stripped
-- AST-based extraction of module-level imports and top-level function/class definitions for code cells (each code cell parses as its own module)
-- per-cell `syntax-error` diagnostics carrying the offending cell index
-- top-level `notebook-decode-error` and `notebook-shape-error` diagnostics for unparseable JSON or non-object cell entries
+- AST-based extraction of module-level imports and top-level function/class
+  definitions for code cells (each code cell parses as its own module), with a
+  zero-based, end-exclusive `SourceRange` on each extracted record
+- per-cell `syntax-error` diagnostics carrying the offending cell index and
+  source range
+- top-level `notebook-decode-error` and `notebook-shape-error` diagnostics for
+  unparseable JSON or non-object cell entries; diagnostics without a cell source
+  site use `range=None`
 - kernel name and language extracted from `metadata.kernelspec` (with `metadata.language_info.name` as a fallback for the language)
 - cutoff-based backdating that ignores `outputs` and `execution_count`: re-running a notebook that leaves cell sources unchanged backdates analysis nodes and never invalidates downstream consumers
 
@@ -424,7 +478,6 @@ These are the current concrete composition edges between shipped integrations. E
 - `python_source` → `deep_module_resolution.resolve_module_location` (populates `resolved_path` for installed imports)
 - `dependency_check` → `installed_packages.installed_distributions_index`, `installed_packages.environment_index`
 - `dependency_check.workspace_dependency_check` → `python_source.workspace_analysis` (entrypoint-layer composition for undeclared-import detection)
-- `dependency_check` → `requirement_evaluation._parse_specifier_set` / `_satisfies` (shared private helpers; documented exception to the "public `@query` only" rule)
 - `requirement_evaluation` → `installed_packages.installed_distributions_index`, `requirements_txt` payload helpers
 - `deep_module_resolution` → `installed_packages.environment_index`
 - `symbol_resolution` → `python_source.{source_text, module_binding_analysis_payload, resolved_imports_for_file, module_wildcard_export_surface, workspace_python_files}`

@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import multiprocessing
 import os
+import struct
+import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from pyinc import (
     ArtifactStore,
+    ArtifactStoreError,
+    ArtifactStoreKeyError,
+    ArtifactStoreLockError,
     Database,
     FileSystemArtifactStore,
     InMemoryArtifactStore,
@@ -16,7 +23,36 @@ from pyinc import (
     query,
     serialize_snapshot,
 )
+from pyinc import (
+    _safe_fs as safe_fs_module,
+)
+from pyinc._locking import FileLock
+from pyinc._safe_fs import (
+    _WIN_FILE_SHARE_DELETE,
+    _WIN_STABLE_SHARE_MODE,
+    _windows_path_prefixes,
+    _windows_rename_information,
+    _WindowsDirectoryHandles,
+)
 from pyinc.value import fingerprint_snapshot  # not re-exported from pyinc
+
+
+def _filesystem_put_worker(
+    root: str,
+    digest: str,
+    payload: bytes,
+    start: Any,
+    results: Any,
+) -> None:
+    store = FileSystemArtifactStore(root)
+    start.wait()
+    try:
+        store.put(digest, payload)
+    except Exception as error:  # noqa: BLE001 - cross-process result transport
+        results.put(type(error).__name__)
+    else:
+        results.put("ok")
+
 
 # ---------------------------------------------------------------------------
 # Group A: InMemoryArtifactStore protocol
@@ -241,9 +277,7 @@ def test_database_persists_shared_identity_input_to_store() -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_database_with_store_under_each_mode_round_trips(
-    mode: str, tmp_path: Path
-) -> None:
+def test_database_with_store_under_each_mode_round_trips(mode: str, tmp_path: Path) -> None:
     payload = Input[dict[str, int]]("p")
     store = FileSystemArtifactStore(tmp_path)
 
@@ -281,6 +315,414 @@ def test_filesystem_store_atomic_write_uses_temporary_file(tmp_path: Path) -> No
         if name.startswith(".tmp-") or name.startswith("tmp")
     ]
     assert leftover == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    (
+        "",
+        "abc",
+        "0" * 63,
+        "A" * 64,
+        "../" + "0" * 64,
+        "0/" + "0" * 62,
+        "C:\\" + "0" * 64,
+        "ck" + "0" * 63,
+    ),
+)
+def test_filesystem_store_rejects_malformed_or_escaping_keys(tmp_path: Path, key: str) -> None:
+    store = FileSystemArtifactStore(tmp_path)
+    with pytest.raises(ArtifactStoreKeyError):
+        store.get(key)
+    with pytest.raises(ArtifactStoreKeyError):
+        store.put(key, b"payload")
+    with pytest.raises(ArtifactStoreKeyError):
+        store.contains(key)
+
+
+def test_filesystem_store_rejects_digest_string_subclasses(tmp_path: Path) -> None:
+    class EvilDigest(str):
+        def __getitem__(self, key: object) -> str:
+            if isinstance(key, slice) and key.stop == 2:
+                return ".."
+            return "victim"
+
+    store = FileSystemArtifactStore(tmp_path)
+    digest = EvilDigest("a" * 64)
+
+    with pytest.raises(ArtifactStoreKeyError):
+        store.put(digest, b"payload")
+    assert not (tmp_path / "victim").exists()
+    assert not (tmp_path / "victim.lock").exists()
+
+
+def test_filesystem_store_wraps_invalid_root_as_typed_error() -> None:
+    with pytest.raises(ArtifactStoreError, match="root path is invalid"):
+        FileSystemArtifactStore("bad\0root")
+
+
+def test_windows_trusted_path_plan_uses_extended_component_prefixes() -> None:
+    assert _windows_path_prefixes(r"C:\store\objects\aa") == (
+        "\\\\?\\C:\\",
+        "\\\\?\\C:\\store",
+        "\\\\?\\C:\\store\\objects",
+        "\\\\?\\C:\\store\\objects\\aa",
+    )
+    assert _windows_path_prefixes(r"\\server\share\store") == (
+        "\\\\?\\UNC\\server\\share\\",
+        "\\\\?\\UNC\\server\\share\\store",
+    )
+    assert not _WIN_STABLE_SHARE_MODE & _WIN_FILE_SHARE_DELETE
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        r"relative\file",
+        r"C:\root\..\escape",
+        r"\\.\C:\device",
+        r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\file",
+        r"\\?\PIPE\service",
+    ),
+)
+def test_windows_trusted_path_plan_rejects_unsafe_namespaces(path: str) -> None:
+    with pytest.raises(OSError):
+        _windows_path_prefixes(path)
+
+
+def test_windows_rename_information_uses_full_utf16_target() -> None:
+    payload, filename_offset = _windows_rename_information(
+        "C:\\g\N{LATIN SMALL LETTER E WITH ACUTE}n\\model.py"
+    )
+    assert struct.unpack_from("<I", payload, 0) == (1,)
+    assert payload[filename_offset:-2].decode("utf-16-le") == (
+        "\\\\?\\C:\\g\N{LATIN SMALL LETTER E WITH ACUTE}n\\model.py"
+    )
+    assert payload[-2:] == b"\0\0"
+
+
+def test_windows_directory_handles_stay_open_until_operation_finishes() -> None:
+    class FakeWindowsApi:
+        def __init__(self) -> None:
+            self.opened: list[str] = []
+            self.closed: list[int] = []
+
+        def open_directory(self, path: str) -> int:
+            self.opened.append(path)
+            return len(self.opened)
+
+        def require_directory(self, handle: int, path: str) -> None:
+            assert handle == len(self.opened)
+            assert path == self.opened[-1]
+
+        def create_directory(self, path: str) -> None:
+            raise AssertionError(f"unexpected create: {path}")
+
+        def close(self, handle: int) -> None:
+            self.closed.append(handle)
+
+    api = FakeWindowsApi()
+    handles = _WindowsDirectoryHandles.open(
+        api,  # type: ignore[arg-type]
+        r"C:\store\objects\aa",
+        create=False,
+    )
+    assert api.closed == []
+    assert len(handles.handles) == 4
+
+    handles.close()
+
+    assert api.closed == [4, 3, 2, 1]
+
+
+def test_filesystem_store_serializes_equal_cross_process_puts(tmp_path: Path) -> None:
+    digest = "a" * 64
+    context: Any = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_filesystem_put_worker,
+            args=(str(tmp_path), digest, b"same", start, results),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    assert sorted(results.get(timeout=1) for _ in processes) == ["ok", "ok"]
+    assert FileSystemArtifactStore(tmp_path).get(digest) == b"same"
+
+
+def test_filesystem_store_refuses_cross_process_conflicting_bytes(tmp_path: Path) -> None:
+    digest = "b" * 64
+    context: Any = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_filesystem_put_worker,
+            args=(str(tmp_path), digest, payload, start, results),
+        )
+        for payload in (b"first", b"second")
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    assert sorted(results.get(timeout=1) for _ in processes) == ["ValueError", "ok"]
+    assert FileSystemArtifactStore(tmp_path).get(digest) in {b"first", b"second"}
+
+
+def test_filesystem_store_lock_timeout_is_typed(tmp_path: Path) -> None:
+    digest = "c" * 64
+    store = FileSystemArtifactStore(tmp_path, lock_timeout=0)
+    with FileLock(store._lock_path_for(digest), timeout=0), pytest.raises(ArtifactStoreLockError):
+        store.put(digest, b"payload")
+
+
+def test_filesystem_store_rejects_nonregular_lock_path_with_typed_error(
+    tmp_path: Path,
+) -> None:
+    digest = "e" * 64
+    store = FileSystemArtifactStore(tmp_path)
+    lock_path = store._lock_path_for(digest)
+    lock_path.parent.mkdir()
+    try:
+        lock_path.symlink_to(tmp_path / "outside-lock")
+    except OSError:
+        pytest.skip("symlink support is unavailable")
+
+    with pytest.raises(ArtifactStoreError, match="artifact lock"):
+        store.put(digest, b"payload")
+
+
+def test_filesystem_store_interrupted_publish_leaves_no_partial_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    digest = "d" * 64
+    store = FileSystemArtifactStore(tmp_path)
+
+    def fail_replace(source: str, destination: str, **kwargs: object) -> None:
+        raise OSError("interrupted")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError, match="interrupted"):
+        store.put(digest, b"payload")
+
+    target = tmp_path / "objects" / "dd" / ("d" * 62)
+    assert not target.exists()
+    assert list(target.parent.glob(".tmp-*")) == []
+
+
+@pytest.mark.parametrize("timeout", (float("nan"), float("inf"), -float("inf")))
+def test_filesystem_store_rejects_nonfinite_lock_timeout(tmp_path: Path, timeout: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        FileSystemArtifactStore(tmp_path, lock_timeout=timeout)
+
+
+def test_filesystem_store_rejects_symlinked_object_fanout(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    outside = tmp_path / "outside"
+    store = FileSystemArtifactStore(root)
+    outside.mkdir()
+    try:
+        (root / "objects" / "aa").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symbolic links are not available")
+
+    with pytest.raises(ArtifactStoreError, match="not a directory"):
+        store.put("a" * 64, b"payload")
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a Windows junction")
+def test_windows_store_rejects_junctioned_object_fanout(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    outside = tmp_path / "outside"
+    store = FileSystemArtifactStore(root)
+    outside.mkdir()
+    junction = root / "objects" / "77"
+    created = subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"junction creation is unavailable: {created.stderr.strip()}")
+    try:
+        with pytest.raises(ArtifactStoreError):
+            store.put("7" * 64, b"payload")
+        assert list(outside.iterdir()) == []
+    finally:
+        junction.rmdir()
+
+
+def test_filesystem_store_rejects_symlinked_object_target(tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    outside = tmp_path / "outside.bin"
+    store = FileSystemArtifactStore(root)
+    fanout = root / "objects" / "bb"
+    fanout.mkdir()
+    outside.write_bytes(b"outside")
+    target = fanout / ("b" * 62)
+    try:
+        target.symlink_to(outside)
+    except OSError:
+        pytest.skip("symbolic links are not available")
+
+    with pytest.raises(ArtifactStoreError, match="not a regular file"):
+        store.get("b" * 64)
+    with pytest.raises(ArtifactStoreError, match="not a regular file"):
+        store.put("b" * 64, b"payload")
+    assert outside.read_bytes() == b"outside"
+
+
+def test_filesystem_store_parent_swap_cannot_redirect_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "store"
+    outside = tmp_path / "outside"
+    moved = tmp_path / "moved-fanout"
+    outside.mkdir()
+    store = FileSystemArtifactStore(root)
+    store_module = __import__("pyinc.store", fromlist=["atomic_write"])
+    original_atomic_write = store_module.atomic_write
+
+    def swap_then_write(target: Path, data: bytes) -> None:
+        target.parent.rename(moved)
+        try:
+            target.parent.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("symbolic links are not available")
+        original_atomic_write(target, data)
+
+    monkeypatch.setattr(store_module, "atomic_write", swap_then_write)
+    with pytest.raises(ArtifactStoreError):
+        store.put("e" * 64, b"blocked")
+    assert list(outside.iterdir()) == []
+    assert list(moved.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-descriptor behavior")
+def test_filesystem_store_rejects_opened_parent_rename_before_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "store"
+    outside = tmp_path / "outside"
+    moved = outside / "moved-fanout"
+    outside.mkdir()
+    store = FileSystemArtifactStore(root)
+    original = safe_fs_module._require_regular_or_missing
+    raced = False
+
+    def rename_after_validation(descriptor: int, name: str, path: Path) -> None:
+        nonlocal raced
+        original(descriptor, name, path)
+        if len(name) == 62 and not raced:
+            raced = True
+            path.parent.rename(moved)
+
+    monkeypatch.setattr(safe_fs_module, "_require_regular_or_missing", rename_after_validation)
+    with pytest.raises(ArtifactStoreError, match="trusted path"):
+        store.put("e" * 64, b"blocked")
+
+    assert raced
+    assert not (moved / ("e" * 62)).exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Win32 handle sharing")
+def test_windows_store_publish_replaces_a_racing_target_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pyinc import _safe_fs as safe_fs_module
+
+    root = tmp_path / "store"
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(outside)
+    except OSError:
+        pytest.skip("Windows symbolic-link creation is unavailable")
+    probe.unlink()
+
+    digest = "f" * 64
+    store = FileSystemArtifactStore(root)
+    target = root / "objects" / "ff" / ("f" * 62)
+    api = safe_fs_module._windows_api()
+    api_type = type(api)
+    original_rename = api_type.rename_handle
+    injected = False
+
+    def race_target(self: Any, handle: int, destination: str) -> None:
+        nonlocal injected
+        if Path(destination) == target and not injected:
+            target.symlink_to(outside)
+            injected = True
+        original_rename(self, handle, destination)
+
+    monkeypatch.setattr(api_type, "rename_handle", race_target)
+    store.put(digest, b"payload")
+
+    assert injected
+    assert not target.is_symlink()
+    assert target.read_bytes() == b"payload"
+    assert outside.read_bytes() == b"outside"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Win32 handle sharing")
+def test_windows_store_holds_fanout_against_a_directory_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pyinc import _safe_fs as safe_fs_module
+
+    root = tmp_path / "store"
+    moved = tmp_path / "moved-fanout"
+    store = FileSystemArtifactStore(root)
+    digest = "9" * 64
+    fanout = root / "objects" / "99"
+    api = safe_fs_module._windows_api()
+    api_type = type(api)
+    original_rename = api_type.rename_handle
+    swap_blocked = False
+
+    def race_parent(self: Any, handle: int, destination: str) -> None:
+        nonlocal swap_blocked
+        if Path(destination).parent == fanout:
+            try:
+                fanout.rename(moved)
+            except OSError:
+                swap_blocked = True
+        original_rename(self, handle, destination)
+
+    monkeypatch.setattr(api_type, "rename_handle", race_parent)
+    store.put(digest, b"payload")
+
+    assert swap_blocked
+    assert store.get(digest) == b"payload"
+    assert not moved.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Win32 handle sharing")
+def test_windows_lock_holds_its_parent_against_a_junction_swap(tmp_path: Path) -> None:
+    store = FileSystemArtifactStore(tmp_path / "store")
+    lock_path = store._lock_path_for("8" * 64)
+    moved = tmp_path / "moved-lock-parent"
+    lock = FileLock(lock_path, timeout=0)
+
+    with lock, pytest.raises(OSError):
+        lock_path.parent.rename(moved)
+
+    assert not moved.exists()
 
 
 # ---------------------------------------------------------------------------

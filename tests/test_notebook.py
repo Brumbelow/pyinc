@@ -73,9 +73,7 @@ def test_package_namespace_exports_notebook_stable_api() -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_notebook_analysis_extracts_cells_and_metadata(
-    mode: str, tmp_path: Path
-) -> None:
+def test_notebook_analysis_extracts_cells_and_metadata(mode: str, tmp_path: Path) -> None:
     nb = _notebook(
         [
             {"cell_type": "markdown", "source": ["# Title\n", "Some prose."]},
@@ -107,12 +105,12 @@ def test_notebook_analysis_extracts_cells_and_metadata(
     assert md.definitions == ()
 
     assert code.cell_type == "code"
-    assert tuple((i.module, i.kind, i.lineno) for i in code.imports) == (
-        ("os", "import", 1),
+    assert tuple((i.module, i.kind, i.range.start.line) for i in code.imports) == (
+        ("os", "import", 0),
     )
-    assert tuple((d.name, d.kind, d.lineno) for d in code.definitions) == (
-        ("f", "function", 3),
-        ("C", "class", 6),
+    assert tuple((d.name, d.kind, d.range.start.line) for d in code.definitions) == (
+        ("f", "function", 2),
+        ("C", "class", 5),
     )
 
     assert raw.cell_type == "raw"
@@ -136,6 +134,20 @@ def test_notebook_handles_source_as_string_or_list(tmp_path: Path) -> None:
     assert result.cells[1].source == "y = 2\n"
 
 
+def test_notebook_definition_range_uses_decomposed_source_spelling(tmp_path: Path) -> None:
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        path,
+        _notebook([{"cell_type": "code", "source": "def e\u0301():\n    pass\n"}]),
+    )
+
+    definition = notebook_analysis(Database(), str(path)).cells[0].definitions[0]
+
+    assert definition.name == "é"
+    assert (definition.range.start.line, definition.range.start.character) == (0, 4)
+    assert (definition.range.end.line, definition.range.end.character) == (0, 6)
+
+
 def test_notebook_from_import_lineno_and_kind(tmp_path: Path) -> None:
     nb = _notebook(
         [
@@ -151,9 +163,9 @@ def test_notebook_from_import_lineno_and_kind(tmp_path: Path) -> None:
     db = Database()
     result = notebook_analysis(db, str(path))
     code = result.cells[0]
-    assert tuple((i.module, i.kind, i.lineno) for i in code.imports) == (
-        ("typing", "from", 1),
-        (".util", "from", 2),
+    assert tuple((i.module, i.kind, i.range.start.line) for i in code.imports) == (
+        ("typing", "from", 0),
+        (".util", "from", 1),
     )
 
 
@@ -173,6 +185,8 @@ def test_notebook_records_per_cell_syntax_error(tmp_path: Path) -> None:
     diag = result.diagnostics[0]
     assert diag.code == "syntax-error"
     assert diag.cell_index == 1
+    assert diag.range is not None
+    assert diag.range.start.line == 0
 
 
 def test_notebook_decode_error(tmp_path: Path) -> None:
@@ -185,6 +199,7 @@ def test_notebook_decode_error(tmp_path: Path) -> None:
     assert len(result.diagnostics) == 1
     assert result.diagnostics[0].code == "notebook-decode-error"
     assert result.diagnostics[0].cell_index is None
+    assert result.diagnostics[0].range is not None
 
 
 def test_notebook_shape_error_top_level(tmp_path: Path) -> None:
@@ -285,9 +300,7 @@ def test_output_only_edit_backdates_notebook(tmp_path: Path) -> None:
     first = notebook_analysis(db, str(path))
     first_changed = db.inspect(notebook_analysis_payload, str(path)).changed_at
 
-    nb["cells"][0]["outputs"] = [
-        {"output_type": "stream", "name": "stdout", "text": "noise\n"}
-    ]
+    nb["cells"][0]["outputs"] = [{"output_type": "stream", "name": "stdout", "text": "noise\n"}]
     nb["cells"][0]["execution_count"] = 7
     _write_notebook(path, nb)
 
@@ -387,9 +400,7 @@ def test_notebook_analysis_matches_fresh_recomputation_over_changes(
 
     def with_outputs() -> dict[str, Any]:
         nb: dict[str, Any] = json.loads(json.dumps(base))
-        nb["cells"][1]["outputs"] = [
-            {"output_type": "stream", "name": "stdout", "text": "hi"}
-        ]
+        nb["cells"][1]["outputs"] = [{"output_type": "stream", "name": "stdout", "text": "hi"}]
         nb["cells"][1]["execution_count"] = 1
         return nb
 
@@ -420,9 +431,7 @@ def test_notebook_analysis_matches_fresh_recomputation_over_changes(
     for _label, content in steps:
         path.write_text(json.dumps(content), encoding="utf-8")
         fresh = Database(mode=mode)
-        assert notebook_analysis(incremental, str(path)) == notebook_analysis(
-            fresh, str(path)
-        )
+        assert notebook_analysis(incremental, str(path)) == notebook_analysis(fresh, str(path))
 
 
 # ---------------------------------------------------------------------------

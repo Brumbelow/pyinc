@@ -4,7 +4,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/pyinc)](https://pypi.org/project/pyinc/)
 [![Python versions](https://img.shields.io/pypi/pyversions/pyinc)](https://pypi.org/project/pyinc/)
 [![PyPI license](https://img.shields.io/pypi/l/pyinc)](https://pypi.org/project/pyinc/)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Lint: Ruff](https://img.shields.io/badge/lint-Ruff-D7FF64.svg)](https://docs.astral.sh/ruff/)
 [![Pytest](https://img.shields.io/badge/Pytest-fff?logo=pytest&logoColor=000)](#)
 
 ```
@@ -18,6 +18,7 @@ declare where external state comes from (files, env vars, directories), and
 the next call recomputes just the affected queries.
 
 It is pure-Python, stdlib-only, with zero runtime dependencies.
+Python 3.11, 3.12, 3.13, and 3.14 are tested on Linux, macOS, and Windows.
 
 The design space is the one occupied by [Salsa][salsa], [Jane Street
 Incremental][incr], and [Bazel/Skyframe][skyframe] — adapted to Python's
@@ -87,7 +88,9 @@ mutable-graph boundary, cross-run checkpoints, the notebook integration, the
 | **Codegen** | `pyinc_codegen`: a JSON-Schema → typed-Python compiler, the reference file→file consumer. | [codegen-guide.md](docs/codegen-guide.md) |
 | **Benchmarks** | A reproducible timing + correctness harness (`bench/`), not shipped in the wheel. | [below](#benchmarks) |
 
-New here? Start with [docs/architecture.md](docs/architecture.md) for the map,
+Upgrading from 2.x? Read [the v3 migration guide](docs/migration-v3.md) before
+reusing persisted state. New here? Start with
+[docs/architecture.md](docs/architecture.md) for the map,
 then [docs/kernel-contract.md](docs/kernel-contract.md) for the guarantee.
 
 ## What pyinc guarantees
@@ -99,7 +102,9 @@ The guarantee holds when, and only when, three conditions hold:
 1. **Value boundary ownership** — every value crossing a cached boundary is
    snapshot-safe (an immutable scalar, a tuple, a `freeze`-convertible container,
    a dataclass, or a registered `ValueAdapter`). Mutable graphs with shared
-   identity or cycles round-trip through `FrozenGraph` / `FrozenRef`.
+   identity or cycles round-trip through `FrozenGraph` / `FrozenRef`. Dataclasses
+   thaw as dictionaries, so a dataclass used as a mapping key or set member
+   requires a `ValueAdapter` that reconstructs a hashable value.
 2. **Tracked ambient reads** — every read of external state inside a query goes
    through a `Resource` (or is explicitly declared via
    `db.report_untracked_read(reason)`). The runtime intercepts `builtins.open`,
@@ -107,8 +112,9 @@ The guarantee holds when, and only when, three conditions hold:
    `Path.iterdir` during query execution and raises `UntrackedReadError` on
    escapes.
 3. **Deterministic queries** — the same tracked dependencies produce a
-   semantically equal value. Mutable closure or global captures are rejected at
-   decoration time, so memo reuse can't silently depend on hidden mutation.
+   semantically equal value. Mutable closure or global captures are rejected
+   when query identity is established (normally the first `db.get()`), so memo
+   reuse can't silently depend on hidden mutation.
 
 The full contract — soundness envelope, the three modes, out-of-scope cases, and
 documented escape hatches — is in
@@ -118,11 +124,13 @@ documented escape hatches — is in
 
 The stable top-level API, grouped by what you reach for:
 
-- **Define work** — `@query` for derived values; `Input` for base leaves;
+- **Define work** — public `Query` objects from `@query` for derived values;
+  stable keyed `Input` objects for base leaves;
   optional `eq=` / `cutoff=` policies for custom equivalence and backdating;
   `ValueAdapter` for custom snapshot-safe boundary types.
-- **Track external state** — `FileResource`, `FileStatResource`, `EnvResource`,
-  `DirectoryResource`.
+- **Track external state** — public generic `Resource` hooks plus
+  `FileResource`, `BinaryFileResource`, `FileStatResource`, `EnvResource`, and
+  `DirectoryResource`; custom callers use `Database.read_resource(...)`.
 - **Run** — pull-based recomputation with `strict` / `checked` / `fast` modes;
   bounded memoization via `Database(max_query_nodes=...)` (LRU at request
   boundaries; inputs and resources stay resident); atomic batch invalidation via
@@ -148,6 +156,8 @@ The stable top-level API, grouped by what you reach for:
   (snapshot-safe, so `tuple[Output, ...]` is a valid query return); a separate
   `@action` reconciles them with the filesystem. Side effects never enter a
   query. See [action-contract.md](docs/action-contract.md).
+  Results distinguish `created`, `updated`, and tamper-`repaired` files from
+  `deleted` and `unchanged` files.
 
 `Database` is thread-safe across instances and on a single shared instance; the
 ambient-read guard is installed once globally and dispatches per-context, so
@@ -166,7 +176,7 @@ public surface per integration is in
 | `python_source` | Workspace module discovery, top-level imports/definitions, export tracking, and import resolution (`workspace` / `stdlib` / `installed` / `missing` / `ambiguous`). |
 | `installed_packages` | Installed packages via `.dist-info`, stdlib modules via `sys.stdlib_module_names`, and import-name resolution. |
 | `deep_module_resolution` | `sys.path` walking, `.pth` processing, PEP 420 namespace packages, and dotted-name → file resolution. |
-| `symbol_resolution` | Module- and class-level symbol tables, re-export following with cycle detection, annotation-text extraction, and a reverse-reference index. |
+| `symbol_resolution` | Shared lexical scope trees, position-resolved symbol identities, conservative attribute resolution, re-export following, and a reverse-reference index. |
 | `dependency_check` | Composes `installed_packages` + `python_source` to flag undeclared imports and missing / mismatched packages. |
 | `toml_config` / `json_config` / `xml_config` | Single-file inspection: sections, keys, traversal, and parse diagnostics. |
 | `requirements_txt` | Requirement specs, file references, index directives, editable/URL installs, and recursive `-r` following with cycle detection. |
@@ -187,9 +197,11 @@ stable `pyinc.integrations` surface:
 
 - `pyinc-tools analyze <root>` — one-shot or threaded `--watch` workspace
   analysis via a polling watcher.
-- `pyinc-tools lsp` — a stdio LSP server with document/workspace symbols,
-  diagnostics (push **and** LSP 3.17 pull channels), hover, goto-definition, and
-  find-references, all backed by `symbol_resolution`. It starts a threaded
+- `pyinc-tools lsp` — a stdio LSP 3.18 server with negotiated UTF-8/UTF-16/UTF-32
+  positions, document/workspace symbols, diagnostics (push and pull channels),
+  hover, goto-definition, and
+  find-references, all backed by the shared lexical scope graph and resolved
+  `SymbolId` identities. It starts a threaded
   filesystem watcher so external edits (`git pull`, formatters) publish fresh
   diagnostics even without editor `didChangeWatchedFiles` events.
 
@@ -216,6 +228,8 @@ file; a property change rewrites the affected model (and its reference-graph
 dependents, each only if its output changed); adding or removing a definition
 touches only that definition's files plus the index. See
 [docs/codegen-guide.md](docs/codegen-guide.md).
+Malformed or unsupported schemas produce severity- and JSON-Pointer-bearing
+diagnostics, and generation fails before touching existing outputs.
 
 ## Diagnostics and escape hatches
 

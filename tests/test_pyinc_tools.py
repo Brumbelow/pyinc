@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from pyinc_tools.lsp import LanguageServer, _RequestFailed
+from pyinc.integrations import SourcePosition, SourceRange, SymbolId
+from pyinc_tools.lsp import LanguageServer, _package_version, _RequestFailed
 from pyinc_tools.session import (
     AnalysisDiagnostic,
     CallHierarchyCallSite,
@@ -45,6 +46,40 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _range(
+    start_line: int,
+    start_character: int,
+    end_line: int,
+    end_character: int,
+) -> SourceRange:
+    return SourceRange(
+        SourcePosition(start_line, start_character),
+        SourcePosition(end_line, end_character),
+    )
+
+
+def _fold_signatures(
+    ranges: tuple[FoldingRange, ...],
+) -> set[tuple[int, int, str]]:
+    return {(item.range.start.line + 1, item.range.end.line + 1, item.kind) for item in ranges}
+
+
+def _symbol_for_name(
+    session: WorkspaceSession,
+    path: Path,
+    name: str,
+) -> SymbolId:
+    source = session.source_text(path)
+    assert source is not None
+    offset = source.index(name)
+    prefix = source[:offset]
+    line = prefix.count("\n")
+    character = len(prefix.rsplit("\n", 1)[-1])
+    symbol_id = session.symbol_at(path, SourcePosition(line, character))
+    assert symbol_id is not None
+    return symbol_id
+
+
 class _WatcherFactory:
     def __init__(self) -> None:
         self.built: list[PollingWorkspaceWatcher] = []
@@ -64,9 +99,7 @@ def watcher_factory() -> Iterator[_WatcherFactory]:
         yield factory
     finally:
         for watcher in factory.built:
-            with contextlib.suppress(
-                Exception
-            ):  # pragma: no cover - best-effort teardown
+            with contextlib.suppress(Exception):  # pragma: no cover - best-effort teardown
                 watcher.stop(timeout=2.0)
 
 
@@ -83,9 +116,7 @@ def test_workspace_session_overlay_edits_do_not_touch_disk(tmp_path: Path) -> No
         session.set_overlay(target, "def broken(\n")
         edited = session.analyze_file(target)
 
-        assert any(
-            diagnostic.code == "syntax-error" for diagnostic in edited.diagnostics
-        )
+        assert any(diagnostic.code == "syntax-error" for diagnostic in edited.diagnostics)
         assert target.read_text(encoding="utf-8") == "def ok() -> int:\n    return 1\n"
 
 
@@ -106,9 +137,7 @@ def test_workspace_session_save_and_close_reconcile_with_disk(tmp_path: Path) ->
 
         assert saved.module is not None
         assert saved.module.definitions[0].name == "saved"
-        assert not any(
-            diagnostic.code == "syntax-error" for diagnostic in saved.diagnostics
-        )
+        assert not any(diagnostic.code == "syntax-error" for diagnostic in saved.diagnostics)
 
 
 def test_workspace_session_cross_file_invalidation_and_path_remap(
@@ -123,15 +152,11 @@ def test_workspace_session_cross_file_invalidation_and_path_remap(
 
     with WorkspaceSession(root) as session:
         clean = session.analyze_file(consumer)
-        assert not any(
-            diagnostic.code == "unresolved-symbol" for diagnostic in clean.diagnostics
-        )
+        assert not any(diagnostic.code == "unresolved-symbol" for diagnostic in clean.diagnostics)
 
         session.set_overlay(provider, "def bar() -> int:\n    return 1\n")
         broken = session.analyze_file(consumer)
-        assert any(
-            diagnostic.code == "unresolved-symbol" for diagnostic in broken.diagnostics
-        )
+        assert any(diagnostic.code == "unresolved-symbol" for diagnostic in broken.diagnostics)
 
         workspace = session.analyze_workspace()
         module_by_path = {module.path: module for module in workspace.python.modules}
@@ -139,8 +164,7 @@ def test_workspace_session_cross_file_invalidation_and_path_remap(
 
         assert workspace.python.root == str(root)
         assert all(
-            not module.path.startswith(session.mirror_root)
-            for module in workspace.python.modules
+            not module.path.startswith(session.mirror_root) for module in workspace.python.modules
         )
         assert consumer_module.resolved_imports[0].resolved_path == str(provider)
         assert consumer_module.dependencies[0].path == str(provider)
@@ -182,7 +206,7 @@ def test_language_server_reports_document_and_workspace_symbols(tmp_path: Path) 
     target = root / "symbols.py"
     _write(
         target,
-        "class Box:\n" "    pass\n" "\n" "def helper() -> int:\n" "    return 1\n",
+        "class Box:\n    pass\n\ndef helper() -> int:\n    return 1\n",
     )
 
     server = LanguageServer(default_root=str(root))
@@ -198,9 +222,7 @@ def test_language_server_reports_document_and_workspace_symbols(tmp_path: Path) 
         )
         assert {item["name"] for item in document_symbols} == {"Box", "helper"}
 
-        workspace_symbols = server._handle_request(
-            "workspace/symbol", {"query": "help"}
-        )
+        workspace_symbols = server._handle_request("workspace/symbol", {"query": "help"})
         assert len(workspace_symbols) == 1
         assert workspace_symbols[0]["name"] == "helper"
     finally:
@@ -398,7 +420,7 @@ def test_language_server_definition_follows_single_level_wildcard_import(
             server._session.close()
 
 
-def test_resolve_symbol_reference_wildcard_chain_is_bounded_by_intermediate_surface(
+def test_symbol_at_wildcard_chain_is_bounded_by_intermediate_surface(
     tmp_path: Path,
 ) -> None:
     """Two-level ``from X import *`` chain currently does **not** resolve end-to-end:
@@ -413,32 +435,34 @@ def test_resolve_symbol_reference_wildcard_chain_is_bounded_by_intermediate_surf
     _write(root / "deepest.py", "def foo() -> int:\n    return 1\n")
     _write(root / "middle.py", "from deepest import *\n")
     outer = root / "outer.py"
-    _write(outer, "from middle import *\n")
+    _write(outer, "from middle import *\n\nfoo()\n")
 
     with WorkspaceSession(root) as session:
-        resolved = session.resolve_symbol_reference(outer, "foo")
-        assert resolved.resolution == "missing"
+        assert session.symbol_at(outer, SourcePosition(2, 1)) is None
 
 
-def test_resolve_symbol_reference_max_follow_depth_boundary(tmp_path: Path) -> None:
+def test_symbol_at_max_follow_depth_boundary(tmp_path: Path) -> None:
     inside = tmp_path / "inside"
     inside.mkdir()
     entry_inside = _write_reexport_chain(inside, length=7, symbol="target")
 
     with WorkspaceSession(inside) as session:
-        resolved = session.resolve_symbol_reference(entry_inside, "target")
-        assert resolved.resolution == "workspace"
-        assert resolved.defining_path == str(inside / "hop_07.py")
-        assert resolved.defining_lineno == 1
+        resolved = session.symbol_at(
+            entry_inside, SourcePosition(0, len("from hop_01 import ") + 1)
+        )
+        assert resolved is not None
+        assert resolved.path == str(inside / "hop_07.py")
+        assert resolved.declaration.start.line == 0
 
     outside = tmp_path / "outside"
     outside.mkdir()
     entry_outside = _write_reexport_chain(outside, length=8, symbol="target")
 
     with WorkspaceSession(outside) as session:
-        too_deep = session.resolve_symbol_reference(entry_outside, "target")
-        assert too_deep.resolution == "ambiguous"
-        assert too_deep.defining_path is None
+        too_deep = session.symbol_at(
+            entry_outside, SourcePosition(0, len("from hop_01 import ") + 1)
+        )
+        assert too_deep is None
 
     server = LanguageServer(default_root=str(outside))
     try:
@@ -456,7 +480,7 @@ def test_resolve_symbol_reference_max_follow_depth_boundary(tmp_path: Path) -> N
             server._session.close()
 
 
-def test_resolve_symbol_reference_cyclic_reexport_returns_ambiguous(
+def test_symbol_at_cyclic_reexport_returns_none(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "workspace"
@@ -465,9 +489,8 @@ def test_resolve_symbol_reference_cyclic_reexport_returns_ambiguous(
     _write(root / "b.py", "from a import foo\n")
 
     with WorkspaceSession(root) as session:
-        resolved = session.resolve_symbol_reference(root / "a.py", "foo")
-        assert resolved.resolution == "ambiguous"
-        assert resolved.defining_path is None
+        resolved = session.symbol_at(root / "a.py", SourcePosition(0, len("from b import ") + 1))
+        assert resolved is None
 
 
 def test_language_server_hover_on_ambiguous_wildcard_returns_none(
@@ -481,8 +504,8 @@ def test_language_server_hover_on_ambiguous_wildcard_returns_none(
     _write(consumer, "from providers_a import *\nfrom providers_b import *\n\nfoo()\n")
 
     with WorkspaceSession(root) as session:
-        resolved = session.resolve_symbol_reference(consumer, "foo")
-        assert resolved.resolution == "ambiguous"
+        resolved = session.symbol_at(consumer, SourcePosition(3, 1))
+        assert resolved is None
 
     server = LanguageServer(default_root=str(root))
     try:
@@ -797,13 +820,14 @@ def test_workspace_session_declaration_location_at_returns_dataclass(
     _write(target, "import os\n\nos.getcwd()\n")
 
     with WorkspaceSession(root) as session:
-        location = session.declaration_location_at(target, "os")
+        symbol_id = SymbolId(str(target.resolve()), "module", "os", _range(0, 7, 0, 9))
+        location = session.declaration_location_at(symbol_id)
 
     assert isinstance(location, DeclarationLocation)
     assert location.path == str(target.resolve())
-    assert location.lineno == 1  # 1-based
-    assert location.col_offset == 7
-    assert location.end_col_offset == 9
+    assert location.range.start.line + 1 == 1  # 1-based
+    assert location.range.start.character == 7
+    assert location.range.end.character == 9
 
 
 def test_workspace_session_declaration_location_at_unknown_returns_none(
@@ -815,7 +839,8 @@ def test_workspace_session_declaration_location_at_unknown_returns_none(
     _write(target, "def helper() -> int:\n    return 1\n")
 
     with WorkspaceSession(root) as session:
-        location = session.declaration_location_at(target, "nonexistent")
+        symbol_id = SymbolId(str(target.resolve()), "module", "nonexistent", _range(0, 4, 0, 10))
+        location = session.declaration_location_at(symbol_id)
 
     assert location is None
 
@@ -827,9 +852,10 @@ def test_workspace_session_declaration_location_at_missing_file_raises(
     root.mkdir()
     _write(root / "mod.py", "x = 1\n")
     missing = root / "missing.py"
+    symbol_id = SymbolId(str(missing), "module", "x", _range(0, 0, 0, 1))
 
     with WorkspaceSession(root) as session, pytest.raises(FileNotFoundError):
-        session.declaration_location_at(missing, "x")
+        session.declaration_location_at(symbol_id)
 
 
 def test_language_server_declaration_overlay_sees_edit(tmp_path: Path) -> None:
@@ -934,7 +960,7 @@ def test_language_server_references_local_function_returns_declaration_and_call(
     try:
         init = server._handle_request("initialize", {"rootUri": root.as_uri()})
         assert init["capabilities"]["referencesProvider"] is True
-        assert init["serverInfo"]["version"] == "2.6.0"
+        assert init["serverInfo"]["version"] == _package_version()
 
         locations = server._handle_request(
             "textDocument/references",
@@ -1000,9 +1026,7 @@ def test_language_server_references_follows_cross_file_reexport(tmp_path: Path) 
         assert provider.as_uri() in uris
         assert consumer.as_uri() in uris
         lines_in_consumer = sorted(
-            loc["range"]["start"]["line"]
-            for loc in locations
-            if loc["uri"] == consumer.as_uri()
+            loc["range"]["start"]["line"] for loc in locations if loc["uri"] == consumer.as_uri()
         )
         assert lines_in_consumer == [2, 3]
     finally:
@@ -1318,18 +1342,20 @@ def test_workspace_session_find_document_highlights_returns_dataclasses(
     )
 
     with WorkspaceSession(root) as session:
-        highlights = session.find_document_highlights(target, "foo")
+        symbol_id = session.symbol_at(target, SourcePosition(0, len("def ") + 1))
+        assert symbol_id is not None
+        highlights = session.find_document_highlights(target, symbol_id)
         kinds = sorted(h.kind for h in highlights)
         # Exactly one declaration ("write") and one call site ("text").
         assert kinds == ["text", "write"]
         decl = next(h for h in highlights if h.kind == "write")
-        assert decl.lineno == 1
-        assert decl.col_offset == len("def ")
-        assert decl.end_col_offset == len("def ") + len("foo")
+        assert decl.range.start.line + 1 == 1
+        assert decl.range.start.character == len("def ")
+        assert decl.range.end.character == len("def ") + len("foo")
         call = next(h for h in highlights if h.kind == "text")
-        assert call.lineno == 4
-        assert call.col_offset == 0
-        assert call.end_col_offset == len("foo")
+        assert call.range.start.line + 1 == 4
+        assert call.range.start.character == 0
+        assert call.range.end.character == len("foo")
 
 
 def test_workspace_session_find_document_highlights_non_workspace_target(
@@ -1341,8 +1367,7 @@ def test_workspace_session_find_document_highlights_non_workspace_target(
     _write(consumer, "from json import JSONDecoder\n\nJSONDecoder()\n")
 
     with WorkspaceSession(root) as session:
-        highlights = session.find_document_highlights(consumer, "JSONDecoder")
-        assert highlights == ()
+        assert session.symbol_at(consumer, SourcePosition(2, 1)) is None
 
 
 def test_language_server_advertises_linked_editing_range_provider(
@@ -1388,7 +1413,7 @@ def test_language_server_linked_editing_range_returns_in_file_ranges(
             },
         )
 
-        assert result["wordPattern"] == r"[A-Za-z_][A-Za-z0-9_]*"
+        assert "wordPattern" not in result
         ranges = result["ranges"]
         # All three in-file occurrences (declaration name, call, bare ref).
         by_line = {r["start"]["line"]: r for r in ranges}
@@ -1402,11 +1427,7 @@ def test_language_server_linked_editing_range_returns_in_file_ranges(
         for editing_range in ranges:
             text_line = source_lines[editing_range["start"]["line"]]
             assert (
-                text_line[
-                    editing_range["start"]["character"] : editing_range["end"][
-                        "character"
-                    ]
-                ]
+                text_line[editing_range["start"]["character"] : editing_range["end"]["character"]]
                 == "foo"
             )
     finally:
@@ -1533,11 +1554,13 @@ def test_workspace_session_linked_editing_ranges_at_returns_dataclasses(
     _write(target, "def foo() -> int:\n    return 1\n\nfoo()\n")
 
     with WorkspaceSession(root) as session:
-        ranges = session.linked_editing_ranges_at(target, "foo")
-        assert {r.lineno for r in ranges} == {1, 4}
-        decl = next(r for r in ranges if r.lineno == 1)
-        assert decl.col_offset == len("def ")
-        assert decl.end_col_offset == len("def ") + len("foo")
+        symbol_id = session.symbol_at(target, SourcePosition(0, len("def ") + 1))
+        assert symbol_id is not None
+        ranges = session.linked_editing_ranges_at(target, symbol_id)
+        assert {r.range.start.line + 1 for r in ranges} == {1, 4}
+        decl = next(r for r in ranges if r.range.start.line + 1 == 1)
+        assert decl.range.start.character == len("def ")
+        assert decl.range.end.character == len("def ") + len("foo")
 
 
 def test_workspace_session_linked_editing_ranges_at_non_workspace_target(
@@ -1549,7 +1572,7 @@ def test_workspace_session_linked_editing_ranges_at_non_workspace_target(
     _write(consumer, "from json import JSONDecoder\n\nJSONDecoder()\n")
 
     with WorkspaceSession(root) as session:
-        assert session.linked_editing_ranges_at(consumer, "JSONDecoder") == ()
+        assert session.symbol_at(consumer, SourcePosition(2, 1)) is None
 
 
 def test_type_checking_imports_visible_and_lsp_hover_works(tmp_path: Path) -> None:
@@ -1747,9 +1770,7 @@ def test_watcher_callback_error_is_contained(
         assert errors and isinstance(errors[0], RuntimeError)
 
 
-def test_watcher_double_start_raises(
-    tmp_path: Path, watcher_factory: _WatcherFactory
-) -> None:
+def test_watcher_double_start_raises(tmp_path: Path, watcher_factory: _WatcherFactory) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "a.py", "x = 1\n")
@@ -1764,9 +1785,7 @@ def test_watcher_double_start_raises(
             watcher.stop()
 
 
-def test_watcher_double_stop_is_noop(
-    tmp_path: Path, watcher_factory: _WatcherFactory
-) -> None:
+def test_watcher_double_stop_is_noop(tmp_path: Path, watcher_factory: _WatcherFactory) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "a.py", "x = 1\n")
@@ -1780,9 +1799,7 @@ def test_watcher_double_stop_is_noop(
         assert watcher.is_running is False
 
 
-def test_watcher_poll_after_start_raises(
-    tmp_path: Path, watcher_factory: _WatcherFactory
-) -> None:
+def test_watcher_poll_after_start_raises(tmp_path: Path, watcher_factory: _WatcherFactory) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "a.py", "x = 1\n")
@@ -1932,17 +1949,20 @@ def _apply_rename_edits(edits: tuple[RenameEdit, ...]) -> None:
     for path, file_edits in by_path.items():
         text = Path(path).read_text(encoding="utf-8")
         lines = text.splitlines(keepends=True)
-        ordered = sorted(file_edits, key=lambda e: (-e.lineno, -e.col_offset))
+        ordered = sorted(
+            file_edits,
+            key=lambda edit: (-edit.range.start.line, -edit.range.start.character),
+        )
         for edit in ordered:
-            line = lines[edit.lineno - 1]
+            line = lines[edit.range.start.line]
             newline = "\n" if line.endswith("\n") else ""
             content = line[:-1] if newline else line
             patched = (
-                content[: edit.col_offset]
+                content[: edit.range.start.character]
                 + edit.new_text
-                + content[edit.end_col_offset :]
+                + content[edit.range.end.character :]
             )
-            lines[edit.lineno - 1] = patched + newline
+            lines[edit.range.start.line] = patched + newline
         Path(path).write_text("".join(lines), encoding="utf-8")
 
 
@@ -1956,12 +1976,18 @@ def test_rename_symbol_function_updates_def_call_and_import_sites(
     _write(root / "c.py", "from a import foo as aliased\n\naliased()\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(root / "b.py", "foo", "bar")
+        result = session.rename_symbol(_symbol_for_name(session, root / "b.py", "foo"), "bar")
         assert result.status == "ok"
+        assert isinstance(result.target, SymbolId)
         edits_by_file: dict[str, list[tuple[int, int, int, str]]] = {}
         for edit in result.edits:
             edits_by_file.setdefault(Path(edit.path).name, []).append(
-                (edit.lineno, edit.col_offset, edit.end_col_offset, edit.new_text)
+                (
+                    edit.range.start.line + 1,
+                    edit.range.start.character,
+                    edit.range.end.character,
+                    edit.new_text,
+                )
             )
         assert edits_by_file["a.py"] == [(1, 4, 7, "bar")]
         assert edits_by_file["b.py"] == [
@@ -1976,9 +2002,7 @@ def test_rename_symbol_function_updates_def_call_and_import_sites(
 
     assert (root / "a.py").read_text() == "def bar() -> int:\n    return 1\n"
     assert (root / "b.py").read_text() == "from a import bar\n\nbar()\nbar()\n"
-    assert (
-        root / "c.py"
-    ).read_text() == "from a import bar as aliased\n\naliased()\n"
+    assert (root / "c.py").read_text() == "from a import bar as aliased\n\naliased()\n"
 
 
 def test_rename_symbol_class_locates_def_offset_in_decorated_line(
@@ -1990,10 +2014,15 @@ def test_rename_symbol_class_locates_def_offset_in_decorated_line(
     _write(root / "y.py", "from x import Widget\n\nWidget()\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(root / "x.py", "Widget", "Gadget")
+        result = session.rename_symbol(_symbol_for_name(session, root / "x.py", "Widget"), "Gadget")
         assert result.status == "ok"
         per_file = sorted(
-            (Path(e.path).name, e.lineno, e.col_offset, e.end_col_offset)
+            (
+                Path(e.path).name,
+                e.range.start.line + 1,
+                e.range.start.character,
+                e.range.end.character,
+            )
             for e in result.edits
         )
         assert per_file == [
@@ -2004,9 +2033,7 @@ def test_rename_symbol_class_locates_def_offset_in_decorated_line(
         _apply_rename_edits(result.edits)
 
     assert (root / "x.py").read_text() == "class Gadget:\n    pass\n"
-    assert (
-        root / "y.py"
-    ).read_text() == "from x import Gadget\n\nGadget()\n"
+    assert (root / "y.py").read_text() == "from x import Gadget\n\nGadget()\n"
 
 
 def test_rename_symbol_rejects_invalid_identifier(tmp_path: Path) -> None:
@@ -2015,7 +2042,7 @@ def test_rename_symbol_rejects_invalid_identifier(tmp_path: Path) -> None:
     _write(root / "a.py", "def foo() -> int:\n    return 1\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(root / "a.py", "foo", "1bad")
+        result = session.rename_symbol(_symbol_for_name(session, root / "a.py", "foo"), "1bad")
         assert result.status == "invalid_identifier"
         assert result.edits == ()
 
@@ -2026,7 +2053,7 @@ def test_rename_symbol_rejects_python_keyword(tmp_path: Path) -> None:
     _write(root / "a.py", "def foo() -> int:\n    return 1\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(root / "a.py", "foo", "class")
+        result = session.rename_symbol(_symbol_for_name(session, root / "a.py", "foo"), "class")
         assert result.status == "keyword_identifier"
         assert result.edits == ()
 
@@ -2037,12 +2064,12 @@ def test_rename_symbol_same_name_is_noop(tmp_path: Path) -> None:
     _write(root / "a.py", "def foo() -> int:\n    return 1\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(root / "a.py", "foo", "foo")
+        result = session.rename_symbol(_symbol_for_name(session, root / "a.py", "foo"), "foo")
         assert result.status == "same_name"
         assert result.edits == ()
 
 
-def test_rename_symbol_refuses_non_workspace_target(tmp_path: Path) -> None:
+def test_symbol_at_rejects_non_workspace_target(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     _write(
@@ -2051,23 +2078,20 @@ def test_rename_symbol_refuses_non_workspace_target(tmp_path: Path) -> None:
     )
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(
-            root / "consumer.py", "JSONDecoder", "MyDecoder"
-        )
-        assert result.status == "non_workspace_target"
-        assert result.edits == ()
+        assert session.symbol_at(root / "consumer.py", SourcePosition(2, 1)) is None
 
 
-def test_rename_symbol_refuses_alias_rename(tmp_path: Path) -> None:
+def test_local_alias_binding_preserves_lexical_symbol_id(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "a.py", "def foo() -> int:\n    return 1\n")
     _write(root / "c.py", "from a import foo as aliased\n\naliased()\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(root / "c.py", "aliased", "quux")
-        assert result.status == "alias_rename_unsupported"
-        assert result.edits == ()
+        target = session._local_symbol_at(root / "c.py", SourcePosition(2, 1))
+        assert target is not None
+        assert target.name == "aliased"
+        assert target.path == str(root / "c.py")
 
 
 def test_rename_symbol_rewrites_sibling_relative_import(tmp_path: Path) -> None:
@@ -2078,10 +2102,10 @@ def test_rename_symbol_rewrites_sibling_relative_import(tmp_path: Path) -> None:
     _write(pkg / "sub.py", "from .helper import foo\n\nfoo()\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(pkg / "helper.py", "foo", "bar")
+        result = session.rename_symbol(_symbol_for_name(session, pkg / "helper.py", "foo"), "bar")
         assert result.status == "ok"
         sub_edits = sorted(
-            (edit.lineno, edit.col_offset, edit.end_col_offset)
+            (edit.range.start.line + 1, edit.range.start.character, edit.range.end.character)
             for edit in result.edits
             if Path(edit.path).name == "sub.py"
         )
@@ -2103,7 +2127,7 @@ def test_rename_symbol_rewrites_dotted_relative_import(tmp_path: Path) -> None:
     _write(pkg / "outer.py", "from .sub.helper import foo\n\nfoo()\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(sub / "helper.py", "foo", "bar")
+        result = session.rename_symbol(_symbol_for_name(session, sub / "helper.py", "foo"), "bar")
         assert result.status == "ok"
         rewritten = sorted(Path(e.path).name for e in result.edits)
         assert "user.py" in rewritten
@@ -2124,7 +2148,7 @@ def test_rename_symbol_rewrites_parent_package_relative_import(tmp_path: Path) -
     _write(sub / "user.py", "from ..helper import foo\n\nfoo()\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(pkg / "helper.py", "foo", "bar")
+        result = session.rename_symbol(_symbol_for_name(session, pkg / "helper.py", "foo"), "bar")
         assert result.status == "ok"
         _apply_rename_edits(result.edits)
 
@@ -2136,24 +2160,20 @@ def test_rename_symbol_relative_import_preserves_as_alias(tmp_path: Path) -> Non
     pkg = root / "pkg"
     _write(pkg / "__init__.py", "")
     _write(pkg / "helper.py", "def foo() -> int:\n    return 1\n")
-    _write(
-        pkg / "sub.py", "from .helper import foo as aliased\n\naliased()\n"
-    )
+    _write(pkg / "sub.py", "from .helper import foo as aliased\n\naliased()\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(pkg / "helper.py", "foo", "bar")
+        result = session.rename_symbol(_symbol_for_name(session, pkg / "helper.py", "foo"), "bar")
         assert result.status == "ok"
         sub_edits = [e for e in result.edits if Path(e.path).name == "sub.py"]
         # Exactly one edit on sub.py — the import-site `foo`. The `as aliased`
         # clause is preserved and `aliased()` is not a reference to `foo`.
         assert len(sub_edits) == 1
-        assert sub_edits[0].col_offset == 20
-        assert sub_edits[0].end_col_offset == 23
+        assert sub_edits[0].range.start.character == 20
+        assert sub_edits[0].range.end.character == 23
         _apply_rename_edits(result.edits)
 
-    assert (
-        pkg / "sub.py"
-    ).read_text() == "from .helper import bar as aliased\n\naliased()\n"
+    assert (pkg / "sub.py").read_text() == "from .helper import bar as aliased\n\naliased()\n"
 
 
 def test_rename_symbol_rewrites_attribute_access_through_module_import(
@@ -2170,10 +2190,16 @@ def test_rename_symbol_rewrites_attribute_access_through_module_import(
     _write(root / "c.py", "import a as alias\n\nalias.foo()\n")
 
     with WorkspaceSession(root) as session:
-        result = session.rename_symbol(root / "a.py", "foo", "bar")
+        result = session.rename_symbol(_symbol_for_name(session, root / "a.py", "foo"), "bar")
         assert result.status == "ok"
         per_file = sorted(
-            (Path(e.path).name, e.lineno, e.col_offset, e.end_col_offset, e.new_text)
+            (
+                Path(e.path).name,
+                e.range.start.line + 1,
+                e.range.start.character,
+                e.range.end.character,
+                e.new_text,
+            )
             for e in result.edits
         )
         assert per_file == [
@@ -2196,15 +2222,11 @@ def test_rename_symbol_with_overlay_uses_overlay_text(tmp_path: Path) -> None:
 
     with WorkspaceSession(root) as session:
         # An overlay adds another call site on b.py that isn't on disk yet.
-        session.set_overlay(
-            root / "b.py", "from a import foo\n\nfoo()\nfoo()\n"
-        )
-        result = session.rename_symbol(root / "b.py", "foo", "bar")
+        session.set_overlay(root / "b.py", "from a import foo\n\nfoo()\nfoo()\n")
+        result = session.rename_symbol(_symbol_for_name(session, root / "b.py", "foo"), "bar")
         assert result.status == "ok"
         b_edits = sorted(
-            edit.lineno
-            for edit in result.edits
-            if Path(edit.path).name == "b.py"
+            edit.range.start.line + 1 for edit in result.edits if Path(edit.path).name == "b.py"
         )
         assert b_edits == [1, 3, 4]
 
@@ -2467,10 +2489,7 @@ def test_signature_help_at_local_function_active_first_param(tmp_path: Path) -> 
     target = root / "mod.py"
     _write(
         target,
-        "def helper(x: int, y: int) -> int:\n"
-        "    return x + y\n"
-        "\n"
-        "helper()\n",
+        "def helper(x: int, y: int) -> int:\n    return x + y\n\nhelper()\n",
     )
     with WorkspaceSession(root) as session:
         signature_help = session.signature_help_at(target, line=3, character=7)
@@ -2478,8 +2497,7 @@ def test_signature_help_at_local_function_active_first_param(tmp_path: Path) -> 
         assert signature_help.label == "def helper(x: int, y: int) -> int"
         assert signature_help.active_parameter == 0
         assert tuple(
-            (p.label, p.label_offset_start, p.label_offset_end)
-            for p in signature_help.parameters
+            (p.label, p.label_offset_start, p.label_offset_end) for p in signature_help.parameters
         ) == (
             ("x: int", 11, 17),
             ("y: int", 19, 25),
@@ -2494,10 +2512,7 @@ def test_signature_help_at_advances_active_parameter_after_comma(
     target = root / "mod.py"
     _write(
         target,
-        "def helper(a: int, b: int, c: int) -> int:\n"
-        "    return a + b + c\n"
-        "\n"
-        "helper(1, 2, 3)\n",
+        "def helper(a: int, b: int, c: int) -> int:\n    return a + b + c\n\nhelper(1, 2, 3)\n",
     )
     with WorkspaceSession(root) as session:
         # Just inside `(`: arg 0.
@@ -2526,10 +2541,7 @@ def test_signature_help_at_skips_call_in_string_literal(tmp_path: Path) -> None:
     target = root / "mod.py"
     _write(
         target,
-        "def helper(x: int) -> int:\n"
-        "    return x\n"
-        "\n"
-        "value = \"foo(\" + str(\n",
+        'def helper(x: int) -> int:\n    return x\n\nvalue = "foo(" + str(\n',
     )
     with WorkspaceSession(root) as session:
         signature_help = session.signature_help_at(target, line=3, character=21)
@@ -2634,12 +2646,7 @@ def test_signature_help_at_overlay_sees_edit(tmp_path: Path) -> None:
     target = root / "mod.py"
     _write(target, "def helper(x: int) -> int:\n    return x\n\nhelper(1)\n")
     with WorkspaceSession(root) as session:
-        overlay_text = (
-            "def helper(a: int, b: int) -> int:\n"
-            "    return a + b\n"
-            "\n"
-            "helper(1, 2)\n"
-        )
+        overlay_text = "def helper(a: int, b: int) -> int:\n    return a + b\n\nhelper(1, 2)\n"
         session.set_overlay(target, overlay_text)
         signature_help = session.signature_help_at(target, line=3, character=11)
     assert signature_help is not None
@@ -2670,10 +2677,7 @@ def test_language_server_signature_help_returns_lsp_payload(tmp_path: Path) -> N
     target = root / "mod.py"
     _write(
         target,
-        "def helper(x: int, y: int) -> int:\n"
-        "    return x + y\n"
-        "\n"
-        "helper(1, )\n",
+        "def helper(x: int, y: int) -> int:\n    return x + y\n\nhelper(1, )\n",
     )
     server = LanguageServer(default_root=str(root))
     try:
@@ -2745,10 +2749,11 @@ def test_folding_ranges_cover_function_class_and_method_bodies(
     )
     with WorkspaceSession(root) as session:
         ranges = session.folding_ranges_for_file(target)
-    assert FoldingRange(start_line=1, end_line=4, kind="region") in ranges
-    assert FoldingRange(start_line=6, end_line=11, kind="region") in ranges
-    assert FoldingRange(start_line=7, end_line=8, kind="region") in ranges
-    assert FoldingRange(start_line=10, end_line=11, kind="region") in ranges
+    signatures = _fold_signatures(ranges)
+    assert (1, 4, "region") in signatures
+    assert (6, 11, "region") in signatures
+    assert (7, 8, "region") in signatures
+    assert (10, 11, "region") in signatures
 
 
 def test_folding_ranges_decorated_function_starts_at_first_decorator(
@@ -2759,14 +2764,11 @@ def test_folding_ranges_decorated_function_starts_at_first_decorator(
     target = root / "mod.py"
     _write(
         target,
-        "@first\n"
-        "@second\n"
-        "def decorated(x: int) -> int:\n"
-        "    return x\n",
+        "@first\n@second\ndef decorated(x: int) -> int:\n    return x\n",
     )
     with WorkspaceSession(root) as session:
         ranges = session.folding_ranges_for_file(target)
-    assert ranges == (FoldingRange(start_line=1, end_line=4, kind="region"),)
+    assert _fold_signatures(ranges) == {(1, 4, "region")}
 
 
 def test_folding_ranges_group_consecutive_top_level_imports(
@@ -2777,17 +2779,13 @@ def test_folding_ranges_group_consecutive_top_level_imports(
     target = root / "mod.py"
     _write(
         target,
-        "import a\n"
-        "import b\n"
-        "from c import d\n"
-        "\n"
-        "def main() -> int:\n"
-        "    return 0\n",
+        "import a\nimport b\nfrom c import d\n\ndef main() -> int:\n    return 0\n",
     )
     with WorkspaceSession(root) as session:
         ranges = session.folding_ranges_for_file(target)
-    assert FoldingRange(start_line=1, end_line=3, kind="imports") in ranges
-    assert FoldingRange(start_line=5, end_line=6, kind="region") in ranges
+    signatures = _fold_signatures(ranges)
+    assert (1, 3, "imports") in signatures
+    assert (5, 6, "region") in signatures
 
 
 def test_folding_ranges_collapse_multi_line_from_import(tmp_path: Path) -> None:
@@ -2796,14 +2794,11 @@ def test_folding_ranges_collapse_multi_line_from_import(tmp_path: Path) -> None:
     target = root / "mod.py"
     _write(
         target,
-        "from c import (\n"
-        "    d,\n"
-        "    e,\n"
-        ")\n",
+        "from c import (\n    d,\n    e,\n)\n",
     )
     with WorkspaceSession(root) as session:
         ranges = session.folding_ranges_for_file(target)
-    assert ranges == (FoldingRange(start_line=1, end_line=4, kind="imports"),)
+    assert _fold_signatures(ranges) == {(1, 4, "imports")}
 
 
 def test_folding_ranges_skip_single_line_definitions(tmp_path: Path) -> None:
@@ -2833,17 +2828,14 @@ def test_folding_ranges_overlay_sees_edit(tmp_path: Path) -> None:
     _write(target, "def foo() -> int:\n    return 1\n")
     with WorkspaceSession(root) as session:
         before = session.folding_ranges_for_file(target)
-        assert FoldingRange(start_line=1, end_line=2, kind="region") in before
+        assert (1, 2, "region") in _fold_signatures(before)
 
         session.set_overlay(
             target,
-            "def foo() -> int:\n"
-            "    if True:\n"
-            "        return 1\n"
-            "    return 2\n",
+            "def foo() -> int:\n    if True:\n        return 1\n    return 2\n",
         )
         after = session.folding_ranges_for_file(target)
-    assert FoldingRange(start_line=1, end_line=4, kind="region") in after
+    assert (1, 4, "region") in _fold_signatures(after)
 
 
 def test_folding_ranges_for_missing_file_raises_filenotfound(
@@ -2898,10 +2890,31 @@ def test_language_server_folding_range_returns_lsp_payload(tmp_path: Path) -> No
         if server._session is not None:
             server._session.close()
 
-    assert {"startLine": 0, "endLine": 1, "kind": "imports"} in result
-    assert {"startLine": 3, "endLine": 4} in result
-    assert {"startLine": 6, "endLine": 8} in result
-    assert {"startLine": 7, "endLine": 8} in result
+    assert {
+        "startLine": 0,
+        "startCharacter": 0,
+        "endLine": 1,
+        "endCharacter": len("import b"),
+        "kind": "imports",
+    } in result
+    assert {
+        "startLine": 3,
+        "startCharacter": 0,
+        "endLine": 4,
+        "endCharacter": len("    return 1"),
+    } in result
+    assert {
+        "startLine": 6,
+        "startCharacter": 0,
+        "endLine": 8,
+        "endCharacter": len("        return 2"),
+    } in result
+    assert {
+        "startLine": 7,
+        "startCharacter": len("    "),
+        "endLine": 8,
+        "endCharacter": len("        return 2"),
+    } in result
     for entry in result:
         assert "kind" not in entry or entry["kind"] in ("imports", "comment", "region")
 
@@ -2932,8 +2945,7 @@ def test_selection_ranges_chain_innermost_to_outermost(tmp_path: Path) -> None:
     target = root / "mod.py"
     _write(
         target,
-        "def foo(x: int) -> int:\n"
-        "    return x + 1\n",
+        "def foo(x: int) -> int:\n    return x + 1\n",
     )
     with WorkspaceSession(root) as session:
         # cursor on the `x` in `return x + 1` (line 1, character 11)
@@ -2941,29 +2953,32 @@ def test_selection_ranges_chain_innermost_to_outermost(tmp_path: Path) -> None:
 
     assert len(chain) >= 3
     # Innermost is the bare Name `x`.
-    assert chain[0] == SelectionRange(
-        start_line=1, start_character=11, end_line=1, end_character=12
-    )
+    assert chain[0] == SelectionRange(range=_range(1, 11, 1, 12))
     # Each subsequent range strictly contains its predecessor.
     for inner, outer in zip(chain, chain[1:], strict=False):
-        assert (outer.start_line, outer.start_character) <= (
-            inner.start_line,
-            inner.start_character,
+        assert (outer.range.start.line, outer.range.start.character) <= (
+            inner.range.start.line,
+            inner.range.start.character,
         )
-        assert (outer.end_line, outer.end_character) >= (
-            inner.end_line,
-            inner.end_character,
+        assert (outer.range.end.line, outer.range.end.character) >= (
+            inner.range.end.line,
+            inner.range.end.character,
         )
-        assert (outer.start_line, outer.start_character, outer.end_line, outer.end_character) != (
-            inner.start_line,
-            inner.start_character,
-            inner.end_line,
-            inner.end_character,
+        assert (
+            outer.range.start.line,
+            outer.range.start.character,
+            outer.range.end.line,
+            outer.range.end.character,
+        ) != (
+            inner.range.start.line,
+            inner.range.start.character,
+            inner.range.end.line,
+            inner.range.end.character,
         )
     # Outermost reaches the function definition (line 0..1).
     outermost = chain[-1]
-    assert outermost.start_line == 0
-    assert outermost.end_line == 1
+    assert outermost.range.start.line == 0
+    assert outermost.range.end.line == 1
 
 
 def test_selection_ranges_for_attribute_access_picks_up_each_subexpression(
@@ -2977,7 +2992,7 @@ def test_selection_ranges_for_attribute_access_picks_up_each_subexpression(
         # cursor on the `c` in `a.b.c` (line 0, character 9)
         chain = session.selection_ranges_at(target, 0, 8)
 
-    starts_and_ends = [(r.start_character, r.end_character) for r in chain]
+    starts_and_ends = [(r.range.start.character, r.range.end.character) for r in chain]
     # Expect at least: `c` (8,9), `a.b.c` (4,9), full assignment (0,9).
     assert (0, 9) in starts_and_ends
     assert (4, 9) in starts_and_ends
@@ -3013,11 +3028,11 @@ def test_selection_ranges_overlay_sees_edit(tmp_path: Path) -> None:
     _write(target, "x = 1\n")
     with WorkspaceSession(root) as session:
         before = session.selection_ranges_at(target, 0, 4)
-        assert any(r.end_character == 5 for r in before)
+        assert any(r.range.end.character == 5 for r in before)
 
         session.set_overlay(target, "x = 1 + 2 + 3\n")
         after = session.selection_ranges_at(target, 0, 4)
-    assert any(r.end_character == 13 for r in after)
+    assert any(r.range.end.character == 13 for r in after)
 
 
 def test_selection_ranges_for_missing_file_raises_filenotfound(
@@ -3051,8 +3066,7 @@ def test_language_server_selection_range_returns_lsp_payload(tmp_path: Path) -> 
     target = root / "mod.py"
     _write(
         target,
-        "def foo(x: int) -> int:\n"
-        "    return x + 1\n",
+        "def foo(x: int) -> int:\n    return x + 1\n",
     )
     server = LanguageServer(default_root=str(root))
     try:
@@ -3173,10 +3187,12 @@ def test_document_links_for_plain_import_targets_module_file(tmp_path: Path) -> 
 
     assert links == (
         DocumentLink(
-            start_line=0,
-            start_character=len("import "),
-            end_line=0,
-            end_character=len("import ") + len("helper"),
+            range=_range(
+                0,
+                len("import "),
+                0,
+                len("import ") + len("helper"),
+            ),
             target_path=str(root / "helper.py"),
         ),
     )
@@ -3196,9 +3212,9 @@ def test_document_links_for_import_as_covers_alias_span(tmp_path: Path) -> None:
     # LSP clients underline.
     assert len(links) == 1
     link = links[0]
-    assert link.start_line == 0
-    assert link.start_character == len("import ")
-    assert link.end_character == len("import helper as h")
+    assert link.range.start.line == 0
+    assert link.range.start.character == len("import ")
+    assert link.range.end.character == len("import helper as h")
     assert link.target_path == str(root / "helper.py")
 
 
@@ -3213,13 +3229,13 @@ def test_document_links_for_from_import_link_each_alias(tmp_path: Path) -> None:
         links = session.document_links_for_file(consumer)
 
     assert len(links) == 2
-    by_char = sorted(links, key=lambda link: link.start_character)
+    by_char = sorted(links, key=lambda link: link.range.start.character)
     alpha, beta = by_char
-    assert alpha.start_character == len("from helper import ")
-    assert alpha.end_character == len("from helper import ALPHA")
+    assert alpha.range.start.character == len("from helper import ")
+    assert alpha.range.end.character == len("from helper import ALPHA")
     assert alpha.target_path == str(root / "helper.py")
-    assert beta.start_character == len("from helper import ALPHA, ")
-    assert beta.end_character == len("from helper import ALPHA, BETA")
+    assert beta.range.start.character == len("from helper import ALPHA, ")
+    assert beta.range.end.character == len("from helper import ALPHA, BETA")
     assert beta.target_path == str(root / "helper.py")
 
 
@@ -3242,10 +3258,12 @@ def test_document_links_for_from_import_submodule_targets_submodule(
     # `pkg/__init__.py`, so clicking the alias jumps directly to child.py.
     assert links == (
         DocumentLink(
-            start_line=0,
-            start_character=len("from pkg import "),
-            end_line=0,
-            end_character=len("from pkg import child"),
+            range=_range(
+                0,
+                len("from pkg import "),
+                0,
+                len("from pkg import child"),
+            ),
             target_path=str(pkg / "child.py"),
         ),
     )
@@ -3290,12 +3308,12 @@ def test_document_links_for_multiline_from_import(tmp_path: Path) -> None:
         links = session.document_links_for_file(consumer)
 
     assert len(links) == 2
-    by_line = {link.start_line: link for link in links}
+    by_line = {link.range.start.line: link for link in links}
     assert set(by_line) == {1, 2}
-    assert by_line[1].start_character == 4
-    assert by_line[1].end_character == 5
-    assert by_line[2].start_character == 4
-    assert by_line[2].end_character == 5
+    assert by_line[1].range.start.character == 4
+    assert by_line[1].range.end.character == 5
+    assert by_line[2].range.start.character == 4
+    assert by_line[2].range.end.character == 5
     for link in links:
         assert link.target_path == str(root / "helper.py")
 
@@ -3428,10 +3446,7 @@ def test_code_lenses_for_function_with_zero_workspace_references(
 
     assert lenses == (
         CodeLens(
-            start_line=0,
-            start_character=len("def "),
-            end_line=0,
-            end_character=len("def lonely"),
+            range=_range(0, len("def "), 0, len("def lonely")),
             title="0 references",
         ),
     )
@@ -3449,9 +3464,9 @@ def test_code_lenses_count_workspace_references_singular(tmp_path: Path) -> None
 
     assert len(lenses) == 1
     assert lenses[0].title == "1 reference"
-    assert lenses[0].start_line == 0
-    assert lenses[0].start_character == len("def ")
-    assert lenses[0].end_character == len("def greet")
+    assert lenses[0].range.start.line == 0
+    assert lenses[0].range.start.character == len("def ")
+    assert lenses[0].range.end.character == len("def greet")
 
 
 def test_code_lenses_count_multiple_workspace_references(tmp_path: Path) -> None:
@@ -3500,7 +3515,7 @@ def test_code_lenses_emit_one_lens_per_top_level_def_and_class(
     with WorkspaceSession(root) as session:
         lenses = session.code_lenses_for_file(target)
 
-    titles = {(lens.start_line, lens.title) for lens in lenses}
+    titles = {(lens.range.start.line, lens.title) for lens in lenses}
     # f at line 0, g at line 3, C at line 6 — no lens for method m or class
     # variable X (kind="method" / "class_variable" are excluded).
     assert titles == {(0, "0 references"), (3, "0 references"), (6, "0 references")}
@@ -3512,20 +3527,15 @@ def test_code_lenses_skip_methods_and_nested_classes(tmp_path: Path) -> None:
     target = root / "mod.py"
     _write(
         target,
-        "class Outer:\n"
-        "    class Inner:\n"
-        "        pass\n"
-        "\n"
-        "    def m(self) -> None:\n"
-        "        pass\n",
+        "class Outer:\n    class Inner:\n        pass\n\n    def m(self) -> None:\n        pass\n",
     )
 
     with WorkspaceSession(root) as session:
         lenses = session.code_lenses_for_file(target)
 
     assert len(lenses) == 1
-    assert lenses[0].start_line == 0
-    assert lenses[0].end_character == len("class Outer")
+    assert lenses[0].range.start.line == 0
+    assert lenses[0].range.end.character == len("class Outer")
 
 
 def test_code_lenses_for_decorated_function_use_def_header_line(
@@ -3536,10 +3546,7 @@ def test_code_lenses_for_decorated_function_use_def_header_line(
     target = root / "mod.py"
     _write(
         target,
-        "import functools\n\n"
-        "@functools.cache\n"
-        "def cached() -> int:\n"
-        "    return 1\n",
+        "import functools\n\n@functools.cache\ndef cached() -> int:\n    return 1\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -3549,9 +3556,9 @@ def test_code_lenses_for_decorated_function_use_def_header_line(
     # The lens covers the bare identifier on the `def` line, not the
     # decorator line — the decorator's `@functools.cache` lineno would
     # collide with `functools` identifier resolution.
-    assert lenses[0].start_line == 3
-    assert lenses[0].start_character == len("def ")
-    assert lenses[0].end_character == len("def cached")
+    assert lenses[0].range.start.line == 3
+    assert lenses[0].range.start.character == len("def ")
+    assert lenses[0].range.end.character == len("def cached")
 
 
 def test_code_lenses_for_invalid_syntax_returns_empty(tmp_path: Path) -> None:
@@ -3575,16 +3582,15 @@ def test_code_lenses_overlay_sees_edit(tmp_path: Path) -> None:
     with WorkspaceSession(root) as session:
         before = session.code_lenses_for_file(target)
         assert len(before) == 1
-        assert before[0].end_character == len("def first")
+        assert before[0].range.end.character == len("def first")
 
         session.set_overlay(
             str(target),
-            "def first() -> int:\n    return 1\n\n"
-            "def second() -> int:\n    return 2\n",
+            "def first() -> int:\n    return 1\n\ndef second() -> int:\n    return 2\n",
         )
         after = session.code_lenses_for_file(target)
         assert len(after) == 2
-        assert {lens.start_line for lens in after} == {0, 3}
+        assert {lens.range.start.line for lens in after} == {0, 3}
 
 
 def test_code_lenses_for_missing_file_raises_filenotfound(
@@ -3671,10 +3677,7 @@ def test_inlay_hints_for_local_call_emits_parameter_names(tmp_path: Path) -> Non
     target = root / "mod.py"
     _write(
         target,
-        "def greet(first: str, second: int) -> None:\n"
-        "    pass\n"
-        "\n"
-        "greet('hi', 7)\n",
+        "def greet(first: str, second: int) -> None:\n    pass\n\ngreet('hi', 7)\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -3683,16 +3686,14 @@ def test_inlay_hints_for_local_call_emits_parameter_names(tmp_path: Path) -> Non
     # Line 3 (0-based): `greet('hi', 7)` — args at columns 6 and 12.
     assert hints == (
         InlayHint(
-            line=3,
-            character=6,
+            position=SourcePosition(3, 6),
             label="first:",
             kind="parameter",
             padding_left=False,
             padding_right=True,
         ),
         InlayHint(
-            line=3,
-            character=12,
+            position=SourcePosition(3, 12),
             label="second:",
             kind="parameter",
             padding_left=False,
@@ -3709,11 +3710,7 @@ def test_inlay_hints_suppress_redundant_when_arg_name_matches_param(
     target = root / "mod.py"
     _write(
         target,
-        "def f(name: str, count: int) -> None:\n"
-        "    pass\n"
-        "\n"
-        "name = 'x'\n"
-        "f(name, 3)\n",
+        "def f(name: str, count: int) -> None:\n    pass\n\nname = 'x'\nf(name, 3)\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -3722,8 +3719,7 @@ def test_inlay_hints_suppress_redundant_when_arg_name_matches_param(
     # The first arg `name` matches the parameter name — suppressed.
     assert hints == (
         InlayHint(
-            line=4,
-            character=8,
+            position=SourcePosition(4, 8),
             label="count:",
             kind="parameter",
             padding_left=False,
@@ -3738,10 +3734,7 @@ def test_inlay_hints_skip_keyword_arguments(tmp_path: Path) -> None:
     target = root / "mod.py"
     _write(
         target,
-        "def f(first: str, second: int) -> None:\n"
-        "    pass\n"
-        "\n"
-        "f('hi', second=2)\n",
+        "def f(first: str, second: int) -> None:\n    pass\n\nf('hi', second=2)\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -3812,11 +3805,7 @@ def test_inlay_hints_stop_at_starred_call_arg(tmp_path: Path) -> None:
     target = root / "mod.py"
     _write(
         target,
-        "def f(a: int, b: int, c: int) -> None:\n"
-        "    pass\n"
-        "\n"
-        "items = (1, 2)\n"
-        "f(0, *items)\n",
+        "def f(a: int, b: int, c: int) -> None:\n    pass\n\nitems = (1, 2)\nf(0, *items)\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -3833,10 +3822,7 @@ def test_inlay_hints_stop_at_varargs_parameter(tmp_path: Path) -> None:
     target = root / "mod.py"
     _write(
         target,
-        "def f(first: int, *rest: int) -> None:\n"
-        "    pass\n"
-        "\n"
-        "f(1, 2, 3, 4)\n",
+        "def f(first: int, *rest: int) -> None:\n    pass\n\nf(1, 2, 3, 4)\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -3852,12 +3838,7 @@ def test_inlay_hints_skip_method_attribute_call(tmp_path: Path) -> None:
     target = root / "mod.py"
     _write(
         target,
-        "class C:\n"
-        "    def m(self, x: int) -> None:\n"
-        "        pass\n"
-        "\n"
-        "obj = C()\n"
-        "obj.m(7)\n",
+        "class C:\n    def m(self, x: int) -> None:\n        pass\n\nobj = C()\nobj.m(7)\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -3909,11 +3890,7 @@ def test_inlay_hints_range_filter_excludes_outside_calls(tmp_path: Path) -> None
     target = root / "mod.py"
     _write(
         target,
-        "def f(first: int, second: int) -> None:\n"
-        "    pass\n"
-        "\n"
-        "f(1, 2)\n"
-        "f(3, 4)\n",
+        "def f(first: int, second: int) -> None:\n    pass\n\nf(1, 2)\nf(3, 4)\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -3922,7 +3899,7 @@ def test_inlay_hints_range_filter_excludes_outside_calls(tmp_path: Path) -> None
             target, start_line=4, start_character=0, end_line=5, end_character=0
         )
 
-    assert tuple((h.line, h.label) for h in hints) == (
+    assert tuple((h.position.line, h.label) for h in hints) == (
         (4, "first:"),
         (4, "second:"),
     )
@@ -3956,7 +3933,7 @@ def test_language_server_advertises_inlay_hint_provider(tmp_path: Path) -> None:
         init = server._handle_request("initialize", {"rootUri": root.as_uri()})
         provider = init["capabilities"]["inlayHintProvider"]
         assert provider == {"resolveProvider": False}
-        assert init["serverInfo"]["version"] == "2.6.0"
+        assert init["serverInfo"]["version"] == _package_version()
     finally:
         if server._session is not None:
             server._session.close()
@@ -3968,10 +3945,7 @@ def test_language_server_inlay_hint_returns_lsp_payload(tmp_path: Path) -> None:
     target = root / "mod.py"
     _write(
         target,
-        "def greet(message: str, times: int) -> None:\n"
-        "    pass\n"
-        "\n"
-        "greet('hi', 3)\n",
+        "def greet(message: str, times: int) -> None:\n    pass\n\ngreet('hi', 3)\n",
     )
 
     server = LanguageServer(default_root=str(root))
@@ -3983,7 +3957,7 @@ def test_language_server_inlay_hint_returns_lsp_payload(tmp_path: Path) -> None:
                 "textDocument": {"uri": target.as_uri()},
                 "range": {
                     "start": {"line": 0, "character": 0},
-                    "end": {"line": 10, "character": 0},
+                    "end": {"line": 4, "character": 0},
                 },
             },
         )
@@ -4026,7 +4000,7 @@ def test_language_server_inlay_hint_unparseable_file_returns_empty(
                 "textDocument": {"uri": target.as_uri()},
                 "range": {
                     "start": {"line": 0, "character": 0},
-                    "end": {"line": 10, "character": 0},
+                    "end": {"line": 1, "character": 0},
                 },
             },
         )
@@ -4043,10 +4017,10 @@ def test_type_definitions_at_variable_with_local_class(tmp_path: Path) -> None:
     target = root / "app.py"
     _write(target, "class Foo:\n    pass\n\nx: Foo = Foo()\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "x")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "x"))
     assert result == (
         TypeDefinitionLocation(
-            path=str(target), lineno=1, col_offset=0, end_col_offset=1
+            path=str(target), range=_range(0, len("class "), 0, len("class Foo"))
         ),
     )
 
@@ -4060,13 +4034,11 @@ def test_type_definitions_at_variable_resolves_through_import(
     target = root / "app.py"
     _write(target, "from helper import Foo\n\nx: Foo = Foo()\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "x")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "x"))
     assert result == (
         TypeDefinitionLocation(
             path=str(root / "helper.py"),
-            lineno=1,
-            col_offset=0,
-            end_col_offset=1,
+            range=_range(0, len("class "), 0, len("class Foo")),
         ),
     )
 
@@ -4079,10 +4051,10 @@ def test_type_definitions_at_unwraps_string_forward_reference(
     target = root / "app.py"
     _write(target, "class Foo:\n    pass\n\nx: 'Foo' = Foo()\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "x")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "x"))
     assert result == (
         TypeDefinitionLocation(
-            path=str(target), lineno=1, col_offset=0, end_col_offset=1
+            path=str(target), range=_range(0, len("class "), 0, len("class Foo"))
         ),
     )
 
@@ -4093,10 +4065,10 @@ def test_type_definitions_at_walks_generic_subscript(tmp_path: Path) -> None:
     target = root / "app.py"
     _write(target, "class Foo:\n    pass\n\nx: list[Foo] = []\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "x")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "x"))
     assert result == (
         TypeDefinitionLocation(
-            path=str(target), lineno=1, col_offset=0, end_col_offset=1
+            path=str(target), range=_range(0, len("class "), 0, len("class Foo"))
         ),
     )
 
@@ -4116,19 +4088,15 @@ def test_type_definitions_at_union_returns_both_workspace_types(
         "from helper import Foo, Bar\n\nx: Foo | Bar = Foo()\n",
     )
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "x")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "x"))
     assert result == (
         TypeDefinitionLocation(
             path=str(root / "helper.py"),
-            lineno=1,
-            col_offset=0,
-            end_col_offset=1,
+            range=_range(0, len("class "), 0, len("class Foo")),
         ),
         TypeDefinitionLocation(
             path=str(root / "helper.py"),
-            lineno=4,
-            col_offset=0,
-            end_col_offset=1,
+            range=_range(3, len("class "), 3, len("class Bar")),
         ),
     )
 
@@ -4145,13 +4113,11 @@ def test_type_definitions_at_attribute_resolves_through_module_alias(
         "import helper\n\nx: helper.Foo = helper.Foo()\n",
     )
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "x")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "x"))
     assert result == (
         TypeDefinitionLocation(
             path=str(root / "helper.py"),
-            lineno=1,
-            col_offset=0,
-            end_col_offset=1,
+            range=_range(0, len("class "), 0, len("class Foo")),
         ),
     )
 
@@ -4162,7 +4128,7 @@ def test_type_definitions_at_skips_stdlib_type(tmp_path: Path) -> None:
     target = root / "app.py"
     _write(target, "x: int = 1\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "x")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "x"))
     assert result == ()
 
 
@@ -4175,10 +4141,10 @@ def test_type_definitions_at_function_return_annotation(tmp_path: Path) -> None:
         "class Foo:\n    pass\n\ndef make() -> Foo:\n    return Foo()\n",
     )
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "make")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "make"))
     assert result == (
         TypeDefinitionLocation(
-            path=str(target), lineno=1, col_offset=0, end_col_offset=1
+            path=str(target), range=_range(0, len("class "), 0, len("class Foo"))
         ),
     )
 
@@ -4189,7 +4155,7 @@ def test_type_definitions_at_function_no_return_annotation(tmp_path: Path) -> No
     target = root / "app.py"
     _write(target, "def make():\n    return 1\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "make")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "make"))
     assert result == ()
 
 
@@ -4199,10 +4165,10 @@ def test_type_definitions_at_class_returns_self_location(tmp_path: Path) -> None
     target = root / "app.py"
     _write(target, "class Foo:\n    pass\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "Foo")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "Foo"))
     assert result == (
         TypeDefinitionLocation(
-            path=str(target), lineno=1, col_offset=0, end_col_offset=1
+            path=str(target), range=_range(0, len("class "), 0, len("class Foo"))
         ),
     )
 
@@ -4213,11 +4179,11 @@ def test_type_definitions_at_variable_without_annotation(tmp_path: Path) -> None
     target = root / "app.py"
     _write(target, "x = 1\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "x")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "x"))
     assert result == ()
 
 
-def test_type_definitions_at_unknown_identifier_returns_empty(
+def test_symbol_at_unknown_identifier_returns_none(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "workspace"
@@ -4225,8 +4191,7 @@ def test_type_definitions_at_unknown_identifier_returns_empty(
     target = root / "app.py"
     _write(target, "x: int = 1\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "does_not_exist")
-    assert result == ()
+        assert session.symbol_at(target, SourcePosition(0, len("x: int "))) is None
 
 
 def test_type_definitions_at_import_alias_returns_empty(tmp_path: Path) -> None:
@@ -4236,7 +4201,9 @@ def test_type_definitions_at_import_alias_returns_empty(tmp_path: Path) -> None:
     target = root / "app.py"
     _write(target, "import helper\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "helper")
+        symbol_id = session._local_symbol_at(target, SourcePosition(0, len("import ")))
+        assert symbol_id is not None
+        result = session.type_definitions_at(symbol_id)
     assert result == ()
 
 
@@ -4252,13 +4219,11 @@ def test_type_definitions_at_deduplicates_repeated_type_refs(
         "from helper import Foo\n\nx: dict[Foo, Foo] = {}\n",
     )
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "x")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "x"))
     assert result == (
         TypeDefinitionLocation(
             path=str(root / "helper.py"),
-            lineno=1,
-            col_offset=0,
-            end_col_offset=1,
+            range=_range(0, len("class "), 0, len("class Foo")),
         ),
     )
 
@@ -4268,8 +4233,14 @@ def test_type_definitions_at_missing_file_raises_filenotfound(
 ) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
+    symbol_id = SymbolId(
+        str(root / "missing.py"),
+        "module",
+        "x",
+        _range(0, 0, 0, 1),
+    )
     with WorkspaceSession(root) as session, pytest.raises(FileNotFoundError):
-        session.type_definitions_at(root / "missing.py", "x")
+        session.type_definitions_at(symbol_id)
 
 
 def test_type_definitions_at_invalid_annotation_returns_empty(
@@ -4283,7 +4254,7 @@ def test_type_definitions_at_invalid_annotation_returns_empty(
     # workspace name" path.
     _write(target, "x: object = object()\n")
     with WorkspaceSession(root) as session:
-        result = session.type_definitions_at(target, "x")
+        result = session.type_definitions_at(_symbol_for_name(session, target, "x"))
     assert result == ()
 
 
@@ -4314,8 +4285,8 @@ def test_language_server_type_definition_returns_lsp_location(
         {
             "uri": (root / "helper.py").as_uri(),
             "range": {
-                "start": {"line": 0, "character": 0},
-                "end": {"line": 0, "character": 1},
+                "start": {"line": 0, "character": len("class ")},
+                "end": {"line": 0, "character": len("class Foo")},
             },
         }
     ]
@@ -4353,9 +4324,7 @@ def test_language_server_advertises_type_definition_provider(tmp_path: Path) -> 
     root.mkdir()
     server = LanguageServer(default_root=str(root))
     try:
-        result = server._handle_request(
-            "initialize", {"rootUri": root.as_uri()}
-        )
+        result = server._handle_request("initialize", {"rootUri": root.as_uri()})
     finally:
         if server._session is not None:
             server._session.close()
@@ -4389,14 +4358,14 @@ def test_prepare_call_hierarchy_top_level_function_at_call_site(
     assert item.qualified_name == "greet"
     assert item.detail == "helper"
     # selectionRange is the bare identifier on the def header line.
-    assert item.selection_start_line == 0
-    assert item.selection_start_character == len("def ")
-    assert item.selection_end_line == 0
-    assert item.selection_end_character == len("def greet")
+    assert item.selection_range.start.line == 0
+    assert item.selection_range.start.character == len("def ")
+    assert item.selection_range.end.line == 0
+    assert item.selection_range.end.character == len("def greet")
     # range covers the whole def block (header through body's last line).
-    assert item.range_start_line == 0
-    assert item.range_start_character == 0
-    assert item.range_end_line == 1
+    assert item.range.start.line == 0
+    assert item.range.start.character == 0
+    assert item.range.end.line == 1
 
 
 def test_prepare_call_hierarchy_on_class_returns_class_item(tmp_path: Path) -> None:
@@ -4460,10 +4429,7 @@ def test_prepare_call_hierarchy_decorated_function_range_includes_decorator(
     helper = root / "helper.py"
     _write(
         helper,
-        "import functools\n\n"
-        "@functools.cache\n"
-        "def cached() -> int:\n"
-        "    return 1\n",
+        "import functools\n\n@functools.cache\ndef cached() -> int:\n    return 1\n",
     )
     app = root / "app.py"
     _write(app, "from helper import cached\n\nprint(cached())\n")
@@ -4474,11 +4440,11 @@ def test_prepare_call_hierarchy_decorated_function_range_includes_decorator(
     assert len(items) == 1
     item = items[0]
     # Decorator is on line 2 (0-based); range starts there.
-    assert item.range_start_line == 2
+    assert item.range.start.line == 2
     # selectionRange is the bare-name span on the `def` line (line 3).
-    assert item.selection_start_line == 3
-    assert item.selection_start_character == len("def ")
-    assert item.selection_end_character == len("def cached")
+    assert item.selection_range.start.line == 3
+    assert item.selection_range.start.character == len("def ")
+    assert item.selection_range.end.character == len("def cached")
 
 
 def test_call_hierarchy_incoming_calls_groups_per_caller(tmp_path: Path) -> None:
@@ -4599,11 +4565,7 @@ def test_call_hierarchy_outgoing_calls_resolves_bare_and_module_attr_calls(
     helper = root / "helper.py"
     _write(
         helper,
-        "def alpha() -> int:\n"
-        "    return 1\n"
-        "\n"
-        "def beta() -> int:\n"
-        "    return 2\n",
+        "def alpha() -> int:\n    return 1\n\ndef beta() -> int:\n    return 2\n",
     )
     app = root / "app.py"
     _write(
@@ -4627,11 +4589,11 @@ def test_call_hierarchy_outgoing_calls_resolves_bare_and_module_attr_calls(
     assert len(by_callee["beta"].call_sites) == 1
     # The bare `alpha()` call site spans just the identifier `alpha`.
     alpha_site = by_callee["alpha"].call_sites[0]
-    assert alpha_site.start_line == 4
-    assert alpha_site.end_character - alpha_site.start_character == len("alpha")
+    assert alpha_site.range.start.line == 4
+    assert alpha_site.range.end.character - alpha_site.range.start.character == len("alpha")
     # The attribute `helper.beta()` reports only the rightmost-attr span.
     beta_site = by_callee["beta"].call_sites[0]
-    assert beta_site.end_character - beta_site.start_character == len("beta")
+    assert beta_site.range.end.character - beta_site.range.start.character == len("beta")
 
 
 def test_call_hierarchy_outgoing_calls_skips_nested_function_calls(
@@ -4684,7 +4646,7 @@ def test_call_hierarchy_outgoing_calls_aggregates_repeated_call_sites(
     assert calls[0].callee.qualified_name == "alpha"
     assert len(calls[0].call_sites) == 3
     # Call sites are emitted in document order.
-    starts = [site.start_character for site in calls[0].call_sites]
+    starts = [site.range.start.character for site in calls[0].call_sites]
     assert starts == sorted(starts)
 
 
@@ -4696,10 +4658,7 @@ def test_call_hierarchy_outgoing_calls_skips_stdlib_and_unresolvable(
     app = root / "app.py"
     _write(
         app,
-        "import json\n"
-        "\n"
-        "def driver() -> None:\n"
-        "    print(json.dumps({}))\n",
+        "import json\n\ndef driver() -> None:\n    print(json.dumps({}))\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -4851,10 +4810,7 @@ def test_language_server_call_hierarchy_incoming_outgoing_roundtrip(
     app = root / "app.py"
     _write(
         app,
-        "from helper import greet\n"
-        "\n"
-        "def caller() -> str:\n"
-        "    return greet()\n",
+        "from helper import greet\n\ndef caller() -> str:\n    return greet()\n",
     )
 
     server = LanguageServer(default_root=str(root))
@@ -4868,9 +4824,7 @@ def test_language_server_call_hierarchy_incoming_outgoing_roundtrip(
             },
         )
         assert prepared is not None and len(prepared) == 1
-        incoming = server._handle_request(
-            "callHierarchy/incomingCalls", {"item": prepared[0]}
-        )
+        incoming = server._handle_request("callHierarchy/incomingCalls", {"item": prepared[0]})
         prepared_caller = server._handle_request(
             "textDocument/prepareCallHierarchy",
             {
@@ -4934,18 +4888,10 @@ def test_call_hierarchy_dataclass_exports_are_re_exported_from_pyinc_tools() -> 
         path="/tmp/x.py",
         qualified_name="f",
         detail=None,
-        range_start_line=0,
-        range_start_character=0,
-        range_end_line=1,
-        range_end_character=0,
-        selection_start_line=0,
-        selection_start_character=4,
-        selection_end_line=0,
-        selection_end_character=5,
+        range=_range(0, 0, 1, 0),
+        selection_range=_range(0, 4, 0, 5),
     )
-    site = CallHierarchyCallSite(
-        start_line=0, start_character=0, end_line=0, end_character=1
-    )
+    site = CallHierarchyCallSite(range=_range(0, 0, 0, 1))
     inc = CallHierarchyIncomingCall(caller=item, call_sites=(site,))
     out = CallHierarchyOutgoingCall(callee=item, call_sites=(site,))
     assert inc.caller is item
@@ -4967,9 +4913,7 @@ def test_prepare_type_hierarchy_on_class_returns_class_item(tmp_path: Path) -> N
 
     with WorkspaceSession(root) as session:
         # Cursor on `Base` inside `class Child(Base)`.
-        items = session.prepare_type_hierarchy(
-            app, 2, len("class Child(")
-        )
+        items = session.prepare_type_hierarchy(app, 2, len("class Child("))
 
     assert len(items) == 1
     item = items[0]
@@ -4979,12 +4923,12 @@ def test_prepare_type_hierarchy_on_class_returns_class_item(tmp_path: Path) -> N
     assert item.path == str(base)
     assert item.detail == "base"
     # selectionRange spans the bare class name on the header line.
-    assert item.selection_start_line == 0
-    assert item.selection_start_character == len("class ")
-    assert item.selection_end_character == len("class Base")
+    assert item.selection_range.start.line == 0
+    assert item.selection_range.start.character == len("class ")
+    assert item.selection_range.end.character == len("class Base")
     # range covers the whole class block.
-    assert item.range_start_line == 0
-    assert item.range_end_line == 1
+    assert item.range.start.line == 0
+    assert item.range.end.line == 1
 
 
 def test_prepare_type_hierarchy_on_function_returns_empty(tmp_path: Path) -> None:
@@ -5033,27 +4977,22 @@ def test_prepare_type_hierarchy_decorated_class_range_includes_decorator(
     base = root / "base.py"
     _write(
         base,
-        "from dataclasses import dataclass\n\n"
-        "@dataclass\n"
-        "class Decorated:\n"
-        "    pass\n",
+        "from dataclasses import dataclass\n\n@dataclass\nclass Decorated:\n    pass\n",
     )
     app = root / "app.py"
     _write(app, "from base import Decorated\n\nclass Child(Decorated):\n    pass\n")
 
     with WorkspaceSession(root) as session:
-        items = session.prepare_type_hierarchy(
-            app, 2, len("class Child(")
-        )
+        items = session.prepare_type_hierarchy(app, 2, len("class Child("))
 
     assert len(items) == 1
     item = items[0]
     # Decorator is on line 2 (0-based) in base.py.
-    assert item.range_start_line == 2
+    assert item.range.start.line == 2
     # selectionRange is the bare-name span on the class header line.
-    assert item.selection_start_line == 3
-    assert item.selection_start_character == len("class ")
-    assert item.selection_end_character == len("class Decorated")
+    assert item.selection_range.start.line == 3
+    assert item.selection_range.start.character == len("class ")
+    assert item.selection_range.end.character == len("class Decorated")
 
 
 def test_type_hierarchy_supertypes_resolves_single_base(tmp_path: Path) -> None:
@@ -5083,10 +5022,7 @@ def test_type_hierarchy_supertypes_resolves_multiple_bases_sorted(
     app = root / "app.py"
     _write(
         app,
-        "from base import Zebra, Antelope\n"
-        "\n"
-        "class Hybrid(Zebra, Antelope):\n"
-        "    pass\n",
+        "from base import Zebra, Antelope\n\nclass Hybrid(Zebra, Antelope):\n    pass\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -5178,10 +5114,7 @@ def test_type_hierarchy_supertypes_skips_stdlib_and_installed_bases(
     app = root / "app.py"
     _write(
         app,
-        "from collections import OrderedDict\n"
-        "\n"
-        "class Mine(OrderedDict):\n"
-        "    pass\n",
+        "from collections import OrderedDict\n\nclass Mine(OrderedDict):\n    pass\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -5191,7 +5124,7 @@ def test_type_hierarchy_supertypes_skips_stdlib_and_installed_bases(
     assert supers == ()
 
 
-def test_type_hierarchy_supertypes_deep_attribute_chain_skipped(
+def test_type_hierarchy_supertypes_proven_deep_attribute_chain(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "workspace"
@@ -5206,10 +5139,7 @@ def test_type_hierarchy_supertypes_deep_attribute_chain_skipped(
     with WorkspaceSession(root) as session:
         supers = session.type_hierarchy_supertypes(app, "Child")
 
-    # Deep attribute chain `pkg.inner.Inner` — LHS is itself an Attribute,
-    # not a bare Name, so the resolver intentionally skips it (matches
-    # `find_references` and `call_hierarchy_outgoing_calls` limits).
-    assert supers == ()
+    assert [item.qualified_name for item in supers] == ["Inner"]
 
 
 def test_type_hierarchy_supertypes_on_non_class_returns_empty(
@@ -5257,11 +5187,7 @@ def test_type_hierarchy_subtypes_includes_nested_classes(
     app = root / "app.py"
     _write(
         app,
-        "from base import Base\n"
-        "\n"
-        "class Outer:\n"
-        "    class Inner(Base):\n"
-        "        pass\n",
+        "from base import Base\n\nclass Outer:\n    class Inner(Base):\n        pass\n",
     )
 
     with WorkspaceSession(root) as session:
@@ -5406,9 +5332,7 @@ def test_language_server_type_hierarchy_supertypes_subtypes_roundtrip(
             },
         )
         assert prepared_child is not None and len(prepared_child) == 1
-        supertypes = server._handle_request(
-            "typeHierarchy/supertypes", {"item": prepared_child[0]}
-        )
+        supertypes = server._handle_request("typeHierarchy/supertypes", {"item": prepared_child[0]})
         # Prepare on `Base` (declaration site in base.py).
         prepared_base = server._handle_request(
             "textDocument/prepareTypeHierarchy",
@@ -5418,9 +5342,7 @@ def test_language_server_type_hierarchy_supertypes_subtypes_roundtrip(
             },
         )
         assert prepared_base is not None and len(prepared_base) == 1
-        subtypes = server._handle_request(
-            "typeHierarchy/subtypes", {"item": prepared_base[0]}
-        )
+        subtypes = server._handle_request("typeHierarchy/subtypes", {"item": prepared_base[0]})
     finally:
         if server._session is not None:
             server._session.close()
@@ -5448,7 +5370,13 @@ def test_language_server_type_hierarchy_supertypes_missing_data_returns_null(
         server._handle_request("initialize", {"rootUri": root.as_uri()})
         result = server._handle_request(
             "typeHierarchy/supertypes",
-            {"item": {"name": "Foo", "kind": _LSP_SYMBOL_KIND_CLASS, "uri": (root / "x.py").as_uri()}},
+            {
+                "item": {
+                    "name": "Foo",
+                    "kind": _LSP_SYMBOL_KIND_CLASS,
+                    "uri": (root / "x.py").as_uri(),
+                }
+            },
         )
     finally:
         if server._session is not None:
@@ -5468,14 +5396,8 @@ def test_type_hierarchy_dataclass_exports_are_re_exported_from_pyinc_tools() -> 
         path="/tmp/x.py",
         qualified_name="C",
         detail=None,
-        range_start_line=0,
-        range_start_character=0,
-        range_end_line=1,
-        range_end_character=0,
-        selection_start_line=0,
-        selection_start_character=len("class "),
-        selection_end_line=0,
-        selection_end_character=len("class C"),
+        range=_range(0, 0, 1, 0),
+        selection_range=_range(0, len("class "), 0, len("class C")),
     )
     assert item.kind == "class"
     assert item.qualified_name == "C"
@@ -5510,16 +5432,19 @@ def test_semantic_tokens_emits_declarations_for_function_and_parameters(
 
     assert tokens == (
         SemanticToken(
-            line=0, character=4, length=5,
-            token_type="function", token_modifiers=("declaration",),
+            range=_range(0, 4, 0, 9),
+            token_type="function",
+            token_modifiers=("declaration",),
         ),
         SemanticToken(
-            line=0, character=10, length=5,
-            token_type="parameter", token_modifiers=("declaration",),
+            range=_range(0, 10, 0, 15),
+            token_type="parameter",
+            token_modifiers=("declaration",),
         ),
         SemanticToken(
-            line=0, character=22, length=6,
-            token_type="parameter", token_modifiers=("declaration",),
+            range=_range(0, 22, 0, 28),
+            token_type="parameter",
+            token_modifiers=("declaration",),
         ),
     )
 
@@ -5532,14 +5457,12 @@ def test_semantic_tokens_method_inside_class_classified_as_method(
     target = root / "mod.py"
     _write(
         target,
-        "class Foo:\n"
-        "    def method(self, x: int) -> None:\n"
-        "        pass\n",
+        "class Foo:\n    def method(self, x: int) -> None:\n        pass\n",
     )
     with WorkspaceSession(root) as session:
         tokens = session.semantic_tokens_for_file(target)
 
-    types = tuple((t.line, t.character, t.token_type) for t in tokens)
+    types = tuple((t.range.start.line, t.range.start.character, t.token_type) for t in tokens)
     # Class name + method name + self + x
     assert types == (
         (0, 6, "class"),
@@ -5558,7 +5481,7 @@ def test_semantic_tokens_async_def_carries_async_modifier(tmp_path: Path) -> Non
         tokens = session.semantic_tokens_for_file(target)
 
     fn_token = next(t for t in tokens if t.token_type == "function")
-    assert fn_token.line == 0
+    assert fn_token.range.start.line == 0
     assert fn_token.token_modifiers == ("declaration", "async")
 
 
@@ -5588,7 +5511,7 @@ def test_semantic_tokens_use_site_classified_via_symbol_table(
         tokens = session.semantic_tokens_for_file(target)
 
     use_tokens = [t for t in tokens if t.token_modifiers == ()]
-    assert {(t.line, t.token_type) for t in use_tokens} == {
+    assert {(t.range.start.line, t.token_type) for t in use_tokens} == {
         (9, "function"),
         (10, "class"),
         (11, "namespace"),
@@ -5604,12 +5527,7 @@ def test_semantic_tokens_decorator_name_resolved_via_symbol_table(
     target = root / "mod.py"
     _write(
         target,
-        "def my_decorator(fn):\n"
-        "    return fn\n"
-        "\n"
-        "@my_decorator\n"
-        "def target():\n"
-        "    pass\n",
+        "def my_decorator(fn):\n    return fn\n\n@my_decorator\ndef target():\n    pass\n",
     )
     with WorkspaceSession(root) as session:
         tokens = session.semantic_tokens_for_file(target)
@@ -5618,11 +5536,13 @@ def test_semantic_tokens_decorator_name_resolved_via_symbol_table(
     decorator_uses = [
         t
         for t in tokens
-        if t.line == 3 and t.token_type == "function" and t.token_modifiers == ()
+        if t.range.start.line == 3 and t.token_type == "function" and t.token_modifiers == ()
     ]
     assert len(decorator_uses) == 1
-    assert decorator_uses[0].character == 1
-    assert decorator_uses[0].length == len("my_decorator")
+    assert decorator_uses[0].range.start.character == 1
+    assert decorator_uses[0].range.end.character - decorator_uses[0].range.start.character == len(
+        "my_decorator"
+    )
 
 
 def test_semantic_tokens_base_class_resolves_to_class_token(
@@ -5635,13 +5555,12 @@ def test_semantic_tokens_base_class_resolves_to_class_token(
     with WorkspaceSession(root) as session:
         tokens = session.semantic_tokens_for_file(target)
 
-    base_uses = [
-        t for t in tokens if t.line == 3 and t.token_modifiers == ()
-    ]
+    base_uses = [t for t in tokens if t.range.start.line == 3 and t.token_modifiers == ()]
     assert base_uses == [
         SemanticToken(
-            line=3, character=14, length=4,
-            token_type="class", token_modifiers=(),
+            range=_range(3, 14, 3, 18),
+            token_type="class",
+            token_modifiers=(),
         ),
     ]
 
@@ -5690,7 +5609,9 @@ def test_semantic_tokens_overlay_change_reflected(tmp_path: Path) -> None:
         session.set_overlay(target, "def second():\n    pass\n")
         tokens = session.semantic_tokens_for_file(target)
     function_tokens = [t for t in tokens if t.token_type == "function"]
-    assert function_tokens[0].length == len("second")
+    assert function_tokens[0].range.end.character - function_tokens[0].range.start.character == len(
+        "second"
+    )
 
 
 def test_language_server_advertises_semantic_tokens_provider(
@@ -5744,13 +5665,25 @@ def test_language_server_semantic_tokens_full_delta_encodes(
     assert result == {
         "data": [
             # First token: greet def at (0, 4), length 5, function, declaration
-            0, 4, 5, 2, 1,
+            0,
+            4,
+            5,
+            2,
+            1,
             # Second token: name at (0, 10) — same line, delta_start = 10-4 = 6,
             # length 4, parameter, declaration
-            0, 6, 4, 4, 1,
+            0,
+            6,
+            4,
+            4,
+            1,
             # Third token: greet use at (3, 0) — delta_line = 3, delta_start = 0,
             # length 5, function, no modifiers
-            3, 0, 5, 2, 0,
+            3,
+            0,
+            5,
+            2,
+            0,
         ]
     }
 
@@ -5781,8 +5714,9 @@ def test_semantic_token_exports_are_re_exported_from_pyinc_tools() -> None:
     for name in ("SemanticToken", "SemanticTokenType", "SemanticTokenModifier"):
         assert hasattr(pyinc_tools, name), name
     token = SemanticToken(
-        line=0, character=0, length=3,
-        token_type="function", token_modifiers=("declaration",),
+        range=_range(0, 0, 0, 3),
+        token_type="function",
+        token_modifiers=("declaration",),
     )
     assert token.token_type == "function"
 
@@ -5807,9 +5741,16 @@ def test_semantic_tokens_range_returns_only_tokens_inside_range(
 
     # The full document has three function-declaration tokens.
     declarations = [t for t in all_tokens if t.token_type == "function"]
-    assert [t.line for t in declarations] == [0, 3, 6]
+    assert [t.range.start.line for t in declarations] == [0, 3, 6]
     # The range filter keeps only the middle one.
-    assert [(t.line, t.character, t.length) for t in middle] == [(3, 4, 6)]
+    assert [
+        (
+            t.range.start.line,
+            t.range.start.character,
+            t.range.end.character - t.range.start.character,
+        )
+        for t in middle
+    ] == [(3, 4, 6)]
 
 
 def test_semantic_tokens_range_excludes_token_on_end_line_at_end_character(
@@ -5830,8 +5771,8 @@ def test_semantic_tokens_range_excludes_token_on_end_line_at_end_character(
         )
     # `def second` starts at (3, 4). With end=(3, 4) it's excluded;
     # with end=(3, 5) it's included.
-    assert all(not (t.line == 3 and t.character == 4) for t in excluded)
-    assert any(t.line == 3 and t.character == 4 for t in included)
+    assert all(not (t.range.start.line == 3 and t.range.start.character == 4) for t in excluded)
+    assert any(t.range.start.line == 3 and t.range.start.character == 4 for t in included)
 
 
 def test_semantic_tokens_range_omitting_end_line_scans_through_eof(
@@ -5851,8 +5792,8 @@ def test_semantic_tokens_range_omitting_end_line_scans_through_eof(
     assert same == full
     # Tokens from line 0 (the `def first` header) are excluded; the `def
     # second` header on line 3 is included.
-    assert all(t.line >= 3 for t in from_line_3)
-    assert any(t.line == 3 and t.token_type == "function" for t in from_line_3)
+    assert all(t.range.start.line >= 3 for t in from_line_3)
+    assert any(t.range.start.line == 3 and t.token_type == "function" for t in from_line_3)
 
 
 def test_semantic_tokens_range_empty_when_range_covers_no_tokens(
@@ -5986,20 +5927,18 @@ def _apply_file_rename_edits(edits: tuple[FileRenameEdit, ...]) -> None:
     for path, file_edits in by_path.items():
         text = Path(path).read_text(encoding="utf-8")
         lines = text.splitlines(keepends=True)
-        ordered = sorted(
-            file_edits, key=lambda e: (-e.start_line, -e.start_character)
-        )
+        ordered = sorted(file_edits, key=lambda e: (-e.range.start.line, -e.range.start.character))
         for edit in ordered:
-            assert edit.start_line == edit.end_line, "multi-line edits unsupported"
-            line = lines[edit.start_line]
+            assert edit.range.start.line == edit.range.end.line, "multi-line edits unsupported"
+            line = lines[edit.range.start.line]
             newline = "\n" if line.endswith("\n") else ""
             content = line[:-1] if newline else line
             patched = (
-                content[: edit.start_character]
+                content[: edit.range.start.character]
                 + edit.new_text
-                + content[edit.end_character :]
+                + content[edit.range.end.character :]
             )
-            lines[edit.start_line] = patched + newline
+            lines[edit.range.start.line] = patched + newline
         Path(path).write_text("".join(lines), encoding="utf-8")
 
 
@@ -6019,16 +5958,17 @@ def test_file_rename_rewrites_absolute_import_and_from_import(
     )
 
     with WorkspaceSession(root) as session:
-        edits = session.import_edits_for_file_renames(
-            [(root / "helper.py", root / "utils.py")]
-        )
+        edits = session.import_edits_for_file_renames([(root / "helper.py", root / "utils.py")])
 
-    by_file: dict[str, list[tuple[int, int, int, str]]] = {
-        Path(e.path).name: [] for e in edits
-    }
+    by_file: dict[str, list[tuple[int, int, int, str]]] = {Path(e.path).name: [] for e in edits}
     for edit in edits:
         by_file[Path(edit.path).name].append(
-            (edit.start_line, edit.start_character, edit.end_character, edit.new_text)
+            (
+                edit.range.start.line,
+                edit.range.start.character,
+                edit.range.end.character,
+                edit.new_text,
+            )
         )
     assert by_file["user.py"] == [
         (0, 7, 13, "utils"),
@@ -6060,14 +6000,17 @@ def test_file_rename_preserves_relative_import_when_anchor_unchanged(
     _write(root / "outside.py", "from pkg.helper import foo\nfoo()\n")
 
     with WorkspaceSession(root) as session:
-        edits = session.import_edits_for_file_renames(
-            [(pkg / "helper.py", pkg / "utils.py")]
-        )
+        edits = session.import_edits_for_file_renames([(pkg / "helper.py", pkg / "utils.py")])
 
     by_file: dict[str, list[tuple[int, int, int, str]]] = {}
     for edit in edits:
         by_file.setdefault(Path(edit.path).name, []).append(
-            (edit.start_line, edit.start_character, edit.end_character, edit.new_text)
+            (
+                edit.range.start.line,
+                edit.range.start.character,
+                edit.range.end.character,
+                edit.new_text,
+            )
         )
     # Relative import inside the same package keeps the leading dot.
     assert by_file["sub.py"] == [(0, 5, 12, ".utils")]
@@ -6076,9 +6019,7 @@ def test_file_rename_preserves_relative_import_when_anchor_unchanged(
 
     _apply_file_rename_edits(edits)
     assert (pkg / "sub.py").read_text() == "from .utils import foo\nfoo()\n"
-    assert (root / "outside.py").read_text() == (
-        "from pkg.utils import foo\nfoo()\n"
-    )
+    assert (root / "outside.py").read_text() == ("from pkg.utils import foo\nfoo()\n")
 
 
 def test_file_rename_falls_back_to_absolute_on_cross_directory_move(
@@ -6094,14 +6035,17 @@ def test_file_rename_falls_back_to_absolute_on_cross_directory_move(
     _write(root / "other.py", "import pkg.helper\npkg.helper.foo()\n")
 
     with WorkspaceSession(root) as session:
-        edits = session.import_edits_for_file_renames(
-            [(pkg / "helper.py", top / "helper.py")]
-        )
+        edits = session.import_edits_for_file_renames([(pkg / "helper.py", top / "helper.py")])
 
     by_file: dict[str, list[tuple[int, int, int, str]]] = {}
     for edit in edits:
         by_file.setdefault(Path(edit.path).name, []).append(
-            (edit.start_line, edit.start_character, edit.end_character, edit.new_text)
+            (
+                edit.range.start.line,
+                edit.range.start.character,
+                edit.range.end.character,
+                edit.new_text,
+            )
         )
     # The relative import's anchor (`pkg`) no longer contains the new
     # module, so the rewrite goes to absolute form.
@@ -6121,14 +6065,17 @@ def test_file_rename_rewrites_from_pkg_import_leaf_when_parent_unchanged(
     _write(pkg / "rel.py", "from . import helper\nhelper.foo()\n")
 
     with WorkspaceSession(root) as session:
-        edits = session.import_edits_for_file_renames(
-            [(pkg / "helper.py", pkg / "utils.py")]
-        )
+        edits = session.import_edits_for_file_renames([(pkg / "helper.py", pkg / "utils.py")])
 
     by_file: dict[str, list[tuple[int, int, int, str]]] = {}
     for edit in edits:
         by_file.setdefault(Path(edit.path).name, []).append(
-            (edit.start_line, edit.start_character, edit.end_character, edit.new_text)
+            (
+                edit.range.start.line,
+                edit.range.start.character,
+                edit.range.end.character,
+                edit.new_text,
+            )
         )
     # `from pkg import helper` -> `from pkg import utils` (leaf rewrite)
     assert by_file["sibling.py"] == [(0, 16, 22, "utils")]
@@ -6139,9 +6086,7 @@ def test_file_rename_rewrites_from_pkg_import_leaf_when_parent_unchanged(
 
     _apply_file_rename_edits(edits)
     assert (pkg / "sibling.py").read_text() == "from pkg import utils\nhelper.foo()\n"
-    assert (
-        pkg / "sibling_alias.py"
-    ).read_text() == "from pkg import utils as h\nh.foo()\n"
+    assert (pkg / "sibling_alias.py").read_text() == "from pkg import utils as h\nh.foo()\n"
     assert (pkg / "rel.py").read_text() == "from . import utils\nhelper.foo()\n"
 
 
@@ -6160,9 +6105,7 @@ def test_file_rename_skips_from_pkg_import_leaf_on_cross_directory_move(
     _write(root / "consumer.py", "from pkg import helper\nhelper.foo()\n")
 
     with WorkspaceSession(root) as session:
-        edits = session.import_edits_for_file_renames(
-            [(pkg / "helper.py", top / "helper.py")]
-        )
+        edits = session.import_edits_for_file_renames([(pkg / "helper.py", top / "helper.py")])
 
     assert all(Path(e.path).name != "consumer.py" for e in edits)
 
@@ -6186,7 +6129,7 @@ def test_file_rename_handles_multiple_renames_in_one_call(tmp_path: Path) -> Non
         )
 
     by_line = sorted(
-        (edit.start_line, edit.start_character, edit.end_character, edit.new_text)
+        (edit.range.start.line, edit.range.start.character, edit.range.end.character, edit.new_text)
         for edit in edits
         if Path(edit.path).name == "user.py"
     )
@@ -6206,9 +6149,7 @@ def test_file_rename_skips_init_py(tmp_path: Path) -> None:
     new_init = root / "newpkg" / "__init__.py"
     new_init.parent.mkdir(parents=True, exist_ok=True)
     with WorkspaceSession(root) as session:
-        edits = session.import_edits_for_file_renames(
-            [(pkg / "__init__.py", new_init)]
-        )
+        edits = session.import_edits_for_file_renames([(pkg / "__init__.py", new_init)])
     assert edits == ()
 
 
@@ -6219,9 +6160,7 @@ def test_file_rename_skips_no_op_rename(tmp_path: Path) -> None:
     _write(root / "user.py", "import helper\nhelper.foo()\n")
 
     with WorkspaceSession(root) as session:
-        edits = session.import_edits_for_file_renames(
-            [(root / "helper.py", root / "helper.py")]
-        )
+        edits = session.import_edits_for_file_renames([(root / "helper.py", root / "helper.py")])
     assert edits == ()
 
 
@@ -6234,9 +6173,7 @@ def test_file_rename_skips_paths_outside_workspace(tmp_path: Path) -> None:
     outside = tmp_path / "outside" / "helper.py"
     outside.parent.mkdir(parents=True, exist_ok=True)
     with WorkspaceSession(root) as session:
-        edits = session.import_edits_for_file_renames(
-            [(root / "helper.py", outside)]
-        )
+        edits = session.import_edits_for_file_renames([(root / "helper.py", outside)])
     assert edits == ()
 
 
@@ -6249,9 +6186,7 @@ def test_file_rename_uses_overlay_text(tmp_path: Path) -> None:
 
     with WorkspaceSession(root) as session:
         session.set_overlay(root / "user.py", "import helper\nhelper.foo()\n")
-        edits = session.import_edits_for_file_renames(
-            [(root / "helper.py", root / "utils.py")]
-        )
+        edits = session.import_edits_for_file_renames([(root / "helper.py", root / "utils.py")])
 
     user_edits = [e for e in edits if Path(e.path).name == "user.py"]
     assert len(user_edits) == 1
@@ -6382,11 +6317,11 @@ def _apply_file_deletion_edits(edits: tuple[FileDeletionEdit, ...]) -> None:
         text = Path(path).read_text(encoding="utf-8")
         ordered = sorted(
             file_edits,
-            key=lambda e: (-e.start_line, -e.start_character),
+            key=lambda e: (-e.range.start.line, -e.range.start.character),
         )
         for edit in ordered:
-            start_offset = _offset(text, edit.start_line, edit.start_character)
-            end_offset = _offset(text, edit.end_line, edit.end_character)
+            start_offset = _offset(text, edit.range.start.line, edit.range.start.character)
+            end_offset = _offset(text, edit.range.end.line, edit.range.end.character)
             text = text[:start_offset] + edit.new_text + text[end_offset:]
         Path(path).write_text(text, encoding="utf-8")
 
@@ -6415,7 +6350,7 @@ def test_file_deletion_removes_whole_import_statement(tmp_path: Path) -> None:
 
     user_edits = [e for e in edits if Path(e.path).name == "user.py"]
     spans = sorted(
-        (e.start_line, e.start_character, e.end_line, e.end_character)
+        (e.range.start.line, e.range.start.character, e.range.end.line, e.range.end.character)
         for e in user_edits
     )
     # Both `import helper` (line 0) and `from helper import foo` (line 1)
@@ -6467,11 +6402,11 @@ def test_file_deletion_removes_from_pkg_import_leaf(tmp_path: Path) -> None:
         by_file.setdefault(Path(edit.path).name, []).append(edit)
 
     # `from pkg import helper` (only name) → whole statement removed.
-    assert by_file["sibling.py"][0].start_line == 0
-    assert by_file["sibling.py"][0].end_line == 1
+    assert by_file["sibling.py"][0].range.start.line == 0
+    assert by_file["sibling.py"][0].range.end.line == 1
     # `from . import helper` (only name) → whole statement removed.
-    assert by_file["rel.py"][0].start_line == 0
-    assert by_file["rel.py"][0].end_line == 1
+    assert by_file["rel.py"][0].range.start.line == 0
+    assert by_file["rel.py"][0].range.end.line == 1
 
     _apply_file_deletion_edits(edits)
     assert (pkg / "sibling.py").read_text() == "helper.foo()\n"
@@ -6493,10 +6428,10 @@ def test_file_deletion_partial_alias_in_multi_name_import(tmp_path: Path) -> Non
     assert len(user_edits) == 1
     edit = user_edits[0]
     # The span absorbs the trailing comma + whitespace up to `b`.
-    assert edit.start_line == 0
-    assert edit.start_character == 7  # column of `a` in `import a, b`
-    assert edit.end_line == 0
-    assert edit.end_character == 10  # column of `b` in `import a, b`
+    assert edit.range.start.line == 0
+    assert edit.range.start.character == 7  # column of `a` in `import a, b`
+    assert edit.range.end.line == 0
+    assert edit.range.end.character == 10  # column of `b` in `import a, b`
 
     _apply_file_deletion_edits(edits)
     assert (root / "user.py").read_text() == "import b\na.foo()\nb.bar()\n"
@@ -6547,12 +6482,10 @@ def test_file_deletion_handles_multiple_deletions(tmp_path: Path) -> None:
     _write(root / "user.py", "import a\nfrom b import bar\n\na.foo()\nbar()\n")
 
     with WorkspaceSession(root) as session:
-        edits = session.import_edits_for_file_deletions(
-            [root / "a.py", root / "b.py"]
-        )
+        edits = session.import_edits_for_file_deletions([root / "a.py", root / "b.py"])
 
     user_edits = sorted(
-        (e.start_line, e.end_line) for e in edits if Path(e.path).name == "user.py"
+        (e.range.start.line, e.range.end.line) for e in edits if Path(e.path).name == "user.py"
     )
     assert user_edits == [(0, 1), (1, 2)]
 
@@ -6569,9 +6502,7 @@ def test_file_deletion_skips_importer_being_deleted(tmp_path: Path) -> None:
     _write(root / "user.py", "import helper\nhelper.foo()\n")
 
     with WorkspaceSession(root) as session:
-        edits = session.import_edits_for_file_deletions(
-            [root / "helper.py", root / "user.py"]
-        )
+        edits = session.import_edits_for_file_deletions([root / "helper.py", root / "user.py"])
     # `user.py` is being deleted, so no edits are emitted for it.
     assert all(Path(e.path).name != "user.py" for e in edits)
 
@@ -6786,9 +6717,7 @@ def test_language_server_document_diagnostic_unchanged_when_result_id_matches(
     try:
         server._handle_request("initialize", {"rootUri": root.as_uri()})
         uri = (root / "user.py").as_uri()
-        first = server._handle_request(
-            "textDocument/diagnostic", {"textDocument": {"uri": uri}}
-        )
+        first = server._handle_request("textDocument/diagnostic", {"textDocument": {"uri": uri}})
         second = server._handle_request(
             "textDocument/diagnostic",
             {
@@ -6812,9 +6741,7 @@ def test_language_server_document_diagnostic_changes_after_edit(
     try:
         server._handle_request("initialize", {"rootUri": root.as_uri()})
         uri = (root / "user.py").as_uri()
-        first = server._handle_request(
-            "textDocument/diagnostic", {"textDocument": {"uri": uri}}
-        )
+        first = server._handle_request("textDocument/diagnostic", {"textDocument": {"uri": uri}})
         # Fix the import via an overlay; the stale result id must no longer match.
         server._require_session().set_overlay(str(root / "user.py"), "x = 1\n")
         second = server._handle_request(
@@ -6870,9 +6797,7 @@ def test_language_server_workspace_diagnostic_reports_each_file(
     bad_uri = (root / "bad.py").as_uri()
     ok_uri = (root / "ok.py").as_uri()
     assert by_uri[bad_uri]["kind"] == "full"
-    assert any(
-        d["code"] == "missing-import" for d in by_uri[bad_uri]["items"]
-    )
+    assert any(d["code"] == "missing-import" for d in by_uri[bad_uri]["items"])
     # The clean file still gets a report (with no items) so clients can clear.
     assert ok_uri in by_uri
     assert by_uri[ok_uri]["items"] == []
@@ -6887,13 +6812,8 @@ def test_language_server_workspace_diagnostic_unchanged_with_previous_ids(
     try:
         server._handle_request("initialize", {"rootUri": root.as_uri()})
         first = server._handle_request("workspace/diagnostic", {})
-        previous = [
-            {"uri": item["uri"], "value": item["resultId"]}
-            for item in first["items"]
-        ]
-        second = server._handle_request(
-            "workspace/diagnostic", {"previousResultIds": previous}
-        )
+        previous = [{"uri": item["uri"], "value": item["resultId"]} for item in first["items"]]
+        second = server._handle_request("workspace/diagnostic", {"previousResultIds": previous})
     finally:
         if server._session is not None:
             server._session.close()
@@ -6918,11 +6838,7 @@ _COMPLETION_HELPERS = (
 )
 
 _COMPLETION_APP = (
-    "from helpers import compute, Widget\n"
-    "import helpers\n"
-    "\n"
-    "def run() -> int:\n"
-    "    return 1\n"
+    "from helpers import compute, Widget\nimport helpers\n\ndef run() -> int:\n    return 1\n"
 )
 
 
@@ -6957,9 +6873,7 @@ def test_completion_bare_name_offers_local_symbols_and_keywords(tmp_path: Path) 
         source, line, character = _caret(_COMPLETION_APP, "    ret")
         session.set_overlay(app, source)
         keyword_items = session.completions_at(app, line, character)
-        assert any(
-            item.label == "return" and item.kind == "keyword" for item in keyword_items
-        )
+        assert any(item.label == "return" and item.kind == "keyword" for item in keyword_items)
 
 
 def test_completion_attribute_lists_module_and_class_members(tmp_path: Path) -> None:
@@ -6974,18 +6888,14 @@ def test_completion_attribute_lists_module_and_class_members(tmp_path: Path) -> 
         session.set_overlay(app, source)
         module_items = session.completions_at(app, line, character)
         assert {"compute", "Widget", "CONST"} <= _labels(module_items)
-        assert any(
-            item.label == "compute" and item.kind == "function" for item in module_items
-        )
+        assert any(item.label == "compute" and item.kind == "function" for item in module_items)
 
         # Class attribute access: Widget.<caret>
         source, line, character = _caret(_COMPLETION_APP, "    Widget.")
         session.set_overlay(app, source)
         class_items = session.completions_at(app, line, character)
         assert _labels(class_items) == {"render", "size"}
-        assert any(
-            item.label == "render" and item.kind == "method" for item in class_items
-        )
+        assert any(item.label == "render" and item.kind == "method" for item in class_items)
 
 
 def test_completion_from_import_lists_workspace_module_members(tmp_path: Path) -> None:
@@ -7109,15 +7019,17 @@ def test_find_references_does_not_count_the_import_binding_site(
     _write(root / "used.py", "from m import foo\nfoo()\n")
 
     with WorkspaceSession(root) as session:
-        unused_refs = session.find_references(root / "unused.py", "foo")
-        used_refs = session.find_references(root / "used.py", "foo")
+        unused_symbol = session.symbol_at(
+            root / "unused.py", SourcePosition(0, len("from m import ") + 1)
+        )
+        used_symbol = session.symbol_at(root / "used.py", SourcePosition(1, 1))
+        assert unused_symbol is not None
+        assert used_symbol is not None
+        unused_refs = session.find_references(unused_symbol)
+        used_refs = session.find_references(used_symbol)
 
-    unused_in_file = [
-        r for r in unused_refs.references if Path(r.path).name == "unused.py"
-    ]
-    used_in_file = [
-        r for r in used_refs.references if Path(r.path).name == "used.py"
-    ]
+    unused_in_file = [r for r in unused_refs.references if Path(r.path).name == "unused.py"]
+    used_in_file = [r for r in used_refs.references if Path(r.path).name == "used.py"]
     assert unused_in_file == []
     assert len(used_in_file) == 1
 
@@ -7146,8 +7058,7 @@ def test_analysis_diagnostic_to_lsp_maps_unnecessary_tag(tmp_path: Path) -> None
             message="unused",
             severity="hint",
             source="pyinc.symbol_resolution",
-            lineno=1,
-            col_offset=0,
+            range=_range(0, 0, 0, 1),
             tags=("unnecessary",),
         )
         payload = server._analysis_diagnostic_to_lsp(tagged)
@@ -7160,8 +7071,7 @@ def test_analysis_diagnostic_to_lsp_maps_unnecessary_tag(tmp_path: Path) -> None
             message="boom",
             severity="error",
             source="pyinc.python_source",
-            lineno=1,
-            col_offset=0,
+            range=_range(0, 0, 0, 1),
         )
         # No `tags` key at all when the diagnostic carries none.
         assert "tags" not in server._analysis_diagnostic_to_lsp(untagged)
@@ -7203,8 +7113,9 @@ def test_unused_import_diagnostic_flags_unused_workspace_from_import(
     diag = unused[0]
     assert diag.severity == "hint"
     assert diag.tags == ("unnecessary",)
-    assert diag.lineno == 1
-    assert diag.col_offset == len("from m import ")
+    assert diag.range is not None
+    assert diag.range.start.line + 1 == 1
+    assert diag.range.start.character == len("from m import ")
     assert "foo" in diag.message
 
 
@@ -7368,13 +7279,11 @@ def test_unused_import_diagnostic_still_flagged_when_not_in_module_all(
 
 def _apply_code_action_edits(source: str, edits: tuple[CodeActionEdit, ...]) -> str:
     """Apply a single action's edits to a source string (right-to-left)."""
-    ordered = sorted(
-        edits, key=lambda e: (-e.start_line, -e.start_character)
-    )
+    ordered = sorted(edits, key=lambda e: (-e.range.start.line, -e.range.start.character))
     text = source
     for edit in ordered:
-        start = _offset(text, edit.start_line, edit.start_character)
-        end = _offset(text, edit.end_line, edit.end_character)
+        start = _offset(text, edit.range.start.line, edit.range.start.character)
+        end = _offset(text, edit.range.end.line, edit.range.end.character)
         text = text[:start] + edit.new_text + text[end:]
     return text
 
@@ -7470,8 +7379,7 @@ def test_code_actions_for_range_removes_middle_alias_keeps_others(
     assert len(unused) == 1
     assert "bar" in unused[0].title
     assert (
-        _apply_code_action_edits(src, unused[0].edits)
-        == "from m import foo, baz\n\nfoo()\nbaz()\n"
+        _apply_code_action_edits(src, unused[0].edits) == "from m import foo, baz\n\nfoo()\nbaz()\n"
     )
 
 
@@ -7509,10 +7417,7 @@ def test_code_actions_unresolved_symbol_offers_removal_and_unique_retarget(
     assert "Remove import of 'foo'" in titles
     assert "Import 'foo' from 'home'" in titles
     retarget = next(a for a in actions if a.title == "Import 'foo' from 'home'")
-    assert (
-        _apply_code_action_edits(src, retarget.edits)
-        == "from home import foo\n\nfoo()\n"
-    )
+    assert _apply_code_action_edits(src, retarget.edits) == "from home import foo\n\nfoo()\n"
 
 
 def test_code_actions_unresolved_symbol_no_retarget_when_ambiguous(
@@ -7989,11 +7894,7 @@ def test_completion_annotated_local_var_completes_instance_view(
     root = tmp_path / "workspace"
     _write(root / "helpers.py", _ANNOT_HELPERS)
     app = root / "app.py"
-    base = (
-        "from helpers import Widget\n\n\n"
-        "def f() -> None:\n"
-        "    w: Widget = Widget()\n"
-    )
+    base = "from helpers import Widget\n\n\ndef f() -> None:\n    w: Widget = Widget()\n"
     _write(app, base)
 
     with WorkspaceSession(root) as session:
@@ -8037,9 +7938,7 @@ def test_completion_annotated_nearest_declaration_wins(tmp_path: Path) -> None:
         "Callable[[], Widget]",
     ],
 )
-def test_completion_annotated_generic_or_union_is_empty(
-    tmp_path: Path, annotation: str
-) -> None:
+def test_completion_annotated_generic_or_union_is_empty(tmp_path: Path, annotation: str) -> None:
     # A bounded model rejects subscripted / union / callable annotations rather
     # than half-inferring the wrapped class.
     root = tmp_path / "workspace"
@@ -8100,9 +7999,7 @@ def test_completion_annotated_import_alias_precedence(tmp_path: Path) -> None:
     _write(root / "helpers.py", _ANNOT_HELPERS)
     app = root / "app.py"
     base = (
-        "from helpers import Widget, Gadget\n\n\n"
-        "def f() -> None:\n"
-        "    Widget: Gadget = Gadget()\n"
+        "from helpers import Widget, Gadget\n\n\ndef f() -> None:\n    Widget: Gadget = Gadget()\n"
     )
     _write(app, base)
 
@@ -8316,7 +8213,7 @@ def test_signature_help_at_stdlib_attribute_call_returns_none(tmp_path: Path) ->
     assert signature_help is None
 
 
-def test_signature_help_at_deep_attribute_chain_returns_none(tmp_path: Path) -> None:
+def test_signature_help_at_proven_dotted_module_chain(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     _write(root / "pkg" / "__init__.py", "")
     _write(root / "pkg" / "sub.py", "def foo(x: int) -> int:\n    return x\n")
@@ -8324,7 +8221,8 @@ def test_signature_help_at_deep_attribute_chain_returns_none(tmp_path: Path) -> 
     _write(consumer, "import pkg.sub\n\npkg.sub.foo(1)\n")
     with WorkspaceSession(root) as session:
         signature_help = session.signature_help_at(consumer, line=2, character=12)
-    assert signature_help is None
+    assert signature_help is not None
+    assert signature_help.label == "def foo(x: int) -> int"
 
 
 def test_language_server_serves_attribute_signature_help(tmp_path: Path) -> None:
@@ -8385,8 +8283,7 @@ def test_signature_help_at_parameter_offsets_stay_aligned_with_defaults(
     assert signature_help is not None
     assert signature_help.label == "def f(a: int, b: int = 2) -> int"
     assert tuple(
-        (p.label, p.label_offset_start, p.label_offset_end)
-        for p in signature_help.parameters
+        (p.label, p.label_offset_start, p.label_offset_end) for p in signature_help.parameters
     ) == (
         ("a: int", 6, 12),
         ("b: int = 2", 14, 24),
@@ -8394,9 +8291,7 @@ def test_signature_help_at_parameter_offsets_stay_aligned_with_defaults(
     # The reported offsets must index the label back to the parameter text.
     for parameter in signature_help.parameters:
         assert (
-            signature_help.label[
-                parameter.label_offset_start : parameter.label_offset_end
-            ]
+            signature_help.label[parameter.label_offset_start : parameter.label_offset_end]
             == parameter.label
         )
 
@@ -8420,8 +8315,6 @@ def test_signature_help_at_class_init_defaults_strip_self(tmp_path: Path) -> Non
     assert signature_help.label == "def Box(width: int = 10, height: int = 20)"
     for parameter in signature_help.parameters:
         assert (
-            signature_help.label[
-                parameter.label_offset_start : parameter.label_offset_end
-            ]
+            signature_help.label[parameter.label_offset_start : parameter.label_offset_end]
             == parameter.label
         )

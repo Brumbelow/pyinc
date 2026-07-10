@@ -98,8 +98,7 @@ SCENARIO_LABELS: dict[str, tuple[str, str]] = {
     ),
     "tampered_generated_output": (
         "Tampered output",
-        "an out-of-band edit corrupts a generated file — content-hash repair "
-        "restores it",
+        "an out-of-band edit corrupts a generated file — content-hash repair restores it",
     ),
     "checkpoint_restore": (
         "Checkpoint restore",

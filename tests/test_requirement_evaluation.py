@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import pytest
+from packaging.markers import Marker, default_environment
+from packaging.specifiers import SpecifierSet
+from packaging.version import Version
 
 import pyinc.integrations as integrations
 from pyinc import Database
@@ -127,6 +132,50 @@ def test_requirement_evaluation_stable_api() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "specifier,version",
+    [
+        (">=1.0,<2", "1.5.2"),
+        ("~=1.4.5", "1.4.9"),
+        ("==1.2.*", "1.2.7"),
+        ("!=1.2.3", "1.2.4"),
+        (">=1.0rc1", "1.0rc2"),
+        ("<2.0", "2.0.post1"),
+        (">=1!1.0", "1!2.0"),
+        ("==1.0+linux", "1.0+linux"),
+        (">1.0", "1.0.post1"),
+        (">1.0", "1.0+local"),
+        ("<1.0rc1", "1.0.dev1"),
+        (">=1.0a1", "1.0.dev1"),
+        (">1.0rc1", "1.0rc1.post1"),
+        (">1.0rc1", "1.0.post1"),
+        ("<=1.0", "1.0+local"),
+        (">=1.0", "1.0+local"),
+    ],
+)
+def test_supported_pep440_vectors_match_packaging(specifier: str, version: str) -> None:
+    result = evaluate_version_specifier(Database(), specifier, version)
+    assert result.satisfied is (Version(version) in SpecifierSet(specifier))
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        'python_version >= "3.8"',
+        'python_full_version < "99"',
+        'sys_platform == "win32"',
+        'os_name != "definitely-not-an-os"',
+        'platform_machine in "x86_64 arm64 aarch64"',
+        'python_version >= "3.8" and implementation_name == "cpython"',
+        'sys_platform == "win32" or sys_platform == "linux"',
+    ],
+)
+def test_supported_pep508_marker_vectors_match_packaging(marker: str) -> None:
+    result = evaluate_markers(Database(), marker)
+    environment = cast(Mapping[str, str], default_environment())
+    assert result.value is Marker(marker).evaluate(environment)
+
+
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize(
     "specifier,version,expected",
@@ -165,9 +214,7 @@ def test_requirement_evaluation_stable_api() -> None:
         ("==1.0", "1.0+local", True),
     ],
 )
-def test_version_specifier_table(
-    mode: str, specifier: str, version: str, expected: bool
-) -> None:
+def test_version_specifier_table(mode: str, specifier: str, version: str, expected: bool) -> None:
     db = Database(mode=mode)
     result = evaluate_version_specifier(db, specifier, version)
     assert isinstance(result, VersionSpecifierEvaluation)
@@ -260,22 +307,11 @@ def test_marker_and_or_grouping(mode: str, monkeypatch: pytest.MonkeyPatch) -> N
     db = Database(mode=mode)
 
     assert (
-        evaluate_markers(
-            db, 'python_version >= "3.10" and sys_platform == "linux"'
-        ).value
-        is True
+        evaluate_markers(db, 'python_version >= "3.10" and sys_platform == "linux"').value is True
     )
+    assert evaluate_markers(db, 'python_version >= "3.14" or sys_platform == "linux"').value is True
     assert (
-        evaluate_markers(
-            db, 'python_version >= "3.14" or sys_platform == "linux"'
-        ).value
-        is True
-    )
-    assert (
-        evaluate_markers(
-            db, 'python_version >= "3.14" and sys_platform == "linux"'
-        ).value
-        is False
+        evaluate_markers(db, 'python_version >= "3.14" and sys_platform == "linux"').value is False
     )
     assert (
         evaluate_markers(
@@ -309,9 +345,7 @@ def test_marker_extras_not_modeled(mode: str, monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_marker_platform_version_flagged(
-    mode: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_marker_platform_version_flagged(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_env(monkeypatch, _fixed_env(platform_version="#42"))
     db = Database(mode=mode)
 
@@ -331,9 +365,7 @@ def test_marker_malformed_yields_diagnostic(mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_marker_version_variable_semantics(
-    mode: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_marker_version_variable_semantics(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """PEP 508: <, >, ==, != with a version variable use PEP 440 semantics."""
     _patch_env(monkeypatch, _fixed_env(python_full_version="3.12.3"))
     db = Database(mode=mode)
@@ -344,9 +376,7 @@ def test_marker_version_variable_semantics(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_marker_string_variable_strict(
-    mode: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_marker_string_variable_strict(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Non-version marker variables compare as plain strings."""
     _patch_env(monkeypatch, _fixed_env(platform_machine="x86_64"))
     db = Database(mode=mode)
@@ -386,8 +416,7 @@ def test_applicable_requirements_filters_by_markers(
 
     req_file = tmp_path / "requirements.txt"
     req_file.write_text(
-        'requests>=2.0 ; sys_platform == "linux"\n'
-        'requests>=5.0 ; sys_platform == "win32"\n',
+        'requests>=2.0 ; sys_platform == "linux"\nrequests>=5.0 ; sys_platform == "win32"\n',
         encoding="utf-8",
     )
 
@@ -420,7 +449,7 @@ def test_applicable_requirements_status_matrix(
 
     req_file = tmp_path / "requirements.txt"
     req_file.write_text(
-        "requests>=2.0\n" "flask>=1.0\n" "requests>=5.0\n" "requests===2.31.0\n",
+        "requests>=2.0\nflask>=1.0\nrequests>=5.0\nrequests===2.31.0\n",
         encoding="utf-8",
     )
 
@@ -510,6 +539,30 @@ def test_applicable_requirements_environment_captured(
     assert env.sys_platform == "linux"
 
 
+def test_python_environment_probe_and_load_uses_one_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = [
+        _fixed_env(python_version="3.12"),
+        _fixed_env(python_version="3.13"),
+    ]
+    calls = 0
+
+    def current() -> tuple[str, ...]:
+        nonlocal calls
+        value = observations[calls]
+        calls += 1
+        return value
+
+    monkeypatch.setattr(requirement_evaluation, "_current_python_env", current)
+    resource = requirement_evaluation._PythonEnvironmentResource()
+
+    probe, value = resource.probe_and_load(Database(), "python")
+
+    assert calls == 1
+    assert probe == value == observations[0]
+
+
 # ---------------------------------------------------------------------------
 # Workspace discovery
 # ---------------------------------------------------------------------------
@@ -578,9 +631,9 @@ def test_applicable_requirements_matches_fresh_recomputation(
     for _label, content in steps:
         req_file.write_text(content, encoding="utf-8")
         fresh = Database(mode=mode)
-        assert applicable_requirements(
-            incremental, str(req_file)
-        ) == applicable_requirements(fresh, str(req_file))
+        assert applicable_requirements(incremental, str(req_file)) == applicable_requirements(
+            fresh, str(req_file)
+        )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

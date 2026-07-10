@@ -111,6 +111,32 @@ def test_json_analysis_reports_syntax_errors(mode: str, tmp_path: Path) -> None:
     assert result.sections == ()
 
 
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ('{"key": 1, "key": 2}', "duplicate JSON object key"),
+        ('{"value": NaN}', "non-finite JSON number"),
+        ('{"value": Infinity}', "non-finite JSON number"),
+        ('{"value": -Infinity}', "non-finite JSON number"),
+        ('{"value": 1e999}', "non-finite JSON number"),
+    ],
+)
+def test_json_analysis_rejects_nonstandard_or_ambiguous_json(
+    text: str,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(text, encoding="utf-8")
+
+    result = json_analysis(Database(mode="strict"), path)
+
+    assert result.sections == ()
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0][0] == "json-decode-error"
+    assert message in result.diagnostics[0][1]
+
+
 # ---------------------------------------------------------------------------
 # Correctness
 # ---------------------------------------------------------------------------
@@ -302,9 +328,7 @@ def test_workspace_json_analysis_returns_none_when_missing(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_json_analysis_matches_fresh_recomputation_over_changes(
-    mode: str, tmp_path: Path
-) -> None:
+def test_json_analysis_matches_fresh_recomputation_over_changes(mode: str, tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     base = json.loads(_MINIMAL_JSON)
 

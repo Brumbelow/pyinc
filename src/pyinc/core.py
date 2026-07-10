@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
+from inspect import isasyncgenfunction, iscoroutinefunction, isgeneratorfunction
+from types import FunctionType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -14,6 +15,7 @@ from typing import (
     overload,
 )
 
+from .errors import InputKeyError
 from .value import semantic_equal
 
 if TYPE_CHECKING:
@@ -24,33 +26,25 @@ T = TypeVar("T")
 EqFn = Callable[[Any, Any], bool]
 CutoffFn = Callable[[Any], Any]
 
-# Per-name construction ordinals for Input nodes. Two Inputs sharing a name
-# (kept distinct via eq=/cutoff=) get stable, process-reproducible ordinals so
-# their identities and checkpoint dep records survive a cross-process reload.
-# Deterministic module-level construction order is the supported contract.
-_input_seq_lock = threading.Lock()
-_input_seq_counters: dict[str, int] = {}
 
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Input(Generic[T]):
-    name: str
-    eq: EqFn | None = None
-    cutoff: CutoffFn | None = None
-    # seq is excluded from equality/hashing (compare=False), so Input identity
-    # semantics are unchanged; it only disambiguates same-named nodes.
-    seq: int = field(init=False, compare=False, repr=False, default=0)
+    key: str
+    eq: EqFn | None = field(default=None, kw_only=True)
+    cutoff: CutoffFn | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.key, str) or not self.key:
+            raise InputKeyError("Input key must be a non-empty string.")
         if self.eq is not None and self.cutoff is not None:
             raise ValueError("Input() accepts either eq= or cutoff=, but not both.")
-        with _input_seq_lock:
-            next_seq = _input_seq_counters.get(self.name, 0)
-            _input_seq_counters[self.name] = next_seq + 1
-        object.__setattr__(self, "seq", next_seq)
+        if self.eq is not None and not callable(self.eq):
+            raise TypeError("Input eq= must be callable.")
+        if self.cutoff is not None and not callable(self.cutoff):
+            raise TypeError("Input cutoff= must be callable.")
 
     def read(self, db: Database) -> T:
-        return db._read_input(self)
+        return db.read_input(self)
 
 
 class Query(Generic[P, T]):
@@ -58,20 +52,30 @@ class Query(Generic[P, T]):
         self,
         fn: Callable[Concatenate[Database, P], T],
         *,
+        key: str | None = None,
         eq: EqFn | None = None,
         cutoff: CutoffFn | None = None,
     ) -> None:
+        if not isinstance(fn, FunctionType):
+            raise TypeError("@query can decorate Python functions only.")
+        if iscoroutinefunction(fn) or isgeneratorfunction(fn) or isasyncgenfunction(fn):
+            raise TypeError("@query requires a synchronous, non-generator function.")
         if eq is not None and cutoff is not None:
             raise ValueError("@query accepts either eq= or cutoff=, but not both.")
+        if eq is not None and not callable(eq):
+            raise TypeError("@query eq= must be callable.")
+        if cutoff is not None and not callable(cutoff):
+            raise TypeError("@query cutoff= must be callable.")
+        query_key = key if key is not None else f"{fn.__module__}:{fn.__qualname__}"
+        if not isinstance(query_key, str) or not query_key:
+            raise ValueError("Query key must be a non-empty string.")
         self.fn = fn
         self.eq = eq
         self.cutoff = cutoff
-        self.query_id = f"{fn.__module__}:{fn.__qualname__}"
-        self.__name__ = fn.__name__
-        self.__doc__ = fn.__doc__
-        self.__module__ = fn.__module__
-        self.__wrapped__ = fn
-        wraps(fn)(self)
+        self.key = query_key
+        # Copy descriptive callable metadata without merging the function's
+        # arbitrary attribute dictionary into the query contract.
+        wraps(fn, updated=())(self)
 
     def __call__(self, db: Database, *args: P.args, **kwargs: P.kwargs) -> T:
         return db.get(self, *args, **kwargs)
@@ -87,6 +91,7 @@ class Query(Generic[P, T]):
 def query(
     fn: Callable[Concatenate[Database, P], T],
     *,
+    key: str | None = None,
     eq: EqFn | None = None,
     cutoff: CutoffFn | None = None,
 ) -> Query[P, T]: ...
@@ -96,6 +101,7 @@ def query(
 def query(
     fn: None = None,
     *,
+    key: str | None = None,
     eq: EqFn | None = None,
     cutoff: CutoffFn | None = None,
 ) -> Callable[[Callable[Concatenate[Database, P], T]], Query[P, T]]: ...
@@ -104,11 +110,12 @@ def query(
 def query(
     fn: Callable[Concatenate[Database, P], T] | None = None,
     *,
+    key: str | None = None,
     eq: EqFn | None = None,
     cutoff: CutoffFn | None = None,
 ) -> Query[P, T] | Callable[[Callable[Concatenate[Database, P], T]], Query[P, T]]:
     def decorate(wrapped: Callable[Concatenate[Database, P], T]) -> Query[P, T]:
-        return Query(wrapped, eq=eq, cutoff=cutoff)
+        return Query(wrapped, key=key, eq=eq, cutoff=cutoff)
 
     if fn is None:
         return decorate

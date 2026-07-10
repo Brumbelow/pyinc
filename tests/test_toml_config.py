@@ -143,6 +143,51 @@ def test_config_analysis_extracts_tool_configs(tmp_path: Path) -> None:
     assert "mypy" in result.tool_configs
 
 
+def test_config_analysis_supports_toml_datetime_values(tmp_path: Path) -> None:
+    path = tmp_path / "pyproject.toml"
+    path.write_text("released = 1979-05-27T07:32:00Z\n", encoding="utf-8")
+
+    result = config_analysis(Database(mode="strict"), path)
+
+    assert result.diagnostics == ()
+    released = result.sections[0].keys[0]
+    assert released.key == "released"
+    assert released.value_type == "datetime"
+    assert released.string_value.startswith("1979-05-27T07:32:00")
+
+
+def test_config_analysis_reports_syntactically_valid_wrong_shapes(tmp_path: Path) -> None:
+    path = tmp_path / "pyproject.toml"
+    path.write_text('project = "wrong"\ntool = ["wrong"]\n', encoding="utf-8")
+
+    result = config_analysis(Database(mode="strict"), path)
+
+    assert {code for code, _message in result.diagnostics} == {
+        "invalid-project",
+        "invalid-tool",
+    }
+    assert result.dependencies == ()
+    assert result.optional_dependency_groups == ()
+    assert result.tool_configs == ()
+
+
+def test_config_analysis_reports_invalid_dependency_shapes(tmp_path: Path) -> None:
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        '[project]\ndependencies = "wrong"\n[project.optional-dependencies]\ndev = "wrong"\n',
+        encoding="utf-8",
+    )
+
+    result = config_analysis(Database(mode="strict"), path)
+
+    assert {code for code, _message in result.diagnostics} == {
+        "invalid-project-dependencies",
+        "invalid-optional-dependency-group",
+    }
+    assert result.dependencies == ()
+    assert result.optional_dependency_groups == ()
+
+
 # ---------------------------------------------------------------------------
 # Cutoff / backdating
 # ---------------------------------------------------------------------------
@@ -253,6 +298,4 @@ def test_config_analysis_matches_fresh_recomputation_over_changes(
     for _label, content in steps:
         path.write_text(content, encoding="utf-8")
         fresh = Database(mode=mode)
-        assert config_analysis(incremental, str(path)) == config_analysis(
-            fresh, str(path)
-        )
+        assert config_analysis(incremental, str(path)) == config_analysis(fresh, str(path))

@@ -31,9 +31,16 @@ The runtime also blocks raw ambient reads through `os.getenv`, `os.environ`, `os
 
 Query definitions are also checked for ambient state. Immutable constants and explicit `Input`/resource/query handles are allowed; mutable closure or global data is rejected so memo reuse never depends on hidden Python object mutation.
 
-Query identity includes the supported function definition payload, so ambient immutable captures contribute to the fingerprint instead of being ignored.
+Query identity is based on a stable key and a canonical typed encoding of the
+complete supported function definition. It includes code objects and nested
+constants, immutable and transitive captures, defaults, equality/cutoff
+policies, adapter/resource implementations, and relevant interpreter/build
+flags. It does not depend on marshal reference-table behavior.
 
-Resource node identity includes resource configuration. Built-in resources are snapshot-safe dataclasses, and custom resources must either be snapshot-safe themselves or expose an `identity()` payload for keying.
+Resource node identity includes configuration plus the implementations of
+`probe`, `load`, `probe_and_load`, and `identity`. The public generic
+`Resource[KeyT, ValueT, ProbeT]` contract exposes those hooks; callers use
+`Database.read_resource` instead of a private database method.
 
 Mutable object graphs with shared or cyclic references are supported in v2.0.0 via the `FrozenGraph` / `FrozenRef` snapshot variants. `freeze` memoizes mutable containers by id; pure trees retain the v1 flat shape. `thaw` runs a two-pass allocate-then-fill so cycles and shared identity are preserved across the boundary.
 
@@ -41,23 +48,43 @@ Mutable object graphs with shared or cyclic references are supported in v2.0.0 v
 
 `Database(store=...)` accepts any object satisfying the `ArtifactStore` protocol (`InMemoryArtifactStore` and `FileSystemArtifactStore` ship in `pyinc.store`). The kernel writes serialized snapshot bytes for every value crossing the membrane, keyed by its `fingerprint_snapshot` digest. Bytes are produced by `serialize_snapshot` and consumed by `deserialize_snapshot`; both round-trip the full snapshot grammar including `FrozenGraph` / `FrozenRef`. External tools may use this for cross-run sharing.
 
-Cross-run cache reuse ships in v2.0.0 via `Database.save_checkpoint(store=None) -> str` and `Database.load_checkpoint(key, store=None)`: the former serialises all current node records (plus snapshot bytes and dependency edges) to the store and returns a content-addressed key prefixed with `"ck"`; the latter reads the manifest back, verifies declared input digests and resource probe hints, and pre-warms the record cache so that the next `db.get(query)` reuses the stored result without re-executing the query function. Inputs must be set before loading; stale or unverifiable checkpoint records are silently skipped and the affected queries re-execute, preserving from-scratch consistency.
+`Database.save_checkpoint(store=None) -> str` serializes current node records,
+snapshot addresses, and dependency edges to a content-addressed key prefixed
+with `"ck"`. `load_checkpoint` accepts manifest schema v4 only and validates the
+entire manifest before staging any record: kernel version, identities, input
+keys, dependency references, duplicates, types, and content addresses. Records
+whose live code/resources no longer match miss safely; structurally malformed
+or foreign manifests raise a typed checkpoint error without partially warming
+the database.
+
+`FileSystemArtifactStore` accepts only digest-shaped keys and serializes each
+digest across processes. It flushes a same-directory temporary file before
+atomic publication and refuses conflicting bytes.
 
 ## Package Shape Today
 
 `pyinc` exposes a stable kernel surface from the top-level package:
 
-- `Database`, `Input`, and `@query` for the query runtime
-- `FileResource`, `FileStatResource`, `EnvResource`, and `DirectoryResource` for tracked external reads
+- `Database`, stable keyed `Input`, public `Query`, and `@query` for the query runtime
+- public generic `Resource`, `Database.read_resource`, `FileResource`,
+  `BinaryFileResource`, `FileStatResource`, `EnvResource`, and
+  `DirectoryResource` for tracked external reads
 - value-boundary helpers such as `freeze`, `thaw`, `semantic_equal`, and `ValueAdapter`
 - structured inspection via `InspectionNode`, `Database.inspect(...)`, `Database.inspect_fresh(...)`, and `Database.explain(...)`
 - observability via `Database.dependency_graph()`, `Database.statistics()`, and `Database.query_profile()`
 - push observers via `Database.observe(callback, query, *args, **kwargs)` returning a `Subscription`, with `QueryChangeEvent` payloads *(added in the v2 development cycle)*
 - mutable graph support via `FrozenGraph` / `FrozenRef` and the byte-stable `serialize_snapshot` / `deserialize_snapshot` helpers *(v2.0.0)*
 - content-addressed artifact storage via `ArtifactStore`, `InMemoryArtifactStore`, `FileSystemArtifactStore`, and `Database(store=...)`, plus the durable checkpoint API `Database.save_checkpoint(store=None)` / `Database.load_checkpoint(key, store=None)` for cross-run cache reuse *(v2.0.0)*
-- declared-output reconciliation via the `@action` layer (`Output`, `ReconcileResult`, `Action.reconcile`/`plan`): queries derive *desired* artifacts; a separate action reconciles them with the filesystem (atomic writes, content-hash change/tamper detection, ownership-ledger orphan deletion, dry-run). It is domain-agnostic and adds no query-side semantics; see [action-contract.md](action-contract.md) *(v2 development cycle)*
+- declared-output reconciliation via the `@action` layer (`Output`,
+  `ReconcileResult`, `Action.reconcile`/`plan`): the complete cycle is
+  cross-process locked, path/manifest trust is prevalidated, files publish
+  atomically, and the schema-v2 ledger is published last; see
+  [action-contract.md](action-contract.md)
 
-`pyinc.integrations` exposes the stable dataclass/result types and high-level entrypoints from the shipped integrations:
+`pyinc.integrations` exposes the stable dataclass/result types and high-level
+entrypoints from the shipped integrations. Its shared public infrastructure
+includes `SourcePosition`, `SourceRange`, `DocumentMap`, `PositionEncoding`,
+`SymbolId`, `Scope`, `Binding`, `ScopeTree`, `scope_tree`, and `symbol_at`:
 
 - `python_source`
 - `toml_config`
@@ -75,7 +102,21 @@ Cross-run cache reuse ships in v2.0.0 via `Database.save_checkpoint(store=None) 
 
 Low-level payload queries, decode helpers, and resource helpers remain module-local experimental helpers. The public integration boundary is the dataclass/result layer plus the documented high-level entrypoints in `docs/integration-contract.md`.
 
-The repository also includes small examples under `examples/`, dedicated tests for kernel semantics and from-scratch consistency, and two separate consumer layers built on top of the stable kernel: `pyinc_tools` for editor/watcher-facing behavior, and `pyinc_codegen`, a JSON-Schema → typed-Python compiler. `pyinc_codegen` consumes only the public surface (`@query`, `FileResource`, and the `@action`/`Output` reconciliation layer) and demonstrates dependency-decomposed file→file code generation; like `pyinc_tools` it must not widen `src/pyinc`'s semver contract, and no JSON-Schema-specific concept lives in the kernel. The include-aware `calc` fixture under `examples/calc/` is the canonical worked example of a small query graph that reconciles outputs to disk. A reproducible benchmark + correctness harness lives under `bench/` (not shipped in the wheel); it exercises the kernel, calc, codegen, and action targets across a canonical edit sequence and pairs every timing with an incremental-equals-fresh correctness assertion. Its only comparison dependency, `joblib`, sits in the `bench` optional-dependency group and is never imported by `src/pyinc` or `src/pyinc_codegen`.
+The repository also includes small examples under `examples/`, dedicated tests
+for kernel semantics and from-scratch consistency, and two consumer layers
+built on top of the stable kernel: `pyinc_tools` for editor/watcher-facing
+behavior, and `pyinc_codegen`, a JSON-Schema → typed-Python compiler.
+`WorkspaceSession` remains the cohesive, lock-owning tools façade; internal
+modules separately own document geometry, analysis/resolution, edit generation,
+workspace mirroring/watching, and JSON-RPC framing. Both consumers use only
+public `pyinc` and `pyinc.integrations` contracts. The include-aware `calc`
+fixture under `examples/calc/` is the canonical worked example of a small query
+graph that reconciles outputs to disk. A reproducible benchmark + correctness
+harness lives under `bench/` (not shipped in the wheel); it exercises the
+kernel, calc, codegen, and action targets across a canonical edit sequence and
+pairs every timing with an incremental-equals-fresh correctness assertion. Its
+only comparison dependency, `joblib`, sits in the `bench` optional-dependency
+group and is never imported by runtime packages.
 
 ## Cross-Integration Composition
 
@@ -87,23 +128,19 @@ Composition queries like `environment_index` are public `@query` functions expor
 
 ## Scope
 
-Version 1 targets:
+Version 3 is a synchronous, serialized `Database` with explicit keyed inputs,
+queries, and resources. Built-in query scheduling, worker pools, async queries,
+distributed execution, and interception of every possible ambient read remain
+out of scope. Custom equality policy purity and `fast`-mode mutation hazards
+remain caller contracts.
 
-- module-defined `@query` functions
-- explicit `Input` leaves
-- explicit file, env, and directory resources
-- optional file metadata resources (`FileStatResource`) for stat-level dependencies
-- explanation/provenance for reuse vs recompute
-- inline package typing via `py.typed`
-- narrow supported integrations for Python source analysis, symbol resolution, config inspection (TOML, JSON, XML, `.env`, CSV), requirements parsing and evaluation, installed package discovery, dependency validation, and deep module resolution
+Python analysis is conservative and declaration-driven, not a full type checker
+or formatter. Unsupported attribute shapes produce no navigation/refactoring
+result rather than a guess. Remote JSON Schema references, combinators,
+conditionals, general validation, and full JSON Schema coverage likewise remain
+outside the code generator's deliberately narrow subset.
 
-The v1 line is closed at v1.2.1. v2.0.0 resolves the items that were deferred from v1, except for schedulers and worker pools which remain out of scope:
-
-- **notebook integration** — landed as `pyinc.integrations.notebook`
-- **push observers in the kernel** — landed as `Database.observe(...)` returning a `Subscription`, with `QueryChangeEvent` payloads
-- **arbitrary mutable object graphs across cached boundaries** — landed as `FrozenGraph` / `FrozenRef` snapshot variants
-- **content-addressed artifact storage** — landed as the `ArtifactStore` protocol with `InMemoryArtifactStore` and `FileSystemArtifactStore` implementations, `Database(store=...)`, and the durable checkpoint API (`Database.save_checkpoint()` / `load_checkpoint()`) for cross-run node-record reuse
-
-Schedulers and worker pools remain out of scope for v2.
-
-Watcher loops, mirror workspaces, and LSP adapters belong to consumer tooling above the kernel. They can live in the repository, but they do not widen `src/pyinc`'s semver contract unless a concrete correctness gap forces a kernel change. The v1.2.0 additions — `textDocument/references` (workspace-wide reverse-reference index) and the threaded `PollingWorkspaceWatcher.start()` live polling mode — land entirely in `pyinc_tools` on top of stable `pyinc.integrations` entrypoints; `src/pyinc` is unchanged.
+Watcher loops, mirror workspaces, protocol-position conversion, and
+LSP/JSON-RPC adapters belong to `pyinc_tools`; the shared code-point geometry
+contract lives in `pyinc.integrations`. JSON Schema analysis belongs to
+`pyinc_codegen`. Neither consumer widens the domain-agnostic kernel contract.

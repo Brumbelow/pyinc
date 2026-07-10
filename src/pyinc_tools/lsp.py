@@ -3,15 +3,29 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-import re
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-from pyinc.integrations import Symbol
+from pyinc.integrations import (
+    DocumentMap,
+    PositionEncoding,
+    SourcePosition,
+    SourceRange,
+    Symbol,
+)
 
+from ._document import InvalidParams, convert_payload_positions, negotiate_position_encoding
+from ._jsonrpc import (
+    InvalidRequest,
+    ParseError,
+    read_message,
+    validate_request,
+    write_message,
+)
 from .session import (
     AnalysisDiagnostic,
     CallHierarchyCallSite,
@@ -57,7 +71,7 @@ _PYINC_SEVERITY_TO_LSP = {
     "hint": 4,
 }
 
-# LSP DiagnosticTag enum values (LSP 3.17).
+# LSP DiagnosticTag enum values (LSP 3.18).
 _PYINC_DIAGNOSTIC_TAG_TO_LSP = {
     "unnecessary": 1,
     "deprecated": 2,
@@ -75,7 +89,7 @@ _FOLDING_RANGE_KINDS = {
     "region": "region",
 }
 
-# LSP CompletionItemKind enum values (LSP 3.17).
+# LSP CompletionItemKind enum values (LSP 3.18).
 _COMPLETION_ITEM_KIND = {
     "method": 2,
     "function": 3,
@@ -86,12 +100,19 @@ _COMPLETION_ITEM_KIND = {
     "keyword": 14,
 }
 
-_ID_START_RE = re.compile(r"[A-Za-z_]")
-_ID_CONT_RE = re.compile(r"[A-Za-z0-9_]")
-
-_LINKED_EDITING_WORD_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*"
-
 _LSP_REQUEST_FAILED = -32803
+_LSP_SERVER_NOT_INITIALIZED = -32002
+_JSONRPC_PARSE_ERROR = -32700
+_JSONRPC_INVALID_REQUEST = -32600
+_JSONRPC_METHOD_NOT_FOUND = -32601
+_JSONRPC_INVALID_PARAMS = -32602
+
+
+def _package_version() -> str:
+    try:
+        return version("pyinc")
+    except PackageNotFoundError:
+        return "0+unknown"
 
 
 class _RequestFailed(Exception):
@@ -101,8 +122,31 @@ class _RequestFailed(Exception):
     """
 
 
+class _MethodNotFound(Exception):
+    pass
+
+
+class _ServerNotInitialized(Exception):
+    pass
+
+
+class _InvalidLifecycleRequest(Exception):
+    pass
+
+
 def _path_to_uri(path: str) -> str:
     return Path(path).resolve(strict=False).as_uri()
+
+
+def _position_to_lsp(position: SourcePosition) -> dict[str, int]:
+    return {"line": position.line, "character": position.character}
+
+
+def _range_to_lsp(source_range: SourceRange) -> dict[str, dict[str, int]]:
+    return {
+        "start": _position_to_lsp(source_range.start),
+        "end": _position_to_lsp(source_range.end),
+    }
 
 
 def _uri_to_path(uri: str) -> str:
@@ -152,12 +196,12 @@ def _identifier_span_at_position(
     if not (0 <= character <= len(text)):
         return None
     start = character
-    while start > 0 and _ID_CONT_RE.match(text[start - 1]):
+    while start > 0 and ("a" + text[start - 1]).isidentifier():
         start -= 1
     end = character
-    while end < len(text) and _ID_CONT_RE.match(text[end]):
+    while end < len(text) and ("a" + text[end]).isidentifier():
         end += 1
-    if start == end or not _ID_START_RE.match(text[start]):
+    if start == end or not text[start:end].isidentifier():
         return None
     return text[start:end], start, end
 
@@ -165,18 +209,6 @@ def _identifier_span_at_position(
 def _identifier_at_position(source: str, line: int, character: int) -> str | None:
     span = _identifier_span_at_position(source, line, character)
     return span[0] if span is not None else None
-
-
-def _find_symbol_by_identifier(
-    symbols: tuple[Symbol, ...], identifier: str
-) -> Symbol | None:
-    for symbol in symbols:
-        if symbol.qualified_name == identifier:
-            return symbol
-    for symbol in symbols:
-        if symbol.qualified_name.rsplit(".", 1)[-1] == identifier:
-            return symbol
-    return None
 
 
 def _format_hover_markdown(symbol: Symbol) -> str:
@@ -226,7 +258,11 @@ _SEMANTIC_TOKEN_MODIFIER_BIT = {
 }
 
 
-def _encode_semantic_tokens(tokens: tuple[SemanticToken, ...]) -> list[int]:
+def _encode_semantic_tokens(
+    tokens: tuple[SemanticToken, ...],
+    source: str,
+    encoding: PositionEncoding,
+) -> list[int]:
     """Encode ``tokens`` into the LSP semantic-tokens wire format.
 
     The wire format is a flat ``list[int]`` of five integers per token —
@@ -239,9 +275,12 @@ def _encode_semantic_tokens(tokens: tuple[SemanticToken, ...]) -> list[int]:
     data: list[int] = []
     prev_line = 0
     prev_character = 0
+    document = DocumentMap(source)
     for token in tokens:
-        delta_line = token.line - prev_line
-        delta_start = token.character if delta_line != 0 else token.character - prev_character
+        start = document.from_codepoint(token.range.start, encoding)
+        end = document.from_codepoint(token.range.end, encoding)
+        delta_line = start.line - prev_line
+        delta_start = start.character if delta_line != 0 else start.character - prev_character
         modifier_mask = 0
         for modifier in token.token_modifiers:
             modifier_mask |= _SEMANTIC_TOKEN_MODIFIER_BIT[modifier]
@@ -249,13 +288,13 @@ def _encode_semantic_tokens(tokens: tuple[SemanticToken, ...]) -> list[int]:
             (
                 delta_line,
                 delta_start,
-                token.length,
+                end.character - start.character,
                 _SEMANTIC_TOKEN_TYPE_INDEX[token.token_type],
                 modifier_mask,
             )
         )
-        prev_line = token.line
-        prev_character = token.character
+        prev_line = start.line
+        prev_character = start.character
     return data
 
 
@@ -264,26 +303,8 @@ def _call_hierarchy_item_to_lsp(item: CallHierarchyItem) -> dict[str, Any]:
         "name": item.name,
         "kind": _CALL_HIERARCHY_KIND_TO_LSP[item.kind],
         "uri": _path_to_uri(item.path),
-        "range": {
-            "start": {
-                "line": item.range_start_line,
-                "character": item.range_start_character,
-            },
-            "end": {
-                "line": item.range_end_line,
-                "character": item.range_end_character,
-            },
-        },
-        "selectionRange": {
-            "start": {
-                "line": item.selection_start_line,
-                "character": item.selection_start_character,
-            },
-            "end": {
-                "line": item.selection_end_line,
-                "character": item.selection_end_character,
-            },
-        },
+        "range": _range_to_lsp(item.range),
+        "selectionRange": _range_to_lsp(item.selection_range),
         "data": {"path": item.path, "qualified_name": item.qualified_name},
     }
     if item.detail is not None:
@@ -292,10 +313,7 @@ def _call_hierarchy_item_to_lsp(item: CallHierarchyItem) -> dict[str, Any]:
 
 
 def _call_site_to_lsp_range(site: CallHierarchyCallSite) -> dict[str, Any]:
-    return {
-        "start": {"line": site.start_line, "character": site.start_character},
-        "end": {"line": site.end_line, "character": site.end_character},
-    }
+    return _range_to_lsp(site.range)
 
 
 def _call_hierarchy_identity_from_item(
@@ -318,26 +336,8 @@ def _type_hierarchy_item_to_lsp(item: TypeHierarchyItem) -> dict[str, Any]:
         "name": item.name,
         "kind": _LSP_SYMBOL_KINDS["class"],
         "uri": _path_to_uri(item.path),
-        "range": {
-            "start": {
-                "line": item.range_start_line,
-                "character": item.range_start_character,
-            },
-            "end": {
-                "line": item.range_end_line,
-                "character": item.range_end_character,
-            },
-        },
-        "selectionRange": {
-            "start": {
-                "line": item.selection_start_line,
-                "character": item.selection_start_character,
-            },
-            "end": {
-                "line": item.selection_end_line,
-                "character": item.selection_end_character,
-            },
-        },
+        "range": _range_to_lsp(item.range),
+        "selectionRange": _range_to_lsp(item.selection_range),
         "data": {"path": item.path, "qualified_name": item.qualified_name},
     }
     if item.detail is not None:
@@ -396,42 +396,62 @@ class LanguageServer:
         self._default_root = default_root
         self._session: WorkspaceSession | None = None
         self._watcher: PollingWorkspaceWatcher | None = None
+        self._initialized = False
         self._shutdown_requested = False
+        self._exit_status = 0
+        self._position_encoding: PositionEncoding = "utf-16"
         self._published_paths: set[str] = set()
         self._published_signatures: dict[str, tuple[tuple[Any, ...], ...]] = {}
 
     def serve(self) -> int:
         try:
             while True:
-                message = self._read_message()
+                try:
+                    message = self._read_message()
+                except ParseError:
+                    self._send_error(None, _JSONRPC_PARSE_ERROR, "Parse error")
+                    return 0
+                except InvalidRequest:
+                    self._send_error(None, _JSONRPC_INVALID_REQUEST, "Invalid Request")
+                    continue
                 if message is None:
                     return 0
                 if not self._handle_message(message):
-                    return 0
+                    return self._exit_status
         finally:
             self._teardown_session()
 
     def _handle_message(self, message: dict[str, Any]) -> bool:
-        if "method" not in message:
+        try:
+            validate_request(message)
+        except InvalidRequest:
+            self._send_error(None, _JSONRPC_INVALID_REQUEST, "Invalid Request")
             return True
 
-        method = str(message["method"])
+        method = message["method"]
         params = message.get("params", {})
 
         if "id" in message:
             request_id = message["id"]
             try:
                 result = self._handle_request(method, params)
+            except _ServerNotInitialized:
+                self._send_error(
+                    request_id,
+                    _LSP_SERVER_NOT_INITIALIZED,
+                    "Server not initialized",
+                )
+            except _InvalidLifecycleRequest as exc:
+                self._send_error(request_id, _JSONRPC_INVALID_REQUEST, str(exc))
             except _RequestFailed as exc:
-                self._send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "error": {
-                            "code": _LSP_REQUEST_FAILED,
-                            "message": str(exc),
-                        },
-                    }
+                self._send_error(request_id, _LSP_REQUEST_FAILED, str(exc))
+            except _MethodNotFound:
+                self._send_error(request_id, _JSONRPC_METHOD_NOT_FOUND, "Method not found")
+            except (InvalidParams, KeyError, TypeError, ValueError) as exc:
+                self._send_error(
+                    request_id,
+                    _JSONRPC_INVALID_PARAMS,
+                    f"Invalid params: {exc}",
                 )
             except Exception:  # pragma: no cover - defensive JSON-RPC boundary
                 self._send(
@@ -445,14 +465,46 @@ class LanguageServer:
                 self._send({"jsonrpc": "2.0", "id": request_id, "result": result})
             return True
 
-        return self._handle_notification(method, params)
+        try:
+            return self._handle_notification(method, params)
+        except (InvalidParams, KeyError, TypeError, ValueError):
+            return True
 
     def _handle_request(self, method: str, params: Any) -> Any:
+        if method == "initialize":
+            if self._initialized or self._shutdown_requested:
+                raise _InvalidLifecycleRequest("Initialize request received more than once")
+        elif not self._initialized:
+            raise _ServerNotInitialized
+        elif self._shutdown_requested:
+            raise _InvalidLifecycleRequest("Request received after shutdown")
+        if not isinstance(params, dict):
+            raise InvalidParams("LSP params must be an object")
+        if method == "initialize":
+            return self._dispatch_request(method, params)
+        uri = self._default_uri(params)
+        converted_params = convert_payload_positions(
+            params,
+            encoding=self._position_encoding,
+            to_client=False,
+            source_for_uri=self._source_for_uri,
+            uri=uri,
+        )
+        result = self._dispatch_request(method, converted_params)
+        return convert_payload_positions(
+            result,
+            encoding=self._position_encoding,
+            to_client=True,
+            source_for_uri=self._source_for_uri,
+            uri=uri,
+        )
+
+    def _dispatch_request(self, method: str, params: Any) -> Any:
         if method == "initialize":
             return self._initialize(params)
         if method == "shutdown":
             self._shutdown_requested = True
-            self._stop_watcher()
+            self._teardown_session()
             return None
         if method == "textDocument/documentSymbol":
             return self._document_symbols(params)
@@ -516,15 +568,27 @@ class LanguageServer:
             return self._will_rename_files(params)
         if method == "workspace/willDeleteFiles":
             return self._will_delete_files(params)
-        raise ValueError(f"Unsupported LSP request: {method}")
+        raise _MethodNotFound(method)
 
     def _handle_notification(self, method: str, params: Any) -> bool:
+        if not isinstance(params, dict):
+            raise InvalidParams("LSP params must be an object")
         if method == "exit":
+            self._exit_status = 0 if self._shutdown_requested else 1
             self._stop_watcher()
             return False
+        if not self._initialized or self._shutdown_requested:
+            return True
         if method == "initialized":
             self.publish_workspace_diagnostics()
             return True
+        params = convert_payload_positions(
+            params,
+            encoding=self._position_encoding,
+            to_client=False,
+            source_for_uri=self._source_for_uri,
+            uri=self._default_uri(params),
+        )
         if method == "textDocument/didOpen":
             document = params["textDocument"]
             self._require_session().set_overlay(
@@ -603,8 +667,7 @@ class LanguageServer:
         else:
             result = self._require_session().analyze_file(real_path)
             items = [
-                self._analysis_diagnostic_to_lsp(diagnostic)
-                for diagnostic in result.diagnostics
+                self._analysis_diagnostic_to_lsp(diagnostic) for diagnostic in result.diagnostics
             ]
         result_id = _diagnostics_result_id(items)
         if previous_result_id is not None and previous_result_id == result_id:
@@ -658,10 +721,8 @@ class LanguageServer:
 
     def _initialize(self, params: Any) -> dict[str, Any]:
         root = self._workspace_root_from_params(params)
-        self._teardown_session()
-        self._session = WorkspaceSession(root)
-        self._published_paths.clear()
-        self._published_signatures.clear()
+        capabilities = params.get("capabilities") if isinstance(params, dict) else None
+        self._position_encoding = negotiate_position_encoding(capabilities)
 
         options = {}
         if isinstance(params, dict):
@@ -669,26 +730,40 @@ class LanguageServer:
             if isinstance(init_options, dict):
                 options = init_options
 
-        watcher_enabled = bool(options.get("pyinc.watcher.enabled", True))
-        if watcher_enabled:
-            debounce_ms = int(options.get("pyinc.watcher.debounceMs", 200))
-            interval_ms = options.get("pyinc.watcher.intervalMs")
-            interval_s: float | None
-            if isinstance(interval_ms, (int, float)):
-                interval_s = float(interval_ms) / 1000.0
-            else:
-                interval_s = None
-            self._watcher = PollingWorkspaceWatcher(
-                self._session, debounce_ms=debounce_ms
-            )
-            self._watcher.start(self._on_watcher_change, interval_s=interval_s)
+        raw_exclusions = options.get("pyinc.workspace.exclude", ())
+        exclude_globs = (
+            tuple(item for item in raw_exclusions if isinstance(item, str))
+            if isinstance(raw_exclusions, list)
+            else ()
+        )
+        try:
+            self._session = WorkspaceSession(root, exclude_globs=exclude_globs)
+            self._published_paths.clear()
+            self._published_signatures.clear()
+
+            watcher_enabled = bool(options.get("pyinc.watcher.enabled", True))
+            if watcher_enabled:
+                debounce_ms = int(options.get("pyinc.watcher.debounceMs", 200))
+                interval_ms = options.get("pyinc.watcher.intervalMs")
+                interval_s: float | None
+                if isinstance(interval_ms, (int, float)):
+                    interval_s = float(interval_ms) / 1000.0
+                else:
+                    interval_s = None
+                self._watcher = PollingWorkspaceWatcher(self._session, debounce_ms=debounce_ms)
+                self._watcher.start(self._on_watcher_change, interval_s=interval_s)
+        except BaseException:
+            self._teardown_session()
+            raise
+        self._initialized = True
 
         return {
             "capabilities": {
+                "positionEncoding": self._position_encoding,
                 "textDocumentSync": {
                     "openClose": True,
                     "change": 1,
-                    "save": {"includeText": True},
+                    "save": {"includeText": False},
                 },
                 "documentSymbolProvider": True,
                 "workspaceSymbolProvider": True,
@@ -756,7 +831,7 @@ class LanguageServer:
                     }
                 },
             },
-            "serverInfo": {"name": "pyinc-tools", "version": "2.6.0"},
+            "serverInfo": {"name": "pyinc-tools", "version": _package_version()},
         }
 
     def _on_watcher_change(self, _changed: tuple[str, ...]) -> None:
@@ -790,11 +865,7 @@ class LanguageServer:
             return []
         symbols: list[dict[str, Any]] = []
         for symbol in result.symbols.symbols:
-            line = max(symbol.lineno - 1, 0)
-            range_payload = {
-                "start": {"line": line, "character": 0},
-                "end": {"line": line, "character": 1},
-            }
+            range_payload = _range_to_lsp(symbol.range)
             symbols.append(
                 {
                     "name": symbol.qualified_name,
@@ -810,9 +881,7 @@ class LanguageServer:
     def _workspace_symbols(self, params: Any) -> list[dict[str, Any]]:
         query = str(params.get("query", "")).lower()
         result = self._require_session().analyze_workspace()
-        module_to_path = {
-            module.module: module.path for module in result.python.modules
-        }
+        module_to_path = {module.module: module.path for module in result.python.modules}
         matches: list[dict[str, Any]] = []
         for entry in result.symbols.entries:
             if query and query not in entry.qualified_name.lower():
@@ -820,7 +889,6 @@ class LanguageServer:
             path = module_to_path.get(entry.module)
             if path is None:
                 continue
-            line = max(entry.lineno - 1, 0)
             matches.append(
                 {
                     "name": entry.qualified_name,
@@ -829,10 +897,7 @@ class LanguageServer:
                     ),
                     "location": {
                         "uri": _path_to_uri(path),
-                        "range": {
-                            "start": {"line": line, "character": 0},
-                            "end": {"line": line, "character": 1},
-                        },
+                        "range": _range_to_lsp(entry.range),
                     },
                     "containerName": entry.module,
                 }
@@ -845,21 +910,27 @@ class LanguageServer:
         position = params["position"]
         line = int(position["line"])
         character = int(position["character"])
-        source = session.source_text(real_path)
-        if source is None:
+        try:
+            target = session.symbol_at(real_path, SourcePosition(line, character))
+        except FileNotFoundError:
             return None
-        identifier = _identifier_at_position(source, line, character)
-        if identifier is None:
+        if target is None:
             return None
-        analysis = session.analyze_file(real_path)
+        analysis = session.analyze_file(target.path)
         if analysis.symbols is None:
             return None
-        symbol = _find_symbol_by_identifier(analysis.symbols.symbols, identifier)
+        symbol = next(
+            (
+                item
+                for item in analysis.symbols.symbols
+                if item.range == target.declaration
+                and item.qualified_name.rsplit(".", 1)[-1] == target.name
+            ),
+            None,
+        )
         if symbol is None:
             return None
-        return {
-            "contents": {"kind": "markdown", "value": _format_hover_markdown(symbol)}
-        }
+        return {"contents": {"kind": "markdown", "value": _format_hover_markdown(symbol)}}
 
     def _completion(self, params: Any) -> dict[str, Any]:
         session = self._require_session()
@@ -889,26 +960,16 @@ class LanguageServer:
         position = params["position"]
         line = int(position["line"])
         character = int(position["character"])
-        source = session.source_text(real_path)
-        if source is None:
-            return []
-        identifier = _identifier_at_position(source, line, character)
-        if identifier is None:
-            return []
         try:
-            resolved = session.resolve_symbol_reference(real_path, identifier)
+            target = session.symbol_at(real_path, SourcePosition(line, character))
         except FileNotFoundError:
             return []
-        if resolved.defining_path is None or resolved.defining_lineno is None:
+        if target is None:
             return []
-        line_zero = max(resolved.defining_lineno - 1, 0)
         return [
             {
-                "uri": _path_to_uri(resolved.defining_path),
-                "range": {
-                    "start": {"line": line_zero, "character": 0},
-                    "end": {"line": line_zero, "character": 1},
-                },
+                "uri": _path_to_uri(target.path),
+                "range": _range_to_lsp(target.declaration),
             }
         ]
 
@@ -921,23 +982,19 @@ class LanguageServer:
         source = session.source_text(real_path)
         if source is None:
             return []
-        identifier = _identifier_at_position(source, line, character)
-        if identifier is None:
-            return []
         try:
-            location = session.declaration_location_at(real_path, identifier)
+            target = session._local_symbol_at(real_path, SourcePosition(line, character))
         except FileNotFoundError:
             return []
+        if target is None:
+            return []
+        location = session.declaration_location_at(target)
         if location is None:
             return []
-        line_zero = max(location.lineno - 1, 0)
         return [
             {
                 "uri": _path_to_uri(location.path),
-                "range": {
-                    "start": {"line": line_zero, "character": location.col_offset},
-                    "end": {"line": line_zero, "character": location.end_col_offset},
-                },
+                "range": _range_to_lsp(location.range),
             }
         ]
 
@@ -950,26 +1007,20 @@ class LanguageServer:
         source = session.source_text(real_path)
         if source is None:
             return []
-        identifier = _identifier_at_position(source, line, character)
-        if identifier is None:
+        try:
+            target = session.symbol_at(real_path, SourcePosition(line, character))
+        except FileNotFoundError:
+            return []
+        if target is None:
             return []
         try:
-            locations = session.type_definitions_at(real_path, identifier)
+            locations = session.type_definitions_at(target)
         except FileNotFoundError:
             return []
         return [
             {
                 "uri": _path_to_uri(location.path),
-                "range": {
-                    "start": {
-                        "line": max(location.lineno - 1, 0),
-                        "character": location.col_offset,
-                    },
-                    "end": {
-                        "line": max(location.lineno - 1, 0),
-                        "character": location.end_col_offset,
-                    },
-                },
+                "range": _range_to_lsp(location.range),
             }
             for location in locations
         ]
@@ -986,30 +1037,19 @@ class LanguageServer:
         source = session.source_text(real_path)
         if source is None:
             return []
-        identifier = _identifier_at_position(source, line, character)
-        if identifier is None:
-            return []
         try:
-            result = session.find_references(
-                real_path, identifier, include_declaration=include_declaration
-            )
+            target = session.symbol_at(real_path, SourcePosition(line, character))
+            if target is None:
+                return []
+            result = session.find_references(target, include_declaration=include_declaration)
         except FileNotFoundError:
-            return []
-        if result.target.resolution != "workspace":
             return []
         locations: list[dict[str, Any]] = []
         for reference in result.references:
-            ref_line = max(reference.lineno - 1, 0)
             locations.append(
                 {
                     "uri": _path_to_uri(reference.path),
-                    "range": {
-                        "start": {"line": ref_line, "character": reference.col_offset},
-                        "end": {
-                            "line": ref_line,
-                            "character": reference.end_col_offset,
-                        },
-                    },
+                    "range": _range_to_lsp(reference.range),
                 }
             )
         return locations
@@ -1023,25 +1063,19 @@ class LanguageServer:
         source = session.source_text(real_path)
         if source is None:
             return []
-        identifier = _identifier_at_position(source, line, character)
-        if identifier is None:
+        try:
+            target = session.symbol_at(real_path, SourcePosition(line, character))
+        except FileNotFoundError:
+            return []
+        if target is None:
             return []
         try:
-            highlights = session.find_document_highlights(real_path, identifier)
+            highlights = session.find_document_highlights(real_path, target)
         except FileNotFoundError:
             return []
         return [
             {
-                "range": {
-                    "start": {
-                        "line": max(highlight.lineno - 1, 0),
-                        "character": highlight.col_offset,
-                    },
-                    "end": {
-                        "line": max(highlight.lineno - 1, 0),
-                        "character": highlight.end_col_offset,
-                    },
-                },
+                "range": _range_to_lsp(highlight.range),
                 "kind": _DOCUMENT_HIGHLIGHT_KINDS[highlight.kind],
             }
             for highlight in highlights
@@ -1056,31 +1090,19 @@ class LanguageServer:
         source = session.source_text(real_path)
         if source is None:
             return None
-        identifier = _identifier_at_position(source, line, character)
-        if identifier is None:
+        try:
+            target = session.symbol_at(real_path, SourcePosition(line, character))
+        except FileNotFoundError:
+            return None
+        if target is None:
             return None
         try:
-            ranges = session.linked_editing_ranges_at(real_path, identifier)
+            ranges = session.linked_editing_ranges_at(real_path, target)
         except FileNotFoundError:
             return None
         if not ranges:
             return None
-        return {
-            "ranges": [
-                {
-                    "start": {
-                        "line": max(editing_range.lineno - 1, 0),
-                        "character": editing_range.col_offset,
-                    },
-                    "end": {
-                        "line": max(editing_range.lineno - 1, 0),
-                        "character": editing_range.end_col_offset,
-                    },
-                }
-                for editing_range in ranges
-            ],
-            "wordPattern": _LINKED_EDITING_WORD_PATTERN,
-        }
+        return {"ranges": [_range_to_lsp(editing_range.range) for editing_range in ranges]}
 
     def _prepare_rename(self, params: Any) -> dict[str, Any] | None:
         session = self._require_session()
@@ -1096,10 +1118,10 @@ class LanguageServer:
             return None
         identifier, start_col, end_col = span
         try:
-            resolved = session.resolve_symbol_reference(real_path, identifier)
+            target = session.symbol_at(real_path, SourcePosition(line, character))
         except FileNotFoundError:
             return None
-        if resolved.resolution != "workspace":
+        if target is None:
             return None
         return {
             "range": {
@@ -1124,21 +1146,33 @@ class LanguageServer:
         if identifier is None:
             return None
         try:
-            result = session.rename_symbol(real_path, identifier, new_name)
+            local_binding = session._local_binding_at(real_path, SourcePosition(line, character))
+            target = session.symbol_at(real_path, SourcePosition(line, character))
         except FileNotFoundError:
             return None
-
-        if result.status == "invalid_identifier":
-            raise _RequestFailed(
-                f"{new_name!r} is not a valid Python identifier."
-            )
-        if result.status == "keyword_identifier":
-            raise _RequestFailed(f"{new_name!r} is a Python keyword.")
-        if result.status == "alias_rename_unsupported":
+        if (
+            local_binding is not None
+            and local_binding.kind == "from_import_alias"
+            and local_binding.import_source is not None
+            and local_binding.name != local_binding.import_source.rpartition(":")[2]
+        ):
             raise _RequestFailed(
                 f"Cannot rename {identifier!r} via an `import ... as` alias; "
                 f"rename the original symbol instead."
             )
+        if target is None:
+            return None
+        if identifier != target.name:
+            raise _RequestFailed(
+                f"Cannot rename {identifier!r} via an `import ... as` alias; "
+                f"rename the original symbol instead."
+            )
+        result = session.rename_symbol(target, new_name)
+
+        if result.status == "invalid_identifier":
+            raise _RequestFailed(f"{new_name!r} is not a valid Python identifier.")
+        if result.status == "keyword_identifier":
+            raise _RequestFailed(f"{new_name!r} is a Python keyword.")
         if result.status == "same_name":
             return None
         if result.status != "ok":
@@ -1147,19 +1181,9 @@ class LanguageServer:
         changes: dict[str, list[dict[str, Any]]] = {}
         for edit in result.edits:
             uri = _path_to_uri(edit.path)
-            edit_line = max(edit.lineno - 1, 0)
             changes.setdefault(uri, []).append(
                 {
-                    "range": {
-                        "start": {
-                            "line": edit_line,
-                            "character": edit.col_offset,
-                        },
-                        "end": {
-                            "line": edit_line,
-                            "character": edit.end_col_offset,
-                        },
-                    },
+                    "range": _range_to_lsp(edit.range),
                     "newText": edit.new_text,
                 }
             )
@@ -1194,16 +1218,7 @@ class LanguageServer:
                 uri = _path_to_uri(edit.path)
                 changes.setdefault(uri, []).append(
                     {
-                        "range": {
-                            "start": {
-                                "line": edit.start_line,
-                                "character": edit.start_character,
-                            },
-                            "end": {
-                                "line": edit.end_line,
-                                "character": edit.end_character,
-                            },
-                        },
+                        "range": _range_to_lsp(edit.range),
                         "newText": edit.new_text,
                     }
                 )
@@ -1211,9 +1226,7 @@ class LanguageServer:
                 {
                     "title": action.title,
                     "kind": action.kind,
-                    "diagnostics": [
-                        self._analysis_diagnostic_to_lsp(action.diagnostic)
-                    ],
+                    "diagnostics": [self._analysis_diagnostic_to_lsp(action.diagnostic)],
                     "edit": {"changes": changes},
                 }
             )
@@ -1261,8 +1274,10 @@ class LanguageServer:
         payload: list[dict[str, Any]] = []
         for fold in ranges:
             entry: dict[str, Any] = {
-                "startLine": max(fold.start_line - 1, 0),
-                "endLine": max(fold.end_line - 1, 0),
+                "startLine": fold.range.start.line,
+                "startCharacter": fold.range.start.character,
+                "endLine": fold.range.end.line,
+                "endCharacter": fold.range.end.character,
             }
             if fold.kind != "region":
                 entry["kind"] = _FOLDING_RANGE_KINDS[fold.kind]
@@ -1293,18 +1308,7 @@ class LanguageServer:
                 continue
             payload: dict[str, Any] | None = None
             for entry in reversed(chain):
-                node: dict[str, Any] = {
-                    "range": {
-                        "start": {
-                            "line": entry.start_line,
-                            "character": entry.start_character,
-                        },
-                        "end": {
-                            "line": entry.end_line,
-                            "character": entry.end_character,
-                        },
-                    }
-                }
+                node: dict[str, Any] = {"range": _range_to_lsp(entry.range)}
                 if payload is not None:
                     node["parent"] = payload
                 payload = node
@@ -1321,16 +1325,7 @@ class LanguageServer:
             return []
         return [
             {
-                "range": {
-                    "start": {
-                        "line": link.start_line,
-                        "character": link.start_character,
-                    },
-                    "end": {
-                        "line": link.end_line,
-                        "character": link.end_character,
-                    },
-                },
+                "range": _range_to_lsp(link.range),
                 "target": _path_to_uri(link.target_path),
             }
             for link in links
@@ -1345,16 +1340,7 @@ class LanguageServer:
             return []
         return [
             {
-                "range": {
-                    "start": {
-                        "line": lens.start_line,
-                        "character": lens.start_character,
-                    },
-                    "end": {
-                        "line": lens.end_line,
-                        "character": lens.end_character,
-                    },
-                },
+                "range": _range_to_lsp(lens.range),
                 "command": {"title": lens.title, "command": ""},
             }
             for lens in lenses
@@ -1374,9 +1360,7 @@ class LanguageServer:
             return None
         return [_call_hierarchy_item_to_lsp(item) for item in items]
 
-    def _call_hierarchy_incoming_calls(
-        self, params: Any
-    ) -> list[dict[str, Any]] | None:
+    def _call_hierarchy_incoming_calls(self, params: Any) -> list[dict[str, Any]] | None:
         ident = _call_hierarchy_identity_from_item(params.get("item"))
         if ident is None:
             return None
@@ -1394,16 +1378,12 @@ class LanguageServer:
         return [
             {
                 "from": _call_hierarchy_item_to_lsp(call.caller),
-                "fromRanges": [
-                    _call_site_to_lsp_range(site) for site in call.call_sites
-                ],
+                "fromRanges": [_call_site_to_lsp_range(site) for site in call.call_sites],
             }
             for call in results
         ]
 
-    def _call_hierarchy_outgoing_calls(
-        self, params: Any
-    ) -> list[dict[str, Any]] | None:
+    def _call_hierarchy_outgoing_calls(self, params: Any) -> list[dict[str, Any]] | None:
         ident = _call_hierarchy_identity_from_item(params.get("item"))
         if ident is None:
             return None
@@ -1421,9 +1401,7 @@ class LanguageServer:
         return [
             {
                 "to": _call_hierarchy_item_to_lsp(call.callee),
-                "fromRanges": [
-                    _call_site_to_lsp_range(site) for site in call.call_sites
-                ],
+                "fromRanges": [_call_site_to_lsp_range(site) for site in call.call_sites],
             }
             for call in results
         ]
@@ -1442,9 +1420,7 @@ class LanguageServer:
             return None
         return [_type_hierarchy_item_to_lsp(item) for item in items]
 
-    def _type_hierarchy_supertypes(
-        self, params: Any
-    ) -> list[dict[str, Any]] | None:
+    def _type_hierarchy_supertypes(self, params: Any) -> list[dict[str, Any]] | None:
         ident = _type_hierarchy_identity_from_item(params.get("item"))
         if ident is None:
             return None
@@ -1454,16 +1430,12 @@ class LanguageServer:
         except (ValueError, RuntimeError):
             return None
         try:
-            results = self._require_session().type_hierarchy_supertypes(
-                real_path, qualified_name
-            )
+            results = self._require_session().type_hierarchy_supertypes(real_path, qualified_name)
         except FileNotFoundError:
             return None
         return [_type_hierarchy_item_to_lsp(item) for item in results]
 
-    def _type_hierarchy_subtypes(
-        self, params: Any
-    ) -> list[dict[str, Any]] | None:
+    def _type_hierarchy_subtypes(self, params: Any) -> list[dict[str, Any]] | None:
         ident = _type_hierarchy_identity_from_item(params.get("item"))
         if ident is None:
             return None
@@ -1473,9 +1445,7 @@ class LanguageServer:
         except (ValueError, RuntimeError):
             return None
         try:
-            results = self._require_session().type_hierarchy_subtypes(
-                real_path, qualified_name
-            )
+            results = self._require_session().type_hierarchy_subtypes(real_path, qualified_name)
         except FileNotFoundError:
             return None
         return [_type_hierarchy_item_to_lsp(item) for item in results]
@@ -1503,7 +1473,7 @@ class LanguageServer:
             return []
         return [
             {
-                "position": {"line": hint.line, "character": hint.character},
+                "position": _position_to_lsp(hint.position),
                 "label": hint.label,
                 "kind": _INLAY_HINT_KIND_TO_LSP[hint.kind],
                 "paddingLeft": hint.padding_left,
@@ -1519,7 +1489,8 @@ class LanguageServer:
             tokens = session.semantic_tokens_for_file(real_path)
         except FileNotFoundError:
             return {"data": []}
-        return {"data": _encode_semantic_tokens(tokens)}
+        source = session.source_text(real_path) or ""
+        return {"data": _encode_semantic_tokens(tokens, source, self._position_encoding)}
 
     def _semantic_tokens_range(self, params: Any) -> dict[str, Any]:
         session = self._require_session()
@@ -1542,7 +1513,8 @@ class LanguageServer:
             )
         except FileNotFoundError:
             return {"data": []}
-        return {"data": _encode_semantic_tokens(tokens)}
+        source = session.source_text(real_path) or ""
+        return {"data": _encode_semantic_tokens(tokens, source, self._position_encoding)}
 
     def _will_rename_files(self, params: Any) -> dict[str, Any] | None:
         files = params.get("files", []) if isinstance(params, dict) else []
@@ -1569,16 +1541,7 @@ class LanguageServer:
             uri = _path_to_uri(edit.path)
             changes.setdefault(uri, []).append(
                 {
-                    "range": {
-                        "start": {
-                            "line": edit.start_line,
-                            "character": edit.start_character,
-                        },
-                        "end": {
-                            "line": edit.end_line,
-                            "character": edit.end_character,
-                        },
-                    },
+                    "range": _range_to_lsp(edit.range),
                     "newText": edit.new_text,
                 }
             )
@@ -1606,16 +1569,7 @@ class LanguageServer:
             uri = _path_to_uri(edit.path)
             changes.setdefault(uri, []).append(
                 {
-                    "range": {
-                        "start": {
-                            "line": edit.start_line,
-                            "character": edit.start_character,
-                        },
-                        "end": {
-                            "line": edit.end_line,
-                            "character": edit.end_character,
-                        },
-                    },
+                    "range": _range_to_lsp(edit.range),
                     "newText": edit.new_text,
                 }
             )
@@ -1638,16 +1592,10 @@ class LanguageServer:
             return str(Path(self._default_root).resolve(strict=False))
         return str(Path.cwd().resolve(strict=False))
 
-    def _analysis_diagnostic_to_lsp(
-        self, diagnostic: AnalysisDiagnostic
-    ) -> dict[str, Any]:
-        line = max((diagnostic.lineno or 1) - 1, 0)
-        character = max(diagnostic.col_offset or 0, 0)
+    def _analysis_diagnostic_to_lsp(self, diagnostic: AnalysisDiagnostic) -> dict[str, Any]:
+        source_range = diagnostic.range or SourceRange(SourcePosition(0, 0), SourcePosition(0, 1))
         payload: dict[str, Any] = {
-            "range": {
-                "start": {"line": line, "character": character},
-                "end": {"line": line, "character": character + 1},
-            },
+            "range": _range_to_lsp(source_range),
             "severity": _PYINC_SEVERITY_TO_LSP[diagnostic.severity],
             "source": diagnostic.source,
             "code": diagnostic.code,
@@ -1674,30 +1622,47 @@ class LanguageServer:
             raise RuntimeError("LSP session has not been initialized.")
         return self._session
 
-    def _read_message(self) -> dict[str, Any] | None:
-        headers: dict[str, str] = {}
-        while True:
-            line = self._input.readline()
-            if not line:
-                return None
-            decoded = line.decode("utf-8").strip()
-            if not decoded:
-                break
-            key, _, value = decoded.partition(":")
-            headers[key.lower()] = value.strip()
+    def _default_uri(self, params: Any) -> str | None:
+        if not isinstance(params, dict):
+            return None
+        document = params.get("textDocument")
+        if isinstance(document, dict) and isinstance(document.get("uri"), str):
+            return cast(str, document["uri"])
+        item = params.get("item")
+        if isinstance(item, dict) and isinstance(item.get("uri"), str):
+            return cast(str, item["uri"])
+        return None
 
-        content_length = headers.get("content-length")
-        if content_length is None:
-            raise ValueError("Missing Content-Length header.")
-        body = self._input.read(int(content_length))
-        return cast(dict[str, Any], json.loads(body.decode("utf-8")))
+    def _source_for_uri(self, uri: str) -> str | None:
+        if self._session is None:
+            return None
+        try:
+            path = _uri_to_path(uri)
+            return self._session.source_text(path)
+        except (FileNotFoundError, ValueError):
+            return None
+
+    def _read_message(self) -> dict[str, Any] | None:
+        return read_message(self._input)
 
     def _send(self, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        self._output.write(header)
-        self._output.write(body)
-        self._output.flush()
+        write_message(self._output, payload)
+
+    def _send_error(self, request_id: Any, code: int, message: str) -> None:
+        self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": code, "message": message},
+            }
+        )
 
     def _send_notification(self, method: str, params: dict[str, Any]) -> None:
-        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+        converted = convert_payload_positions(
+            params,
+            encoding=self._position_encoding,
+            to_client=True,
+            source_for_uri=self._source_for_uri,
+            uri=params.get("uri") if isinstance(params.get("uri"), str) else None,
+        )
+        self._send({"jsonrpc": "2.0", "method": method, "params": converted})

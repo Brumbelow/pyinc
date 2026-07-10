@@ -16,8 +16,8 @@ Integrations use a layered query architecture:
 
 **Layer 1 -- Payload queries.** `@query`-decorated functions that return tuple-typed
 payloads. These are the kernel-level cached nodes. They read resources, parse data, and
-return simple hashable structures. Examples: `source_text` (python_source.py:583),
-`imports_for_file`, `definitions_for_file`.
+return simple hashable structures. Examples include `source_text`, `imports_for_file`,
+and `definitions_for_file`.
 
 **Layer 2 -- Composition queries.** Queries that call other queries and assemble richer
 composite payloads. Example: `workspace_analysis_payload` calls `module_analysis_payload`
@@ -25,7 +25,7 @@ in a loop over discovered Python files.
 
 **Layer 3 -- High-level entrypoints.** Non-query functions that call `db.get()` and
 decode tuple payloads into frozen dataclasses. These are the public API. Examples:
-`file_analysis` (python_source.py:957), `workspace_analysis` (python_source.py:982).
+`file_analysis` and `workspace_analysis`.
 
 **Why this layering?** The kernel caches and compares tuple payloads efficiently (they are
 snapshot-safe and hashable by default). The decode layer converts to ergonomic dataclasses
@@ -36,12 +36,12 @@ external API stays user-friendly.
 
 All public result types must be `@dataclass(frozen=True)` with snapshot-safe fields:
 
-- Use `str`, `int`, `bool`, `None`, and `tuple` of these types.
+- Use snapshot-safe scalars, tuples, and nested frozen dataclasses such as
+  `SourcePosition` and `SourceRange`.
 - Use `tuple[T, ...]` instead of `list[T]` for collections (tuples are hashable and
   immutable).
 - No `list`, `dict`, or `set` in result type fields.
-- Reference: `ImportRef` (python_source.py:65), `PythonFileAnalysis`
-  (python_source.py:87), `PythonWorkspaceAnalysis` (python_source.py:126).
+- Reference: `ImportRef`, `PythonFileAnalysis`, and `PythonWorkspaceAnalysis`.
 
 **Why?** Frozen dataclasses satisfy the kernel's value boundary ownership condition
 (kernel-contract.md condition 1). The kernel's `freeze`/`thaw` cycle handles them
@@ -49,18 +49,21 @@ automatically without custom `ValueAdapter` registration.
 
 ### Payload Type Aliases
 
-Define a `TypeAlias` for each internal payload shape as a tuple matching the corresponding
-dataclass's field order:
+Define a `TypeAlias` for each internal payload shape. The tuple may use a compact
+representation that differs from the corresponding public dataclass:
 
 ```python
 ImportPayload: TypeAlias = tuple[str, ImportKind, int]
-#                                 module, kind,  lineno  → matches ImportRef fields
+#                                 module, kind,  internal one-based line
 ```
 
-Each layer has a `_decode_*` function that reconstructs the dataclass from its payload.
-Reference: `ImportPayload` (python_source.py:28), `FileAnalysisPayload`
-(python_source.py:55), `_decode_import` (python_source.py:887), `_decode_file_analysis`
-(python_source.py:934).
+Internal payloads may retain compact line-oriented coordinates. Each layer has
+a `_decode_*` function that reconstructs the dataclass and converts source
+locations to the public zero-based, code-point `SourceRange` contract. When the
+payload originates from Python's AST, use the public `DocumentMap` at the parser
+boundary so UTF-8 byte columns are converted exactly once. Reference:
+`ImportPayload`, `FileAnalysisPayload`, `_decode_import`, and
+`_decode_file_analysis`.
 
 **Why?** Tuples are snapshot-safe and hashable by default -- zero-cost for the kernel's
 caching and comparison. The `TypeAlias` makes the bidirectional conversion self-documenting.
@@ -71,27 +74,31 @@ All reads of external state inside a query must go through the Resource API. The
 intercepts `open()`, `os.getenv`, `os.listdir`, `os.scandir`, and `Path.iterdir` during
 query execution and raises `UntrackedReadError` otherwise.
 
-**Built-in resources:** `FileResource`, `FileStatResource`, `EnvResource`,
-`DirectoryResource` cover common cases.
+**Built-in resources:** `FileResource`, `BinaryFileResource`, `FileStatResource`,
+`EnvResource`, and `DirectoryResource` cover common cases.
 
 **Custom resources:** When built-in resources do not fit, define a custom resource as a
-frozen dataclass (or class with `identity()`) implementing four methods:
+frozen dataclass implementing the public `Resource[KeyT, ValueT, ProbeT]` hooks:
 
-- `read(db, key)` -- public read method; delegates to `db._read_resource(self, key)`.
+- `read(db, key)` -- public read method; delegates to `db.read_resource(self, key)`.
 - `label(key)` -- returns a human-readable string for provenance display.
 - `probe(key)` -- returns a cheap, snapshot-safe fingerprint for change detection.
   Must not require `db`. Called on every request.
-- `load(db, key)` -- performs the actual I/O under `db._allow_raw_open()`. Called only
-  when `probe` detects a change.
+- `load(db, key)` -- performs the actual I/O. The database applies raw-read allowance
+  internally while invoking resource hooks.
+- `probe_and_load(db, key)` -- observes the probe and value from one underlying state
+  when separate calls could race.
+- `identity()` -- optionally returns snapshot-safe resource configuration.
 
-Reference: `_SourceTextResource` (python_source.py:132-159) uses SHA-256 content hashing
-in `probe` for precise invalidation beyond stat-based detection.
+Reference: `_SourceTextResource` uses SHA-256 content hashing in `probe` for precise
+invalidation beyond stat-based detection.
 
 Instantiate resources as **module-level singletons**: `_FILES = _SourceTextResource()`,
-`_DIRECTORIES = DirectoryResource()` (python_source.py:161-162).
+`_DIRECTORIES = DirectoryResource()`.
 
 **Why?** Resources are how the kernel enforces tracked ambient reads (kernel-contract.md
-condition 2). The `probe`/`load` separation keeps cheap change detection on the fast path.
+condition 2). `probe_and_load` prevents torn observations while `probe` keeps validation
+cheap on the fast path.
 Resource configuration is part of the node key, so the resource must be snapshot-safe.
 
 ### Conservative Resolution and Untracked Reads
@@ -101,13 +108,13 @@ Two principles for maintaining the soundness guarantee:
 **Prefer conservative outcomes over optimistic reuse.** When your integration cannot
 determine a dependency statically, return `ambiguous` or `missing` rather than guessing.
 Optimistic reuse risks from-scratch inconsistency. Reference:
-`_resolve_workspace_module` (python_source.py:429) returns `"ambiguous"` when multiple
-paths match a module prefix.
+`_resolve_workspace_module` returns `"ambiguous"` when multiple paths match a module
+prefix.
 
 **Mark unsupported cases as untracked.** When static analysis hits a pattern it cannot
 handle deterministically, call `db.report_untracked_read(reason)`. This forces
 re-execution on every request but preserves correctness. Reference:
-`module_export_surface` (python_source.py:821) marks dynamic `__all__` as untracked.
+`module_export_surface` marks dynamic `__all__` as untracked.
 
 **Why?** From-scratch consistency is the kernel's primary guarantee. Re-execution is
 always safe; stale reuse is never safe. An integration that guesses wrong about reuse
@@ -126,9 +133,9 @@ def _source_cutoff_token(source: str) -> tuple[str, str]:
         return ("source", source)
 ```
 
-Reference: `source_text` (python_source.py:583) uses `_source_cutoff_token`
-(python_source.py:186). A comment-only edit produces the same AST dump, so the kernel
-backdates `source_text` and downstream queries are reused without re-execution.
+Reference: `source_text` uses `_source_cutoff_token`. A comment-only edit produces the
+same AST dump, so the kernel backdates `source_text` and downstream queries are reused
+without re-execution.
 
 **Why?** Cutoff functions are the mechanism that enables backdating -- the Salsa/Skyframe
 optimization that prevents false ripple when recomputation yields a semantically equivalent
@@ -141,8 +148,8 @@ When your integration traverses directory trees or recursive structures:
 - Track a `visited` set of canonical (resolved) paths.
 - Use `Path.resolve()` to canonicalize before comparing.
 - Check root containment before recursing to prevent escaping the workspace.
-- Reference: `_collect_python_files` (python_source.py:546-579) uses
-  `visited_directories`, `_canonical_path`, and `_is_within_root` for safe traversal.
+- Reference: `_collect_python_files` uses `visited_directories`, `_canonical_path`,
+  and `_is_within_root` for safe traversal.
 
 ### Stable API Surface
 
@@ -150,9 +157,7 @@ Define the public boundary explicitly:
 
 1. Add `__all__` to your integration module listing stable dataclass types,
    high-level entrypoints, and any payload/composition queries other integrations
-   depend on at the query layer. Reference: python_source.py:995-1013 lists 8 types
-   and 9 functions (4 high-level entrypoints plus 5 composition-layer queries used
-   by `symbol_resolution` and others).
+   depend on at the query layer. `python_source.__all__` is the reference shape.
 2. Add re-exports in `src/pyinc/integrations/__init__.py` for only those stable
    names.
 3. Experimental helpers (payload queries, decode functions, internal utilities) stay
@@ -167,8 +172,13 @@ query's result changes, the downstream query is re-verified and re-executed as n
 
 **Rules:**
 
-- Cross-integration imports must target public `@query` functions listed in the upstream
-  module's `__all__`. Never import `_`-prefixed internals from another integration.
+- Cross-integration query imports must target public `@query` functions listed in the
+  upstream module's `__all__`. Never import `_`-prefixed helpers from another
+  integration module.
+- Pure parsing primitives shared by multiple integrations belong behind a named
+  interface in a dedicated internal module. For example, `requirement_evaluation`
+  and `dependency_check` both use `_pep440` rather than importing one another's
+  private helpers.
 - The importing integration gains an incremental dependency edge tracked by the runtime.
   No special wiring is required beyond calling `db.get()` on the imported query (or
   calling it directly inside another `@query`, which the kernel intercepts).
@@ -177,8 +187,8 @@ query's result changes, the downstream query is re-verified and re-executed as n
   user-facing entrypoints.
 
 **Reference:** `python_source` imports `environment_index` from `installed_packages`
-(python_source.py:12) and calls it during import resolution (python_source.py:744)
-to classify non-workspace imports as `stdlib`, `installed`, or `missing`.
+and calls it during import resolution to classify non-workspace imports as `stdlib`,
+`installed`, or `missing`.
 
 ### Testing
 
@@ -204,9 +214,11 @@ A new integration needs:
 
 - [ ] All public result types are `@dataclass(frozen=True)` with snapshot-safe fields
 - [ ] All ambient reads go through resources or `db.report_untracked_read()`
-- [ ] Payload queries return `TypeAlias`-typed tuples matching dataclass field order
+- [ ] Payload queries return documented `TypeAlias`-typed tuples, with explicit decode
+      transformations where the public dataclass shape differs
 - [ ] High-level entrypoints decode payloads into frozen dataclasses
-- [ ] Custom resources implement `read`/`label`/`probe`/`load` as frozen dataclasses
+- [ ] Custom resources implement the public
+      `read`/`label`/`probe`/`load`/`probe_and_load`/`identity` hooks as frozen dataclasses
 - [ ] Resource instances are module-level singletons
 - [ ] Uncertain resolution cases return conservative outcomes, not optimistic reuse
 - [ ] Dynamic or unsupported cases call `db.report_untracked_read(reason)`

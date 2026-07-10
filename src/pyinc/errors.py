@@ -19,3 +19,51 @@ class UnsupportedValueError(PyIncError):
 
 class CycleError(PyIncError):
     """Raised when query evaluation encounters a dependency cycle."""
+
+
+class InputKeyError(PyIncError, ValueError):
+    """Raised when an input key is invalid or conflicts within a database."""
+
+
+class CheckpointError(PyIncError):
+    """Base error for durable-checkpoint failures."""
+
+
+class CheckpointVersionError(CheckpointError, ValueError):
+    """Raised when a checkpoint uses an unsupported manifest or kernel version."""
+
+
+class CheckpointManifestError(CheckpointError, ValueError):
+    """Raised when a checkpoint manifest is malformed or internally inconsistent."""
+
+
+class CheckpointIntegrityError(CheckpointManifestError):
+    """Raised when checkpoint bytes do not match their content address."""
+
+
+class ActionError(PyIncError):
+    """Base error for output reconciliation failures."""
+
+
+class ActionPathError(ActionError, ValueError):
+    """Raised when an action output path is unsafe or ambiguous."""
+
+
+class ActionManifestError(ActionError, ValueError):
+    """Raised when an action ownership manifest is malformed or untrusted."""
+
+
+class ActionLockTimeoutError(ActionError, TimeoutError):
+    """Raised when an action cannot acquire its filesystem lock in time."""
+
+
+class ArtifactStoreError(PyIncError):
+    """Base error for artifact-store failures."""
+
+
+class ArtifactStoreKeyError(ArtifactStoreError, ValueError):
+    """Raised when an artifact key is malformed or unsafe."""
+
+
+class ArtifactStoreLockError(ArtifactStoreError, TimeoutError):
+    """Raised when an artifact-store lock cannot be acquired."""

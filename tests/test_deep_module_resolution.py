@@ -19,9 +19,7 @@ from pyinc.integrations.deep_module_resolution import (
 )
 
 
-def _install_search_paths(
-    monkeypatch: pytest.MonkeyPatch, paths: tuple[str, ...]
-) -> None:
+def _install_search_paths(monkeypatch: pytest.MonkeyPatch, paths: tuple[str, ...]) -> None:
     monkeypatch.setattr(
         "pyinc.integrations.deep_module_resolution._get_sys_path_entries",
         lambda: paths,
@@ -125,9 +123,7 @@ def test_pth_exec_line_recorded_as_diagnostic(
 ) -> None:
     site = tmp_path / "site"
     site.mkdir()
-    (site / "weird.pth").write_text(
-        "# a comment\nimport something_fancy\n", encoding="utf-8"
-    )
+    (site / "weird.pth").write_text("# a comment\nimport something_fancy\n", encoding="utf-8")
 
     _install_search_paths(monkeypatch, (str(site),))
     db = Database()
@@ -269,9 +265,7 @@ def test_missing_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 # ---------------------------------------------------------------------------
 
 
-def test_pth_comment_edit_backdates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_pth_comment_edit_backdates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site = tmp_path / "site"
     site.mkdir()
     extra = tmp_path / "extra"
@@ -309,36 +303,26 @@ def test_deep_module_resolution_matches_fresh_recomputation(
         return Database(mode=mode)
 
     # Step 1: empty
-    assert deep_module_resolution_analysis(
-        incremental
-    ) == deep_module_resolution_analysis(fresh())
+    assert deep_module_resolution_analysis(incremental) == deep_module_resolution_analysis(fresh())
 
     # Step 2: add a .pth file pointing to an extra path
     extra = tmp_path / "extra"
     extra.mkdir()
     (site / "a.pth").write_text(f"{extra}\n", encoding="utf-8")
-    assert deep_module_resolution_analysis(
-        incremental
-    ) == deep_module_resolution_analysis(fresh())
+    assert deep_module_resolution_analysis(incremental) == deep_module_resolution_analysis(fresh())
 
     # Step 3: add a namespace contribution under extra
     (extra / "ns").mkdir()
     (extra / "ns" / "leaf.py").write_text("", encoding="utf-8")
-    assert deep_module_resolution_analysis(
-        incremental
-    ) == deep_module_resolution_analysis(fresh())
+    assert deep_module_resolution_analysis(incremental) == deep_module_resolution_analysis(fresh())
 
     # Step 4: convert the namespace into a regular package
     (extra / "ns" / "__init__.py").write_text("", encoding="utf-8")
-    assert deep_module_resolution_analysis(
-        incremental
-    ) == deep_module_resolution_analysis(fresh())
+    assert deep_module_resolution_analysis(incremental) == deep_module_resolution_analysis(fresh())
 
     # Step 5: remove the .pth file
     (site / "a.pth").unlink()
-    assert deep_module_resolution_analysis(
-        incremental
-    ) == deep_module_resolution_analysis(fresh())
+    assert deep_module_resolution_analysis(incremental) == deep_module_resolution_analysis(fresh())
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -368,9 +352,7 @@ def test_resolve_module_location_matches_fresh_recomputation(
     (site / "pkg" / "leaf.py").write_text("", encoding="utf-8")
     fresh3 = Database(mode=mode)
     assert resolve_module_path(incremental, "pkg") == resolve_module_path(fresh3, "pkg")
-    assert resolve_module_path(incremental, "pkg.leaf") == resolve_module_path(
-        fresh3, "pkg.leaf"
-    )
+    assert resolve_module_path(incremental, "pkg.leaf") == resolve_module_path(fresh3, "pkg.leaf")
 
 
 # ---------------------------------------------------------------------------

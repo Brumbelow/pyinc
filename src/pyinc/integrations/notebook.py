@@ -9,9 +9,12 @@ from pathlib import Path
 from typing import Any, Literal, TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.resources import DirectoryResource, _file_read_snapshot
+from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
+
+from ._resources import file_read_snapshot
+from .source_geometry import DocumentMap, SourcePosition, SourceRange, identifier_range
 
 CellType: TypeAlias = Literal["code", "markdown", "raw", "unknown"]
 ImportKind: TypeAlias = Literal["import", "from"]
@@ -41,14 +44,14 @@ NotebookAnalysisPayload: TypeAlias = tuple[
 class NotebookImport:
     module: str
     kind: ImportKind
-    lineno: int
+    range: SourceRange
 
 
 @dataclass(frozen=True)
 class NotebookDefinition:
     name: str
     kind: DefinitionKind
-    lineno: int
+    range: SourceRange
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,7 @@ class NotebookDiagnostic:
     code: str
     message: str
     cell_index: int | None
+    range: SourceRange | None
 
 
 @dataclass(frozen=True)
@@ -87,7 +91,7 @@ class _NotebookFileResource:
     encoding: str = "utf-8"
 
     def read(self, db: Database, path: str | os.PathLike[str]) -> str:
-        return cast(str, db._read_resource(self, os.fspath(path)))
+        return cast(str, db.read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"notebookfile[{path}]"
@@ -102,13 +106,10 @@ class _NotebookFileResource:
         file_path = Path(path)
         if not file_path.exists():
             return ""
-        with db._allow_raw_open():
-            return file_path.read_text(encoding=self.encoding)
+        return file_path.read_text(encoding=self.encoding)
 
-    def probe_and_load(
-        self, db: Database, path: str
-    ) -> tuple[tuple[str, str] | tuple[str], str]:
-        probe, text = _file_read_snapshot(path, self.encoding)
+    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
+        probe, text = file_read_snapshot(path, self.encoding)
         return probe, text if text is not None else ""
 
 
@@ -271,9 +272,7 @@ def notebook_cells_payload(db: Database, path: str) -> tuple[NotebookCellPayload
 
 
 @query
-def notebook_diagnostics_payload(
-    db: Database, path: str
-) -> tuple[NotebookDiagnosticPayload, ...]:
+def notebook_diagnostics_payload(db: Database, path: str) -> tuple[NotebookDiagnosticPayload, ...]:
     text = notebook_text(db, path)
     if not text:
         return ()
@@ -343,39 +342,117 @@ def notebook_analysis_payload(db: Database, path: str) -> NotebookAnalysisPayloa
 # ---------------------------------------------------------------------------
 
 
+def _payload_range(lineno: int) -> SourceRange:
+    position = SourcePosition(max(lineno - 1, 0), 0)
+    return SourceRange(position, position)
+
+
+def _definition_name_range(
+    document: DocumentMap,
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> SourceRange:
+    return identifier_range(document.source, node, node.name)
+
+
+def _cell_ranges(
+    source: str,
+) -> tuple[dict[int, SourceRange], dict[tuple[int, str], SourceRange]]:
+    document = DocumentMap(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}, {}
+    imports: dict[int, SourceRange] = {}
+    definitions: dict[tuple[int, str], SourceRange] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imports.setdefault(node.lineno, document.ast_range(node))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions[(node.lineno, node.name)] = _definition_name_range(document, node)
+    return imports, definitions
+
+
 def _decode_cell(payload: NotebookCellPayload) -> NotebookCell:
     index, cell_type, source, heading, imports, definitions = payload
+    import_ranges, definition_ranges = _cell_ranges(source)
     return NotebookCell(
         index=index,
         cell_type=cell_type,
         source=source,
         heading=heading,
         imports=tuple(
-            NotebookImport(module=m, kind=k, lineno=ln) for m, k, ln in imports
+            NotebookImport(
+                module=module,
+                kind=kind,
+                range=import_ranges.get(lineno, _payload_range(lineno)),
+            )
+            for module, kind, lineno in imports
         ),
         definitions=tuple(
-            NotebookDefinition(name=n, kind=k, lineno=ln) for n, k, ln in definitions
+            NotebookDefinition(
+                name=name,
+                kind=kind,
+                range=definition_ranges.get((lineno, name), _payload_range(lineno)),
+            )
+            for name, kind, lineno in definitions
         ),
     )
 
 
-def _decode_diagnostic(payload: NotebookDiagnosticPayload) -> NotebookDiagnostic:
+def _syntax_error_range(source: str) -> SourceRange | None:
+    try:
+        ast.parse(source)
+    except SyntaxError as exc:
+        if exc.lineno is None:
+            return None
+        start = SourcePosition(max(exc.lineno - 1, 0), max((exc.offset or 1) - 1, 0))
+        end = SourcePosition(
+            max((exc.end_lineno or exc.lineno) - 1, 0),
+            max((exc.end_offset or exc.offset or 1) - 1, 0),
+        )
+        if end <= start:
+            end = SourcePosition(start.line, start.character + 1)
+        return SourceRange(start, end)
+    return None
+
+
+def _decode_diagnostic(
+    payload: NotebookDiagnosticPayload,
+    cells: tuple[NotebookCell, ...],
+    notebook_text_value: str,
+) -> NotebookDiagnostic:
     code, message, cell_index = payload
-    return NotebookDiagnostic(code=code, message=message, cell_index=cell_index)
+    source_range: SourceRange | None = None
+    if code == "syntax-error" and cell_index is not None:
+        cell = next((item for item in cells if item.index == cell_index), None)
+        if cell is not None:
+            source_range = _syntax_error_range(cell.source)
+    elif code == "notebook-decode-error":
+        try:
+            json.loads(notebook_text_value)
+        except json.JSONDecodeError as exc:
+            start = SourcePosition(exc.lineno - 1, exc.colno - 1)
+            source_range = SourceRange(start, SourcePosition(start.line, start.character + 1))
+    return NotebookDiagnostic(
+        code=code,
+        message=message,
+        cell_index=cell_index,
+        range=source_range,
+    )
 
 
 def notebook_analysis(db: Database, path: str | os.PathLike[str]) -> NotebookAnalysis:
     normalized = os.fspath(path)
-    payload = cast(
-        NotebookAnalysisPayload, thaw(db.get(notebook_analysis_payload, normalized))
-    )
+    payload = cast(NotebookAnalysisPayload, thaw(db.get(notebook_analysis_payload, normalized)))
     path_str, kernel_name, language, cells, diagnostics = payload
+    decoded_cells = tuple(_decode_cell(c) for c in cells)
+    text = notebook_text(db, normalized)
     return NotebookAnalysis(
         path=path_str,
         kernel_name=kernel_name,
         language=language,
-        cells=tuple(_decode_cell(c) for c in cells),
-        diagnostics=tuple(_decode_diagnostic(d) for d in diagnostics),
+        cells=decoded_cells,
+        diagnostics=tuple(_decode_diagnostic(d, decoded_cells, text) for d in diagnostics),
     )
 
 
@@ -389,9 +466,7 @@ def workspace_notebook_analysis(
     except NotADirectoryError:
         return ()
     base = Path(normalized_root)
-    notebook_paths = tuple(
-        str(base / name) for name in entries if name.endswith(".ipynb")
-    )
+    notebook_paths = tuple(str(base / name) for name in entries if name.endswith(".ipynb"))
     return tuple(notebook_analysis(db, p) for p in notebook_paths)
 
 

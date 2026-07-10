@@ -1,27 +1,30 @@
 from __future__ import annotations
 
 import contextlib
+import email.policy
 import hashlib
 import os
 import re
 import site
 import sys
 from dataclasses import dataclass
+from email.message import Message
+from email.parser import Parser
 from pathlib import Path
 from typing import TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.resources import DirectoryResource, _file_read_snapshot
+from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
+
+from ._resources import file_read_snapshot
 
 # ---------------------------------------------------------------------------
 # Payload type aliases
 # ---------------------------------------------------------------------------
 
-InstalledPackagePayload: TypeAlias = tuple[
-    str, str, tuple[str, ...], tuple[str, ...], str
-]
+InstalledPackagePayload: TypeAlias = tuple[str, str, tuple[str, ...], tuple[str, ...], str]
 #                                          dist_name, version, top_level_names, requires_dist, summary
 
 DiagnosticPayload: TypeAlias = tuple[str, str]
@@ -78,7 +81,7 @@ class InstalledPackagesAnalysis:
 @dataclass(frozen=True)
 class _DistInfoMetadataResource:
     def read(self, db: Database, path: str | os.PathLike[str]) -> str:
-        return cast(str, db._read_resource(self, os.fspath(path)))
+        return cast(str, db.read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"dist-info-metadata[{path}]"
@@ -93,13 +96,10 @@ class _DistInfoMetadataResource:
         file_path = Path(path)
         if not file_path.exists():
             return ""
-        with db._allow_raw_open():
-            return file_path.read_text(encoding="utf-8")
+        return file_path.read_text(encoding="utf-8")
 
-    def probe_and_load(
-        self, db: Database, path: str
-    ) -> tuple[tuple[str, str] | tuple[str], str]:
-        probe, text = _file_read_snapshot(path, "utf-8")
+    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
+        probe, text = file_read_snapshot(path, "utf-8")
         return probe, text if text is not None else ""
 
 
@@ -107,11 +107,34 @@ _METADATA = _DistInfoMetadataResource()
 _DIRECTORIES = DirectoryResource()
 
 
+@dataclass(frozen=True)
+class _SitePackagesResource:
+    def read(self, db: Database) -> tuple[str, ...]:
+        return cast(tuple[str, ...], db.read_resource(self, "python"))
+
+    def label(self, _key: str) -> str:
+        return "site-packages"
+
+    def probe(self, _key: str) -> tuple[str, ...]:
+        return _get_site_packages_dirs()
+
+    def load(self, _db: Database, _key: str) -> tuple[str, ...]:
+        return _get_site_packages_dirs()
+
+    def probe_and_load(self, _db: Database, _key: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        value = _get_site_packages_dirs()
+        return value, value
+
+
+_SITE_PACKAGES = _SitePackagesResource()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _DIST_INFO_PAT = r"^(.+)-(.+)\.dist-info$"
+_METADATA_HEADER_PAT = r"^[A-Za-z0-9][A-Za-z0-9-]*:"
 
 
 def _normalize_dist_name(name: str) -> str:
@@ -124,17 +147,36 @@ def _dist_name_to_import_fallback(dist_name: str) -> str:
     return re.sub(r"[-_.]+", "_", dist_name).lower()
 
 
+def _metadata_message(text: str) -> Message:
+    """Parse metadata while tolerating blank lines between header fields."""
+
+    lines = text.splitlines()
+    normalized: list[str] = []
+    for index, line in enumerate(lines):
+        if line.strip():
+            normalized.append(line)
+            continue
+        following = next(
+            (candidate for candidate in lines[index + 1 :] if candidate.strip()),
+            "",
+        )
+        if following and re.match(_METADATA_HEADER_PAT, following):
+            continue
+        normalized.append(line)
+    return Parser(policy=email.policy.default).parsestr("\n".join(normalized), headersonly=True)
+
+
 def _parse_metadata_field(text: str, field_name: str) -> str | None:
     """Extract a single-value field from email-style METADATA."""
-    pat = r"^" + re.escape(field_name) + r": (.+)$"
-    m = re.search(pat, text, re.MULTILINE)
-    return m.group(1).strip() if m else None
+    message = _metadata_message(text)
+    value = message.get(field_name)
+    return str(value).strip() if value is not None else None
 
 
 def _parse_metadata_fields(text: str, field_name: str) -> tuple[str, ...]:
     """Extract all occurrences of a multi-value field from METADATA."""
-    pat = r"^" + re.escape(field_name) + r": (.+)$"
-    return tuple(m.group(1).strip() for m in re.finditer(pat, text, re.MULTILINE))
+    message = _metadata_message(text)
+    return tuple(str(value).strip() for value in message.get_all(field_name, ()))
 
 
 def _metadata_cutoff_token(text: str) -> tuple[str, ...]:
@@ -178,13 +220,8 @@ def _get_stdlib_modules() -> tuple[str, ...]:
 
 @query
 def _site_packages_dirs(db: Database) -> tuple[str, ...]:
-    """Discover site-packages directories. Marks sys.path as untracked."""
-    db.report_untracked_read("sys.path is a mutable runtime list")
-    # site.getsitepackages() and site.getusersitepackages() check os.environ
-    # (e.g. VIRTUAL_ENV) internally on Python 3.11+. Since this query already
-    # declares all its reads as untracked, suppress the environ guard here.
-    with db._allow_raw_open():
-        return _get_site_packages_dirs()
+    """Discover site-packages through a tracked environment resource."""
+    return _SITE_PACKAGES.read(db)
 
 
 @query

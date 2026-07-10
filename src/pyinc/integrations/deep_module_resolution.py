@@ -10,9 +10,11 @@ from typing import TypeAlias, cast
 
 from pyinc.core import query
 from pyinc.integrations.installed_packages import environment_index
-from pyinc.resources import DirectoryResource, FileStatResource, _file_read_snapshot
+from pyinc.resources import DirectoryResource, FileStatResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
+
+from ._resources import file_read_snapshot
 
 # ---------------------------------------------------------------------------
 # Payload type aliases
@@ -103,7 +105,7 @@ class _PthFileResource:
     """Read a .pth file, returning empty string when absent."""
 
     def read(self, db: Database, path: str | os.PathLike[str]) -> str:
-        return cast(str, db._read_resource(self, os.fspath(path)))
+        return cast(str, db.read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"pth-file[{path}]"
@@ -118,13 +120,10 @@ class _PthFileResource:
         file_path = Path(path)
         if not file_path.exists():
             return ""
-        with db._allow_raw_open():
-            return file_path.read_text(encoding="utf-8")
+        return file_path.read_text(encoding="utf-8")
 
-    def probe_and_load(
-        self, db: Database, path: str
-    ) -> tuple[tuple[str, str] | tuple[str], str]:
-        probe, text = _file_read_snapshot(path, "utf-8")
+    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
+        probe, text = file_read_snapshot(path, "utf-8")
         return probe, text if text is not None else ""
 
 
@@ -347,9 +346,7 @@ def _descend(
 
 
 @query
-def resolve_module_location(
-    db: Database, dotted_name: str
-) -> ResolvedModuleLocationPayload:
+def resolve_module_location(db: Database, dotted_name: str) -> ResolvedModuleLocationPayload:
     """Resolve ``dotted_name`` to a module file, package directory, or namespace.
 
     Cross-integration composition query: exported in this module's ``__all__``

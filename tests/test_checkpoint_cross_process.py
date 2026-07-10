@@ -195,9 +195,7 @@ def cross_process(tmp_path: Path) -> CrossProcessEnv:
         # .pyc and mask the module bump. It also keeps tmp_path free of debris.
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    saved = _run(
-        [sys.executable, str(script), str(store_dir), "save", "unchanged"], env
-    )
+    saved = _run([sys.executable, str(script), str(store_dir), "save", "unchanged"], env)
     assert saved["result"] == BASE_RESULT
     return CrossProcessEnv(
         python=sys.executable,

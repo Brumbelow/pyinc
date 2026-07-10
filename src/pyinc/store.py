@@ -10,12 +10,32 @@ declared inputs and resource probes are unchanged.
 
 from __future__ import annotations
 
-import contextlib
 import os
-import tempfile
+import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+
+from ._locking import FileLock, _validate_lock_timeout
+from ._safe_fs import (
+    UnsafeFilesystemPathError,
+    atomic_write,
+    ensure_directory,
+    read_regular_file,
+)
+from .errors import ArtifactStoreError, ArtifactStoreKeyError, ArtifactStoreLockError
+
+_STORE_KEY = re.compile(r"(?:[0-9a-f]{64}|ck[0-9a-f]{64})\Z")
+
+
+def _validate_store_key(key: str) -> str:
+    if type(key) is not str or _STORE_KEY.fullmatch(key) is None:
+        raise ArtifactStoreKeyError(
+            "Artifact-store keys must be a 64-character lowercase hexadecimal digest "
+            "or 'ck' followed by such a digest."
+        )
+    return key
 
 
 @runtime_checkable
@@ -51,6 +71,8 @@ class InMemoryArtifactStore:
         return self._items.get(digest)
 
     def put(self, digest: str, payload: bytes) -> None:
+        if type(payload) is not bytes:
+            raise TypeError("Artifact payloads must be bytes.")
         existing = self._items.get(digest)
         if existing is not None:
             if existing != payload:
@@ -71,57 +93,135 @@ class InMemoryArtifactStore:
 class FileSystemArtifactStore:
     """Disk-backed content-addressed store. Layout: ``<root>/objects/<digest[:2]>/<digest[2:]>``,
     with two-character fan-out so a workspace's worth of digests stays under
-    common-filesystem directory-size limits. Writes are atomic via ``tempfile``
-    in the same directory plus :func:`os.replace`."""
+    common-filesystem directory-size limits. Per-digest process locks and
+    no-follow same-directory atomic publication reject symlink and observed
+    parent-rename races. As on other POSIX filesystem APIs, callers must not let
+    non-cooperating processes rename the store root during a mutation."""
 
-    def __init__(self, root: str | os.PathLike[str]) -> None:
-        self._root = Path(root)
+    def __init__(self, root: str | os.PathLike[str], *, lock_timeout: float = 30.0) -> None:
+        lock_timeout = _validate_lock_timeout(lock_timeout)
+        try:
+            self._root = Path(root).resolve(strict=False)
+        except (OSError, ValueError) as error:
+            raise ArtifactStoreError(f"Artifact-store root path is invalid: {error}") from error
         self._objects = self._root / "objects"
-        self._objects.mkdir(parents=True, exist_ok=True)
+        self._locks = self._root / "locks"
+        self._lock_timeout = lock_timeout
+        self._ensure_directory(self._root, create=True)
+        self._ensure_directory(self._objects, create=True)
+        self._ensure_directory(self._locks, create=True)
 
     @property
     def root(self) -> Path:
         return self._root
 
     def _path_for(self, digest: str) -> Path:
-        if len(digest) < 3:
-            raise ValueError(
-                f"Digest {digest!r} is too short for filesystem fan-out layout."
-            )
+        digest = _validate_store_key(digest)
         return self._objects / digest[:2] / digest[2:]
 
-    def get(self, digest: str) -> bytes | None:
-        path = self._path_for(digest)
+    def _lock_path_for(self, digest: str) -> Path:
+        digest = _validate_store_key(digest)
+        return self._locks / digest[:2] / f"{digest[2:]}.lock"
+
+    def _ensure_directory(self, path: Path, *, create: bool) -> bool:
+        if create:
+            try:
+                ensure_directory(path)
+            except UnsafeFilesystemPathError as error:
+                raise ArtifactStoreError(
+                    f"Artifact-store path is not a directory: {path}"
+                ) from error
+            except OSError as error:
+                raise ArtifactStoreError(
+                    f"Cannot safely create artifact-store directory: {path}"
+                ) from error
         try:
-            return path.read_bytes()
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ArtifactStoreError(f"Artifact-store path is not a directory: {path}")
+        resolved = path.resolve(strict=True)
+        try:
+            common = os.path.commonpath((os.fspath(self._root), os.fspath(resolved)))
+        except ValueError as error:
+            raise ArtifactStoreError(f"Artifact-store path escapes its root: {path}") from error
+        if common != os.fspath(self._root):
+            raise ArtifactStoreError(f"Artifact-store path escapes its root: {path}")
+        return True
+
+    def _object_state(
+        self, digest: str, *, create_parent: bool
+    ) -> tuple[Path, os.stat_result | None]:
+        target = self._path_for(digest)
+        if not self._ensure_directory(self._objects, create=False):
+            raise ArtifactStoreError("Artifact-store objects directory is missing.")
+        if not self._ensure_directory(target.parent, create=create_parent):
+            return target, None
+        try:
+            metadata = target.lstat()
+        except FileNotFoundError:
+            return target, None
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ArtifactStoreError(f"Artifact-store object is not a regular file: {target}")
+        return target, metadata
+
+    def _prepare_lock(self, digest: str) -> Path:
+        lock_path = self._lock_path_for(digest)
+        if not self._ensure_directory(self._locks, create=False):
+            raise ArtifactStoreError("Artifact-store locks directory is missing.")
+        self._ensure_directory(lock_path.parent, create=True)
+        return lock_path
+
+    def get(self, digest: str) -> bytes | None:
+        path, metadata = self._object_state(digest, create_parent=False)
+        if metadata is None:
+            return None
+        try:
+            return read_regular_file(path)
         except FileNotFoundError:
             return None
+        except UnsafeFilesystemPathError as error:
+            raise ArtifactStoreError(str(error)) from error
 
     def put(self, digest: str, payload: bytes) -> None:
+        if type(payload) is not bytes:
+            raise TypeError("Artifact payloads must be bytes.")
         target = self._path_for(digest)
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        if target.exists():
-            existing = target.read_bytes()
-            if existing != payload:
-                raise ValueError(
-                    f"Digest collision in FileSystemArtifactStore for {digest!r}: refusing to "
-                    "overwrite existing payload with different bytes."
-                )
-            return
-
-        # Atomic write: tmpfile in the same directory + os.replace.
-        fd, tmp_path = tempfile.mkstemp(dir=target.parent, prefix=".tmp-")
-        replaced = False
+        lock = FileLock(self._prepare_lock(digest), timeout=self._lock_timeout)
         try:
-            with os.fdopen(fd, "wb") as fp:
-                fp.write(payload)
-            os.replace(tmp_path, target)
-            replaced = True
+            lock.acquire()
+        except TimeoutError as error:
+            raise ArtifactStoreLockError(
+                f"Timed out waiting to store artifact {digest!r}."
+            ) from error
+        except OSError as error:
+            raise ArtifactStoreError(
+                f"Cannot safely acquire the artifact lock for {digest!r}: {error}"
+            ) from error
+        try:
+            target, metadata = self._object_state(digest, create_parent=True)
+            try:
+                existing = read_regular_file(target) if metadata is not None else None
+            except FileNotFoundError:
+                existing = None
+            except UnsafeFilesystemPathError as error:
+                raise ArtifactStoreError(str(error)) from error
+            if existing is not None:
+                if existing != payload:
+                    raise ValueError(
+                        f"Digest collision in FileSystemArtifactStore for {digest!r}: "
+                        "refusing to overwrite existing payload with different bytes."
+                    )
+                return
+
+            try:
+                atomic_write(target, payload)
+            except UnsafeFilesystemPathError as error:
+                raise ArtifactStoreError(str(error)) from error
         finally:
-            if not replaced:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(tmp_path)
+            lock.release()
 
     def contains(self, digest: str) -> bool:
-        return self._path_for(digest).exists()
+        _path, metadata = self._object_state(digest, create_parent=False)
+        return metadata is not None

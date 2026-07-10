@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
 from pyinc.core import query
+from pyinc.integrations._pep440 import (
+    compare_versions,
+    parse_specifier_set,
+    parse_version,
+    satisfies,
+)
 from pyinc.integrations.installed_packages import installed_distributions_index
 from pyinc.integrations.requirements_txt import (
     RequirementPayload,
@@ -22,9 +28,7 @@ from pyinc.value import thaw
 # Payload type aliases
 # ---------------------------------------------------------------------------
 
-PythonEnvironmentPayload: TypeAlias = tuple[
-    str, str, str, str, str, str, str, str, str, str, str
-]
+PythonEnvironmentPayload: TypeAlias = tuple[str, str, str, str, str, str, str, str, str, str, str]
 #   python_version, python_full_version, implementation_name, implementation_version,
 #   os_name, sys_platform, platform_system, platform_release, platform_machine,
 #   platform_python_implementation, platform_version
@@ -138,7 +142,7 @@ def _current_python_env() -> PythonEnvironmentPayload:
 @dataclass(frozen=True)
 class _PythonEnvironmentResource:
     def read(self, db: Database) -> PythonEnvironmentPayload:
-        return cast(PythonEnvironmentPayload, db._read_resource(self, "python"))
+        return cast(PythonEnvironmentPayload, db.read_resource(self, "python"))
 
     def label(self, _key: str) -> str:
         return "py-env"
@@ -149,311 +153,15 @@ class _PythonEnvironmentResource:
     def load(self, _db: Database, _key: str) -> PythonEnvironmentPayload:
         return _current_python_env()
 
+    def probe_and_load(
+        self, _db: Database, _key: str
+    ) -> tuple[PythonEnvironmentPayload, PythonEnvironmentPayload]:
+        value = _current_python_env()
+        return value, value
+
 
 _PY_ENV = _PythonEnvironmentResource()
 _DIRECTORIES = DirectoryResource()
-
-
-# ---------------------------------------------------------------------------
-# PEP 440 — version parsing and comparison
-# ---------------------------------------------------------------------------
-
-_VERSION_PAT = (
-    r"^"
-    r"(?:(?P<epoch>[0-9]+)!)?"
-    r"(?P<release>[0-9]+(?:\.[0-9]+)*)"
-    r"(?:"
-    r"[-_.]?"
-    r"(?P<pre_l>a|b|c|rc|alpha|beta|pre|preview)"
-    r"[-_.]?"
-    r"(?P<pre_n>[0-9]+)?"
-    r")?"
-    r"(?P<post>"
-    r"(?:-(?P<post_n1>[0-9]+))"
-    r"|"
-    r"(?:"
-    r"[-_.]?"
-    r"(?P<post_l>post|rev|r)"
-    r"[-_.]?"
-    r"(?P<post_n2>[0-9]+)?"
-    r")"
-    r")?"
-    r"(?:"
-    r"[-_.]?"
-    r"(?P<dev_l>dev)"
-    r"[-_.]?"
-    r"(?P<dev_n>[0-9]+)?"
-    r")?"
-    r"(?:\+(?P<local>[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)*))?"
-    r"$"
-)
-
-
-def _canonical_pre(letter: str) -> str | None:
-    if letter in ("a", "alpha"):
-        return "a"
-    if letter in ("b", "beta"):
-        return "b"
-    if letter in ("c", "rc", "pre", "preview"):
-        return "rc"
-    return None
-
-
-@dataclass(frozen=True)
-class _Version:
-    epoch: int
-    release: tuple[int, ...]
-    pre: tuple[str, int] | None
-    post: int | None
-    dev: int | None
-    local: tuple[str | int, ...]
-
-
-def _parse_version(text: str) -> _Version | None:
-    stripped = text.strip().lower()
-    if stripped.startswith("v"):
-        stripped = stripped[1:]
-    m = re.match(_VERSION_PAT, stripped)
-    if m is None:
-        return None
-
-    epoch = int(m.group("epoch")) if m.group("epoch") else 0
-    release = tuple(int(x) for x in m.group("release").split("."))
-
-    pre_letter = m.group("pre_l")
-    if pre_letter is not None:
-        canonical = _canonical_pre(pre_letter)
-        if canonical is None:
-            return None
-        pre_n = int(m.group("pre_n")) if m.group("pre_n") else 0
-        pre: tuple[str, int] | None = (canonical, pre_n)
-    else:
-        pre = None
-
-    post: int | None
-    if m.group("post_n1") is not None:
-        post = int(m.group("post_n1"))
-    elif m.group("post_l") is not None:
-        post = int(m.group("post_n2")) if m.group("post_n2") else 0
-    else:
-        post = None
-
-    dev: int | None
-    if m.group("dev_l") is not None:
-        dev = int(m.group("dev_n")) if m.group("dev_n") else 0
-    else:
-        dev = None
-
-    local_raw = m.group("local")
-    if local_raw is None:
-        local: tuple[str | int, ...] = ()
-    else:
-        parts: list[str | int] = []
-        for comp in re.split(r"[-_.]", local_raw):
-            parts.append(int(comp) if comp.isdigit() else comp)
-        local = tuple(parts)
-
-    return _Version(
-        epoch=epoch, release=release, pre=pre, post=post, dev=dev, local=local
-    )
-
-
-def _cmp_tuple(
-    version: _Version,
-) -> tuple[
-    int,
-    tuple[int, ...],
-    tuple[int, str, int],
-    tuple[int, int],
-    tuple[int, int],
-    tuple[tuple[int, object], ...],
-]:
-    release = _trim_trailing_zeros(version.release)
-
-    if version.pre is None:
-        pre_key = (1, "", 0)
-    else:
-        letter, num = version.pre
-        pre_key = (0, letter, num)
-
-    post_key = (0, 0) if version.post is None else (1, version.post)
-    dev_key = (1, 0) if version.dev is None else (0, version.dev)
-
-    local_key = tuple((1, c) if isinstance(c, int) else (0, c) for c in version.local)
-
-    return (version.epoch, release, pre_key, post_key, dev_key, local_key)
-
-
-def _trim_trailing_zeros(release: tuple[int, ...]) -> tuple[int, ...]:
-    end = len(release)
-    while end > 1 and release[end - 1] == 0:
-        end -= 1
-    return release[:end]
-
-
-def _compare_versions(a: _Version, b: _Version) -> int:
-    ka = _cmp_tuple(a)
-    kb = _cmp_tuple(b)
-    # Pad release tuples to same length for comparison
-    ra = ka[1]
-    rb = kb[1]
-    maxlen = max(len(ra), len(rb))
-    padded_a = (ka[0], ra + (0,) * (maxlen - len(ra)), ka[2], ka[3], ka[4], ka[5])
-    padded_b = (kb[0], rb + (0,) * (maxlen - len(rb)), kb[2], kb[3], kb[4], kb[5])
-    if padded_a < padded_b:
-        return -1
-    if padded_a > padded_b:
-        return 1
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# PEP 440 — specifier parsing and satisfaction
-# ---------------------------------------------------------------------------
-
-_SPEC_PAT = r"^\s*(===|~=|==|!=|<=|>=|<|>)\s*(.+?)\s*$"
-
-
-def _parse_specifier_set(text: str) -> tuple[tuple[str, str], ...] | None:
-    stripped = text.strip()
-    if not stripped:
-        return ()
-    specs: list[tuple[str, str]] = []
-    for clause in stripped.split(","):
-        clause = clause.strip()
-        if not clause:
-            continue
-        m = re.match(_SPEC_PAT, clause)
-        if m is None:
-            return None
-        specs.append((m.group(1), m.group(2).strip()))
-    return tuple(specs)
-
-
-def _satisfies_single(op: str, spec_version_str: str, version: _Version) -> bool | None:
-    """Returns True/False for match, or None if op is unsupported."""
-    if op == "===":
-        return None  # Deferred — caller should treat as ambiguous
-
-    is_wildcard = spec_version_str.endswith(".*")
-    if is_wildcard:
-        base_str = spec_version_str[:-2]
-        spec_version = _parse_version(base_str)
-        if spec_version is None:
-            return None
-        if op not in ("==", "!="):
-            return None  # Wildcards only valid with == and !=
-        prefix = spec_version.release
-        installed_prefix = version.release[: len(prefix)]
-        padded_prefix = prefix + (0,) * max(0, len(installed_prefix) - len(prefix))
-        padded_installed = installed_prefix + (0,) * max(
-            0, len(padded_prefix) - len(installed_prefix)
-        )
-        matches = padded_installed == padded_prefix
-        return matches if op == "==" else not matches
-
-    spec_version = _parse_version(spec_version_str)
-    if spec_version is None:
-        return None
-
-    if op == "~=":
-        if len(spec_version.release) < 2:
-            return None
-        lower = spec_version
-        upper_release = spec_version.release[:-1]
-        upper_release = upper_release[:-1] + (upper_release[-1] + 1,)
-        upper = _Version(
-            epoch=spec_version.epoch,
-            release=upper_release,
-            pre=None,
-            post=None,
-            dev=None,
-            local=(),
-        )
-        return (
-            _compare_versions(version, lower) >= 0
-            and _compare_versions(version, upper) < 0
-        )
-
-    cmp = _compare_versions(version, spec_version)
-    if op == "==":
-        if spec_version.local:
-            return cmp == 0
-        # Ignore local segment on version side
-        stripped_version = _Version(
-            epoch=version.epoch,
-            release=version.release,
-            pre=version.pre,
-            post=version.post,
-            dev=version.dev,
-            local=(),
-        )
-        return _compare_versions(stripped_version, spec_version) == 0
-    if op == "!=":
-        if spec_version.local:
-            return cmp != 0
-        stripped_version = _Version(
-            epoch=version.epoch,
-            release=version.release,
-            pre=version.pre,
-            post=version.post,
-            dev=version.dev,
-            local=(),
-        )
-        return _compare_versions(stripped_version, spec_version) != 0
-    if op == ">=":
-        return cmp >= 0
-    if op == "<=":
-        return cmp <= 0
-    if op == ">":
-        return cmp > 0
-    if op == "<":
-        return cmp < 0
-    return None
-
-
-def _specifier_allows_prereleases(spec_set: tuple[tuple[str, str], ...]) -> bool:
-    for _op, ver in spec_set:
-        base = ver[:-2] if ver.endswith(".*") else ver
-        parsed = _parse_version(base)
-        if parsed is not None and (parsed.pre is not None or parsed.dev is not None):
-            return True
-    return False
-
-
-def _satisfies(
-    spec_set: tuple[tuple[str, str], ...],
-    version_str: str,
-    *,
-    include_prerelease: bool,
-) -> tuple[bool, str]:
-    version = _parse_version(version_str)
-    if version is None:
-        return False, f"unparseable version: {version_str}"
-
-    if not spec_set:
-        return True, f"{version_str} satisfies (no constraint)"
-
-    is_prerelease = version.pre is not None or version.dev is not None
-    if (
-        is_prerelease
-        and not include_prerelease
-        and not _specifier_allows_prereleases(spec_set)
-    ):
-        return (
-            False,
-            f"pre-release {version_str} excluded by default; specifier does not opt in",
-        )
-
-    for op, ver in spec_set:
-        result = _satisfies_single(op, ver, version)
-        if result is None:
-            return False, f"cannot evaluate: {op}{ver}"
-        if not result:
-            return False, f"{version_str} does not satisfy {op}{ver}"
-
-    joined = ",".join(f"{op}{ver}" for op, ver in spec_set)
-    return True, f"{version_str} satisfies {joined}"
 
 
 # ---------------------------------------------------------------------------
@@ -671,9 +379,7 @@ _MARKER_VARIABLES = frozenset(
     }
 )
 
-_VERSION_VARIABLES = frozenset(
-    {"python_version", "python_full_version", "implementation_version"}
-)
+_VERSION_VARIABLES = frozenset({"python_version", "python_full_version", "implementation_version"})
 
 
 def _env_lookup(name: str, env: PythonEnvironmentPayload) -> str:
@@ -725,9 +431,7 @@ def _eval_compare(
     def resolve(kind: str, text: str) -> tuple[str, bool]:
         if kind == "name":
             if text not in _MARKER_VARIABLES:
-                diagnostics.append(
-                    ("unknown-marker-variable", f"unknown marker variable: {text}")
-                )
+                diagnostics.append(("unknown-marker-variable", f"unknown marker variable: {text}"))
                 return "", False
             if text == "extra":
                 diagnostics.append(
@@ -753,8 +457,7 @@ def _eval_compare(
     op = node.op
 
     use_version_compare = op in ("<", "<=", ">", ">=", "==", "!=") and (
-        (node.left_kind == "name" and left_is_ver)
-        or (node.right_kind == "name" and right_is_ver)
+        (node.left_kind == "name" and left_is_ver) or (node.right_kind == "name" and right_is_ver)
     )
 
     if op == "in":
@@ -764,8 +467,8 @@ def _eval_compare(
     if op == "===":
         return left_val == right_val
     if op == "~=":
-        left_v = _parse_version(left_val)
-        right_v = _parse_version(right_val)
+        left_v = parse_version(left_val)
+        right_v = parse_version(right_val)
         if left_v is None or right_v is None:
             diagnostics.append(
                 (
@@ -775,12 +478,12 @@ def _eval_compare(
             )
             return False
         spec_set = (("~=", right_val),)
-        ok, _ = _satisfies(spec_set, left_val, include_prerelease=True)
+        ok, _ = satisfies(spec_set, left_val, include_prerelease=True)
         return ok
 
     if use_version_compare:
-        left_v = _parse_version(left_val)
-        right_v = _parse_version(right_val)
+        left_v = parse_version(left_val)
+        right_v = parse_version(right_val)
         if left_v is None or right_v is None:
             diagnostics.append(
                 (
@@ -789,7 +492,7 @@ def _eval_compare(
                 )
             )
             return False
-        cmp = _compare_versions(left_v, right_v)
+        cmp = compare_versions(left_v, right_v)
         if op == "<":
             return cmp < 0
         if op == "<=":
@@ -856,10 +559,10 @@ def _evaluate_markers_payload(db: Database, marker: str) -> MarkerEvaluationPayl
 def _evaluate_version_specifier_payload(
     db: Database, specifier: str, version: str
 ) -> VersionSpecifierEvalPayload:
-    spec_set = _parse_specifier_set(specifier)
+    spec_set = parse_specifier_set(specifier)
     if spec_set is None:
         return (specifier, version, False, f"cannot parse specifier: {specifier}")
-    ok, detail = _satisfies(spec_set, version, include_prerelease=False)
+    ok, detail = satisfies(spec_set, version, include_prerelease=False)
     return (specifier, version, ok, detail)
 
 
@@ -876,9 +579,7 @@ def _evaluate_requirement(
     if markers:
         node = _parse_marker(markers)
         if node is None:
-            diagnostics.append(
-                ("marker-parse-error", f"cannot parse marker for {name}: {markers}")
-            )
+            diagnostics.append(("marker-parse-error", f"cannot parse marker for {name}: {markers}"))
             marker_applicable = False
         else:
             marker_applicable, marker_diag = _evaluate_marker(node, env)
@@ -945,7 +646,7 @@ def _evaluate_requirement(
             tuple(diagnostics),
         )
 
-    spec_set = _parse_specifier_set(version_spec)
+    spec_set = parse_specifier_set(version_spec)
     if spec_set is None:
         return (
             (
@@ -975,7 +676,7 @@ def _evaluate_requirement(
                 tuple(diagnostics),
             )
 
-    ok, detail = _satisfies(spec_set, installed, include_prerelease=False)
+    ok, detail = satisfies(spec_set, installed, include_prerelease=False)
     status: ApplicableStatus = "satisfied" if ok else "version_mismatch"
     return (
         (normalized, version_spec, markers, True, installed, status, detail),

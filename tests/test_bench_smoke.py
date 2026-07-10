@@ -35,6 +35,7 @@ def test_harness_runs_synthetic_and_asserts_correctness(tmp_path: Path) -> None:
 def test_csv_report_has_readable_schema_and_blank_pyinc_only_cells(tmp_path: Path) -> None:
     results = harness.run_scenarios(["synthetic"], out_dir=tmp_path, comparators=["full", "naive"])
     csv_path, _ = harness.write_reports(results, tmp_path)
+    assert b"\r\n" not in csv_path.read_bytes()
     with csv_path.open(encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     # Self-describing headers replace the old cryptic ones.

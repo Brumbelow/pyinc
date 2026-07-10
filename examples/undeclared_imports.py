@@ -50,9 +50,7 @@ def main() -> None:
         if not analysis.undeclared_imports:
             print("  (none — all imports accounted for)")
         for item in analysis.undeclared_imports:
-            print(
-                f"  - {item.import_name:<20s} -> distribution: {item.distribution_name}"
-            )
+            print(f"  - {item.import_name:<20s} -> distribution: {item.distribution_name}")
 
 
 if __name__ == "__main__":

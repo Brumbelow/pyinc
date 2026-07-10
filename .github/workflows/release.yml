@@ -5,31 +5,119 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-publish:
-    name: Build and publish to PyPI
+  gates:
+    uses: ./.github/workflows/ci.yml
+
+  verify-and-build:
+    name: Verify signed tag and build
+    needs: gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EXPECTED_FINGERPRINT: 2B6DF408BD973740052925DC894C75E1B1D05EA2
+      TRUSTED_BASELINE: 7756872a98930daf9c5824d014fab0a449238a90
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14'
+
+      - name: Import the release signing key
+        env:
+          GNUPGHOME: ${{ runner.temp }}/pyinc-release-gnupg
+        run: |
+          install -d -m 700 "$GNUPGHOME"
+          gpg --batch --import .github/release-signing-key.asc
+          primary_count="$(gpg --batch --with-colons --list-keys | awk -F: '$1 == "pub" { count++ } END { print count + 0 }')"
+          test "$primary_count" = 1
+          actual_fingerprint="$(gpg --batch --with-colons --fingerprint | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test "$actual_fingerprint" = "$EXPECTED_FINGERPRINT"
+
+      - name: Verify tag identity and signatures
+        env:
+          GNUPGHOME: ${{ runner.temp }}/pyinc-release-gnupg
+        run: |
+          verify_expected_signature() {
+            kind="$1"
+            reference="$2"
+            status="$(git "verify-$kind" --raw "$reference" 2>&1)"
+            printf '%s\n' "$status"
+            signer="$(printf '%s\n' "$status" | awk -v expected="$EXPECTED_FINGERPRINT" '$2 == "VALIDSIG" && ($3 == expected || $NF == expected) { print expected; exit }')"
+            test "$signer" = "$EXPECTED_FINGERPRINT"
+          }
+
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          verify_expected_signature tag "$GITHUB_REF_NAME"
+          git merge-base --is-ancestor "$TRUSTED_BASELINE" "$GITHUB_SHA"
+          git rev-list --reverse "$TRUSTED_BASELINE..$GITHUB_SHA" > "$RUNNER_TEMP/release-commits"
+          while IFS= read -r commit; do
+            verify_expected_signature commit "$commit"
+          done < "$RUNNER_TEMP/release-commits"
+
+          if test "$GITHUB_REF_NAME" = "v3.0.0"; then
+            rc_tag="v3.0.0rc1"
+            test "$(git cat-file -t "$rc_tag")" = tag
+            verify_expected_signature tag "$rc_tag"
+          fi
+
+      - name: Verify release metadata
+        run: |
+          python scripts/verify_release_metadata.py \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA"
+
+      - name: Build and check distribution
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Validate exact release artifacts
+        run: |
+          python -m venv .release-venv
+          .release-venv/bin/python -m pip install --no-deps dist/*.whl
+          .release-venv/bin/python scripts/validate_install.py
+          .release-venv/bin/pyinc-tools --version
+          .release-venv/bin/python examples/correctness_demo.py
+          .release-venv/bin/python examples/action_reconcile_demo.py
+          .release-venv/bin/python examples/calc_demo.py
+          .release-venv/bin/python examples/codegen_demo.py
+
+      - name: Upload exact release artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish verified artifacts
+    needs: verify-and-build
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/project/pyinc/
     permissions:
+      actions: read
       id-token: write
     steps:
-      - name: Check out the repository
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Download exact release artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          python-version: '3.12'
-
-      - name: Install build tooling
-        run: python -m pip install --upgrade build twine
-
-      - name: Build sdist and wheel
-        run: python -m build
-
-      - name: Verify metadata
-        run: python -m twine check dist/*
+          name: release-distributions
+          path: dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0

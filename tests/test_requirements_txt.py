@@ -4,6 +4,9 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
 
 import pyinc.integrations as integrations
 from pyinc import Database
@@ -38,6 +41,35 @@ pywin32; sys_platform == "win32"
 --extra-index-url https://internal.example.com/simple/
 --find-links /local/wheels
 """
+
+
+@pytest.mark.parametrize(
+    "requirement_text",
+    [
+        "requests>=2.28,<3",
+        "Flask[async,dotenv]~=3.0",
+        'typing-extensions>=4; python_version < "3.12"',
+        "demo @ https://example.invalid/demo-1.0.tar.gz",
+        "zope.interface!=6.0,>=5.0",
+    ],
+)
+def test_supported_requirement_vectors_match_packaging(
+    tmp_path: Path, requirement_text: str
+) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{requirement_text}\n", encoding="utf-8")
+    parsed = requirements_analysis(Database(), path).requirements
+    oracle = Requirement(requirement_text)
+
+    assert len(parsed) == 1
+    actual = parsed[0]
+    assert actual.name == canonicalize_name(oracle.name).replace("-", "_")
+    assert set(actual.extras) == set(oracle.extras)
+    assert actual.markers == (str(oracle.marker) if oracle.marker is not None else "")
+    if oracle.url is not None:
+        assert actual.version_spec == f"@ {oracle.url}"
+    else:
+        assert SpecifierSet(actual.version_spec) == oracle.specifier
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +139,19 @@ def test_requirements_analysis_reports_diagnostics_for_unparseable_lines(
     assert result.diagnostics[0][0] == "unparseable-line"
 
 
+def test_deep_requirements_reports_nul_reference_without_path_error(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_bytes(b"-r invalid\x00name.in\nrequests>=2\n")
+
+    result = deep_requirements_analysis(Database(), path)
+
+    assert tuple(requirement.name for requirement in result.requirements) == ("requests",)
+    assert result.file_references == ()
+    assert result.diagnostics == (("unparseable-line", "line 1: -r invalid\x00name.in"),)
+
+
 # ---------------------------------------------------------------------------
 # Specific correctness
 # ---------------------------------------------------------------------------
@@ -158,9 +203,7 @@ def test_requirements_analysis_parses_environment_markers(tmp_path: Path) -> Non
 
 def test_requirements_analysis_parses_editable_installs(tmp_path: Path) -> None:
     path = tmp_path / "requirements.txt"
-    path.write_text(
-        "-e .\n-e git+https://github.com/example/pkg.git\n", encoding="utf-8"
-    )
+    path.write_text("-e .\n-e git+https://github.com/example/pkg.git\n", encoding="utf-8")
 
     db = Database()
     result = requirements_analysis(db, str(path))
@@ -188,6 +231,34 @@ def test_requirements_analysis_parses_file_references(tmp_path: Path) -> None:
     assert "base.txt" in paths
     assert "constraints.txt" in paths
     assert "pins.txt" in paths
+
+
+def test_recursive_file_references_strip_inline_comments(tmp_path: Path) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    leaf = nested / "leaf.in"
+    leaf.write_text("leaf-package==1\n", encoding="utf-8")
+    base = tmp_path / "base.in"
+    base.write_text("-r nested/leaf.in # nested include\nbase-package==2\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.in"
+    constraints.write_text("base-package<3\n", encoding="utf-8")
+    main = tmp_path / "requirements.txt"
+    main.write_text(
+        "-r base.in  # shared requirements\n--constraint constraints.in # deployment pins\n",
+        encoding="utf-8",
+    )
+
+    shallow = requirements_analysis(Database(), main)
+    assert [(item.kind, item.path) for item in shallow.file_references] == [
+        ("requirement", "base.in"),
+        ("constraint", "constraints.in"),
+    ]
+    deep = deep_requirements_analysis(Database(), main)
+    assert {item.name for item in deep.requirements} == {
+        "base_package",
+        "leaf_package",
+    }
+    assert deep.diagnostics == ()
 
 
 def test_requirements_analysis_parses_index_directives(tmp_path: Path) -> None:
@@ -224,6 +295,9 @@ def test_requirements_analysis_handles_line_continuations(tmp_path: Path) -> Non
     assert "requests" in by_name
     assert by_name["requests"].version_spec == ">=2.0"
     assert "click" in by_name
+    assert by_name["requests"].range.start.line == 0
+    assert by_name["requests"].range.end.line == 1
+    assert by_name["click"].range.start.line == 2
 
 
 def test_requirements_analysis_handles_empty_file(tmp_path: Path) -> None:
@@ -264,9 +338,7 @@ def test_requirements_analysis_on_nonexistent_file(tmp_path: Path) -> None:
 
 def test_requirements_analysis_normalizes_package_names(tmp_path: Path) -> None:
     path = tmp_path / "requirements.txt"
-    path.write_text(
-        "Requests>=2.0\nmy-package==1.0\nAnother.Pkg>=3.0\n", encoding="utf-8"
-    )
+    path.write_text("Requests>=2.0\nmy-package==1.0\nAnother.Pkg>=3.0\n", encoding="utf-8")
 
     db = Database()
     result = requirements_analysis(db, str(path))

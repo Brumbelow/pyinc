@@ -49,12 +49,7 @@ def main() -> None:
         print(f"{'Name':<22s} {'Applicable':<12s} {'Status':<16s} Detail")
         print("-" * 90)
         for req in analysis.requirements:
-            print(
-                f"{req.name:<22s} "
-                f"{str(req.applicable):<12s} "
-                f"{req.status:<16s} "
-                f"{req.detail}"
-            )
+            print(f"{req.name:<22s} {str(req.applicable):<12s} {req.status:<16s} {req.detail}")
 
         if analysis.diagnostics:
             print()

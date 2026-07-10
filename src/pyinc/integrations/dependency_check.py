@@ -5,13 +5,10 @@ from dataclasses import dataclass
 from typing import TypeAlias, cast
 
 from pyinc.core import query
+from pyinc.integrations._pep440 import parse_specifier_set, satisfies
 from pyinc.integrations.installed_packages import (
     environment_index,
     installed_distributions_index,
-)
-from pyinc.integrations.requirement_evaluation import (
-    _parse_specifier_set,
-    _satisfies,
 )
 from pyinc.runtime import Database
 from pyinc.value import thaw
@@ -56,20 +53,18 @@ class DependencyCheckAnalysis:
 
 
 # ---------------------------------------------------------------------------
-# PEP 440 version matching — delegated to requirement_evaluation
+# PEP 440 version matching
 # ---------------------------------------------------------------------------
 
 
-def _check_version_constraints(
-    declared_spec: str, installed_version: str
-) -> tuple[str, str]:
-    spec_set = _parse_specifier_set(declared_spec)
+def _check_version_constraints(declared_spec: str, installed_version: str) -> tuple[str, str]:
+    spec_set = parse_specifier_set(declared_spec)
     if spec_set is None:
         return "ambiguous", f"cannot parse specifier: {declared_spec}"
     for op, _ver in spec_set:
         if op == "===":
             return "ambiguous", f"cannot evaluate: {op}{_ver}"
-    ok, detail = _satisfies(spec_set, installed_version, include_prerelease=True)
+    ok, detail = satisfies(spec_set, installed_version, include_prerelease=True)
     if not ok:
         if "unparseable" in detail or "cannot evaluate" in detail:
             return "ambiguous", detail
@@ -121,9 +116,7 @@ def _extract_dep_name_and_spec(specifier: str) -> tuple[str, str]:
 
 
 @query
-def _declared_deps_payload(
-    db: Database, deps: tuple[str, ...]
-) -> tuple[tuple[str, str], ...]:
+def _declared_deps_payload(db: Database, deps: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
     result: list[tuple[str, str]] = []
     for spec in deps:
         name, version_spec = _extract_dep_name_and_spec(spec)
