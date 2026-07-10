@@ -20,7 +20,7 @@ from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import (
     BuiltinFunctionType,
     CodeType,
@@ -92,6 +92,15 @@ _CHECKPOINT_MANIFEST_VERSION = 4
 _KERNEL_FINGERPRINT_VERSION = 2
 _DEFAULT_SEMANTIC_EQUALITY_VERSION = 1
 _MISSING_SNAPSHOT = object()
+
+
+def _is_stdlib_path(value: object) -> bool:
+    """Return whether ``value`` is one of pathlib's own immutable path types."""
+
+    return isinstance(value, PurePath) and type(value).__module__ in {
+        "pathlib",
+        "pathlib._local",
+    }
 
 
 @lru_cache(maxsize=1024)
@@ -4720,7 +4729,7 @@ class Database:
                     ),
                 )
             if isinstance(value, os.PathLike):
-                if type(value).__module__ == "pathlib":
+                if _is_stdlib_path(value):
                     return (
                         "path",
                         self._implementation_type_payload(type(value)),
@@ -5048,7 +5057,7 @@ class Database:
         }:
             return value
         if isinstance(value, os.PathLike):
-            if type(value).__module__ == "pathlib":
+            if _is_stdlib_path(value):
                 return (
                     "path",
                     self._type_definition_payload(type(value)),

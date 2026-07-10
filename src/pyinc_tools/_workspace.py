@@ -423,9 +423,9 @@ class WorkspaceMirror:
         ignored_dir_names: frozenset[str],
         exclude_globs: tuple[str, ...],
     ) -> None:
-        self.root = root
-        self.root_path = Path(root)
-        self.mirror_root_path = Path(mirror_root)
+        self.root_path = Path(root).resolve(strict=False)
+        self.root = str(self.root_path)
+        self.mirror_root_path = Path(mirror_root).resolve(strict=False)
         self.ignored_dir_names = ignored_dir_names
         self.exclude_globs = exclude_globs
         self._referenced_paths: set[Path] = set()
@@ -537,6 +537,7 @@ class PollingWorkspaceWatcher:
         )
         self._pending: dict[str, float] = {}
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.RLock()
         self._stop_event = threading.Event()
         self._on_change: Callable[[tuple[str, ...]], None] | None = None
         self._on_error: Callable[[Exception], None] | None = None
@@ -591,37 +592,71 @@ class PollingWorkspaceWatcher:
         interval_s: float | None = None,
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
-        if self.is_running:
-            raise RuntimeError("PollingWorkspaceWatcher is already running.")
-        effective_interval = (
-            interval_s if interval_s is not None else max(self._debounce_seconds / 2.0, 0.05)
-        )
-        self._on_change = on_change
-        self._on_error = on_error
-        self._stop_event = threading.Event()
-        thread = threading.Thread(
-            target=self._run,
-            args=(effective_interval,),
-            name="pyinc-tools-watcher",
-            daemon=True,
-        )
-        self._thread = thread
-        thread.start()
+        with self._lifecycle_lock:
+            if self._thread is not None:
+                raise RuntimeError("PollingWorkspaceWatcher is already running.")
+            effective_interval = (
+                interval_s if interval_s is not None else max(self._debounce_seconds / 2.0, 0.05)
+            )
+            self._register_with_session()
+            self._on_change = on_change
+            self._on_error = on_error
+            self._stop_event = threading.Event()
+            thread = threading.Thread(
+                target=self._run,
+                args=(effective_interval,),
+                name="pyinc-tools-watcher",
+                daemon=True,
+            )
+            self._thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                self._thread = None
+                self._on_change = None
+                self._on_error = None
+                self._unregister_from_session()
+                raise
 
     def stop(self, *, timeout: float = 5.0) -> None:
-        thread = self._thread
-        if thread is None:
-            return
-        self._stop_event.set()
+        self._request_stop()
+        with self._lifecycle_lock:
+            thread = self._thread
+            if thread is None:
+                return
+            if thread is threading.current_thread():
+                return
         thread.join(timeout)
         if thread.is_alive():
             print(
                 "pyinc-tools watcher: thread did not stop within timeout",
                 file=sys.stderr,
             )
-        self._thread = None
-        self._on_change = None
-        self._on_error = None
+
+    def _request_stop(self) -> None:
+        self._stop_event.set()
+
+    def _runs_in_current_thread(self) -> bool:
+        return self._thread is threading.current_thread()
+
+    def _register_with_session(self) -> None:
+        register = getattr(self._session, "_register_watcher", None)
+        if register is not None:
+            register(self)
+
+    def _unregister_from_session(self) -> None:
+        unregister = getattr(self._session, "_unregister_watcher", None)
+        if unregister is not None:
+            unregister(self)
+
+    def _finish_current_thread(self) -> None:
+        with self._lifecycle_lock:
+            if self._thread is not threading.current_thread():
+                return
+            self._thread = None
+            self._on_change = None
+            self._on_error = None
+        self._unregister_from_session()
 
     def __enter__(self) -> PollingWorkspaceWatcher:
         return self
@@ -630,24 +665,29 @@ class PollingWorkspaceWatcher:
         self.stop()
 
     def _run(self, interval_s: float) -> None:
-        while not self._stop_event.is_set():
-            try:
-                ready = self._poll_once()
-            except RuntimeError:
-                # Session was closed out from under us; exit cleanly.
-                return
-            except Exception as exc:  # pragma: no cover - defensive
-                self._handle_error(exc)
-                ready = ()
-            if ready:
-                callback = self._on_change
-                if callback is not None:
-                    try:
-                        callback(ready)
-                    except Exception as exc:
-                        self._handle_error(exc)
-            if self._stop_event.wait(interval_s):
-                return
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    ready = self._poll_once()
+                except RuntimeError:
+                    # Session was closed out from under us; exit cleanly.
+                    return
+                except Exception as exc:  # pragma: no cover - defensive
+                    self._handle_error(exc)
+                    ready = ()
+                if self._stop_event.is_set():
+                    return
+                if ready:
+                    callback = self._on_change
+                    if callback is not None:
+                        try:
+                            callback(ready)
+                        except Exception as exc:
+                            self._handle_error(exc)
+                if self._stop_event.wait(interval_s):
+                    return
+        finally:
+            self._finish_current_thread()
 
     def _handle_error(self, exc: Exception) -> None:
         if self._on_error is not None:

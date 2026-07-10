@@ -711,10 +711,12 @@ def test_public_safe_fs_functions_dispatch_to_windows_boundaries(
 class _ReadWindowsApi:
     def __init__(self, open_result: int | BaseException = 55) -> None:
         self.open_result = open_result
+        self.opened: list[tuple[str, dict[str, object]]] = []
         self.closed: list[int] = []
         self.required: list[tuple[int, str]] = []
 
-    def open_handle(self, path: str, **_kwargs: object) -> int:
+    def open_handle(self, path: str, **kwargs: object) -> int:
+        self.opened.append((path, kwargs))
         if isinstance(self.open_result, BaseException):
             raise self.open_result
         return self.open_result
@@ -759,6 +761,19 @@ def test_windows_read_regular_file_transfers_or_closes_handle(
     monkeypatch.setattr(safe_fs, "_windows_file_from_handle", lambda *_args: stream)
 
     assert safe_fs._read_regular_file_windows(path) == b"contents"
+    assert api.opened == [
+        (
+            os.fspath(path),
+            {
+                "access": safe_fs._WIN_GENERIC_READ | safe_fs._WIN_FILE_READ_ATTRIBUTES,
+                "creation": safe_fs._WIN_OPEN_EXISTING,
+                "flags": (
+                    safe_fs._WIN_FILE_FLAG_OPEN_REPARSE_POINT
+                    | safe_fs._WIN_FILE_FLAG_BACKUP_SEMANTICS
+                ),
+            },
+        )
+    ]
     assert api.required == [(55, os.fspath(path))]
     assert api.closed == []
     assert stream.closed

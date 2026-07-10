@@ -255,9 +255,10 @@ class WorkspaceSession:
         self._tempdir: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(
             prefix="pyinc-tools-"
         )
-        self.mirror_root = str(Path(self._tempdir.name, "workspace"))
-        mirror_root_path = Path(self.mirror_root)
+        mirror_root_path = Path(self._tempdir.name, "workspace")
         mirror_root_path.mkdir(parents=True, exist_ok=True)
+        mirror_root_path = mirror_root_path.resolve(strict=True)
+        self.mirror_root = str(mirror_root_path)
         self._mirror = WorkspaceMirror(
             self.root,
             self.mirror_root,
@@ -267,15 +268,54 @@ class WorkspaceSession:
         self._overlays: dict[str, str] = {}
         self._scheduled_paths: set[str] = set()
         self._state_lock = threading.RLock()
+        self._watchers: set[PollingWorkspaceWatcher] = set()
+        self._close_complete = threading.Event()
         self._closed = False
         self._mirror.copy_workspace()
 
     def close(self) -> None:
         with self._state_lock:
-            if self._closed:
+            if self._close_complete.is_set():
                 return
-            self._closed = True
+
+            if self._closed:
+                close_complete = self._close_complete
+                # A watcher callback can race another thread that is closing the
+                # session and joining that watcher. Waiting here would make the
+                # two threads wait on each other.
+                if any(watcher._runs_in_current_thread() for watcher in self._watchers):
+                    return
+                should_close = False
+                watchers: tuple[PollingWorkspaceWatcher, ...] = ()
+            else:
+                self._closed = True
+                close_complete = self._close_complete
+                should_close = True
+                watchers = tuple(self._watchers)
+
+        if not should_close:
+            close_complete.wait()
+            return
+
+        try:
+            # Wake every watcher before joining any one of them. No session lock
+            # is held while joining because a watcher may be finishing a refresh.
+            for watcher in watchers:
+                watcher._request_stop()
+            for watcher in watchers:
+                watcher.stop()
             self._tempdir.cleanup()
+        finally:
+            close_complete.set()
+
+    def _register_watcher(self, watcher: PollingWorkspaceWatcher) -> None:
+        with self._state_lock:
+            self._check_open()
+            self._watchers.add(watcher)
+
+    def _unregister_watcher(self, watcher: PollingWorkspaceWatcher) -> None:
+        with self._state_lock:
+            self._watchers.discard(watcher)
 
     def _check_open(self) -> None:
         if self._closed:

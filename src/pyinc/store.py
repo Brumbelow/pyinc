@@ -101,8 +101,11 @@ class FileSystemArtifactStore:
     def __init__(self, root: str | os.PathLike[str], *, lock_timeout: float = 30.0) -> None:
         lock_timeout = _validate_lock_timeout(lock_timeout)
         try:
-            self._root = Path(root).resolve(strict=False)
-        except (OSError, ValueError) as error:
+            root_text = os.fspath(root)
+            if "\0" in root_text:
+                raise ValueError("embedded null character in path")
+            self._root = Path(root_text).resolve(strict=False)
+        except (OSError, TypeError, ValueError) as error:
             raise ArtifactStoreError(f"Artifact-store root path is invalid: {error}") from error
         self._objects = self._root / "objects"
         self._locks = self._root / "locks"

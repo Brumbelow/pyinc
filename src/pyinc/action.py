@@ -342,12 +342,26 @@ class Action:
     ) -> ReconcileResult:
         """Validate, lock, and converge all owned outputs under ``root``."""
         try:
-            root_path = Path(root).resolve(strict=False)
+            root_text = os.fspath(root)
+            state_text = os.fspath(state_dir) if state_dir is not None else root_text
+            if "\0" in root_text or "\0" in state_text:
+                raise ValueError("embedded null character in path")
+            root_path = Path(root_text).resolve(strict=False)
             state_path = (
-                Path(state_dir).resolve(strict=False) if state_dir is not None else root_path
+                Path(state_text).resolve(strict=False) if state_dir is not None else root_path
             )
-        except (OSError, ValueError) as error:
+        except (OSError, TypeError, ValueError) as error:
             raise ActionPathError(f"Action root or state directory is invalid: {error}") from error
+
+        for path, label in ((root_path, "owned output path"), (state_path, "action state path")):
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as error:
+                raise ActionPathError(f"Cannot safely inspect {label}: {error}") from error
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ActionPathError(f"Cannot safely inspect {label}: not a directory: {path}")
         timeout = self.lock_timeout if lock_timeout is None else lock_timeout
         timeout = _validate_lock_timeout(timeout)
         lock_paths = sorted({_lock_path(root_path, self.tool), _lock_path(state_path, self.tool)})

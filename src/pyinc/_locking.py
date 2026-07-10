@@ -118,6 +118,8 @@ def _unlock(handle: BinaryIO) -> None:
 
 
 def _is_lock_contention(error: OSError) -> bool:
+    if isinstance(error, BlockingIOError):
+        return True
     if os.name == "nt":
         return error.errno in {13, 36} or getattr(error, "winerror", None) in {33, 36}
-    return isinstance(error, BlockingIOError) or error.errno in {11, 13}
+    return error.errno in {11, 13}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -291,9 +292,10 @@ def test_freeze_already_frozen_values_pass_through() -> None:
 
 
 def test_freeze_pathlike_converts_to_str() -> None:
-    result = freeze(Path("/tmp/test.txt"))
+    path = Path("/tmp/test.txt")
+    result = freeze(path)
     assert isinstance(result, str)
-    assert result == "/tmp/test.txt"
+    assert result == os.fspath(path)
 
 
 def test_freeze_range_converts_to_tuple() -> None:

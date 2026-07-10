@@ -52,7 +52,7 @@ def test_file_resources_support_independent_probe_and_load(
     assert resource.probe(missing) == ("missing",)
     assert resource.load(Database(), missing) == ""
 
-    path.write_text(contents, encoding="utf-8")
+    path.write_bytes(contents.encode("utf-8"))
     assert resource.probe(missing) == (
         "present",
         hashlib.sha256(contents.encode()).hexdigest(),

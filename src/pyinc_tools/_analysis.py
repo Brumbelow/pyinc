@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import ast
-import io
 import keyword
 import re
-import tokenize
 import unicodedata
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Literal, cast, overload
 
 from pyinc import Database
+from pyinc._python_lexing import identifier_tokens
 from pyinc.integrations import (
     DocumentMap,
     ModuleSymbolTable,
@@ -1606,17 +1605,12 @@ def _normalized_name_offsets_on_line(
 ) -> tuple[int, int] | None:
     """Locate an identifier even when the AST normalized its source spelling."""
 
-    try:
-        tokens = tokenize.generate_tokens(io.StringIO(line).readline)
-        for token in tokens:
-            if (
-                token.type == tokenize.NAME
-                and token.start[1] >= minimum_character
-                and unicodedata.normalize("NFKC", token.string) == name
-            ):
-                return token.start[1], token.end[1]
-    except (IndentationError, tokenize.TokenError):
-        return None
+    for token in identifier_tokens(line):
+        if (
+            token.start[1] >= minimum_character
+            and unicodedata.normalize("NFKC", token.string) == name
+        ):
+            return token.start[1], token.end[1]
     return None
 
 

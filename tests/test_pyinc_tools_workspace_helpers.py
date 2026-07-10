@@ -509,6 +509,21 @@ def test_workspace_mirror_copies_and_normalizes_paths(tmp_path: Path) -> None:
         mirror.normalize_real_path(tmp_path / "outside.py")
 
 
+def test_workspace_mirror_canonicalizes_alias_roots(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    canonical_mirror = tmp_path / "canonical-mirror"
+    canonical_mirror.mkdir()
+    mirror_alias = tmp_path / "mirror-alias"
+    _symlink_or_skip(mirror_alias, canonical_mirror, target_is_directory=True)
+
+    mirror = workspace.WorkspaceMirror(str(root), str(mirror_alias), frozenset(), ())
+
+    assert mirror.root_path == root.resolve(strict=True)
+    assert mirror.mirror_root_path == canonical_mirror.resolve(strict=True)
+    assert mirror.mirror_path_for_real(str(root / "mod.py")) == canonical_mirror / "mod.py"
+
+
 def test_workspace_mirror_copy_tolerates_a_file_disappearing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -701,7 +716,7 @@ def test_watcher_stop_reports_a_thread_that_does_not_finish(
     watcher.stop(timeout=0.25)
 
     assert "thread did not stop within timeout" in capsys.readouterr().err
-    assert watcher._thread is None
+    assert watcher._thread is not None
 
 
 def test_watcher_error_handler_uses_callback_or_stderr(

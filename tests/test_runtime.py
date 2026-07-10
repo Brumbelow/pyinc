@@ -2457,13 +2457,17 @@ def test_module_capture_stable_for_stdlib_within_same_interpreter() -> None:
     assert fp_a == fp_b
 
 
-def test_module_capture_accepts_authenticated_frozen_stdlib_alias() -> None:
+def test_module_capture_accepts_authenticated_stdlib_spec_identity() -> None:
     import collections.abc as collections_abc
     import sys
 
-    assert collections_abc.__spec__ is not None
-    assert collections_abc.__spec__.name == "_collections_abc"
-    assert sys.modules[collections_abc.__spec__.name] is collections_abc
+    specification = collections_abc.__spec__
+    assert specification is not None
+    # CPython 3.11/3.12 uses the canonical source-backed name, while newer
+    # builds may expose the same live module through the frozen stdlib alias.
+    assert specification.name in {"collections.abc", "_collections_abc"}
+    assert sys.modules[collections_abc.__name__] is collections_abc
+    assert sys.modules[specification.name] is collections_abc
 
     @query
     def uses_collections_abc(db: Database) -> str:
@@ -2546,7 +2550,7 @@ def test_observe_does_not_fire_on_equal_input_update() -> None:
 
 def test_observe_does_not_fire_on_backdate(tmp_path: Path) -> None:
     path = tmp_path / "src.py"
-    path.write_text("x = 1\n")
+    path.write_bytes(b"x = 1\n")
     file_resource = FileResource()
 
     @query(cutoff=lambda value: value.strip())
@@ -2559,7 +2563,7 @@ def test_observe_does_not_fire_on_backdate(tmp_path: Path) -> None:
     assert db.get(trimmed, path) == "x = 1\n"
     assert len(events) == 1
     # Whitespace-only edit → same cutoff token → backdate
-    path.write_text("x = 1\n\n")
+    path.write_bytes(b"x = 1\n\n")
     assert db.get(trimmed, path) == "x = 1\n\n"
     assert len(events) == 1, "backdate must not fire observer"
 

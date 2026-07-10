@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import tokenize
 from typing import Any, cast
 
 import pytest
 
+from pyinc._python_lexing import identifier_tokens
 from pyinc.integrations import DocumentMap, SourcePosition, SourceRange
 
 
@@ -73,3 +75,43 @@ def test_document_map_rejects_unknown_encodings_even_for_empty_lines() -> None:
         document.to_codepoint(SourcePosition(0, 0), invalid)
     with pytest.raises(ValueError, match="unsupported position encoding"):
         document.from_codepoint(SourcePosition(0, 0), invalid)
+
+
+def test_identifier_tokens_repair_unicode_spans_and_exclude_non_code() -> None:
+    source = 'e\u0301x = ℘1\na·b = e\u0301x\ntext = f"e\u0301x"\n# ℘1 a·b\n'
+
+    assert [(token.string, token.start, token.end) for token in identifier_tokens(source)] == [
+        ("e\u0301x", (1, 0), (1, 3)),
+        ("℘1", (1, 6), (1, 8)),
+        ("a·b", (2, 0), (2, 3)),
+        ("e\u0301x", (2, 6), (2, 9)),
+        ("text", (3, 0), (3, 4)),
+    ]
+    assert identifier_tokens("'''unterminated") == ()
+
+
+def test_identifier_tokens_repair_python_311_split_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    line = "e\u0301x ℘1 + tail\n"
+    split_tokens = (
+        tokenize.TokenInfo(tokenize.NAME, "e", (1, 0), (1, 1), line),
+        tokenize.TokenInfo(tokenize.ERRORTOKEN, "\u0301", (1, 1), (1, 2), line),
+        tokenize.TokenInfo(tokenize.NAME, "x", (1, 2), (1, 3), line),
+        tokenize.TokenInfo(tokenize.ERRORTOKEN, " ", (1, 3), (1, 4), line),
+        tokenize.TokenInfo(tokenize.ERRORTOKEN, "℘", (1, 4), (1, 5), line),
+        tokenize.TokenInfo(tokenize.NUMBER, "1", (1, 5), (1, 6), line),
+        tokenize.TokenInfo(tokenize.OP, "+", (1, 7), (1, 8), line),
+        tokenize.TokenInfo(tokenize.NAME, "tail", (1, 9), (1, 13), line),
+    )
+    monkeypatch.setattr(
+        tokenize,
+        "generate_tokens",
+        lambda _readline: iter(split_tokens),
+    )
+
+    assert [(token.string, token.start, token.end) for token in identifier_tokens(line)] == [
+        ("e\u0301x", (1, 0), (1, 3)),
+        ("℘1", (1, 4), (1, 6)),
+        ("tail", (1, 9), (1, 13)),
+    ]

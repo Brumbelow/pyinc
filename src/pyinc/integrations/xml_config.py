@@ -141,11 +141,9 @@ def _safe_parse(text: str) -> ET.Element:
     """
     builder = ET.TreeBuilder()
     parser = xml.parsers.expat.ParserCreate(encoding=None, namespace_separator="}")
-    forbidden = False
 
     def _forbid(*_args: object, **_kwargs: object) -> None:
-        nonlocal forbidden
-        forbidden = True
+        raise ET.ParseError("DTD / entity declarations disabled for safety")
 
     def _start_element(tag: str, attrs: dict[str, str]) -> None:
         normalised_tag = "{" + tag if "}" in tag else tag
@@ -164,8 +162,6 @@ def _safe_parse(text: str) -> ET.Element:
         parser.Parse(text.encode("utf-8"), True)
     except xml.parsers.expat.ExpatError as exc:
         raise ET.ParseError(str(exc)) from exc
-    if forbidden:
-        raise ET.ParseError("DTD / entity declarations disabled for safety")
     return builder.close()
 
 

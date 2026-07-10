@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import ast
-import io
 import re
-import tokenize
 import unicodedata
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
+
+from pyinc._python_lexing import identifier_tokens
 
 PositionEncoding: TypeAlias = Literal["utf-8", "utf-16", "utf-32"]
 
@@ -177,15 +177,10 @@ def identifier_range(
     document = DocumentMap(source)
     full = document.ast_range(node)
     normalized_source = "\n".join(document.lines)
-    try:
-        tokens = tuple(tokenize.generate_tokens(io.StringIO(normalized_source).readline))
-    except (IndentationError, tokenize.TokenError):
-        tokens = ()
     candidates = [
         token
-        for token in tokens
-        if token.type == tokenize.NAME
-        and unicodedata.normalize("NFKC", token.string) == name
+        for token in identifier_tokens(normalized_source)
+        if unicodedata.normalize("NFKC", token.string) == name
         and full.start <= SourcePosition(token.start[0] - 1, token.start[1])
         and SourcePosition(token.end[0] - 1, token.end[1]) <= full.end
     ]

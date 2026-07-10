@@ -155,6 +155,30 @@ def test_action_wraps_non_directory_root_as_typed_path_error(
     assert tuple(state_dir.iterdir()) == ()
 
 
+def test_action_wraps_root_inspection_failure_as_typed_path_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+
+    @action(tool="uninspectable-root")
+    def invalid_root_action(db: Database) -> list[Output]:
+        return [Output("result.txt", b"content")]
+
+    original_lstat = Path.lstat
+
+    def fail_root_lstat(path: Path) -> os.stat_result:
+        if path == root:
+            raise OSError("inspection denied")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_root_lstat)
+    with pytest.raises(ActionPathError, match="Cannot safely inspect owned output path"):
+        invalid_root_action.reconcile(Database(), root=root)
+
+    assert tuple(root.iterdir()) == ()
+
+
 @pytest.mark.parametrize(
     ("root", "state_dir"),
     (("bad\0root", None), ("valid-root", "bad\0state")),

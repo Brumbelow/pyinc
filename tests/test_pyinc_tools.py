@@ -1874,6 +1874,127 @@ def test_watcher_context_manager_stops_on_exit(
         assert watcher.is_running is False
 
 
+def test_session_close_stops_watcher_before_removing_mirror(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    session = WorkspaceSession(root)
+    watchers = (PollingWorkspaceWatcher(session), PollingWorkspaceWatcher(session))
+    for watcher in watchers:
+        watcher.start(lambda _paths: None, interval_s=60.0)
+    threads = tuple(watcher._thread for watcher in watchers)
+    assert all(thread is not None and thread.is_alive() for thread in threads)
+
+    session.close()
+
+    assert all(thread is not None and not thread.is_alive() for thread in threads)
+    assert all(watcher.is_running is False for watcher in watchers)
+    assert not Path(session.mirror_root).exists()
+
+
+def test_session_can_close_from_watcher_callback(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "x = 1\n")
+
+    session = WorkspaceSession(root)
+    watcher = PollingWorkspaceWatcher(session, debounce_ms=0)
+    callback_finished = threading.Event()
+    errors: list[Exception] = []
+
+    def close_session(_paths: tuple[str, ...]) -> None:
+        session.close()
+        callback_finished.set()
+
+    watcher.start(close_session, interval_s=0.01, on_error=errors.append)
+    thread = watcher._thread
+    assert thread is not None
+    _write(target, "x = 22\n")
+
+    assert callback_finished.wait(timeout=2.0)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    assert errors == []
+    assert not Path(session.mirror_root).exists()
+
+
+def test_concurrent_session_close_does_not_deadlock_watcher_callback(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "x = 1\n")
+
+    session = WorkspaceSession(root)
+    watcher = PollingWorkspaceWatcher(session, debounce_ms=0)
+    callback_started = threading.Event()
+    finish_callback = threading.Event()
+    callback_finished = threading.Event()
+
+    def close_session(_paths: tuple[str, ...]) -> None:
+        callback_started.set()
+        assert finish_callback.wait(timeout=2.0)
+        session.close()
+        callback_finished.set()
+
+    watcher.start(close_session, interval_s=0.01)
+    _write(target, "x = 22\n")
+    assert callback_started.wait(timeout=2.0)
+
+    close_thread = threading.Thread(target=session.close)
+    close_thread.start()
+    try:
+        assert watcher._stop_event.wait(timeout=2.0)
+        finish_callback.set()
+        assert callback_finished.wait(timeout=2.0)
+        close_thread.join(timeout=2.0)
+        assert not close_thread.is_alive()
+    finally:
+        finish_callback.set()
+        watcher.stop(timeout=2.0)
+        close_thread.join(timeout=2.0)
+
+    assert watcher.is_running is False
+    assert not Path(session.mirror_root).exists()
+
+
+def test_watcher_cannot_start_after_session_close(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    session = WorkspaceSession(root)
+    watcher = PollingWorkspaceWatcher(session)
+    session.close()
+
+    with pytest.raises(RuntimeError, match="WorkspaceSession is closed"):
+        watcher.start(lambda _paths: None)
+    assert watcher.is_running is False
+
+
+def test_watcher_start_failure_unregisters_from_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+
+    session = WorkspaceSession(root)
+    watcher = PollingWorkspaceWatcher(session)
+
+    def fail_start(_thread: threading.Thread) -> None:
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="thread unavailable"):
+        watcher.start(lambda _paths: None)
+
+    assert watcher.is_running is False
+    assert session._watchers == set()
+    session.close()
+
+
 def test_session_raises_after_close(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()

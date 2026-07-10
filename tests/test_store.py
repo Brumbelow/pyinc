@@ -510,10 +510,20 @@ def test_filesystem_store_interrupted_publish_leaves_no_partial_object(
     digest = "d" * 64
     store = FileSystemArtifactStore(tmp_path)
 
-    def fail_replace(source: str, destination: str, **kwargs: object) -> None:
-        raise OSError("interrupted")
+    if os.name == "nt":
+        api_type = type(safe_fs_module._windows_api())
 
-    monkeypatch.setattr(os, "replace", fail_replace)
+        def fail_rename(_self: Any, _handle: int, _destination: str) -> None:
+            raise OSError("interrupted")
+
+        monkeypatch.setattr(api_type, "rename_handle", fail_rename)
+    else:
+
+        def fail_replace(source: str, destination: str, **kwargs: object) -> None:
+            del source, destination, kwargs
+            raise OSError("interrupted")
+
+        monkeypatch.setattr(os, "replace", fail_replace)
     with pytest.raises(OSError, match="interrupted"):
         store.put(digest, b"payload")
 

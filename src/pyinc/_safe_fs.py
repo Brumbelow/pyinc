@@ -528,7 +528,7 @@ def _read_regular_file_windows(path: Path) -> bytes | None:
                 os.fspath(path),
                 access=_WIN_GENERIC_READ | _WIN_FILE_READ_ATTRIBUTES,
                 creation=_WIN_OPEN_EXISTING,
-                flags=_WIN_FILE_FLAG_OPEN_REPARSE_POINT,
+                flags=_WIN_FILE_FLAG_OPEN_REPARSE_POINT | _WIN_FILE_FLAG_BACKUP_SEMANTICS,
             )
         except OSError as error:
             if _windows_error_code(error) in _WIN_MISSING_ERRORS:

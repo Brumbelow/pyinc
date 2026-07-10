@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import ast
-import io
 import os
-import tokenize
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeAlias, cast, overload
 
+from pyinc._python_lexing import identifier_tokens
 from pyinc.core import query
 from pyinc.integrations.python_source import source_text
 from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
@@ -191,10 +190,7 @@ class _ScopeBuilder:
         self.uses: list[_Use] = []
         self._event_counter = 0
         normalized_source = "\n".join(self.document.lines)
-        try:
-            self._tokens = tuple(tokenize.generate_tokens(io.StringIO(normalized_source).readline))
-        except (IndentationError, tokenize.TokenError):
-            self._tokens = ()
+        self._tokens = identifier_tokens(normalized_source)
         self._visit_statements(tree.body, self.root)
 
     def build(self) -> ScopeTree:
@@ -918,8 +914,7 @@ class _ScopeBuilder:
         tokens = [
             token
             for token in self._tokens
-            if token.type == tokenize.NAME
-            and _normalized_identifier(token.string) == name
+            if _normalized_identifier(token.string) == name
             and full.start <= SourcePosition(token.start[0] - 1, token.start[1])
             and SourcePosition(token.end[0] - 1, token.end[1]) <= full.end
         ]
@@ -927,8 +922,7 @@ class _ScopeBuilder:
             as_tokens = [
                 token
                 for token in self._tokens
-                if token.type == tokenize.NAME
-                and token.string == "as"
+                if token.string == "as"
                 and full.start <= SourcePosition(token.start[0] - 1, token.start[1])
                 and SourcePosition(token.end[0] - 1, token.end[1]) <= full.end
             ]
