@@ -33,7 +33,7 @@ def _tree(root: Path) -> dict[str, bytes]:
     return {
         p.relative_to(root).as_posix(): p.read_bytes()
         for p in sorted(root.rglob("*"))
-        if p.is_file()
+        if p.is_file() and not p.name.startswith(".pyinc-action.")
     }
 
 
@@ -173,7 +173,8 @@ def test_explain_shows_root_include_and_chain(tmp_path: Path) -> None:  # B5
     text = db.explain(evaluate_name, str(root), "alpha")
     assert "m.calc" in text
     assert "constants.calc" in text
-    assert "beta" in text
+    assert "binding_expr[" in text
+    assert "beta" not in text  # argument values stay behind digest-only labels
 
 
 # --------------------------------------------------------------------------- #
@@ -187,7 +188,7 @@ def test_emit_writes_one_output_per_emit(tmp_path: Path) -> None:
     _write(root, "let a = 6 + 1\nemit a\n")
     db = Database(mode="strict")
     res = calc_emit.reconcile(db, str(root), root=out)
-    assert res.written == ("a.out",)
+    assert res.created == ("a.out",)
     assert (out / "a.out").read_text() == "7\n"
 
 
@@ -200,7 +201,8 @@ def test_removing_emit_deletes_owned_output(tmp_path: Path) -> None:  # B4
     assert (out / "a.out").exists() and (out / "b.out").exists()
     _write(root, "let a = 1\nlet b = 2\nemit a\n")  # emit b removed
     res = calc_emit.reconcile(db, str(root), root=out)
-    assert res.deleted == ("b.out",) and res.written == ()
+    assert res.deleted == ("b.out",)
+    assert res.created == res.updated == res.repaired == ()
     assert not (out / "b.out").exists()
 
 

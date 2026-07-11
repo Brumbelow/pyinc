@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -279,7 +281,8 @@ def test_freeze_already_frozen_values_pass_through() -> None:
     assert freeze(fs) is fs
     assert freeze(fr) is fr
     assert freeze(fa) is fa
-    assert freeze(fref) is fref
+    with pytest.raises(UnsupportedValueError, match="FrozenRef index"):
+        freeze(fref)
     assert freeze(fg) is fg
 
 
@@ -289,9 +292,10 @@ def test_freeze_already_frozen_values_pass_through() -> None:
 
 
 def test_freeze_pathlike_converts_to_str() -> None:
-    result = freeze(Path("/tmp/test.txt"))
+    path = Path("/tmp/test.txt")
+    result = freeze(path)
     assert isinstance(result, str)
-    assert result == "/tmp/test.txt"
+    assert result == os.fspath(path)
 
 
 def test_freeze_range_converts_to_tuple() -> None:
@@ -417,9 +421,9 @@ CANONICAL_FINGERPRINTS: dict[str, tuple[Any, str]] = {
 def test_fingerprint_snapshot_pins_exact_bytes_for_canonical_values() -> None:
     for label, (value, expected_digest) in CANONICAL_FINGERPRINTS.items():
         actual = fingerprint_snapshot(value)
-        assert (
-            actual == expected_digest
-        ), f"fingerprint_snapshot drift for {label!r}: got {actual}, expected {expected_digest}"
+        assert actual == expected_digest, (
+            f"fingerprint_snapshot drift for {label!r}: got {actual}, expected {expected_digest}"
+        )
 
 
 def test_fingerprint_snapshot_distinguishes_shapes() -> None:
@@ -435,9 +439,9 @@ def test_fingerprint_snapshot_distinguishes_shapes() -> None:
     # range-as-tuple vs raw tuple with same head
     assert fingerprint_snapshot(("range", 1, 10, 2)) != fingerprint_snapshot((1, 10, 2))
     # FrozenRecord differing type_name
-    assert fingerprint_snapshot(
-        FrozenRecord("Point", (("x", 1),))
-    ) != fingerprint_snapshot(FrozenRecord("Other", (("x", 1),)))
+    assert fingerprint_snapshot(FrozenRecord("Point", (("x", 1),))) != fingerprint_snapshot(
+        FrozenRecord("Other", (("x", 1),))
+    )
     # FrozenAdapterValue differing adapter_key
     assert fingerprint_snapshot(FrozenAdapterValue("a", 1)) != fingerprint_snapshot(
         FrozenAdapterValue("b", 1)
@@ -463,9 +467,7 @@ def test_fingerprint_snapshot_equivalence_under_freeze_normalization() -> None:
     assert fingerprint_snapshot(left) == fingerprint_snapshot(right)
 
     # Sets freeze by canonical sort — ordering of input items does not affect digest.
-    assert fingerprint_snapshot(freeze({1, 2, 3})) == fingerprint_snapshot(
-        freeze({3, 2, 1})
-    )
+    assert fingerprint_snapshot(freeze({1, 2, 3})) == fingerprint_snapshot(freeze({3, 2, 1}))
 
 
 def test_assert_not_mutated_matching_passes_different_raises() -> None:
@@ -597,6 +599,124 @@ def test_frozen_graph_digest_is_deterministic_across_construction_orders() -> No
     assert digest_a == digest_b
 
 
+@pytest.mark.parametrize("shared_factory", [list, set])
+def test_frozen_graph_node_numbers_ignore_mapping_insertion_order(
+    shared_factory: Any,
+) -> None:
+    first_left = shared_factory([1])
+    second_left = shared_factory([2])
+    left: dict[str, Any] = {}
+    for key, value in (
+        ("a", first_left),
+        ("b", second_left),
+        ("aa", first_left),
+        ("bb", second_left),
+    ):
+        left[key] = value
+
+    first_right = shared_factory([1])
+    second_right = shared_factory([2])
+    right: dict[str, Any] = {}
+    for key, value in (
+        ("bb", second_right),
+        ("aa", first_right),
+        ("b", second_right),
+        ("a", first_right),
+    ):
+        right[key] = value
+
+    left_snapshot = freeze(left)
+    right_snapshot = freeze(right)
+
+    assert left == right
+    assert left_snapshot == right_snapshot
+    assert fingerprint_snapshot(left_snapshot) == fingerprint_snapshot(right_snapshot)
+    thawed = cast(dict[str, Any], thaw(left_snapshot))
+    assert thawed["a"] is thawed["aa"]
+    assert thawed["b"] is thawed["bb"]
+    assert thawed["a"] is not thawed["b"]
+
+
+def test_frozen_graph_node_numbers_ignore_mapping_order_with_cycles() -> None:
+    def cyclic(marker: int) -> list[Any]:
+        value: list[Any] = []
+        value.extend((value, marker))
+        return value
+
+    first_left = cyclic(1)
+    second_left = cyclic(2)
+    left = {
+        "a": first_left,
+        "b": second_left,
+        "aa": first_left,
+        "bb": second_left,
+    }
+
+    first_right = cyclic(1)
+    second_right = cyclic(2)
+    right: dict[str, Any] = {}
+    for key, value in (
+        ("bb", second_right),
+        ("aa", first_right),
+        ("b", second_right),
+        ("a", first_right),
+    ):
+        right[key] = value
+
+    left_snapshot = freeze(left)
+    right_snapshot = freeze(right)
+
+    assert left_snapshot == right_snapshot
+    thawed = cast(dict[str, list[Any]], thaw(left_snapshot))
+    assert thawed["a"] is thawed["aa"]
+    assert thawed["a"][0] is thawed["a"]
+    assert thawed["b"][0] is thawed["b"]
+
+
+def test_adapted_hash_positions_are_isolated_from_graph_node_order() -> None:
+    class AdaptedKey:
+        def __init__(self, name: str, payload: Any) -> None:
+            self.name = name
+            self.payload = payload
+
+        def __hash__(self) -> int:
+            return 0
+
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, AdaptedKey) and self.name == other.name
+
+    class AdaptedKeyAdapter:
+        def freeze(self, value: AdaptedKey, _freeze_value: Any) -> Any:
+            return {"name": value.name, "payload": value.payload}
+
+        def thaw(self, snapshot: Any, thaw_value: Any) -> AdaptedKey:
+            data = cast(Any, snapshot)
+            return AdaptedKey(
+                cast(str, thaw_value(data["name"])),
+                thaw_value(data["payload"]),
+            )
+
+    adapters = {AdaptedKey: AdaptedKeyAdapter()}
+    left: set[AdaptedKey] = set()
+    right: set[AdaptedKey] = set()
+    for name in ("a", "b", "c"):
+        left.add(AdaptedKey(name, [name]))
+    for name in ("c", "b", "a"):
+        right.add(AdaptedKey(name, [name]))
+
+    assert freeze(left, adapters=adapters) == freeze(right, adapters=adapters)
+
+    shared: list[Any] = []
+    shared_payload = [shared, shared]
+    with pytest.raises(UnsupportedValueError, match="remain hashable"):
+        freeze({AdaptedKey("shared", shared_payload)}, adapters=adapters)
+
+    cyclic_payload: list[Any] = []
+    cyclic_payload.append(cyclic_payload)
+    with pytest.raises(UnsupportedValueError, match="remain hashable"):
+        freeze({AdaptedKey("cyclic", cyclic_payload)}, adapters=adapters)
+
+
 # ---------------------------------------------------------------------------
 # Group H: Serialize/deserialize and K2 fingerprint prefix
 # ---------------------------------------------------------------------------
@@ -682,3 +802,87 @@ def test_deserialize_rejects_trailing_garbage() -> None:
     payload = serialize_snapshot(freeze(42))
     with pytest.raises(UnsupportedValueError, match="trailing"):
         deserialize_snapshot(payload + b"junk")
+
+
+def test_snapshot_validation_rejects_invalid_graphs_and_excessive_depth() -> None:
+    invalid = FrozenGraph(nodes=(), root=FrozenRef(0))
+    with pytest.raises(UnsupportedValueError, match="non-empty"):
+        freeze(invalid)
+    with pytest.raises(UnsupportedValueError, match="non-empty"):
+        serialize_snapshot(invalid)
+    with pytest.raises(UnsupportedValueError, match="non-empty"):
+        thaw(invalid)
+
+    deep_payload = b"K2;" + b"t1:" * 3_000 + b"N;" + b";" * 3_000
+    with pytest.raises(UnsupportedValueError, match="invalid snapshot encoding"):
+        deserialize_snapshot(deep_payload)
+
+
+def test_snapshot_metadata_requires_exact_unicode_strings() -> None:
+    class StringSubclass(str):
+        pass
+
+    invalid_metadata = (
+        FrozenSet(cast(Any, StringSubclass("set")), ()),
+        FrozenRecord(cast(Any, StringSubclass("Record")), ()),
+        FrozenRecord("Record", ((cast(Any, StringSubclass("field")), 1),)),
+        FrozenAdapterValue(cast(Any, StringSubclass("module:Type")), 1),
+        FrozenRecord("\ud800", ()),
+        FrozenRecord("Record", (("\ud800", 1),)),
+        FrozenAdapterValue("module:\ud800", 1),
+    )
+
+    for snapshot in invalid_metadata:
+        with pytest.raises(UnsupportedValueError):
+            serialize_snapshot(snapshot)
+
+
+def test_freeze_rejects_values_that_thaw_unhashably_in_hash_positions() -> None:
+    @dataclass(frozen=True)
+    class Key:
+        value: int
+
+    invalid_values = (
+        {Key(1): "value"},
+        {Key(1)},
+        frozenset({Key(1)}),
+        {(Key(1),): "value"},
+        {frozenset({Key(1)}): "value"},
+        {FrozenList((1,)): "value"},
+        {FrozenDict((("key", 1),)): "value"},
+        {FrozenSet("set", (1,)): "value"},
+        {FrozenGraph((FrozenList(()),), FrozenRef(0)): "value"},
+    )
+
+    for value in invalid_values:
+        with pytest.raises(UnsupportedValueError, match="remain hashable"):
+            freeze(value)
+
+    adapted = freeze({Point(1, 2)}, adapters={Point: PointAdapter()})
+    assert thaw(adapted, adapters={Point: PointAdapter()}) == {Point(1, 2)}
+
+
+def test_scalar_subclasses_require_an_adapter_at_boundaries() -> None:
+    class StatefulInt(int):
+        factor: int
+
+        def __new__(cls, value: int, factor: int) -> StatefulInt:
+            instance = super().__new__(cls, value)
+            instance.factor = factor
+            return instance
+
+    with pytest.raises(UnsupportedValueError, match="Scalar subclass"):
+        freeze(StatefulInt(2, 3))
+
+
+def test_nan_payloads_are_canonicalized_and_prefrozen_payloads_are_validated() -> None:
+    first = struct.unpack(">d", bytes.fromhex("7ff8000000000001"))[0]
+    second = struct.unpack(">d", bytes.fromhex("7ff8000000000002"))[0]
+    canonical_first = freeze(first)
+    canonical_second = freeze(second)
+
+    assert struct.pack(">d", cast(float, canonical_first)) == struct.pack(
+        ">d", cast(float, canonical_second)
+    )
+    with pytest.raises(UnsupportedValueError, match="canonical bit pattern"):
+        freeze(FrozenList((first,)))

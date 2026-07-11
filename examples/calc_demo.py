@@ -47,7 +47,8 @@ def main() -> None:
         db.reset_statistics()
         unrelated.write_text("let z = 2\n", encoding="utf-8")
         unrelated_run = calc_emit.reconcile(db, str(root), root=out)
-        print(f"unrelated_edit_writes={unrelated_run.written}")
+        changes = unrelated_run.created + unrelated_run.updated + unrelated_run.repaired
+        print(f"unrelated_edit_changes={changes}")
         print(f"unrelated_edit_executions={db.statistics().query_executions}")
 
         # A comment-only edit reparses but backdates the semantic parse.

@@ -94,8 +94,8 @@ def test_checkpoint_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
 def test_action_reconcile_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     _run_example("action_reconcile_demo.py")
     output = capsys.readouterr().out
-    assert "first_written=('alpha.txt', 'beta.txt')" in output
-    assert "rerun_written=()" in output
+    assert "first_created=('alpha.txt', 'beta.txt')" in output
+    assert "rerun_updated=()" in output
     assert "tamper_repaired=('beta.txt',)" in output
     assert "orphan_deleted=('beta.txt',)" in output
     assert "plan_only_no_files=True" in output
@@ -105,7 +105,7 @@ def test_calc_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     _run_example("calc_demo.py")
     output = capsys.readouterr().out
     assert "alpha=42" in output
-    assert "unrelated_edit_writes=()" in output
+    assert "unrelated_edit_changes=()" in output
     assert "unrelated_edit_executions=0" in output
     assert "comment_edit_backdated=True" in output
     assert "removed_emit_deleted=('base.out',)" in output
@@ -118,6 +118,6 @@ def test_codegen_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
         "generated=('__init__.py', 'color.py', 'docs/color.md', 'docs/widget.md', 'widget.py')"
         in output
     )
-    assert "whitespace_edit_written=()" in output
-    assert "description_edit_written=('docs/widget.md',)" in output
+    assert "whitespace_edit_changed=()" in output
+    assert "description_edit_updated=('docs/widget.md',)" in output
     assert "removed_def_deleted=('color.py', 'docs/color.md')" in output

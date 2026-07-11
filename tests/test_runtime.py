@@ -18,6 +18,8 @@ from pyinc import (
     FileResource,
     FileStatResource,
     FrozenDict,
+    FrozenGraph,
+    FrozenList,
     Input,
     InspectionNode,
     MutationError,
@@ -26,8 +28,10 @@ from pyinc import (
     Subscription,
     UnsupportedValueError,
     UntrackedReadError,
+    freeze,
     query,
 )
+from pyinc.value import fingerprint_snapshot
 
 _GLOBAL_BOX = {"x": 1}
 
@@ -37,16 +41,12 @@ def read_global_box(db: Database) -> int:
     return _GLOBAL_BOX["x"]
 
 
-def _query_record(
-    db: Database, query_fn: object, *args: object, **kwargs: object
-) -> Any:
+def _query_record(db: Database, query_fn: object, *args: object, **kwargs: object) -> Any:
     key, _ = db._query_key(query_fn, args, kwargs)
     return db._records[key]
 
 
-def _inspect_node(
-    db: Database, query_fn: Any, *args: object, **kwargs: object
-) -> InspectionNode:
+def _inspect_node(db: Database, query_fn: Any, *args: object, **kwargs: object) -> InspectionNode:
     return db.inspect(query_fn, *args, **kwargs)
 
 
@@ -61,9 +61,10 @@ def _find_node(root: InspectionNode, needle: str) -> InspectionNode:
     raise LookupError(needle)
 
 
-def test_max_query_nodes_must_be_positive() -> None:
-    with pytest.raises(ValueError):
-        Database(max_query_nodes=0)
+@pytest.mark.parametrize("limit", [0, -1, 1.5, float("nan"), True, "1"])
+def test_max_query_nodes_must_be_a_positive_integer(limit: object) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        Database(max_query_nodes=cast(Any, limit))
 
 
 def test_inputs_and_queries_reject_eq_and_cutoff_together() -> None:
@@ -215,12 +216,8 @@ def test_dynamic_dependencies_drop_stale_edges() -> None:
     assert db.get(branch) == 10
 
     inspection = _inspect_node(db, branch)
-    assert any(
-        dependency.label == "input[right]" for dependency in inspection.dependencies
-    )
-    assert all(
-        dependency.label != "input[left]" for dependency in inspection.dependencies
-    )
+    assert any(dependency.label == "input[right]" for dependency in inspection.dependencies)
+    assert all(dependency.label != "input[left]" for dependency in inspection.dependencies)
 
 
 def test_inspect_returns_structured_dependency_tree() -> None:
@@ -290,9 +287,7 @@ def test_inspect_fresh_on_cold_cache_returns_same_shape_as_inspect() -> None:
     assert tree_a.label == tree_b.label
     assert tree_a.kind == tree_b.kind
     assert tree_a.last_decision == tree_b.last_decision == "executed"
-    assert {dep.label for dep in tree_a.dependencies} == {
-        dep.label for dep in tree_b.dependencies
-    }
+    assert {dep.label for dep in tree_a.dependencies} == {dep.label for dep in tree_b.dependencies}
 
 
 def test_inspect_fresh_rejects_non_query() -> None:
@@ -305,9 +300,7 @@ def test_inspect_fresh_rejects_non_query() -> None:
     ("mode", "expected_type"),
     [("strict", FrozenDict), ("checked", dict), ("fast", dict)],
 )
-def test_modes_expose_expected_boundary_shapes(
-    mode: str, expected_type: type[object]
-) -> None:
+def test_modes_expose_expected_boundary_shapes(mode: str, expected_type: type[object]) -> None:
     payload = Input[dict[str, int]]("payload")
 
     @query
@@ -318,6 +311,85 @@ def test_modes_expose_expected_boundary_shapes(
     db.set(payload, {"x": 1})
     result = db.get(echo)
     assert isinstance(result, expected_type)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_query_call_materializes_direct_mutable_argument(mode: str) -> None:
+    @query
+    def first(db: Database, values: list[int]) -> int:
+        return values[0]
+
+    assert Database(mode=mode).get(first, [7, 8]) == 7
+
+
+def test_tree_query_call_snapshot_retains_flat_digest_shape() -> None:
+    @query
+    def combine(db: Database, value: int, *, enabled: bool) -> int:
+        return value if enabled else 0
+
+    db = Database()
+    key, snapshot = db._query_key(combine, (7,), {"enabled": True})
+    previous_shape = (freeze((7,)), freeze({"enabled": True}))
+
+    assert snapshot == previous_shape
+    assert key.args_digest == fingerprint_snapshot(previous_shape)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_query_call_preserves_shared_positional_identity(mode: str) -> None:
+    @query
+    def same_object(db: Database, left: list[int], right: list[int]) -> bool:
+        return left is right
+
+    shared = [1]
+    db = Database(mode=mode)
+    key, snapshot = db._query_key(same_object, (shared, shared), {})
+
+    assert isinstance(snapshot, FrozenGraph)
+    assert key.args_digest == fingerprint_snapshot(snapshot)
+    assert db.get(same_object, shared, shared) is True
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_query_call_preserves_self_cycle(mode: str) -> None:
+    @query
+    def sees_cycle(db: Database, value: list[Any]) -> bool:
+        return value[0] is value
+
+    cyclic: list[Any] = []
+    cyclic.append(cyclic)
+
+    assert Database(mode=mode).get(sees_cycle, cyclic) is True
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_query_call_preserves_positional_keyword_alias(mode: str) -> None:
+    @query
+    def same_object(db: Database, positional: list[int], *, keyword: list[int]) -> bool:
+        return positional is keyword
+
+    shared = [1]
+
+    assert Database(mode=mode).get(same_object, shared, keyword=shared) is True
+
+
+def test_strict_query_call_exposes_safe_cyclic_view() -> None:
+    @query
+    def inspect_cycle(db: Database, value: list[Any]) -> tuple[bool, bool, bool]:
+        return (
+            isinstance(value, FrozenList),
+            value[0] is value,
+            hasattr(value, "append"),
+        )
+
+    cyclic: list[Any] = []
+    cyclic.append(cyclic)
+
+    assert Database(mode="strict").get(inspect_cycle, cyclic) == (
+        True,
+        True,
+        False,
+    )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked"])
@@ -425,9 +497,7 @@ def test_os_environ_access_is_rejected_inside_query(
 
 
 @pytest.mark.parametrize("method_name", ["read_text", "read_bytes"])
-def test_path_read_helpers_are_rejected_inside_query(
-    tmp_path: Path, method_name: str
-) -> None:
+def test_path_read_helpers_are_rejected_inside_query(tmp_path: Path, method_name: str) -> None:
     path = tmp_path / "sample.txt"
     path.write_text("hello", encoding="utf-8")
 
@@ -444,9 +514,7 @@ def test_path_read_helpers_are_rejected_inside_query(
 
 
 @pytest.mark.parametrize("method_name", ["listdir", "scandir", "iterdir"])
-def test_directory_helpers_are_rejected_inside_query(
-    tmp_path: Path, method_name: str
-) -> None:
+def test_directory_helpers_are_rejected_inside_query(tmp_path: Path, method_name: str) -> None:
     path = tmp_path / "workspace"
     path.mkdir()
     (path / "a.txt").write_text("alpha", encoding="utf-8")
@@ -479,6 +547,42 @@ def test_resource_reads_are_allowed_inside_query(
 
     db = Database()
     assert db.get(read_tracked, str(workspace)) == ("value", ("a.txt",))
+
+
+def test_query_nested_inside_resource_hook_cannot_read_raw_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variable = "PYINC_NESTED_RESOURCE_ENV"
+    monkeypatch.setenv(variable, "value")
+
+    @query(key="raw-resource-leaf")
+    def raw_leaf(db: Database) -> str | None:
+        return os.getenv(variable)
+
+    class NestedQueryResource:
+        def identity(self) -> tuple[str]:
+            return ("nested-query-resource",)
+
+        def read(self, db: Database, name: str) -> str | None:
+            return cast(str | None, db.read_resource(self, name))
+
+        def label(self, name: str) -> str:
+            return f"nested-query[{name}]"
+
+        def probe(self, name: str) -> str | None:
+            return os.getenv(name)
+
+        def load(self, db: Database, name: str) -> str | None:
+            return db.get(raw_leaf)
+
+    resource = NestedQueryResource()
+
+    @query(key="nested-resource-root")
+    def root(db: Database) -> str | None:
+        return resource.read(db, variable)
+
+    with pytest.raises(UntrackedReadError):
+        Database().get(root)
 
 
 def test_failed_resource_reads_do_not_leave_dangling_dependencies(
@@ -1187,11 +1291,11 @@ def test_mutation_of_query_return_value_does_not_corrupt_memo(mode: str) -> None
     assert second == {"items": [1, 2, 3]}
 
 
-def test_custom_eq_with_side_effect_does_not_corrupt_graph() -> None:
-    call_count = [0]
-
+def test_custom_eq_with_side_effect_does_not_corrupt_graph(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     def parity_eq(left: int, right: int) -> bool:
-        call_count[0] += 1
+        print("custom comparator ran")
         return left % 2 == right % 2
 
     number = Input[int]("number")
@@ -1212,7 +1316,7 @@ def test_custom_eq_with_side_effect_does_not_corrupt_graph() -> None:
     # eq callback fires with a side effect; kernel should still function correctly.
     db.set(number, 5)
     assert db.get(describe) == "v=3"  # Backdated — parity says equal.
-    assert call_count[0] > 0
+    assert "custom comparator ran" in capsys.readouterr().out
     assert _inspect_node(db, describe).last_decision == "reused"
 
     # Now change parity: odd → even, eq returns False → graph updates.
@@ -1444,11 +1548,9 @@ def test_cutoff_performing_ambient_read_does_not_crash(tmp_path: Path) -> None:
 
 def test_eq_raising_exception_mid_comparison_leaves_database_usable() -> None:
     """If eq= raises an exception, the error propagates but safe queries still work."""
-    comparisons = {"count": 0}
 
     def raising_eq(left: int, right: int) -> bool:
-        comparisons["count"] += 1
-        if comparisons["count"] >= 2:
+        if right == 3:
             raise RuntimeError("boom")
         return left == right
 
@@ -1467,9 +1569,9 @@ def test_eq_raising_exception_mid_comparison_leaves_database_usable() -> None:
     assert db.get(transform) == 1  # First execution — no comparison.
 
     db.set(number, 2)
-    assert db.get(transform) == 2  # Re-executes, comparison #1 (doesn't raise).
+    assert db.get(transform) == 2  # Re-executes; this comparison does not raise.
 
-    # Third change triggers comparison #2 which raises.
+    # The third value selects the policy's explicit failure branch.
     db.set(number, 3)
     with pytest.raises(RuntimeError, match="boom"):
         db.get(transform)
@@ -1681,10 +1783,7 @@ def test_statistics_returns_frozen_snapshot() -> None:
     db = Database()
     stats = db.statistics()
     assert isinstance(stats, DatabaseStatistics)
-    assert all(
-        isinstance(getattr(stats, f.name), int)
-        for f in stats.__dataclass_fields__.values()
-    )
+    assert all(isinstance(getattr(stats, f.name), int) for f in stats.__dataclass_fields__.values())
     with pytest.raises(AttributeError):
         stats.node_count = 99  # type: ignore[misc]
 
@@ -1843,9 +1942,7 @@ def test_statistics_node_counts_match_records(tmp_path: Path) -> None:
     db.get(compute)
 
     stats = db.statistics()
-    assert (
-        stats.node_count == stats.input_count + stats.query_count + stats.resource_count
-    )
+    assert stats.node_count == stats.input_count + stats.query_count + stats.resource_count
     assert stats.input_count >= 1
     assert stats.query_count >= 1
     assert stats.resource_count >= 1
@@ -1935,17 +2032,14 @@ def test_dependency_graph_diamond_structure() -> None:
         if n.kind == "query"
         and len(n.dependency_labels) == 2
         and all(
-            d not in [n2.label for n2 in graph if n2.kind == "input"]
-            for d in n.dependency_labels
+            d not in [n2.label for n2 in graph if n2.kind == "input"] for d in n.dependency_labels
         )
     ]
     assert len(combine_nodes) == 1
     combine_node = combine_nodes[0]
 
     input_label = [n.label for n in graph if n.kind == "input"][0]
-    mid_nodes = [
-        n for n in graph if n.kind == "query" and input_label in n.dependency_labels
-    ]
+    mid_nodes = [n for n in graph if n.kind == "query" and input_label in n.dependency_labels]
     assert len(mid_nodes) == 2
     mid_labels = {n.label for n in mid_nodes}
     assert set(combine_node.dependency_labels) == mid_labels
@@ -2302,7 +2396,7 @@ def test_module_capture_invalidates_on_source_change(
             return cast(str, mod.CONSTANT)
 
         db1 = Database()
-        first_fp = db1._code_fingerprint(cast(Any, read_constant.fn))
+        first_fp = db1._query_fingerprint(read_constant)
 
         # Update the source and reload. A later query registration must see a
         # different code fingerprint because the captured module's source
@@ -2311,8 +2405,7 @@ def test_module_capture_invalidates_on_source_change(
         os.utime(str(module_file), ns=(0, 2_000_000_000))
         importlib.reload(mod)
 
-        db2 = Database()
-        second_fp = db2._code_fingerprint(cast(Any, read_constant.fn))
+        second_fp = db1._query_fingerprint(read_constant)
 
         assert first_fp != second_fp
     finally:
@@ -2337,13 +2430,14 @@ def test_module_capture_invalidates_on_version_attr_change(
         def read_version(db: Database) -> str:
             return cast(str, mod.__version__)
 
-        first_fp = Database()._code_fingerprint(cast(Any, read_version.fn))
+        db = Database()
+        first_fp = db._query_fingerprint(read_version)
 
         # Simulate a version bump in-process; the captured module's payload
         # must reflect the new value.
         mod.__version__ = "2.0.0"  # type: ignore[attr-defined]
 
-        second_fp = Database()._code_fingerprint(cast(Any, read_version.fn))
+        second_fp = db._query_fingerprint(read_version)
         assert first_fp != second_fp
     finally:
         _sys.modules.pop("pyinc_test_f5_version", None)
@@ -2361,6 +2455,25 @@ def test_module_capture_stable_for_stdlib_within_same_interpreter() -> None:
     fp_a = db_a._code_fingerprint(cast(Any, uses_os.fn))
     fp_b = db_b._code_fingerprint(cast(Any, uses_os.fn))
     assert fp_a == fp_b
+
+
+def test_module_capture_accepts_authenticated_stdlib_spec_identity() -> None:
+    import collections.abc as collections_abc
+    import sys
+
+    specification = collections_abc.__spec__
+    assert specification is not None
+    # CPython 3.11/3.12 uses the canonical source-backed name, while newer
+    # builds may expose the same live module through the frozen stdlib alias.
+    assert specification.name in {"collections.abc", "_collections_abc"}
+    assert sys.modules[collections_abc.__name__] is collections_abc
+    assert sys.modules[specification.name] is collections_abc
+
+    @query
+    def uses_collections_abc(db: Database) -> str:
+        return collections_abc.Mapping.__name__
+
+    assert Database().get(uses_collections_abc) == "Mapping"
 
 
 def test_guard_stack_reentrant_within_same_thread() -> None:
@@ -2395,7 +2508,7 @@ def test_observe_fires_on_cold_execution() -> None:
     assert isinstance(sub, Subscription)
     assert db.get(doubled) == 20
     assert len(events) == 1
-    assert events[0].query_id == doubled.query_id
+    assert events[0].query_id == doubled.key
     assert events[0].decision == "executed"
     assert events[0].changed_at == events[0].verified_at
 
@@ -2437,7 +2550,7 @@ def test_observe_does_not_fire_on_equal_input_update() -> None:
 
 def test_observe_does_not_fire_on_backdate(tmp_path: Path) -> None:
     path = tmp_path / "src.py"
-    path.write_text("x = 1\n")
+    path.write_bytes(b"x = 1\n")
     file_resource = FileResource()
 
     @query(cutoff=lambda value: value.strip())
@@ -2450,7 +2563,7 @@ def test_observe_does_not_fire_on_backdate(tmp_path: Path) -> None:
     assert db.get(trimmed, path) == "x = 1\n"
     assert len(events) == 1
     # Whitespace-only edit → same cutoff token → backdate
-    path.write_text("x = 1\n\n")
+    path.write_bytes(b"x = 1\n\n")
     assert db.get(trimmed, path) == "x = 1\n\n"
     assert len(events) == 1, "backdate must not fire observer"
 

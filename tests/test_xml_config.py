@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pyinc.integrations as integrations
 from pyinc import Database
 from pyinc.integrations.xml_config import (
     XmlAnalysis,
+    _safe_parse,
     workspace_xml_analysis,
     xml_analysis,
 )
@@ -332,17 +334,19 @@ _EXTERNAL_DTD = """\
 """
 
 
-def test_xml_analysis_rejects_billion_laughs_payload(tmp_path: Path) -> None:
-    import time
+def test_safe_parse_rejects_billion_laughs_at_doctype() -> None:
+    with pytest.raises(ET.ParseError) as exc_info:
+        _safe_parse(_BILLION_LAUGHS + "<unterminated")
 
+    assert str(exc_info.value) == "DTD / entity declarations disabled for safety"
+
+
+def test_xml_analysis_rejects_billion_laughs_payload(tmp_path: Path) -> None:
     path = tmp_path / "evil.xml"
     path.write_text(_BILLION_LAUGHS, encoding="utf-8")
 
-    start = time.monotonic()
     result = xml_analysis(Database(), str(path))
-    elapsed = time.monotonic() - start
 
-    assert elapsed < 1.0, f"parse took {elapsed:.2f}s; billion-laughs not bounded"
     assert result.elements == ()
     assert any(diag[0] == "xml-parse-error" for diag in result.diagnostics)
 

@@ -41,21 +41,23 @@ def main() -> None:
 
         db = Database(mode="strict")
         first = generate(db, schema_path, out)
-        print(f"generated={first.written}")
+        print(f"generated={first.created}")
 
         # Whitespace + key reordering: parsed schema is identical, nothing rewrites.
         schema_path.write_text(json.dumps(schema, indent=4, sort_keys=True), encoding="utf-8")
         whitespace = generate(db, schema_path, out)
-        print(f"whitespace_edit_written={whitespace.written}")
+        whitespace_changes = whitespace.created + whitespace.updated + whitespace.repaired
+        print(f"whitespace_edit_changed={whitespace_changes}")
 
         # Description-only change: only the doc artifact rewrites, not the model.
         widget = schema["$defs"]["Widget"]  # type: ignore[index]
         widget["description"] = "A widget."
         schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
         described = generate(db, schema_path, out)
-        print(f"description_edit_written={described.written}")
+        print(f"description_edit_updated={described.updated}")
 
         # Removing a definition deletes only the files it owned.
+        del widget["properties"]["color"]  # type: ignore[index]
         del schema["$defs"]["Color"]  # type: ignore[attr-defined]
         schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
         removed = generate(db, schema_path, out)

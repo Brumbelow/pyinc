@@ -240,6 +240,20 @@ def test_add_row_invalidates_csv(tmp_path: Path) -> None:
     assert first.row_count != second.row_count
 
 
+def test_diagnostic_only_edit_invalidates_csv(tmp_path: Path) -> None:
+    path = tmp_path / "data.csv"
+    path.write_text("first,second\n1\n2,3\n", encoding="utf-8")
+    db = Database(mode="strict")
+    assert "row 2:" in csv_analysis(db, path).diagnostics[0][1]
+
+    path.write_text("first,second\n1,2\n3\n", encoding="utf-8")
+    incremental = csv_analysis(db, path)
+    fresh = csv_analysis(Database(mode="strict"), path)
+
+    assert incremental == fresh
+    assert "row 3:" in incremental.diagnostics[0][1]
+
+
 # ---------------------------------------------------------------------------
 # From-scratch consistency
 # ---------------------------------------------------------------------------

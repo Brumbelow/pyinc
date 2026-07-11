@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import os
-from dataclasses import dataclass
+import tokenize
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
 from pyinc.core import query
 from pyinc.integrations.deep_module_resolution import resolve_module_location
 from pyinc.integrations.installed_packages import environment_index
-from pyinc.resources import DirectoryResource, _file_read_snapshot
+from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
+
+from .source_geometry import DocumentMap, SourcePosition, SourceRange, identifier_range
 
 ImportKind: TypeAlias = Literal["import", "from"]
 DefinitionKind: TypeAlias = Literal["function", "class"]
@@ -47,6 +51,7 @@ ResolvedImportPayload: TypeAlias = tuple[
 ]
 DependencySurfacePayload: TypeAlias = tuple[str, str, tuple[str, ...]]
 ModuleIndexEntryPayload: TypeAlias = tuple[str, str]
+SourceTextPayload: TypeAlias = tuple[str, str | None]
 ModuleAnalysisPayload: TypeAlias = tuple[
     str,
     str,
@@ -70,22 +75,21 @@ DirectoryAnalysisPayload: TypeAlias = tuple[FileAnalysisPayload, ...]
 class ImportRef:
     module: str
     kind: ImportKind
-    lineno: int
+    range: SourceRange
 
 
 @dataclass(frozen=True)
 class DefinitionRef:
     name: str
     kind: DefinitionKind
-    lineno: int
+    range: SourceRange
 
 
 @dataclass(frozen=True)
 class Diagnostic:
     code: str
     message: str
-    lineno: int | None
-    col_offset: int | None
+    range: SourceRange | None
 
 
 @dataclass(frozen=True)
@@ -100,7 +104,7 @@ class PythonFileAnalysis:
 class ResolvedImportRef:
     module: str
     kind: ImportKind
-    lineno: int
+    range: SourceRange
     imported_name: str | None
     resolved_module: str | None
     resolved_path: str | None
@@ -135,10 +139,8 @@ class PythonWorkspaceAnalysis:
 
 @dataclass(frozen=True)
 class _SourceTextResource:
-    encoding: str = "utf-8"
-
-    def read(self, db: Database, path: str | os.PathLike[str]) -> str:
-        return cast(str, db._read_resource(self, os.fspath(path)))
+    def read(self, db: Database, path: str | os.PathLike[str]) -> SourceTextPayload:
+        return cast(SourceTextPayload, db.read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"sourcefile[{path}]"
@@ -149,22 +151,47 @@ class _SourceTextResource:
             return ("missing",)
         return ("present", hashlib.sha256(file_path.read_bytes()).hexdigest())
 
-    def load(self, db: Database, path: str) -> str:
+    def load(self, db: Database, path: str) -> SourceTextPayload:
         file_path = Path(path)
         if not file_path.exists():
-            return ""
-        with db._allow_raw_open():
-            return file_path.read_text(encoding=self.encoding)
+            return "", None
+        return _decode_python_source(file_path.read_bytes(), path)
 
     def probe_and_load(
         self, db: Database, path: str
-    ) -> tuple[tuple[str, str] | tuple[str], str]:
-        probe, text = _file_read_snapshot(path, self.encoding)
-        return probe, text if text is not None else ""
+    ) -> tuple[tuple[str, str] | tuple[str], SourceTextPayload]:
+        file_path = Path(path)
+        try:
+            data = file_path.read_bytes()
+        except FileNotFoundError:
+            return ("missing",), ("", None)
+        probe = ("present", hashlib.sha256(data).hexdigest())
+        return probe, _decode_python_source(data, path)
+
+    def identity(self) -> str:
+        return "python-source-pep263-v1"
+
+
+def _decode_python_source(data: bytes, path: str) -> SourceTextPayload:
+    """Decode source according to the BOM and PEP 263 encoding cookie."""
+
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+    except SyntaxError as exc:
+        return "", f"{path}: {exc}"
+    try:
+        return data.decode(encoding), None
+    except (LookupError, UnicodeError) as exc:
+        return "", f"{path}: {exc}"
 
 
 _FILES = _SourceTextResource()
 _DIRECTORIES = DirectoryResource()
+_AST_TYPE_ALIAS = getattr(ast, "TypeAlias", None)
+
+
+def _is_type_alias(node: ast.AST) -> bool:
+    return isinstance(_AST_TYPE_ALIAS, type) and isinstance(node, _AST_TYPE_ALIAS)
 
 
 def _normalize_path(path: str | os.PathLike[str]) -> str:
@@ -243,9 +270,7 @@ def _literal_string_collection(value: ast.expr | None) -> tuple[str, ...] | None
 
 
 def _contains_name(node: ast.AST, name: str) -> bool:
-    return any(
-        isinstance(item, ast.Name) and item.id == name for item in ast.walk(node)
-    )
+    return any(isinstance(item, ast.Name) and item.id == name for item in ast.walk(node))
 
 
 def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
@@ -256,6 +281,12 @@ def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
     for node in tree.body:
         if isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef)):
             bound_names.add(node.name)
+            continue
+
+        if _is_type_alias(node):
+            name = getattr(node, "name", None)
+            if isinstance(name, ast.Name):
+                bound_names.add(name.id)
             continue
 
         if isinstance(node, ast.Import):
@@ -272,9 +303,7 @@ def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
             continue
 
         if isinstance(node, ast.Assign):
-            target_names = {
-                name for target in node.targets for name in _target_bound_names(target)
-            }
+            target_names = {name for target in node.targets for name in _target_bound_names(target)}
             bound_names.update(target_names)
             if "__all__" in target_names:
                 literal_names = _literal_string_collection(node.value)
@@ -346,9 +375,7 @@ def _module_binding_analysis(tree: ast.Module) -> ModuleBindingAnalysisPayload:
     if static_all_names is not None:
         wildcard_exports = static_all_names
     else:
-        wildcard_exports = tuple(
-            name for name in explicit_exports if not name.startswith("_")
-        )
+        wildcard_exports = tuple(name for name in explicit_exports if not name.startswith("_"))
     return explicit_exports, wildcard_exports, tuple(impurity_reasons)
 
 
@@ -477,9 +504,7 @@ def _installed_module_candidates(
         return ()
     candidates: list[str] = []
     if imported_name is not None and imported_name != "*":
-        candidate = (
-            f"{absolute_base}.{imported_name}" if absolute_base else imported_name
-        )
+        candidate = f"{absolute_base}.{imported_name}" if absolute_base else imported_name
         candidates.append(candidate)
     if absolute_base:
         candidates.append(absolute_base)
@@ -543,9 +568,7 @@ def _resolve_import_reference(
 
     candidates: list[str] = []
     if imported_name is not None and imported_name != "*":
-        candidate = (
-            f"{absolute_base}.{imported_name}" if absolute_base else imported_name
-        )
+        candidate = f"{absolute_base}.{imported_name}" if absolute_base else imported_name
         candidates.append(candidate)
     if absolute_base:
         candidates.append(absolute_base)
@@ -606,7 +629,7 @@ def _collect_python_files(
 
 @query(cutoff=_source_cutoff_token)
 def source_text(db: Database, path: str) -> str:
-    return _FILES.read(db, path)
+    return _FILES.read(db, path)[0]
 
 
 def _is_type_checking_test(test: ast.expr) -> bool:
@@ -633,8 +656,7 @@ def _has_import_error_handler(handlers: list[ast.ExceptHandler]) -> bool:
         ):
             return True
         if isinstance(exc_type, ast.Tuple) and any(
-            isinstance(elt, ast.Name)
-            and elt.id in ("ImportError", "ModuleNotFoundError")
+            isinstance(elt, ast.Name) and elt.id in ("ImportError", "ModuleNotFoundError")
             for elt in exc_type.elts
         ):
             return True
@@ -646,9 +668,7 @@ def _collect_import_statements(
 ) -> None:
     for node in body:
         if isinstance(node, ast.Import):
-            statements.extend(
-                (alias.name, "import", node.lineno, tuple()) for alias in node.names
-            )
+            statements.extend((alias.name, "import", node.lineno, tuple()) for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             statements.append(
                 (
@@ -661,9 +681,7 @@ def _collect_import_statements(
 
 
 @query
-def import_statements_for_file(
-    db: Database, path: str
-) -> tuple[ImportStatementPayload, ...]:
+def import_statements_for_file(db: Database, path: str) -> tuple[ImportStatementPayload, ...]:
     tree = _try_parse(source_text(db, path))
     if tree is None:
         return tuple()
@@ -671,9 +689,7 @@ def import_statements_for_file(
     statements: list[ImportStatementPayload] = []
     for node in tree.body:
         if isinstance(node, ast.Import):
-            statements.extend(
-                (alias.name, "import", node.lineno, tuple()) for alias in node.names
-            )
+            statements.extend((alias.name, "import", node.lineno, tuple()) for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             statements.append(
                 (
@@ -712,10 +728,10 @@ def definitions_for_file(db: Database, path: str) -> tuple[DefinitionPayload, ..
 
 
 @query
-def syntax_diagnostics_for_file(
-    db: Database, path: str
-) -> tuple[DiagnosticPayload, ...]:
-    source = source_text(db, path)
+def syntax_diagnostics_for_file(db: Database, path: str) -> tuple[DiagnosticPayload, ...]:
+    source, decode_error = _FILES.read(db, path)
+    if decode_error is not None:
+        return (("source-decode-error", decode_error, None, None),)
     try:
         ast.parse(source)
     except SyntaxError as exc:
@@ -731,9 +747,7 @@ def syntax_diagnostics_for_file(
 
 
 @query
-def module_binding_analysis_payload(
-    db: Database, path: str
-) -> ModuleBindingAnalysisPayload:
+def module_binding_analysis_payload(db: Database, path: str) -> ModuleBindingAnalysisPayload:
     tree = _try_parse(source_text(db, path))
     if tree is None:
         return (tuple(), tuple(), tuple())
@@ -768,12 +782,9 @@ def workspace_python_files(db: Database, root: str) -> tuple[str, ...]:
 
 
 @query
-def workspace_module_index(
-    db: Database, root: str
-) -> tuple[ModuleIndexEntryPayload, ...]:
+def workspace_module_index(db: Database, root: str) -> tuple[ModuleIndexEntryPayload, ...]:
     return tuple(
-        (_module_name_for_path(root, path), path)
-        for path in workspace_python_files(db, root)
+        (_module_name_for_path(root, path), path) for path in workspace_python_files(db, root)
     )
 
 
@@ -875,9 +886,7 @@ def resolved_imports_for_file(
 
 
 @query
-def module_export_surface(
-    db: Database, root: str, path: str
-) -> DependencySurfacePayload:
+def module_export_surface(db: Database, root: str, path: str) -> DependencySurfacePayload:
     module = _module_name_for_path(root, path)
     exports, _, impurity_reasons = module_binding_analysis_payload(db, path)
     for reason in impurity_reasons:
@@ -886,9 +895,7 @@ def module_export_surface(
 
 
 @query
-def module_wildcard_export_surface(
-    db: Database, root: str, path: str
-) -> DependencySurfacePayload:
+def module_wildcard_export_surface(db: Database, root: str, path: str) -> DependencySurfacePayload:
     module = _module_name_for_path(root, path)
     _, exports, impurity_reasons = module_binding_analysis_payload(db, path)
     for reason in impurity_reasons:
@@ -897,9 +904,7 @@ def module_wildcard_export_surface(
 
 
 @query
-def module_analysis_payload(
-    db: Database, root: str, path: str
-) -> ModuleAnalysisPayload:
+def module_analysis_payload(db: Database, root: str, path: str) -> ModuleAnalysisPayload:
     workspace_files = workspace_python_files(db, root)
     if path not in workspace_files:
         return _empty_module_analysis_payload(root, path)
@@ -917,11 +922,7 @@ def module_analysis_payload(
         _,
         _,
     ) in resolved_imports:
-        if (
-            resolution != "workspace"
-            or resolved_module is None
-            or resolved_path is None
-        ):
+        if resolution != "workspace" or resolved_module is None or resolved_path is None:
             continue
         _, _, impurity_reasons = module_binding_analysis_payload(db, resolved_path)
         for reason in impurity_reasons:
@@ -966,19 +967,24 @@ def directory_analysis_payload(db: Database, root: str) -> DirectoryAnalysisPayl
     return tuple(file_analysis_payload(db, path) for path in python_files)
 
 
+def _payload_range(lineno: int, width: int = 0) -> SourceRange:
+    start = SourcePosition(max(lineno - 1, 0), 0)
+    return SourceRange(start, SourcePosition(start.line, width))
+
+
 def _decode_import(payload: ImportPayload) -> ImportRef:
     module, kind, lineno = payload
-    return ImportRef(module=module, kind=kind, lineno=lineno)
+    return ImportRef(module=module, kind=kind, range=_payload_range(lineno))
 
 
 def _decode_definition(payload: DefinitionPayload) -> DefinitionRef:
     name, kind, lineno = payload
-    return DefinitionRef(name=name, kind=kind, lineno=lineno)
+    return DefinitionRef(name=name, kind=kind, range=_payload_range(lineno))
 
 
 def _decode_diagnostic(payload: DiagnosticPayload) -> Diagnostic:
-    code, message, lineno, col_offset = payload
-    return Diagnostic(code=code, message=message, lineno=lineno, col_offset=col_offset)
+    code, message, _lineno, _col_offset = payload
+    return Diagnostic(code=code, message=message, range=None)
 
 
 def _decode_resolved_import(payload: ResolvedImportPayload) -> ResolvedImportRef:
@@ -996,7 +1002,7 @@ def _decode_resolved_import(payload: ResolvedImportPayload) -> ResolvedImportRef
     return ResolvedImportRef(
         module=module,
         kind=kind,
-        lineno=lineno,
+        range=_payload_range(lineno),
         imported_name=imported_name,
         resolved_module=resolved_module,
         resolved_path=resolved_path,
@@ -1034,28 +1040,97 @@ def _decode_file_analysis(payload: FileAnalysisPayload) -> PythonFileAnalysis:
 
 
 def _decode_module_analysis(payload: ModuleAnalysisPayload) -> PythonModuleAnalysis:
-    path, module, imports, definitions, diagnostics, resolved_imports, dependencies = (
-        payload
-    )
+    path, module, imports, definitions, diagnostics, resolved_imports, dependencies = payload
     return PythonModuleAnalysis(
         path=path,
         module=module,
         imports=tuple(_decode_import(item) for item in imports),
         definitions=tuple(_decode_definition(item) for item in definitions),
         diagnostics=tuple(_decode_diagnostic(item) for item in diagnostics),
-        resolved_imports=tuple(
-            _decode_resolved_import(item) for item in resolved_imports
-        ),
+        resolved_imports=tuple(_decode_resolved_import(item) for item in resolved_imports),
         dependencies=tuple(_decode_dependency_surface(item) for item in dependencies),
+    )
+
+
+def _definition_name_range(
+    document: DocumentMap, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+) -> SourceRange:
+    return identifier_range(document.source, node, node.name)
+
+
+def _add_file_source_ranges(analysis: PythonFileAnalysis, source: str) -> PythonFileAnalysis:
+    document = DocumentMap(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        diagnostics = analysis.diagnostics
+        if diagnostics and exc.lineno is not None:
+            start = SourcePosition(max(exc.lineno - 1, 0), max((exc.offset or 1) - 1, 0))
+            end = SourcePosition(
+                max((exc.end_lineno or exc.lineno) - 1, 0),
+                max((exc.end_offset or exc.offset or 1) - 1, 0),
+            )
+            if end <= start:
+                end = SourcePosition(start.line, start.character + 1)
+            diagnostics = (replace(diagnostics[0], range=SourceRange(start, end)), *diagnostics[1:])
+        return replace(analysis, diagnostics=diagnostics)
+
+    import_ranges: dict[int, SourceRange] = {}
+    definition_ranges: dict[tuple[int, str], SourceRange] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            import_ranges.setdefault(node.lineno, document.ast_range(node))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definition_ranges[(node.lineno, node.name)] = _definition_name_range(document, node)
+    return replace(
+        analysis,
+        imports=tuple(
+            replace(
+                item,
+                range=import_ranges.get(item.range.start.line + 1, item.range),
+            )
+            for item in analysis.imports
+        ),
+        definitions=tuple(
+            replace(
+                item,
+                range=definition_ranges.get((item.range.start.line + 1, item.name), item.range),
+            )
+            for item in analysis.definitions
+        ),
+    )
+
+
+def _add_module_source_ranges(analysis: PythonModuleAnalysis, source: str) -> PythonModuleAnalysis:
+    file_part = _add_file_source_ranges(
+        PythonFileAnalysis(
+            analysis.path,
+            analysis.imports,
+            analysis.definitions,
+            analysis.diagnostics,
+        ),
+        source,
+    )
+    ranges_by_line = {item.range.start.line: item.range for item in file_part.imports}
+    return replace(
+        analysis,
+        imports=file_part.imports,
+        definitions=file_part.definitions,
+        diagnostics=file_part.diagnostics,
+        resolved_imports=tuple(
+            replace(
+                item,
+                range=ranges_by_line.get(item.range.start.line, item.range),
+            )
+            for item in analysis.resolved_imports
+        ),
     )
 
 
 def file_analysis(db: Database, path: str | os.PathLike[str]) -> PythonFileAnalysis:
     normalized_path = _normalize_path(path)
-    payload = cast(
-        FileAnalysisPayload, thaw(db.get(file_analysis_payload, normalized_path))
-    )
-    return _decode_file_analysis(payload)
+    payload = cast(FileAnalysisPayload, thaw(db.get(file_analysis_payload, normalized_path)))
+    return _add_file_source_ranges(_decode_file_analysis(payload), source_text(db, normalized_path))
 
 
 def directory_analysis(
@@ -1066,7 +1141,10 @@ def directory_analysis(
         DirectoryAnalysisPayload,
         thaw(db.get(directory_analysis_payload, normalized_root)),
     )
-    return tuple(_decode_file_analysis(item) for item in payload)
+    return tuple(
+        _add_file_source_ranges(_decode_file_analysis(item), source_text(db, item[0]))
+        for item in payload
+    )
 
 
 def module_analysis(
@@ -1074,9 +1152,7 @@ def module_analysis(
 ) -> PythonModuleAnalysis:
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
-    workspace_files = cast(
-        tuple[str, ...], thaw(db.get(workspace_python_files, normalized_root))
-    )
+    workspace_files = cast(tuple[str, ...], thaw(db.get(workspace_python_files, normalized_root)))
     if normalized_path not in workspace_files:
         raise ValueError(
             f"{normalized_path!r} is not a Python source file under {normalized_root!r}."
@@ -1085,12 +1161,12 @@ def module_analysis(
         ModuleAnalysisPayload,
         thaw(db.get(module_analysis_payload, normalized_root, normalized_path)),
     )
-    return _decode_module_analysis(payload)
+    return _add_module_source_ranges(
+        _decode_module_analysis(payload), source_text(db, normalized_path)
+    )
 
 
-def workspace_analysis(
-    db: Database, root: str | os.PathLike[str]
-) -> PythonWorkspaceAnalysis:
+def workspace_analysis(db: Database, root: str | os.PathLike[str]) -> PythonWorkspaceAnalysis:
     normalized_root = _normalize_path(root)
     payload = cast(
         WorkspaceAnalysisPayload,
@@ -1099,7 +1175,10 @@ def workspace_analysis(
     workspace_root, modules = payload
     return PythonWorkspaceAnalysis(
         root=workspace_root,
-        modules=tuple(_decode_module_analysis(item) for item in modules),
+        modules=tuple(
+            _add_module_source_ranges(_decode_module_analysis(item), source_text(db, item[0]))
+            for item in modules
+        ),
     )
 
 

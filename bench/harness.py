@@ -54,7 +54,7 @@ def _metric_value(result: ScenarioResult, metric: labels.Metric) -> object:
 
 def _write_csv(results: Sequence[ScenarioResult], csv_path: Path) -> None:
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
+        writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(_FIELDS)
         for r in results:
             row = [r.target, r.scenario, r.engine]
@@ -101,9 +101,7 @@ def _correct_cell(correct: bool, engine: str) -> str:
 
 def _write_markdown(results: Sequence[ScenarioResult], md_path: Path) -> None:
     engines = [e for e in labels.ENGINE_LABELS if any(r.engine == e for r in results)]
-    scenarios_present = [
-        s for s in labels.SCENARIO_LABELS if any(r.scenario == s for r in results)
-    ]
+    scenarios_present = [s for s in labels.SCENARIO_LABELS if any(r.scenario == s for r in results)]
     stale = [r for r in results if r.engine != "pyinc" and not r.correct]
 
     lines: list[str] = [
@@ -160,9 +158,7 @@ def _write_markdown(results: Sequence[ScenarioResult], md_path: Path) -> None:
     )
     lines.append("")
     lines.append(
-        "Engines: "
-        + ", ".join(f"`{e}` — {labels.engine_label(e)}" for e in engines)
-        + "."
+        "Engines: " + ", ".join(f"`{e}` — {labels.engine_label(e)}" for e in engines) + "."
     )
     lines.append("")
 
@@ -181,15 +177,12 @@ def _write_markdown(results: Sequence[ScenarioResult], md_path: Path) -> None:
         lines.append("")
         lines.append(f"_{labels.scenario_description(scenario)}_")
         lines.append("")
-        baseline = next(
-            (r.seconds for r in rows if r.engine == labels.BASELINE_ENGINE), None
-        )
+        baseline = next((r.seconds for r in rows if r.engine == labels.BASELINE_ENGINE), None)
         lines.append("| engine | wall (ms) | peak (KiB) | correct? | speedup |")
         lines.append("|---|---|---|---|---|")
         for r in rows:
             speedup = (
-                "baseline" if r.engine == labels.BASELINE_ENGINE
-                else _speedup(baseline, r.seconds)
+                "baseline" if r.engine == labels.BASELINE_ENGINE else _speedup(baseline, r.seconds)
             )
             lines.append(
                 f"| {labels.engine_label(r.engine)} | {r.seconds * 1000:.2f} | "

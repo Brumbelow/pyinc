@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import site
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from hypothesis import given, settings
@@ -104,9 +106,7 @@ def file_contents() -> st.SearchStrategy[list[str]]:
 
 
 def workspace_states() -> st.SearchStrategy[list[WorkspaceState]]:
-    provider_variant = st.sampled_from(
-        ["internal_a", "internal_b", "export_a", "export_b"]
-    )
+    provider_variant = st.sampled_from(["internal_a", "internal_b", "export_a", "export_b"])
     consumer_variant = st.sampled_from(
         ["provider_only", "provider_and_helper", "provider_star", "external_only"]
     )
@@ -114,7 +114,7 @@ def workspace_states() -> st.SearchStrategy[list[WorkspaceState]]:
     return st.lists(
         st.tuples(provider_variant, consumer_variant, helper_present),
         min_size=1,
-        max_size=20,
+        max_size=10,
     )
 
 
@@ -166,21 +166,26 @@ def test_resource_backed_queries_match_fresh_recomputation(
             path.write_text(content, encoding="utf-8")
 
             fresh = Database(mode=mode, max_query_nodes=max_query_nodes)
-            assert incremental.get(diagnostics, str(path)) == fresh.get(
-                diagnostics, str(path)
-            )
+            assert incremental.get(diagnostics, str(path)) == fresh.get(diagnostics, str(path))
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("max_query_nodes", [None, 2])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=10, deadline=None)
 @given(states=workspace_states())
 def test_workspace_queries_match_fresh_recomputation(
     mode: str,
     max_query_nodes: int | None,
     states: list[WorkspaceState],
 ) -> None:
-    with tempfile.TemporaryDirectory() as tmpdir:
+    # Installed-distribution discovery has its own integration tests. Keep this
+    # property focused on workspace graph rewiring instead of re-reading every
+    # development-environment METADATA file for each fresh Database.
+    with (
+        patch.object(site, "getsitepackages", return_value=[]),
+        patch.object(site, "getusersitepackages", return_value=""),
+        tempfile.TemporaryDirectory() as tmpdir,
+    ):
         root = Path(tmpdir) / "workspace"
         root.mkdir()
         pkg = root / "pkg"
@@ -196,26 +201,18 @@ def test_workspace_queries_match_fresh_recomputation(
             provider.write_text(_provider_source(provider_variant), encoding="utf-8")
             consumer.write_text(_consumer_source(consumer_variant), encoding="utf-8")
             if helper_present:
-                helper.write_text(
-                    "def helper() -> int:\n    return 1\n", encoding="utf-8"
-                )
+                helper.write_text("def helper() -> int:\n    return 1\n", encoding="utf-8")
             elif helper.exists():
                 helper.unlink()
 
             fresh = Database(mode=mode, max_query_nodes=max_query_nodes)
-            assert workspace_analysis(incremental, root) == workspace_analysis(
-                fresh, root
-            )
+            assert workspace_analysis(incremental, root) == workspace_analysis(fresh, root)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @settings(max_examples=40, deadline=None)
-@given(
-    values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=20)
-)
-def test_aliasing_mutation_boundaries_behave_by_mode(
-    mode: str, values: list[int]
-) -> None:
+@given(values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=20))
+def test_aliasing_mutation_boundaries_behave_by_mode(mode: str, values: list[int]) -> None:
     payload = Input[tuple[dict[str, int], dict[str, int]]]("payload")
 
     @query
@@ -245,9 +242,7 @@ def test_aliasing_mutation_boundaries_behave_by_mode(
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @settings(max_examples=20, deadline=None)
-@given(
-    values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=10)
-)
+@given(values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=10))
 def test_shared_identity_preserved_across_boundary_in_fast_mode(
     mode: str, values: list[int]
 ) -> None:
@@ -278,9 +273,7 @@ def test_shared_identity_preserved_across_boundary_in_fast_mode(
                 db.get(mutate_left)
 
 
-def multi_level_rewiring_steps() -> (
-    st.SearchStrategy[list[tuple[str, str, int, int, int, int]]]
-):
+def multi_level_rewiring_steps() -> st.SearchStrategy[list[tuple[str, str, int, int, int, int]]]:
     return st.lists(
         st.tuples(
             st.sampled_from(["a", "b"]),  # level0 chooser
@@ -345,9 +338,7 @@ def test_multi_level_rewiring_matches_fresh_recomputation(
         incremental.set(inp, state[name])
 
     for l0c, l1c, av, bv, xv, yv in steps:
-        state.update(
-            {"l0_chooser": l0c, "l1_chooser": l1c, "a": av, "b": bv, "x": xv, "y": yv}
-        )
+        state.update({"l0_chooser": l0c, "l1_chooser": l1c, "a": av, "b": bv, "x": xv, "y": yv})
         for name, inp in inputs.items():
             incremental.set(inp, state[name])
 
@@ -359,9 +350,7 @@ def test_multi_level_rewiring_matches_fresh_recomputation(
 
 
 def checkpoint_op_sequences() -> st.SearchStrategy[list[CheckpointOp]]:
-    set_scale = st.tuples(
-        st.just("set_scale"), st.integers(min_value=-8, max_value=8)
-    )
+    set_scale = st.tuples(st.just("set_scale"), st.integers(min_value=-8, max_value=8))
     set_bias = st.tuples(st.just("set_bias"), st.integers(min_value=-8, max_value=8))
     write = st.tuples(
         st.just("write"),

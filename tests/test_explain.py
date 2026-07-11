@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import FrozenInstanceError, dataclass
+from types import ModuleType
+from typing import cast
 
 import pytest
 
@@ -116,13 +119,14 @@ _FROZEN_CONFIG = _FrozenConfig(name="alpha", limit=10)
 _MUTABLE_CONFIG = _MutableConfig(name="beta")
 
 
-def test_explain_query_captures_no_captures() -> None:
+def test_explain_query_captures_reports_metadata_without_ambient_captures() -> None:
     @query
     def bare(db: Database) -> int:
         return 1
 
     infos = explain_query_captures(bare)
-    assert infos == ()
+    assert {item.name for item in infos} == {"annotation[db]", "annotation[return]"}
+    assert all(item.accepted and item.kind == "annotation" for item in infos)
 
 
 def test_explain_query_captures_accepts_query_decorator_or_plain_function() -> None:
@@ -144,6 +148,18 @@ def test_explain_query_captures_accepts_query_decorator_or_plain_function() -> N
     assert decorated_by_name["suffix"].accepted
     assert plain_by_name["suffix"].accepted
     assert decorated_by_name["suffix"].kind == "value"
+
+
+def test_explain_query_captures_reports_accepted_function_custom_state() -> None:
+    def raw(db: Database) -> int:
+        return 1
+
+    raw.build_flag = 7  # type: ignore[attr-defined]
+    info = {item.name: item for item in explain_query_captures(raw)}["attribute[build_flag]"]
+
+    assert info.accepted
+    assert info.origin == "attribute"
+    assert info.kind == "value"
 
 
 def test_explain_query_captures_classifies_accepted_kinds() -> None:
@@ -206,9 +222,7 @@ def test_explain_query_captures_classifies_rejected_mutable_list() -> None:
     assert not by_name["_MUTABLE_LIST"].accepted
 
 
-def test_explain_query_captures_accepts_frozen_dataclass_rejects_mutable_dataclass() -> (
-    None
-):
+def test_explain_query_captures_accepts_frozen_dataclass_rejects_mutable_dataclass() -> None:
     @query
     def frozen_ok(db: Database) -> str:
         return _FROZEN_CONFIG.name
@@ -217,12 +231,8 @@ def test_explain_query_captures_accepts_frozen_dataclass_rejects_mutable_datacla
     def mutable_bad(db: Database) -> str:
         return _MUTABLE_CONFIG.name
 
-    frozen_info = {i.name: i for i in explain_query_captures(frozen_ok)}[
-        "_FROZEN_CONFIG"
-    ]
-    mutable_info = {i.name: i for i in explain_query_captures(mutable_bad)}[
-        "_MUTABLE_CONFIG"
-    ]
+    frozen_info = {i.name: i for i in explain_query_captures(frozen_ok)}["_FROZEN_CONFIG"]
+    mutable_info = {i.name: i for i in explain_query_captures(mutable_bad)}["_MUTABLE_CONFIG"]
     assert frozen_info.accepted
     assert frozen_info.kind == "value"
     assert not mutable_info.accepted
@@ -252,6 +262,40 @@ def test_explain_query_captures_accepts_module_and_function_captures() -> None:
     by_name = {i.name: i for i in infos}
     assert by_name["os"].kind == "module"
     assert by_name["helper"].kind == "function"
+
+
+def test_explain_query_captures_matches_dynamic_module_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("pyinc_explain_dynamic_module")
+    module.answer = 1  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    @query
+    def uses_dynamic_module(db: Database) -> int:
+        return cast(int, module.answer)
+
+    info = {item.name: item for item in explain_query_captures(uses_dynamic_module)}["module"]
+    assert not info.accepted
+    assert info.kind == "rejected"
+    assert "stable source identity" in info.rejection_reason
+
+    with pytest.raises(UnsupportedValueError, match="stable source identity"):
+        Database().get(uses_dynamic_module)
+
+
+def test_explain_query_captures_rejects_local_type_capture() -> None:
+    class LocalHelper:
+        value = 1
+
+    @query
+    def uses_local_type(db: Database) -> int:
+        return LocalHelper.value
+
+    info = {item.name: item for item in explain_query_captures(uses_local_type)}["LocalHelper"]
+    assert not info.accepted
+    assert info.kind == "rejected"
+    assert "Local type" in info.rejection_reason
 
 
 def test_explain_query_captures_rejects_non_function() -> None:
@@ -285,9 +329,7 @@ def test_runtime_capture_error_points_to_preflight_diagnostics() -> None:
 
 
 def test_capture_info_is_frozen() -> None:
-    info = CaptureInfo(
-        name="x", origin="closure", type_name="int", accepted=True, kind="value"
-    )
+    info = CaptureInfo(name="x", origin="closure", type_name="int", accepted=True, kind="value")
     with pytest.raises(FrozenInstanceError):
         info.accepted = False  # type: ignore[misc]
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
+import struct
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -15,6 +17,7 @@ ThawFn = Callable[[Any], Any]
 
 _KERNEL_FINGERPRINT_VERSION = 2
 _KERNEL_FINGERPRINT_PREFIX = b"K2;"
+_MAX_SNAPSHOT_DEPTH = 200
 
 
 class ValueAdapter(Protocol):
@@ -151,8 +154,7 @@ class _AdapterRegistry:
     def __init__(self, adapters: AdapterMap | None = None) -> None:
         self._adapters = dict(adapters or {})
         self._adapters_by_key = {
-            _adapter_key(value_type): adapter
-            for value_type, adapter in self._adapters.items()
+            _adapter_key(value_type): adapter for value_type, adapter in self._adapters.items()
         }
         if len(self._adapters_by_key) != len(self._adapters):
             raise ValueError("Adapter registry contains duplicate type identifiers.")
@@ -179,14 +181,20 @@ class _FreezeState:
     live_refs: list[Any] = field(default_factory=list)
 
 
-def freeze(
-    value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None
-) -> Snapshot:
+def freeze(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> Snapshot:
     registry = _coerce_registry(adapters)
     state = _FreezeState()
     snapshot = _freeze(value, registry, state)
+    result = _finalize_snapshot(snapshot, state)
+    _validate_snapshot(result)
+    return result
+
+
+def _finalize_snapshot(snapshot: Snapshot, state: _FreezeState) -> Snapshot:
+    """Collapse a freeze state into its public canonical snapshot form."""
+
     if state.has_back_edge:
-        return FrozenGraph(nodes=tuple(state.nodes), root=snapshot)
+        return _canonicalize_graph(FrozenGraph(nodes=tuple(state.nodes), root=snapshot))
     if not state.nodes:
         # No memoization happened at all — preserve the snapshot as-is so already-frozen
         # values pass through with identity intact.
@@ -197,16 +205,32 @@ def freeze(
 
 
 def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snapshot:
-    if isinstance(value, IMMUTABLE_SCALARS):
-        return value
-    if isinstance(value, _FROZEN_TYPES):
-        return value
+    if type(value) in IMMUTABLE_SCALARS:
+        if type(value) is float:
+            return float.fromhex(value.hex())
+        if type(value) is complex:
+            return complex(
+                float.fromhex(value.real.hex()),
+                float.fromhex(value.imag.hex()),
+            )
+        return cast(Snapshot, value)
+    if type(value) in _FROZEN_TYPES:
+        return cast(Snapshot, value)
     adapter_match = registry.for_value(value)
     if adapter_match is not None:
         adapter_key, adapter = adapter_match
         with _active_guard(value, state):
             payload = adapter.freeze(value, lambda item: _freeze(item, registry, state))
             return FrozenAdapterValue(adapter_key, _freeze(payload, registry, state))
+    if isinstance(value, IMMUTABLE_SCALARS):
+        raise UnsupportedValueError(
+            f"Scalar subclass {type(value).__qualname__} cannot cross cached "
+            "boundaries without a ValueAdapter."
+        )
+    if isinstance(value, _FROZEN_TYPES):
+        raise UnsupportedValueError(
+            f"Snapshot wrapper subclass {type(value).__qualname__} is not supported."
+        )
     if isinstance(value, list):
         return _freeze_via_memo(
             value,
@@ -223,24 +247,18 @@ def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snap
             lambda: FrozenSet("set", _freeze_unordered(value, registry, state)),
         )
     if isinstance(value, Mapping):
-        return _freeze_via_memo(
-            value, state, lambda: _freeze_mapping(value, registry, state)
-        )
+        return _freeze_via_memo(value, state, lambda: _freeze_mapping(value, registry, state))
     if isinstance(value, tuple):
         with _active_guard(value, state):
             return tuple(_freeze(item, registry, state) for item in value)
     if isinstance(value, os.PathLike):
         return cast(str | bytes, os.fspath(value))
     if is_dataclass(value) and not isinstance(value, type):
-        return _freeze_via_memo(
-            value, state, lambda: _freeze_dataclass(value, registry, state)
-        )
+        return _freeze_via_memo(value, state, lambda: _freeze_dataclass(value, registry, state))
     if isinstance(value, range):
         return ("range", value.start, value.stop, value.step)
     if isinstance(value, Iterator):
-        raise UnsupportedValueError(
-            "Iterators and generators cannot cross cached boundaries."
-        )
+        raise UnsupportedValueError("Iterators and generators cannot cross cached boundaries.")
     if isinstance(value, Iterable) and not isinstance(value, Sequence):
         raise UnsupportedValueError(
             f"Unsupported iterable boundary value {type(value).__qualname__}; "
@@ -252,9 +270,7 @@ def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snap
     )
 
 
-def _freeze_via_memo(
-    value: Any, state: _FreezeState, build: Callable[[], Snapshot]
-) -> Snapshot:
+def _freeze_via_memo(value: Any, state: _FreezeState, build: Callable[[], Snapshot]) -> Snapshot:
     obj_id = id(value)
     if obj_id in state.memo:
         state.has_back_edge = True
@@ -278,7 +294,10 @@ def _freeze_mapping(
     frozen_items = tuple(
         sorted(
             (
-                (_freeze(key, registry, state), _freeze(item, registry, state))
+                (
+                    _freeze_hash_position(key, registry, state),
+                    _freeze(item, registry, state),
+                )
                 for key, item in value.items()
             ),
             key=lambda item: _canonical_sort_key(item[0]),
@@ -287,9 +306,7 @@ def _freeze_mapping(
     return FrozenDict(frozen_items)
 
 
-def _freeze_dataclass(
-    value: Any, registry: _AdapterRegistry, state: _FreezeState
-) -> FrozenRecord:
+def _freeze_dataclass(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> FrozenRecord:
     frozen_items = cast(
         tuple[tuple[str, Any], ...],
         tuple(
@@ -308,15 +325,10 @@ def _inline_refs(value: Snapshot, nodes: list[Any]) -> Snapshot:
         return FrozenList(tuple(_inline_refs(item, nodes) for item in value.items))
     if isinstance(value, FrozenDict):
         return FrozenDict(
-            tuple(
-                (_inline_refs(k, nodes), _inline_refs(v, nodes))
-                for k, v in value.entries
-            )
+            tuple((_inline_refs(k, nodes), _inline_refs(v, nodes)) for k, v in value.entries)
         )
     if isinstance(value, FrozenSet):
-        return FrozenSet(
-            value.kind, tuple(_inline_refs(item, nodes) for item in value.items)
-        )
+        return FrozenSet(value.kind, tuple(_inline_refs(item, nodes) for item in value.items))
     if isinstance(value, FrozenRecord):
         return FrozenRecord(
             value.type_name,
@@ -327,6 +339,59 @@ def _inline_refs(value: Snapshot, nodes: list[Any]) -> Snapshot:
     if isinstance(value, tuple):
         return tuple(_inline_refs(item, nodes) for item in value)
     return value
+
+
+def _canonicalize_graph(graph: FrozenGraph) -> FrozenGraph:
+    """Renumber graph nodes by deterministic first traversal from the root.
+
+    Memo slots are allocated while live containers are visited.  Mapping and set
+    contents are canonicalized only after their members have been frozen, so the
+    allocation order can reflect insertion or hash iteration order.  Rewriting
+    references from the already-canonical container traversal removes that
+    incidental order while preserving sharing and cycles.
+    """
+
+    _validate_snapshot(graph)
+    old_to_new: dict[int, int] = {}
+    new_nodes: list[Any] = []
+
+    def rewrite(value: Any) -> Any:
+        if type(value) is FrozenRef:
+            old_index = value.index
+            existing = old_to_new.get(old_index)
+            if existing is not None:
+                return FrozenRef(existing)
+            new_index = len(new_nodes)
+            old_to_new[old_index] = new_index
+            new_nodes.append(None)
+            new_nodes[new_index] = rewrite(graph.nodes[old_index])
+            return FrozenRef(new_index)
+        if type(value) is FrozenList:
+            return FrozenList(tuple(rewrite(item) for item in value.items))
+        if type(value) is FrozenDict:
+            return FrozenDict(tuple((rewrite(key), rewrite(item)) for key, item in value.entries))
+        if type(value) is FrozenSet:
+            return FrozenSet(value.kind, tuple(rewrite(item) for item in value.items))
+        if type(value) is FrozenRecord:
+            return FrozenRecord(
+                value.type_name,
+                tuple((name, rewrite(item)) for name, item in value.entries),
+            )
+        if type(value) is FrozenAdapterValue:
+            return FrozenAdapterValue(value.adapter_key, rewrite(value.payload))
+        if type(value) is FrozenGraph:
+            # A nested graph is an already-frozen value with its own reference
+            # namespace. Preserve it exactly; only this graph's node table is
+            # being renumbered.
+            return value
+        if type(value) is tuple:
+            return tuple(rewrite(item) for item in value)
+        return value
+
+    root = rewrite(graph.root)
+    if len(old_to_new) != len(graph.nodes):
+        raise UnsupportedValueError("FrozenGraph contains unreachable nodes.")
+    return FrozenGraph(tuple(new_nodes), root)
 
 
 def collect_adapter_keys(snapshot: Any) -> frozenset[str]:
@@ -381,6 +446,7 @@ def _collect_adapter_keys(value: Any, keys: set[str]) -> None:
 
 
 def thaw(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> Any:
+    _validate_snapshot(value)
     registry = _coerce_registry(adapters)
     if isinstance(value, FrozenGraph):
         env: list[Any] = [_allocate_shell(node, registry) for node in value.nodes]
@@ -393,9 +459,7 @@ def thaw(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -
 def _thaw(value: Any, registry: _AdapterRegistry, env: list[Any] | None) -> Any:
     if isinstance(value, FrozenRef):
         if env is None:
-            raise UnsupportedValueError(
-                "FrozenRef encountered outside a FrozenGraph context."
-            )
+            raise UnsupportedValueError("FrozenRef encountered outside a FrozenGraph context.")
         return env[value.index]
     if isinstance(value, FrozenAdapterValue):
         adapter = registry.for_key(value.adapter_key)
@@ -408,8 +472,7 @@ def _thaw(value: Any, registry: _AdapterRegistry, env: list[Any] | None) -> Any:
         return [_thaw(item, registry, env) for item in value.items]
     if isinstance(value, FrozenDict):
         return {
-            _thaw(key, registry, env): _thaw(item, registry, env)
-            for key, item in value.entries
+            _thaw(key, registry, env): _thaw(item, registry, env) for key, item in value.entries
         }
     if isinstance(value, FrozenSet):
         thawed_items = tuple(_thaw(item, registry, env) for item in value.items)
@@ -447,9 +510,7 @@ def _allocate_shell(node: Any, registry: _AdapterRegistry) -> Any:
     )
 
 
-def _fill_shell(
-    shell: Any, node: Any, registry: _AdapterRegistry, env: list[Any]
-) -> None:
+def _fill_shell(shell: Any, node: Any, registry: _AdapterRegistry, env: list[Any]) -> None:
     if isinstance(node, FrozenList):
         for item in node.items:
             shell.append(_thaw(item, registry, env))
@@ -480,11 +541,205 @@ def _fill_shell(
         return
 
 
-def fingerprint(
-    value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None
-) -> str:
+def fingerprint(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> str:
     snapshot = freeze(value, adapters=adapters)
     return fingerprint_snapshot(snapshot)
+
+
+def _validate_snapshot(snapshot: Any) -> None:
+    """Reject values outside the canonical K2 snapshot grammar."""
+
+    active: set[int] = set()
+
+    def encoded_digest(value: Any) -> str:
+        buffer = bytearray(_KERNEL_FINGERPRINT_PREFIX)
+        _encode_snapshot(value, buffer)
+        return hashlib.sha256(buffer).hexdigest()
+
+    def require_metadata_string(value: Any, description: str) -> str:
+        if type(value) is not str or not value:
+            raise UnsupportedValueError(f"{description} must be a non-empty string.")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise UnsupportedValueError(
+                f"{description} must contain valid Unicode scalar values."
+            ) from exc
+        return value
+
+    def walk(value: Any, depth: int, graph_size: int | None) -> None:
+        if depth > _MAX_SNAPSHOT_DEPTH:
+            raise UnsupportedValueError(
+                f"Snapshot nesting exceeds the {_MAX_SNAPSHOT_DEPTH}-level limit."
+            )
+        if value is None or type(value) in (bool, int, bytes):
+            return
+        if type(value) is float:
+            if math.isnan(value) and struct.pack(">d", value) != struct.pack(
+                ">d", float.fromhex("nan")
+            ):
+                raise UnsupportedValueError(
+                    "Snapshot NaN values must use the canonical bit pattern."
+                )
+            return
+        if type(value) is complex:
+            canonical_nan = struct.pack(">d", float.fromhex("nan"))
+            if (math.isnan(value.real) and struct.pack(">d", value.real) != canonical_nan) or (
+                math.isnan(value.imag) and struct.pack(">d", value.imag) != canonical_nan
+            ):
+                raise UnsupportedValueError(
+                    "Snapshot complex NaNs must use the canonical bit pattern."
+                )
+            return
+        if type(value) is str:
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise UnsupportedValueError(
+                    "Snapshot strings must contain valid Unicode scalar values."
+                ) from exc
+            return
+        if type(value) is FrozenRef:
+            if (
+                graph_size is None
+                or type(value.index) is not int
+                or value.index < 0
+                or value.index >= graph_size
+            ):
+                raise UnsupportedValueError(
+                    "FrozenRef index is outside its FrozenGraph node table."
+                )
+            return
+
+        object_id = id(value)
+        if object_id in active:
+            raise UnsupportedValueError(
+                "Snapshot wrappers may not contain direct Python object cycles."
+            )
+        active.add(object_id)
+        try:
+            if type(value) is tuple:
+                for item in value:
+                    walk(item, depth + 1, graph_size)
+                return
+            if type(value) is FrozenList:
+                if type(value.items) is not tuple:
+                    raise UnsupportedValueError("FrozenList.items must be a tuple.")
+                for item in value.items:
+                    walk(item, depth + 1, graph_size)
+                return
+            if type(value) is FrozenDict:
+                if type(value.entries) is not tuple:
+                    raise UnsupportedValueError("FrozenDict.entries must be a tuple.")
+                key_digests: list[str] = []
+                for entry in value.entries:
+                    if type(entry) is not tuple or len(entry) != 2:
+                        raise UnsupportedValueError("FrozenDict entries must be key/value pairs.")
+                    key, item = entry
+                    walk(key, depth + 1, graph_size)
+                    walk(item, depth + 1, graph_size)
+                    key_digests.append(encoded_digest(key))
+                if len(set(key_digests)) != len(key_digests):
+                    raise UnsupportedValueError("FrozenDict contains duplicate frozen keys.")
+                if key_digests != sorted(key_digests):
+                    raise UnsupportedValueError("FrozenDict keys are not in canonical order.")
+                return
+            if type(value) is FrozenSet:
+                if type(value.kind) is not str or value.kind not in {
+                    "set",
+                    "frozenset",
+                }:
+                    raise UnsupportedValueError("FrozenSet.kind must be 'set' or 'frozenset'.")
+                if type(value.items) is not tuple:
+                    raise UnsupportedValueError("FrozenSet.items must be a tuple.")
+                item_digests: list[str] = []
+                for item in value.items:
+                    walk(item, depth + 1, graph_size)
+                    item_digests.append(encoded_digest(item))
+                if len(set(item_digests)) != len(item_digests):
+                    raise UnsupportedValueError("FrozenSet contains duplicate frozen members.")
+                if item_digests != sorted(item_digests):
+                    raise UnsupportedValueError("FrozenSet members are not in canonical order.")
+                return
+            if type(value) is FrozenRecord:
+                require_metadata_string(value.type_name, "FrozenRecord.type_name")
+                if type(value.entries) is not tuple:
+                    raise UnsupportedValueError("FrozenRecord.entries must be a tuple.")
+                names: list[str] = []
+                for entry in value.entries:
+                    if type(entry) is not tuple or len(entry) != 2:
+                        raise UnsupportedValueError(
+                            "FrozenRecord entries must be field/value pairs."
+                        )
+                    field_name = require_metadata_string(entry[0], "FrozenRecord field names")
+                    names.append(field_name)
+                    walk(entry[1], depth + 1, graph_size)
+                if len(set(names)) != len(names):
+                    raise UnsupportedValueError("FrozenRecord contains duplicate field names.")
+                return
+            if type(value) is FrozenAdapterValue:
+                require_metadata_string(value.adapter_key, "FrozenAdapterValue.adapter_key")
+                walk(value.payload, depth + 1, graph_size)
+                return
+            if type(value) is FrozenGraph:
+                if type(value.nodes) is not tuple or not value.nodes:
+                    raise UnsupportedValueError("FrozenGraph.nodes must be a non-empty tuple.")
+                node_count = len(value.nodes)
+                for node in value.nodes:
+                    if type(node) not in {
+                        FrozenList,
+                        FrozenDict,
+                        FrozenSet,
+                        FrozenRecord,
+                    } or (type(node) is FrozenSet and node.kind != "set"):
+                        raise UnsupportedValueError(
+                            "FrozenGraph nodes must be mutable-container shells."
+                        )
+                    walk(node, depth + 1, node_count)
+                walk(value.root, depth + 1, node_count)
+                reachable: set[int] = set()
+                pending = list(_snapshot_refs(value.root))
+                while pending:
+                    index = pending.pop()
+                    if index in reachable:
+                        continue
+                    reachable.add(index)
+                    pending.extend(_snapshot_refs(value.nodes[index]))
+                if reachable != set(range(node_count)):
+                    raise UnsupportedValueError("FrozenGraph contains unreachable nodes.")
+                return
+        finally:
+            active.remove(object_id)
+        raise UnsupportedValueError(f"Unsupported snapshot value {type(value).__qualname__}.")
+
+    walk(snapshot, 0, None)
+
+
+def _snapshot_refs(value: Any) -> tuple[int, ...]:
+    """Collect references belonging to the nearest containing FrozenGraph."""
+
+    refs: list[int] = []
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if type(current) is FrozenRef:
+            refs.append(current.index)
+        elif type(current) is FrozenGraph:
+            continue
+        elif type(current) is FrozenList:
+            pending.extend(current.items)
+        elif type(current) is FrozenDict:
+            for key, item in current.entries:
+                pending.extend((key, item))
+        elif type(current) is FrozenSet:
+            pending.extend(current.items)
+        elif type(current) is FrozenRecord:
+            pending.extend(item for _name, item in current.entries)
+        elif type(current) is FrozenAdapterValue:
+            pending.append(current.payload)
+        elif type(current) is tuple:
+            pending.extend(current)
+    return tuple(refs)
 
 
 def fingerprint_snapshot(snapshot: Any) -> str:
@@ -496,6 +751,7 @@ def fingerprint_snapshot(snapshot: Any) -> str:
 def serialize_snapshot(snapshot: Any) -> bytes:
     """Encode a snapshot to bytes. The byte form carries the kernel-version prefix
     so an `ArtifactStore` can refuse payloads from older kernel versions."""
+    _validate_snapshot(snapshot)
     buf = bytearray(_KERNEL_FINGERPRINT_PREFIX)
     _encode_snapshot(snapshot, buf)
     return bytes(buf)
@@ -507,13 +763,13 @@ def deserialize_snapshot(payload: bytes) -> Snapshot:
         raise UnsupportedValueError(
             f"Payload does not carry the expected kernel fingerprint version prefix {_KERNEL_FINGERPRINT_PREFIX!r}."
         )
-    snapshot, offset = _decode_snapshot(
-        memoryview(payload), len(_KERNEL_FINGERPRINT_PREFIX)
-    )
+    try:
+        snapshot, offset = _decode_snapshot(memoryview(payload), len(_KERNEL_FINGERPRINT_PREFIX))
+    except (IndexError, OverflowError, RecursionError, UnicodeError, ValueError) as exc:
+        raise UnsupportedValueError("Payload contains an invalid snapshot encoding.") from exc
     if offset != len(payload):
-        raise UnsupportedValueError(
-            "Payload contains trailing bytes after a complete snapshot."
-        )
+        raise UnsupportedValueError("Payload contains trailing bytes after a complete snapshot.")
+    _validate_snapshot(snapshot)
     return snapshot
 
 
@@ -777,7 +1033,7 @@ def _decode_snapshot(buf: memoryview, offset: int) -> tuple[Snapshot, int]:
 def _expect(buf: memoryview, offset: int, expected: bytes) -> None:
     if bytes(buf[offset : offset + len(expected)]) != expected:
         raise UnsupportedValueError(
-            f"Expected {expected!r} at offset {offset}, got {bytes(buf[offset:offset + len(expected)])!r}."
+            f"Expected {expected!r} at offset {offset}, got {bytes(buf[offset : offset + len(expected)])!r}."
         )
 
 
@@ -817,8 +1073,75 @@ def assert_not_mutated(before: str, after: str) -> None:
 def _freeze_unordered(
     values: Iterable[Any], registry: _AdapterRegistry, state: _FreezeState
 ) -> tuple[Any, ...]:
-    snapshots = tuple(_freeze(item, registry, state) for item in values)
+    snapshots = tuple(_freeze_hash_position(item, registry, state) for item in values)
     return tuple(sorted(snapshots, key=_canonical_sort_key))
+
+
+def _freeze_hash_position(value: Any, registry: _AdapterRegistry, _state: _FreezeState) -> Snapshot:
+    # Freeze hash-position values independently. Their live identity cannot
+    # safely participate in a mutable graph, and isolating them prevents memo
+    # node numbers allocated during mapping/set iteration from entering the
+    # canonical ordering key.
+    local_state = _FreezeState()
+    snapshot = _finalize_snapshot(_freeze(value, registry, local_state), local_state)
+    _validate_snapshot(snapshot)
+    if not _snapshot_thaws_hashably(snapshot, [], set()):
+        raise UnsupportedValueError(
+            "Values used as mapping keys or set members must remain hashable "
+            "after thaw; register a ValueAdapter for this value."
+        )
+    return snapshot
+
+
+def _snapshot_thaws_hashably(snapshot: Any, nodes: list[Any], active_refs: set[int]) -> bool:
+    if snapshot is None or type(snapshot) in IMMUTABLE_SCALARS:
+        return True
+    if type(snapshot) is tuple:
+        return all(_snapshot_thaws_hashably(item, nodes, active_refs) for item in snapshot)
+    if type(snapshot) is FrozenSet:
+        return snapshot.kind == "frozenset" and all(
+            _snapshot_thaws_hashably(item, nodes, active_refs) for item in snapshot.items
+        )
+    if type(snapshot) is FrozenAdapterValue:
+        # A tree payload is reconstructed wholly by the adapter and remains
+        # hashable under its round-trip contract. A graph payload can expose
+        # mutable shared/cyclic state after insertion into a dict/set, so its
+        # hash stability cannot be proven here.
+        return not _snapshot_contains_graph(snapshot.payload)
+    if type(snapshot) is FrozenRef:
+        index = snapshot.index
+        if index in active_refs or index < 0 or index >= len(nodes):
+            return False
+        target = nodes[index]
+        if target is None:
+            return False
+        active_refs.add(index)
+        try:
+            return _snapshot_thaws_hashably(target, nodes, active_refs)
+        finally:
+            active_refs.remove(index)
+    return False
+
+
+def _snapshot_contains_graph(snapshot: Any) -> bool:
+    if type(snapshot) is FrozenGraph:
+        return True
+    if type(snapshot) is FrozenList:
+        return any(_snapshot_contains_graph(item) for item in snapshot.items)
+    if type(snapshot) is FrozenDict:
+        return any(
+            _snapshot_contains_graph(key) or _snapshot_contains_graph(item)
+            for key, item in snapshot.entries
+        )
+    if type(snapshot) is FrozenSet:
+        return any(_snapshot_contains_graph(item) for item in snapshot.items)
+    if type(snapshot) is FrozenRecord:
+        return any(_snapshot_contains_graph(item) for _name, item in snapshot.entries)
+    if type(snapshot) is FrozenAdapterValue:
+        return _snapshot_contains_graph(snapshot.payload)
+    if type(snapshot) is tuple:
+        return any(_snapshot_contains_graph(item) for item in snapshot)
+    return False
 
 
 def _canonical_sort_key(value: Any) -> str:

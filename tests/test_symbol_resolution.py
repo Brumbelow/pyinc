@@ -7,24 +7,59 @@ import pytest
 
 import pyinc.integrations as integrations
 from pyinc import Database
+from pyinc.integrations import SourcePosition, SourceRange
+from pyinc.integrations.scope_resolution import scope_tree, symbol_at
 from pyinc.integrations.symbol_resolution import (
     ClassMember,
     Parameter,
+    ReferenceQueryResult,
     Signature,
     class_model,
     class_models_for_file,
-    find_references,
     module_symbol_table,
     module_symbol_table_payload,
-    name_occurrences_for_file,
-    resolve_symbol,
-    resolve_symbol_payload,
     resolved_class_model_payload,
-    workspace_name_occurrence_index,
     workspace_symbol_index,
+)
+from pyinc.integrations.symbol_resolution import (
+    _resolve_symbol_payload as resolve_symbol_payload,
+)
+from pyinc.integrations.symbol_resolution import (
+    find_references as find_references_by_id,
+)
+from pyinc.integrations.symbol_resolution import (
+    resolve_qualified_name as resolve_symbol,
 )
 
 Operation = tuple[Literal["write", "delete"], str, str | None]
+
+
+def find_references(
+    db: Database,
+    root: Path,
+    path: Path,
+    qualified_name: str,
+    *,
+    include_declaration: bool = True,
+) -> ReferenceQueryResult:
+    """Resolve the legacy fixture inputs through the v3 position API."""
+
+    resolved = resolve_symbol(db, root, path, qualified_name)
+    if resolved.defining_path is None or resolved.range is None:
+        raise AssertionError(f"{qualified_name!r} does not resolve to a workspace symbol")
+    symbol_id = symbol_at(
+        db,
+        root,
+        resolved.defining_path,
+        resolved.range.start,
+    )
+    assert symbol_id is not None
+    return find_references_by_id(
+        db,
+        root,
+        symbol_id,
+        include_declaration=include_declaration,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +77,6 @@ def test_symbol_resolution_all_list_is_exact() -> None:
         "Parameter",
         "Reference",
         "ReferenceQueryResult",
-        "ResolvedSymbol",
         "Signature",
         "Symbol",
         "WorkspaceSymbolEntry",
@@ -50,7 +84,6 @@ def test_symbol_resolution_all_list_is_exact() -> None:
         "class_model",
         "find_references",
         "module_symbol_table",
-        "resolve_symbol",
         "workspace_symbol_index",
     }
 
@@ -63,7 +96,6 @@ def test_symbol_resolution_stable_surface_on_integrations_namespace() -> None:
         "Parameter",
         "Reference",
         "ReferenceQueryResult",
-        "ResolvedSymbol",
         "Signature",
         "Symbol",
         "WorkspaceSymbolEntry",
@@ -71,10 +103,20 @@ def test_symbol_resolution_stable_surface_on_integrations_namespace() -> None:
         "class_model",
         "find_references",
         "module_symbol_table",
-        "resolve_symbol",
         "workspace_symbol_index",
     ):
         assert hasattr(integrations, name)
+    assert not hasattr(integrations, "resolve_symbol")
+    assert not hasattr(integrations, "ResolvedSymbol")
+
+
+@pytest.mark.parametrize("name", ["ResolvedSymbol", "resolve_symbol"])
+def test_v2_resolver_names_cannot_be_imported_from_submodule(name: str) -> None:
+    from pyinc.integrations import symbol_resolution
+
+    assert not hasattr(symbol_resolution, name)
+    with pytest.raises(ImportError):
+        exec(f"from pyinc.integrations.symbol_resolution import {name}", {})
 
 
 def test_symbol_resolution_payload_helpers_are_not_re_exported() -> None:
@@ -95,9 +137,7 @@ def test_symbol_resolution_payload_helpers_are_not_re_exported() -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_module_symbol_table_captures_top_level_symbols(
-    mode: str, tmp_path: Path
-) -> None:
+def test_module_symbol_table_captures_top_level_symbols(mode: str, tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "sample.py"
@@ -141,16 +181,16 @@ def test_module_symbol_table_captures_top_level_symbols(
     assert by_qname["thing"].import_source_name == "thing"
 
     assert by_qname["alpha"].kind == "function"
-    assert by_qname["alpha"].lineno == 4
+    assert by_qname["alpha"].range.start.line == 3
     assert by_qname["beta"].kind == "function"
-    assert by_qname["beta"].lineno == 7
+    assert by_qname["beta"].range.start.line == 6
     assert by_qname["beta"].signature == Signature(
         parameters=(Parameter(name="x", annotation="int"),),
         return_annotation="int",
     )
 
     assert by_qname["Gamma"].kind == "class"
-    assert by_qname["Gamma"].lineno == 10
+    assert by_qname["Gamma"].range.start.line == 9
     assert by_qname["Gamma.value"].kind == "class_variable"
     assert by_qname["Gamma.value"].annotation == "int"
     assert by_qname["Gamma.tag"].kind == "class_variable"
@@ -260,7 +300,8 @@ def test_resolve_symbol_follows_from_import_to_definition(tmp_path: Path) -> Non
     assert resolved.resolution == "workspace"
     assert resolved.defining_module == "a"
     assert resolved.defining_path == str(a)
-    assert resolved.defining_lineno == 1
+    assert resolved.range is not None
+    assert resolved.range.start.line == 0
     assert resolved.trail == ("b:foo", "a:foo")
     assert resolved.follow_depth == 1
 
@@ -280,7 +321,7 @@ def test_resolve_symbol_terminates_on_plain_import(tmp_path: Path) -> None:
     assert resolved.resolution == "workspace"
     assert resolved.defining_module == "pkg"
     assert resolved.defining_path == str(pkg / "__init__.py")
-    assert resolved.defining_lineno is None
+    assert resolved.range is None
 
 
 def test_resolve_symbol_follows_submodule_import_as_module(tmp_path: Path) -> None:
@@ -300,7 +341,7 @@ def test_resolve_symbol_follows_submodule_import_as_module(tmp_path: Path) -> No
     assert resolved.resolution == "workspace"
     assert resolved.defining_module == "pkg.helper"
     assert resolved.defining_path == str(helper)
-    assert resolved.defining_lineno is None
+    assert resolved.range is None
 
 
 def test_resolve_symbol_returns_missing_when_name_absent(tmp_path: Path) -> None:
@@ -341,7 +382,8 @@ def test_resolve_symbol_follows_three_module_chain(tmp_path: Path) -> None:
 
     assert resolved.resolution == "workspace"
     assert resolved.defining_module == "a"
-    assert resolved.defining_lineno == 1
+    assert resolved.range is not None
+    assert resolved.range.start.line == 0
     assert resolved.follow_depth == 2
     assert resolved.trail == ("c:target", "b:target", "a:target")
 
@@ -370,13 +412,9 @@ def test_resolve_symbol_depth_cap_terminates_at_max_follow_depth(
 ) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
-    (root / "m0.py").write_text(
-        "def target() -> int:\n    return 1\n", encoding="utf-8"
-    )
+    (root / "m0.py").write_text("def target() -> int:\n    return 1\n", encoding="utf-8")
     for i in range(1, 10):
-        (root / f"m{i}.py").write_text(
-            f"from m{i - 1} import target\n", encoding="utf-8"
-        )
+        (root / f"m{i}.py").write_text(f"from m{i - 1} import target\n", encoding="utf-8")
 
     db = Database(mode="strict")
     resolved = resolve_symbol(db, root, root / "m9.py", "target")
@@ -410,7 +448,8 @@ def test_resolve_symbol_follows_wildcard_export_with_static_all(tmp_path: Path) 
 
     assert resolved.resolution == "workspace"
     assert resolved.defining_module == "provider"
-    assert resolved.defining_lineno == 1
+    assert resolved.range is not None
+    assert resolved.range.start.line == 0
     assert resolved.trail == ("consumer:shown", "provider:shown")
 
 
@@ -420,10 +459,7 @@ def test_resolve_symbol_with_dynamic_all_is_ambiguous(tmp_path: Path) -> None:
     provider = root / "provider.py"
     consumer = root / "consumer.py"
     provider.write_text(
-        "def shown() -> int:\n"
-        "    return 1\n"
-        "__all__ = ['shown']\n"
-        "__all__ += ['extra']\n",
+        "def shown() -> int:\n    return 1\n__all__ = ['shown']\n__all__ += ['extra']\n",
         encoding="utf-8",
     )
     consumer.write_text("from provider import *\n", encoding="utf-8")
@@ -432,9 +468,7 @@ def test_resolve_symbol_with_dynamic_all_is_ambiguous(tmp_path: Path) -> None:
     resolved = resolve_symbol(db, root, consumer, "missing_name")
 
     assert resolved.resolution == "ambiguous"
-    inspection = db.inspect(
-        resolve_symbol_payload, str(root), str(consumer), "missing_name"
-    )
+    inspection = db.inspect(resolve_symbol_payload, str(root), str(consumer), "missing_name")
     assert inspection.is_untracked
 
 
@@ -469,10 +503,7 @@ def test_resolve_symbol_stops_at_installed_boundary(
     dist_info = site / "fake_installed-1.2.3.dist-info"
     dist_info.mkdir()
     (dist_info / "METADATA").write_text(
-        "Metadata-Version: 2.1\n"
-        "Name: fake_installed\n"
-        "Version: 1.2.3\n"
-        "Summary: Fake\n",
+        "Metadata-Version: 2.1\nName: fake_installed\nVersion: 1.2.3\nSummary: Fake\n",
         encoding="utf-8",
     )
     (dist_info / "top_level.txt").write_text("fake_installed\n", encoding="utf-8")
@@ -534,17 +565,15 @@ def test_signature_change_triggers_downstream_reresolution(tmp_path: Path) -> No
     assert first.resolution == "workspace"
 
     a.write_text(
-        "# spacer\n" "def foo(x: int) -> int:\n" "    return x\n",
+        "# spacer\ndef foo(x: int) -> int:\n    return x\n",
         encoding="utf-8",
     )
     second = resolve_symbol(db, root, b, "foo")
 
-    assert second.defining_lineno == 2
+    assert second.range is not None
+    assert second.range.start.line == 1
     assert db.inspect(module_symbol_table_payload, str(a)).last_recompute == "executed"
-    assert (
-        db.inspect(resolve_symbol_payload, str(root), str(b), "foo").last_recompute
-        == "executed"
-    )
+    assert db.inspect(resolve_symbol_payload, str(root), str(b), "foo").last_recompute == "executed"
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +640,7 @@ def test_type_checking_typing_dot_form(tmp_path: Path) -> None:
     root.mkdir()
     path = root / "mod.py"
     path.write_text(
-        "import typing\n" "if typing.TYPE_CHECKING:\n" "    from helper import Bar\n",
+        "import typing\nif typing.TYPE_CHECKING:\n    from helper import Bar\n",
         encoding="utf-8",
     )
 
@@ -674,9 +703,7 @@ def test_resolve_symbol_from_type_checking_import(tmp_path: Path) -> None:
     (root / "models.py").write_text("class User:\n    pass\n", encoding="utf-8")
     path = root / "service.py"
     path.write_text(
-        "from typing import TYPE_CHECKING\n"
-        "if TYPE_CHECKING:\n"
-        "    from models import User\n",
+        "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from models import User\n",
         encoding="utf-8",
     )
 
@@ -699,11 +726,11 @@ def test_workspace_symbol_index_flattens_and_sorts(tmp_path: Path) -> None:
     pkg.mkdir()
     (pkg / "__init__.py").write_text("", encoding="utf-8")
     (pkg / "helper.py").write_text(
-        "def util() -> int:\n    return 1\n" "class Holder:\n    pass\n",
+        "def util() -> int:\n    return 1\nclass Holder:\n    pass\n",
         encoding="utf-8",
     )
     (root / "main.py").write_text(
-        "from pkg.helper import util\n" "flag: bool = True\n",
+        "from pkg.helper import util\nflag: bool = True\n",
         encoding="utf-8",
     )
 
@@ -751,15 +778,11 @@ def test_workspace_symbol_index_matches_fresh_recomputation_over_edits(
             target.unlink()
 
         fresh = Database(mode=mode)
-        assert workspace_symbol_index(incremental, root) == workspace_symbol_index(
-            fresh, root
-        )
+        assert workspace_symbol_index(incremental, root) == workspace_symbol_index(fresh, root)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_resolve_symbol_matches_fresh_recomputation_over_edits(
-    mode: str, tmp_path: Path
-) -> None:
+def test_resolve_symbol_matches_fresh_recomputation_over_edits(mode: str, tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     a = root / "a.py"
@@ -777,9 +800,7 @@ def test_resolve_symbol_matches_fresh_recomputation_over_edits(
     for content in contents_a:
         a.write_text(content, encoding="utf-8")
         fresh = Database(mode=mode)
-        assert resolve_symbol(incremental, root, b, "foo") == resolve_symbol(
-            fresh, root, b, "foo"
-        )
+        assert resolve_symbol(incremental, root, b, "foo") == resolve_symbol(fresh, root, b, "foo")
 
 
 # ---------------------------------------------------------------------------
@@ -797,10 +818,10 @@ def test_workspace_symbol_index_against_own_source_tree() -> None:
     modules = {entry.module for entry in idx.entries}
     assert "integrations.symbol_resolution" in modules
     assert any(
-        entry.qualified_name == "ResolvedSymbol"
-        and entry.module == "integrations.symbol_resolution"
+        entry.qualified_name == "SymbolId" and entry.module == "integrations.scope_resolution"
         for entry in idx.entries
     )
+    assert not any(entry.qualified_name == "ResolvedSymbol" for entry in idx.entries)
 
 
 # ---------------------------------------------------------------------------
@@ -820,16 +841,17 @@ def test_find_references_returns_declaration_and_call_site(tmp_path: Path) -> No
     db = Database(mode="strict")
     result = find_references(db, root, target, "foo")
 
-    assert result.target.resolution == "workspace"
-    assert result.target.defining_lineno == 1
+    assert result.target.path == str(target)
+    assert result.target.name == "foo"
+    assert result.target.declaration.start.line == 0
     assert len(result.references) == 2
     declaration = next(r for r in result.references if r.is_declaration)
-    assert declaration.lineno == 1
+    assert declaration.range.start.line == 0
     assert declaration.path == str(target)
     call = next(r for r in result.references if not r.is_declaration)
-    assert call.lineno == 4
-    assert call.col_offset == 0
-    assert call.end_col_offset == 3
+    assert call.range.start.line == 3
+    assert call.range.start.character == 0
+    assert call.range.end.character == 3
 
 
 def test_find_references_excludes_declaration_when_flag_false(tmp_path: Path) -> None:
@@ -846,7 +868,7 @@ def test_find_references_excludes_declaration_when_flag_false(tmp_path: Path) ->
 
     assert all(not r.is_declaration for r in result.references)
     assert len(result.references) == 1
-    assert result.references[0].lineno == 4
+    assert result.references[0].range.start.line == 3
 
 
 def test_find_references_crosses_re_export(tmp_path: Path) -> None:
@@ -862,14 +884,15 @@ def test_find_references_crosses_re_export(tmp_path: Path) -> None:
     db = Database(mode="strict")
     result = find_references(db, root, root / "a.py", "foo")
 
-    assert result.target.resolution == "workspace"
+    assert result.target.path == str(root / "a.py")
+    assert result.target.name == "foo"
     call_sites = sorted(
         (r for r in result.references if not r.is_declaration),
-        key=lambda r: (r.path, r.lineno),
+        key=lambda r: (r.path, r.range.start),
     )
-    assert [(Path(r.path).name, r.lineno) for r in call_sites] == [
+    assert [(Path(r.path).name, r.range.start.line) for r in call_sites] == [
+        ("b.py", 2),
         ("b.py", 3),
-        ("b.py", 4),
     ]
     declarations = [r for r in result.references if r.is_declaration]
     assert len(declarations) == 1
@@ -899,9 +922,9 @@ def test_find_references_resolves_attribute_chain_on_imported_module(
     non_decl = [r for r in result.references if not r.is_declaration]
     assert len(non_decl) == 1
     ref = non_decl[0]
-    assert ref.lineno == 3
+    assert ref.range.start.line == 2
     # ``a.foo()`` — the ``foo`` portion is at cols 2-5.
-    assert (ref.col_offset, ref.end_col_offset) == (2, 5)
+    assert (ref.range.start.character, ref.range.end.character) == (2, 5)
 
 
 def test_find_references_resolves_attribute_chain_on_aliased_import(
@@ -916,9 +939,7 @@ def test_find_references_resolves_attribute_chain_on_aliased_import(
         "def foo() -> int:\n    return 1\n",
         encoding="utf-8",
     )
-    (root / "b.py").write_text(
-        "import a as alias\n\nalias.foo()\n", encoding="utf-8"
-    )
+    (root / "b.py").write_text("import a as alias\n\nalias.foo()\n", encoding="utf-8")
 
     db = Database(mode="strict")
     result = find_references(db, root, root / "a.py", "foo")
@@ -926,9 +947,9 @@ def test_find_references_resolves_attribute_chain_on_aliased_import(
     non_decl = [r for r in result.references if not r.is_declaration]
     assert len(non_decl) == 1
     ref = non_decl[0]
-    assert ref.lineno == 3
+    assert ref.range.start.line == 2
     # ``alias.foo()`` — the ``foo`` portion is at cols 6-9.
-    assert (ref.col_offset, ref.end_col_offset) == (6, 9)
+    assert (ref.range.start.character, ref.range.end.character) == (6, 9)
 
 
 def test_find_references_attribute_chain_through_module_re_export(
@@ -958,8 +979,8 @@ def test_find_references_attribute_chain_through_module_re_export(
     assert len(non_decl) == 1
     ref = non_decl[0]
     assert ref.path.endswith("b.py")
-    assert ref.lineno == 3
-    assert (ref.col_offset, ref.end_col_offset) == (2, 5)
+    assert ref.range.start.line == 2
+    assert (ref.range.start.character, ref.range.end.character) == (2, 5)
 
 
 def test_find_references_does_not_match_attribute_on_unrelated_module(
@@ -979,9 +1000,7 @@ def test_find_references_does_not_match_attribute_on_unrelated_module(
         "def foo() -> int:\n    return 99\n",
         encoding="utf-8",
     )
-    (root / "b.py").write_text(
-        "import other\n\nother.foo()\n", encoding="utf-8"
-    )
+    (root / "b.py").write_text("import other\n\nother.foo()\n", encoding="utf-8")
 
     db = Database(mode="strict")
     result = find_references(db, root, root / "a.py", "foo")
@@ -1003,9 +1022,7 @@ def test_find_references_skips_attribute_on_non_module_local(
         "def foo() -> int:\n    return 1\n",
         encoding="utf-8",
     )
-    (root / "b.py").write_text(
-        "x = 1\n\nx.foo\n", encoding="utf-8"
-    )
+    (root / "b.py").write_text("x = 1\n\nx.foo\n", encoding="utf-8")
 
     db = Database(mode="strict")
     result = find_references(db, root, root / "a.py", "foo")
@@ -1014,57 +1031,43 @@ def test_find_references_skips_attribute_on_non_module_local(
     assert non_decl == []
 
 
-def test_find_references_attribute_chain_on_nested_module_lhs_skipped(
+def test_find_references_resolves_proven_nested_module_chain(
     tmp_path: Path,
 ) -> None:
-    """``import pkg.subpkg`` plus ``pkg.subpkg.foo()`` is NOT counted —
-    the LHS of ``foo`` is the Attribute ``pkg.subpkg``, not a Name, and the
-    occurrence walker only emits a hint when ``Attribute.value`` is a Name.
-    Use ``from pkg import subpkg; subpkg.foo()`` (or
-    ``from pkg.subpkg import foo``) to opt in. Documented limitation."""
+    """A directly imported nested module proves each receiver component."""
     root = tmp_path / "workspace"
     root.mkdir()
     pkg = root / "pkg"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "subpkg.py").write_text(
-        "def foo() -> int:\n    return 1\n", encoding="utf-8"
-    )
-    (root / "b.py").write_text(
-        "import pkg.subpkg\n\npkg.subpkg.foo()\n", encoding="utf-8"
-    )
+    (pkg / "subpkg.py").write_text("def foo() -> int:\n    return 1\n", encoding="utf-8")
+    (root / "b.py").write_text("import pkg.subpkg\n\npkg.subpkg.foo()\n", encoding="utf-8")
 
     db = Database(mode="strict")
     result = find_references(db, root, pkg / "subpkg.py", "foo")
 
     non_decl = [r for r in result.references if not r.is_declaration]
-    assert non_decl == []
+    assert len(non_decl) == 1
+    assert non_decl[0].range == SourceRange(SourcePosition(2, 11), SourcePosition(2, 14))
 
 
-def test_find_references_ignores_shadowing_local_known_limitation(
+def test_find_references_excludes_shadowing_locals(
     tmp_path: Path,
 ) -> None:
-    """Pins v1.2.0 behavior: a function-local binding that shadows a module-level
-    name is still reported as a reference to the module-level target, because
-    ``symbol_resolution`` does not track function-local scopes."""
+    """A local binding is distinct from the module symbol with the same name."""
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "mod.py"
     target.write_text(
-        "def foo() -> int:\n    return 1\n\n"
-        "def other() -> int:\n"
-        "    foo = 42\n"
-        "    return foo\n",
+        "def foo() -> int:\n    return 1\n\ndef other() -> int:\n    foo = 42\n    return foo\n",
         encoding="utf-8",
     )
 
     db = Database(mode="strict")
     result = find_references(db, root, target, "foo")
 
-    # Both the local ``foo = 42`` (line 5) and the local ``return foo`` (line 6)
-    # currently count as references because the resolver is module-scoped.
-    linenos = sorted(r.lineno for r in result.references if not r.is_declaration)
-    assert linenos == [5, 6]
+    lines = sorted(r.range.start.line for r in result.references if not r.is_declaration)
+    assert lines == []
 
 
 def test_find_references_includes_forward_ref_strings_in_param_and_return_annotation(
@@ -1087,15 +1090,40 @@ def test_find_references_includes_forward_ref_strings_in_param_and_return_annota
 
     non_decl = sorted(
         (r for r in result.references if not r.is_declaration),
-        key=lambda r: (r.path, r.lineno, r.col_offset),
+        key=lambda r: (r.path, r.range.start),
     )
     assert len(non_decl) == 2
     # `def g(a: 'Foo') -> 'Foo':` — opening quotes at col 9 and 19.
     param_ref, return_ref = non_decl
-    assert param_ref.lineno == 3
-    assert (param_ref.col_offset, param_ref.end_col_offset) == (10, 13)
-    assert return_ref.lineno == 3
-    assert (return_ref.col_offset, return_ref.end_col_offset) == (20, 23)
+    assert param_ref.range.start.line == 2
+    assert (param_ref.range.start.character, param_ref.range.end.character) == (10, 13)
+    assert return_ref.range.start.line == 2
+    assert (return_ref.range.start.character, return_ref.range.end.character) == (20, 23)
+
+
+def test_forward_ref_ranges_after_unicode_prefix_use_codepoint_columns(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    target.write_text("class Foo:\n    pass\n", encoding="utf-8")
+    consumer = root / "b.py"
+    source = "from a import Foo\ndef résumé(élément: 'É | Foo') -> 'Foo':\n    return élément\n"
+    consumer.write_text(source, encoding="utf-8")
+    line = source.splitlines()[1]
+    expected = (
+        (line.index("Foo"), line.index("Foo") + 3),
+        (line.rindex("Foo"), line.rindex("Foo") + 3),
+    )
+
+    references = find_references(Database(), root, target, "Foo")
+    reference_ranges = tuple(
+        (item.range.start.character, item.range.end.character)
+        for item in references.references
+        if not item.is_declaration and item.path == str(consumer)
+    )
+    assert reference_ranges == expected
 
 
 def test_find_references_includes_forward_ref_strings_in_class_variable_annotation(
@@ -1116,9 +1144,9 @@ def test_find_references_includes_forward_ref_strings_in_class_variable_annotati
     non_decl = [r for r in result.references if not r.is_declaration]
     assert len(non_decl) == 1
     ref = non_decl[0]
-    assert ref.lineno == 4
+    assert ref.range.start.line == 3
     # `    x: 'Foo'` — opening quote at col 7, name at cols 8-11.
-    assert (ref.col_offset, ref.end_col_offset) == (8, 11)
+    assert (ref.range.start.character, ref.range.end.character) == (8, 11)
 
 
 def test_find_references_includes_forward_ref_strings_in_module_ann_assign(
@@ -1138,8 +1166,11 @@ def test_find_references_includes_forward_ref_strings_in_module_ann_assign(
 
     non_decl = [r for r in result.references if not r.is_declaration]
     assert len(non_decl) == 1
-    assert non_decl[0].lineno == 3
-    assert (non_decl[0].col_offset, non_decl[0].end_col_offset) == (4, 7)
+    assert non_decl[0].range.start.line == 2
+    assert (
+        non_decl[0].range.start.character,
+        non_decl[0].range.end.character,
+    ) == (4, 7)
 
 
 def test_find_references_includes_forward_ref_strings_in_subscript(
@@ -1152,9 +1183,7 @@ def test_find_references_includes_forward_ref_strings_in_subscript(
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
     b = root / "b.py"
     b.write_text(
-        "from a import Foo\n\n"
-        "def g(a: list['Foo']) -> dict[str, 'Foo']:\n"
-        "    return a\n",
+        "from a import Foo\n\ndef g(a: list['Foo']) -> dict[str, 'Foo']:\n    return a\n",
         encoding="utf-8",
     )
 
@@ -1163,7 +1192,7 @@ def test_find_references_includes_forward_ref_strings_in_subscript(
 
     non_decl = [r for r in result.references if not r.is_declaration]
     assert len(non_decl) == 2
-    assert all(r.lineno == 3 for r in non_decl)
+    assert all(r.range.start.line == 2 for r in non_decl)
 
 
 def test_find_references_includes_forward_ref_strings_in_union(
@@ -1184,37 +1213,9 @@ def test_find_references_includes_forward_ref_strings_in_union(
     non_decl = [r for r in result.references if not r.is_declaration]
     assert len(non_decl) == 1
     ref = non_decl[0]
-    assert ref.lineno == 3
+    assert ref.range.start.line == 2
     # `def g(a: 'Foo | None') -> None:` — opening quote at col 9, name at 10-13.
-    assert (ref.col_offset, ref.end_col_offset) == (10, 13)
-
-
-def test_name_occurrences_for_file_extracts_attribute_inside_string_annotation(
-    tmp_path: Path,
-) -> None:
-    """Inside `'pkg.Foo'`, the rightmost attribute name is emitted as an
-    occurrence with the correct in-file offsets. The 5th payload field carries
-    the LHS Name ``"pkg"`` so the references verifier can route the lookup
-    through ``pkg``'s import binding."""
-    root = tmp_path / "workspace"
-    root.mkdir()
-    path = root / "b.py"
-    path.write_text(
-        "import pkg\n\ndef g(a: 'pkg.Foo') -> None:\n    return None\n",
-        encoding="utf-8",
-    )
-
-    db = Database(mode="strict")
-    occurrences = name_occurrences_for_file(db, str(path))
-
-    matching = [occ for occ in occurrences if occ[0] == "Foo"]
-    assert len(matching) == 1
-    bare_name, lineno, col_offset, end_col_offset, value_name_hint = matching[0]
-    assert bare_name == "Foo"
-    assert lineno == 3
-    # `def g(a: 'pkg.Foo') -> None:` — `Foo` is at cols 14-17.
-    assert (col_offset, end_col_offset) == (14, 17)
-    assert value_name_hint == "pkg"
+    assert (ref.range.start.character, ref.range.end.character) == (10, 13)
 
 
 def test_find_references_resolves_attribute_chain_in_string_annotation(
@@ -1238,9 +1239,9 @@ def test_find_references_resolves_attribute_chain_in_string_annotation(
     non_decl = [r for r in result.references if not r.is_declaration]
     assert len(non_decl) == 1
     ref = non_decl[0]
-    assert ref.lineno == 3
+    assert ref.range.start.line == 2
     # `def g(x: 'a.Foo') -> None:` — inside the string, `Foo` is at cols 12-15.
-    assert (ref.col_offset, ref.end_col_offset) == (12, 15)
+    assert (ref.range.start.character, ref.range.end.character) == (12, 15)
 
 
 def test_find_references_includes_forward_ref_strings_double_quoted(
@@ -1261,8 +1262,8 @@ def test_find_references_includes_forward_ref_strings_double_quoted(
     non_decl = [r for r in result.references if not r.is_declaration]
     assert len(non_decl) == 1
     ref = non_decl[0]
-    assert ref.lineno == 3
-    assert (ref.col_offset, ref.end_col_offset) == (10, 13)
+    assert ref.range.start.line == 2
+    assert (ref.range.start.character, ref.range.end.character) == (10, 13)
 
 
 def test_find_references_skips_malformed_string_annotation(tmp_path: Path) -> None:
@@ -1273,8 +1274,7 @@ def test_find_references_skips_malformed_string_annotation(tmp_path: Path) -> No
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
     b = root / "b.py"
     b.write_text(
-        "from a import Foo\n\ndef g(a: 'this is not valid python'): ...\n"
-        "Foo()\n",
+        "from a import Foo\n\ndef g(a: 'this is not valid python'): ...\nFoo()\n",
         encoding="utf-8",
     )
 
@@ -1285,7 +1285,7 @@ def test_find_references_skips_malformed_string_annotation(tmp_path: Path) -> No
     # Only the unquoted `Foo()` on line 4 is reported; the malformed
     # annotation contributes nothing (and doesn't crash).
     assert len(non_decl) == 1
-    assert non_decl[0].lineno == 4
+    assert non_decl[0].range.start.line == 3
 
 
 def test_find_references_skips_string_annotation_with_escape_sequence(
@@ -1310,11 +1310,9 @@ def test_find_references_skips_string_annotation_with_escape_sequence(
     assert non_decl == []
 
 
-def test_find_references_skips_triple_quoted_string_annotation(
+def test_find_references_supports_single_line_triple_quoted_annotation(
     tmp_path: Path,
 ) -> None:
-    """Triple-quoted (single- or multi-line) string annotations are
-    skipped. Vanishingly rare in real code."""
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
@@ -1328,7 +1326,11 @@ def test_find_references_skips_triple_quoted_string_annotation(
     result = find_references(db, root, root / "a.py", "Foo")
 
     non_decl = [r for r in result.references if not r.is_declaration]
-    assert non_decl == []
+    assert len(non_decl) == 1
+    assert (
+        non_decl[0].range.start.character,
+        non_decl[0].range.end.character,
+    ) == (12, 15)
 
 
 def test_find_references_skips_implicit_string_concatenation_annotation(
@@ -1377,12 +1379,12 @@ def test_find_references_finds_type_checking_imported_name_in_string_annotation(
     non_decl = [r for r in result.references if not r.is_declaration]
     assert len(non_decl) == 1
     ref = non_decl[0]
-    assert ref.lineno == 6
+    assert ref.range.start.line == 5
     # `    x: 'Foo'` on line 6 — opening quote at col 7, name at 8-11.
-    assert (ref.col_offset, ref.end_col_offset) == (8, 11)
+    assert (ref.range.start.character, ref.range.end.character) == (8, 11)
 
 
-def test_find_references_on_stdlib_target_returns_empty_with_target_carried(
+def test_symbol_at_returns_none_for_stdlib_target(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "workspace"
@@ -1394,23 +1396,121 @@ def test_find_references_on_stdlib_target_returns_empty_with_target_carried(
     )
 
     db = Database(mode="strict")
-    result = find_references(db, root, consumer, "JSONDecoder")
-
-    assert result.target.resolution == "stdlib"
-    assert result.references == ()
+    assert symbol_at(db, root, consumer, SourcePosition(2, 1)) is None
 
 
-def test_find_references_on_ambiguous_target_returns_empty(tmp_path: Path) -> None:
+def test_symbol_at_returns_none_for_ambiguous_target(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text("from b import foo\n", encoding="utf-8")
     (root / "b.py").write_text("from a import foo\n", encoding="utf-8")
 
     db = Database(mode="strict")
-    result = find_references(db, root, root / "a.py", "foo")
+    assert symbol_at(db, root, root / "a.py", SourcePosition(0, 15)) is None
 
-    assert result.target.resolution == "ambiguous"
-    assert result.references == ()
+
+def test_subscript_assignment_reads_container_and_index(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "sample.py"
+    path.write_text(
+        "items = [0]\nindex = 0\nitems[index] = 1\nprint(items[index])\n",
+        encoding="utf-8",
+    )
+    db = Database(mode="strict")
+
+    item_refs = find_references(db, root, path, "items").references
+    assert [(item.range.start.line, item.range.start.character) for item in item_refs] == [
+        (0, 0),
+        (2, 0),
+        (3, 6),
+    ]
+    index_refs = find_references(db, root, path, "index").references
+    assert [(item.range.start.line, item.range.start.character) for item in index_refs] == [
+        (1, 0),
+        (2, 6),
+        (3, 12),
+    ]
+
+
+def test_decomposed_identifier_ranges_preserve_source_spelling(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "sample.py"
+    path.write_text("def e\u0301():\n    return e\u0301()\n", encoding="utf-8")
+    db = Database(mode="strict")
+
+    table = module_symbol_table(db, root, path)
+    symbol = next(item for item in table.symbols if item.qualified_name == "é")
+    assert symbol.range == SourceRange(SourcePosition(0, 4), SourcePosition(0, 6))
+
+    lexical = scope_tree(db, path)
+    binding = next(item for item in lexical.bindings if item.name == "é")
+    assert binding.range == SourceRange(SourcePosition(0, 4), SourcePosition(0, 6))
+    refs = find_references(db, root, path, "é").references
+    assert [item.range for item in refs] == [
+        SourceRange(SourcePosition(0, 4), SourcePosition(0, 6)),
+        SourceRange(SourcePosition(1, 11), SourcePosition(1, 13)),
+    ]
+
+
+def test_deleted_module_receiver_is_not_resolved_speculatively(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "provider.py").write_text("def f() -> None:\n    pass\n", encoding="utf-8")
+    consumer = root / "consumer.py"
+    consumer.write_text(
+        "import provider\ndel provider\nprovider.f()\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        symbol_at(
+            Database(mode="strict"),
+            root,
+            consumer,
+            SourcePosition(2, 9),
+        )
+        is None
+    )
+
+
+def test_pep695_bindings_share_the_lexical_scope_graph(tmp_path: Path) -> None:
+    import ast
+
+    if not hasattr(ast, "TypeAlias"):
+        pytest.skip("PEP 695 syntax requires Python 3.12+")
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "generic.py"
+    path.write_text(
+        "type Alias[T] = list[T]\n"
+        "class Box[T]:\n"
+        "    value: T\n"
+        "def identity[T](value: T) -> T:\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    db = Database(mode="strict")
+
+    table = module_symbol_table(db, root, path)
+    alias = next(item for item in table.symbols if item.qualified_name == "Alias")
+    assert alias.kind == "variable"
+    lexical = scope_tree(db, path)
+    assert any(item.kind == "type_alias" and item.name == "Alias" for item in lexical.bindings)
+    type_parameters = [item for item in lexical.bindings if item.kind == "type_parameter"]
+    scope_kinds = {item.id: item.kind for item in lexical.scopes}
+    assert [(item.name, scope_kinds[item.scope_id]) for item in type_parameters] == [
+        ("T", "type_alias"),
+        ("T", "class"),
+        ("T", "function"),
+    ]
+    for parameter in type_parameters:
+        assert (
+            sum(occurrence.symbol_id == parameter.symbol_id for occurrence in lexical.occurrences)
+            >= 2
+        )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -1427,35 +1527,18 @@ def test_find_references_by_mode(mode: str, tmp_path: Path) -> None:
     db = Database(mode=mode)
     result = find_references(db, root, root / "a.py", "foo")
 
-    assert result.target.resolution == "workspace"
+    assert result.target.path == str(root / "a.py")
+    assert result.target.name == "foo"
     assert sorted(
-        (Path(r.path).name, r.lineno, r.is_declaration) for r in result.references
+        (Path(r.path).name, r.range.start.line, r.is_declaration) for r in result.references
     ) == [
-        ("a.py", 1, True),
-        ("b.py", 3, False),
+        ("a.py", 0, True),
+        ("b.py", 2, False),
     ]
 
 
-def test_comment_only_edit_backdates_name_occurrences_for_file(tmp_path: Path) -> None:
-    root = tmp_path / "workspace"
-    root.mkdir()
-    path = root / "a.py"
-    path.write_text("x = 1\nprint(x)\n", encoding="utf-8")
-
-    db = Database(mode="strict")
-    first = name_occurrences_for_file(db, str(path))
-
-    path.write_text("x = 1\nprint(x)\n# trailing\n", encoding="utf-8")
-    second = name_occurrences_for_file(db, str(path))
-
-    assert first == second
-    assert db.inspect(name_occurrences_for_file, str(path)).last_decision == "reused"
-
-
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_find_references_matches_fresh_recomputation_over_edits(
-    mode: str, tmp_path: Path
-) -> None:
+def test_find_references_matches_fresh_recomputation_over_edits(mode: str, tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     a = root / "a.py"
@@ -1476,22 +1559,6 @@ def test_find_references_matches_fresh_recomputation_over_edits(
         inc = find_references(incremental, root, a, "foo")
         fresh_result = find_references(fresh, root, a, "foo")
         assert inc == fresh_result
-
-
-def test_workspace_name_occurrence_index_skips_missing_syntax(tmp_path: Path) -> None:
-    root = tmp_path / "workspace"
-    root.mkdir()
-    (root / "good.py").write_text("x = 1\nprint(x)\n", encoding="utf-8")
-    (root / "broken.py").write_text("def (\n", encoding="utf-8")
-
-    db = Database(mode="strict")
-    index = workspace_name_occurrence_index(db, str(root))
-    mapping = dict(index)
-
-    assert mapping[str(root / "broken.py")] == ()
-    good_names = {entry[0] for entry in mapping[str(root / "good.py")]}
-    assert "x" in good_names
-    assert "print" in good_names
 
 
 # ---------------------------------------------------------------------------
@@ -1537,10 +1604,7 @@ def test_import_error_try_module_not_found_error(tmp_path: Path) -> None:
     root.mkdir()
     path = root / "mod.py"
     path.write_text(
-        "try:\n"
-        "    import tomllib\n"
-        "except ModuleNotFoundError:\n"
-        "    import tomli as tomllib\n",
+        "try:\n    import tomllib\nexcept ModuleNotFoundError:\n    import tomli as tomllib\n",
         encoding="utf-8",
     )
 
@@ -1600,7 +1664,7 @@ def test_import_error_try_bare_except_records_impurity(tmp_path: Path) -> None:
     root.mkdir()
     path = root / "mod.py"
     path.write_text(
-        "try:\n" "    import ujson\n" "except:\n" "    pass\n",
+        "try:\n    import ujson\nexcept:\n    pass\n",
         encoding="utf-8",
     )
 
@@ -1655,9 +1719,7 @@ _CLASS_MODEL_SAMPLE = (
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_class_model_captures_class_body_and_init_members(
-    mode: str, tmp_path: Path
-) -> None:
+def test_class_model_captures_class_body_and_init_members(mode: str, tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "widget.py"
@@ -1670,16 +1732,16 @@ def test_class_model_captures_class_body_and_init_members(
     by_name = {member.name: member for member in model.members}
 
     assert by_name["size"].kind == "class_variable"
-    assert by_name["size"].lineno == 2
+    assert by_name["size"].range.start.line == 1
     assert by_name["size"].annotation == "int"
     assert by_name["size"].signature is None
 
     assert by_name["tag"].kind == "class_variable"
-    assert by_name["tag"].lineno == 3
+    assert by_name["tag"].range.start.line == 2
     assert by_name["tag"].annotation is None
 
     assert by_name["__init__"].kind == "method"
-    assert by_name["__init__"].lineno == 5
+    assert by_name["__init__"].range.start.line == 4
     assert by_name["__init__"].signature == Signature(
         parameters=(
             Parameter(name="self", annotation=None),
@@ -1689,16 +1751,16 @@ def test_class_model_captures_class_body_and_init_members(
     )
 
     assert by_name["render"].kind == "method"
-    assert by_name["render"].lineno == 9
+    assert by_name["render"].range.start.line == 8
 
     assert by_name["name"].kind == "instance_variable"
-    assert by_name["name"].lineno == 6
+    assert by_name["name"].range.start.line == 5
     assert by_name["name"].annotation is None
     assert by_name["count"].kind == "instance_variable"
-    assert by_name["count"].lineno == 7
+    assert by_name["count"].range.start.line == 6
     assert by_name["count"].annotation == "int"
     assert by_name["cache"].kind == "instance_variable"
-    assert by_name["cache"].lineno == 10
+    assert by_name["cache"].range.start.line == 9
 
     # Every own member is attributed to this file and class.
     for member in model.members:
@@ -1746,8 +1808,8 @@ def test_class_model_self_attrs_dedup_lowest_lineno_wins(tmp_path: Path) -> None
     model = class_model(Database(mode="strict"), root, path, "C")
     by_name = {member.name: member for member in model.members}
     assert by_name["x"].kind == "instance_variable"
-    assert by_name["x"].lineno == 3  # __init__ occurrence, not the reset() rebind
-    assert by_name["y"].lineno == 6
+    assert by_name["x"].range.start.line == 2  # __init__ occurrence, not reset()
+    assert by_name["y"].range.start.line == 5
 
 
 def test_class_model_requires_literal_self_first_param(tmp_path: Path) -> None:
@@ -1755,9 +1817,7 @@ def test_class_model_requires_literal_self_first_param(tmp_path: Path) -> None:
     root.mkdir()
     path = root / "c.py"
     path.write_text(
-        "class C:\n"
-        "    def m(this) -> None:\n"
-        "        this.z = 1\n",
+        "class C:\n    def m(this) -> None:\n        this.z = 1\n",
         encoding="utf-8",
     )
 
@@ -1785,11 +1845,7 @@ def test_class_model_skips_nested_def_and_class(tmp_path: Path) -> None:
     )
 
     model = class_model(Database(mode="strict"), root, path, "C")
-    instance_names = {
-        member.name
-        for member in model.members
-        if member.kind == "instance_variable"
-    }
+    instance_names = {member.name for member in model.members if member.kind == "instance_variable"}
     assert instance_names == {"a", "e"}  # b, c live in nested scopes
 
 
@@ -1807,11 +1863,7 @@ def test_class_model_tuple_unpacked_self_targets(tmp_path: Path) -> None:
     )
 
     model = class_model(Database(mode="strict"), root, path, "C")
-    instance_names = {
-        member.name
-        for member in model.members
-        if member.kind == "instance_variable"
-    }
+    instance_names = {member.name for member in model.members if member.kind == "instance_variable"}
     assert instance_names == {"a", "b", "c", "d", "e", "rest"}
 
 
@@ -1898,9 +1950,7 @@ def test_resolved_class_model_out_of_workspace_is_empty(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_class_model_matches_fresh_recomputation_over_edits(
-    mode: str, tmp_path: Path
-) -> None:
+def test_class_model_matches_fresh_recomputation_over_edits(mode: str, tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "widget.py"
@@ -2015,9 +2065,7 @@ def test_class_model_derived_shadows_base(tmp_path: Path) -> None:
     base = root / "base.py"
     _write_file(
         base,
-        "class Base:\n"
-        "    def render(self) -> str:\n"
-        "        return 'base'\n",
+        "class Base:\n    def render(self) -> str:\n        return 'base'\n",
     )
     derived = root / "derived.py"
     _write_file(
@@ -2032,7 +2080,7 @@ def test_class_model_derived_shadows_base(tmp_path: Path) -> None:
     renders = [m for m in model.members if m.name == "render"]
     # First-definition-wins: exactly one `render`, the derived override.
     assert len(renders) == 1
-    assert renders[0].lineno == 5  # def render in derived.py
+    assert renders[0].range.start.line == 4  # def render in derived.py
     assert renders[0].defining_class == "Derived"
     assert renders[0].defining_path == str(derived)
 
@@ -2169,11 +2217,7 @@ def test_class_model_diamond_first_definition_wins(tmp_path: Path) -> None:
 def test_class_model_base_file_comment_edit_reused(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     base = root / "base.py"
-    base_src = (
-        "class Base:\n"
-        "    def shared(self) -> None:\n"
-        "        pass\n"
-    )
+    base_src = "class Base:\n    def shared(self) -> None:\n        pass\n"
     _write_file(base, base_src)
     derived = root / "derived.py"
     _write_file(

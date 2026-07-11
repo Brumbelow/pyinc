@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
@@ -14,6 +14,8 @@ from pyinc.integrations.python_source import (
     source_text,
     workspace_python_files,
 )
+from pyinc.integrations.scope_resolution import SymbolId, scope_tree, symbol_at
+from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
@@ -70,7 +72,7 @@ ModuleSymbolTablePayload: TypeAlias = tuple[
 ]
 #   module, path, symbols, impurity_reasons
 
-ResolvedSymbolPayload: TypeAlias = tuple[
+_ResolvedSymbolPayload: TypeAlias = tuple[
     str,
     str,
     SymbolResolutionKind,
@@ -100,31 +102,6 @@ WorkspaceSymbolIndexPayload: TypeAlias = tuple[
     tuple[WorkspaceSymbolEntryPayload, ...],
 ]
 #   root, entries
-
-NameOccurrencePayload: TypeAlias = tuple[str, int, int, int, str | None]
-#                                    bare_name, lineno, col_offset, end_col_offset, value_name_hint
-#
-# value_name_hint carries the LHS Name's id when the occurrence comes from an
-# `Attribute(value=Name(...), attr=...)` access — e.g., for `a.foo()` the `foo`
-# occurrence stores hint="a". This lets the references verifier route the
-# lookup through the import alias bound at `a` (resolving `a.foo` rather than
-# the file-local `foo`). For bare Name occurrences and for Attribute
-# occurrences whose `value` is itself an Attribute (e.g. `pkg.subpkg.foo`),
-# the hint is None.
-
-FileNameOccurrencesPayload: TypeAlias = tuple[str, tuple[NameOccurrencePayload, ...]]
-#                                    path,  occurrences
-
-WorkspaceNameOccurrencesPayload: TypeAlias = tuple[FileNameOccurrencesPayload, ...]
-
-ReferenceEntryPayload: TypeAlias = tuple[str, int, int, int, bool]
-#                                    path, lineno, col_offset, end_col_offset, is_declaration
-
-ReferenceQueryResultPayload: TypeAlias = tuple[
-    ResolvedSymbolPayload,
-    tuple[ReferenceEntryPayload, ...],
-]
-#   target, references
 
 ClassMemberKind: TypeAlias = Literal["method", "class_variable", "instance_variable"]
 
@@ -187,7 +164,7 @@ class Signature:
 class Symbol:
     qualified_name: str
     kind: SymbolKind
-    lineno: int
+    range: SourceRange
     annotation: str | None
     signature: Signature | None
     import_source_module: str | None
@@ -203,13 +180,13 @@ class ModuleSymbolTable:
 
 
 @dataclass(frozen=True)
-class ResolvedSymbol:
+class _ResolvedSymbol:
     original_module: str
     qualified_name: str
     resolution: SymbolResolutionKind
     defining_module: str | None
     defining_path: str | None
-    defining_lineno: int | None
+    range: SourceRange | None
     distribution_name: str | None
     distribution_version: str | None
     follow_depth: int
@@ -221,7 +198,7 @@ class WorkspaceSymbolEntry:
     module: str
     qualified_name: str
     kind: SymbolKind
-    lineno: int
+    range: SourceRange
     annotation: str | None
 
 
@@ -234,15 +211,13 @@ class WorkspaceSymbolIndex:
 @dataclass(frozen=True)
 class Reference:
     path: str
-    lineno: int
-    col_offset: int
-    end_col_offset: int
+    range: SourceRange
     is_declaration: bool
 
 
 @dataclass(frozen=True)
 class ReferenceQueryResult:
-    target: ResolvedSymbol
+    target: SymbolId
     references: tuple[Reference, ...]
 
 
@@ -250,7 +225,7 @@ class ReferenceQueryResult:
 class ClassMember:
     name: str
     kind: ClassMemberKind
-    lineno: int
+    range: SourceRange
     annotation: str | None
     signature: Signature | None
     defining_path: str | None
@@ -357,6 +332,13 @@ def _signature_payload(
     )
 
 
+_AST_TYPE_ALIAS = getattr(ast, "TypeAlias", None)
+
+
+def _is_type_alias(node: ast.AST) -> bool:
+    return isinstance(_AST_TYPE_ALIAS, type) and isinstance(node, _AST_TYPE_ALIAS)
+
+
 _TOP_LEVEL_ALLOWED_NODE_TYPES: tuple[type[ast.AST], ...] = (
     ast.FunctionDef,
     ast.AsyncFunctionDef,
@@ -370,9 +352,7 @@ _TOP_LEVEL_ALLOWED_NODE_TYPES: tuple[type[ast.AST], ...] = (
 )
 
 
-def _class_body_walk(
-    cls: ast.ClassDef, qualifier: str, out: list[SymbolPayload]
-) -> None:
+def _class_body_walk(cls: ast.ClassDef, qualifier: str, out: list[SymbolPayload]) -> None:
     for node in cls.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             out.append(
@@ -434,6 +414,21 @@ def _class_body_walk(
                         )
                     )
             continue
+        if _is_type_alias(node):
+            alias_name = getattr(node, "name", None)
+            if isinstance(alias_name, ast.Name):
+                out.append(
+                    (
+                        f"{qualifier}.{alias_name.id}",
+                        "class_variable",
+                        node.lineno,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                )
+            continue
 
 
 def _is_type_checking_test(test: ast.expr) -> bool:
@@ -460,25 +455,20 @@ def _has_import_error_handler(handlers: list[ast.ExceptHandler]) -> bool:
         ):
             return True
         if isinstance(exc_type, ast.Tuple) and any(
-            isinstance(elt, ast.Name)
-            and elt.id in ("ImportError", "ModuleNotFoundError")
+            isinstance(elt, ast.Name) and elt.id in ("ImportError", "ModuleNotFoundError")
             for elt in exc_type.elts
         ):
             return True
     return False
 
 
-def _type_checking_block_walk(
-    body: list[ast.stmt], symbols: list[SymbolPayload]
-) -> None:
+def _type_checking_block_walk(body: list[ast.stmt], symbols: list[SymbolPayload]) -> None:
     """Collect import symbols from a block — used for TYPE_CHECKING and try/except ImportError."""
     for stmt in body:
         if isinstance(stmt, ast.Import):
             for alias in stmt.names:
                 bound = _bound_name_for_import(alias)
-                symbols.append(
-                    (bound, "import_alias", stmt.lineno, None, None, alias.name, None)
-                )
+                symbols.append((bound, "import_alias", stmt.lineno, None, None, alias.name, None))
         elif isinstance(stmt, ast.ImportFrom):
             module_label = ("." * stmt.level) + (stmt.module or "")
             for alias in stmt.names:
@@ -584,6 +574,21 @@ def _module_symbol_walk(
                         )
                     )
             continue
+        if _is_type_alias(node):
+            alias_name = getattr(node, "name", None)
+            if isinstance(alias_name, ast.Name):
+                symbols.append(
+                    (
+                        alias_name.id,
+                        "variable",
+                        node.lineno,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                )
+            continue
         if isinstance(node, ast.Import):
             for alias in node.names:
                 bound = _bound_name_for_import(alias)
@@ -662,9 +667,7 @@ def module_symbol_table_payload(db: Database, path: str) -> ModuleSymbolTablePay
 
 
 @query
-def module_symbol_table_for_module(
-    db: Database, root: str, path: str
-) -> ModuleSymbolTablePayload:
+def module_symbol_table_for_module(db: Database, root: str, path: str) -> ModuleSymbolTablePayload:
     workspace_files = workspace_python_files(db, root)
     if path not in workspace_files:
         return ("", path, tuple(), ("not in workspace",))
@@ -689,9 +692,7 @@ _TERMINAL_SYMBOL_KINDS: frozenset[SymbolKind] = frozenset(
 )
 
 
-def _find_symbol(
-    table: ModuleSymbolTablePayload, qualified_name: str
-) -> SymbolPayload | None:
+def _find_symbol(table: ModuleSymbolTablePayload, qualified_name: str) -> SymbolPayload | None:
     for symbol in table[2]:
         if symbol[0] == qualified_name:
             return symbol
@@ -715,7 +716,7 @@ def _terminal(
     dist_ver: str | None,
     depth: int,
     trail: tuple[str, ...],
-) -> ResolvedSymbolPayload:
+) -> _ResolvedSymbolPayload:
     return (
         original_module,
         qualified_name,
@@ -809,12 +810,8 @@ def _resolve_via_wildcards(
                 continue
             if resolution != "workspace" or resolved_path is None:
                 continue
-            _, _, provider_exports = module_wildcard_export_surface(
-                db, root, resolved_path
-            )
-            _, _, _, provider_impurity = module_symbol_table_for_module(
-                db, root, resolved_path
-            )
+            _, _, provider_exports = module_wildcard_export_surface(db, root, resolved_path)
+            _, _, _, provider_impurity = module_symbol_table_for_module(db, root, resolved_path)
             if "dynamic __all__" in provider_impurity:
                 any_dynamic_provider = True
             if qualified_name in provider_exports:
@@ -823,27 +820,21 @@ def _resolve_via_wildcards(
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        db.report_untracked_read(
-            f"wildcard lookup {qualified_name} resolves to multiple providers"
-        )
+        db.report_untracked_read(f"wildcard lookup {qualified_name} resolves to multiple providers")
         return "ambiguous"
     if any_dynamic_provider:
-        db.report_untracked_read(
-            f"wildcard lookup {qualified_name} blocked by dynamic __all__"
-        )
+        db.report_untracked_read(f"wildcard lookup {qualified_name} blocked by dynamic __all__")
         return "ambiguous"
     return None
 
 
 @query
-def resolve_symbol_payload(
+def _resolve_symbol_payload(
     db: Database, root: str, path: str, qualified_name: str
-) -> ResolvedSymbolPayload:
+) -> _ResolvedSymbolPayload:
     workspace_files = workspace_python_files(db, root)
     if path not in workspace_files:
-        return _terminal(
-            "", qualified_name, "missing", None, None, None, None, None, 0, tuple()
-        )
+        return _terminal("", qualified_name, "missing", None, None, None, None, None, 0, tuple())
 
     original_module = _module_name_for_path(root, path)
     current_path = path
@@ -856,9 +847,7 @@ def resolve_symbol_payload(
         current_module = _module_name_for_path(root, current_path)
         key = (current_module, current_qname)
         if key in visited:
-            db.report_untracked_read(
-                f"symbol resolution cycle at {current_module}:{current_qname}"
-            )
+            db.report_untracked_read(f"symbol resolution cycle at {current_module}:{current_qname}")
             return _terminal(
                 original_module,
                 qualified_name,
@@ -892,9 +881,7 @@ def resolve_symbol_payload(
         symbol = _find_symbol(table, current_qname)
 
         if symbol is None:
-            wildcard_outcome = _resolve_via_wildcards(
-                db, root, current_path, current_qname, table
-            )
+            wildcard_outcome = _resolve_via_wildcards(db, root, current_path, current_qname, table)
             if wildcard_outcome is None:
                 return _terminal(
                     original_module,
@@ -1083,9 +1070,7 @@ def resolve_symbol_payload(
 
 
 @query
-def workspace_symbol_index_payload(
-    db: Database, root: str
-) -> WorkspaceSymbolIndexPayload:
+def workspace_symbol_index_payload(db: Database, root: str) -> WorkspaceSymbolIndexPayload:
     files = workspace_python_files(db, root)
     entries: list[WorkspaceSymbolEntryPayload] = []
     for path in files:
@@ -1098,275 +1083,6 @@ def workspace_symbol_index_payload(
             entries.append((module, qname, kind, lineno, annotation))
     entries.sort(key=lambda item: (item[0], item[1]))
     return (root, tuple(entries))
-
-
-# ---------------------------------------------------------------------------
-# Layer 1 query: per-file name occurrences (full-AST walk)
-# ---------------------------------------------------------------------------
-
-
-def _collect_names_in_string_annotation(
-    constant: ast.Constant,
-    source_lines: list[str],
-    occurrences: list[NameOccurrencePayload],
-) -> None:
-    """Parse a string-valued annotation and emit Name/Attribute occurrences.
-
-    Bails on multi-line, triple-quoted, escape-bearing, or implicitly
-    concatenated string literals — offset reconstruction would be ambiguous.
-    Silent on parse errors (malformed annotation strings).
-    """
-    if not isinstance(constant.value, str):
-        return
-    if constant.lineno != constant.end_lineno:
-        return
-    if constant.end_col_offset is None:
-        return
-    line_index = constant.lineno - 1
-    if line_index < 0 or line_index >= len(source_lines):
-        return
-    line = source_lines[line_index]
-    if constant.end_col_offset > len(line):
-        return
-    literal = line[constant.col_offset : constant.end_col_offset]
-    if literal.startswith(("'''", '"""')):
-        return
-    # prefix_len is 0 if the literal opens with a quote, else 1 for a single
-    # leading letter prefix (r, R, u, U). Bytes literals never appear as str
-    # Constants, and f-strings parse as JoinedStr, not Constant — but be
-    # defensive about unexpected prefixes.
-    if literal[:1] in ("'", '"'):
-        prefix_len = 0
-    elif len(literal) >= 2 and literal[1:2] in ("'", '"'):
-        prefix_len = 1
-    else:
-        return
-    quote_len = 1
-    span = constant.end_col_offset - constant.col_offset
-    if span - prefix_len - 2 * quote_len != len(constant.value):
-        # Escape sequences, line continuations, or implicit concatenation.
-        return
-    try:
-        parsed = ast.parse(constant.value, mode="eval")
-    except (SyntaxError, ValueError):
-        return
-    base_col = constant.col_offset + prefix_len + quote_len
-    for inner in ast.walk(parsed.body):
-        if isinstance(inner, ast.Name):
-            inner_end = inner.end_col_offset
-            if inner_end is None:
-                inner_end = inner.col_offset + len(inner.id)
-            if inner.lineno != 1 or (inner.end_lineno or 1) != 1:
-                continue
-            occurrences.append(
-                (
-                    inner.id,
-                    constant.lineno,
-                    base_col + inner.col_offset,
-                    base_col + inner_end,
-                    None,
-                )
-            )
-            continue
-        if isinstance(inner, ast.Attribute):
-            inner_end = inner.end_col_offset
-            inner_end_lineno = inner.end_lineno
-            if inner_end is None or inner_end_lineno is None:
-                continue
-            if inner_end_lineno != 1:
-                continue
-            attr_col = inner_end - len(inner.attr)
-            if attr_col < 0:
-                continue
-            value_hint = (
-                inner.value.id if isinstance(inner.value, ast.Name) else None
-            )
-            occurrences.append(
-                (
-                    inner.attr,
-                    constant.lineno,
-                    base_col + attr_col,
-                    base_col + inner_end,
-                    value_hint,
-                )
-            )
-
-
-def _annotation_string_constants(node: ast.AST) -> list[ast.Constant]:
-    """Collect every string-valued ast.Constant inside an annotation expression.
-
-    Captures `'Foo'` directly, plus strings nested in `list['Foo']`,
-    `Annotated['Foo', meta]`, `dict[str, 'Foo']`, etc.
-    """
-    found: list[ast.Constant] = []
-    for inner in ast.walk(node):
-        if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
-            found.append(inner)
-    return found
-
-
-def _collect_name_occurrences(
-    tree: ast.Module, source: str
-) -> tuple[NameOccurrencePayload, ...]:
-    occurrences: list[NameOccurrencePayload] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            end_col = node.end_col_offset
-            if end_col is None:
-                end_col = node.col_offset + len(node.id)
-            occurrences.append((node.id, node.lineno, node.col_offset, end_col, None))
-            continue
-        if isinstance(node, ast.Attribute):
-            end_col = node.end_col_offset
-            end_lineno = node.end_lineno
-            if end_col is None or end_lineno is None:
-                continue
-            attr_col = end_col - len(node.attr)
-            if attr_col < 0:
-                continue
-            value_hint = node.value.id if isinstance(node.value, ast.Name) else None
-            occurrences.append((node.attr, end_lineno, attr_col, end_col, value_hint))
-
-    source_lines = source.splitlines()
-    for node in ast.walk(tree):
-        annotation: ast.expr | None = None
-        if isinstance(node, (ast.AnnAssign, ast.arg)):
-            annotation = node.annotation
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            annotation = node.returns
-        if annotation is None:
-            continue
-        for constant in _annotation_string_constants(annotation):
-            _collect_names_in_string_annotation(
-                constant, source_lines, occurrences
-            )
-
-    seen: set[NameOccurrencePayload] = set()
-    deduped: list[NameOccurrencePayload] = []
-    for occ in occurrences:
-        if occ in seen:
-            continue
-        seen.add(occ)
-        deduped.append(occ)
-    deduped.sort(key=lambda item: (item[1], item[2]))
-    return tuple(deduped)
-
-
-@query
-def name_occurrences_for_file(
-    db: Database, path: str
-) -> tuple[NameOccurrencePayload, ...]:
-    source = source_text(db, path)
-    tree = _try_parse(source)
-    if tree is None:
-        return tuple()
-    return _collect_name_occurrences(tree, source)
-
-
-# ---------------------------------------------------------------------------
-# Layer 2 query: workspace-wide name occurrence index
-# ---------------------------------------------------------------------------
-
-
-@query
-def workspace_name_occurrence_index(
-    db: Database, root: str
-) -> WorkspaceNameOccurrencesPayload:
-    files = workspace_python_files(db, root)
-    entries: list[FileNameOccurrencesPayload] = []
-    for path in files:
-        occurrences = name_occurrences_for_file(db, path)
-        entries.append((path, tuple(occurrences)))
-    return tuple(entries)
-
-
-# ---------------------------------------------------------------------------
-# Layer 2 query: workspace-wide reference index for a target symbol
-# ---------------------------------------------------------------------------
-
-
-@query
-def find_references_payload(
-    db: Database, root: str, path: str, qualified_name: str
-) -> ReferenceQueryResultPayload:
-    target_payload = resolve_symbol_payload(db, root, path, qualified_name)
-    (
-        _orig_module,
-        _qname,
-        resolution,
-        defining_module,
-        defining_path,
-        defining_lineno,
-        _dist_name,
-        _dist_ver,
-        _follow_depth,
-        _trail,
-    ) = target_payload
-
-    if resolution != "workspace" or defining_path is None:
-        return (target_payload, tuple())
-
-    bare_target = qualified_name.rsplit(".", 1)[-1]
-    references: list[ReferenceEntryPayload] = []
-    declaration_seen = False
-
-    occurrences_index = workspace_name_occurrence_index(db, root)
-    for file_path, occurrences in occurrences_index:
-        for (
-            bare_name,
-            lineno,
-            col_offset,
-            end_col_offset,
-            value_name_hint,
-        ) in occurrences:
-            if bare_name != bare_target:
-                continue
-            if value_name_hint is None:
-                verify = resolve_symbol_payload(db, root, file_path, bare_name)
-            else:
-                # `value_name_hint.bare_name` form (e.g., `M.foo` where `M` is
-                # bound by `import M [as alias]` or by `from pkg import M`
-                # naming a workspace module). Resolve the LHS to a workspace
-                # module, then resolve the attribute name within that module
-                # so cross-module re-exports hop through. The equality checks
-                # below confirm the result still points at the target.
-                lhs = resolve_symbol_payload(db, root, file_path, value_name_hint)
-                if lhs[2] != "workspace":
-                    continue
-                if lhs[5] is not None:
-                    # defining_lineno is set, meaning the LHS resolved to a
-                    # specific definition site (function / class / variable),
-                    # not a module. Attribute access on a non-module workspace
-                    # symbol is out of scope.
-                    continue
-                lhs_def_path = lhs[4]
-                if lhs_def_path is None:
-                    continue
-                verify = resolve_symbol_payload(db, root, lhs_def_path, bare_name)
-            v_resolution = verify[2]
-            v_def_module = verify[3]
-            v_def_path = verify[4]
-            v_def_lineno = verify[5]
-            if v_resolution != "workspace":
-                continue
-            if v_def_module != defining_module:
-                continue
-            if v_def_path != defining_path:
-                continue
-            if v_def_lineno != defining_lineno:
-                continue
-            is_declaration = file_path == defining_path and lineno == defining_lineno
-            if is_declaration:
-                declaration_seen = True
-            references.append(
-                (file_path, lineno, col_offset, end_col_offset, is_declaration)
-            )
-
-    if not declaration_seen and defining_lineno is not None:
-        references.append((defining_path, defining_lineno, 0, 1, True))
-
-    references.sort(key=lambda item: (item[0], item[1], item[2]))
-    return (target_payload, tuple(references))
 
 
 # ---------------------------------------------------------------------------
@@ -1389,6 +1105,11 @@ def _decode_signature(payload: SignaturePayload | None) -> Signature | None:
     )
 
 
+def _payload_range(lineno: int, width: int = 0) -> SourceRange:
+    start = SourcePosition(max(lineno - 1, 0), 0)
+    return SourceRange(start, SourcePosition(start.line, width))
+
+
 def _decode_symbol(payload: SymbolPayload) -> Symbol:
     (
         qualified_name,
@@ -1402,7 +1123,7 @@ def _decode_symbol(payload: SymbolPayload) -> Symbol:
     return Symbol(
         qualified_name=qualified_name,
         kind=kind,
-        lineno=lineno,
+        range=_payload_range(lineno),
         annotation=annotation,
         signature=_decode_signature(signature),
         import_source_module=import_source_module,
@@ -1420,7 +1141,7 @@ def _decode_module_symbol_table(payload: ModuleSymbolTablePayload) -> ModuleSymb
     )
 
 
-def _decode_resolved_symbol(payload: ResolvedSymbolPayload) -> ResolvedSymbol:
+def _decode_resolved_symbol(payload: _ResolvedSymbolPayload) -> _ResolvedSymbol:
     (
         original_module,
         qualified_name,
@@ -1433,13 +1154,13 @@ def _decode_resolved_symbol(payload: ResolvedSymbolPayload) -> ResolvedSymbol:
         follow_depth,
         trail,
     ) = payload
-    return ResolvedSymbol(
+    return _ResolvedSymbol(
         original_module=original_module,
         qualified_name=qualified_name,
         resolution=resolution,
         defining_module=defining_module,
         defining_path=defining_path,
-        defining_lineno=defining_lineno,
+        range=None,
         distribution_name=distribution_name,
         distribution_version=distribution_version,
         follow_depth=follow_depth,
@@ -1455,7 +1176,7 @@ def _decode_workspace_symbol_entry(
         module=module,
         qualified_name=qualified_name,
         kind=kind,
-        lineno=lineno,
+        range=_payload_range(lineno),
         annotation=annotation,
     )
 
@@ -1470,15 +1191,23 @@ def _decode_workspace_symbol_index(
     )
 
 
-def _decode_reference(payload: ReferenceEntryPayload) -> Reference:
-    path, lineno, col_offset, end_col_offset, is_declaration = payload
-    return Reference(
-        path=path,
-        lineno=lineno,
-        col_offset=col_offset,
-        end_col_offset=end_col_offset,
-        is_declaration=is_declaration,
-    )
+def _source_ranges_for_path(db: Database, path: str) -> dict[tuple[str, int], SourceRange]:
+    ranges = {
+        (binding.name, binding.range.start.line): binding.range
+        for binding in scope_tree(db, path).bindings
+    }
+    source = source_text(db, path)
+    tree = _try_parse(source)
+    if tree is None:
+        return ranges
+    document = DocumentMap(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        for alias in node.names:
+            if alias.name == "*":
+                ranges[("*", node.lineno - 1)] = document.ast_range(alias)
+    return ranges
 
 
 # ---------------------------------------------------------------------------
@@ -1497,69 +1226,159 @@ def module_symbol_table(
         ModuleSymbolTablePayload,
         thaw(db.get(module_symbol_table_for_module, normalized_root, normalized_path)),
     )
-    return _decode_module_symbol_table(payload)
+    decoded = _decode_module_symbol_table(payload)
+    ranges_by_name_and_line = _source_ranges_for_path(db, normalized_path)
+    symbols = tuple(
+        replace(
+            symbol,
+            range=ranges_by_name_and_line.get(
+                (
+                    symbol.qualified_name.rsplit(".", 1)[-1],
+                    symbol.range.start.line,
+                ),
+                symbol.range,
+            ),
+        )
+        for symbol in decoded.symbols
+    )
+    return replace(decoded, symbols=symbols)
 
 
-def resolve_symbol(
+def resolve_qualified_name(
     db: Database,
     root: str | os.PathLike[str],
     path: str | os.PathLike[str],
     qualified_name: str,
-) -> ResolvedSymbol:
+) -> _ResolvedSymbol:
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
     payload = cast(
-        ResolvedSymbolPayload,
+        _ResolvedSymbolPayload,
         thaw(
             db.get(
-                resolve_symbol_payload,
+                _resolve_symbol_payload,
                 normalized_root,
                 normalized_path,
                 qualified_name,
             )
         ),
     )
-    return _decode_resolved_symbol(payload)
+    decoded = _decode_resolved_symbol(payload)
+    defining_lineno = payload[5]
+    if decoded.defining_path is None or defining_lineno is None:
+        return decoded
+    name = decoded.qualified_name.rsplit(".", 1)[-1]
+    lexical = scope_tree(db, decoded.defining_path)
+    source_range = next(
+        (
+            binding.range
+            for binding in lexical.bindings
+            if binding.name == name and binding.range.start.line == defining_lineno - 1
+        ),
+        None,
+    )
+    return replace(decoded, range=source_range)
 
 
-def workspace_symbol_index(
-    db: Database, root: str | os.PathLike[str]
-) -> WorkspaceSymbolIndex:
+def workspace_symbol_index(db: Database, root: str | os.PathLike[str]) -> WorkspaceSymbolIndex:
     normalized_root = _normalize_path(root)
     payload = cast(
         WorkspaceSymbolIndexPayload,
         thaw(db.get(workspace_symbol_index_payload, normalized_root)),
     )
-    return _decode_workspace_symbol_index(payload)
+    decoded = _decode_workspace_symbol_index(payload)
+    module_paths = {
+        _module_name_for_path(normalized_root, path): path
+        for path in workspace_python_files(db, normalized_root)
+    }
+    ranges_by_path: dict[str, dict[tuple[str, int], SourceRange]] = {}
+    entries: list[WorkspaceSymbolEntry] = []
+    for entry in decoded.entries:
+        path = module_paths.get(entry.module)
+        source_range = entry.range
+        if path is not None:
+            ranges = ranges_by_path.get(path)
+            if ranges is None:
+                ranges = _source_ranges_for_path(db, path)
+                ranges_by_path[path] = ranges
+            source_range = ranges.get(
+                (
+                    entry.qualified_name.rsplit(".", 1)[-1],
+                    entry.range.start.line,
+                ),
+                source_range,
+            )
+        entries.append(replace(entry, range=source_range))
+    return replace(decoded, entries=tuple(entries))
 
 
 def find_references(
     db: Database,
     root: str | os.PathLike[str],
-    path: str | os.PathLike[str],
-    qualified_name: str,
+    symbol_id: SymbolId,
     *,
     include_declaration: bool = True,
 ) -> ReferenceQueryResult:
-    normalized_root = _normalize_path(root)
-    normalized_path = _normalize_path(path)
-    payload = cast(
-        ReferenceQueryResultPayload,
-        thaw(
-            db.get(
-                find_references_payload,
-                normalized_root,
-                normalized_path,
-                qualified_name,
-            )
-        ),
+    if not isinstance(symbol_id, SymbolId):
+        raise TypeError("find_references() requires a resolved SymbolId")
+    return _find_references_for_symbol(
+        db,
+        os.fspath(root),
+        symbol_id,
+        include_declaration=include_declaration,
     )
-    target_payload, references_payload = payload
-    target = _decode_resolved_symbol(target_payload)
-    decoded = tuple(_decode_reference(item) for item in references_payload)
-    if not include_declaration:
-        decoded = tuple(item for item in decoded if not item.is_declaration)
-    return ReferenceQueryResult(target=target, references=decoded)
+
+
+def _find_references_for_symbol(
+    db: Database,
+    root: str,
+    target: SymbolId,
+    *,
+    include_declaration: bool,
+) -> ReferenceQueryResult:
+    """Find references by resolved lexical identity.
+
+    Local bindings are compared directly. Module attributes and direct
+    ``from`` imports are normalized through the conservative workspace
+    resolver before comparison, so an unrelated shadow with the same spelling
+    is never included.
+    """
+
+    files = cast(tuple[str, ...], thaw(db.get(workspace_python_files, root)))
+    references: list[Reference] = []
+    seen_locations: set[tuple[str, SourceRange]] = set()
+    for path in files:
+        lexical = scope_tree(db, path)
+        for occurrence in lexical.occurrences:
+            if occurrence.name != target.name:
+                continue
+            candidate = symbol_at(db, root, path, occurrence.range.start)
+            if candidate != target:
+                continue
+            if occurrence.is_declaration and occurrence.symbol_id != target:
+                # An import binding names the target but is not itself a
+                # declaration or usage of the target symbol.
+                continue
+            is_declaration = (
+                occurrence.is_declaration
+                and occurrence.symbol_id == target
+                and occurrence.range == target.declaration
+            )
+            if is_declaration and not include_declaration:
+                continue
+            location = (path, occurrence.range)
+            if location in seen_locations:
+                continue
+            seen_locations.add(location)
+            references.append(
+                Reference(
+                    path=path,
+                    range=occurrence.range,
+                    is_declaration=is_declaration,
+                )
+            )
+    references.sort(key=lambda item: (item.path, item.range.start))
+    return ReferenceQueryResult(target=target, references=tuple(references))
 
 
 # ---------------------------------------------------------------------------
@@ -1658,9 +1477,7 @@ def _collect_instance_attributes(
                 and isinstance(target.value, ast.Name)
                 and target.value.id == "self"
             ):
-                collected.append(
-                    (target.attr, node.lineno, _annotation_text(node.annotation))
-                )
+                collected.append((target.attr, node.lineno, _annotation_text(node.annotation)))
         for child in ast.iter_child_nodes(node):
             if isinstance(
                 child,
@@ -1670,9 +1487,7 @@ def _collect_instance_attributes(
             visit(child)
 
     for stmt in method.body:
-        if isinstance(
-            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         visit(stmt)
     return collected
@@ -1782,7 +1597,7 @@ def class_models_for_file(db: Database, path: str) -> tuple[OwnClassModelPayload
 
 
 def _class_site_from_resolved(
-    db: Database, root: str, resolved: ResolvedSymbolPayload
+    db: Database, root: str, resolved: _ResolvedSymbolPayload
 ) -> tuple[str, str] | None:
     """The ``(defining_path, class_qname)`` a resolved symbol lands on when it
     points at a workspace ``class`` — else ``None``.
@@ -1822,20 +1637,20 @@ def _resolve_base_to_class(
     tag = encoded[0]
     if tag == "name":
         return _class_site_from_resolved(
-            db, root, resolve_symbol_payload(db, root, path, encoded[1])
+            db, root, _resolve_symbol_payload(db, root, path, encoded[1])
         )
     if tag == "attr":
         lhs, attr = encoded[1], encoded[2]
-        direct = resolve_symbol_payload(db, root, path, f"{lhs}.{attr}")
+        direct = _resolve_symbol_payload(db, root, path, f"{lhs}.{attr}")
         site = _class_site_from_resolved(db, root, direct)
         if site is not None:
             return site
-        lhs_resolved = resolve_symbol_payload(db, root, path, lhs)
+        lhs_resolved = _resolve_symbol_payload(db, root, path, lhs)
         lhs_path = lhs_resolved[4]
         # `defining_lineno is None` means the LHS is a module, not a symbol.
         if lhs_resolved[2] == "workspace" and lhs_resolved[5] is None and lhs_path:
             return _class_site_from_resolved(
-                db, root, resolve_symbol_payload(db, root, lhs_path, attr)
+                db, root, _resolve_symbol_payload(db, root, lhs_path, attr)
             )
     return None
 
@@ -1910,7 +1725,7 @@ def _decode_class_member(payload: ResolvedClassMemberPayload) -> ClassMember:
     return ClassMember(
         name=name,
         kind=kind,
-        lineno=lineno,
+        range=_payload_range(lineno),
         annotation=annotation,
         signature=_decode_signature(signature),
         defining_path=defining_path,
@@ -1947,7 +1762,19 @@ def class_model(
             )
         ),
     )
-    return _decode_class_model(payload)
+    decoded = _decode_class_model(payload)
+    ranges_by_path: dict[str, dict[tuple[str, int], SourceRange]] = {}
+    members: list[ClassMember] = []
+    for member in decoded.members:
+        source_range = member.range
+        if member.defining_path is not None:
+            ranges = ranges_by_path.get(member.defining_path)
+            if ranges is None:
+                ranges = _source_ranges_for_path(db, member.defining_path)
+                ranges_by_path[member.defining_path] = ranges
+            source_range = ranges.get((member.name, member.range.start.line), source_range)
+        members.append(replace(member, range=source_range))
+    return replace(decoded, members=tuple(members))
 
 
 __all__ = [
@@ -1957,7 +1784,6 @@ __all__ = [
     "Parameter",
     "Reference",
     "ReferenceQueryResult",
-    "ResolvedSymbol",
     "Signature",
     "Symbol",
     "WorkspaceSymbolEntry",
@@ -1965,6 +1791,5 @@ __all__ = [
     "class_model",
     "find_references",
     "module_symbol_table",
-    "resolve_symbol",
     "workspace_symbol_index",
 ]

@@ -33,7 +33,7 @@ def _tree(root: Path) -> dict[str, bytes]:
     return {
         p.relative_to(root).as_posix(): p.read_bytes()
         for p in sorted(root.rglob("*"))
-        if p.is_file()
+        if p.is_file() and not p.name.startswith(".pyinc-action.")
     }
 
 
@@ -109,19 +109,46 @@ def _synthetic(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioRes
         value, secs, peak = measure(lambda: db.get(_aggregate))
         results.append(
             ScenarioResult(
-                "synthetic", scenario, "pyinc", secs, peak,
-                len(db.dependency_graph()), db.statistics().node_count, value == reference(),
+                "synthetic",
+                scenario,
+                "pyinc",
+                secs,
+                peak,
+                len(db.dependency_graph()),
+                db.statistics().node_count,
+                value == reference(),
             )
         )
         if "full" in comparators:
-            value, secs, peak = measure(lambda: sum(state["root"] + state["leaf"][i] * 2 for i in range(_WIDTH)))
-            results.append(ScenarioResult("synthetic", scenario, "full", secs, peak, 0, 0, value == reference()))
+            value, secs, peak = measure(
+                lambda: sum(state["root"] + state["leaf"][i] * 2 for i in range(_WIDTH))
+            )
+            results.append(
+                ScenarioResult(
+                    "synthetic", scenario, "full", secs, peak, 0, 0, value == reference()
+                )
+            )
         if "naive" in comparators:
             value, secs, peak = measure(naive_compute)
-            results.append(ScenarioResult("synthetic", scenario, "naive", secs, peak, 0, len(naive_cache), value == reference()))
+            results.append(
+                ScenarioResult(
+                    "synthetic",
+                    scenario,
+                    "naive",
+                    secs,
+                    peak,
+                    0,
+                    len(naive_cache),
+                    value == reference(),
+                )
+            )
         if joblib_compute is not None:
             value, secs, peak = measure(joblib_compute)
-            results.append(ScenarioResult("synthetic", scenario, "joblib", secs, peak, 0, 0, value == reference()))
+            results.append(
+                ScenarioResult(
+                    "synthetic", scenario, "joblib", secs, peak, 0, 0, value == reference()
+                )
+            )
 
     emit("cold")
     emit("unchanged")
@@ -144,8 +171,14 @@ def _synthetic(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioRes
     value, secs, peak = measure(restore)
     results.append(
         ScenarioResult(
-            "synthetic", "checkpoint_restore", "pyinc", secs, peak,
-            len(db2.dependency_graph()), db2.statistics().node_count, value == reference(),
+            "synthetic",
+            "checkpoint_restore",
+            "pyinc",
+            secs,
+            peak,
+            len(db2.dependency_graph()),
+            db2.statistics().node_count,
+            value == reference(),
         )
     )
     return results
@@ -204,8 +237,13 @@ def _calc(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResult]:
         value, secs, peak = measure(lambda: calc_emit.reconcile(db, str(root), root=out_inc))
         results.append(
             ScenarioResult(
-                "calc", scenario, "pyinc", secs, peak,
-                len(db.dependency_graph()), db.statistics().node_count,
+                "calc",
+                scenario,
+                "pyinc",
+                secs,
+                peak,
+                len(db.dependency_graph()),
+                db.statistics().node_count,
                 _tree(out_inc) == fresh_tree(),
             )
         )
@@ -213,11 +251,28 @@ def _calc(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResult]:
             full_dir = work / "full"
             if full_dir.exists():
                 shutil.rmtree(full_dir)
-            _value, secs, peak = measure(lambda: calc_emit.reconcile(Database(mode="strict"), str(root), root=full_dir))
-            results.append(ScenarioResult("calc", scenario, "full", secs, peak, 0, 0, _tree(full_dir) == fresh_tree()))
+            _value, secs, peak = measure(
+                lambda: calc_emit.reconcile(Database(mode="strict"), str(root), root=full_dir)
+            )
+            results.append(
+                ScenarioResult(
+                    "calc", scenario, "full", secs, peak, 0, 0, _tree(full_dir) == fresh_tree()
+                )
+            )
         if "naive" in comparators:
             _value, secs, peak = measure(naive_reconcile)
-            results.append(ScenarioResult("calc", scenario, "naive", secs, peak, 0, len(naive_sig), _tree(naive_out) == fresh_tree()))
+            results.append(
+                ScenarioResult(
+                    "calc",
+                    scenario,
+                    "naive",
+                    secs,
+                    peak,
+                    0,
+                    len(naive_sig),
+                    _tree(naive_out) == fresh_tree(),
+                )
+            )
 
     emit("cold")
     emit("unchanged")
@@ -259,8 +314,13 @@ def _calc(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResult]:
     _value, secs, peak = measure(restore)
     results.append(
         ScenarioResult(
-            "calc", "checkpoint_restore", "pyinc", secs, peak,
-            len(db3.dependency_graph()), db3.statistics().node_count,
+            "calc",
+            "checkpoint_restore",
+            "pyinc",
+            secs,
+            peak,
+            len(db3.dependency_graph()),
+            db3.statistics().node_count,
             _tree(out_ck) == fresh_tree(),
         )
     )
@@ -319,8 +379,13 @@ def _codegen(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResul
         value, secs, peak = measure(lambda: generate(db, schema_path, out_inc))
         results.append(
             ScenarioResult(
-                "codegen", scenario, "pyinc", secs, peak,
-                len(db.dependency_graph()), db.statistics().node_count,
+                "codegen",
+                scenario,
+                "pyinc",
+                secs,
+                peak,
+                len(db.dependency_graph()),
+                db.statistics().node_count,
                 _tree(out_inc) == fresh_tree(schema),
             )
         )
@@ -329,7 +394,18 @@ def _codegen(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResul
             if full_dir.exists():
                 shutil.rmtree(full_dir)
             measured = measure(lambda: generate(Database(mode="strict"), schema_path, full_dir))
-            results.append(ScenarioResult("codegen", scenario, "full", measured[1], measured[2], 0, 0, _tree(full_dir) == fresh_tree(schema)))
+            results.append(
+                ScenarioResult(
+                    "codegen",
+                    scenario,
+                    "full",
+                    measured[1],
+                    measured[2],
+                    0,
+                    0,
+                    _tree(full_dir) == fresh_tree(schema),
+                )
+            )
 
     emit("cold")
     emit("unchanged")
@@ -345,6 +421,7 @@ def _codegen(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResul
     write(schema)
     emit("high_fanout_shared_edit")
 
+    del schema["$defs"]["Widget"]["properties"]["size"]  # type: ignore[index]
     del schema["$defs"]["Size"]  # type: ignore[attr-defined]
     write(schema)
     emit("removed_emitted_artifact")
@@ -364,8 +441,13 @@ def _codegen(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResul
     _value, secs, peak = measure(restore)
     results.append(
         ScenarioResult(
-            "codegen", "checkpoint_restore", "pyinc", secs, peak,
-            len(db2.dependency_graph()), db2.statistics().node_count,
+            "codegen",
+            "checkpoint_restore",
+            "pyinc",
+            secs,
+            peak,
+            len(db2.dependency_graph()),
+            db2.statistics().node_count,
             _tree(out_ck) == fresh_tree(schema),
         )
     )
@@ -421,8 +503,13 @@ def _action_target(*, out_dir: Path, comparators: Sequence[str]) -> list[Scenari
         value, secs, peak = measure(lambda: emit_files.reconcile(db, root=out_inc))
         results.append(
             ScenarioResult(
-                "action", scenario, "pyinc", secs, peak,
-                len(db.dependency_graph()), db.statistics().node_count,
+                "action",
+                scenario,
+                "pyinc",
+                secs,
+                peak,
+                len(db.dependency_graph()),
+                db.statistics().node_count,
                 _tree(out_inc) == fresh_tree(),
             )
         )
@@ -433,7 +520,18 @@ def _action_target(*, out_dir: Path, comparators: Sequence[str]) -> list[Scenari
             full_db = Database(mode="strict")
             apply_to(full_db)
             measured = measure(lambda: emit_files.reconcile(full_db, root=full_dir))
-            results.append(ScenarioResult("action", scenario, "full", measured[1], measured[2], 0, 0, _tree(full_dir) == fresh_tree()))
+            results.append(
+                ScenarioResult(
+                    "action",
+                    scenario,
+                    "full",
+                    measured[1],
+                    measured[2],
+                    0,
+                    0,
+                    _tree(full_dir) == fresh_tree(),
+                )
+            )
 
     emit("cold")
     emit("unchanged")

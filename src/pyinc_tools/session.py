@@ -4,19 +4,15 @@ import ast
 import contextlib
 import keyword
 import os
-import re
-import shutil
-import sys
 import tempfile
 import threading
-import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+import tokenize
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Literal
 
 from pyinc import Database
 from pyinc.integrations import (
+    Binding,
     ClassMember,
     ClassModel,
     ConfigAnalysis,
@@ -24,1999 +20,219 @@ from pyinc.integrations import (
     DependencyStatus,
     DependencySurface,
     ModuleSymbolTable,
-    Parameter,
     PythonModuleAnalysis,
     PythonWorkspaceAnalysis,
     Reference,
     ReferenceQueryResult,
     RequirementsAnalysis,
     ResolvedImportRef,
-    ResolvedSymbol,
+    Scope,
+    ScopeTree,
     Signature,
+    SourcePosition,
+    SourceRange,
     Symbol,
+    SymbolId,
     WorkspaceSymbolIndex,
     class_model,
     find_references,
     module_analysis,
     module_symbol_table,
-    resolve_symbol,
+    scope_tree,
     workspace_analysis,
     workspace_config_analysis,
     workspace_dependency_check,
     workspace_requirements_analysis,
     workspace_symbol_index,
 )
+from pyinc.integrations import (
+    symbol_at as resolve_symbol_at,
+)
 
-DiagnosticSeverity = Literal["error", "warning", "information", "hint"]
-
-DEFAULT_IGNORED_DIR_NAMES = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        ".venv",
-        "__pycache__",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".hypothesis",
-        "dist",
-    }
+from ._analysis import (
+    _BINDING_TO_COMPLETION_KIND,
+    _CLASS_MEMBER_KINDS,
+    _COMPLETION_LIMIT,
+    _INSTANCE_MEMBER_KINDS,
+    _SYMBOL_TO_COMPLETION_KIND,
+    _annotation_expr_for_name_at,
+    _annotation_type_positions,
+    _build_signature_label,
+    _call_func_range,
+    _collect_annotation_type_refs,
+    _collect_outgoing_calls,
+    _compute_document_links,
+    _compute_folding_ranges,
+    _compute_selection_chain,
+    _compute_semantic_tokens,
+    _enclosing_callable_qname,
+    _enclosing_method_context,
+    _expression_name_position,
+    _find_call_at_position,
+    _find_callable_node,
+    _find_completion_context,
+    _inlay_hints_for_call,
+    _keyword_completions,
+    _normalize_dependency_name,
+    _normalized_name_offsets_on_line,
+    _parameter_defaults_from_source,
+    _parse_python,
+    _repair_caret_line,
+    _source_parses,
+    _unwrap_base_expression,
+    _walk_class_definitions,
+)
+from ._analysis import (
+    resolve_target as _resolve_target,
+)
+from ._analysis import (
+    target_from_symbol_id as _target_from_symbol_id,
+)
+from ._edits import (
+    _alias_list_deletion_edits,
+    _find_from_module_span,
+    _import_node_for_line,
+    _relative_import_anchor,
+    _resolve_import_from_target,
+    _statement_line_span,
+    _static_module_all_names,
+)
+from ._models import (
+    AnalysisDiagnostic as AnalysisDiagnostic,
+)
+from ._models import (
+    CallHierarchyCallSite as CallHierarchyCallSite,
+)
+from ._models import (
+    CallHierarchyIncomingCall as CallHierarchyIncomingCall,
+)
+from ._models import (
+    CallHierarchyItem as CallHierarchyItem,
+)
+from ._models import (
+    CallHierarchyItemKind as CallHierarchyItemKind,
+)
+from ._models import (
+    CallHierarchyOutgoingCall as CallHierarchyOutgoingCall,
+)
+from ._models import (
+    CodeAction as CodeAction,
+)
+from ._models import (
+    CodeActionEdit as CodeActionEdit,
+)
+from ._models import (
+    CodeActionKind as CodeActionKind,
+)
+from ._models import (
+    CodeLens as CodeLens,
+)
+from ._models import (
+    CompletionItem as CompletionItem,
+)
+from ._models import (
+    CompletionItemKind as CompletionItemKind,
+)
+from ._models import (
+    DeclarationLocation as DeclarationLocation,
+)
+from ._models import (
+    DependencyInputs as _DependencyInputs,
+)
+from ._models import (
+    DiagnosticSeverity as DiagnosticSeverity,
+)
+from ._models import (
+    DocumentHighlight as DocumentHighlight,
+)
+from ._models import (
+    DocumentHighlightKind as DocumentHighlightKind,
+)
+from ._models import (
+    DocumentLink as DocumentLink,
+)
+from ._models import (
+    FileAnalysisResult as FileAnalysisResult,
+)
+from ._models import (
+    FileDeletionEdit as FileDeletionEdit,
+)
+from ._models import (
+    FileRenameEdit as FileRenameEdit,
+)
+from ._models import (
+    FoldingRange as FoldingRange,
+)
+from ._models import (
+    FoldingRangeKind as FoldingRangeKind,
+)
+from ._models import (
+    InlayHint as InlayHint,
+)
+from ._models import (
+    InlayHintKind as InlayHintKind,
+)
+from ._models import (
+    LinkedEditingRange as LinkedEditingRange,
+)
+from ._models import (
+    RenameEdit as RenameEdit,
+)
+from ._models import (
+    RenameResult as RenameResult,
+)
+from ._models import (
+    RenameStatus as RenameStatus,
+)
+from ._models import (
+    ResolvedReferenceResult as _ResolvedReferenceResult,
+)
+from ._models import (
+    ResolvedTarget,
+)
+from ._models import (
+    SelectionRange as SelectionRange,
+)
+from ._models import (
+    SemanticToken as SemanticToken,
+)
+from ._models import (
+    SemanticTokenModifier as SemanticTokenModifier,
+)
+from ._models import (
+    SemanticTokenType as SemanticTokenType,
+)
+from ._models import (
+    SignatureHelp as SignatureHelp,
+)
+from ._models import (
+    SignatureParameterInfo as SignatureParameterInfo,
+)
+from ._models import (
+    TypeDefinitionLocation as TypeDefinitionLocation,
+)
+from ._models import (
+    TypeHierarchyItem as TypeHierarchyItem,
+)
+from ._models import (
+    TypeHierarchyItemKind as TypeHierarchyItemKind,
+)
+from ._models import (
+    WorkspaceAnalysisResult as WorkspaceAnalysisResult,
+)
+from ._workspace import (
+    DEFAULT_IGNORED_DIR_NAMES as DEFAULT_IGNORED_DIR_NAMES,
+)
+from ._workspace import (
+    PollingWorkspaceWatcher as PollingWorkspaceWatcher,
+)
+from ._workspace import (
+    WorkspaceMirror,
+    _encode_python_text,
 )
 
 # Diagnostic codes that `code_actions_for_range` can offer a quick fix for.
-_CODE_ACTION_CODES = frozenset(
-    {"unused-import", "missing-import", "unresolved-symbol"}
-)
-
-
-@dataclass(frozen=True)
-class AnalysisDiagnostic:
-    path: str
-    code: str
-    message: str
-    severity: DiagnosticSeverity
-    source: str
-    lineno: int | None = None
-    col_offset: int | None = None
-    tags: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class FileAnalysisResult:
-    path: str
-    module: PythonModuleAnalysis | None
-    symbols: ModuleSymbolTable | None
-    dependency_check: DependencyCheckAnalysis
-    diagnostics: tuple[AnalysisDiagnostic, ...]
-
-
-@dataclass(frozen=True)
-class WorkspaceAnalysisResult:
-    root: str
-    python: PythonWorkspaceAnalysis
-    symbols: WorkspaceSymbolIndex
-    dependency_check: DependencyCheckAnalysis
-    files: tuple[FileAnalysisResult, ...]
-    diagnostics: tuple[AnalysisDiagnostic, ...]
-
-
-RenameStatus = Literal[
-    "ok",
-    "non_workspace_target",
-    "invalid_identifier",
-    "keyword_identifier",
-    "same_name",
-    "alias_rename_unsupported",
-]
-
-
-@dataclass(frozen=True)
-class RenameEdit:
-    path: str
-    lineno: int
-    col_offset: int
-    end_col_offset: int
-    new_text: str
-
-
-@dataclass(frozen=True)
-class RenameResult:
-    target: ResolvedSymbol
-    edits: tuple[RenameEdit, ...]
-    status: RenameStatus
-
-
-@dataclass(frozen=True)
-class FileRenameEdit:
-    """A text edit returned by ``import_edits_for_file_renames``.
-
-    All position fields are 0-based (LSP-style).
-    """
-
-    path: str
-    start_line: int
-    start_character: int
-    end_line: int
-    end_character: int
-    new_text: str
-
-
-@dataclass(frozen=True)
-class FileDeletionEdit:
-    """A text edit returned by ``import_edits_for_file_deletions``.
-
-    Represents the deletion of an ``import`` / ``from`` statement (or a
-    single alias inside one) that references a Python file that is about
-    to be removed from the workspace. The edit's range covers the source
-    span to be removed; ``new_text`` is always the empty string.
-
-    All position fields are 0-based (LSP-style).
-    """
-
-    path: str
-    start_line: int
-    start_character: int
-    end_line: int
-    end_character: int
-    new_text: str = ""
-
-
-CodeActionKind = Literal["quickfix"]
-
-
-@dataclass(frozen=True)
-class CodeActionEdit:
-    """A single text edit produced by a code action.
-
-    All position fields are 0-based (LSP-style); ``new_text`` is the empty
-    string for the deletion-style fixes and the replacement text for the
-    retarget-style fixes.
-    """
-
-    path: str
-    start_line: int
-    start_character: int
-    end_line: int
-    end_character: int
-    new_text: str = ""
-
-
-@dataclass(frozen=True)
-class CodeAction:
-    """A quick fix anchored to a single diagnostic.
-
-    ``diagnostic`` is the analysis diagnostic the fix resolves; the LSP layer
-    echoes it back (converted) in the ``diagnostics`` field of the response so
-    the client can associate the action with the problem. ``edits`` are the
-    workspace text edits that apply the fix.
-    """
-
-    title: str
-    kind: CodeActionKind
-    diagnostic: AnalysisDiagnostic
-    edits: tuple[CodeActionEdit, ...]
-
-
-DocumentHighlightKind = Literal["text", "read", "write"]
-
-
-@dataclass(frozen=True)
-class DocumentHighlight:
-    lineno: int
-    col_offset: int
-    end_col_offset: int
-    kind: DocumentHighlightKind
-
-
-@dataclass(frozen=True)
-class LinkedEditingRange:
-    lineno: int
-    col_offset: int
-    end_col_offset: int
-
-
-@dataclass(frozen=True)
-class SignatureParameterInfo:
-    label: str
-    label_offset_start: int
-    label_offset_end: int
-
-
-@dataclass(frozen=True)
-class SignatureHelp:
-    label: str
-    parameters: tuple[SignatureParameterInfo, ...]
-    active_parameter: int | None
-
-
-CompletionItemKind = Literal[
-    "function",
-    "method",
-    "class",
-    "variable",
-    "field",
-    "module",
-    "keyword",
-]
-
-
-@dataclass(frozen=True)
-class CompletionItem:
-    label: str
-    kind: CompletionItemKind
-    detail: str | None
-    sort_text: str
-
-
-FoldingRangeKind = Literal["imports", "comment", "region"]
-
-
-@dataclass(frozen=True)
-class FoldingRange:
-    start_line: int
-    end_line: int
-    kind: FoldingRangeKind
-
-
-@dataclass(frozen=True)
-class SelectionRange:
-    start_line: int
-    start_character: int
-    end_line: int
-    end_character: int
-
-
-@dataclass(frozen=True)
-class DocumentLink:
-    start_line: int
-    start_character: int
-    end_line: int
-    end_character: int
-    target_path: str
-
-
-@dataclass(frozen=True)
-class CodeLens:
-    start_line: int
-    start_character: int
-    end_line: int
-    end_character: int
-    title: str
-
-
-@dataclass(frozen=True)
-class TypeDefinitionLocation:
-    path: str
-    lineno: int
-    col_offset: int
-    end_col_offset: int
-
-
-@dataclass(frozen=True)
-class DeclarationLocation:
-    """Location where the identifier under the cursor is *declared* in the
-    current file.
-
-    Distinct from :class:`TypeDefinitionLocation` / ``textDocument/definition``:
-    ``definition`` follows ``import`` / ``from … import`` chains through to
-    the imported target's defining file, while ``declaration`` stops at the
-    binding statement in the current file. For workspace functions, classes,
-    and module-level variables the two coincide; for ``import_alias``,
-    ``from_import_alias``, and ``wildcard_import_stub`` symbols they differ.
-
-    All offsets are 1-based for ``lineno`` (matching ``Symbol.lineno`` and the
-    rest of the session API); ``col_offset`` / ``end_col_offset`` are 0-based
-    column positions, matching the rest of the session dataclasses. The LSP
-    layer subtracts 1 from ``lineno`` to produce the LSP 0-based shape.
-    """
-
-    path: str
-    lineno: int
-    col_offset: int
-    end_col_offset: int
-
-
-InlayHintKind = Literal["parameter", "type"]
-
-
-@dataclass(frozen=True)
-class InlayHint:
-    line: int
-    character: int
-    label: str
-    kind: InlayHintKind
-    padding_left: bool
-    padding_right: bool
-
-
-SemanticTokenType = Literal[
-    "namespace",
-    "class",
-    "function",
-    "method",
-    "parameter",
-    "variable",
-]
-
-SemanticTokenModifier = Literal["declaration", "async"]
-
-
-@dataclass(frozen=True)
-class SemanticToken:
-    line: int
-    character: int
-    length: int
-    token_type: SemanticTokenType
-    token_modifiers: tuple[SemanticTokenModifier, ...]
-
-
-CallHierarchyItemKind = Literal["function", "method", "class"]
-
-
-@dataclass(frozen=True)
-class CallHierarchyItem:
-    name: str
-    kind: CallHierarchyItemKind
-    path: str
-    qualified_name: str
-    detail: str | None
-    range_start_line: int
-    range_start_character: int
-    range_end_line: int
-    range_end_character: int
-    selection_start_line: int
-    selection_start_character: int
-    selection_end_line: int
-    selection_end_character: int
-
-
-@dataclass(frozen=True)
-class CallHierarchyCallSite:
-    start_line: int
-    start_character: int
-    end_line: int
-    end_character: int
-
-
-@dataclass(frozen=True)
-class CallHierarchyIncomingCall:
-    caller: CallHierarchyItem
-    call_sites: tuple[CallHierarchyCallSite, ...]
-
-
-@dataclass(frozen=True)
-class CallHierarchyOutgoingCall:
-    callee: CallHierarchyItem
-    call_sites: tuple[CallHierarchyCallSite, ...]
-
-
-TypeHierarchyItemKind = Literal["class"]
-
-
-@dataclass(frozen=True)
-class TypeHierarchyItem:
-    """A single class entry returned by the type-hierarchy endpoints.
-
-    The shape mirrors :class:`CallHierarchyItem`: ``range`` covers the whole
-    ``class`` block (including any decorator lines), ``selection_*`` spans
-    the bare class name on the header line, and ``qualified_name`` follows
-    the ``module_symbol_table`` convention (``Outer.Inner`` for nested
-    classes). ``detail`` is the declaring module name when known.
-
-    The ``kind`` field is fixed to ``"class"`` for now; type hierarchies
-    only surface classes, mirroring the LSP spec.
-    """
-
-    name: str
-    kind: TypeHierarchyItemKind
-    path: str
-    qualified_name: str
-    detail: str | None
-    range_start_line: int
-    range_start_character: int
-    range_end_line: int
-    range_end_character: int
-    selection_start_line: int
-    selection_start_character: int
-    selection_end_line: int
-    selection_end_character: int
-
-
-@dataclass(frozen=True)
-class _DependencyInputs:
-    config: ConfigAnalysis | None
-    requirements: RequirementsAnalysis | None
-    declared_dependencies: tuple[str, ...]
-
-
-def _normalize_dependency_name(name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def _resolve_import_from_target(
-    *,
-    importer_module: str,
-    importer_path: str,
-    level: int,
-    module: str | None,
-) -> str | None:
-    if level == 0:
-        return module
-    package_parts = [part for part in importer_module.split(".") if part]
-    if package_parts and Path(importer_path).name != "__init__.py":
-        package_parts = package_parts[:-1]
-    if level - 1 > len(package_parts):
-        return None
-    anchor = package_parts[: len(package_parts) - (level - 1)]
-    base_parts = [part for part in (module or "").split(".") if part]
-    return ".".join(anchor + base_parts)
-
-
-def _relative_import_anchor(
-    *, importer_module: str, importer_path: str, level: int
-) -> str | None:
-    """Return the dotted-package anchor a relative import resolves against.
-
-    Mirrors :func:`_resolve_import_from_target`'s level math: starts from
-    ``importer_module``, drops the trailing component when the importer is
-    not a package (``__init__.py``), then walks up ``level - 1`` more
-    components. Returns ``None`` when ``level`` overshoots the available
-    package depth, and ``""`` for ``level == 0`` (no anchor — absolute
-    import).
-    """
-    if level == 0:
-        return ""
-    package_parts = [part for part in importer_module.split(".") if part]
-    if package_parts and Path(importer_path).name != "__init__.py":
-        package_parts = package_parts[:-1]
-    if level - 1 > len(package_parts):
-        return None
-    return ".".join(package_parts[: len(package_parts) - (level - 1)])
-
-
-def _find_from_module_span(
-    source_lines: list[str], node: ast.ImportFrom
-) -> tuple[int, int, int] | None:
-    """Locate the dotted-module span of an ``ast.ImportFrom`` in source.
-
-    Returns ``(line_index, start_column, end_column)`` — 0-based — for the
-    ``".".joinedmodule`` portion between ``from`` and ``import`` (including
-    any leading dots). Returns ``None`` when the span can't be located
-    unambiguously on the statement's header line.
-    """
-    line_idx = node.lineno - 1
-    if not (0 <= line_idx < len(source_lines)):
-        return None
-    line = source_lines[line_idx]
-    expected = ("." * node.level) + (node.module or "")
-    if not expected:
-        return None
-    cursor = node.col_offset
-    if line[cursor : cursor + 4] != "from":
-        return None
-    cursor += 4
-    while cursor < len(line) and line[cursor] in " \t":
-        cursor += 1
-    if line[cursor : cursor + len(expected)] != expected:
-        return None
-    end = cursor + len(expected)
-    if end < len(line) and (line[end].isalnum() or line[end] in "._"):
-        return None
-    return (line_idx, cursor, end)
-
-
-def _import_node_for_line(
-    nodes: Sequence[ast.Import | ast.ImportFrom], lineno: int | None
-) -> ast.Import | ast.ImportFrom | None:
-    """Return the import statement whose line span covers ``lineno``.
-
-    Diagnostics anchor at different points: ``unused-import`` sits on the
-    individual alias line, which in a parenthesised multi-line import is
-    *not* the statement's first line, whereas ``missing-import`` /
-    ``unresolved-symbol`` sit on the statement line. A span-aware lookup
-    (``node.lineno <= lineno <= node.end_lineno``) matches all three; import
-    statements never overlap, so at most one node matches.
-    """
-    if lineno is None:
-        return None
-    for node in nodes:
-        end = node.end_lineno if node.end_lineno is not None else node.lineno
-        if node.lineno <= lineno <= end:
-            return node
-    return None
-
-
-def _static_module_all_names(tree: ast.Module) -> frozenset[str]:
-    """Names in the module's *static* ``__all__``, or empty when it has none.
-
-    Mirrors the integration's ``static_all_names`` notion: only a literal
-    ``__all__`` list / tuple / set of string constants at module scope
-    counts. A dynamically built or mutated ``__all__`` cannot be inspected
-    statically and yields the empty set (no suppression). Used to leave
-    intentional public re-exports (``from m import foo`` with ``foo`` in this
-    module's own ``__all__``) unflagged.
-    """
-    names: set[str] = set()
-    has_static = False
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            targets: list[ast.expr] = list(node.targets)
-            value: ast.expr | None = node.value
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-            value = node.value
-        else:
-            continue
-        if not any(
-            isinstance(target, ast.Name) and target.id == "__all__"
-            for target in targets
-        ):
-            continue
-        literal: set[str] = set()
-        if value is None or not isinstance(value, (ast.List, ast.Set, ast.Tuple)):
-            # A non-literal `__all__` is dynamic — can't confirm membership.
-            return frozenset()
-        for item in value.elts:
-            if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
-                return frozenset()
-            literal.add(item.value)
-        names = literal
-        has_static = True
-    return frozenset(names) if has_static else frozenset()
-
-
-def _statement_line_span(source: str, node: ast.stmt) -> tuple[int, int] | None:
-    """Return ``(start_line, end_line)`` for an import statement to delete.
-
-    Both values are 0-based LSP-style line indices. ``start_line`` is the
-    statement's first line (``node.lineno - 1``); ``end_line`` is one past
-    the statement's last source line — i.e. the line index where the next
-    statement starts. Pairing the two as ``{start: line_start, end:
-    end_line_start}`` produces an LSP ``TextEdit`` range that removes the
-    statement *including* its trailing newline, so neighbouring lines are
-    not pulled up onto the same physical line.
-
-    For an EOF-anchored statement (no trailing newline), ``end_line`` is
-    clamped to the total number of source lines and the column at the end
-    of the last line is folded back into the line index by setting
-    ``end_line == start_line + n``.
-    """
-    if node.end_lineno is None:
-        return None
-    start_line = node.lineno - 1
-    end_line = node.end_lineno
-    total_lines = source.count("\n") + 1
-    if end_line > total_lines:
-        end_line = total_lines
-    return start_line, end_line
-
-
-def _alias_list_deletion_edits(
-    *,
-    importer_path: str,
-    source: str,
-    aliases: list[ast.alias],
-    dead_indices: list[int],
-) -> list[FileDeletionEdit]:
-    """Emit edits that remove specific aliases from an alias-list import.
-
-    Used when only some aliases inside a single ``import a, b, c`` /
-    ``from M import a, b, c`` statement are dead — the surviving aliases
-    keep the statement intact. For each dead alias the edit covers the
-    alias's name + ``as`` clause span plus an adjacent comma so the list
-    stays well-formed afterwards.
-
-    Aliases whose ``end_lineno`` / ``end_col_offset`` are missing are
-    skipped (the surviving statement still references the deleted module
-    but at least the file is not mis-edited).
-    """
-    del source  # AST positions are sufficient; the source is unused here.
-    edits: list[FileDeletionEdit] = []
-    dead = set(dead_indices)
-    for i in dead_indices:
-        alias = aliases[i]
-        if (
-            alias.lineno is None
-            or alias.col_offset is None
-            or alias.end_lineno is None
-            or alias.end_col_offset is None
-        ):
-            continue
-        alias_start_line = alias.lineno - 1
-        alias_start_char = alias.col_offset
-        alias_end_line = alias.end_lineno - 1
-        alias_end_char = alias.end_col_offset
-
-        # Decide which adjacent comma to absorb.
-        prev_alive_idx: int | None = None
-        for j in range(i - 1, -1, -1):
-            if j not in dead:
-                prev_alive_idx = j
-                break
-        next_alive_idx: int | None = None
-        for j in range(i + 1, len(aliases)):
-            if j not in dead:
-                next_alive_idx = j
-                break
-
-        if next_alive_idx is not None:
-            # Absorb the trailing comma + whitespace up to the next alive
-            # alias's start, so the surviving alias slides into this slot.
-            next_alias = aliases[next_alive_idx]
-            if (
-                next_alias.lineno is None
-                or next_alias.col_offset is None
-            ):
-                continue
-            end_line = next_alias.lineno - 1
-            end_char = next_alias.col_offset
-            edits.append(
-                FileDeletionEdit(
-                    path=importer_path,
-                    start_line=alias_start_line,
-                    start_character=alias_start_char,
-                    end_line=end_line,
-                    end_character=end_char,
-                )
-            )
-        elif prev_alive_idx is not None:
-            # No surviving alias after us — absorb the preceding comma so
-            # the surviving alias before us doesn't end with a trailing `,`.
-            prev_alias = aliases[prev_alive_idx]
-            if (
-                prev_alias.end_lineno is None
-                or prev_alias.end_col_offset is None
-            ):
-                continue
-            start_line = prev_alias.end_lineno - 1
-            start_char = prev_alias.end_col_offset
-            edits.append(
-                FileDeletionEdit(
-                    path=importer_path,
-                    start_line=start_line,
-                    start_character=start_char,
-                    end_line=alias_end_line,
-                    end_character=alias_end_char,
-                )
-            )
-        else:
-            # No surviving sibling at all — caller should have routed this
-            # to the whole-statement removal path, but emit a span-only
-            # edit defensively rather than misbehaving silently.
-            edits.append(
-                FileDeletionEdit(
-                    path=importer_path,
-                    start_line=alias_start_line,
-                    start_character=alias_start_char,
-                    end_line=alias_end_line,
-                    end_character=alias_end_char,
-                )
-            )
-    return edits
-
-
-def _line_char_to_offset(source: str, line: int, character: int) -> int | None:
-    pos = 0
-    current_line = 0
-    while current_line < line:
-        nl = source.find("\n", pos)
-        if nl == -1:
-            return None
-        pos = nl + 1
-        current_line += 1
-    line_end = source.find("\n", pos)
-    if line_end == -1:
-        line_end = len(source)
-    return pos + min(character, line_end - pos)
-
-
-def _identifier_at_source_position(
-    source: str, line: int, character: int
-) -> str | None:
-    """Return the bare identifier covering ``(line, character)`` or ``None``.
-
-    Coordinates are LSP-style 0-based. Matches the identifier-lookup the LSP
-    layer applies for hover/definition: walk outward from the cursor while
-    the characters are `[A-Za-z0-9_]`, and require the leading character to
-    be `[A-Za-z_]`.
-    """
-    lines = source.splitlines()
-    if not (0 <= line < len(lines)):
-        return None
-    text = lines[line]
-    if not (0 <= character <= len(text)):
-        return None
-    start = character
-    while start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
-        start -= 1
-    end = character
-    while end < len(text) and (text[end].isalnum() or text[end] == "_"):
-        end += 1
-    if start == end:
-        return None
-    first = text[start]
-    if not (first.isalpha() or first == "_"):
-        return None
-    return text[start:end]
-
-
-def _identifier_immediately_before(source: str, paren_pos: int) -> str | None:
-    """Return the identifier appearing immediately before `(` at `paren_pos`.
-
-    Recognises a bare identifier (``foo``) or a single-dot attribute access
-    whose left-hand side is itself a bare name (``M.foo``). Returns None when
-    the preceding token is not a usable identifier — a closing bracket, a
-    literal, a Python keyword, or the name of a `def` / `class` definition
-    header (which is not a call site). Deeper chains (``pkg.sub.foo``) and
-    non-`Name` left-hand sides fall back to the bare rightmost identifier,
-    which the caller resolves (and typically fails to resolve) as a plain name.
-    """
-    j = paren_pos - 1
-    while j >= 0 and source[j] in " \t":
-        j -= 1
-    if j < 0 or not (source[j].isalnum() or source[j] == "_"):
-        return None
-    end = j + 1
-    while j >= 0 and (source[j].isalnum() or source[j] == "_"):
-        j -= 1
-    start = j + 1
-    name = source[start:end]
-    if not name or name[0].isdigit():
-        return None
-    if keyword.iskeyword(name):
-        return None
-    k = start - 1
-    while k >= 0 and source[k] in " \t":
-        k -= 1
-    if k >= 0 and (source[k].isalnum() or source[k] == "_"):
-        prev_end = k + 1
-        prev_start = prev_end
-        while prev_start > 0 and (
-            source[prev_start - 1].isalnum() or source[prev_start - 1] == "_"
-        ):
-            prev_start -= 1
-        if source[prev_start:prev_end] in ("def", "class"):
-            return None
-        return name
-    if k >= 0 and source[k] == ".":
-        # `<lhs>.name(` — capture the owner only when it is a single bare Name.
-        m = k - 1
-        while m >= 0 and source[m] in " \t":
-            m -= 1
-        if m < 0 or not (source[m].isalnum() or source[m] == "_"):
-            return name
-        lhs_end = m + 1
-        while m >= 0 and (source[m].isalnum() or source[m] == "_"):
-            m -= 1
-        lhs = source[m + 1 : lhs_end]
-        if not lhs or lhs[0].isdigit() or keyword.iskeyword(lhs):
-            return name
-        p = m
-        while p >= 0 and source[p] in " \t":
-            p -= 1
-        if p >= 0 and source[p] == ".":
-            # A deeper chain (`a.b.name(`) — LHS is not a bare Name.
-            return name
-        return f"{lhs}.{name}"
-    return name
-
-
-def _find_call_at_position(
-    source: str, line: int, character: int
-) -> tuple[str, int] | None:
-    """Locate the call-expression enclosing the cursor.
-
-    Returns ``(function_name, active_parameter_index)`` or ``None``.
-
-    The scanner runs forward over `source`, skipping comments and string
-    literals, and tracks a stack of open brackets. The topmost open `(`
-    whose preceding token is a usable identifier is the enclosing call;
-    its accumulated comma count yields the active parameter index. Bare-name
-    calls (``foo(``) and single-dot attribute calls whose owner is a bare
-    name (``M.foo(``) are detected; deeper chains (``pkg.sub.foo(``) and
-    subscripted calls (``factory[T](``) are not.
-    """
-    target = _line_char_to_offset(source, line, character)
-    if target is None:
-        return None
-
-    stack: list[tuple[str, str | None, int]] = []
-    n = len(source)
-    i = 0
-    while i < n and i < target:
-        c = source[i]
-        if c == "#":
-            j = source.find("\n", i)
-            i = n if j == -1 else j + 1
-            continue
-        if c in ('"', "'"):
-            triple = c * 3
-            if source[i : i + 3] == triple:
-                end = source.find(triple, i + 3)
-                i = n if end == -1 else end + 3
-                continue
-            j = i + 1
-            while j < n:
-                ch = source[j]
-                if ch == "\\":
-                    j += 2
-                    continue
-                if ch == c:
-                    j += 1
-                    break
-                if ch == "\n":
-                    j += 1
-                    break
-                j += 1
-            i = j
-            continue
-        if c in "([{":
-            name = _identifier_immediately_before(source, i) if c == "(" else None
-            stack.append((c, name, 0))
-            i += 1
-            continue
-        if c in ")]}":
-            opener = "(" if c == ")" else ("[" if c == "]" else "{")
-            if stack and stack[-1][0] == opener:
-                stack.pop()
-            i += 1
-            continue
-        if c == "," and stack:
-            opener_top, name_top, commas = stack[-1]
-            stack[-1] = (opener_top, name_top, commas + 1)
-        i += 1
-
-    for opener, name, commas in reversed(stack):
-        if opener == "(" and name is not None:
-            return name, commas
-    return None
-
-
-# Completion is intentionally *line-local* and declaration-driven: it never
-# infers runtime types. ``CompletionContext`` is the shape the scanner hands to
-# the session, tagged by ``kind``:
-#   ("name", prefix)                 — a bare identifier being typed
-#   ("attribute", owner, prefix)     — ``owner.<prefix>`` where owner is a bare name
-#   ("from_import", module, prefix)  — ``from <module> import <prefix>``
-#   ("import_module", prefix)        — ``import <prefix>`` / ``from <prefix>``
-CompletionContext = tuple[str, ...]
-
-_FROM_IMPORT_RE = re.compile(r"^\s*from\s+([\w.]+)\s+import\s+(.*)$")
-_FROM_MODULE_RE = re.compile(r"^\s*from\s+([\w.]*)$")
-_IMPORT_MODULE_RE = re.compile(r"^\s*import\s+(?:[\w.]+\s*,\s*)*([\w.]*)$")
-
-
-def _completion_head_in_string_or_comment(head: str) -> bool:
-    """Best-effort: is the caret inside a string or line comment on this line?
-
-    Scans the pre-caret text of the current line only. Triple-quoted strings
-    spanning lines are not modelled (documented limitation); this keeps
-    completion from firing inside ordinary single-line strings and comments.
-    """
-    quote: str | None = None
-    k = 0
-    n = len(head)
-    while k < n:
-        c = head[k]
-        if quote is not None:
-            if c == "\\":
-                k += 2
-                continue
-            if c == quote:
-                quote = None
-            k += 1
-            continue
-        if c in ("'", '"'):
-            quote = c
-            k += 1
-            continue
-        if c == "#":
-            return True
-        k += 1
-    return quote is not None
-
-
-def _completion_token_before(head: str) -> str:
-    """The trailing ``[\\w.]*`` run immediately before the caret."""
-    i = len(head)
-    while i > 0 and (head[i - 1].isalnum() or head[i - 1] in "_."):
-        i -= 1
-    return head[i:]
-
-
-def _find_completion_context(
-    source: str, line: int, character: int
-) -> CompletionContext | None:
-    """Classify what the caret at ``(line, character)`` is completing.
-
-    Returns ``None`` when nothing sensible can be offered (inside a string or
-    comment, or an attribute access whose owner is not a bare name)."""
-    lines = source.splitlines()
-    if not (0 <= line < len(lines)):
-        # Allow a caret one past the last line (empty trailing line).
-        if line == len(lines):
-            head = ""
-        else:
-            return None
-    else:
-        text = lines[line]
-        head = text[: max(0, min(character, len(text)))]
-
-    if _completion_head_in_string_or_comment(head):
-        return None
-
-    from_import = _FROM_IMPORT_RE.match(head)
-    if from_import is not None:
-        module = from_import.group(1)
-        after = from_import.group(2)
-        # The identifier currently being typed is the trailing word; anything
-        # with a dot in this position is out of scope.
-        last = after.rsplit(",", 1)[-1].strip()
-        if last and not last.replace("_", "").isalnum():
-            return None
-        return ("from_import", module, last)
-
-    from_module = _FROM_MODULE_RE.match(head)
-    if from_module is not None:
-        return ("import_module", from_module.group(1))
-
-    import_module = _IMPORT_MODULE_RE.match(head)
-    if import_module is not None:
-        return ("import_module", import_module.group(1))
-
-    run = _completion_token_before(head)
-    if "." in run:
-        owner, _, prefix = run.rpartition(".")
-        # Accept a bare name (``M.``) or a dotted owner whose every component
-        # is an identifier (``pkg.sub.``, ``pkg.sub.M.``); reject anything with
-        # an empty / numeric component (a leading dot, ``1.``, etc.). The
-        # session decides which dotted owners actually resolve to a workspace
-        # module or module-class.
-        if not all(part.isidentifier() for part in owner.split(".")):
-            return None
-        return ("attribute", owner, prefix)
-    return ("name", run)
-
-
-_SYMBOL_TO_COMPLETION_KIND: dict[str, CompletionItemKind] = {
-    "function": "function",
-    "method": "method",
-    "class": "class",
-    "class_variable": "field",
-    "variable": "variable",
-    "import_alias": "module",
-    "from_import_alias": "variable",
-}
-
-# Upper bound on returned items so a broad, empty-prefix request stays bounded;
-# editors filter client-side as the user keeps typing.
-_COMPLETION_LIMIT = 200
-
-
-def _repair_caret_line(source: str, line: int) -> str:
-    """Return ``source`` with line ``line`` replaced by ``pass`` at its original
-    indentation.
-
-    The caret line is typically the only unparseable part of a buffer mid-edit
-    (e.g. a trailing ``owner.``). Substituting ``pass`` — rather than blanking
-    the line, which would leave an enclosing ``def``/``class`` with an empty
-    body — lets the file parse while keeping every top-level import and
-    definition intact, which is all the local symbol table and owner resolution
-    need."""
-    lines = source.split("\n")
-    if 0 <= line < len(lines):
-        indent = lines[line][: len(lines[line]) - len(lines[line].lstrip())]
-        lines[line] = f"{indent}pass"
-    return "\n".join(lines)
-
-
-def _source_parses(text: str) -> bool:
-    try:
-        ast.parse(text)
-    except SyntaxError:
-        return False
-    return True
-
-
-def _keyword_completions(prefix: str) -> list[CompletionItem]:
-    return [
-        CompletionItem(label=kw, kind="keyword", detail=None, sort_text=f"3{kw}")
-        for kw in keyword.kwlist
-        if kw.startswith(prefix)
-    ]
-
-
-def _build_signature_label(
-    name: str,
-    signature: Signature,
-    defaults: Mapping[str, str] | None = None,
-) -> tuple[str, tuple[SignatureParameterInfo, ...]]:
-    """Render a ``def name(...)`` label and per-parameter substring offsets.
-
-    ``defaults`` maps a parameter name to the source text of its default value
-    (``ast.unparse``d); parameters absent from the mapping render without one.
-    Spacing follows PEP 8: ``name: ann = default`` when annotated, ``name=default``
-    otherwise. When ``defaults`` is ``None`` the output is byte-identical to the
-    annotation-only rendering used by hover and completion detail.
-    """
-    parts: list[str] = [f"def {name}("]
-    info: list[SignatureParameterInfo] = []
-    for index, parameter in enumerate(signature.parameters):
-        if index > 0:
-            parts.append(", ")
-        default = defaults.get(parameter.name) if defaults else None
-        if parameter.annotation is not None:
-            text = f"{parameter.name}: {parameter.annotation}"
-            if default is not None:
-                text = f"{text} = {default}"
-        else:
-            text = parameter.name
-            if default is not None:
-                text = f"{text}={default}"
-        offset = sum(len(piece) for piece in parts)
-        parts.append(text)
-        info.append(
-            SignatureParameterInfo(
-                label=text,
-                label_offset_start=offset,
-                label_offset_end=offset + len(text),
-            )
-        )
-    parts.append(")")
-    if signature.return_annotation is not None:
-        parts.append(f" -> {signature.return_annotation}")
-    return "".join(parts), tuple(info)
-
-
-def _defaults_from_arguments(args: ast.arguments) -> dict[str, str]:
-    """Map parameter name → ``ast.unparse``d default expression for `args`.
-
-    Positional defaults (``args.defaults``) are tail-aligned against the
-    posonly + positional parameters; keyword-only defaults (``args.kw_defaults``)
-    zip 1:1 with ``args.kwonlyargs`` (a ``None`` slot means no default).
-    Parameters without a default are omitted.
-    """
-    defaults: dict[str, str] = {}
-    positional = [*args.posonlyargs, *args.args]
-    positional_defaults = list(args.defaults)
-    if positional_defaults:
-        for arg, default in zip(
-            positional[-len(positional_defaults) :],
-            positional_defaults,
-            strict=True,
-        ):
-            defaults[arg.arg] = ast.unparse(default)
-    for arg, kw_default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
-        if kw_default is not None:
-            defaults[arg.arg] = ast.unparse(kw_default)
-    return defaults
-
-
-def _parameter_defaults_from_source(
-    source: str, lineno: int, name: str
-) -> dict[str, str] | None:
-    """Default-value expressions for the callable named `name` at `lineno`.
-
-    Parses `source` (the *defining* file) and locates the
-    ``FunctionDef`` / ``AsyncFunctionDef`` whose header is at 1-based `lineno`
-    with a matching `name`; for a ``ClassDef`` it digs into the class's
-    ``__init__``. Returns the name→default mapping (see
-    :func:`_defaults_from_arguments`), or ``None`` when the file fails to parse
-    or no matching definition is found. ``self`` / ``cls`` carry no default, so
-    the mapping already matches the self-stripped constructor signature."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return None
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.lineno == lineno
-            and node.name == name
-        ):
-            return _defaults_from_arguments(node.args)
-        if (
-            isinstance(node, ast.ClassDef)
-            and node.lineno == lineno
-            and node.name == name
-        ):
-            for stmt in node.body:
-                if (
-                    isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and stmt.name == "__init__"
-                ):
-                    return _defaults_from_arguments(stmt.args)
-            return {}
-    return None
-
-
-def _collect_annotation_type_refs(
-    annotation: str,
-) -> tuple[tuple[str, ...], ...]:
-    """Parse `annotation` and return a tuple of type-name references.
-
-    Each entry is either ``("name", id)`` for a bare-name reference or
-    ``("attribute", lhs_id, attr)`` for an ``lhs.attr`` reference where the
-    LHS is itself a bare name. Attribute chains whose LHS is not a bare
-    `Name` (e.g. ``pkg.sub.Foo``) are skipped — only the rightmost-bare-LHS
-    shape is supported, mirroring the resolver's existing handling for
-    references.
-
-    A whole-string forward reference (``"Foo"``, ``"pkg.Foo | None"``) is
-    unwrapped exactly once before walking. Malformed annotation text returns
-    an empty tuple.
-    """
-    try:
-        tree = ast.parse(annotation, mode="eval")
-    except SyntaxError:
-        return ()
-    body = tree.body
-    if isinstance(body, ast.Constant) and isinstance(body.value, str):
-        try:
-            body = ast.parse(body.value, mode="eval").body
-        except SyntaxError:
-            return ()
-
-    refs: list[tuple[str, ...]] = []
-
-    def walk(node: ast.AST) -> None:
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            refs.append(("attribute", node.value.id, node.attr))
-            return
-        if isinstance(node, ast.Name):
-            refs.append(("name", node.id))
-            return
-        for child in ast.iter_child_nodes(node):
-            walk(child)
-
-    walk(body)
-    return tuple(refs)
-
-
-def _compute_folding_ranges(source: str) -> tuple[FoldingRange, ...]:
-    """Walk the AST of `source` and emit `FoldingRange` entries.
-
-    Folds:
-    - `def`, `async def`, and `class` blocks (header line stays visible, body
-      folds). Decorated definitions start at the first decorator line so the
-      decorator block + def + body collapse together below that line.
-    - Runs of consecutive top-level `import` / `from ... import` statements
-      that span more than one source line in total. Mixed `import` and
-      `from-import` lines without a blank line between them are grouped.
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return ()
-
-    ranges: list[FoldingRange] = []
-
-    def walk_definitions(nodes: list[ast.stmt]) -> None:
-        for node in nodes:
-            if isinstance(
-                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ):
-                if node.decorator_list:
-                    start = min(dec.lineno for dec in node.decorator_list)
-                else:
-                    start = node.lineno
-                end = node.end_lineno or node.lineno
-                if end > start:
-                    ranges.append(
-                        FoldingRange(
-                            start_line=start,
-                            end_line=end,
-                            kind="region",
-                        )
-                    )
-                walk_definitions(list(node.body))
-            elif isinstance(node, (ast.If, ast.For, ast.While, ast.With, ast.Try)):
-                walk_definitions(list(node.body))
-                walk_definitions(list(getattr(node, "orelse", []) or []))
-                walk_definitions(list(getattr(node, "finalbody", []) or []))
-                for handler in getattr(node, "handlers", []) or []:
-                    walk_definitions(list(handler.body))
-
-    walk_definitions(list(tree.body))
-
-    run_start: int | None = None
-    run_end: int | None = None
-    for node in tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            if run_start is None:
-                run_start = node.lineno
-            run_end = node.end_lineno or node.lineno
-        else:
-            if run_start is not None and run_end is not None and run_end > run_start:
-                ranges.append(
-                    FoldingRange(
-                        start_line=run_start,
-                        end_line=run_end,
-                        kind="imports",
-                    )
-                )
-            run_start = None
-            run_end = None
-    if run_start is not None and run_end is not None and run_end > run_start:
-        ranges.append(
-            FoldingRange(
-                start_line=run_start,
-                end_line=run_end,
-                kind="imports",
-            )
-        )
-
-    ranges.sort(key=lambda r: (r.start_line, r.end_line))
-    return tuple(ranges)
-
-
-def _compute_selection_chain(
-    source: str, line: int, character: int
-) -> tuple[SelectionRange, ...]:
-    """Walk the AST of `source` and return a chain of nested ranges around the cursor.
-
-    The chain is ordered innermost-first; each subsequent entry strictly contains its
-    predecessor. Coordinates are 0-based (LSP-style) for both line and character.
-    Returns `()` when the file fails to parse, the cursor is out of bounds, or no AST
-    node contains the cursor.
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return ()
-
-    line_starts = [0]
-    for index, char in enumerate(source):
-        if char == "\n":
-            line_starts.append(index + 1)
-    line_count = len(line_starts)
-
-    if line < 0 or line >= line_count:
-        return ()
-    line_start = line_starts[line]
-    line_end = line_starts[line + 1] - 1 if line + 1 < line_count else len(source)
-    if character < 0 or line_start + character > line_end + 1:
-        return ()
-    cursor = line_start + character
-
-    candidates: set[tuple[int, int]] = set()
-    for node in ast.walk(tree):
-        start_lineno = getattr(node, "lineno", None)
-        start_col = getattr(node, "col_offset", None)
-        end_lineno = getattr(node, "end_lineno", None)
-        end_col = getattr(node, "end_col_offset", None)
-        if (
-            start_lineno is None
-            or start_col is None
-            or end_lineno is None
-            or end_col is None
-        ):
-            continue
-        if start_lineno < 1 or start_lineno > line_count:
-            continue
-        if end_lineno < 1 or end_lineno > line_count:
-            continue
-        start_offset = line_starts[start_lineno - 1] + start_col
-        end_offset = line_starts[end_lineno - 1] + end_col
-        if start_offset <= cursor <= end_offset and start_offset != end_offset:
-            candidates.add((start_offset, end_offset))
-
-    if not candidates:
-        return ()
-
-    sorted_candidates = sorted(candidates, key=lambda pair: (pair[1] - pair[0], pair[0]))
-
-    chain: list[tuple[int, int]] = []
-    for start_offset, end_offset in sorted_candidates:
-        if not chain:
-            chain.append((start_offset, end_offset))
-            continue
-        prev_start, prev_end = chain[-1]
-        if (
-            start_offset <= prev_start
-            and end_offset >= prev_end
-            and (start_offset < prev_start or end_offset > prev_end)
-        ):
-            chain.append((start_offset, end_offset))
-
-    def offset_to_position(offset: int) -> tuple[int, int]:
-        lo, hi = 0, line_count - 1
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if line_starts[mid] <= offset:
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo, offset - line_starts[lo]
-
-    selection_ranges: list[SelectionRange] = []
-    for start_offset, end_offset in chain:
-        sl, sc = offset_to_position(start_offset)
-        el, ec = offset_to_position(end_offset)
-        selection_ranges.append(
-            SelectionRange(
-                start_line=sl,
-                start_character=sc,
-                end_line=el,
-                end_character=ec,
-            )
-        )
-    return tuple(selection_ranges)
-
-
-def _compute_document_links(
-    source: str, resolved_imports: tuple[ResolvedImportRef, ...]
-) -> tuple[DocumentLink, ...]:
-    """Walk the AST of `source` and emit one `DocumentLink` per alias whose
-    resolved import points at a workspace file.
-
-    For `import M` / `import M as alias` / `import M.x` the link spans the
-    `ast.alias` node (which covers any `as <alias>` suffix). For `from M
-    import bar [, baz]` each alias is linked to its own resolved path —
-    the same path goto-definition would jump to for the bound name. Aliases
-    whose resolution is anything other than `"workspace"` (including
-    stdlib / installed / missing / ambiguous) are skipped, mirroring the
-    LSP's existing scope.
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return ()
-
-    import_targets: dict[tuple[int, str], str] = {}
-    from_targets: dict[tuple[int, str], str] = {}
-    for resolved in resolved_imports:
-        if resolved.resolution != "workspace" or resolved.resolved_path is None:
-            continue
-        if resolved.kind == "import":
-            import_targets[(resolved.lineno, resolved.module)] = resolved.resolved_path
-        elif resolved.imported_name is not None:
-            from_targets[(resolved.lineno, resolved.imported_name)] = (
-                resolved.resolved_path
-            )
-
-    links: list[DocumentLink] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.end_lineno is None or alias.end_col_offset is None:
-                    continue
-                target = import_targets.get((node.lineno, alias.name))
-                if target is None:
-                    continue
-                links.append(
-                    DocumentLink(
-                        start_line=alias.lineno - 1,
-                        start_character=alias.col_offset,
-                        end_line=alias.end_lineno - 1,
-                        end_character=alias.end_col_offset,
-                        target_path=target,
-                    )
-                )
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if (
-                    alias.name == "*"
-                    or alias.end_lineno is None
-                    or alias.end_col_offset is None
-                ):
-                    continue
-                target = from_targets.get((node.lineno, alias.name))
-                if target is None:
-                    continue
-                links.append(
-                    DocumentLink(
-                        start_line=alias.lineno - 1,
-                        start_character=alias.col_offset,
-                        end_line=alias.end_lineno - 1,
-                        end_character=alias.end_col_offset,
-                        target_path=target,
-                    )
-                )
-
-    links.sort(key=lambda link: (link.start_line, link.start_character))
-    return tuple(links)
-
-
-_CallableNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
-
-
-def _find_callable_node(
-    tree: ast.Module, qualified_name: str
-) -> _CallableNode | None:
-    """Locate the FunctionDef/AsyncFunctionDef/ClassDef matching `qualified_name`.
-
-    Matches `module_symbol_table`'s qualified-name convention: top-level
-    `def f` / `class C` resolve to ``f`` / ``C``; methods inside a class body
-    resolve to ``C.f``; nested classes inside a class body resolve to
-    ``C.Inner``. Nested functions inside another function body are not in
-    the symbol table and are therefore not matched here.
-    """
-    parts = qualified_name.split(".")
-    if not parts or any(not part for part in parts):
-        return None
-
-    def walk(
-        nodes: list[ast.stmt], remaining: list[str]
-    ) -> _CallableNode | None:
-        head = remaining[0]
-        rest = remaining[1:]
-        for node in nodes:
-            if isinstance(node, ast.ClassDef) and node.name == head:
-                if not rest:
-                    return node
-                found = walk(list(node.body), rest)
-                if found is not None:
-                    return found
-            elif (
-                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name == head
-            ):
-                if not rest:
-                    return node
-                # Nested functions are not part of the symbol-table qualifier
-                # scheme — stop descending.
-        return None
-
-    return walk(list(tree.body), parts)
-
-
-def _enclosing_callable_qname(
-    tree: ast.Module, known_qnames: frozenset[str], line: int
-) -> str | None:
-    """Innermost qualified name from `known_qnames` whose def/class span
-    contains the 1-based source `line`.
-
-    Qualifier follows the `module_symbol_table` convention: only `ClassDef`
-    nesting contributes to the dotted path; nested function bodies do not
-    extend the qualifier. Returns the deepest matching qname, or ``None`` if
-    no enclosing def/class is in `known_qnames`.
-    """
-    best: tuple[int, str] | None = None
-
-    def visit(node: ast.AST, class_qualifier: str) -> None:
-        nonlocal best
-        if isinstance(node, ast.ClassDef):
-            qname = (
-                f"{class_qualifier}.{node.name}" if class_qualifier else node.name
-            )
-            end_lineno = node.end_lineno or node.lineno
-            if node.lineno <= line <= end_lineno and qname in known_qnames:
-                span = end_lineno - node.lineno
-                if best is None or span < best[0]:
-                    best = (span, qname)
-            for body_child in node.body:
-                visit(body_child, qname)
-            return
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            qname = (
-                f"{class_qualifier}.{node.name}" if class_qualifier else node.name
-            )
-            end_lineno = node.end_lineno or node.lineno
-            if node.lineno <= line <= end_lineno and qname in known_qnames:
-                span = end_lineno - node.lineno
-                if best is None or span < best[0]:
-                    best = (span, qname)
-            # Nested defs/classes inside a function body are not in the
-            # module symbol table; reset the class qualifier for any further
-            # walk so a nested class can still be detected if it ever lands
-            # in the table.
-            for descendant in ast.iter_child_nodes(node):
-                visit(descendant, "")
-            return
-        for descendant in ast.iter_child_nodes(node):
-            visit(descendant, class_qualifier)
-
-    visit(tree, "")
-    return best[1] if best is not None else None
-
-
-def _first_positional_param(
-    node: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> str | None:
-    """Name of a callable's first positional parameter, or ``None``.
-
-    Positional-only parameters take precedence, then regular positionals; a
-    callable that takes only ``*args`` / keyword parameters has none."""
-    args = node.args
-    if args.posonlyargs:
-        return args.posonlyargs[0].arg
-    if args.args:
-        return args.args[0].arg
-    return None
-
-
-def _enclosing_method_context(
-    tree: ast.Module, line: int
-) -> tuple[str, str] | None:
-    """The class qualifier and first-parameter name of the method enclosing
-    the 1-based `line`, or ``None``.
-
-    The innermost callable containing `line` must be a ``FunctionDef`` /
-    ``AsyncFunctionDef`` that is a *direct* child of a ``ClassDef`` body — a
-    closure nested inside a method returns ``None``, as does a module-level
-    function or a caret outside any callable. The class qualifier follows
-    ``module_symbol_table``'s scheme (``Outer.Inner``; function-nested classes
-    reset). The first-parameter name is returned verbatim so the caller can
-    apply the literal ``self`` / ``cls`` rule; a method with no positional
-    parameter yields ``None``.
-    """
-    best: tuple[int, tuple[str, str] | None] | None = None
-
-    def visit(node: ast.AST, class_qualifier: str, direct_class: str | None) -> None:
-        nonlocal best
-        if isinstance(node, ast.ClassDef):
-            qname = (
-                f"{class_qualifier}.{node.name}" if class_qualifier else node.name
-            )
-            for body_child in node.body:
-                visit(body_child, qname, qname)
-            return
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            end_lineno = node.end_lineno or node.lineno
-            if node.lineno <= line <= end_lineno:
-                span = end_lineno - node.lineno
-                first = _first_positional_param(node)
-                payload = (
-                    (direct_class, first)
-                    if direct_class is not None and first is not None
-                    else None
-                )
-                if best is None or span < best[0]:
-                    best = (span, payload)
-            for descendant in ast.iter_child_nodes(node):
-                visit(descendant, "", None)
-            return
-        for descendant in ast.iter_child_nodes(node):
-            visit(descendant, class_qualifier, None)
-
-    visit(tree, "", None)
-    return best[1] if best is not None else None
-
-
-def _iter_own_scope(node: ast.AST) -> Iterator[ast.AST]:
-    """Yield the descendants of `node` that share its scope.
-
-    Descends through control-flow blocks (``if`` / ``for`` / ``while`` /
-    ``with`` / ``try``) but never into nested ``def`` / ``async def`` /
-    ``class`` / ``lambda`` bodies, so a scan stays inside `node`'s own scope."""
-    for child in ast.iter_child_nodes(node):
-        if isinstance(
-            child,
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
-        ):
-            continue
-        yield child
-        yield from _iter_own_scope(child)
-
-
-def _annotation_expr_for_name_at(
-    tree: ast.Module, line: int, name: str
-) -> ast.expr | None:
-    """Annotation expression bound to bare ``name`` visible at 1-based `line`.
-
-    Rule A's local declaration lookup — first hit wins:
-
-    1. a parameter named ``name`` (with an annotation) of the innermost
-       function enclosing `line`;
-    2. otherwise the nearest preceding ``AnnAssign`` to bare ``Name`` ``name``
-       (``lineno <= line``) inside that same function's own scope — control-flow
-       blocks are searched, nested ``def`` / ``class`` / ``lambda`` scopes are
-       not.
-
-    Returns the annotation node, or ``None`` when neither applies. The
-    module-level fallback (priority 3) is the caller's responsibility."""
-    enclosing: ast.FunctionDef | ast.AsyncFunctionDef | None = None
-    enclosing_span: int | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            end = node.end_lineno or node.lineno
-            if node.lineno <= line <= end:
-                span = end - node.lineno
-                if enclosing_span is None or span < enclosing_span:
-                    enclosing = node
-                    enclosing_span = span
-    if enclosing is None:
-        return None
-
-    args = enclosing.args
-    params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
-    if args.vararg is not None:
-        params.append(args.vararg)
-    if args.kwarg is not None:
-        params.append(args.kwarg)
-    for param in params:
-        if param.arg == name and param.annotation is not None:
-            return param.annotation
-
-    best: ast.expr | None = None
-    best_lineno = 0
-    for stmt in _iter_own_scope(enclosing):
-        if (
-            isinstance(stmt, ast.AnnAssign)
-            and isinstance(stmt.target, ast.Name)
-            and stmt.target.id == name
-            and stmt.lineno <= line
-            and stmt.lineno > best_lineno
-        ):
-            best = stmt.annotation
-            best_lineno = stmt.lineno
-    return best
-
-
-# self./cls. member views: `self` sees instance attributes plus everything the
-# class view sees; `cls` never sees instance attributes.
-_INSTANCE_MEMBER_KINDS: frozenset[str] = frozenset(
-    {"method", "class_variable", "instance_variable"}
-)
-_CLASS_MEMBER_KINDS: frozenset[str] = frozenset({"method", "class_variable"})
-
-
-def _collect_outgoing_calls(
-    body_node: _CallableNode,
-) -> tuple[ast.Call, ...]:
-    """Walk `body_node.body` for ``ast.Call`` nodes, skipping descent into
-    any nested ``FunctionDef`` / ``AsyncFunctionDef`` / ``ClassDef`` /
-    ``Lambda`` so each scope owns its own outgoing-call list.
-
-    Comprehension scopes (`ListComp`, `SetComp`, `DictComp`, `GeneratorExp`)
-    are walked through since they conceptually run inline.
-    """
-    calls: list[ast.Call] = []
-
-    def walk(node: ast.AST) -> None:
-        if isinstance(
-            node,
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
-        ):
-            return
-        if isinstance(node, ast.Call):
-            calls.append(node)
-        for child in ast.iter_child_nodes(node):
-            walk(child)
-
-    for stmt in body_node.body:
-        walk(stmt)
-    return tuple(calls)
-
-
-def _call_func_range(call: ast.Call) -> tuple[int, int, int, int] | None:
-    """Return the LSP-style 0-based range of `call.func`'s name span.
-
-    For `Name(id=name)` it's the entire Name; for
-    `Attribute(value=Name, attr=name)` it's just the rightmost-attribute
-    span (matching `find_references`'s reporting convention). Returns
-    ``None`` for any other call shape (subscripted, deep attribute chains,
-    lambdas, etc.) so the caller can skip it.
-    """
-    func = call.func
-    if isinstance(func, ast.Name):
-        end_col = func.end_col_offset
-        end_lineno = func.end_lineno
-        if end_col is None or end_lineno is None:
-            end_col = func.col_offset + len(func.id)
-            end_lineno = func.lineno
-        return (
-            func.lineno - 1,
-            func.col_offset,
-            end_lineno - 1,
-            end_col,
-        )
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-        end_col = func.end_col_offset
-        end_lineno = func.end_lineno
-        if end_col is None or end_lineno is None:
-            return None
-        attr_col = end_col - len(func.attr)
-        if attr_col < 0:
-            return None
-        return (
-            end_lineno - 1,
-            attr_col,
-            end_lineno - 1,
-            end_col,
-        )
-    return None
-
-
-def _unwrap_base_expression(node: ast.expr) -> tuple[str, ...] | None:
-    """Map a ``ClassDef`` base expression to a resolver-ready tuple.
-
-    Returns ``("name", id)`` for a bare ``Name``, or
-    ``("attr", lhs_id, attr_name)`` for ``Name.attr``. ``Subscript``
-    bases (``Generic[T]``, ``Base[T]``) are unwrapped to their ``value``
-    once, so ``Base[T]`` resolves to ``Base``. ``Starred`` bases, deep
-    attribute chains (``pkg.sub.Foo``), and call expressions are
-    rejected by returning ``None`` — matching the LHS-bare-Name limit
-    that ``find_references`` and ``call_hierarchy_outgoing_calls``
-    apply.
-    """
-    if isinstance(node, ast.Subscript):
-        node = node.value
-    if isinstance(node, ast.Name):
-        return ("name", node.id)
-    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-        return ("attr", node.value.id, node.attr)
-    return None
-
-
-def _walk_class_definitions(
-    tree: ast.Module,
-) -> tuple[tuple[str, ast.ClassDef], ...]:
-    """Yield every ``ClassDef`` in ``tree`` with its dotted qualifier.
-
-    The qualifier follows ``module_symbol_table``'s scheme: only
-    ``ClassDef`` nesting contributes to the dotted path — a class
-    declared inside a function body is reported with its bare class
-    name (no function qualifier), matching how the symbol table would
-    have stored it had it been at module top level. Classes declared
-    inside another class are reported as ``Outer.Inner``. Class bodies
-    are walked recursively so arbitrary nesting depth is covered.
-    """
-    out: list[tuple[str, ast.ClassDef]] = []
-
-    def walk(node: ast.AST, class_qualifier: str) -> None:
-        if isinstance(node, ast.ClassDef):
-            qname = (
-                f"{class_qualifier}.{node.name}" if class_qualifier else node.name
-            )
-            out.append((qname, node))
-            for body_child in node.body:
-                walk(body_child, qname)
-            return
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # Classes declared inside a function body are not part of the
-            # module symbol table's qualifier scheme; reset the class
-            # qualifier so any nested class re-enters at "top level".
-            for descendant in ast.iter_child_nodes(node):
-                walk(descendant, "")
-            return
-        for descendant in ast.iter_child_nodes(node):
-            walk(descendant, class_qualifier)
-
-    walk(tree, "")
-    return tuple(out)
-
-
-def _inlay_hints_for_call(
-    call: ast.Call,
-    parameters: Sequence[Parameter],
-) -> list[InlayHint]:
-    """Pair each positional argument with the next positional parameter slot
-    and emit one ``InlayHint`` with label ``"name:"`` per pair.
-
-    Walks ``parameters`` left-to-right (which mirrors `_parameter_payloads_from_args`'s
-    posonly-then-positional-then-vararg-then-kwonly-then-kwarg order). The
-    encoding prefixes vararg parameter names with ``*`` and kwargs with
-    ``**`` — both are skipped/stopped here:
-
-    - ``**name`` cannot receive positional → silently skipped (kwonly args
-      following a ``*`` are handled by the rule below).
-    - ``*name`` absorbs all remaining positional args → iteration stops.
-
-    Iteration also stops at the first ``ast.Starred`` argument in the call,
-    since a `*spread` consumes an unknown number of slots and the pairing
-    becomes ambiguous after that point. Hints are suppressed when the
-    argument is itself a bare ``Name`` whose identifier matches the
-    parameter name.
-    """
-    hints: list[InlayHint] = []
-    param_index = 0
-    for arg in call.args:
-        if isinstance(arg, ast.Starred):
-            break
-        while param_index < len(parameters):
-            name = parameters[param_index].name
-            if name.startswith("**"):
-                param_index += 1
-                continue
-            if name.startswith("*"):
-                return hints
-            break
-        if param_index >= len(parameters):
-            break
-        param_name = parameters[param_index].name
-        param_index += 1
-        if isinstance(arg, ast.Name) and arg.id == param_name:
-            continue
-        if arg.col_offset is None or arg.lineno is None:
-            continue
-        hints.append(
-            InlayHint(
-                line=arg.lineno - 1,
-                character=arg.col_offset,
-                label=f"{param_name}:",
-                kind="parameter",
-                padding_left=False,
-                padding_right=True,
-            )
-        )
-    return hints
-
-
-_SYMBOL_KIND_TO_SEMANTIC_TOKEN_TYPE: dict[str, SemanticTokenType] = {
-    "function": "function",
-    "method": "method",
-    "class": "class",
-    "variable": "variable",
-    "class_variable": "variable",
-    "import_alias": "namespace",
-}
-
-
-def _locate_def_name_offsets_on_header(
-    source_lines: Sequence[str], node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
-) -> tuple[int, int, int] | None:
-    """Return ``(line, col_offset, end_col_offset)`` of ``node.name`` on the
-    definition's header line, scanning forward from ``node.col_offset``.
-
-    The AST records the header line on ``node.lineno`` (in 3.8+ that's the
-    ``def`` / ``class`` keyword line, even for decorated definitions), so the
-    name lives on that same line. Returns ``None`` when the line is missing
-    or the name cannot be located by a word-boundary search.
-    """
-    line_idx = node.lineno - 1
-    if not (0 <= line_idx < len(source_lines)):
-        return None
-    line = source_lines[line_idx]
-    pattern = re.compile(rf"\b{re.escape(node.name)}\b")
-    match = pattern.search(line, node.col_offset)
-    if match is None:
-        return None
-    return node.lineno, match.start(), match.end()
-
-
-def _iter_function_args(args: ast.arguments) -> list[ast.arg]:
-    """Return all ``ast.arg`` entries in posonly / positional / vararg /
-    kwonly / kwarg slot order — the same order
-    ``_parameter_payloads_from_args`` uses inside ``symbol_resolution``.
-    """
-    entries: list[ast.arg] = []
-    entries.extend(args.posonlyargs)
-    entries.extend(args.args)
-    if args.vararg is not None:
-        entries.append(args.vararg)
-    entries.extend(args.kwonlyargs)
-    if args.kwarg is not None:
-        entries.append(args.kwarg)
-    return entries
-
-
-def _compute_semantic_tokens(
-    source: str, symbol_table: ModuleSymbolTable
-) -> tuple[SemanticToken, ...]:
-    """Walk ``source``'s AST and emit semantic tokens for declarations
-    (function / method / class headers and function parameters) and for bare
-    ``ast.Name`` uses whose identifier matches a top-level entry in
-    ``symbol_table``.
-
-    Files that fail to parse return ``()``. Token coordinates are 0-based
-    (LSP-style); the returned tuple is sorted by ``(line, character)``.
-
-    Use-site classification covers only top-level bare-name lookups in the
-    file's own symbol table; attribute access, function-local shadowing, and
-    cross-module re-export following are intentionally out of scope (they
-    match the existing limitations of ``find_references`` / ``inlayHint``).
-    """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return ()
-
-    lines = source.splitlines()
-
-    name_to_token_type: dict[str, SemanticTokenType] = {}
-    for symbol in symbol_table.symbols:
-        if "." in symbol.qualified_name:
-            continue
-        token_type = _SYMBOL_KIND_TO_SEMANTIC_TOKEN_TYPE.get(symbol.kind)
-        if token_type is None:
-            continue
-        name_to_token_type.setdefault(symbol.qualified_name, token_type)
-
-    tokens: list[SemanticToken] = []
-
-    def emit(
-        lineno: int,
-        col_offset: int,
-        length: int,
-        token_type: SemanticTokenType,
-        modifiers: tuple[SemanticTokenModifier, ...],
-    ) -> None:
-        if length <= 0 or lineno < 1:
-            return
-        tokens.append(
-            SemanticToken(
-                line=lineno - 1,
-                character=col_offset,
-                length=length,
-                token_type=token_type,
-                token_modifiers=modifiers,
-            )
-        )
-
-    def walk(node: ast.AST, inside_class: bool) -> None:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            located = _locate_def_name_offsets_on_header(lines, node)
-            if located is not None:
-                line_no, col, end_col = located
-                modifiers: tuple[SemanticTokenModifier, ...] = ("declaration",)
-                if isinstance(node, ast.AsyncFunctionDef):
-                    modifiers = modifiers + ("async",)
-                emit(
-                    line_no,
-                    col,
-                    end_col - col,
-                    "method" if inside_class else "function",
-                    modifiers,
-                )
-            for arg in _iter_function_args(node.args):
-                if arg.lineno is None or arg.col_offset is None:
-                    continue
-                emit(
-                    arg.lineno,
-                    arg.col_offset,
-                    len(arg.arg),
-                    "parameter",
-                    ("declaration",),
-                )
-            for decorator in node.decorator_list:
-                walk(decorator, inside_class=inside_class)
-            for default_expr in node.args.defaults:
-                walk(default_expr, inside_class=inside_class)
-            for kw_default in node.args.kw_defaults:
-                if kw_default is not None:
-                    walk(kw_default, inside_class=inside_class)
-            for arg in _iter_function_args(node.args):
-                if arg.annotation is not None:
-                    walk(arg.annotation, inside_class=inside_class)
-            if node.returns is not None:
-                walk(node.returns, inside_class=inside_class)
-            for body_stmt in node.body:
-                walk(body_stmt, inside_class=False)
-            return
-        if isinstance(node, ast.ClassDef):
-            located = _locate_def_name_offsets_on_header(lines, node)
-            if located is not None:
-                line_no, col, end_col = located
-                emit(line_no, col, end_col - col, "class", ("declaration",))
-            for decorator in node.decorator_list:
-                walk(decorator, inside_class=inside_class)
-            for base in node.bases:
-                walk(base, inside_class=inside_class)
-            for keyword_arg in node.keywords:
-                walk(keyword_arg.value, inside_class=inside_class)
-            for class_body_stmt in node.body:
-                walk(class_body_stmt, inside_class=True)
-            return
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            token_type = name_to_token_type.get(node.id)
-            if token_type is not None and node.lineno is not None:
-                emit(node.lineno, node.col_offset, len(node.id), token_type, ())
-            return
-        for descendant in ast.iter_child_nodes(node):
-            walk(descendant, inside_class=inside_class)
-
-    walk(tree, inside_class=False)
-    tokens.sort(key=lambda token: (token.line, token.character))
-    return tuple(tokens)
-
-
-def _collect_filesystem_snapshot(
-    root: str, ignored_dir_names: frozenset[str]
-) -> dict[str, tuple[int, int]]:
-    snapshot: dict[str, tuple[int, int]] = {}
-    for current_root, dirnames, filenames in os.walk(root):
-        dirnames[:] = [name for name in dirnames if name not in ignored_dir_names]
-        for filename in filenames:
-            file_path = Path(current_root, filename).resolve(strict=False)
-            try:
-                stat = file_path.stat()
-            except FileNotFoundError:
-                continue
-            snapshot[str(file_path)] = (stat.st_mtime_ns, stat.st_size)
-    return snapshot
+_CODE_ACTION_CODES = frozenset({"unused-import", "missing-import", "unresolved-symbol"})
 
 
 class WorkspaceSession:
@@ -2026,6 +242,7 @@ class WorkspaceSession:
         *,
         mode: str = "strict",
         ignored_dir_names: tuple[str, ...] | None = None,
+        exclude_globs: tuple[str, ...] = (),
     ) -> None:
         root_path = Path(root).resolve(strict=False)
         if not root_path.exists() or not root_path.is_dir():
@@ -2033,27 +250,72 @@ class WorkspaceSession:
 
         self.root = str(root_path)
         self.db = Database(mode=mode)
-        self._ignored_dir_names = frozenset(
-            ignored_dir_names or DEFAULT_IGNORED_DIR_NAMES
-        )
+        self._ignored_dir_names = frozenset(ignored_dir_names or DEFAULT_IGNORED_DIR_NAMES)
+        self._exclude_globs = tuple(exclude_globs)
         self._tempdir: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(
             prefix="pyinc-tools-"
         )
-        self.mirror_root = str(Path(self._tempdir.name, "workspace"))
-        self._mirror_root_path = Path(self.mirror_root)
-        self._mirror_root_path.mkdir(parents=True, exist_ok=True)
+        mirror_root_path = Path(self._tempdir.name, "workspace")
+        mirror_root_path.mkdir(parents=True, exist_ok=True)
+        mirror_root_path = mirror_root_path.resolve(strict=True)
+        self.mirror_root = str(mirror_root_path)
+        self._mirror = WorkspaceMirror(
+            self.root,
+            self.mirror_root,
+            self._ignored_dir_names,
+            self._exclude_globs,
+        )
         self._overlays: dict[str, str] = {}
         self._scheduled_paths: set[str] = set()
         self._state_lock = threading.RLock()
+        self._watchers: set[PollingWorkspaceWatcher] = set()
+        self._close_complete = threading.Event()
         self._closed = False
-        self._copy_workspace_into_mirror()
+        self._mirror.copy_workspace()
 
     def close(self) -> None:
         with self._state_lock:
-            if self._closed:
+            if self._close_complete.is_set():
                 return
-            self._closed = True
+
+            if self._closed:
+                close_complete = self._close_complete
+                # A watcher callback can race another thread that is closing the
+                # session and joining that watcher. Waiting here would make the
+                # two threads wait on each other.
+                if any(watcher._runs_in_current_thread() for watcher in self._watchers):
+                    return
+                should_close = False
+                watchers: tuple[PollingWorkspaceWatcher, ...] = ()
+            else:
+                self._closed = True
+                close_complete = self._close_complete
+                should_close = True
+                watchers = tuple(self._watchers)
+
+        if not should_close:
+            close_complete.wait()
+            return
+
+        try:
+            # Wake every watcher before joining any one of them. No session lock
+            # is held while joining because a watcher may be finishing a refresh.
+            for watcher in watchers:
+                watcher._request_stop()
+            for watcher in watchers:
+                watcher.stop()
             self._tempdir.cleanup()
+        finally:
+            close_complete.set()
+
+    def _register_watcher(self, watcher: PollingWorkspaceWatcher) -> None:
+        with self._state_lock:
+            self._check_open()
+            self._watchers.add(watcher)
+
+    def _unregister_watcher(self, watcher: PollingWorkspaceWatcher) -> None:
+        with self._state_lock:
+            self._watchers.discard(watcher)
 
     def _check_open(self) -> None:
         if self._closed:
@@ -2071,7 +333,7 @@ class WorkspaceSession:
             real_path = self._normalize_real_path(path)
             mirror_path = self._mirror_path_for_real(real_path)
             mirror_path.parent.mkdir(parents=True, exist_ok=True)
-            mirror_path.write_text(text, encoding="utf-8")
+            mirror_path.write_bytes(_encode_python_text(text))
             self._overlays[real_path] = text
             self._scheduled_paths.add(real_path)
             return real_path
@@ -2114,9 +376,7 @@ class WorkspaceSession:
                 self.mirror_root,
                 dependency_inputs.declared_dependencies,
             )
-            result = self._build_file_result(
-                real_path, dependency_inputs, dependency_check
-            )
+            result = self._build_file_result(real_path, dependency_inputs, dependency_check)
             self._scheduled_paths.discard(real_path)
             return result
 
@@ -2145,14 +405,8 @@ class WorkspaceSession:
                 for module in python_analysis.modules
             )
             diagnostics = self._dedupe_diagnostics(
-                tuple(
-                    diagnostic
-                    for file_result in files
-                    for diagnostic in file_result.diagnostics
-                )
-                + self._dependency_status_diagnostics(
-                    dependency_inputs, dependency_check
-                )
+                tuple(diagnostic for file_result in files for diagnostic in file_result.diagnostics)
+                + self._dependency_status_diagnostics(dependency_inputs, dependency_check)
             )
             self._scheduled_paths.clear()
             return WorkspaceAnalysisResult(
@@ -2190,7 +444,8 @@ class WorkspaceSession:
                 diagnostic
                 for diagnostic in result.diagnostics
                 if diagnostic.code in _CODE_ACTION_CODES
-                and start_line <= max((diagnostic.lineno or 1) - 1, 0) <= end_line
+                and diagnostic.range is not None
+                and start_line <= diagnostic.range.start.line <= end_line
             ]
             if not anchors:
                 return ()
@@ -2198,29 +453,24 @@ class WorkspaceSession:
             if source is None:
                 return ()
             try:
-                tree = ast.parse(source)
+                tree = _parse_python(source)
             except SyntaxError:
                 return ()
             import_nodes: list[ast.Import | ast.ImportFrom] = [
-                node
-                for node in ast.walk(tree)
-                if isinstance(node, (ast.Import, ast.ImportFrom))
+                node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
             ]
             mirror_path = str(self._mirror_path_for_real(real_path))
             module_result = result.module
 
             actions: list[CodeAction] = []
-            seen: set[tuple[str, tuple[tuple[str, int, int, int, int, str], ...]]] = (
-                set()
-            )
+            seen: set[tuple[str, tuple[tuple[str, SourceRange, str], ...]]] = set()
             for diagnostic in anchors:
-                import_node = _import_node_for_line(import_nodes, diagnostic.lineno)
+                assert diagnostic.range is not None
+                import_node = _import_node_for_line(import_nodes, diagnostic.range.start.line + 1)
                 if import_node is None:
                     continue
                 if diagnostic.code == "unused-import":
-                    built = self._unused_import_actions(
-                        real_path, source, import_node, diagnostic
-                    )
+                    built = self._unused_import_actions(real_path, source, import_node, diagnostic)
                 elif diagnostic.code == "missing-import":
                     built = self._missing_import_actions(
                         real_path, module_result, source, import_node, diagnostic
@@ -2235,10 +485,7 @@ class WorkspaceSession:
                         tuple(
                             (
                                 edit.path,
-                                edit.start_line,
-                                edit.start_character,
-                                edit.end_line,
-                                edit.end_character,
+                                edit.range,
                                 edit.new_text,
                             )
                             for edit in action.edits
@@ -2265,19 +512,16 @@ class WorkspaceSession:
             return [
                 CodeActionEdit(
                     path=importer_path,
-                    start_line=start_line,
-                    start_character=0,
-                    end_line=end_line,
-                    end_character=0,
+                    range=SourceRange(
+                        SourcePosition(start_line, 0),
+                        SourcePosition(end_line, 0),
+                    ),
                 )
             ]
         return [
             CodeActionEdit(
                 path=edit.path,
-                start_line=edit.start_line,
-                start_character=edit.start_character,
-                end_line=edit.end_line,
-                end_character=edit.end_character,
+                range=edit.range,
             )
             for edit in _alias_list_deletion_edits(
                 importer_path=importer_path,
@@ -2296,10 +540,10 @@ class WorkspaceSession:
         start_line, end_line = span
         return CodeActionEdit(
             path=importer_path,
-            start_line=start_line,
-            start_character=0,
-            end_line=end_line,
-            end_character=0,
+            range=SourceRange(
+                SourcePosition(start_line, 0),
+                SourcePosition(end_line, 0),
+            ),
         )
 
     def _unused_import_actions(
@@ -2318,8 +562,9 @@ class WorkspaceSession:
             (
                 i
                 for i, alias in enumerate(node.names)
-                if alias.lineno == diagnostic.lineno
-                and alias.col_offset == diagnostic.col_offset
+                if diagnostic.range is not None
+                and alias.lineno == diagnostic.range.start.line + 1
+                and alias.col_offset == diagnostic.range.start.character
             ),
             None,
         )
@@ -2358,7 +603,8 @@ class WorkspaceSession:
             missing_modules = {
                 resolved_import.module
                 for resolved_import in module_result.resolved_imports
-                if resolved_import.lineno == diagnostic.lineno
+                if diagnostic.range is not None
+                and resolved_import.range.start.line == diagnostic.range.start.line
                 and resolved_import.resolution == "missing"
             }
             dead_indices = [
@@ -2373,10 +619,7 @@ class WorkspaceSession:
                 edits = [
                     CodeActionEdit(
                         path=deletion.path,
-                        start_line=deletion.start_line,
-                        start_character=deletion.start_character,
-                        end_line=deletion.end_line,
-                        end_character=deletion.end_character,
+                        range=deletion.range,
                     )
                     for deletion in _alias_list_deletion_edits(
                         importer_path=importer_path,
@@ -2410,9 +653,7 @@ class WorkspaceSession:
         for i, alias in enumerate(node.names):
             if alias.name == "*":
                 continue
-            resolved = resolve_symbol(
-                self.db, self.mirror_root, mirror_path, alias.name
-            )
+            resolved = _resolve_target(self.db, self.mirror_root, mirror_path, alias.name)
             if resolved.resolution != "missing":
                 continue
             binding = alias.asname or alias.name
@@ -2462,10 +703,10 @@ class WorkspaceSession:
         line_idx, start_col, end_col = located
         edit = CodeActionEdit(
             path=importer_path,
-            start_line=line_idx,
-            start_character=start_col,
-            end_line=line_idx,
-            end_character=end_col,
+            range=SourceRange(
+                SourcePosition(line_idx, start_col),
+                SourcePosition(line_idx, end_col),
+            ),
             new_text=target_module,
         )
         return CodeAction(
@@ -2475,122 +716,253 @@ class WorkspaceSession:
             edits=(edit,),
         )
 
-    def resolve_symbol_reference(
+    def symbol_at(
         self,
         path: str | os.PathLike[str],
-        qualified_name: str,
-    ) -> ResolvedSymbol:
+        position: SourcePosition,
+    ) -> SymbolId | None:
         with self._state_lock:
             self._check_open()
             real_path = self._normalize_real_path(path)
             mirror_path = self._mirror_path_for_real(real_path)
             if not mirror_path.exists() or mirror_path.suffix != ".py":
                 raise FileNotFoundError(real_path)
-            resolved = resolve_symbol(
-                self.db, self.mirror_root, str(mirror_path), qualified_name
+            symbol_id = resolve_symbol_at(self.db, self.mirror_root, str(mirror_path), position)
+            if symbol_id is None:
+                return None
+            return SymbolId(
+                self._remap_path(symbol_id.path) or symbol_id.path,
+                symbol_id.scope_id,
+                symbol_id.name,
+                symbol_id.declaration,
             )
-            return self._remap_resolved_symbol(resolved)
+
+    def _resolved_target_at(
+        self,
+        mirror_path: Path,
+        position: SourcePosition,
+    ) -> ResolvedTarget | None:
+        lexical = scope_tree(self.db, str(mirror_path))
+        occurrence = lexical.occurrence_at(position)
+        if occurrence is None:
+            return None
+        if occurrence.receiver and occurrence.receiver not in {"self", "cls"}:
+            root_name = occurrence.receiver.split(".", 1)[0]
+            roots = [
+                item
+                for item in lexical.occurrences
+                if item.name == root_name
+                and item.range.end.line == occurrence.range.start.line
+                and item.range.end <= occurrence.range.start
+            ]
+            roots.sort(key=lambda item: item.range.end, reverse=True)
+            if not roots or roots[0].symbol_id is None:
+                return None
+            binding = next(
+                (item for item in lexical.bindings if item.symbol_id == roots[0].symbol_id),
+                None,
+            )
+            if binding is None:
+                return None
+            if (
+                binding.kind not in {"import_alias", "from_import_alias", "class"}
+                and binding.annotation is None
+            ):
+                return None
+            if any(
+                item.is_declaration
+                and item.symbol_id == binding.symbol_id
+                and binding.range.start < item.range.start < roots[0].range.start
+                for item in lexical.occurrences
+            ):
+                return None
+
+        symbol_id = resolve_symbol_at(
+            self.db,
+            self.mirror_root,
+            str(mirror_path),
+            position,
+        )
+        if symbol_id is not None:
+            return self._remap_resolved_target(
+                _target_from_symbol_id(self.db, self.mirror_root, symbol_id)
+            )
+        if occurrence.symbol_id is None:
+            return None
+        binding = next(
+            (item for item in lexical.bindings if item.symbol_id == occurrence.symbol_id),
+            None,
+        )
+        if binding is None or binding.kind != "from_import_alias":
+            return None
+        return self._remap_resolved_target(
+            _resolve_target(
+                self.db,
+                self.mirror_root,
+                str(mirror_path),
+                binding.name,
+            )
+        )
+
+    def _local_symbol_at(
+        self,
+        path: str | os.PathLike[str],
+        position: SourcePosition,
+    ) -> SymbolId | None:
+        real_path = self._normalize_real_path(path)
+        mirror_path = self._mirror_path_for_real(real_path)
+        if not mirror_path.exists() or mirror_path.suffix != ".py":
+            raise FileNotFoundError(real_path)
+        symbol_id = scope_tree(self.db, str(mirror_path)).symbol_at(position)
+        if symbol_id is None:
+            return None
+        return SymbolId(
+            self._remap_path(symbol_id.path) or symbol_id.path,
+            symbol_id.scope_id,
+            symbol_id.name,
+            symbol_id.declaration,
+        )
+
+    def _local_binding_at(
+        self,
+        path: str | os.PathLike[str],
+        position: SourcePosition,
+    ) -> Binding | None:
+        real_path = self._normalize_real_path(path)
+        mirror_path = self._mirror_path_for_real(real_path)
+        if not mirror_path.exists() or mirror_path.suffix != ".py":
+            raise FileNotFoundError(real_path)
+        tree = scope_tree(self.db, str(mirror_path))
+        symbol_id = tree.symbol_at(position)
+        if symbol_id is None:
+            return None
+        return next(
+            (binding for binding in tree.bindings if binding.symbol_id == symbol_id),
+            None,
+        )
 
     def find_references(
         self,
-        path: str | os.PathLike[str],
-        qualified_name: str,
+        symbol_id: SymbolId,
         *,
         include_declaration: bool = True,
     ) -> ReferenceQueryResult:
         with self._state_lock:
             self._check_open()
-            real_path = self._normalize_real_path(path)
-            mirror_path = self._mirror_path_for_real(real_path)
-            if not mirror_path.exists() or mirror_path.suffix != ".py":
-                raise FileNotFoundError(real_path)
+            target_path = self._mirror_path_for_real(self._normalize_real_path(symbol_id.path))
+            if not target_path.exists() or target_path.suffix != ".py":
+                raise FileNotFoundError(symbol_id.path)
+            mirror_target = SymbolId(
+                str(target_path),
+                symbol_id.scope_id,
+                symbol_id.name,
+                symbol_id.declaration,
+            )
             result = find_references(
                 self.db,
                 self.mirror_root,
-                str(mirror_path),
-                qualified_name,
+                mirror_target,
                 include_declaration=include_declaration,
             )
-            remapped_target = self._remap_resolved_symbol(result.target)
             remapped_refs = tuple(
                 Reference(
                     path=self._remap_path(ref.path) or ref.path,
-                    lineno=ref.lineno,
-                    col_offset=ref.col_offset,
-                    end_col_offset=ref.end_col_offset,
+                    range=ref.range,
                     is_declaration=ref.is_declaration,
                 )
                 for ref in result.references
             )
-            return ReferenceQueryResult(
-                target=remapped_target, references=remapped_refs
-            )
+            return ReferenceQueryResult(target=symbol_id, references=remapped_refs)
+
+    def _find_references_by_name(
+        self,
+        path: str | os.PathLike[str],
+        qualified_name: str,
+        *,
+        include_declaration: bool = True,
+    ) -> _ResolvedReferenceResult:
+        real_path = self._normalize_real_path(path)
+        mirror_path = self._mirror_path_for_real(real_path)
+        if not mirror_path.exists() or mirror_path.suffix != ".py":
+            raise FileNotFoundError(real_path)
+        resolved = _resolve_target(
+            self.db,
+            self.mirror_root,
+            str(mirror_path),
+            qualified_name,
+        )
+        remapped_target = self._remap_resolved_target(resolved)
+        symbol_id = self._symbol_id_for_resolved(resolved)
+        if symbol_id is None:
+            return _ResolvedReferenceResult(target=remapped_target, references=())
+        real_symbol_id = SymbolId(
+            self._remap_path(symbol_id.path) or symbol_id.path,
+            symbol_id.scope_id,
+            symbol_id.name,
+            symbol_id.declaration,
+        )
+        result = self.find_references(
+            real_symbol_id,
+            include_declaration=include_declaration,
+        )
+        return _ResolvedReferenceResult(
+            target=remapped_target,
+            references=result.references,
+        )
+
+    def _symbol_id_for_resolved(self, resolved: ResolvedTarget) -> SymbolId | None:
+        if (
+            resolved.resolution != "workspace"
+            or resolved.defining_path is None
+            or resolved.range is None
+        ):
+            return None
+        return resolve_symbol_at(
+            self.db,
+            self.mirror_root,
+            resolved.defining_path,
+            resolved.range.start,
+        )
 
     def find_document_highlights(
         self,
         path: str | os.PathLike[str],
-        qualified_name: str,
+        symbol_id: SymbolId,
     ) -> tuple[DocumentHighlight, ...]:
-        bare_name = qualified_name.rsplit(".", 1)[-1]
         with self._state_lock:
             self._check_open()
             real_path = self._normalize_real_path(path)
             mirror_path = self._mirror_path_for_real(real_path)
             if not mirror_path.exists() or mirror_path.suffix != ".py":
                 raise FileNotFoundError(real_path)
-            result = find_references(
-                self.db,
-                self.mirror_root,
-                str(mirror_path),
-                qualified_name,
-                include_declaration=True,
-            )
-            if result.target.resolution != "workspace":
-                return ()
+            result = self.find_references(symbol_id, include_declaration=True)
             highlights: list[DocumentHighlight] = []
-            seen: set[tuple[int, int, int]] = set()
+            seen: set[SourceRange] = set()
             for ref in result.references:
                 ref_real_path = self._remap_path(ref.path) or ref.path
                 if ref_real_path != real_path:
                     continue
-                col, end_col = ref.col_offset, ref.end_col_offset
-                if ref.is_declaration and col == 0 and end_col == 1:
-                    located = self._locate_def_class_name_offsets(
-                        ref_real_path, ref.lineno, bare_name
-                    )
-                    if located is None:
-                        continue
-                    col, end_col = located
-                key = (ref.lineno, col, end_col)
-                if key in seen:
+                source_range = ref.range
+                if source_range in seen:
                     continue
-                seen.add(key)
+                seen.add(source_range)
                 kind: DocumentHighlightKind = "write" if ref.is_declaration else "text"
                 highlights.append(
                     DocumentHighlight(
-                        lineno=ref.lineno,
-                        col_offset=col,
-                        end_col_offset=end_col,
+                        range=source_range,
                         kind=kind,
                     )
                 )
-            highlights.sort(key=lambda h: (h.lineno, h.col_offset))
+            highlights.sort(key=lambda highlight: highlight.range.start)
             return tuple(highlights)
 
     def linked_editing_ranges_at(
         self,
         path: str | os.PathLike[str],
-        qualified_name: str,
+        symbol_id: SymbolId,
     ) -> tuple[LinkedEditingRange, ...]:
-        highlights = self.find_document_highlights(path, qualified_name)
-        return tuple(
-            LinkedEditingRange(
-                lineno=highlight.lineno,
-                col_offset=highlight.col_offset,
-                end_col_offset=highlight.end_col_offset,
-            )
-            for highlight in highlights
-        )
+        highlights = self.find_document_highlights(path, symbol_id)
+        return tuple(LinkedEditingRange(range=highlight.range) for highlight in highlights)
 
     def signature_help_at(
         self,
@@ -2610,20 +982,10 @@ class WorkspaceSession:
             located = _find_call_at_position(source, line, character)
             if located is None:
                 return None
-            function_name, active_index = located
-            if "." in function_name:
-                # ``M.foo(`` — resolve the LHS to a workspace module, then the
-                # attribute within it (the shared bare-Name-LHS idiom).
-                lhs, _, attr = function_name.partition(".")
-                resolved = self._resolve_attr_on_module(mirror_path, lhs, attr)
-                if resolved is None:
-                    return None
-            else:
-                resolved = self._remap_resolved_symbol(
-                    resolve_symbol(
-                        self.db, self.mirror_root, str(mirror_path), function_name
-                    )
-                )
+            _function_name, active_index, function_position = located
+            resolved = self._resolved_target_at(mirror_path, function_position)
+            if resolved is None:
+                return None
             if resolved.resolution != "workspace":
                 return None
             callable_info = self._lookup_callable_signature(resolved)
@@ -2631,12 +993,8 @@ class WorkspaceSession:
                 return None
             display_name, signature = callable_info
             defaults = self._signature_defaults(resolved, display_name)
-            label, parameters = _build_signature_label(
-                display_name, signature, defaults
-            )
-            active_parameter = (
-                active_index if 0 <= active_index < len(parameters) else None
-            )
+            label, parameters = _build_signature_label(display_name, signature, defaults)
+            active_parameter = active_index if 0 <= active_index < len(parameters) else None
             return SignatureHelp(
                 label=label,
                 parameters=parameters,
@@ -2677,7 +1035,11 @@ class WorkspaceSession:
                 # usually the only broken part, so analyse a repaired copy.
                 with self._repaired_current_file(mirror_path, source, line) as ok:
                     if ok:
-                        items += self._local_symbol_completions(mirror_path, prefix)
+                        items += self._local_symbol_completions(
+                            mirror_path,
+                            prefix,
+                            SourcePosition(line, character),
+                        )
                 items += self._workspace_module_completions(prefix, full=False)
                 items += _keyword_completions(prefix)
             elif kind == "attribute":
@@ -2689,14 +1051,35 @@ class WorkspaceSession:
                                 mirror_path, source, line, owner, prefix
                             )
                         else:
-                            items += self._attribute_completions(
-                                mirror_path, owner, prefix
+                            binding = self._visible_binding(
+                                mirror_path,
+                                owner.split(".", 1)[0],
+                                SourcePosition(line, character),
                             )
-                            # Rule A: a single-component owner that the
-                            # resolve_symbol path could not turn into a
-                            # module/class may still be a locally annotated
-                            # name — follow its annotation to a workspace class.
-                            if not items and "." not in owner:
+                            if (
+                                binding is not None
+                                and binding.kind != "variable"
+                                and self._binding_is_rebound(
+                                    mirror_path,
+                                    binding,
+                                    SourcePosition(line, character),
+                                )
+                            ):
+                                binding = None
+                            if binding is not None and binding.kind in (
+                                "import_alias",
+                                "from_import_alias",
+                                "class",
+                            ):
+                                items += self._attribute_completions(
+                                    mirror_path, owner, prefix, binding
+                                )
+                            if (
+                                not items
+                                and "." not in owner
+                                and binding is not None
+                                and binding.annotation is not None
+                            ):
                                 items += self._annotated_name_completions(
                                     mirror_path, source, line, owner, prefix
                                 )
@@ -2707,16 +1090,14 @@ class WorkspaceSession:
                 prefix = context[1]
                 items += self._workspace_module_completions(prefix, full=True)
 
-            deduped: dict[tuple[str, str], CompletionItem] = {}
+            deduped: dict[str, CompletionItem] = {}
             for item in items:
-                deduped.setdefault((item.label, item.kind), item)
+                deduped.setdefault(item.label, item)
             ordered = sorted(deduped.values(), key=lambda c: (c.sort_text, c.label))
             return tuple(ordered[:_COMPLETION_LIMIT])
 
     @contextlib.contextmanager
-    def _repaired_current_file(
-        self, mirror_path: Path, original: str, line: int
-    ) -> Iterator[bool]:
+    def _repaired_current_file(self, mirror_path: Path, original: str, line: int) -> Iterator[bool]:
         """Temporarily write a caret-line-repaired copy of the current file to
         the mirror so symbol-table and resolution queries can run against a
         parseable buffer, then restore the exact original bytes.
@@ -2732,11 +1113,11 @@ class WorkspaceSession:
         if not _source_parses(repaired):
             yield False
             return
-        mirror_path.write_text(repaired, encoding="utf-8")
+        mirror_path.write_bytes(_encode_python_text(repaired))
         try:
             yield True
         finally:
-            mirror_path.write_text(original, encoding="utf-8")
+            mirror_path.write_bytes(_encode_python_text(original))
 
     def _symbol_completion_item(
         self, label: str, symbol: Symbol, sort_group: str
@@ -2754,13 +1135,51 @@ class WorkspaceSession:
         )
 
     def _local_symbol_completions(
-        self, mirror_path: Path, prefix: str
+        self,
+        mirror_path: Path,
+        prefix: str,
+        position: SourcePosition,
     ) -> list[CompletionItem]:
+        lexical = scope_tree(self.db, str(mirror_path))
+        scope = self._innermost_scope(lexical, position)
+        visible: dict[str, Binding] = {}
+        while scope is not None:
+            for binding in lexical.bindings:
+                if binding.scope_id == scope.id:
+                    visible.setdefault(binding.name, binding)
+            scope = next(
+                (item for item in lexical.scopes if item.id == scope.parent_id),
+                None,
+            )
+
         table = module_symbol_table(self.db, self.mirror_root, str(mirror_path))
         items: list[CompletionItem] = []
+        seen: set[str] = set()
+        symbols_by_range = {
+            (symbol.qualified_name.rsplit(".", 1)[-1], symbol.range): symbol
+            for symbol in table.symbols
+        }
+        for name, binding in visible.items():
+            if not name.startswith(prefix):
+                continue
+            symbol = symbols_by_range.get((name, binding.range))
+            if symbol is not None:
+                item = self._symbol_completion_item(name, symbol, sort_group="0")
+            else:
+                kind = _BINDING_TO_COMPLETION_KIND[binding.kind]
+                detail = f"{name}: {binding.annotation}" if binding.annotation else None
+                item = CompletionItem(
+                    label=name,
+                    kind=kind,
+                    detail=detail,
+                    sort_text=f"0{name}",
+                )
+            if item is not None:
+                items.append(item)
+                seen.add(name)
         for symbol in table.symbols:
             name = symbol.qualified_name
-            if "." in name:  # module-level bindings only
+            if "." in name or name in seen:  # module-level bindings only
                 continue
             if not name.startswith(prefix):
                 continue
@@ -2769,9 +1188,62 @@ class WorkspaceSession:
                 items.append(item)
         return items
 
-    def _workspace_module_completions(
-        self, prefix: str, *, full: bool
-    ) -> list[CompletionItem]:
+    def _innermost_scope(
+        self,
+        lexical: ScopeTree,
+        position: SourcePosition,
+    ) -> Scope | None:
+        scopes = lexical.scopes
+        candidates = [scope for scope in scopes if scope.range.contains(position, include_end=True)]
+        candidates.sort(
+            key=lambda scope: (
+                scope.range.end.line - scope.range.start.line,
+                scope.range.end.character - scope.range.start.character,
+            )
+        )
+        return candidates[0] if candidates else None
+
+    def _visible_binding(
+        self,
+        mirror_path: Path,
+        name: str,
+        position: SourcePosition,
+    ) -> Binding | None:
+        lexical = scope_tree(self.db, str(mirror_path))
+        scope = self._innermost_scope(lexical, position)
+        while scope is not None:
+            binding = next(
+                (
+                    item
+                    for item in lexical.bindings
+                    if item.scope_id == scope.id and item.name == name
+                ),
+                None,
+            )
+            if binding is not None:
+                return binding
+            scope = next(
+                (item for item in lexical.scopes if item.id == scope.parent_id),
+                None,
+            )
+        return None
+
+    def _binding_is_rebound(
+        self,
+        mirror_path: Path,
+        binding: Binding,
+        position: SourcePosition,
+    ) -> bool:
+        lexical = scope_tree(self.db, str(mirror_path))
+        return any(
+            occurrence.is_declaration
+            and occurrence.symbol_id == binding.symbol_id
+            and occurrence.range != binding.range
+            and occurrence.range.start <= position
+            for occurrence in lexical.occurrences
+        )
+
+    def _workspace_module_completions(self, prefix: str, *, full: bool) -> list[CompletionItem]:
         index = workspace_symbol_index(self.db, self.mirror_root)
         modules = {entry.module for entry in index.entries}
         # ``full`` offers dotted module names (import position); otherwise the
@@ -2781,15 +1253,11 @@ class WorkspaceSession:
         for name in names:
             if name and name.startswith(prefix):
                 items.append(
-                    CompletionItem(
-                        label=name, kind="module", detail=None, sort_text=f"2{name}"
-                    )
+                    CompletionItem(label=name, kind="module", detail=None, sort_text=f"2{name}")
                 )
         return items
 
-    def _module_member_completions(
-        self, module: str, prefix: str
-    ) -> list[CompletionItem]:
+    def _module_member_completions(self, module: str, prefix: str) -> list[CompletionItem]:
         """Top-level names of a workspace ``module`` (for ``from M import ...``)."""
         index = workspace_symbol_index(self.db, self.mirror_root)
         items: list[CompletionItem] = []
@@ -2800,42 +1268,51 @@ class WorkspaceSession:
             if "." in name or not name.startswith(prefix):
                 continue
             kind = _SYMBOL_TO_COMPLETION_KIND.get(entry.kind, "variable")
-            detail = (
-                f"{name}: {entry.annotation}" if entry.annotation else None
-            )
-            items.append(
-                CompletionItem(
-                    label=name, kind=kind, detail=detail, sort_text=f"0{name}"
-                )
-            )
+            detail = f"{name}: {entry.annotation}" if entry.annotation else None
+            items.append(CompletionItem(label=name, kind=kind, detail=detail, sort_text=f"0{name}"))
         return items
 
     def _attribute_completions(
-        self, mirror_path: Path, owner: str, prefix: str
+        self,
+        mirror_path: Path,
+        owner: str,
+        prefix: str,
+        binding: Binding,
     ) -> list[CompletionItem]:
         """Members of ``owner`` when it resolves to a workspace module or class.
 
-        A single-component ``owner`` (``M.``) keeps the ``resolve_symbol`` path.
+        A single-component ``owner`` (``M.``) keeps the shared public resolver path.
         A dotted ``owner`` is handled longest-match-first: the whole owner as a
         workspace module (``pkg.sub.``), else ``head.Class`` where ``head`` is a
         workspace module and ``Class`` a class in it (``pkg.sub.C.``, ``M.C.``).
         Instance chains (``obj.attr.``) resolve to nothing — no type inference.
         """
         if "." in owner:
-            return self._dotted_owner_completions(mirror_path, owner, prefix)
+            return self._dotted_owner_completions(mirror_path, owner, prefix, binding)
         return self._bare_owner_completions(mirror_path, owner, prefix)
 
     def _dotted_owner_completions(
-        self, mirror_path: Path, owner: str, prefix: str
+        self,
+        mirror_path: Path,
+        owner: str,
+        prefix: str,
+        binding: Binding,
     ) -> list[CompletionItem]:
         # Rule 1: the dotted owner is itself a workspace module.
         if self._is_workspace_module(owner):
+            imported = binding.import_source
+            if imported is None or (imported != owner and not imported.startswith(f"{owner}.")):
+                return []
             return self._module_member_completions(owner, prefix)
         # Rule 2: ``head.Class`` — head is a workspace module, Class a class in it.
         head, _, last = owner.rpartition(".")
         module = self._resolve_owner_module(mirror_path, head)
         if module is None:
             return []
+        if binding.kind == "import_alias":
+            imported = binding.import_source
+            if imported is None or (imported != module and not imported.startswith(f"{module}.")):
+                return []
         return self._class_member_completions_from_index(module, last, prefix)
 
     def _is_workspace_module(self, name: str) -> bool:
@@ -2846,25 +1323,23 @@ class WorkspaceSession:
         index = workspace_symbol_index(self.db, self.mirror_root)
         return any(entry.module == name for entry in index.entries)
 
-    def _resolve_owner_module(
-        self, mirror_path: Path, owner: str
-    ) -> str | None:
+    def _resolve_owner_module(self, mirror_path: Path, owner: str) -> str | None:
         """The workspace module `owner` denotes, or ``None``.
 
         A dotted `owner` matches a module by exact index name; a single bare
-        name is resolved through the file's imports (``resolve_symbol``) and
-        accepted only when it lands on a workspace *module* (no ``defining_lineno``
-        — a specific symbol line would mean a class / function / variable)."""
+        name is resolved through the file's imports (the shared public resolver) and
+        accepted only when it lands on a workspace *module* (no source range —
+        a specific symbol range would mean a class / function / variable)."""
         if self._is_workspace_module(owner):
             return owner
         if "." in owner:
             return None
-        resolved = self._remap_resolved_symbol(
-            resolve_symbol(self.db, self.mirror_root, str(mirror_path), owner)
+        resolved = self._remap_resolved_target(
+            _resolve_target(self.db, self.mirror_root, str(mirror_path), owner)
         )
         if (
             resolved.resolution == "workspace"
-            and resolved.defining_lineno is None
+            and resolved.range is None
             and resolved.defining_module is not None
             and self._is_workspace_module(resolved.defining_module)
         ):
@@ -2896,18 +1371,16 @@ class WorkspaceSession:
             kind = _SYMBOL_TO_COMPLETION_KIND.get(entry.kind, "variable")
             detail = f"{member}: {entry.annotation}" if entry.annotation else None
             items.append(
-                CompletionItem(
-                    label=member, kind=kind, detail=detail, sort_text=f"0{member}"
-                )
+                CompletionItem(label=member, kind=kind, detail=detail, sort_text=f"0{member}")
             )
         return items if is_class else []
 
     def _bare_owner_completions(
         self, mirror_path: Path, owner: str, prefix: str
     ) -> list[CompletionItem]:
-        """Members of a single bare-name ``owner`` via ``resolve_symbol``."""
-        resolved = self._remap_resolved_symbol(
-            resolve_symbol(self.db, self.mirror_root, str(mirror_path), owner)
+        """Members of a single bare-name ``owner`` via the shared public resolver."""
+        resolved = self._remap_resolved_target(
+            _resolve_target(self.db, self.mirror_root, str(mirror_path), owner)
         )
         if resolved.resolution != "workspace" or resolved.defining_path is None:
             return []
@@ -2920,8 +1393,7 @@ class WorkspaceSession:
             (
                 symbol
                 for symbol in table.symbols
-                if symbol.qualified_name == owner_bare
-                and "." not in symbol.qualified_name
+                if symbol.qualified_name == owner_bare and "." not in symbol.qualified_name
             ),
             None,
         )
@@ -2943,14 +1415,10 @@ class WorkspaceSession:
             # `class_model` surface, so `Derived.` sees members from workspace
             # bases just like `self.`/`cls.`/annotated-name completion do.
             model = self._remap_class_model(
-                class_model(
-                    self.db, self.mirror_root, str(defining_mirror), owner_bare
-                )
+                class_model(self.db, self.mirror_root, str(defining_mirror), owner_bare)
             )
             for member in model.members:
-                if member.kind not in _CLASS_MEMBER_KINDS or not member.name.startswith(
-                    prefix
-                ):
+                if member.kind not in _CLASS_MEMBER_KINDS or not member.name.startswith(prefix):
                     continue
                 items.append(self._class_member_completion_item(member))
             return items
@@ -2972,11 +1440,9 @@ class WorkspaceSession:
         (``self`` → instance view, ``cls`` → class view). The declaration-only
         member set comes from the ``class_model`` integration surface — no type
         inference, own members only (Stage 1)."""
-        parse_source = source if _source_parses(source) else _repair_caret_line(
-            source, line
-        )
+        parse_source = source if _source_parses(source) else _repair_caret_line(source, line)
         try:
-            tree = ast.parse(parse_source)
+            tree = _parse_python(parse_source)
         except SyntaxError:
             return []
         context = _enclosing_method_context(tree, line + 1)
@@ -3022,18 +1488,16 @@ class WorkspaceSession:
         """Rule A — instance-view completions for a bare, annotated ``owner``.
 
         Applies when ``owner`` is neither ``self``/``cls`` nor resolvable by the
-        ``resolve_symbol`` attribute path: its declared annotation is followed to
+        shared public resolver attribute path: its declared annotation is followed to
         a workspace class and that class's instance view (methods + class vars +
         instance vars, via ``class_model``) is offered. The declaration is looked
         up on the caret-line-repaired current buffer only — see
         :func:`_annotation_expr_for_name_at` — falling back to the module-level
         ``variable`` symbol's annotation. No type inference: only the annotation
         shapes accepted by :meth:`_workspace_class_from_annotation` resolve."""
-        parse_source = (
-            source if _source_parses(source) else _repair_caret_line(source, line)
-        )
+        parse_source = source if _source_parses(source) else _repair_caret_line(source, line)
         try:
-            tree = ast.parse(parse_source)
+            tree = _parse_python(parse_source)
         except SyntaxError:
             return []
         expr = _annotation_expr_for_name_at(tree, line + 1, owner)
@@ -3059,16 +1523,12 @@ class WorkspaceSession:
         )
         items: list[CompletionItem] = []
         for member in model.members:
-            if member.kind not in _INSTANCE_MEMBER_KINDS or not member.name.startswith(
-                prefix
-            ):
+            if member.kind not in _INSTANCE_MEMBER_KINDS or not member.name.startswith(prefix):
                 continue
             items.append(self._class_member_completion_item(member))
         return items
 
-    def _module_variable_annotation(
-        self, mirror_path: Path, name: str
-    ) -> str | None:
+    def _module_variable_annotation(self, mirror_path: Path, name: str) -> str | None:
         """Annotation text of the module-level ``variable`` symbol ``name`` in
         the current file, or ``None`` — Rule A's priority-3 declaration lookup."""
         table = module_symbol_table(self.db, self.mirror_root, str(mirror_path))
@@ -3084,7 +1544,7 @@ class WorkspaceSession:
 
     def _workspace_class_from_annotation(
         self, mirror_path: Path, annotation_text: str
-    ) -> ResolvedSymbol | None:
+    ) -> ResolvedTarget | None:
         """Resolve ``annotation_text`` to a verified workspace ``class`` symbol.
 
         Accepts a bare ``Name`` (``Foo``) or a one-hop ``Attribute`` of a bare
@@ -3097,12 +1557,12 @@ class WorkspaceSession:
         file's table by the ``(lineno, qualified_name, kind == "class")`` check
         (the ``prepare_type_hierarchy`` idiom); anything else returns ``None``."""
         try:
-            body: ast.expr = ast.parse(annotation_text, mode="eval").body
+            body: ast.expr = _parse_python(annotation_text, mode="eval").body
         except SyntaxError:
             return None
         if isinstance(body, ast.Constant) and isinstance(body.value, str):
             try:
-                body = ast.parse(body.value, mode="eval").body
+                body = _parse_python(body.value, mode="eval").body
             except SyntaxError:
                 return None
         if isinstance(body, ast.Name):
@@ -3116,21 +1576,15 @@ class WorkspaceSession:
             resolved is None
             or resolved.resolution != "workspace"
             or resolved.defining_path is None
-            or resolved.defining_lineno is None
+            or resolved.range is None
         ):
             return None
         defining_mirror = self._mirror_path_for_real(resolved.defining_path)
         if not defining_mirror.exists() or defining_mirror.suffix != ".py":
             return None
-        defining_table = module_symbol_table(
-            self.db, self.mirror_root, str(defining_mirror)
-        )
+        defining_table = module_symbol_table(self.db, self.mirror_root, str(defining_mirror))
         for symbol in defining_table.symbols:
-            if (
-                symbol.lineno == resolved.defining_lineno
-                and symbol.qualified_name == resolved.qualified_name
-                and symbol.kind == "class"
-            ):
+            if symbol.qualified_name == resolved.qualified_name and symbol.kind == "class":
                 return resolved
         return None
 
@@ -3215,33 +1669,35 @@ class WorkspaceSession:
                 if "." in symbol.qualified_name:
                     continue
                 located = self._locate_def_class_name_offsets(
-                    real_path, symbol.lineno, symbol.qualified_name
+                    real_path,
+                    symbol.range.start.line + 1,
+                    symbol.qualified_name,
                 )
                 if located is None:
                     continue
                 start_col, end_col = located
-                result = find_references(
-                    self.db,
-                    self.mirror_root,
-                    str(mirror_path),
+                result = self._find_references_by_name(
+                    real_path,
                     symbol.qualified_name,
                     include_declaration=False,
                 )
-                if result.target.resolution != "workspace":
+                if (
+                    not isinstance(result.target, ResolvedTarget)
+                    or result.target.resolution != "workspace"
+                ):
                     continue
                 count = len(result.references)
                 title = f"{count} reference" if count == 1 else f"{count} references"
-                line_zero = max(symbol.lineno - 1, 0)
                 lenses.append(
                     CodeLens(
-                        start_line=line_zero,
-                        start_character=start_col,
-                        end_line=line_zero,
-                        end_character=end_col,
+                        range=SourceRange(
+                            SourcePosition(symbol.range.start.line, start_col),
+                            SourcePosition(symbol.range.start.line, end_col),
+                        ),
                         title=title,
                     )
                 )
-            lenses.sort(key=lambda lens: (lens.start_line, lens.start_character))
+            lenses.sort(key=lambda lens: lens.range.start)
             return tuple(lenses)
 
     def inlay_hints_for_file(
@@ -3273,10 +1729,10 @@ class WorkspaceSession:
         parameters are silently skipped since they cannot receive a
         positional argument.
 
-        Targets resolved as stdlib / installed / ambiguous / missing, calls
-        whose callee shape is not a bare ``Name`` or ``Name.attr`` (e.g.
-        ``factory[T](...)``, ``pkg.subpkg.foo(...)``, ``self.method(...)``,
-        ``lambda x: x(...)``), and files that fail to parse return ``()``.
+        Targets resolved as stdlib / installed / ambiguous / missing,
+        unproven or rebound receiver chains, subscripted calls
+        (``factory[T](...)``), lambda calls, and files that fail to parse
+        return ``()``.
         """
         with self._state_lock:
             self._check_open()
@@ -3288,7 +1744,7 @@ class WorkspaceSession:
             if source is None:
                 return ()
             try:
-                tree = ast.parse(source)
+                tree = _parse_python(source)
             except SyntaxError:
                 return ()
 
@@ -3315,10 +1771,7 @@ class WorkspaceSession:
                     continue
                 if range_end_line is not None and (
                     func_start_line > range_end_line
-                    or (
-                        func_start_line == range_end_line
-                        and func_start_col >= end_character
-                    )
+                    or (func_start_line == range_end_line and func_start_col >= end_character)
                 ):
                     continue
                 target = self._resolve_call_target(mirror_path, call.func)
@@ -3328,10 +1781,8 @@ class WorkspaceSession:
                 if callable_info is None:
                     continue
                 _display, signature = callable_info
-                hints.extend(
-                    _inlay_hints_for_call(call, signature.parameters)
-                )
-            hints.sort(key=lambda hint: (hint.line, hint.character))
+                hints.extend(_inlay_hints_for_call(call, signature.parameters))
+            hints.sort(key=lambda hint: hint.position)
             return tuple(hints)
 
     def semantic_tokens_for_file(
@@ -3349,15 +1800,11 @@ class WorkspaceSession:
           ``"declaration"``.
         - Each function parameter (posonly / positional / vararg / kwonly /
           kwarg) — token type ``"parameter"``, modifier ``"declaration"``.
-        - Each bare ``ast.Name`` use (Load context) whose identifier matches
-          a top-level entry in the file's ``ModuleSymbolTable``. The token
-          type follows the matched symbol's kind: ``function``,
-          ``method`` (already qualified entries are skipped),
-          ``class``, ``variable`` / ``class_variable`` → ``"variable"``, and
-          ``import_alias`` → ``"namespace"``. ``from_import_alias`` and
-          ``wildcard_import_stub`` entries are skipped (resolving them to
-          their real kind would require cross-module hops; the editor's
-          default highlighting handles them).
+        - Each resolved bare ``ast.Name`` use (Load context). Local bindings
+          are classified through the shared lexical scope tree, so parameters
+          and local variables that shadow module bindings retain their local
+          token kind. Module-level uses fall back to the symbol table's kind.
+          Attribute uses and unresolved cross-module re-exports are skipped.
 
         Tokens are sorted by ``(line, character)`` with ``line`` /
         ``character`` 0-based (LSP-style). Files that fail to parse,
@@ -3365,10 +1812,6 @@ class WorkspaceSession:
         for the missing-file case and return ``()`` for the unparseable
         case.
 
-        Function-local shadowing is not modeled (a local ``foo`` inside a
-        function that shadows a top-level ``foo`` is still reported as the
-        top-level kind), mirroring the documented ``find_references``
-        limitation.
         """
         with self._state_lock:
             self._check_open()
@@ -3382,7 +1825,8 @@ class WorkspaceSession:
             table = self._remap_module_symbol_table(
                 module_symbol_table(self.db, self.mirror_root, str(mirror_path))
             )
-            return _compute_semantic_tokens(source, table)
+            lexical = scope_tree(self.db, str(mirror_path))
+            return _compute_semantic_tokens(source, table, lexical)
 
     def semantic_tokens_range_for_file(
         self,
@@ -3413,180 +1857,148 @@ class WorkspaceSession:
         if start_line == 0 and start_character == 0 and end_line is None:
             return all_tokens
         filtered: list[SemanticToken] = []
+        start = SourcePosition(start_line, start_character)
+        end = SourcePosition(end_line, end_character) if end_line is not None else None
         for token in all_tokens:
-            if token.line < start_line or (
-                token.line == start_line and token.character < start_character
-            ):
+            if token.range.start < start:
                 continue
-            if end_line is not None and (
-                token.line > end_line
-                or (token.line == end_line and token.character >= end_character)
-            ):
+            if end is not None and token.range.start >= end:
                 continue
             filtered.append(token)
         return tuple(filtered)
 
     def type_definitions_at(
         self,
-        path: str | os.PathLike[str],
-        qualified_name: str,
+        symbol_id: SymbolId,
     ) -> tuple[TypeDefinitionLocation, ...]:
-        """Resolve the type-definition locations of the symbol named `qualified_name`.
+        """Resolve the type-definition locations for ``symbol_id``.
 
-        Resolves `qualified_name` against `path`'s imports to find the symbol's
-        declaration, reads the declared annotation (variable / class-variable
-        annotation, or function / method return annotation), parses it as a
-        Python expression, and resolves the contained type names against the
-        declaration's defining module. Returns one
-        `TypeDefinitionLocation(path, lineno, col_offset, end_col_offset)` per
-        workspace-resolved type, deduplicated by `(path, lineno)`.
+        Reads the lexical binding's declared annotation (or a module-level
+        function's return annotation), parses it as a Python expression, and
+        resolves the contained type names against the declaration's module. Returns one
+        `TypeDefinitionLocation(path, range)` per workspace-resolved type,
+        deduplicated by path and range.
 
         Classes are themselves the type — clicking on a class name returns its
-        own definition location. Import aliases, `from_import` aliases,
-        wildcard-import stubs, parameters, and non-workspace targets return an
-        empty tuple. Whole-string forward references (`x: "Foo"`,
+        own definition location. Annotated lexical bindings, including
+        parameters, resolve their declared types. Import aliases, `from_import`
+        aliases, wildcard-import stubs, unannotated bindings, and non-workspace
+        targets return an empty tuple. Whole-string forward references (`x: "Foo"`,
         `def f() -> "Foo"`) are unwrapped and re-parsed once; partial string
         annotations (`x: "Foo" | None`) and stdlib / installed / ambiguous type
         names are skipped.
         """
         with self._state_lock:
             self._check_open()
-            real_path = self._normalize_real_path(path)
+            real_path = self._normalize_real_path(symbol_id.path)
             mirror_path = self._mirror_path_for_real(real_path)
             if not mirror_path.exists() or mirror_path.suffix != ".py":
                 raise FileNotFoundError(real_path)
-            resolved = self._remap_resolved_symbol(
-                resolve_symbol(
-                    self.db, self.mirror_root, str(mirror_path), qualified_name
-                )
+            lexical = scope_tree(self.db, str(mirror_path))
+            binding = next(
+                (
+                    item
+                    for item in lexical.bindings
+                    if item.symbol_id.scope_id == symbol_id.scope_id
+                    and item.name == symbol_id.name
+                    and item.range == symbol_id.declaration
+                ),
+                None,
             )
-            if resolved.resolution != "workspace":
+            if binding is None:
                 return ()
-            if resolved.defining_path is None or resolved.defining_lineno is None:
-                return ()
-            defining_mirror = self._mirror_path_for_real(resolved.defining_path)
-            if not defining_mirror.exists() or defining_mirror.suffix != ".py":
-                return ()
-            defining_table = module_symbol_table(
-                self.db, self.mirror_root, str(defining_mirror)
-            )
-            matched: Symbol | None = None
-            for symbol in defining_table.symbols:
-                if (
-                    symbol.lineno == resolved.defining_lineno
-                    and "." not in symbol.qualified_name
-                ):
-                    matched = symbol
-                    break
-            if matched is None:
-                return ()
-            if matched.kind == "class":
+            if binding.kind == "class":
                 return (
                     TypeDefinitionLocation(
-                        path=resolved.defining_path,
-                        lineno=resolved.defining_lineno,
-                        col_offset=0,
-                        end_col_offset=1,
+                        path=real_path,
+                        range=symbol_id.declaration,
                     ),
                 )
-            if matched.kind in ("function", "method"):
+            annotation = binding.annotation
+            if binding.kind == "function":
+                defining_table = module_symbol_table(self.db, self.mirror_root, str(mirror_path))
+                matched = next(
+                    (
+                        symbol
+                        for symbol in defining_table.symbols
+                        if symbol.qualified_name.rsplit(".", 1)[-1] == binding.name
+                        and symbol.range == binding.range
+                    ),
+                    None,
+                )
                 annotation = (
                     matched.signature.return_annotation
-                    if matched.signature is not None
+                    if matched is not None and matched.signature is not None
                     else None
                 )
-            elif matched.kind in ("variable", "class_variable"):
-                annotation = matched.annotation
-            else:
-                return ()
             if annotation is None:
                 return ()
-            type_refs = _collect_annotation_type_refs(annotation)
-            locations: list[TypeDefinitionLocation] = []
-            seen: set[tuple[str, int]] = set()
-            for ref in type_refs:
-                type_resolved = self._resolve_annotation_type_ref(
-                    defining_mirror, ref
+            source = self.source_text(real_path)
+            positions = (
+                _annotation_type_positions(
+                    source,
+                    binding.name,
+                    binding.kind,
+                    binding.range,
                 )
-                if type_resolved is None:
-                    continue
+                if source is not None
+                else ()
+            )
+            resolved_types: list[ResolvedTarget] = []
+            for position in positions:
+                resolved = self._resolved_target_at(mirror_path, position)
+                if resolved is not None:
+                    resolved_types.append(resolved)
+            if not positions:
+                for ref in _collect_annotation_type_refs(annotation):
+                    resolved = self._resolve_annotation_type_ref(mirror_path, ref)
+                    if resolved is not None:
+                        resolved_types.append(resolved)
+            locations: list[TypeDefinitionLocation] = []
+            seen: set[tuple[str, SourceRange]] = set()
+            for type_resolved in resolved_types:
                 if (
                     type_resolved.resolution != "workspace"
                     or type_resolved.defining_path is None
-                    or type_resolved.defining_lineno is None
+                    or type_resolved.range is None
                 ):
                     continue
-                key = (type_resolved.defining_path, type_resolved.defining_lineno)
+                key = (type_resolved.defining_path, type_resolved.range)
                 if key in seen:
                     continue
                 seen.add(key)
                 locations.append(
                     TypeDefinitionLocation(
                         path=type_resolved.defining_path,
-                        lineno=type_resolved.defining_lineno,
-                        col_offset=0,
-                        end_col_offset=1,
+                        range=type_resolved.range,
                     )
                 )
             return tuple(locations)
 
     def declaration_location_at(
         self,
-        path: str | os.PathLike[str],
-        qualified_name: str,
+        symbol_id: SymbolId,
     ) -> DeclarationLocation | None:
-        """Return the in-file declaration location of ``qualified_name``.
+        """Return the exact declaration of an already-resolved lexical ID."""
 
-        Looks up ``qualified_name`` in ``path``'s
-        :class:`ModuleSymbolTable` (an exact ``qualified_name`` match wins
-        over a bare-name match against the last dotted component) and
-        returns a :class:`DeclarationLocation` pointing at the binding
-        statement in ``path``. The location's ``col_offset`` /
-        ``end_col_offset`` span the bare-name identifier on the binding's
-        header line; if the identifier cannot be located on that line, the
-        offsets fall back to ``(0, 1)``.
-
-        Distinct from ``definition``: for an ``import_alias`` /
-        ``from_import_alias`` / ``wildcard_import_stub`` the declaration is
-        the ``import`` statement in the current file, while ``definition``
-        follows the import chain through to the resolved target's file.
-        For workspace functions, classes, and module-level variables the
-        two coincide.
-
-        Returns ``None`` when ``qualified_name`` is not found in ``path``'s
-        symbol table, when the file has not been mirrored, or when the
-        path is not a Python file.
-        """
         with self._state_lock:
             self._check_open()
-            real_path = self._normalize_real_path(path)
+            real_path = self._normalize_real_path(symbol_id.path)
             mirror_path = self._mirror_path_for_real(real_path)
             if not mirror_path.exists() or mirror_path.suffix != ".py":
                 raise FileNotFoundError(real_path)
-            table = module_symbol_table(
-                self.db, self.mirror_root, str(mirror_path)
+            mirror_id = SymbolId(
+                str(mirror_path),
+                symbol_id.scope_id,
+                symbol_id.name,
+                symbol_id.declaration,
             )
-            matched: Symbol | None = None
-            for symbol in table.symbols:
-                if symbol.qualified_name == qualified_name:
-                    matched = symbol
-                    break
-            if matched is None:
-                bare = qualified_name.rsplit(".", 1)[-1]
-                for symbol in table.symbols:
-                    if symbol.qualified_name.rsplit(".", 1)[-1] == bare:
-                        matched = symbol
-                        break
-            if matched is None:
+            lexical = scope_tree(self.db, str(mirror_path))
+            if not any(binding.symbol_id == mirror_id for binding in lexical.bindings):
                 return None
-            col_offset, end_col_offset = self._locate_symbol_name_offsets(
-                real_path, matched
-            )
             return DeclarationLocation(
                 path=real_path,
-                lineno=matched.lineno,
-                col_offset=col_offset,
-                end_col_offset=end_col_offset,
+                range=symbol_id.declaration,
             )
 
     def prepare_call_hierarchy(
@@ -3598,7 +2010,7 @@ class WorkspaceSession:
         """Return the call-hierarchy item(s) for the identifier at the cursor.
 
         Resolves the identifier under ``(line, character)`` (LSP-style 0-based
-        coordinates) through ``resolve_symbol``. If the resolved target is a
+        coordinates) through the shared public resolver. If the resolved target is a
         workspace function, method, or class, a single
         :class:`CallHierarchyItem` describing that target is returned;
         otherwise the result is empty. Variables, import aliases,
@@ -3611,33 +2023,23 @@ class WorkspaceSession:
             mirror_path = self._mirror_path_for_real(real_path)
             if not mirror_path.exists() or mirror_path.suffix != ".py":
                 raise FileNotFoundError(real_path)
-            source = self.source_text(real_path)
-            if source is None:
+            resolved = self._resolved_target_at(mirror_path, SourcePosition(line, character))
+            if resolved is None:
                 return ()
-            identifier = _identifier_at_source_position(source, line, character)
-            if identifier is None:
-                return ()
-            resolved = self._remap_resolved_symbol(
-                resolve_symbol(
-                    self.db, self.mirror_root, str(mirror_path), identifier
-                )
-            )
             if resolved.resolution != "workspace":
                 return ()
-            if resolved.defining_path is None or resolved.defining_lineno is None:
+            if resolved.defining_path is None or resolved.range is None:
                 return ()
             defining_mirror = self._mirror_path_for_real(resolved.defining_path)
             if not defining_mirror.exists() or defining_mirror.suffix != ".py":
                 return ()
-            defining_table = module_symbol_table(
-                self.db, self.mirror_root, str(defining_mirror)
-            )
+            defining_table = module_symbol_table(self.db, self.mirror_root, str(defining_mirror))
             matched: Symbol | None = None
             for symbol in defining_table.symbols:
-                if (
-                    symbol.lineno == resolved.defining_lineno
-                    and symbol.qualified_name == resolved.qualified_name
-                    and symbol.kind in ("function", "method", "class")
+                if symbol.qualified_name == resolved.qualified_name and symbol.kind in (
+                    "function",
+                    "method",
+                    "class",
                 ):
                     matched = symbol
                     break
@@ -3674,19 +2076,16 @@ class WorkspaceSession:
             mirror_path = self._mirror_path_for_real(real_path)
             if not mirror_path.exists() or mirror_path.suffix != ".py":
                 raise FileNotFoundError(real_path)
-            result = find_references(
-                self.db,
-                self.mirror_root,
-                str(mirror_path),
-                qualified_name,
-                include_declaration=False,
+            result = self._find_references_by_name(
+                real_path, qualified_name, include_declaration=False
             )
-            if result.target.resolution != "workspace":
+            if (
+                not isinstance(result.target, ResolvedTarget)
+                or result.target.resolution != "workspace"
+            ):
                 return ()
 
-            grouped: dict[
-                tuple[str, str], list[CallHierarchyCallSite]
-            ] = {}
+            grouped: dict[tuple[str, str], list[CallHierarchyCallSite]] = {}
             order: list[tuple[str, str]] = []
             tree_cache: dict[str, ast.Module | None] = {}
             table_cache: dict[str, ModuleSymbolTable] = {}
@@ -3702,7 +2101,7 @@ class WorkspaceSession:
                         tree_cache[ref_real_path] = None
                     else:
                         try:
-                            tree_cache[ref_real_path] = ast.parse(source)
+                            tree_cache[ref_real_path] = _parse_python(source)
                         except SyntaxError:
                             tree_cache[ref_real_path] = None
                 tree = tree_cache[ref_real_path]
@@ -3710,9 +2109,7 @@ class WorkspaceSession:
                     continue
                 if ref_real_path not in table_cache:
                     table_cache[ref_real_path] = self._remap_module_symbol_table(
-                        module_symbol_table(
-                            self.db, self.mirror_root, str(ref_mirror_path)
-                        )
+                        module_symbol_table(self.db, self.mirror_root, str(ref_mirror_path))
                     )
                 table = table_cache[ref_real_path]
                 known_qnames = frozenset(
@@ -3721,7 +2118,7 @@ class WorkspaceSession:
                     if symbol.kind in ("function", "method", "class")
                 )
                 caller_qname = _enclosing_callable_qname(
-                    tree, known_qnames, ref.lineno
+                    tree, known_qnames, ref.range.start.line + 1
                 )
                 if caller_qname is None:
                     continue
@@ -3729,14 +2126,7 @@ class WorkspaceSession:
                 if key not in grouped:
                     grouped[key] = []
                     order.append(key)
-                grouped[key].append(
-                    CallHierarchyCallSite(
-                        start_line=max(ref.lineno - 1, 0),
-                        start_character=ref.col_offset,
-                        end_line=max(ref.lineno - 1, 0),
-                        end_character=ref.end_col_offset,
-                    )
-                )
+                grouped[key].append(CallHierarchyCallSite(range=ref.range))
 
             incoming: list[CallHierarchyIncomingCall] = []
             for caller_path, caller_qname in order:
@@ -3747,12 +2137,10 @@ class WorkspaceSession:
                     continue
                 sites = sorted(
                     grouped[(caller_path, caller_qname)],
-                    key=lambda site: (site.start_line, site.start_character),
+                    key=lambda site: site.range.start,
                 )
                 incoming.append(
-                    CallHierarchyIncomingCall(
-                        caller=caller_item, call_sites=tuple(sites)
-                    )
+                    CallHierarchyIncomingCall(caller=caller_item, call_sites=tuple(sites))
                 )
             incoming.sort(key=lambda call: (call.caller.path, call.caller.qualified_name))
             return tuple(incoming)
@@ -3769,14 +2157,12 @@ class WorkspaceSession:
         walks its body for ``ast.Call`` nodes — without descending into
         nested ``FunctionDef`` / ``AsyncFunctionDef`` / ``ClassDef`` /
         ``Lambda`` scopes, each of which owns its own outgoing-call list.
-        Calls whose ``func`` is a bare ``Name`` are resolved against the
-        declaring module's imports; calls whose ``func`` is
-        ``Name.attr`` are resolved by first resolving the LHS name to a
-        workspace module and then resolving ``attr`` inside that module
-        (mirroring ``find_references``'s LHS-bare-Name handling).
-        Subscripted calls (``factory[T](``), deep attribute chains
-        (``pkg.subpkg.foo()``), and lambda calls produce no callee. Targets
-        that don't resolve to a workspace function/method/class are skipped.
+        Each bare-name or attribute callee is resolved at its terminal source
+        position through the shared lexical resolver. Proven workspace-module,
+        class, ``self`` / ``cls``, and directly annotated receiver chains can
+        resolve; unproven or rebound chains do not. Subscripted and lambda
+        calls produce no callee. Targets that don't resolve to a workspace
+        function, method, or class are skipped.
         """
         with self._state_lock:
             self._check_open()
@@ -3788,49 +2174,40 @@ class WorkspaceSession:
             if source is None:
                 return ()
             try:
-                tree = ast.parse(source)
+                tree = _parse_python(source)
             except SyntaxError:
                 return ()
             body_node = _find_callable_node(tree, qualified_name)
             if body_node is None:
                 return ()
 
-            grouped: dict[
-                tuple[str, str], list[CallHierarchyCallSite]
-            ] = {}
+            grouped: dict[tuple[str, str], list[CallHierarchyCallSite]] = {}
             order: list[tuple[str, str]] = []
             for call in _collect_outgoing_calls(body_node):
                 func_range = _call_func_range(call)
                 if func_range is None:
                     continue
-                target_resolved = self._resolve_call_target(
-                    mirror_path, call.func
-                )
+                target_resolved = self._resolve_call_target(mirror_path, call.func)
                 if target_resolved is None:
                     continue
                 if (
                     target_resolved.resolution != "workspace"
                     or target_resolved.defining_path is None
-                    or target_resolved.defining_lineno is None
+                    or target_resolved.range is None
                 ):
                     continue
-                defining_mirror = self._mirror_path_for_real(
-                    target_resolved.defining_path
-                )
-                if (
-                    not defining_mirror.exists()
-                    or defining_mirror.suffix != ".py"
-                ):
+                defining_mirror = self._mirror_path_for_real(target_resolved.defining_path)
+                if not defining_mirror.exists() or defining_mirror.suffix != ".py":
                     continue
                 defining_table = module_symbol_table(
                     self.db, self.mirror_root, str(defining_mirror)
                 )
                 matched: Symbol | None = None
                 for symbol in defining_table.symbols:
-                    if (
-                        symbol.lineno == target_resolved.defining_lineno
-                        and symbol.qualified_name == target_resolved.qualified_name
-                        and symbol.kind in ("function", "method", "class")
+                    if symbol.qualified_name == target_resolved.qualified_name and symbol.kind in (
+                        "function",
+                        "method",
+                        "class",
                     ):
                         matched = symbol
                         break
@@ -3843,10 +2220,10 @@ class WorkspaceSession:
                 sl, sc, el, ec = func_range
                 grouped[key].append(
                     CallHierarchyCallSite(
-                        start_line=sl,
-                        start_character=sc,
-                        end_line=el,
-                        end_character=ec,
+                        range=SourceRange(
+                            SourcePosition(sl, sc),
+                            SourcePosition(el, ec),
+                        )
                     )
                 )
 
@@ -3859,12 +2236,10 @@ class WorkspaceSession:
                     continue
                 sites = sorted(
                     grouped[(callee_path, callee_qname)],
-                    key=lambda site: (site.start_line, site.start_character),
+                    key=lambda site: site.range.start,
                 )
                 outgoing.append(
-                    CallHierarchyOutgoingCall(
-                        callee=callee_item, call_sites=tuple(sites)
-                    )
+                    CallHierarchyOutgoingCall(callee=callee_item, call_sites=tuple(sites))
                 )
             outgoing.sort(key=lambda call: (call.callee.path, call.callee.qualified_name))
             return tuple(outgoing)
@@ -3878,7 +2253,7 @@ class WorkspaceSession:
         """Return the type-hierarchy item for the identifier at the cursor.
 
         Resolves the identifier under ``(line, character)`` (LSP-style 0-based
-        coordinates) through :func:`resolve_symbol`. If the resolved target is
+        coordinates) through the shared public resolver. If the resolved target is
         a workspace class (including a class re-exported through an
         ``import`` / ``from … import …`` chain), a single
         :class:`TypeHierarchyItem` describing the declaring ``ClassDef`` is
@@ -3893,34 +2268,20 @@ class WorkspaceSession:
             mirror_path = self._mirror_path_for_real(real_path)
             if not mirror_path.exists() or mirror_path.suffix != ".py":
                 raise FileNotFoundError(real_path)
-            source = self.source_text(real_path)
-            if source is None:
+            resolved = self._resolved_target_at(mirror_path, SourcePosition(line, character))
+            if resolved is None:
                 return ()
-            identifier = _identifier_at_source_position(source, line, character)
-            if identifier is None:
-                return ()
-            resolved = self._remap_resolved_symbol(
-                resolve_symbol(
-                    self.db, self.mirror_root, str(mirror_path), identifier
-                )
-            )
             if resolved.resolution != "workspace":
                 return ()
-            if resolved.defining_path is None or resolved.defining_lineno is None:
+            if resolved.defining_path is None or resolved.range is None:
                 return ()
             defining_mirror = self._mirror_path_for_real(resolved.defining_path)
             if not defining_mirror.exists() or defining_mirror.suffix != ".py":
                 return ()
-            defining_table = module_symbol_table(
-                self.db, self.mirror_root, str(defining_mirror)
-            )
+            defining_table = module_symbol_table(self.db, self.mirror_root, str(defining_mirror))
             matched: Symbol | None = None
             for symbol in defining_table.symbols:
-                if (
-                    symbol.lineno == resolved.defining_lineno
-                    and symbol.qualified_name == resolved.qualified_name
-                    and symbol.kind == "class"
-                ):
+                if symbol.qualified_name == resolved.qualified_name and symbol.kind == "class":
                     matched = symbol
                     break
             if matched is None:
@@ -3944,13 +2305,13 @@ class WorkspaceSession:
         ``call_hierarchy_outgoing_calls``), and resolves each entry in its
         ``bases`` list. ``Subscript`` bases (``Generic[T]``, ``Base[T]``) are
         unwrapped to their ``value`` before resolution, so generic base
-        classes are still navigated. Bare ``Name(id=X)`` bases resolve
-        ``X`` against the declaring module's imports; ``Name.attr`` bases
-        resolve the LHS to a workspace module and then ``attr`` inside it
-        (mirroring ``call_hierarchy_outgoing_calls``'s LHS-bare-Name rule).
-        ``Starred`` bases and deeper attribute chains (``pkg.sub.Foo``)
-        produce no entry. Only workspace ``class`` targets contribute an
-        item; stdlib / installed / ambiguous / missing bases are dropped.
+        classes are still navigated. Bare-name and attribute-chain bases are
+        resolved at their terminal source position through the shared lexical
+        resolver, so a chain such as ``pkg.sub.Foo`` works only when its root
+        and each step are proven. ``Starred`` bases, call expressions, and
+        unproven or rebound chains produce no entry. Only workspace ``class``
+        targets contribute an item; stdlib / installed / ambiguous / missing
+        bases are dropped.
         Duplicates (same ``(path, qualified_name)``) are collapsed, and the
         result is sorted by ``(path, qualified_name)``.
         """
@@ -3964,7 +2325,7 @@ class WorkspaceSession:
             if source is None:
                 return ()
             try:
-                tree = ast.parse(source)
+                tree = _parse_python(source)
             except SyntaxError:
                 return ()
             class_node = _find_callable_node(tree, qualified_name)
@@ -3977,13 +2338,15 @@ class WorkspaceSession:
                 target = _unwrap_base_expression(base)
                 if target is None:
                     continue
-                resolved = self._resolve_class_target(mirror_path, target)
+                resolved = self._resolve_class_target(
+                    mirror_path, target, _expression_name_position(base)
+                )
                 if resolved is None:
                     continue
                 if (
                     resolved.resolution != "workspace"
                     or resolved.defining_path is None
-                    or resolved.defining_lineno is None
+                    or resolved.range is None
                 ):
                     continue
                 key = (resolved.defining_path, resolved.qualified_name)
@@ -3991,21 +2354,14 @@ class WorkspaceSession:
                     continue
                 seen.add(key)
                 defining_mirror = self._mirror_path_for_real(resolved.defining_path)
-                if (
-                    not defining_mirror.exists()
-                    or defining_mirror.suffix != ".py"
-                ):
+                if not defining_mirror.exists() or defining_mirror.suffix != ".py":
                     continue
                 defining_table = module_symbol_table(
                     self.db, self.mirror_root, str(defining_mirror)
                 )
                 base_symbol: Symbol | None = None
                 for symbol in defining_table.symbols:
-                    if (
-                        symbol.lineno == resolved.defining_lineno
-                        and symbol.qualified_name == resolved.qualified_name
-                        and symbol.kind == "class"
-                    ):
+                    if symbol.qualified_name == resolved.qualified_name and symbol.kind == "class":
                         base_symbol = symbol
                         break
                 if base_symbol is None:
@@ -4036,10 +2392,9 @@ class WorkspaceSession:
         bases drop their subscript) and resolved through the candidate
         file's imports; a candidate is a subtype iff at least one of its
         resolved bases points at ``(path, qualified_name)``. Resolution
-        of bases follows the same rules as :meth:`type_hierarchy_supertypes`:
-        bare ``Name`` resolves in the candidate's module, ``Name.attr``
-        resolves the LHS to a workspace module then ``attr`` inside it,
-        deeper attribute chains are skipped. Duplicates by
+        of bases follows the same position-based rules as
+        :meth:`type_hierarchy_supertypes`; unproven or rebound chains are
+        skipped. Duplicates by
         ``(path, qualified_name)`` are collapsed, and the result is
         sorted by ``(path, qualified_name)``.
 
@@ -4057,7 +2412,7 @@ class WorkspaceSession:
             if source is None:
                 return ()
             try:
-                tree = ast.parse(source)
+                tree = _parse_python(source)
             except SyntaxError:
                 return ()
             target_node = _find_callable_node(tree, qualified_name)
@@ -4074,16 +2429,13 @@ class WorkspaceSession:
             for module in workspace.modules:
                 candidate_real_path = module.path
                 candidate_mirror = self._mirror_path_for_real(candidate_real_path)
-                if (
-                    not candidate_mirror.exists()
-                    or candidate_mirror.suffix != ".py"
-                ):
+                if not candidate_mirror.exists() or candidate_mirror.suffix != ".py":
                     continue
                 candidate_source = self.source_text(candidate_real_path)
                 if candidate_source is None:
                     continue
                 try:
-                    candidate_tree = ast.parse(candidate_source)
+                    candidate_tree = _parse_python(candidate_source)
                 except SyntaxError:
                     continue
                 candidate_table: ModuleSymbolTable | None = None
@@ -4097,7 +2449,9 @@ class WorkspaceSession:
                         if base_target is None:
                             continue
                         base_resolved = self._resolve_class_target(
-                            candidate_mirror, base_target
+                            candidate_mirror,
+                            base_target,
+                            _expression_name_position(base),
                         )
                         if base_resolved is None:
                             continue
@@ -4135,7 +2489,8 @@ class WorkspaceSession:
         self,
         caller_mirror_path: Path,
         target: tuple[str, ...],
-    ) -> ResolvedSymbol | None:
+        position: SourcePosition | None = None,
+    ) -> ResolvedTarget | None:
         """Resolve a ``("name", X)`` or ``("attr", L, A)`` ref to a class.
 
         ``("name", X)`` looks ``X`` up in ``caller_mirror_path``'s module
@@ -4145,9 +2500,11 @@ class WorkspaceSession:
         Mirrors :meth:`_resolve_call_target`'s shape — kept separate so
         the two resolvers can diverge without coupling.
         """
+        if position is not None:
+            return self._resolved_target_at(caller_mirror_path, position)
         if target[0] == "name":
-            return self._remap_resolved_symbol(
-                resolve_symbol(
+            return self._remap_resolved_target(
+                _resolve_target(
                     self.db,
                     self.mirror_root,
                     str(caller_mirror_path),
@@ -4167,19 +2524,15 @@ class WorkspaceSession:
         if source is None:
             return None
         try:
-            tree = ast.parse(source)
+            tree = _parse_python(source)
         except SyntaxError:
             return None
         node = _find_callable_node(tree, qualified_name)
         if node is None or not isinstance(node, ast.ClassDef):
             return None
         if node.decorator_list:
-            range_start_line = (
-                min(dec.lineno for dec in node.decorator_list) - 1
-            )
-            range_start_col = min(
-                dec.col_offset for dec in node.decorator_list
-            )
+            range_start_line = min(dec.lineno for dec in node.decorator_list) - 1
+            range_start_col = min(dec.col_offset for dec in node.decorator_list)
         else:
             range_start_line = node.lineno - 1
             range_start_col = node.col_offset
@@ -4187,9 +2540,7 @@ class WorkspaceSession:
         range_end_col = node.end_col_offset or 0
 
         bare_name = qualified_name.rsplit(".", 1)[-1]
-        located = self._locate_def_class_name_offsets(
-            real_path, node.lineno, bare_name
-        )
+        located = self._locate_def_class_name_offsets(real_path, node.lineno, bare_name)
         if located is None:
             return None
         selection_start_col, selection_end_col = located
@@ -4201,14 +2552,14 @@ class WorkspaceSession:
             path=real_path,
             qualified_name=qualified_name,
             detail=module_name,
-            range_start_line=range_start_line,
-            range_start_character=range_start_col,
-            range_end_line=range_end_line,
-            range_end_character=range_end_col,
-            selection_start_line=selection_line,
-            selection_start_character=selection_start_col,
-            selection_end_line=selection_line,
-            selection_end_character=selection_end_col,
+            range=SourceRange(
+                SourcePosition(range_start_line, range_start_col),
+                SourcePosition(range_end_line, range_end_col),
+            ),
+            selection_range=SourceRange(
+                SourcePosition(selection_line, selection_start_col),
+                SourcePosition(selection_line, selection_end_col),
+            ),
         )
 
     def _resolve_attr_on_module(
@@ -4216,7 +2567,7 @@ class WorkspaceSession:
         caller_mirror_path: Path,
         lhs_name: str,
         attr_name: str,
-    ) -> ResolvedSymbol | None:
+    ) -> ResolvedTarget | None:
         """Resolve ``lhs_name.attr_name`` LHS-bare-`Name`-first.
 
         Resolves ``lhs_name`` through ``caller_mirror_path``'s imports to a
@@ -4226,42 +2577,29 @@ class WorkspaceSession:
         ``_resolve_call_target``, ``_resolve_class_target``, and
         ``signature_help_at``.
         """
-        lhs_resolved = self._remap_resolved_symbol(
-            resolve_symbol(
-                self.db, self.mirror_root, str(caller_mirror_path), lhs_name
-            )
+        lhs_resolved = self._remap_resolved_target(
+            _resolve_target(self.db, self.mirror_root, str(caller_mirror_path), lhs_name)
         )
-        if (
-            lhs_resolved.resolution != "workspace"
-            or lhs_resolved.defining_path is None
-        ):
+        if lhs_resolved.resolution != "workspace" or lhs_resolved.defining_path is None:
             return None
         lhs_mirror = self._mirror_path_for_real(lhs_resolved.defining_path)
         if not lhs_mirror.exists() or lhs_mirror.suffix != ".py":
             return None
-        return self._remap_resolved_symbol(
-            resolve_symbol(self.db, self.mirror_root, str(lhs_mirror), attr_name)
+        return self._remap_resolved_target(
+            _resolve_target(self.db, self.mirror_root, str(lhs_mirror), attr_name)
         )
 
     def _resolve_call_target(
         self,
         caller_mirror_path: Path,
         func: ast.expr,
-    ) -> ResolvedSymbol | None:
-        if isinstance(func, ast.Name):
-            return self._remap_resolved_symbol(
-                resolve_symbol(
-                    self.db,
-                    self.mirror_root,
-                    str(caller_mirror_path),
-                    func.id,
-                )
-            )
-        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            return self._resolve_attr_on_module(
-                caller_mirror_path, func.value.id, func.attr
-            )
-        return None
+    ) -> ResolvedTarget | None:
+        if isinstance(func, ast.Subscript):
+            return None
+        position = _expression_name_position(func)
+        if position is None:
+            return None
+        return self._resolved_target_at(caller_mirror_path, position)
 
     def _build_call_hierarchy_item(
         self,
@@ -4273,7 +2611,7 @@ class WorkspaceSession:
         if source is None:
             return None
         try:
-            tree = ast.parse(source)
+            tree = _parse_python(source)
         except SyntaxError:
             return None
         node = _find_callable_node(tree, qualified_name)
@@ -4284,12 +2622,8 @@ class WorkspaceSession:
         else:
             kind = "method" if "." in qualified_name else "function"
         if node.decorator_list:
-            range_start_line = (
-                min(dec.lineno for dec in node.decorator_list) - 1
-            )
-            range_start_col = min(
-                dec.col_offset for dec in node.decorator_list
-            )
+            range_start_line = min(dec.lineno for dec in node.decorator_list) - 1
+            range_start_col = min(dec.col_offset for dec in node.decorator_list)
         else:
             range_start_line = node.lineno - 1
             range_start_col = node.col_offset
@@ -4297,9 +2631,7 @@ class WorkspaceSession:
         range_end_col = node.end_col_offset or 0
 
         bare_name = qualified_name.rsplit(".", 1)[-1]
-        located = self._locate_def_class_name_offsets(
-            real_path, node.lineno, bare_name
-        )
+        located = self._locate_def_class_name_offsets(real_path, node.lineno, bare_name)
         if located is None:
             return None
         selection_start_col, selection_end_col = located
@@ -4309,9 +2641,7 @@ class WorkspaceSession:
             mirror_path = self._mirror_path_for_real(real_path)
             if mirror_path.exists() and mirror_path.suffix == ".py":
                 table = self._remap_module_symbol_table(
-                    module_symbol_table(
-                        self.db, self.mirror_root, str(mirror_path)
-                    )
+                    module_symbol_table(self.db, self.mirror_root, str(mirror_path))
                 )
                 module_name = table.module
 
@@ -4325,24 +2655,24 @@ class WorkspaceSession:
             path=real_path,
             qualified_name=qualified_name,
             detail=module_name,
-            range_start_line=range_start_line,
-            range_start_character=range_start_col,
-            range_end_line=range_end_line,
-            range_end_character=range_end_col,
-            selection_start_line=selection_line,
-            selection_start_character=selection_start_col,
-            selection_end_line=selection_line,
-            selection_end_character=selection_end_col,
+            range=SourceRange(
+                SourcePosition(range_start_line, range_start_col),
+                SourcePosition(range_end_line, range_end_col),
+            ),
+            selection_range=SourceRange(
+                SourcePosition(selection_line, selection_start_col),
+                SourcePosition(selection_line, selection_end_col),
+            ),
         )
 
     def _resolve_annotation_type_ref(
         self,
         defining_mirror: Path,
         ref: tuple[str, ...],
-    ) -> ResolvedSymbol | None:
+    ) -> ResolvedTarget | None:
         if ref[0] == "name":
-            return self._remap_resolved_symbol(
-                resolve_symbol(
+            return self._remap_resolved_target(
+                _resolve_target(
                     self.db,
                     self.mirror_root,
                     str(defining_mirror),
@@ -4350,39 +2680,28 @@ class WorkspaceSession:
                 )
             )
         # ("attribute", lhs_name, attr)
-        lhs_resolved = self._remap_resolved_symbol(
-            resolve_symbol(
-                self.db, self.mirror_root, str(defining_mirror), ref[1]
-            )
+        lhs_resolved = self._remap_resolved_target(
+            _resolve_target(self.db, self.mirror_root, str(defining_mirror), ref[1])
         )
-        if (
-            lhs_resolved.resolution != "workspace"
-            or lhs_resolved.defining_path is None
-        ):
+        if lhs_resolved.resolution != "workspace" or lhs_resolved.defining_path is None:
             return None
         lhs_mirror = self._mirror_path_for_real(lhs_resolved.defining_path)
         if not lhs_mirror.exists() or lhs_mirror.suffix != ".py":
             return None
-        return self._remap_resolved_symbol(
-            resolve_symbol(
-                self.db, self.mirror_root, str(lhs_mirror), ref[2]
-            )
+        return self._remap_resolved_target(
+            _resolve_target(self.db, self.mirror_root, str(lhs_mirror), ref[2])
         )
 
-    def _lookup_callable_signature(
-        self, target: ResolvedSymbol
-    ) -> tuple[str, Signature] | None:
-        if target.defining_path is None or target.defining_lineno is None:
+    def _lookup_callable_signature(self, target: ResolvedTarget) -> tuple[str, Signature] | None:
+        if target.defining_path is None or target.range is None:
             return None
         defining_mirror = self._mirror_path_for_real(target.defining_path)
         if not defining_mirror.exists() or defining_mirror.suffix != ".py":
             return None
-        table = module_symbol_table(
-            self.db, self.mirror_root, str(defining_mirror)
-        )
+        table = module_symbol_table(self.db, self.mirror_root, str(defining_mirror))
         matched = None
         for symbol in table.symbols:
-            if symbol.lineno == target.defining_lineno and "." not in symbol.qualified_name:
+            if symbol.qualified_name == target.qualified_name:
                 matched = symbol
                 break
         if matched is None:
@@ -4392,10 +2711,7 @@ class WorkspaceSession:
         if matched.kind == "class":
             init_qualified = f"{matched.qualified_name}.__init__"
             for inner in table.symbols:
-                if (
-                    inner.qualified_name == init_qualified
-                    and inner.signature is not None
-                ):
+                if inner.qualified_name == init_qualified and inner.signature is not None:
                     init_params = inner.signature.parameters
                     if init_params and init_params[0].name in ("self", "cls"):
                         init_params = init_params[1:]
@@ -4413,160 +2729,85 @@ class WorkspaceSession:
         return None
 
     def _signature_defaults(
-        self, resolved: ResolvedSymbol, display_name: str
+        self, resolved: ResolvedTarget, display_name: str
     ) -> dict[str, str] | None:
         """Default-value expressions for `resolved`'s callable, extracted from
-        its defining file's source (`symbol_resolution.Parameter` carries no
+        its defining file's source (`Parameter` carries no
         default, so this is a consumer-side read). Returns ``None`` when the
         defining source is unavailable or unparseable — defaults are then
         simply omitted from the signature label."""
-        if resolved.defining_path is None or resolved.defining_lineno is None:
+        if resolved.defining_path is None or resolved.range is None:
             return None
         defining_source = self.source_text(resolved.defining_path)
         if defining_source is None:
             return None
         return _parameter_defaults_from_source(
-            defining_source, resolved.defining_lineno, display_name
+            defining_source, resolved.range.start.line + 1, display_name
         )
 
     def rename_symbol(
         self,
-        path: str | os.PathLike[str],
-        qualified_name: str,
+        symbol_id: SymbolId,
         new_name: str,
     ) -> RenameResult:
-        bare_old = qualified_name.rsplit(".", 1)[-1]
+        bare_old = symbol_id.name
         with self._state_lock:
             self._check_open()
-            real_path = self._normalize_real_path(path)
+            real_path = self._normalize_real_path(symbol_id.path)
             mirror_path = self._mirror_path_for_real(real_path)
             if not mirror_path.exists() or mirror_path.suffix != ".py":
                 raise FileNotFoundError(real_path)
-            target = self._remap_resolved_symbol(
-                resolve_symbol(
-                    self.db, self.mirror_root, str(mirror_path), qualified_name
-                )
-            )
             if not new_name.isidentifier():
-                return RenameResult(
-                    target=target, edits=(), status="invalid_identifier"
-                )
+                return RenameResult(target=symbol_id, edits=(), status="invalid_identifier")
             if keyword.iskeyword(new_name):
-                return RenameResult(
-                    target=target, edits=(), status="keyword_identifier"
-                )
+                return RenameResult(target=symbol_id, edits=(), status="keyword_identifier")
             if new_name == bare_old:
-                return RenameResult(target=target, edits=(), status="same_name")
-            if target.resolution != "workspace":
-                return RenameResult(
-                    target=target, edits=(), status="non_workspace_target"
-                )
-            defining_bare_name = self._defining_bare_name(target)
-            if defining_bare_name is not None and defining_bare_name != bare_old:
-                return RenameResult(
-                    target=target, edits=(), status="alias_rename_unsupported"
-                )
-            references = find_references(
-                self.db,
-                self.mirror_root,
-                str(mirror_path),
-                qualified_name,
-                include_declaration=True,
-            )
+                return RenameResult(target=symbol_id, edits=(), status="same_name")
+            references = self.find_references(symbol_id, include_declaration=True)
             edits: list[RenameEdit] = []
             for ref in references.references:
                 ref_real_path = self._remap_path(ref.path) or ref.path
-                col, end_col = ref.col_offset, ref.end_col_offset
-                if ref.is_declaration and col == 0 and end_col == 1:
+                source_range = ref.range
+                if (
+                    ref.is_declaration
+                    and source_range.start.character == 0
+                    and source_range.end.character == 1
+                ):
                     located = self._locate_def_class_name_offsets(
-                        ref_real_path, ref.lineno, bare_old
+                        ref_real_path, source_range.start.line + 1, bare_old
                     )
                     if located is None:
                         continue
-                    col, end_col = located
+                    source_range = SourceRange(
+                        SourcePosition(source_range.start.line, located[0]),
+                        SourcePosition(source_range.start.line, located[1]),
+                    )
                 edits.append(
                     RenameEdit(
                         path=ref_real_path,
-                        lineno=ref.lineno,
-                        col_offset=col,
-                        end_col_offset=end_col,
+                        range=source_range,
                         new_text=new_name,
                     )
                 )
-            if target.defining_module is not None:
+            if symbol_id.scope_id == "module":
+                defining_table = module_symbol_table(self.db, self.mirror_root, str(mirror_path))
                 edits.extend(
                     self._collect_from_import_edits(
-                        defining_module=target.defining_module,
+                        defining_module=defining_table.module,
                         bare_old=bare_old,
                         new_name=new_name,
                     )
                 )
-            seen: set[tuple[str, int, int, int]] = set()
+            seen: set[tuple[str, SourceRange]] = set()
             unique_edits: list[RenameEdit] = []
             for edit in edits:
-                key = (edit.path, edit.lineno, edit.col_offset, edit.end_col_offset)
+                key = (edit.path, edit.range)
                 if key in seen:
                     continue
                 seen.add(key)
                 unique_edits.append(edit)
-            unique_edits.sort(
-                key=lambda e: (e.path, e.lineno, e.col_offset)
-            )
-            return RenameResult(
-                target=target, edits=tuple(unique_edits), status="ok"
-            )
-
-    def _defining_bare_name(self, target: ResolvedSymbol) -> str | None:
-        """Return the bare name of `target` as bound in its defining module.
-
-        Returns None if the symbol can't be located in the defining module's
-        symbol table (e.g. resolution data is missing); callers should treat
-        None as "best-effort proceed" rather than as a mismatch.
-        """
-        if target.defining_path is None or target.defining_lineno is None:
-            return None
-        defining_mirror = self._mirror_path_for_real(target.defining_path)
-        if not defining_mirror.exists() or defining_mirror.suffix != ".py":
-            return None
-        table = module_symbol_table(
-            self.db, self.mirror_root, str(defining_mirror)
-        )
-        for symbol in table.symbols:
-            if symbol.lineno != target.defining_lineno:
-                continue
-            if "." in symbol.qualified_name:
-                continue
-            return symbol.qualified_name
-        return None
-
-    def _locate_symbol_name_offsets(
-        self, real_path: str, symbol: Symbol
-    ) -> tuple[int, int]:
-        """Return ``(col_offset, end_col_offset)`` of ``symbol``'s bare name on
-        its header line.
-
-        Scans the file's line at ``symbol.lineno - 1`` for the first
-        word-boundary match of the bare-name component of
-        ``symbol.qualified_name``. Used to make declaration-style endpoints
-        report the actual identifier span rather than a column-0 placeholder.
-
-        Falls back to ``(0, 1)`` when the source is unreadable, the line is
-        out of range, or the bare name does not match on that line.
-        """
-        bare_name = symbol.qualified_name.rsplit(".", 1)[-1]
-        source = self.source_text(real_path)
-        if source is None:
-            return 0, 1
-        lines = source.splitlines()
-        line_idx = symbol.lineno - 1
-        if not (0 <= line_idx < len(lines)):
-            return 0, 1
-        line = lines[line_idx]
-        pattern = re.compile(rf"\b{re.escape(bare_name)}\b")
-        match = pattern.search(line)
-        if match is None:
-            return 0, 1
-        return match.start(), match.end()
+            unique_edits.sort(key=lambda edit: (edit.path, edit.range.start))
+            return RenameResult(target=symbol_id, edits=tuple(unique_edits), status="ok")
 
     def _locate_def_class_name_offsets(
         self, real_path: str, lineno: int, bare_old: str
@@ -4575,14 +2816,12 @@ class WorkspaceSession:
         if source is None:
             return None
         try:
-            tree = ast.parse(source)
+            tree = _parse_python(source)
         except SyntaxError:
             return None
         for node in ast.walk(tree):
             if (
-                isinstance(
-                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-                )
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
                 and node.lineno == lineno
                 and node.name == bare_old
             ):
@@ -4591,10 +2830,13 @@ class WorkspaceSession:
                 if not (0 <= line_idx < len(lines)):
                     return None
                 line = lines[line_idx]
-                pattern = re.compile(rf"\b{re.escape(bare_old)}\b")
-                match = pattern.search(line, node.col_offset)
-                if match is not None:
-                    return match.start(), match.end()
+                located = _normalized_name_offsets_on_line(
+                    line,
+                    bare_old,
+                    node.col_offset,
+                )
+                if located is not None:
+                    return located
         return None
 
     def _collect_from_import_edits(
@@ -4604,9 +2846,7 @@ class WorkspaceSession:
         bare_old: str,
         new_name: str,
     ) -> list[RenameEdit]:
-        workspace = self._remap_workspace_analysis(
-            workspace_analysis(self.db, self.mirror_root)
-        )
+        workspace = self._remap_workspace_analysis(workspace_analysis(self.db, self.mirror_root))
         edits: list[RenameEdit] = []
         for module in workspace.modules:
             real_path = module.path
@@ -4614,7 +2854,7 @@ class WorkspaceSession:
             if source is None:
                 continue
             try:
-                tree = ast.parse(source)
+                tree = _parse_python(source)
             except SyntaxError:
                 continue
             for node in ast.walk(tree):
@@ -4636,9 +2876,13 @@ class WorkspaceSession:
                     edits.append(
                         RenameEdit(
                             path=real_path,
-                            lineno=alias.lineno,
-                            col_offset=alias.col_offset,
-                            end_col_offset=alias.col_offset + len(bare_old),
+                            range=SourceRange(
+                                SourcePosition(alias.lineno - 1, alias.col_offset),
+                                SourcePosition(
+                                    alias.lineno - 1,
+                                    alias.col_offset + len(bare_old),
+                                ),
+                            ),
                             new_text=new_name,
                         )
                     )
@@ -4646,9 +2890,7 @@ class WorkspaceSession:
 
     def import_edits_for_file_renames(
         self,
-        renames: Sequence[
-            tuple[str | os.PathLike[str], str | os.PathLike[str]]
-        ],
+        renames: Sequence[tuple[str | os.PathLike[str], str | os.PathLike[str]]],
     ) -> tuple[FileRenameEdit, ...]:
         """Compute import edits that update references to renamed Python files.
 
@@ -4705,9 +2947,7 @@ class WorkspaceSession:
                         old_to_new=old_to_new,
                     )
                 )
-            edits.sort(
-                key=lambda e: (e.path, e.start_line, e.start_character)
-            )
+            edits.sort(key=lambda edit: (edit.path, edit.range.start))
             return tuple(edits)
 
     def _resolve_file_rename_pair(
@@ -4744,7 +2984,7 @@ class WorkspaceSession:
         if source is None:
             return []
         try:
-            tree = ast.parse(source)
+            tree = _parse_python(source)
         except SyntaxError:
             return []
         source_lines = source.splitlines()
@@ -4760,10 +3000,13 @@ class WorkspaceSession:
                     edits.append(
                         FileRenameEdit(
                             path=importer_path,
-                            start_line=alias.lineno - 1,
-                            start_character=alias.col_offset,
-                            end_line=alias.lineno - 1,
-                            end_character=alias.col_offset + len(alias.name),
+                            range=SourceRange(
+                                SourcePosition(alias.lineno - 1, alias.col_offset),
+                                SourcePosition(
+                                    alias.lineno - 1,
+                                    alias.col_offset + len(alias.name),
+                                ),
+                            ),
                             new_text=new_module,
                         )
                     )
@@ -4788,10 +3031,10 @@ class WorkspaceSession:
                         edits.append(
                             FileRenameEdit(
                                 path=importer_path,
-                                start_line=line_idx,
-                                start_character=start_col,
-                                end_line=line_idx,
-                                end_character=end_col,
+                                range=SourceRange(
+                                    SourcePosition(line_idx, start_col),
+                                    SourcePosition(line_idx, end_col),
+                                ),
                                 new_text=replacement,
                             )
                         )
@@ -4802,9 +3045,7 @@ class WorkspaceSession:
                 for alias in node.names:
                     if alias.name == "*":
                         continue
-                    candidate = (
-                        f"{resolved}.{alias.name}" if resolved else alias.name
-                    )
+                    candidate = f"{resolved}.{alias.name}" if resolved else alias.name
                     new_module = old_to_new.get(candidate)
                     if new_module is None:
                         continue
@@ -4817,10 +3058,13 @@ class WorkspaceSession:
                     edits.append(
                         FileRenameEdit(
                             path=importer_path,
-                            start_line=alias.lineno - 1,
-                            start_character=alias.col_offset,
-                            end_line=alias.lineno - 1,
-                            end_character=alias.col_offset + len(alias.name),
+                            range=SourceRange(
+                                SourcePosition(alias.lineno - 1, alias.col_offset),
+                                SourcePosition(
+                                    alias.lineno - 1,
+                                    alias.col_offset + len(alias.name),
+                                ),
+                            ),
                             new_text=new_leaf,
                         )
                     )
@@ -4914,14 +3158,10 @@ class WorkspaceSession:
                         deleted_modules=deleted_modules,
                     )
                 )
-            edits.sort(
-                key=lambda e: (e.path, e.start_line, e.start_character)
-            )
+            edits.sort(key=lambda edit: (edit.path, edit.range.start))
             return tuple(edits)
 
-    def _resolve_file_deletion(
-        self, path: str | os.PathLike[str]
-    ) -> str | None:
+    def _resolve_file_deletion(self, path: str | os.PathLike[str]) -> str | None:
         try:
             real = self._normalize_real_path(path)
         except ValueError:
@@ -4947,7 +3187,7 @@ class WorkspaceSession:
         if source is None:
             return []
         try:
-            tree = ast.parse(source)
+            tree = _parse_python(source)
         except SyntaxError:
             return []
         edits: list[FileDeletionEdit] = []
@@ -4975,10 +3215,10 @@ class WorkspaceSession:
                         edits.append(
                             FileDeletionEdit(
                                 path=importer_path,
-                                start_line=start_line,
-                                start_character=0,
-                                end_line=end_line,
-                                end_character=0,
+                                range=SourceRange(
+                                    SourcePosition(start_line, 0),
+                                    SourcePosition(end_line, 0),
+                                ),
                             )
                         )
                     continue
@@ -5001,9 +3241,7 @@ class WorkspaceSession:
         node: ast.Import,
         deleted_modules: set[str],
     ) -> list[FileDeletionEdit]:
-        dead_indices = [
-            i for i, alias in enumerate(node.names) if alias.name in deleted_modules
-        ]
+        dead_indices = [i for i, alias in enumerate(node.names) if alias.name in deleted_modules]
         if not dead_indices:
             return []
         if len(dead_indices) == len(node.names):
@@ -5014,10 +3252,10 @@ class WorkspaceSession:
             return [
                 FileDeletionEdit(
                     path=importer_path,
-                    start_line=start_line,
-                    start_character=0,
-                    end_line=end_line,
-                    end_character=0,
+                    range=SourceRange(
+                        SourcePosition(start_line, 0),
+                        SourcePosition(end_line, 0),
+                    ),
                 )
             ]
         return _alias_list_deletion_edits(
@@ -5040,9 +3278,7 @@ class WorkspaceSession:
         for i, alias in enumerate(node.names):
             if alias.name == "*":
                 continue
-            candidate = (
-                f"{resolved_module}.{alias.name}" if resolved_module else alias.name
-            )
+            candidate = f"{resolved_module}.{alias.name}" if resolved_module else alias.name
             if candidate not in deleted_modules:
                 continue
             dead_indices.append(i)
@@ -5056,10 +3292,10 @@ class WorkspaceSession:
             return [
                 FileDeletionEdit(
                     path=importer_path,
-                    start_line=start_line,
-                    start_character=0,
-                    end_line=end_line,
-                    end_character=0,
+                    range=SourceRange(
+                        SourcePosition(start_line, 0),
+                        SourcePosition(end_line, 0),
+                    ),
                 )
             ]
         return _alias_list_deletion_edits(
@@ -5078,8 +3314,9 @@ class WorkspaceSession:
         if overlay is not None:
             return overlay
         try:
-            return Path(real_path).read_text(encoding="utf-8")
-        except OSError:
+            with tokenize.open(real_path) as source_file:
+                return source_file.read()
+        except (OSError, SyntaxError, UnicodeError):
             return None
 
     def _build_file_result(
@@ -5147,8 +3384,7 @@ class WorkspaceSession:
                     message=diagnostic.message,
                     severity="error",
                     source="pyinc.python_source",
-                    lineno=diagnostic.lineno,
-                    col_offset=diagnostic.col_offset,
+                    range=diagnostic.range,
                 )
             )
 
@@ -5161,8 +3397,7 @@ class WorkspaceSession:
                         message=f"Import {resolved_import.module!r} could not be resolved.",
                         severity="error",
                         source="pyinc.python_source",
-                        lineno=resolved_import.lineno,
-                        col_offset=0,
+                        range=resolved_import.range,
                     )
                 )
             elif resolved_import.resolution == "ambiguous":
@@ -5173,8 +3408,7 @@ class WorkspaceSession:
                         message=f"Import {resolved_import.module!r} resolved ambiguously.",
                         severity="warning",
                         source="pyinc.python_source",
-                        lineno=resolved_import.lineno,
-                        col_offset=0,
+                        range=resolved_import.range,
                     )
                 )
 
@@ -5194,8 +3428,7 @@ class WorkspaceSession:
                         ),
                         severity="warning",
                         source="pyinc.dependency_check",
-                        lineno=resolved_import.lineno,
-                        col_offset=0,
+                        range=resolved_import.range,
                     )
                 )
 
@@ -5204,8 +3437,8 @@ class WorkspaceSession:
                 and resolved_import.imported_name is not None
                 and resolved_import.imported_name != "*"
             ):
-                symbol_result = self._remap_resolved_symbol(
-                    resolve_symbol(
+                symbol_result = self._remap_resolved_target(
+                    _resolve_target(
                         self.db,
                         self.mirror_root,
                         mirror_path,
@@ -5223,8 +3456,7 @@ class WorkspaceSession:
                             ),
                             severity="error",
                             source="pyinc.symbol_resolution",
-                            lineno=resolved_import.lineno,
-                            col_offset=0,
+                            range=resolved_import.range,
                         )
                     )
                 elif symbol_result.resolution == "ambiguous":
@@ -5238,14 +3470,11 @@ class WorkspaceSession:
                             ),
                             severity="warning",
                             source="pyinc.symbol_resolution",
-                            lineno=resolved_import.lineno,
-                            col_offset=0,
+                            range=resolved_import.range,
                         )
                     )
 
-        diagnostics.extend(
-            self._unused_import_diagnostics(real_path, mirror_path, module_result)
-        )
+        diagnostics.extend(self._unused_import_diagnostics(real_path, mirror_path, module_result))
 
         return tuple(diagnostics)
 
@@ -5276,7 +3505,7 @@ class WorkspaceSession:
         if source is None:
             return []
         try:
-            tree = ast.parse(source)
+            tree = _parse_python(source)
         except SyntaxError:
             return []
 
@@ -5288,14 +3517,15 @@ class WorkspaceSession:
                 and resolved_import.imported_name is not None
                 and resolved_import.imported_name != "*"
             ):
-                key = (resolved_import.lineno, resolved_import.imported_name)
+                key = (
+                    resolved_import.range.start.line + 1,
+                    resolved_import.imported_name,
+                )
                 workspace_from[key] = resolved_import
         if not workspace_from:
             return []
 
-        reexported = self._reexported_names_for_module(
-            module_result.module, mirror_path
-        )
+        reexported = self._reexported_names_for_module(module_result.module, mirror_path)
         # A name listed in this module's own static `__all__` is an intentional
         # public re-export; removing it would break the facade's API.
         static_all = _static_module_all_names(tree)
@@ -5317,11 +3547,14 @@ class WorkspaceSession:
                     continue
                 if binding in static_all:
                     continue
-                references = self.find_references(real_path, binding)
+                references = self._find_references_by_name(real_path, binding)
                 # A binding that doesn't resolve to a workspace symbol is a
                 # *broken* import (its own `unresolved-symbol` diagnostic), not
                 # an unused one — leave it to that diagnostic + its quick fix.
-                if references.target.resolution != "workspace":
+                if (
+                    not isinstance(references.target, ResolvedTarget)
+                    or references.target.resolution != "workspace"
+                ):
                     continue
                 if any(ref.path == real_path for ref in references.references):
                     continue
@@ -5329,21 +3562,24 @@ class WorkspaceSession:
                     AnalysisDiagnostic(
                         path=real_path,
                         code="unused-import",
-                        message=(
-                            f"Imported name {binding!r} is not used in this module."
-                        ),
+                        message=(f"Imported name {binding!r} is not used in this module."),
                         severity="hint",
                         source="pyinc.symbol_resolution",
-                        lineno=alias.lineno,
-                        col_offset=alias.col_offset,
+                        range=SourceRange(
+                            SourcePosition(alias.lineno - 1, alias.col_offset),
+                            SourcePosition(
+                                (alias.end_lineno or alias.lineno) - 1,
+                                alias.end_col_offset
+                                if alias.end_col_offset is not None
+                                else alias.col_offset + len(alias.name),
+                            ),
+                        ),
                         tags=("unnecessary",),
                     )
                 )
         return diagnostics
 
-    def _reexported_names_for_module(
-        self, file_module: str, self_mirror_path: str
-    ) -> set[str]:
+    def _reexported_names_for_module(self, file_module: str, self_mirror_path: str) -> set[str]:
         """Names other workspace modules import ``from <file_module>``.
 
         Removing a ``from M import name`` binding in this file is only safe
@@ -5376,9 +3612,7 @@ class WorkspaceSession:
             for _, group_entries in config.optional_dependency_groups:
                 declared.extend(group_entries)
         if requirements is not None:
-            declared.extend(
-                requirement.raw_line for requirement in requirements.requirements
-            )
+            declared.extend(requirement.raw_line for requirement in requirements.requirements)
 
         return _DependencyInputs(
             config=self._remap_config_analysis(config),
@@ -5394,18 +3628,29 @@ class WorkspaceSession:
         only_path: str | None = None,
     ) -> tuple[AnalysisDiagnostic, ...]:
         diagnostics: list[AnalysisDiagnostic] = []
-        requirements_by_name: dict[str, tuple[str, int]] = {}
+        requirements_by_name: dict[str, tuple[str, SourceRange]] = {}
         if dependency_inputs.requirements is not None:
+            requirements_path = dependency_inputs.requirements.path
+            if only_path is None or requirements_path == only_path:
+                for code, message in dependency_inputs.requirements.diagnostics:
+                    diagnostics.append(
+                        AnalysisDiagnostic(
+                            path=requirements_path,
+                            code=code,
+                            message=message,
+                            severity="error",
+                            source="pyinc.requirements_txt",
+                            range=SourceRange(SourcePosition(0, 0), SourcePosition(0, 1)),
+                        )
+                    )
             for requirement in dependency_inputs.requirements.requirements:
                 requirements_by_name.setdefault(
                     _normalize_dependency_name(requirement.name),
-                    (dependency_inputs.requirements.path, requirement.lineno),
+                    (dependency_inputs.requirements.path, requirement.range),
                 )
 
         config_path = (
-            dependency_inputs.config.path
-            if dependency_inputs.config is not None
-            else None
+            dependency_inputs.config.path if dependency_inputs.config is not None else None
         )
 
         for status in dependency_check.statuses:
@@ -5413,9 +3658,10 @@ class WorkspaceSession:
                 continue
 
             if status.name in requirements_by_name:
-                path, lineno = requirements_by_name[status.name]
+                path, source_range = requirements_by_name[status.name]
             elif config_path is not None:
-                path, lineno = config_path, 1
+                path = config_path
+                source_range = SourceRange(SourcePosition(0, 0), SourcePosition(0, 1))
             else:
                 continue
 
@@ -5430,8 +3676,7 @@ class WorkspaceSession:
                     message=message,
                     severity="warning",
                     source="pyinc.dependency_check",
-                    lineno=lineno,
-                    col_offset=0,
+                    range=source_range,
                 )
             )
 
@@ -5441,9 +3686,7 @@ class WorkspaceSession:
                 target_path = dependency_inputs.requirements.path
             elif dependency_inputs.config is not None:
                 target_path = dependency_inputs.config.path
-            if target_path is not None and (
-                only_path is None or target_path == only_path
-            ):
+            if target_path is not None and (only_path is None or target_path == only_path):
                 for code, message in dependency_check.diagnostics:
                     diagnostics.append(
                         AnalysisDiagnostic(
@@ -5452,8 +3695,7 @@ class WorkspaceSession:
                             message=message,
                             severity="warning",
                             source="pyinc.dependency_check",
-                            lineno=1,
-                            col_offset=0,
+                            range=SourceRange(SourcePosition(0, 0), SourcePosition(0, 1)),
                         )
                     )
 
@@ -5472,80 +3714,24 @@ class WorkspaceSession:
             f"{status.detail or status.declared_spec!r}"
         )
 
-    def _copy_workspace_into_mirror(self) -> None:
-        for current_root, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = [
-                name for name in dirnames if name not in self._ignored_dir_names
-            ]
-            relative_dir = (
-                Path(current_root).resolve(strict=False).relative_to(Path(self.root))
-            )
-            target_dir = self._mirror_root_path / relative_dir
-            target_dir.mkdir(parents=True, exist_ok=True)
-            for filename in filenames:
-                source_path = Path(current_root, filename)
-                target_path = target_dir / filename
-                shutil.copy2(source_path, target_path)
-
     def _normalize_real_path(self, path: str | os.PathLike[str]) -> str:
-        candidate = Path(path)
-        if not candidate.is_absolute():
-            candidate = Path(self.root, candidate)
-        normalized = candidate.resolve(strict=False)
-        try:
-            normalized.relative_to(Path(self.root))
-        except ValueError as exc:
-            raise ValueError(
-                f"{normalized!s} is outside the workspace root {self.root!r}."
-            ) from exc
-        return str(normalized)
+        return self._mirror.normalize_real_path(path)
 
     def _mirror_path_for_real(self, real_path: str) -> Path:
-        relative_path = Path(real_path).relative_to(Path(self.root))
-        return self._mirror_root_path / relative_path
+        return self._mirror.mirror_path_for_real(real_path)
 
     def _sync_path_from_disk(self, real_path: str) -> None:
-        source_path = Path(real_path)
-        mirror_path = self._mirror_path_for_real(real_path)
-        if source_path.exists():
-            if source_path.is_dir():
-                mirror_path.mkdir(parents=True, exist_ok=True)
-                return
-            mirror_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_path, mirror_path)
-            return
-
-        if mirror_path.is_dir():
-            shutil.rmtree(mirror_path)
-        elif mirror_path.exists():
-            mirror_path.unlink()
-        self._prune_empty_parents(mirror_path.parent)
-
-    def _prune_empty_parents(self, directory: Path) -> None:
-        while directory != self._mirror_root_path:
-            if not directory.exists():
-                directory = directory.parent
-                continue
-            try:
-                next(directory.iterdir())
-                return
-            except StopIteration:
-                directory.rmdir()
-                directory = directory.parent
+        self._mirror.sync_path_from_disk(real_path)
 
     def _remap_workspace_analysis(
         self, analysis: PythonWorkspaceAnalysis
     ) -> PythonWorkspaceAnalysis:
         return PythonWorkspaceAnalysis(
             root=self.root,
-            modules=tuple(
-                self._remap_module_analysis(module) for module in analysis.modules
-            ),
+            modules=tuple(self._remap_module_analysis(module) for module in analysis.modules),
         )
 
-    def _remap_module_analysis(
-        self, analysis: PythonModuleAnalysis
-    ) -> PythonModuleAnalysis:
+    def _remap_module_analysis(self, analysis: PythonModuleAnalysis) -> PythonModuleAnalysis:
         return PythonModuleAnalysis(
             path=self._remap_path(analysis.path) or analysis.path,
             module=analysis.module,
@@ -5556,7 +3742,7 @@ class WorkspaceSession:
                 ResolvedImportRef(
                     module=item.module,
                     kind=item.kind,
-                    lineno=item.lineno,
+                    range=item.range,
                     imported_name=item.imported_name,
                     resolved_module=item.resolved_module,
                     resolved_path=self._remap_path(item.resolved_path),
@@ -5584,9 +3770,7 @@ class WorkspaceSession:
             impurity_reasons=table.impurity_reasons,
         )
 
-    def _remap_workspace_symbol_index(
-        self, index: WorkspaceSymbolIndex
-    ) -> WorkspaceSymbolIndex:
+    def _remap_workspace_symbol_index(self, index: WorkspaceSymbolIndex) -> WorkspaceSymbolIndex:
         return WorkspaceSymbolIndex(
             root=self.root,
             entries=index.entries,
@@ -5600,7 +3784,7 @@ class WorkspaceSession:
                 ClassMember(
                     name=member.name,
                     kind=member.kind,
-                    lineno=member.lineno,
+                    range=member.range,
                     annotation=member.annotation,
                     signature=member.signature,
                     defining_path=self._remap_path(member.defining_path),
@@ -5611,23 +3795,21 @@ class WorkspaceSession:
             unresolved_bases=model.unresolved_bases,
         )
 
-    def _remap_resolved_symbol(self, symbol: ResolvedSymbol) -> ResolvedSymbol:
-        return ResolvedSymbol(
+    def _remap_resolved_target(self, symbol: ResolvedTarget) -> ResolvedTarget:
+        return ResolvedTarget(
             original_module=symbol.original_module,
             qualified_name=symbol.qualified_name,
             resolution=symbol.resolution,
             defining_module=symbol.defining_module,
             defining_path=self._remap_path(symbol.defining_path),
-            defining_lineno=symbol.defining_lineno,
+            range=symbol.range,
             distribution_name=symbol.distribution_name,
             distribution_version=symbol.distribution_version,
             follow_depth=symbol.follow_depth,
             trail=symbol.trail,
         )
 
-    def _remap_config_analysis(
-        self, analysis: ConfigAnalysis | None
-    ) -> ConfigAnalysis | None:
+    def _remap_config_analysis(self, analysis: ConfigAnalysis | None) -> ConfigAnalysis | None:
         if analysis is None:
             return None
         return ConfigAnalysis(
@@ -5657,7 +3839,7 @@ class WorkspaceSession:
             return None
         candidate = Path(path)
         try:
-            relative_path = candidate.relative_to(self._mirror_root_path)
+            relative_path = candidate.relative_to(self._mirror.mirror_root_path)
         except ValueError:
             return path
         return str(Path(self.root, relative_path))
@@ -5665,7 +3847,7 @@ class WorkspaceSession:
     def _dedupe_diagnostics(
         self, diagnostics: tuple[AnalysisDiagnostic, ...]
     ) -> tuple[AnalysisDiagnostic, ...]:
-        seen: set[tuple[str, str, str, str, str, int | None, int | None]] = set()
+        seen: set[tuple[str, str, str, str, str, SourceRange | None]] = set()
         ordered: list[AnalysisDiagnostic] = []
         for diagnostic in diagnostics:
             key = (
@@ -5674,152 +3856,10 @@ class WorkspaceSession:
                 diagnostic.message,
                 diagnostic.severity,
                 diagnostic.source,
-                diagnostic.lineno,
-                diagnostic.col_offset,
+                diagnostic.range,
             )
             if key in seen:
                 continue
             seen.add(key)
             ordered.append(diagnostic)
         return tuple(ordered)
-
-
-class PollingWorkspaceWatcher:
-    def __init__(
-        self,
-        session: WorkspaceSession,
-        *,
-        debounce_ms: int = 200,
-        clock: Callable[[], float] | None = None,
-    ) -> None:
-        self._session = session
-        self._debounce_seconds = debounce_ms / 1000.0
-        self._clock = clock or time.monotonic
-        self._snapshot = _collect_filesystem_snapshot(
-            self._session.root,
-            self._session._ignored_dir_names,
-        )
-        self._pending: dict[str, float] = {}
-        self._thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
-        self._on_change: Callable[[tuple[str, ...]], None] | None = None
-        self._on_error: Callable[[Exception], None] | None = None
-
-    @property
-    def is_running(self) -> bool:
-        thread = self._thread
-        return thread is not None and thread.is_alive()
-
-    def poll(self) -> tuple[str, ...]:
-        if self.is_running:
-            raise RuntimeError(
-                "PollingWorkspaceWatcher is running; stop() it before calling poll() directly."
-            )
-        return self._poll_once()
-
-    def _poll_once(self) -> tuple[str, ...]:
-        now = self._clock()
-        current_snapshot = _collect_filesystem_snapshot(
-            self._session.root,
-            self._session._ignored_dir_names,
-        )
-
-        changed_paths = {
-            path
-            for path in set(self._snapshot) | set(current_snapshot)
-            if self._snapshot.get(path) != current_snapshot.get(path)
-        }
-        for path in changed_paths:
-            self._pending[path] = now
-
-        ready = tuple(
-            sorted(
-                path
-                for path, seen_at in self._pending.items()
-                if now - seen_at >= self._debounce_seconds
-            )
-        )
-        for path in ready:
-            self._pending.pop(path, None)
-        if ready:
-            self._session.refresh_paths(list(ready))
-
-        self._snapshot = current_snapshot
-        return ready
-
-    def start(
-        self,
-        on_change: Callable[[tuple[str, ...]], None],
-        *,
-        interval_s: float | None = None,
-        on_error: Callable[[Exception], None] | None = None,
-    ) -> None:
-        if self.is_running:
-            raise RuntimeError("PollingWorkspaceWatcher is already running.")
-        effective_interval = (
-            interval_s
-            if interval_s is not None
-            else max(self._debounce_seconds / 2.0, 0.05)
-        )
-        self._on_change = on_change
-        self._on_error = on_error
-        self._stop_event = threading.Event()
-        thread = threading.Thread(
-            target=self._run,
-            args=(effective_interval,),
-            name="pyinc-tools-watcher",
-            daemon=True,
-        )
-        self._thread = thread
-        thread.start()
-
-    def stop(self, *, timeout: float = 5.0) -> None:
-        thread = self._thread
-        if thread is None:
-            return
-        self._stop_event.set()
-        thread.join(timeout)
-        if thread.is_alive():
-            print(
-                "pyinc-tools watcher: thread did not stop within timeout",
-                file=sys.stderr,
-            )
-        self._thread = None
-        self._on_change = None
-        self._on_error = None
-
-    def __enter__(self) -> PollingWorkspaceWatcher:
-        return self
-
-    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
-        self.stop()
-
-    def _run(self, interval_s: float) -> None:
-        while not self._stop_event.is_set():
-            try:
-                ready = self._poll_once()
-            except RuntimeError:
-                # Session was closed out from under us; exit cleanly.
-                return
-            except Exception as exc:  # pragma: no cover - defensive
-                self._handle_error(exc)
-                ready = ()
-            if ready:
-                callback = self._on_change
-                if callback is not None:
-                    try:
-                        callback(ready)
-                    except Exception as exc:
-                        self._handle_error(exc)
-            if self._stop_event.wait(interval_s):
-                return
-
-    def _handle_error(self, exc: Exception) -> None:
-        if self._on_error is not None:
-            with contextlib.suppress(Exception):  # pragma: no cover - defensive
-                self._on_error(exc)
-            return
-        print(
-            f"pyinc-tools watcher: callback raised: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )

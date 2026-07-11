@@ -186,9 +186,7 @@ def test_resolve_import_name_unknown(
 # ---------------------------------------------------------------------------
 
 
-def test_top_level_fallback_when_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_top_level_fallback_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     # No top_level.txt → should fall back to normalized dist name
@@ -210,9 +208,7 @@ def test_top_level_fallback_when_missing(
 # ---------------------------------------------------------------------------
 
 
-def test_multiple_top_level_names(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_multiple_top_level_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     _make_dist_info(site_dir, "boto3", "1.28.0", top_level="boto3\nbotocore")
@@ -253,6 +249,39 @@ def test_malformed_metadata_produces_diagnostic(
     assert analysis.diagnostics[0][0] == "metadata-parse-failed"
 
 
+def test_metadata_headers_are_case_insensitive_and_unfolded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    dist_info = site_dir / "mixed-1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "metadata-version: 2.1\n"
+        "nAmE: Mixed-Pkg\n"
+        "vErSiOn: 1.0\n"
+        "sUmMaRy: first line\n"
+        " second line\n"
+        "rEqUiReS-DiSt: dependency>=1;\n"
+        ' python_version >= "3.11"\n',
+        encoding="utf-8",
+    )
+    (dist_info / "top_level.txt").write_text("mixed_pkg\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    analysis = installed_packages_analysis(Database(mode="strict"))
+
+    assert analysis.diagnostics == ()
+    package = analysis.packages[0]
+    assert package.distribution_name == "Mixed-Pkg"
+    assert package.version == "1.0"
+    assert package.summary == "first line second line"
+    assert package.requires_dist == ('dependency>=1; python_version >= "3.11"',)
+
+
 def test_empty_site_packages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
@@ -268,9 +297,7 @@ def test_empty_site_packages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert len(analysis.stdlib_modules) > 0
 
 
-def test_non_dist_info_entries_ignored(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_non_dist_info_entries_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     # Create non-dist-info directories/files that should be ignored
@@ -296,9 +323,7 @@ def test_non_dist_info_entries_ignored(
 # ---------------------------------------------------------------------------
 
 
-def test_metadata_comment_edit_backdates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_metadata_comment_edit_backdates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     dist_info = _make_dist_info(site_dir, "example", "1.0.0", top_level="example")
@@ -321,9 +346,7 @@ def test_metadata_comment_edit_backdates(
     assert first == second
 
 
-def test_version_change_invalidates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_version_change_invalidates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     dist_info = _make_dist_info(site_dir, "example", "1.0.0", top_level="example")
@@ -367,16 +390,12 @@ def test_installed_packages_matches_fresh_recomputation(
 
     # Step 1: empty
     fresh1 = Database(mode=mode)
-    assert installed_packages_analysis(incremental) == installed_packages_analysis(
-        fresh1
-    )
+    assert installed_packages_analysis(incremental) == installed_packages_analysis(fresh1)
 
     # Step 2: add a package
     _make_dist_info(site_dir, "pkg-a", "1.0.0", top_level="pkg_a")
     fresh2 = Database(mode=mode)
-    assert installed_packages_analysis(incremental) == installed_packages_analysis(
-        fresh2
-    )
+    assert installed_packages_analysis(incremental) == installed_packages_analysis(fresh2)
 
     # Step 3: add another package
     _make_dist_info(
@@ -387,9 +406,7 @@ def test_installed_packages_matches_fresh_recomputation(
         requires_dist=("pkg-a>=1.0",),
     )
     fresh3 = Database(mode=mode)
-    assert installed_packages_analysis(incremental) == installed_packages_analysis(
-        fresh3
-    )
+    assert installed_packages_analysis(incremental) == installed_packages_analysis(fresh3)
 
     # Step 4: modify metadata (version bump)
     dist_info = site_dir / "pkg-a-1.0.0.dist-info"
@@ -398,18 +415,14 @@ def test_installed_packages_matches_fresh_recomputation(
         encoding="utf-8",
     )
     fresh4 = Database(mode=mode)
-    assert installed_packages_analysis(incremental) == installed_packages_analysis(
-        fresh4
-    )
+    assert installed_packages_analysis(incremental) == installed_packages_analysis(fresh4)
 
     # Step 5: remove a package
     import shutil
 
     shutil.rmtree(site_dir / "pkg-b-2.0.0.dist-info")
     fresh5 = Database(mode=mode)
-    assert installed_packages_analysis(incremental) == installed_packages_analysis(
-        fresh5
-    )
+    assert installed_packages_analysis(incremental) == installed_packages_analysis(fresh5)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -427,16 +440,12 @@ def test_resolve_import_matches_fresh_recomputation(
 
     # Step 1: resolve before any package exists
     fresh1 = Database(mode=mode)
-    assert resolve_import_name(incremental, "pkg_a") == resolve_import_name(
-        fresh1, "pkg_a"
-    )
+    assert resolve_import_name(incremental, "pkg_a") == resolve_import_name(fresh1, "pkg_a")
 
     # Step 2: add the package
     _make_dist_info(site_dir, "pkg-a", "1.0.0", top_level="pkg_a")
     fresh2 = Database(mode=mode)
-    assert resolve_import_name(incremental, "pkg_a") == resolve_import_name(
-        fresh2, "pkg_a"
-    )
+    assert resolve_import_name(incremental, "pkg_a") == resolve_import_name(fresh2, "pkg_a")
     assert resolve_import_name(incremental, "pkg_a").origin == "installed"
 
     # Step 3: check stdlib resolution stays correct

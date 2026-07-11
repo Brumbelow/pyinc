@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.resources import DirectoryResource, _file_read_snapshot
+from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
+
+from ._resources import file_read_snapshot
 
 JsonKeyPayload: TypeAlias = tuple[str, str, str, str]
 JsonSectionPayload: TypeAlias = tuple[str, tuple[JsonKeyPayload, ...], tuple[str, ...]]
@@ -54,7 +57,7 @@ class _JsonFileResource:
     encoding: str = "utf-8"
 
     def read(self, db: Database, path: str | os.PathLike[str]) -> str:
-        return cast(str, db._read_resource(self, os.fspath(path)))
+        return cast(str, db.read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"jsonfile[{path}]"
@@ -69,18 +72,48 @@ class _JsonFileResource:
         file_path = Path(path)
         if not file_path.exists():
             return ""
-        with db._allow_raw_open():
-            return file_path.read_text(encoding=self.encoding)
+        return file_path.read_text(encoding=self.encoding)
 
-    def probe_and_load(
-        self, db: Database, path: str
-    ) -> tuple[tuple[str, str] | tuple[str], str]:
-        probe, text = _file_read_snapshot(path, self.encoding)
+    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
+        probe, text = file_read_snapshot(path, self.encoding)
         return probe, text if text is not None else ""
 
 
 _FILES = _JsonFileResource()
 _DIRECTORIES = DirectoryResource()
+
+
+class _DuplicateJsonKeyError(ValueError):
+    pass
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON number {value!r} is not permitted")
+
+
+def _parse_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number {value!r} is not permitted")
+    return parsed
+
+
+def _json_object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKeyError(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
+
+
+def _load_json(text: str) -> Any:
+    return json.loads(
+        text,
+        object_pairs_hook=_json_object_from_pairs,
+        parse_constant=_reject_json_constant,
+        parse_float=_parse_json_float,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -140,20 +173,20 @@ def _walk_sections(
 
 def _json_cutoff_token(text: str) -> tuple[str, str]:
     try:
-        parsed = json.loads(text)
+        parsed = _load_json(text)
         snapshot = freeze(parsed)
         return ("parsed", repr(snapshot))
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError, OverflowError):
         return ("raw", text)
 
 
 def _try_parse_json(text: str) -> dict[str, Any] | None:
     try:
-        result = json.loads(text)
+        result = _load_json(text)
         if isinstance(result, dict):
             return result
         return None
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError, OverflowError):
         return None
 
 
@@ -182,9 +215,9 @@ def json_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload
     if not text:
         return ()
     try:
-        json.loads(text)
+        _load_json(text)
         return ()
-    except json.JSONDecodeError as exc:
+    except (ValueError, RecursionError, OverflowError) as exc:
         return (("json-decode-error", str(exc)),)
 
 
@@ -210,8 +243,7 @@ def _decode_section(payload: JsonSectionPayload) -> JsonSection:
     return JsonSection(
         name=name,
         keys=tuple(
-            JsonKey(section=k[0], key=k[1], value_type=k[2], string_value=k[3])
-            for k in keys
+            JsonKey(section=k[0], key=k[1], value_type=k[2], string_value=k[3]) for k in keys
         ),
         subsections=subsections,
     )

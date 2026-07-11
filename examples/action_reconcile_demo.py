@@ -41,15 +41,15 @@ def main() -> None:
         db.set(NAMES, ("alpha", "beta"))
 
         first = emit.reconcile(db, str(src), root=out)
-        print(f"first_written={first.written}")
+        print(f"first_created={first.created}")
 
         rerun = emit.reconcile(db, str(src), root=out)
-        print(f"rerun_written={rerun.written}")
+        print(f"rerun_updated={rerun.updated}")
 
         # Out-of-band edit to a generated file is detected via hash mismatch.
         (out / "beta.txt").write_text("TAMPERED", encoding="utf-8")
         repaired = emit.reconcile(db, str(src), root=out)
-        print(f"tamper_repaired={repaired.written}")
+        print(f"tamper_repaired={repaired.repaired}")
 
         # Removing a declaration deletes only that owned output.
         db.set(NAMES, ("alpha",))
@@ -59,7 +59,7 @@ def main() -> None:
         # Dry-run plan writes nothing.
         plan_root = root / "planned"
         plan = emit.plan(db, str(src), root=plan_root)
-        print(f"plan_written={plan.written}")
+        print(f"plan_created={plan.created}")
         print(f"plan_only_no_files={not plan_root.exists()}")
 
 

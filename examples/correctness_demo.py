@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import tempfile
 import textwrap
+from collections.abc import Mapping
 from pathlib import Path
 
 from pyinc import Database, FileResource, UntrackedReadError, query
@@ -49,9 +50,7 @@ def count_functions(db: Database, path: str) -> int:
         tree = ast.parse(source)
     except SyntaxError:
         return 0
-    return sum(
-        1 for node in ast.iter_child_nodes(tree) if isinstance(node, ast.FunctionDef)
-    )
+    return sum(1 for node in ast.iter_child_nodes(tree) if isinstance(node, ast.FunctionDef))
 
 
 @query
@@ -63,9 +62,7 @@ def count_imports(db: Database, path: str) -> int:
     except SyntaxError:
         return 0
     return sum(
-        1
-        for node in ast.iter_child_nodes(tree)
-        if isinstance(node, ast.Import | ast.ImportFrom)
+        1 for node in ast.iter_child_nodes(tree) if isinstance(node, ast.Import | ast.ImportFrom)
     )
 
 
@@ -109,7 +106,7 @@ def main() -> None:
         db = Database(mode="strict")
         result = db.get(summary, str(sample))
         print(f"Result: {result}")
-        print(f"\nProvenance tree:")
+        print("\nProvenance tree:")
         print(db.explain(summary, str(sample)))
 
         # --- Phase 2: Comment-only edit → backdating (early cutoff) ---
@@ -135,10 +132,10 @@ def main() -> None:
 
         node = db.inspect(summary, str(sample))
         print(f"\nsummary decision: {node.last_decision}")
-        print(f"  (read_source was re-read from disk but the AST cutoff")
-        print(f"   detected no structural change → downstream queries")
-        print(f"   were backdated and did NOT re-execute)")
-        print(f"\nFull provenance:")
+        print("  (read_source was re-read from disk but the AST cutoff")
+        print("   detected no structural change → downstream queries")
+        print("   were backdated and did NOT re-execute)")
+        print("\nFull provenance:")
         print(db.explain(summary, str(sample)))
 
         # --- Phase 3: Structural edit → selective recomputation ---
@@ -165,7 +162,7 @@ def main() -> None:
 
         result3 = db.get(summary, str(sample))
         print(f"Result: {result3}")
-        print(f"\nProvenance (structural change forces recomputation):")
+        print("\nProvenance (structural change forces recomputation):")
         print(db.explain(summary, str(sample)))
 
         # --- Phase 4: Untracked read enforcement ---
@@ -183,9 +180,9 @@ def main() -> None:
             print("ERROR: should have raised!")
         except UntrackedReadError as exc:
             print(f"Caught UntrackedReadError: {exc}")
-            print(f"\n  pyinc patches builtins.open during query execution.")
-            print(f"  All file reads must go through FileResource to maintain")
-            print(f"  the from-scratch consistency guarantee.")
+            print("\n  pyinc patches builtins.open during query execution.")
+            print("  All file reads must go through FileResource to maintain")
+            print("  the from-scratch consistency guarantee.")
 
         # --- Phase 5: Mutation protection (strict mode) ---
         _banner("Phase 5: Mutation protection (strict mode)")
@@ -194,18 +191,18 @@ def main() -> None:
         def get_config(db: Database) -> dict[str, int]:
             return {"a": 1, "b": 2}
 
-        frozen_result = db.get(get_config)
+        frozen_result: Mapping[str, int] = db.get(get_config)
         print(f"Query returned: {frozen_result} (type: {type(frozen_result).__name__})")
         print(f"  frozen_result['a'] = {frozen_result['a']}")
-        print(f"\nAttempting to mutate the frozen result...")
+        print("\nAttempting to mutate the frozen result...")
         try:
             frozen_result["c"] = 3  # type: ignore[index]
             print("ERROR: should have raised!")
         except TypeError as exc:
             print(f"Caught TypeError: {exc}")
-            print(f"\n  In strict mode, query results are frozen at the boundary.")
-            print(f"  Lists become FrozenList, dicts become FrozenDict, etc.")
-            print(f"  This prevents external aliases from corrupting cached state.")
+            print("\n  In strict mode, query results are frozen at the boundary.")
+            print("  Lists become FrozenList, dicts become FrozenDict, etc.")
+            print("  This prevents external aliases from corrupting cached state.")
 
         # --- Phase 6: Provenance summary ---
         _banner("Phase 6: Final provenance inspection")
@@ -220,7 +217,7 @@ def main() -> None:
         for dep in node.dependencies:
             print(f"    - {dep.label}: {dep.last_decision}")
 
-        print(f"\n--- Demo complete ---")
+        print("\n--- Demo complete ---")
 
 
 if __name__ == "__main__":

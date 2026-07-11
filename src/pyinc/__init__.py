@@ -1,7 +1,19 @@
 from .action import Action, Output, ReconcileResult, action
-from .core import Input, query
+from .core import Input, Query, query
 from .errors import (
+    ActionError,
+    ActionLockTimeoutError,
+    ActionManifestError,
+    ActionPathError,
+    ArtifactStoreError,
+    ArtifactStoreKeyError,
+    ArtifactStoreLockError,
+    CheckpointError,
+    CheckpointIntegrityError,
+    CheckpointManifestError,
+    CheckpointVersionError,
     CycleError,
+    InputKeyError,
     MutationError,
     PyIncError,
     UnsupportedValueError,
@@ -9,11 +21,13 @@ from .errors import (
 )
 from .explain import CaptureInfo, InspectionNode, explain_query_captures
 from .resources import (
+    BinaryFileResource,
     DirectoryResource,
     EnvResource,
     FileResource,
     FileStatResource,
     FileStatSnapshot,
+    Resource,
 )
 from .runtime import (
     Database,
@@ -48,8 +62,20 @@ from .value import (
 
 __all__ = [
     "Action",
+    "ActionError",
+    "ActionLockTimeoutError",
+    "ActionManifestError",
+    "ActionPathError",
     "ArtifactStore",
+    "ArtifactStoreError",
+    "ArtifactStoreKeyError",
+    "ArtifactStoreLockError",
+    "BinaryFileResource",
     "CaptureInfo",
+    "CheckpointError",
+    "CheckpointIntegrityError",
+    "CheckpointManifestError",
+    "CheckpointVersionError",
     "CycleError",
     "Database",
     "DatabaseStatistics",
@@ -69,6 +95,7 @@ __all__ = [
     "FrozenSet",
     "InMemoryArtifactStore",
     "Input",
+    "InputKeyError",
     "InspectionNode",
     "MutationError",
     "ObserverCallback",
@@ -76,8 +103,10 @@ __all__ = [
     "Output",
     "PyIncError",
     "QueryChangeEvent",
+    "Query",
     "QueryProfile",
     "ReconcileResult",
+    "Resource",
     "Subscription",
     "UnsupportedValueError",
     "UntrackedReadError",

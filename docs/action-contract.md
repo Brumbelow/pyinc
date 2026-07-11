@@ -1,124 +1,113 @@
 # Action Contract — Declared-Output Reconciliation
 
-The kernel contract (`docs/kernel-contract.md`) governs *pure* incremental
-evaluation: queries read tracked inputs and resources and return snapshot-safe
-values. It says nothing about side effects, because queries have none. The
-**action layer** is where derived results meet the filesystem.
-
-## The split: queries derive, actions reconcile
-
-- A **query** derives *desired* artifacts. It is pure and tracked: it reads
-  inputs/resources, computes content, and returns it. Because `Output` is
-  snapshot-safe (`path: str`, `content: bytes`), a `tuple[Output, ...]` may be
-  the return value of a `@query` and participates in caching/backdating like
-  any other value.
-- An **action** (`@action(tool=...)`) reconciles a desired `Output` set against
-  the filesystem. Reconciliation is the *only* place writes happen. Actions run
-  at top level — never inside a query — so they do not pollute the dependency
-  graph and the untracked-read guard (which only fires inside queries) is not
-  involved.
-
-This keeps the soundness envelope intact: nothing in the action layer changes
-query semantics, the value membrane, untracked-read enforcement, or the
-`strict`/`checked`/`fast` modes.
+Queries derive desired artifacts without side effects. An `Action` is the
+top-level boundary that reconciles those artifacts with a filesystem. It does
+not run inside the query graph.
 
 ## Public surface
 
 ```python
-from pyinc import Output, ReconcileResult, Action, action
+from pyinc import (
+    Action,
+    ActionLockTimeoutError,
+    ActionManifestError,
+    ActionPathError,
+    Output,
+    ReconcileResult,
+    action,
+)
 ```
 
-- `Output(path: str, content: bytes)` — one declared output. `path` is relative
-  to the reconcile root (POSIX). `Output.text(path, text, *, encoding="utf-8")`
-  builds one from text.
-- `@action(tool: str)` wraps `(db, *args) -> Iterable[Output]` into an `Action`.
-- `Action.outputs(db, *args, **kwargs) -> tuple[Output, ...]` — the pure desired
-  set (forwards to the wrapped function).
-- `Action.reconcile(db, *args, root, dry_run=False, state_dir=None, **kwargs)
-  -> ReconcileResult` — apply the desired set to `root`.
-- `Action.plan(db, *args, root, state_dir=None, **kwargs) -> ReconcileResult` —
-  dry-run reconcile (writes nothing).
-- `ReconcileResult(written, deleted, unchanged, dry_run)` — root-relative POSIX
-  path tuples describing the outcome.
+- `Output(path, content)` declares exact bytes at a root-relative POSIX path.
+  `Output.text(...)` encodes text explicitly.
+- `@action(tool="stable identity", lock_timeout=30.0)` wraps a pure desired-set
+  function.
+- `reconcile(..., root=..., state_dir=None, lock_timeout=None)` converges the
+  filesystem. `plan(...)` performs the same validation under the same lock but
+  does not mutate the output root or ledger.
+- `ReconcileResult` reports `created`, `updated`, `repaired`, `deleted`, and
+  `unchanged` path tuples plus `dry_run`. There is no aggregate `written` field
+  in v3.
 
-`root`, `dry_run`, and `state_dir` are reserved keyword-only parameters of
-`reconcile` / `plan`; the wrapped action's own positional `*args` and remaining
-`**kwargs` are forwarded to it, so an action function must not declare
-parameters named `root`, `dry_run`, or `state_dir`.
+`created` means the action claimed a previously absent output. `updated` means
+an existing file was intentionally changed to a new desired value. `repaired`
+means a previously owned output was missing or no longer matched its recorded
+digest. These distinctions make tamper recovery observable without inspecting
+the filesystem.
 
-## The reconcile algorithm
+## Preflight and portable paths
 
-For a desired set `{rel -> bytes}` against `root` (manifest under `state_dir`,
-default `root`):
+The complete desired iterable is materialized and validated before any write.
+Paths must be non-empty, normalized, relative POSIX file names. Absolute,
+drive-qualified, UNC, backslash-containing, dot, traversal, duplicate, and
+NUL-containing paths are rejected with `ActionPathError`.
 
-1. **Materialize** the desired set by calling the wrapped function. Duplicate
-   relative paths are a `ValueError`; absolute paths or `..` escapes are a
-   `ValueError`. The full set is computed *before* any write, so a failure in
-   output computation writes nothing.
-2. **Write what differs.** For each declared output, read the on-disk bytes and
-   compare `sha256(on_disk)` to `sha256(desired)`. Equal → *unchanged* (no
-   write). Missing or different → atomic rewrite (temp file in the target's
-   directory, then `os.replace`). This single hash rule simultaneously gives:
-   - unchanged output left untouched,
-   - changed input rewrites only the affected outputs,
-   - **out-of-band edits repaired** — a hand-edited or corrupted output hashes
-     differently from the desired bytes and is rewritten on the next reconcile.
-3. **Delete orphans.** Any path recorded in *our* manifest that the desired set
-   no longer declares is deleted. We only ever delete paths we previously wrote;
-   files the action does not own are never touched.
-4. **Update the manifest** — but only if it changed. A no-op reconcile (nothing
-   written, nothing deleted) leaves the manifest byte-identical and therefore
-   performs **zero filesystem writes**.
+The action rejects collisions after Unicode NFC normalization and case folding,
+as well as a set that treats one output as both a file and a directory (for
+example `pkg` and `pkg/model.py`). The ownership manifest receives the same
+whole-set validation before any desired output is touched.
 
-## Ownership ledger (manifest) and tool identity
+The root is resolved once. Every owned target is checked before preflight and
+again immediately before a write or deletion. Existing path components may not
+be symbolic links, all resolved parents must remain under the root, and an
+owned target must be a regular file. An orphan that has become a directory,
+device, or symbolic link is never deleted.
 
-Orphan deletion needs to know what the action wrote last time. Each reconcile
-reads/writes a deterministic JSON manifest `.pyinc-action.<tool-slug>.json`
-under `state_dir`, namespaced by the action's **tool identity**:
+## Locking, publication, and recovery
 
-```json
-{ "tool": "pyinc-codegen", "version": 1, "outputs": { "a.py": "<sha256>", "docs/a.md": "<sha256>" } }
+The full preflight/write/delete/manifest sequence is protected by advisory
+cross-process locks keyed by the resolved root, state directory, and full tool identity. The
+default timeout is 30 seconds and can be configured on the decorator or each
+call. A timeout raises `ActionLockTimeoutError`; a symlink, non-regular lock
+target, or other unsafe lock-path failure raises `ActionPathError` before any
+desired output is evaluated or mutated.
+
+Changed files are flushed to same-directory temporary files and atomically
+published. On POSIX, parent directories are traversed with no-follow directory
+descriptors and publication/deletion is relative to the opened directory. On
+Windows, every directory component is opened with
+`FILE_FLAG_OPEN_REPARSE_POINT`, validated as a non-reparse directory, and held
+without `FILE_SHARE_DELETE` until the operation completes. Temporary files are
+published with `SetFileInformationByHandle`, and orphans are marked for deletion
+through their already-validated handles. A concurrent symlink or junction swap
+therefore cannot redirect either operation outside the root. POSIX additionally
+reopens and compares an opened parent's filesystem identity immediately before
+publication or deletion, rejecting a parent that was renamed after traversal.
+POSIX has no portable mechanism that prevents a hostile process from renaming a
+directory in the final interval between that identity check and the mutation;
+action roots must therefore not be concurrently renamed by non-cooperating
+processes. Desired files are published first, validated orphans are deleted
+second, and the new ledger is published last. Each file is atomic, but the set
+is deliberately not transactional. If a process stops mid-run, the prior ledger
+remains sufficient for the next locked reconcile to repair and converge the set.
+
+Directory pruning, rollback of already-published files, and transactional
+directory swaps remain out of scope.
+
+## Ownership manifest
+
+Each tool owns one manifest under `state_dir` (the root by default):
+
+```text
+.pyinc-action.<sha256-of-full-tool-identity>.json
 ```
 
-- **Tool identity is the ownership key.** Two different tools writing into the
-  same root keep separate ledgers and never delete each other's files. Point two
-  tools at overlapping outputs and they will fight — don't.
-- **Tool *logic* sensitivity is free.** The kernel already fingerprints query
-  function definitions, so changing the code that produces an output changes the
-  output bytes and triggers a rewrite. The `tool` string is for *ownership*, not
-  versioning; you do not need to bump it when logic changes.
+Schema v2 records exactly `root`, `tool`, `version`, and `outputs`. The root
+digest prevents one external state directory from being reused across output
+roots, and the full tool string is verified on every read. Every output digest must be 64 lowercase
+hexadecimal characters. Unknown fields, duplicate JSON keys, wrong types,
+foreign identities, old schema versions, malformed paths, and malformed hashes
+raise `ActionManifestError` before mutation. v1 manifests are intentionally not
+compatible with v3 and may be discarded.
 
-## From-scratch consistency
+An action deletes only regular files recorded by its own validated ledger. The
+manifest is left byte-identical on a no-op reconcile, so no-op operation does
+not rewrite user-visible outputs or state.
 
-The action layer preserves the kernel's headline guarantee, lifted to the
-filesystem: **an incremental sequence of reconciles produces the same set of
-output files (paths + bytes) as a single reconcile from a fresh `Database` into
-an empty directory.** This is verified by edit-sequence tests that compare the
-incremental output tree against a fresh run at every step
-(`tests/test_action.py::test_action_incremental_matches_fresh_over_edits`, and
-per-consumer tests in `tests/test_calc.py` / `tests/test_codegen.py`).
+## Soundness boundary
 
-## Atomicity and failure behavior
-
-- Writes are atomic per file (`tempfile.mkstemp` in the destination directory +
-  `os.replace`), so a reader never observes a half-written output and a crash
-  leaves either the old or the new bytes, never a truncated file.
-- If output computation raises, nothing is written.
-- If an individual write fails, its temp file is cleaned up; already-committed
-  atomic writes remain (they are part of the desired set and self-heal on the
-  next reconcile), and the manifest is left describing the prior ownership set so
-  orphan tracking stays correct.
-
-## Limitations / non-goals (v1 of the action layer)
-
-- **No transactional rollback across outputs.** Each output is individually
-  atomic; the set as a whole is not. A mid-reconcile failure may leave some
-  outputs updated and others not — the next reconcile converges.
-- **Empty directories are not pruned.** Deleting the last owned file in a
-  generated subdirectory leaves the (now empty) directory in place. From-scratch
-  consistency is therefore stated over *files*, which is the meaningful artifact
-  equivalence.
-- **Outputs are bytes.** Text producers encode to bytes (`Output.text`);
-  hashing and atomic writes operate on bytes.
-- **Reconciliation is top-level only.** Do not call `reconcile`/`plan` inside a
-  query; actions are side effects, not derivations.
+The kernel's from-scratch consistency guarantee lifts to owned output files:
+given the same desired set, an incremental reconcile converges to the same file
+paths and bytes as a fresh reconcile into an empty root. This does not imply
+rollback across a set or ownership coordination between different tools that
+declare the same path.

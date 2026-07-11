@@ -27,11 +27,13 @@ from typing import Any, cast
 import pytest
 
 from pyinc import (
+    CheckpointManifestError,
     Database,
     FileResource,
     FileSystemArtifactStore,
     InMemoryArtifactStore,
     Input,
+    InputKeyError,
     UnsupportedValueError,
     freeze,
     query,
@@ -39,6 +41,12 @@ from pyinc import (
 )
 from pyinc.core import Query  # internal: introspecting query identities
 from pyinc.value import fingerprint_snapshot  # not re-exported from pyinc
+
+
+class _BehavioralList(list[int]):
+    def score(self) -> int:
+        return self[0] * 2
+
 
 # ---------------------------------------------------------------------------
 # Snapshot-level corruption: skipped and re-executed, never surfaced.
@@ -203,7 +211,7 @@ def test_manifest_missing_required_field_raises_value_error() -> None:
     db = Database(store=store)
 
     manifest = {
-        "pyinc_ckpt_version": 3,
+        "pyinc_ckpt_version": 4,
         "kernel_fingerprint_version": 2,
         "records": [{"kind": "query"}],
     }
@@ -214,6 +222,55 @@ def test_manifest_missing_required_field_raises_value_error() -> None:
     with pytest.raises(ValueError) as exc_info:
         db.load_checkpoint(key)
     assert not isinstance(exc_info.value, KeyError)
+
+
+def test_manifest_rejects_structurally_invalid_query_call_snapshot() -> None:
+    @query(key="invalid-call-snapshot")
+    def calculated(db: Database) -> int:
+        return 7
+
+    store = InMemoryArtifactStore()
+    writer = Database(store=store)
+    assert writer.get(calculated) == 7
+    checkpoint = writer.save_checkpoint()
+    manifest = json.loads(store._items[checkpoint].decode("utf-8"))
+
+    cyclic: list[Any] = []
+    cyclic.append(cyclic)
+    for invalid_call_snapshot in (freeze(123), freeze(cyclic)):
+        invalid_digest = fingerprint_snapshot(invalid_call_snapshot)
+        store.put(invalid_digest, serialize_snapshot(invalid_call_snapshot))
+        manifest["records"][0]["args_digest"] = invalid_digest
+        malformed_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+        malformed_key = "ck" + hashlib.sha256(malformed_bytes).hexdigest()
+        store.put(malformed_key, malformed_bytes)
+
+        reader = Database(store=store)
+        with pytest.raises(CheckpointManifestError, match="invalid call snapshot"):
+            reader.load_checkpoint(malformed_key)
+        assert not reader._checkpoint_query_records
+
+
+def test_checkpoint_accepts_graph_query_call_snapshot() -> None:
+    @query(key="graph-call-snapshot")
+    def inspect_graph(db: Database, positional: list[Any], *, keyword: list[Any]) -> bool:
+        return positional is keyword and positional[0] is positional
+
+    cyclic: list[Any] = []
+    cyclic.append(cyclic)
+    store = InMemoryArtifactStore()
+    writer = Database(mode="checked", store=store)
+    assert writer.get(inspect_graph, cyclic, keyword=cyclic) is True
+    checkpoint = writer.save_checkpoint()
+
+    reader = Database(mode="checked", store=store)
+    reader.load_checkpoint(checkpoint)
+    equivalent: list[Any] = []
+    equivalent.append(equivalent)
+
+    assert reader.get(inspect_graph, equivalent, keyword=equivalent) is True
+    assert reader.inspect(inspect_graph, equivalent, keyword=equivalent).last_recompute == "reused"
+    assert reader.statistics().query_executions == 0
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +363,71 @@ def test_second_request_after_load_still_reuses() -> None:
     assert db2.inspect(warm_stable_query).last_decision == "reused"
     assert db2.statistics().query_reuses > reuses_after_first
     assert db2.statistics().query_executions == 0
+
+
+def test_warmed_dependency_can_be_resaved_to_a_fresh_store() -> None:
+    @query(key="portable-resave-child")
+    def child(db: Database, value: int) -> int:
+        return value * 2
+
+    @query(key="portable-resave-parent")
+    def parent(db: Database) -> int:
+        return child(db, 3) + 1
+
+    first_store = InMemoryArtifactStore()
+    writer = Database(store=first_store)
+    assert writer.get(parent) == 7
+    first_checkpoint = writer.save_checkpoint()
+
+    warmed = Database(store=first_store)
+    warmed.load_checkpoint(first_checkpoint)
+    assert warmed.get(parent) == 7
+    assert warmed.statistics().query_executions == 0
+
+    second_store = InMemoryArtifactStore()
+    second_checkpoint = warmed.save_checkpoint(second_store)
+    assert second_checkpoint in second_store._items
+
+    reader = Database(store=second_store)
+    reader.load_checkpoint(second_checkpoint)
+    assert reader.get(parent) == 7
+    assert reader.inspect(parent).last_recompute == "reused"
+    assert reader.statistics().query_executions == 0
+
+
+def test_checkpoint_resource_parameter_type_mismatch_cannot_poison_request() -> None:
+    @dataclass(frozen=True)
+    class BehavioralResource:
+        def identity(self) -> tuple[str]:
+            return ("behavioral-parameter",)
+
+        def read(self, db: Database, parameter: list[int]) -> int:
+            return cast(int, db.read_resource(self, parameter))
+
+        def label(self, parameter: list[int]) -> str:
+            return "behavioral-parameter"
+
+        def probe(self, parameter: list[int]) -> tuple[int, ...]:
+            return tuple(parameter)
+
+        def load(self, db: Database, parameter: list[int]) -> int:
+            return parameter.score() if isinstance(parameter, _BehavioralList) else 0
+
+    resource = BehavioralResource()
+
+    @query(key="behavioral-parameter-root")
+    def root(db: Database) -> int:
+        return resource.read(db, _BehavioralList([2]))
+
+    store = InMemoryArtifactStore()
+    writer = Database(store=store)
+    assert writer.get(root) == 4
+    checkpoint = writer.save_checkpoint()
+
+    reader = Database(store=store)
+    reader.load_checkpoint(checkpoint)
+    assert reader.get(root) == 4
+    assert Database().get(root) == 4
 
 
 def test_transitive_dep_change_invalidates_warmed_parent_without_live_child() -> None:
@@ -523,40 +645,14 @@ def test_optimize_flag_changes_identity(tmp_path: Path) -> None:
     assert normal != optimized
 
 
-def test_same_name_inputs_disambiguated_in_checkpoint() -> None:
-    # Two distinct Inputs sharing a name (kept distinct via eq=/cutoff=), each
-    # feeding its own query.
+def test_duplicate_input_keys_are_rejected_before_checkpointing() -> None:
     first = Input[int]("dup_name", eq=lambda old, new: old == new)
     second = Input[int]("dup_name", cutoff=lambda value: value)
-
-    @query
-    def dup_reader_first(db: Database) -> int:
-        return first.read(db) + 100
-
-    @query
-    def dup_reader_second(db: Database) -> int:
-        return second.read(db) + 200
-
-    store = InMemoryArtifactStore()
-    db1 = Database(store=store)
-    db1.set(first, 1)
-    db1.set(second, 2)
-    assert db1.get(dup_reader_first) == 101
-    assert db1.get(dup_reader_second) == 202
-    ck_key = db1.save_checkpoint()
-
-    db2 = Database(store=store)
-    db2.set(first, 1)
-    db2.set(second, 2)
-    db2.load_checkpoint(ck_key)
-
-    # Each query's input dep must resolve to the correct same-named node, so
-    # both records verify and reuse. Name-only matching would resolve the second
-    # query against the first node (digest mismatch) and force a re-execute.
-    assert db2.get(dup_reader_first) == 101
-    assert db2.get(dup_reader_second) == 202
-    assert db2.inspect(dup_reader_first).last_recompute == "reused"
-    assert db2.inspect(dup_reader_second).last_recompute == "reused"
+    db = Database(store=InMemoryArtifactStore())
+    db.set(first, 1)
+    with pytest.raises(InputKeyError, match="dup_name"):
+        db.set(second, 2)
+    assert first.read(db) == 1
 
 
 def test_runtime_imported_dep_query_refuses_warm_and_recomputes(
@@ -670,7 +766,7 @@ class _ProbeStamp:
 @dataclass(frozen=True)
 class _StampResource:
     def read(self, db: Database, path: str) -> str:
-        return cast(str, db._read_resource(self, path))
+        return cast(str, db.read_resource(self, path))
 
     def label(self, path: str) -> str:
         return f"stamp[{path}]"
@@ -682,8 +778,7 @@ class _StampResource:
         return _ProbeStamp(True, hashlib.sha256(file_path.read_bytes()).hexdigest())
 
     def load(self, db: Database, path: str) -> str:
-        with db._allow_raw_open():
-            return Path(path).read_text()
+        return Path(path).read_text()
 
 
 def test_unchanged_file_downstream_reuses_after_leaf_verification(
@@ -754,17 +849,14 @@ def test_changed_file_reexecutes_only_affected_subtree(tmp_path: Path) -> None:
     assert db2.inspect(combined).last_recompute == "executed"
 
 
-def test_parameterized_query_args_restored_from_store(tmp_path: Path) -> None:
+def test_tuple_nested_resource_is_pinned_for_probe_hint_reuse(tmp_path: Path) -> None:
     file_a = tmp_path / "pa.txt"
     file_b = tmp_path / "pb.txt"
     file_a.write_text("aa")  # 2 chars
     file_b.write_text("bbbb")  # 4 chars
-    # The resource is captured inside a tuple. It is folded into the query's
-    # identity (code-pinned) but is NOT reachable to the pinned-capture walk,
-    # which only descends into captured queries/functions/resources. Probe-hint
-    # restoration therefore cannot resolve it, so the parent's parameterized
-    # query deps take the execute-to-verify path -- and their call snapshots
-    # (the x in q(x)) have to be recovered from the store to re-run them.
+    # The resource is captured inside a tuple. Identity encoding and the pinned
+    # capture walk both recurse through that immutable shape, so probe-hint
+    # restoration can resolve it without executing the parameterized leaves.
     hidden = (FileResource(),)
 
     @query
@@ -782,12 +874,10 @@ def test_parameterized_query_args_restored_from_store(tmp_path: Path) -> None:
 
     db2 = Database(store=store)
     db2.load_checkpoint(ck_key)
-    # Files unchanged: each leaf measure(x) is verified by re-execution using the
-    # call snapshot restored from the store; the downstream total then reuses.
+    # Files unchanged: both resource-backed leaves and the downstream total reuse.
     assert db2.get(measure_total) == 6
     assert db2.inspect(measure_total).last_recompute == "reused"
-    # Only the two parameterized leaves executed (to verify); the total did not.
-    assert db2.statistics().query_executions == 2
+    assert db2.statistics().query_executions == 0
 
 
 def test_resource_probe_hint_reuses_with_frozen_dataclass_probe(
@@ -838,9 +928,7 @@ def test_missing_args_snapshot_degrades_to_reexecution(tmp_path: Path) -> None:
     # Drop the persisted call snapshot for hidden_leaf(path): execute-to-verify
     # can no longer recover the leaf's args from the store and must degrade to
     # warm refusal (re-execution) -- never an error, never a stale value.
-    call_snapshot_digest = fingerprint_snapshot(
-        (freeze((str(data_file),)), freeze({}))
-    )
+    call_snapshot_digest = fingerprint_snapshot(freeze(((str(data_file),), {})))
     assert call_snapshot_digest in store._items  # the call snapshot was persisted
     del store._items[call_snapshot_digest]
 
@@ -871,9 +959,7 @@ def _make_twin_child(op: str) -> Query[..., int]:
     return twin_child
 
 
-def _make_twin_root(
-    a_wrong: Query[..., int], z_right: Query[..., int]
-) -> Query[..., int]:
+def _make_twin_root(a_wrong: Query[..., int], z_right: Query[..., int]) -> Query[..., int]:
     # The captured objects are freevars, walked in co_freevars order -- which
     # CPython sorts alphabetically. Name the wrong twin so it sorts first, so the
     # first-wins pinned-capture map binds it under the shared query_id.
@@ -890,7 +976,7 @@ def test_twin_query_id_execute_to_verify_refuses_wrong_body() -> None:
     # query_id (first-wins), so the WRONG twin (mul) is the one the root pins.
     wrong_child = _make_twin_child("mul")  # p*2
     right_child = _make_twin_child("add")  # p+2, the body root actually calls
-    assert wrong_child.query_id == right_child.query_id
+    assert wrong_child.key == right_child.key
     root = _make_twin_root(wrong_child, right_child)
 
     store = InMemoryArtifactStore()
@@ -980,7 +1066,7 @@ class _SpecResource:
     """
 
     def read(self, db: Database, spec: _RecordSpec) -> str:
-        return cast(str, db._read_resource(self, spec))
+        return cast(str, db.read_resource(self, spec))
 
     def label(self, spec: _RecordSpec) -> str:
         return f"spec[{spec.name}]"
@@ -1076,6 +1162,40 @@ class _OffsetTempAdapter:
         return _Temperature(recurse(snapshot) - 1)
 
 
+class _ThawOffsetTempAdapter:
+    """Keeps argument identity stable while changing its thawed value."""
+
+    def freeze(self, value: Any, recurse: Callable[[Any], Any]) -> Any:
+        return recurse(value.degrees)
+
+    def thaw(self, snapshot: Any, recurse: Callable[[Any], Any]) -> Any:
+        return _Temperature(recurse(snapshot) + 10)
+
+
+_MUTABLE_ADAPTER_OFFSETS = {"freeze": 1.0, "thaw": 1.0}
+
+
+class _MutableCaptureTempAdapter:
+    """An operational adapter whose mutable ambient state is not pinnable."""
+
+    def freeze(self, value: Any, recurse: Callable[[Any], Any]) -> Any:
+        return recurse(value.degrees + _MUTABLE_ADAPTER_OFFSETS["freeze"])
+
+    def thaw(self, snapshot: Any, recurse: Callable[[Any], Any]) -> Any:
+        return _Temperature(recurse(snapshot) - _MUTABLE_ADAPTER_OFFSETS["thaw"])
+
+
+@dataclass(frozen=True)
+class _ConfiguredTempAdapter:
+    offset: float
+
+    def freeze(self, value: Any, recurse: Callable[[Any], Any]) -> Any:
+        return recurse(value.degrees + self.offset)
+
+    def thaw(self, snapshot: Any, recurse: Callable[[Any], Any]) -> Any:
+        return _Temperature(recurse(snapshot) - self.offset)
+
+
 def test_checkpoint_with_same_adapter_reuses() -> None:
     temp_in = Input[float]("adapter_same")
 
@@ -1096,6 +1216,26 @@ def test_checkpoint_with_same_adapter_reuses() -> None:
     db2.load_checkpoint(ck_key)
     assert db2.get(read_temp) == _Temperature(5.0)
     assert db2.inspect(read_temp).last_recompute == "reused"
+
+
+def test_checkpoint_rejects_adapter_key_declaration_that_omits_snapshot_usage() -> None:
+    @query(key="adapter-declaration-tamper")
+    def read_temp(db: Database) -> _Temperature:
+        return _Temperature(5.0)
+
+    store = InMemoryArtifactStore()
+    writer = Database("checked", store=store, adapters={_Temperature: _IdentityTempAdapter()})
+    assert writer.get(read_temp) == _Temperature(5.0)
+    checkpoint = writer.save_checkpoint()
+    manifest = json.loads(store._items[checkpoint].decode("utf-8"))
+    manifest["records"][0]["adapter_keys"] = []
+    malformed_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    malformed_key = "ck" + hashlib.sha256(malformed_bytes).hexdigest()
+    store.put(malformed_key, malformed_bytes)
+
+    reader = Database("checked", store=store, adapters={_Temperature: _OffsetTempAdapter()})
+    with pytest.raises(CheckpointManifestError, match="inconsistent adapter keys"):
+        reader.load_checkpoint(malformed_key)
 
 
 def test_modified_adapter_implementation_skips_warm() -> None:
@@ -1128,6 +1268,226 @@ def test_modified_adapter_implementation_skips_warm() -> None:
     # re-executes -- never serving the stale, wrongly-thawed value.
     assert db2.get(read_temp) == _Temperature(5.0)
     assert db2.inspect(read_temp).last_recompute == "executed"
+
+
+def test_modified_query_argument_adapter_skips_root_warm() -> None:
+    @query(key="adapted-root-argument")
+    def read_argument(db: Database, value: _Temperature) -> float:
+        return value.degrees
+
+    store = InMemoryArtifactStore()
+    writer = Database("checked", store=store, adapters={_Temperature: _IdentityTempAdapter()})
+    assert writer.get(read_argument, _Temperature(1.0)) == 1.0
+    checkpoint = writer.save_checkpoint()
+
+    loaded = Database("checked", store=store, adapters={_Temperature: _ThawOffsetTempAdapter()})
+    loaded.load_checkpoint(checkpoint)
+
+    fresh = Database("checked", adapters={_Temperature: _ThawOffsetTempAdapter()})
+    assert fresh.get(read_argument, _Temperature(1.0)) == 11.0
+    assert loaded.get(read_argument, _Temperature(1.0)) == 11.0
+    assert loaded.inspect(read_argument, _Temperature(1.0)).last_recompute == "executed"
+
+
+def test_modified_query_argument_adapter_inside_graph_skips_root_warm() -> None:
+    @query(key="adapted-root-graph-argument")
+    def read_argument(
+        db: Database,
+        value: _Temperature,
+        left: list[int],
+        right: list[int],
+    ) -> float:
+        return value.degrees + int(left is right)
+
+    shared = [1]
+    store = InMemoryArtifactStore()
+    writer = Database(
+        "checked",
+        store=store,
+        adapters={_Temperature: _IdentityTempAdapter()},
+    )
+    assert writer.get(read_argument, _Temperature(1.0), shared, shared) == 2.0
+    checkpoint = writer.save_checkpoint()
+
+    loaded = Database(
+        "checked",
+        store=store,
+        adapters={_Temperature: _ThawOffsetTempAdapter()},
+    )
+    loaded.load_checkpoint(checkpoint)
+    equivalent = [1]
+
+    assert loaded.get(read_argument, _Temperature(1.0), equivalent, equivalent) == 12.0
+    assert (
+        loaded.inspect(read_argument, _Temperature(1.0), equivalent, equivalent).last_recompute
+        == "executed"
+    )
+
+
+def test_modified_query_argument_adapter_skips_descendant_warm() -> None:
+    @query(key="adapted-child-argument")
+    def child(db: Database, value: _Temperature) -> float:
+        return value.degrees
+
+    @query(key="adapted-child-root")
+    def root(db: Database) -> float:
+        return child(db, _Temperature(1.0))
+
+    store = InMemoryArtifactStore()
+    writer = Database("checked", store=store, adapters={_Temperature: _IdentityTempAdapter()})
+    assert writer.get(root) == 1.0
+    checkpoint = writer.save_checkpoint()
+
+    loaded = Database("checked", store=store, adapters={_Temperature: _ThawOffsetTempAdapter()})
+    loaded.load_checkpoint(checkpoint)
+    fresh = Database("checked", adapters={_Temperature: _ThawOffsetTempAdapter()})
+
+    assert fresh.get(root) == 11.0
+    assert loaded.get(root) == 11.0
+    assert loaded.inspect(root).last_recompute == "executed"
+
+
+def test_modified_descendant_result_adapter_skips_parent_warm() -> None:
+    @query(key="adapted-child-result")
+    def child(db: Database) -> _Temperature:
+        return _Temperature(1.0)
+
+    @query(key="adapted-result-root")
+    def root(db: Database) -> float:
+        return child(db).degrees
+
+    store = InMemoryArtifactStore()
+    writer = Database("checked", store=store, adapters={_Temperature: _IdentityTempAdapter()})
+    assert writer.get(root) == 1.0
+    checkpoint = writer.save_checkpoint()
+
+    loaded = Database("checked", store=store, adapters={_Temperature: _ThawOffsetTempAdapter()})
+    loaded.load_checkpoint(checkpoint)
+    fresh = Database("checked", adapters={_Temperature: _ThawOffsetTempAdapter()})
+
+    assert fresh.get(root) == 11.0
+    assert loaded.get(root) == 11.0
+    assert loaded.inspect(root).last_recompute == "executed"
+
+
+def test_modified_input_adapter_skips_dependent_warm() -> None:
+    adapted_input = Input[_Temperature]("adapted-input")
+
+    @query(key="adapted-input-reader")
+    def read_input(db: Database) -> float:
+        return adapted_input.read(db).degrees
+
+    store = InMemoryArtifactStore()
+    writer = Database("checked", store=store, adapters={_Temperature: _IdentityTempAdapter()})
+    writer.set(adapted_input, _Temperature(1.0))
+    assert writer.get(read_input) == 1.0
+    checkpoint = writer.save_checkpoint()
+
+    loaded = Database("checked", store=store, adapters={_Temperature: _ThawOffsetTempAdapter()})
+    loaded.set(adapted_input, _Temperature(1.0))
+    loaded.load_checkpoint(checkpoint)
+    fresh = Database("checked", adapters={_Temperature: _ThawOffsetTempAdapter()})
+    fresh.set(adapted_input, _Temperature(1.0))
+
+    assert fresh.get(read_input) == 11.0
+    assert loaded.get(read_input) == 11.0
+    assert loaded.inspect(read_input).last_recompute == "executed"
+
+
+def test_checkpoint_save_rejects_adapter_with_unpinnable_capture() -> None:
+    temp_in = Input[float]("adapter_unpinnable_save")
+
+    @query
+    def read_temp(db: Database) -> _Temperature:
+        return _Temperature(temp_in.read(db))
+
+    db = Database(
+        "checked",
+        store=InMemoryArtifactStore(),
+        adapters={_Temperature: _MutableCaptureTempAdapter()},
+    )
+    db.set(temp_in, 5.0)
+    assert db.get(read_temp) == _Temperature(5.0)
+
+    with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted"):
+        db.save_checkpoint()
+
+
+def test_checkpoint_save_rejects_adapter_with_mixed_slot_state() -> None:
+    class MixedSlotAdapter:
+        __slots__ = ("offset", "__dict__")
+
+        def __init__(self, offset: float) -> None:
+            self.offset = offset
+
+        def freeze(self, value: _Temperature, freeze_value: Any) -> Any:
+            return freeze_value(value.degrees + self.offset)
+
+        def thaw(self, snapshot: Any, thaw_value: Any) -> _Temperature:
+            return _Temperature(float(thaw_value(snapshot)) - self.offset)
+
+    temp_in = Input[float]("adapter_mixed_slots")
+
+    @query
+    def read_temp(db: Database) -> _Temperature:
+        return _Temperature(temp_in.read(db))
+
+    db = Database(
+        "checked",
+        store=InMemoryArtifactStore(),
+        adapters={_Temperature: MixedSlotAdapter(1.0)},
+    )
+    db.set(temp_in, 5.0)
+    assert db.get(read_temp) == _Temperature(5.0)
+
+    with pytest.raises(UnsupportedValueError, match="slot state"):
+        db.save_checkpoint()
+
+
+def test_unpinnable_live_adapter_safely_misses_checkpoint() -> None:
+    temp_in = Input[float]("adapter_unpinnable_warm")
+
+    @query
+    def read_temp(db: Database) -> _Temperature:
+        return _Temperature(temp_in.read(db))
+
+    store = InMemoryArtifactStore()
+    saved = Database("checked", store=store, adapters={_Temperature: _IdentityTempAdapter()})
+    saved.set(temp_in, 5.0)
+    assert saved.get(read_temp) == _Temperature(5.0)
+    checkpoint = saved.save_checkpoint()
+
+    loaded = Database(
+        "checked",
+        store=store,
+        adapters={_Temperature: _MutableCaptureTempAdapter()},
+    )
+    loaded.set(temp_in, 5.0)
+    loaded.load_checkpoint(checkpoint)
+
+    assert loaded.get(read_temp) == _Temperature(5.0)
+    assert loaded.inspect(read_temp).last_recompute == "executed"
+
+
+def test_changed_adapter_instance_configuration_skips_warm() -> None:
+    temp_in = Input[float]("adapter_configuration")
+
+    @query
+    def read_temp(db: Database) -> _Temperature:
+        return _Temperature(temp_in.read(db))
+
+    store = InMemoryArtifactStore()
+    saved = Database("checked", store=store, adapters={_Temperature: _ConfiguredTempAdapter(1.0)})
+    saved.set(temp_in, 5.0)
+    assert saved.get(read_temp) == _Temperature(5.0)
+    checkpoint = saved.save_checkpoint()
+
+    loaded = Database("checked", store=store, adapters={_Temperature: _ConfiguredTempAdapter(2.0)})
+    loaded.set(temp_in, 5.0)
+    loaded.load_checkpoint(checkpoint)
+
+    assert loaded.get(read_temp) == _Temperature(5.0)
+    assert loaded.inspect(read_temp).last_recompute == "executed"
 
 
 def test_missing_adapter_errors_match_fresh_database() -> None:
@@ -1174,7 +1534,7 @@ class _StableProbeTempResource:
     """
 
     def read(self, db: Database, degrees: float) -> _Temperature:
-        return cast(_Temperature, db._read_resource(self, degrees))
+        return cast(_Temperature, db.read_resource(self, degrees))
 
     def label(self, degrees: float) -> str:
         return f"temp[{degrees}]"
@@ -1196,18 +1556,14 @@ def test_adapter_change_with_stable_probe_reloads_resource_result() -> None:
         return resource.read(db, 5.0)
 
     store = InMemoryArtifactStore()
-    db1 = Database(
-        "checked", store=store, adapters={_Temperature: _IdentityTempAdapter()}
-    )
+    db1 = Database("checked", store=store, adapters={_Temperature: _IdentityTempAdapter()})
     assert db1.get(read_temp_resource) == _Temperature(5.0)
     ck_key = db1.save_checkpoint()
 
     # Fresh process, behaviourally different adapter under the same key. The v1
     # payload stored the raw degrees (5.0); thawing it under the offset adapter
     # would yield _Temperature(4.0) -- a value the new adapter never produces.
-    db2 = Database(
-        "checked", store=store, adapters={_Temperature: _OffsetTempAdapter()}
-    )
+    db2 = Database("checked", store=store, adapters={_Temperature: _OffsetTempAdapter()})
     db2.load_checkpoint(ck_key)
 
     # Ground truth: the offset adapter, fresh with no checkpoint, round-trips 5.0.
@@ -1224,6 +1580,27 @@ def test_adapter_change_with_stable_probe_reloads_resource_result() -> None:
     assert db2.statistics().resource_loads == 1
     assert db2.statistics().resource_probe_hits == 0
     assert db2.inspect(read_temp_resource).last_recompute == "executed"
+
+
+def test_modified_resource_result_adapter_skips_parent_warm() -> None:
+    resource = _StableProbeTempResource()
+
+    @query(key="adapted-resource-parent")
+    def read_temp_degrees(db: Database) -> float:
+        return resource.read(db, 1.0).degrees
+
+    store = InMemoryArtifactStore()
+    writer = Database("checked", store=store, adapters={_Temperature: _IdentityTempAdapter()})
+    assert writer.get(read_temp_degrees) == 1.0
+    checkpoint = writer.save_checkpoint()
+
+    loaded = Database("checked", store=store, adapters={_Temperature: _ThawOffsetTempAdapter()})
+    loaded.load_checkpoint(checkpoint)
+    fresh = Database("checked", adapters={_Temperature: _ThawOffsetTempAdapter()})
+
+    assert fresh.get(read_temp_degrees) == 11.0
+    assert loaded.get(read_temp_degrees) == 11.0
+    assert loaded.inspect(read_temp_degrees).last_recompute == "executed"
 
 
 # ---------------------------------------------------------------------------
@@ -1335,44 +1712,39 @@ def test_partial_object_write_never_visible(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Marshal determinism (the branch's _CODE_MARSHAL_VERSION == 2 fix).
+# Code-identity determinism.
 #
-# A code object's identity must not depend on ambient runtime refcounts. marshal
-# format >= 3 encodes FLAG_REF/interning state, so the bytes for a code object
-# flip once one of its string consts gains a reference (the classic trigger:
-# re._cache retaining a regex-pattern literal after first use). Format 2 fully
-# encodes the code object without reference sharing, so it is stable across a
-# process's lifetime. This regression guard pins that behaviourally.
+# A code object's identity must not depend on ambient runtime refcounts. The
+# canonical typed encoder reads semantic code fields directly, so retaining a
+# string constant elsewhere in the process cannot move the identity.
 # ---------------------------------------------------------------------------
 
 
-def _marshal_guard_helper(text: str) -> bool:
+def _refcount_guard_helper(text: str) -> bool:
     # The regex-pattern literal is a const of THIS code object; passing it by
     # identity to re.fullmatch makes re._cache retain that exact object on first
-    # use, nudging its refcount from 1 to 2. Under a marshal >= 3 code
-    # fingerprint that crossing would flip the marshaled bytes (FLAG_REF).
-    return re.fullmatch(r"\d+ marshal_guard \w+", text) is not None
+    # use, nudging its refcount from 1 to 2. The identity must ignore that move.
+    return re.fullmatch(r"\d+ refcount_guard \w+", text) is not None
 
 
 def test_code_fingerprint_ignores_ambient_refcount_changes() -> None:
     @query
-    def marshal_guard_query(db: Database) -> bool:
-        return _marshal_guard_helper("7 marshal_guard ok")
+    def refcount_guard_query(db: Database) -> bool:
+        return _refcount_guard_helper("7 refcount_guard ok")
 
     db = Database()
     # Drop any cached compilation so the captured helper's pattern const starts at
     # refcount 1 (held only by its co_consts) for the first keying.
     re.purge()
-    identity_before = db._query_key(marshal_guard_query, (), {})[0].identity
+    identity_before = db._query_key(refcount_guard_query, (), {})[0].identity
 
     # Perturb ambient refcounts exactly as first regex use does: the helper's
     # pattern const is retained by re._cache, so its refcount crosses 1 -> 2.
-    assert _marshal_guard_helper("7 marshal_guard ok") is True
-    identity_after = db._query_key(marshal_guard_query, (), {})[0].identity
+    assert _refcount_guard_helper("7 refcount_guard ok") is True
+    identity_after = db._query_key(refcount_guard_query, (), {})[0].identity
 
-    # marshal format 2 never shares references, so the code identity is invariant
-    # to the refcount shift. Pinned behaviourally -- the identity, not the
-    # constant. (Under the pre-branch marshal >= 3 default these would diverge.)
+    # The typed code encoding is invariant to the refcount shift. Pin the
+    # externally observable identity rather than an encoding implementation.
     assert identity_before == identity_after
 
 

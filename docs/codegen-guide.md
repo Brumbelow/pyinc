@@ -9,7 +9,7 @@ actually changed are rewritten.
 
 It is **stdlib-only** — JSON Schema is parsed with `json` plus dict walking, not
 a third-party schema library — and it builds on pyinc's **public API only**
-(`pyinc` top-level: `@query`, `FileResource`, `Output` / `@action`). It never
+(`pyinc` top-level: `@query`, `BinaryFileResource`, `Output` / `@action`). It never
 imports kernel internals. This is the same architectural boundary that
 `pyinc_tools` observes (see [architecture.md](architecture.md)).
 
@@ -26,9 +26,17 @@ plan = generate_outputs.plan(db, "schema.json", root="generated/")  # dry-run, w
 ```
 
 `generate(db, schema_path, out_dir) -> ReconcileResult` returns the
-`written` / `deleted` / `unchanged` sets. `schema_analysis(db, schema_path) ->
-SchemaAnalysis` decodes the per-definition models for inspection without
-generating.
+`created` / `updated` / `repaired` / `deleted` / `unchanged` sets.
+`schema_analysis(db, schema_path) -> SchemaAnalysis` decodes the per-definition
+models and structured diagnostics without generating. Each diagnostic has an
+`error` or `warning` severity and an RFC 6901 `json_pointer` into the source
+document.
+
+`generate` raises `SchemaGenerationError` when analysis contains an error. The
+exception exposes the full `analysis` and its error `diagnostics`. Validation is
+completed before reconciliation starts, so malformed or unsupported input
+cannot overwrite or delete outputs from the last valid run. The same boundary
+applies when calling `generate_outputs.reconcile(...)` directly.
 
 ## Output layout
 
@@ -40,8 +48,10 @@ For each definition `D` (under `$defs` or legacy `definitions`):
 
 A definition rendered as an `object` becomes a frozen `@dataclass`; an `enum`
 becomes a `typing.Literal` alias; a top-level `$ref`/primitive becomes a type
-alias. Local `$ref`s render as the referenced class name with a matching
-`from .<module> import <Name>`.
+alias. Model references use deferred annotations and imports guarded by
+`TYPE_CHECKING`; aliases store their type expression as a forward-reference
+string. Mutually recursive models and aliases therefore compile and import on
+every supported Python version.
 
 ## Supported subset
 
@@ -51,22 +61,50 @@ alias. Local `$ref`s render as the referenced class name with a matching
 - arrays (`items`), primitives (`string`/`integer`/`number`/`boolean`/`null`)
 - `enum`
 - nullable unions (`type: ["X", "null"]`)
-- `description` (rendered into docs only)
-- deterministic diagnostics for unsupported constructs (remote `$ref`,
-  `allOf`/`anyOf`/`oneOf`, unresolved `$ref`, unsupported unions) and for names
-  that are not valid Python identifiers — `unsupported-field-name`,
-  `unsupported-definition-name`, `unsupported-ref-name` — all surfaced on
-  `SchemaModel.diagnostics`
+- `description` (rendered for definitions and properties; accepted as an
+  annotation on nested schema nodes)
+- deterministic error diagnostics for malformed schema shapes, remote or
+  unresolved `$ref`, schema combinators and conditionals, unsupported unions,
+  invalid enum members, and names that cannot be emitted safely
+- portable module collision checks after Unicode normalization, snake-case
+  conversion, and case folding
 
-**Identifier safety.** Names that are not valid Python identifiers are never
-emitted as invalid code. A property named after a keyword (e.g. `class`) is
-dropped from its model with an `unsupported-field-name` diagnostic; a definition
-whose name is not an identifier renders a comment-only placeholder module,
-is excluded from the aggregate index, and a `$ref` pointing at it falls back to
-`object`. The generated package therefore always compiles.
+**Identifier safety.** Invalid definition and property names are error
+diagnostics rather than lossy substitutions. Generation stops before touching
+the output tree. Property names reserved by Python's data model, such as
+`__dict__`, `__slots__`, and `__weakref__`, are rejected as well. Definition
+names that would produce the same portable module name (for example
+`HTTPServer` and `http_server`) are rejected together, as is a definition that
+would occupy the generated `__init__.py` path. The snake-cased module stem must
+itself be a non-keyword Python identifier and may not be a Windows-reserved
+device name, so names such as `Class` and `CON` fail analysis instead of
+producing an unimportable or non-portable package.
 
-Out of scope for this first cut: remote/HTTP `$ref`, combinators, conditional
-schemas (`if`/`then`/`else`), `patternProperties`, format validation, and code
+Unsupported combinators, conditionals, and direct model keywords on the
+document root are errors too. Models must live in `$defs` or `definitions`;
+root metadata such as `$schema`, `$id`, `title`, and `description` remains
+accepted. An unsupported root cannot be mistaken for an empty desired model set
+and therefore cannot delete files from the last valid generation.
+
+The accepted non-semantic metadata policy is deliberately narrow. `title` and
+`$comment` are accepted as string annotations on schema nodes and ignored by
+generation. At the document root, `$schema` and `$id` are also accepted as
+string metadata and ignored: they do not select a dialect, change reference
+resolution, or enable remote references. Nested `description` values are
+accepted but only definition and property descriptions are emitted into the
+generated documentation. Every other keyword outside the supported subset is
+an error, including validation-only constraints such as `format`, `minimum`,
+`additionalProperties`, and `minItems`.
+
+**Fallback policy.** The supported subset never silently guesses. An explicitly
+unconstrained schema is represented as `object` with a non-blocking
+`unconstrained-schema` warning; an array without `items` similarly uses
+`list[object]` with a warning. Unsupported constructs and invalid data are
+errors. Empty enums render internally as `Never` so inspection output remains
+valid Python, but their `empty-enum` error prevents reconciliation.
+
+Out of scope for v3: remote/HTTP `$ref`, combinators, conditional schemas
+(`if`/`then`/`else`), `patternProperties`, validation constraints, and code
 *validation* (the compiler emits models; it does not validate instances).
 
 ## Incremental behavior
@@ -83,9 +121,11 @@ incrementality, which the action layer turns into write-granular incrementality:
   reference-graph closure) and rewritten only if their emitted bytes change;
   models with no path to it are reused. (See *Reference-graph semantics* below.)
 - **adding a definition** — creates its two files plus the aggregate
-  `__init__.py`; existing models are untouched.
-- **removing a definition** — deletes only the two files that definition owned;
-  the index is updated.
+  `__init__.py`; existing model render queries remain green and are not
+  executed.
+- **removing an unreferenced definition** — deletes only the two files that
+  definition owned; the index is updated. Removing a referenced definition is
+  an error and preserves the prior output set.
 
 Each of these is asserted byte-for-byte against a from-scratch run in
 `tests/test_codegen.py`.
@@ -98,14 +138,17 @@ re-validation closure, but because `A` refers to `B` only by class name, an
 internal change to `B` (e.g. one of `B`'s own properties changing requiredness)
 does not change `A`'s emitted bytes — `A` backdates and is not rewritten.
 Dependents *are* rewritten when the referenced interface changes in a way that
-alters their output. Two distinct edits both land there: *removing* `B` so `A`'s
-`$ref` dangles (the field falls back to `object` with an `unknown-ref`
-diagnostic), and *consistently renaming* `B` (updating both the `$defs` key and
-`A`'s `$ref` in one edit) so the graph stays fully resolved but the referenced
-class name changes at `A`'s reference site. This is the efficient, correct
-reading of "rewrite the affected model and its structural dependents": the
-reference graph defines what is re-validated; content hashing defines what is
+alters their output. A consistent rename of `B` (updating both the `$defs` key
+and `A`'s `$ref` in one edit) keeps the graph resolved while changing the class
+name at `A`'s reference site. Removing `B` without updating `A` instead produces
+an `unknown-ref` error and leaves the last valid output tree intact. The
+reference graph defines what is revalidated; content hashing defines what is
 rewritten.
+
+Reference existence is tracked per referenced definition rather than through a
+single dependency on the complete definition-name set. Adding or removing an
+unrelated definition therefore does not place every existing model in the
+revalidation closure.
 
 ## Architectural boundary
 

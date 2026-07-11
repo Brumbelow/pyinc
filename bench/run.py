@@ -53,7 +53,9 @@ def main() -> None:
         pairs = sorted({(r.target, r.scenario, r.engine) for r in stale})
         print(f"note: {len(stale)} comparator run(s) were stale (fast but wrong): {pairs}")
     if incorrect:
-        raise SystemExit(f"pyinc incorrectness detected: {[(r.target, r.scenario) for r in incorrect]}")
+        raise SystemExit(
+            f"pyinc incorrectness detected: {[(r.target, r.scenario) for r in incorrect]}"
+        )
 
 
 if __name__ == "__main__":

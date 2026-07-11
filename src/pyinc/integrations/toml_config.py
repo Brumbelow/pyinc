@@ -9,14 +9,14 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.resources import DirectoryResource, _file_read_snapshot
+from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
 
+from ._resources import file_read_snapshot
+
 ConfigKeyPayload: TypeAlias = tuple[str, str, str, str]
-ConfigSectionPayload: TypeAlias = tuple[
-    str, tuple[ConfigKeyPayload, ...], tuple[str, ...]
-]
+ConfigSectionPayload: TypeAlias = tuple[str, tuple[ConfigKeyPayload, ...], tuple[str, ...]]
 DiagnosticPayload: TypeAlias = tuple[str, str]
 ConfigAnalysisPayload: TypeAlias = tuple[
     str,
@@ -63,7 +63,7 @@ class _ConfigFileResource:
     encoding: str = "utf-8"
 
     def read(self, db: Database, path: str | os.PathLike[str]) -> str:
-        return cast(str, db._read_resource(self, os.fspath(path)))
+        return cast(str, db.read_resource(self, os.fspath(path)))
 
     def label(self, path: str) -> str:
         return f"configfile[{path}]"
@@ -78,13 +78,10 @@ class _ConfigFileResource:
         file_path = Path(path)
         if not file_path.exists():
             return ""
-        with db._allow_raw_open():
-            return file_path.read_text(encoding=self.encoding)
+        return file_path.read_text(encoding=self.encoding)
 
-    def probe_and_load(
-        self, db: Database, path: str
-    ) -> tuple[tuple[str, str] | tuple[str], str]:
-        probe, text = _file_read_snapshot(path, self.encoding)
+    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
+        probe, text = file_read_snapshot(path, self.encoding)
         return probe, text if text is not None else ""
 
 
@@ -154,10 +151,24 @@ def _walk_sections(
 def _config_cutoff_token(text: str) -> tuple[str, str]:
     try:
         parsed = tomllib.loads(text)
-        snapshot = freeze(parsed)
+        snapshot = freeze(_toml_cutoff_value(parsed))
         return ("parsed", repr(snapshot))
     except tomllib.TOMLDecodeError:
         return ("raw", text)
+
+
+def _toml_cutoff_value(value: Any) -> object:
+    if isinstance(value, datetime):
+        return ("datetime", value.isoformat())
+    if isinstance(value, date):
+        return ("date", value.isoformat())
+    if isinstance(value, time):
+        return ("time", value.isoformat())
+    if isinstance(value, dict):
+        return tuple((key, _toml_cutoff_value(item)) for key, item in sorted(value.items()))
+    if isinstance(value, list):
+        return tuple(_toml_cutoff_value(item) for item in value)
+    return value
 
 
 def _try_parse_toml(text: str) -> dict[str, Any] | None:
@@ -165,6 +176,46 @@ def _try_parse_toml(text: str) -> dict[str, Any] | None:
         return tomllib.loads(text)
     except tomllib.TOMLDecodeError:
         return None
+
+
+def _config_shape_diagnostics(parsed: dict[str, Any]) -> tuple[DiagnosticPayload, ...]:
+    diagnostics: list[DiagnosticPayload] = []
+    project = parsed.get("project")
+    if project is not None and not isinstance(project, dict):
+        diagnostics.append(("invalid-project", "project must be a TOML table"))
+    elif isinstance(project, dict):
+        dependencies = project.get("dependencies")
+        if dependencies is not None and (
+            not isinstance(dependencies, list)
+            or any(not isinstance(item, str) for item in dependencies)
+        ):
+            diagnostics.append(
+                (
+                    "invalid-project-dependencies",
+                    "project.dependencies must be an array of strings",
+                )
+            )
+        optional = project.get("optional-dependencies")
+        if optional is not None and not isinstance(optional, dict):
+            diagnostics.append(
+                (
+                    "invalid-optional-dependencies",
+                    "project.optional-dependencies must be a TOML table",
+                )
+            )
+        elif isinstance(optional, dict):
+            for group, items in sorted(optional.items()):
+                if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+                    diagnostics.append(
+                        (
+                            "invalid-optional-dependency-group",
+                            f"project.optional-dependencies.{group} must be an array of strings",
+                        )
+                    )
+    tool = parsed.get("tool")
+    if tool is not None and not isinstance(tool, dict):
+        diagnostics.append(("invalid-tool", "tool must be a TOML table"))
+    return tuple(diagnostics)
 
 
 # ---------------------------------------------------------------------------
@@ -178,9 +229,7 @@ def config_file_text(db: Database, path: str) -> str:
 
 
 @query
-def config_sections_payload(
-    db: Database, path: str
-) -> tuple[ConfigSectionPayload, ...]:
+def config_sections_payload(db: Database, path: str) -> tuple[ConfigSectionPayload, ...]:
     text = config_file_text(db, path)
     parsed = _try_parse_toml(text)
     if parsed is None:
@@ -197,13 +246,22 @@ def config_dependencies_payload(
     if parsed is None:
         return ((), ())
 
-    project = parsed.get("project", {})
-    deps = tuple(str(d) for d in project.get("dependencies", []))
+    project_value = parsed.get("project", {})
+    project = project_value if isinstance(project_value, dict) else {}
+    dependencies_value = project.get("dependencies", [])
+    deps = (
+        tuple(dependencies_value)
+        if isinstance(dependencies_value, list)
+        and all(isinstance(item, str) for item in dependencies_value)
+        else ()
+    )
 
-    optional_deps = project.get("optional-dependencies", {})
+    optional_value = project.get("optional-dependencies", {})
+    optional_deps = optional_value if isinstance(optional_value, dict) else {}
     optional_groups = tuple(
-        (group, tuple(str(d) for d in items))
+        (group, tuple(items))
         for group, items in sorted(optional_deps.items())
+        if isinstance(items, list) and all(isinstance(item, str) for item in items)
     )
     return (deps, optional_groups)
 
@@ -214,22 +272,21 @@ def config_tool_configs_payload(db: Database, path: str) -> tuple[str, ...]:
     parsed = _try_parse_toml(text)
     if parsed is None:
         return ()
-    tool = parsed.get("tool", {})
+    tool_value = parsed.get("tool", {})
+    tool = tool_value if isinstance(tool_value, dict) else {}
     return tuple(sorted(tool.keys()))
 
 
 @query
-def config_diagnostics_payload(
-    db: Database, path: str
-) -> tuple[DiagnosticPayload, ...]:
+def config_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload, ...]:
     text = config_file_text(db, path)
     if not text:
         return ()
     try:
-        tomllib.loads(text)
-        return ()
+        parsed = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         return (("toml-decode-error", str(exc)),)
+    return _config_shape_diagnostics(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +313,7 @@ def _decode_section(payload: ConfigSectionPayload) -> ConfigSection:
     return ConfigSection(
         name=name,
         keys=tuple(
-            ConfigKey(section=k[0], key=k[1], value_type=k[2], string_value=k[3])
-            for k in keys
+            ConfigKey(section=k[0], key=k[1], value_type=k[2], string_value=k[3]) for k in keys
         ),
         subsections=subsections,
     )
@@ -265,9 +321,7 @@ def _decode_section(payload: ConfigSectionPayload) -> ConfigSection:
 
 def config_analysis(db: Database, path: str | os.PathLike[str]) -> ConfigAnalysis:
     normalized = os.fspath(path)
-    payload = cast(
-        ConfigAnalysisPayload, thaw(db.get(config_analysis_payload, normalized))
-    )
+    payload = cast(ConfigAnalysisPayload, thaw(db.get(config_analysis_payload, normalized)))
     path_str, sections, deps, optional_deps, tools, diagnostics = payload
     return ConfigAnalysis(
         path=path_str,
@@ -279,9 +333,7 @@ def config_analysis(db: Database, path: str | os.PathLike[str]) -> ConfigAnalysi
     )
 
 
-def workspace_config_analysis(
-    db: Database, root: str | os.PathLike[str]
-) -> ConfigAnalysis | None:
+def workspace_config_analysis(db: Database, root: str | os.PathLike[str]) -> ConfigAnalysis | None:
     normalized_root = os.fspath(root)
     entries = _DIRECTORIES.read(db, normalized_root)
     config_path = None
