@@ -102,3 +102,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     server = LanguageServer(default_root=args.root)
     return server.serve()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
