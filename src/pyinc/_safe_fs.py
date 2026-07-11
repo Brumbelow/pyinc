@@ -486,7 +486,13 @@ def open_lock_file(path: Path) -> BinaryIO:
     try:
         _require_directory_identity(parent_fd, path.parent)
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
+        try:
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
+        except FileNotFoundError:
+            # Concurrent first creation can transiently report a missing leaf.
+            # Revalidate the pinned parent before one fail-closed retry.
+            _require_directory_identity(parent_fd, path.parent)
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise UnsafeFilesystemPathError(f"Lock path is not a regular file: {path}")
         _require_directory_identity(parent_fd, path.parent)

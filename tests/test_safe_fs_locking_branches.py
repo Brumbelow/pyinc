@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import io
 import os
 import struct
@@ -280,6 +281,117 @@ def test_posix_lock_file_rejects_a_symlink_target(tmp_path: Path) -> None:
     with pytest.raises(safe_fs.UnsafeFilesystemPathError, match="safely open lock"):
         safe_fs.open_lock_file(link)
     assert outside.read_bytes() == b"outside"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor behavior")
+def test_posix_lock_file_retries_a_transient_missing_leaf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "retry.lock"
+    real_open = os.open
+    real_require_identity = safe_fs._require_directory_identity
+    attempts = 0
+    events: list[str] = []
+
+    def transient_open(
+        path: str | bytes,
+        flags: int,
+        mode: int = 0o600,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal attempts
+        if path == lock_path.name and dir_fd is not None and flags & os.O_CREAT:
+            attempts += 1
+            events.append("open")
+            if attempts == 1:
+                raise FileNotFoundError(errno.ENOENT, "transient lock create race", path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def track_identity(descriptor: int, path: Path) -> None:
+        if path == lock_path.parent:
+            events.append("identity")
+        real_require_identity(descriptor, path)
+
+    monkeypatch.setattr(safe_fs_internals.os, "open", transient_open)
+    monkeypatch.setattr(safe_fs, "_require_directory_identity", track_identity)
+
+    handle = safe_fs.open_lock_file(lock_path)
+    handle.close()
+
+    assert attempts == 2
+    assert events == ["identity", "open", "identity", "open", "identity"]
+    assert lock_path.is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor behavior")
+def test_posix_lock_file_stops_after_a_second_missing_leaf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "missing.lock"
+    real_open = os.open
+    attempts = 0
+
+    def missing_open(
+        path: str | bytes,
+        flags: int,
+        mode: int = 0o600,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal attempts
+        if path == lock_path.name and dir_fd is not None and flags & os.O_CREAT:
+            attempts += 1
+            raise FileNotFoundError(errno.ENOENT, f"missing lock leaf attempt {attempts}", path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(safe_fs_internals.os, "open", missing_open)
+
+    with pytest.raises(safe_fs.UnsafeFilesystemPathError, match="safely open lock") as caught:
+        safe_fs.open_lock_file(lock_path)
+
+    assert attempts == 2
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+    assert caught.value.__cause__.errno == errno.ENOENT
+    assert "attempt 2" in str(caught.value.__cause__)
+    assert not lock_path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor behavior")
+def test_posix_lock_file_revalidates_parent_before_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted = tmp_path / "trusted"
+    moved = tmp_path / "moved"
+    trusted.mkdir()
+    lock_path = trusted / "retry.lock"
+    real_open = os.open
+    attempts = 0
+
+    def replace_parent(
+        path: str | bytes,
+        flags: int,
+        mode: int = 0o600,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal attempts
+        if path == lock_path.name and dir_fd is not None and flags & os.O_CREAT:
+            attempts += 1
+            if attempts == 1:
+                trusted.rename(moved)
+                trusted.mkdir()
+                raise FileNotFoundError(errno.ENOENT, "parent moved during lock create", path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(safe_fs_internals.os, "open", replace_parent)
+
+    with pytest.raises(safe_fs.UnsafeFilesystemPathError, match="changed identity"):
+        safe_fs.open_lock_file(lock_path)
+
+    assert attempts == 1
+    assert not lock_path.exists()
+    assert not (moved / lock_path.name).exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory-descriptor behavior")
