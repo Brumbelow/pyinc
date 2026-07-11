@@ -93,7 +93,7 @@ def _run_filesystem_put_workers(
     payloads: tuple[bytes, ...],
 ) -> list[_WorkerResult]:
     context: Any = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
-    ready = [context.Event() for _payload in payloads]
+    ready = [context.Event() for _ in payloads]
     start = context.Event()
     results = context.Queue()
     processes = [
@@ -112,7 +112,7 @@ def _run_filesystem_put_workers(
         for worker_ready in ready:
             assert worker_ready.wait(timeout=15), [process.exitcode for process in started]
         start.set()
-        for _process in started:
+        for _ in started:
             try:
                 reports.append(results.get(timeout=35))
             except Empty as error:
