@@ -249,7 +249,8 @@ def _action_lock_directory() -> Path:
         user_identity = hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
     else:
         user_identity = str(uid)
-    directory = Path(tempfile.gettempdir()) / f"pyinc-action-locks-{user_identity}"
+    temp_directory = Path(tempfile.gettempdir()).resolve(strict=True)
+    directory = temp_directory / f"pyinc-action-locks-{user_identity}"
     with contextlib.suppress(FileExistsError):
         directory.mkdir(mode=0o700)
     metadata = directory.lstat()

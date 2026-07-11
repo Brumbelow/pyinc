@@ -123,6 +123,40 @@ def test_file_lock_retries_contention_then_acquires(
     assert stream.closed
 
 
+def test_file_lock_retries_simulated_darwin_contention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stream = _TrackingStream()
+    attempts = 0
+
+    def try_lock(_handle: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError(35, "resource temporarily unavailable")
+
+    times = iter((10.0, 10.1, 10.2))
+    monkeypatch.setattr(locking, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(
+        locking,
+        "errno",
+        SimpleNamespace(EACCES=13, EAGAIN=35, EWOULDBLOCK=35),
+    )
+    monkeypatch.setattr(locking, "open_lock_file", lambda _path: stream)
+    monkeypatch.setattr(locking, "_try_lock", try_lock)
+    monkeypatch.setattr(locking, "_unlock", lambda _handle: None)
+    monkeypatch.setattr(locking_internals.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(locking_internals.time, "sleep", lambda _duration: None)
+
+    lock = locking.FileLock(tmp_path / "darwin.lock", timeout=1)
+    lock.acquire()
+
+    assert locking._is_lock_contention(OSError(35, "busy"))
+    assert attempts == 2
+    lock.release()
+    assert stream.closed
+
+
 def test_file_lock_closes_handle_for_non_contention_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

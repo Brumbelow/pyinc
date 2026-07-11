@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib
 import math
 import os
@@ -122,4 +123,4 @@ def _is_lock_contention(error: OSError) -> bool:
         return True
     if os.name == "nt":
         return error.errno in {13, 36} or getattr(error, "winerror", None) in {33, 36}
-    return error.errno in {11, 13}
+    return error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}

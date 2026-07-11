@@ -175,7 +175,32 @@ def test_action_lock_directory_without_numeric_uid(
     directory = _action_lock_directory()
 
     expected_identity = action_module.hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
-    assert directory == tmp_path / f"pyinc-action-locks-{expected_identity}"
+    assert directory == tmp_path.resolve() / f"pyinc-action-locks-{expected_identity}"
+    assert directory.is_dir()
+
+
+def test_action_lock_directory_resolves_a_symlinked_temporary_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_temporary_directory = tmp_path / "real"
+    real_temporary_directory.mkdir()
+    temporary_alias = tmp_path / "alias"
+    try:
+        temporary_alias.symlink_to(real_temporary_directory, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink support is unavailable")
+    monkeypatch.setattr(action_module.tempfile, "gettempdir", lambda: os.fspath(temporary_alias))
+
+    directory = _action_lock_directory()
+
+    getuid = getattr(os, "getuid", None)
+    uid = getuid() if getuid is not None else None
+    identity = (
+        str(uid)
+        if uid is not None
+        else action_module.hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
+    )
+    assert directory == real_temporary_directory.resolve() / f"pyinc-action-locks-{identity}"
     assert directory.is_dir()
 
 
@@ -190,6 +215,28 @@ def test_action_lock_directory_rejects_a_non_directory(
     )
     lock_path = tmp_path / f"pyinc-action-locks-{identity}"
     lock_path.write_bytes(b"hostile")
+    monkeypatch.setattr(action_module.tempfile, "gettempdir", lambda: os.fspath(tmp_path))
+
+    with pytest.raises(ActionPathError, match="not a directory"):
+        _action_lock_directory()
+
+
+def test_action_lock_directory_rejects_a_symlinked_private_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    identity = (
+        str(uid)
+        if uid is not None
+        else action_module.hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    lock_path = tmp_path / f"pyinc-action-locks-{identity}"
+    try:
+        lock_path.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink support is unavailable")
     monkeypatch.setattr(action_module.tempfile, "gettempdir", lambda: os.fspath(tmp_path))
 
     with pytest.raises(ActionPathError, match="not a directory"):
