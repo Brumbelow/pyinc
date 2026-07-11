@@ -7,6 +7,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Any
 
+from ._path_identity import is_stdlib_path
 from .value import (
     FrozenAdapterValue,
     FrozenDict,
@@ -136,7 +137,7 @@ def _classify_value_capture(value: Any, seen: set[int]) -> tuple[bool, str]:
         reason = _type_capture_rejection(type(value))
         if reason:
             return False, reason
-        if type(value).__module__ == "pathlib":
+        if is_stdlib_path(value):
             return True, ""
         if _instance_slots(type(value)):
             return False, "Path-like slot state cannot be fingerprinted safely."

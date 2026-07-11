@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
         python-version: ['3.11', '3.12', '3.13', '3.14']
 
     steps:
@@ -34,6 +34,50 @@ jobs:
 
       - name: Run test suite
         run: pytest -q
+
+  test-macos:
+    name: Test (macos-latest, Python ${{ matrix.python-version }}, ${{ matrix.shard }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+        shard: [core, properties, tools]
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Run core test shard
+        if: matrix.shard == 'core'
+        run: >-
+          pytest -q
+          --ignore=tests/test_properties.py
+          --ignore=tests/test_pyinc_tools.py
+          --ignore=tests/test_pyinc_tools_workspace_helpers.py
+          --ignore=tests/test_v3_tools.py
+
+      - name: Run property test shard
+        if: matrix.shard == 'properties'
+        run: pytest -q tests/test_properties.py
+
+      - name: Run tools test shard
+        if: matrix.shard == 'tools'
+        run: >-
+          pytest -q
+          tests/test_pyinc_tools.py
+          tests/test_pyinc_tools_workspace_helpers.py
+          tests/test_v3_tools.py
 
   quality:
     name: Static analysis and coverage
