@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import multiprocessing
 import os
 import struct
 import subprocess
 from pathlib import Path
-from typing import Any
+from queue import Empty
+from typing import Any, TypeAlias
 
 import pytest
 
@@ -36,22 +38,107 @@ from pyinc._safe_fs import (
 )
 from pyinc.value import fingerprint_snapshot  # not re-exported from pyinc
 
+_ExceptionDiagnostic: TypeAlias = tuple[str, str, int | None, int | None, str | None]
+_WorkerResult: TypeAlias = tuple[str, tuple[_ExceptionDiagnostic, ...]]
+
 
 def _filesystem_put_worker(
     root: str,
     digest: str,
     payload: bytes,
+    ready: Any,
     start: Any,
     results: Any,
 ) -> None:
-    store = FileSystemArtifactStore(root)
-    start.wait()
     try:
+        store = FileSystemArtifactStore(root)
+        ready.set()
+        if not start.wait(timeout=15):
+            raise TimeoutError("Parent did not release the artifact-store worker.")
         store.put(digest, payload)
     except Exception as error:  # noqa: BLE001 - cross-process result transport
-        results.put(type(error).__name__)
+        ready.set()
+        diagnostics = _exception_diagnostics(error)
+        results.put((diagnostics[0][0], diagnostics))
     else:
-        results.put("ok")
+        results.put(("ok", ()))
+
+
+def _exception_diagnostics(error: BaseException) -> tuple[_ExceptionDiagnostic, ...]:
+    diagnostics: list[_ExceptionDiagnostic] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        filename = getattr(current, "filename", None)
+        diagnostics.append(
+            (
+                type(current).__name__,
+                str(current),
+                getattr(current, "errno", None),
+                getattr(current, "winerror", None),
+                str(filename) if filename is not None else None,
+            )
+        )
+        next_error = current.__cause__
+        if next_error is None and not current.__suppress_context__:
+            next_error = current.__context__
+        current = next_error
+    return tuple(diagnostics)
+
+
+def _run_filesystem_put_workers(
+    root: Path,
+    digest: str,
+    payloads: tuple[bytes, ...],
+) -> list[_WorkerResult]:
+    context: Any = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
+    ready = [context.Event() for _payload in payloads]
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_filesystem_put_worker,
+            args=(str(root), digest, payload, worker_ready, start, results),
+        )
+        for payload, worker_ready in zip(payloads, ready, strict=True)
+    ]
+    started: list[Any] = []
+    reports: list[_WorkerResult] = []
+    try:
+        for process in processes:
+            process.start()
+            started.append(process)
+        for worker_ready in ready:
+            assert worker_ready.wait(timeout=15), [process.exitcode for process in started]
+        start.set()
+        for _process in started:
+            try:
+                reports.append(results.get(timeout=35))
+            except Empty as error:
+                raise AssertionError(
+                    "Artifact-store worker did not report; "
+                    f"exit codes: {[process.exitcode for process in started]}"
+                ) from error
+        for process in started:
+            process.join(timeout=5)
+            assert process.exitcode == 0, reports
+        return reports
+    finally:
+        start.set()
+        for process in started:
+            if process.is_alive():
+                process.terminate()
+        for process in started:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+        results.close()
+        results.join_thread()
+        for process in started:
+            if process.exitcode is not None:
+                process.close()
 
 
 # ---------------------------------------------------------------------------
@@ -435,49 +522,34 @@ def test_windows_directory_handles_stay_open_until_operation_finishes() -> None:
     assert api.closed == [4, 3, 2, 1]
 
 
+def test_worker_exception_diagnostics_preserve_operating_system_details() -> None:
+    cause = OSError(errno.EMFILE, "too many open files", "store.lock")
+    error = ArtifactStoreError("outer failure")
+    error.__cause__ = cause
+
+    diagnostics = _exception_diagnostics(error)
+
+    assert diagnostics[0] == ("ArtifactStoreError", "outer failure", None, None, None)
+    assert diagnostics[1][0] == "OSError"
+    assert diagnostics[1][2:] == (errno.EMFILE, None, "store.lock")
+
+
 def test_filesystem_store_serializes_equal_cross_process_puts(tmp_path: Path) -> None:
     digest = "a" * 64
-    context: Any = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
-    start = context.Event()
-    results = context.Queue()
-    processes = [
-        context.Process(
-            target=_filesystem_put_worker,
-            args=(str(tmp_path), digest, b"same", start, results),
-        )
-        for _ in range(2)
-    ]
-    for process in processes:
-        process.start()
-    start.set()
-    for process in processes:
-        process.join(timeout=10)
-        assert process.exitcode == 0
+    reports = _run_filesystem_put_workers(tmp_path, digest, (b"same", b"same"))
 
-    assert sorted(results.get(timeout=1) for _ in processes) == ["ok", "ok"]
+    assert sorted(report[0] for report in reports) == ["ok", "ok"], reports
     assert FileSystemArtifactStore(tmp_path).get(digest) == b"same"
 
 
 def test_filesystem_store_refuses_cross_process_conflicting_bytes(tmp_path: Path) -> None:
     digest = "b" * 64
-    context: Any = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
-    start = context.Event()
-    results = context.Queue()
-    processes = [
-        context.Process(
-            target=_filesystem_put_worker,
-            args=(str(tmp_path), digest, payload, start, results),
-        )
-        for payload in (b"first", b"second")
-    ]
-    for process in processes:
-        process.start()
-    start.set()
-    for process in processes:
-        process.join(timeout=10)
-        assert process.exitcode == 0
+    reports = _run_filesystem_put_workers(tmp_path, digest, (b"first", b"second"))
 
-    assert sorted(results.get(timeout=1) for _ in processes) == ["ValueError", "ok"]
+    assert sorted(report[0] for report in reports) == ["ValueError", "ok"], reports
+    collision = next(report for report in reports if report[0] == "ValueError")
+    assert collision[1][0][0] == "ValueError"
+    assert "collision" in collision[1][0][1].lower()
     assert FileSystemArtifactStore(tmp_path).get(digest) in {b"first", b"second"}
 
 
