@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import compileall
 import importlib
 import importlib.metadata
@@ -13,7 +14,7 @@ import sysconfig
 import tarfile
 import tempfile
 import tomllib
-from collections.abc import MutableSequence
+from collections.abc import MutableSequence, Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -36,31 +37,51 @@ def _import_package_tree(package: _Package) -> None:
         importlib.import_module(module.name)
 
 
-def _validate_sdist(version: str) -> None:
-    archives = tuple(Path("dist").glob(f"pyinc-{version}.tar.gz"))
-    assert len(archives) == 1
+def _validate_sdist(archive_path: Path, version: str) -> None:
+    assert archive_path.name == f"pyinc-{version}.tar.gz"
     prefix = f"pyinc-{version}"
     required = {
+        f"{prefix}/bench/README.md",
         f"{prefix}/bench/__init__.py",
         f"{prefix}/bench/harness.py",
+        f"{prefix}/bench/run.py",
+        f"{prefix}/docs/getting-started.md",
+        f"{prefix}/docs/lsp-reference.md",
         f"{prefix}/scripts/__init__.py",
+        f"{prefix}/scripts/check_docs.py",
+        f"{prefix}/scripts/release_artifacts.py",
         f"{prefix}/scripts/validate_install.py",
         f"{prefix}/scripts/verify_release_metadata.py",
         f"{prefix}/tests/test_bench_smoke.py",
+        f"{prefix}/tests/test_docs.py",
+        f"{prefix}/tests/test_release_artifacts.py",
         f"{prefix}/tests/test_release_metadata.py",
     }
-    with tarfile.open(archives[0], mode="r:gz") as archive:
+    with tarfile.open(archive_path, mode="r:gz") as archive:
         names = frozenset(archive.getnames())
     assert required <= names
     assert not any("__pycache__" in name or name.endswith(".pyc") for name in names)
 
 
-def main() -> None:
-    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--expected-version")
+    parser.add_argument("--sdist", type=Path)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = _parser().parse_args(argv)
+    expected_version = arguments.expected_version
+    if expected_version is None:
+        project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+        expected_version = project["version"]
+    assert isinstance(expected_version, str)
     installed = importlib.metadata.distribution("pyinc")
-    assert installed.version == project["version"]
+    assert installed.version == expected_version
     assert all("extra ==" in requirement for requirement in installed.requires or ())
-    _validate_sdist(installed.version)
+    if arguments.sdist is not None:
+        _validate_sdist(arguments.sdist, installed.version)
 
     executable_name = "pyinc-tools.exe" if sys.platform == "win32" else "pyinc-tools"
     executable = Path(sysconfig.get_path("scripts")) / executable_name
@@ -122,7 +143,8 @@ def main() -> None:
             importlib.import_module("generated.b")
         finally:
             sys.path.pop(0)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

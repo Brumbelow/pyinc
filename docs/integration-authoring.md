@@ -1,4 +1,4 @@
-## Integration Authoring Guide
+# Integration Authoring Guide
 
 An integration is a domain-specific query graph built on the pyinc kernel. The kernel
 provides revisions, dependency tracking, red-green verification, and backdating. The
@@ -10,7 +10,7 @@ This guide extracts the shared patterns from the shipped integrations, using
 [kernel-contract.md](kernel-contract.md) for the soundness envelope and
 [integration-contract.md](integration-contract.md) for the current public boundary.
 
-### Three-Layer Query Structure
+## Three-Layer Query Structure
 
 Integrations use a layered query architecture:
 
@@ -34,7 +34,7 @@ snapshot-safe and hashable by default). The decode layer converts to ergonomic d
 only at the public boundary. Internal graph nodes stay cheap to hash and compare; the
 external API stays user-friendly.
 
-### Result Types
+## Result Types
 
 All public result types must be `@dataclass(frozen=True)` with snapshot-safe fields:
 
@@ -45,11 +45,14 @@ All public result types must be `@dataclass(frozen=True)` with snapshot-safe fie
 - No `list`, `dict`, or `set` in result type fields.
 - Reference: `ImportRef`, `PythonFileAnalysis`, and `PythonWorkspaceAnalysis`.
 
-**Why?** Frozen dataclasses satisfy the kernel's value boundary ownership condition
-(kernel-contract.md condition 1). The kernel's `freeze`/`thaw` cycle handles them
-automatically without custom `ValueAdapter` registration.
+**Why?** The public dataclasses are decoded *after* `db.get()` returns the
+cached tuple payload. Their frozen shape gives callers an immutable, typed
+result without making arbitrary classes part of the snapshot contract. If a
+dataclass itself crosses a cached boundary, `freeze` stores it as a
+`FrozenRecord` and ordinary `thaw` returns a dictionary; preserving the
+original class requires a matching `ValueAdapter`.
 
-### Payload Type Aliases
+## Payload Type Aliases
 
 Define a `TypeAlias` for each internal payload shape. The tuple may use a compact
 representation that differs from the corresponding public dataclass:
@@ -71,7 +74,7 @@ boundary so UTF-8 byte columns are converted exactly once. Reference:
 Query Structure*), and the `TypeAlias` makes the bidirectional conversion
 self-documenting.
 
-### Resources
+## Resources
 
 All reads of external state inside a query must go through the Resource API. The kernel
 intercepts `open()`, `os.getenv`, `os.listdir`, `os.scandir`, and `Path.iterdir` during
@@ -104,7 +107,7 @@ condition 2). `probe_and_load` prevents torn observations while `probe` keeps va
 cheap on the fast path.
 Resource configuration is part of the node key, so the resource must be snapshot-safe.
 
-### Conservative Resolution and Untracked Reads
+## Conservative Resolution and Untracked Reads
 
 Two principles for maintaining the soundness guarantee:
 
@@ -123,7 +126,7 @@ re-execution on every request but preserves correctness. Reference:
 always safe; stale reuse is never safe. An integration that guesses wrong about reuse
 causes silent staleness that violates the soundness envelope.
 
-### Cutoff Functions
+## Cutoff Functions
 
 Use `@query(cutoff=fn)` when semantic equivalence is cheaper than comparing full output
 values. The cutoff function maps a query result to a snapshot-safe comparison token:
@@ -144,7 +147,7 @@ without re-execution.
 optimization that prevents false ripple when recomputation yields a semantically equivalent
 result.
 
-### Cycle-Safe Traversal
+## Cycle-Safe Traversal
 
 When your integration traverses directory trees or recursive structures:
 
@@ -154,7 +157,7 @@ When your integration traverses directory trees or recursive structures:
 - Reference: `_collect_python_files` uses `visited_directories`, `_canonical_path`,
   and `_is_within_root` for safe traversal.
 
-### Stable API Surface
+## Stable API Surface
 
 Define the public boundary explicitly:
 
@@ -167,7 +170,7 @@ Define the public boundary explicitly:
    importable from the submodule but are **not** re-exported from
    `pyinc.integrations`.
 
-### Cross-Integration Composition
+## Cross-Integration Composition
 
 An integration can depend on queries defined in another integration module. The kernel
 tracks these cross-integration calls as ordinary dependency edges -- if the upstream
@@ -193,7 +196,7 @@ query's result changes, the downstream query is re-verified and re-executed as n
 and calls it during import resolution to classify non-workspace imports as `stdlib`,
 `installed`, or `missing`.
 
-### Testing
+## Testing
 
 Three categories of tests for an integration:
 
@@ -212,7 +215,7 @@ fresh-database recomputation over a sequence of state changes. Reference:
 `test_workspace_analysis_matches_fresh_recomputation_over_changes` in
 `tests/test_python_source.py`.
 
-### Checklist
+## Checklist
 
 A new integration needs:
 
@@ -235,7 +238,7 @@ A new integration needs:
 - [ ] Mode-parametrized correctness tests cover `strict`, `checked`, and `fast`
 - [ ] From-scratch consistency test compares incremental vs fresh over edit sequences
 
-### Canonical End-to-End Example: `calc`
+## Canonical End-to-End Example: `calc`
 
 `examples/calc/` is a deliberately small consumer that exercises this whole
 pattern end to end: a single shared `FileResource`, a `@query(cutoff=...)` parse

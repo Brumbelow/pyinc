@@ -12,9 +12,20 @@ jobs:
   gates:
     uses: ./.github/workflows/ci.yml
 
+  codeql:
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    uses: ./.github/workflows/codeql.yml
+
+  benchmark:
+    uses: ./.github/workflows/benchmark.yml
+
   verify-and-build:
     name: Verify signed tag and build
-    needs: gates
+    needs: [gates, codeql, benchmark]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -59,6 +70,9 @@ jobs:
           test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
           test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
           verify_expected_signature tag "$GITHUB_REF_NAME"
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
           git merge-base --is-ancestor "$TRUSTED_BASELINE" "$GITHUB_SHA"
           git rev-list --reverse "$TRUSTED_BASELINE..$GITHUB_SHA" > "$RUNNER_TEMP/release-commits"
           while IFS= read -r commit; do
@@ -87,18 +101,29 @@ jobs:
         run: |
           python -m venv .release-venv
           .release-venv/bin/python -m pip install --no-deps dist/*.whl
-          .release-venv/bin/python scripts/validate_install.py
+          .release-venv/bin/python scripts/validate_install.py --sdist dist/pyinc-*.tar.gz
           .release-venv/bin/pyinc-tools --version
           .release-venv/bin/python examples/correctness_demo.py
           .release-venv/bin/python examples/action_reconcile_demo.py
           .release-venv/bin/python examples/calc_demo.py
           .release-venv/bin/python examples/codegen_demo.py
 
+      - name: Generate artifact checksums
+        shell: bash
+        run: |
+          python scripts/release_artifacts.py write-checksums \
+            --version "${GITHUB_REF_NAME#v}" \
+            --directory dist \
+            --output SHA256SUMS
+
       - name: Upload exact release artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-distributions
-          path: dist/
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            SHA256SUMS
           if-no-files-found: error
           retention-days: 7
 
@@ -117,7 +142,190 @@ jobs:
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           name: release-distributions
-          path: dist/
+          path: release-artifacts/
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: release-artifacts/dist/
+          skip-existing: true
+
+  github-release:
+    name: Publish GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: source
+
+      - name: Download exact release artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: release-distributions
+          path: release-artifacts/
+
+      - name: Verify published artifacts and extract release notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python source/scripts/release_artifacts.py verify-checksums \
+            --version "$version" \
+            --directory release-artifacts/dist \
+            --checksums release-artifacts/SHA256SUMS
+          published=false
+          for attempt in {1..12}; do
+            if python source/scripts/release_artifacts.py verify-pypi \
+              --version "$version" \
+              --directory release-artifacts/dist; then
+              published=true
+              break
+            fi
+            echo "PyPI metadata is not ready (attempt ${attempt}/12)"
+            sleep 10
+          done
+          test "$published" = true
+          python source/scripts/release_artifacts.py release-notes \
+            --version "$version" \
+            --changelog source/CHANGELOG.md \
+            --output release-notes.md
+
+      - name: Create or repair GitHub Release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          title="pyinc ${version}"
+          metadata_fields="body,isDraft,isPrerelease,name,tagName"
+
+          verify_remote_assets() {
+            local remote_directory="$1"
+            python source/scripts/release_artifacts.py verify-remote-assets \
+              --version "$version" \
+              --directory release-artifacts/dist \
+              --checksums release-artifacts/SHA256SUMS \
+              --remote-directory "$remote_directory"
+          }
+
+          verify_release_state() {
+            local metadata_path="$1"
+            local release_list_path="$RUNNER_TEMP/release-list.json"
+            gh release list \
+              --limit 1000 \
+              --json tagName,isLatest > "$release_list_path"
+            python source/scripts/release_artifacts.py verify-release-state \
+              --version "$version" \
+              --metadata "$metadata_path" \
+              --notes release-notes.md \
+              --release-list "$release_list_path"
+          }
+
+          release_exists=false
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            release_exists=true
+            release_is_draft="$(
+              gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft'
+            )"
+            if test "$release_is_draft" = false; then
+              published_assets="$RUNNER_TEMP/published-release-assets"
+              published_metadata="$RUNNER_TEMP/published-release.json"
+              mkdir -p "$published_assets"
+              gh release download "$GITHUB_REF_NAME" --dir "$published_assets"
+              gh release view "$GITHUB_REF_NAME" \
+                --json "$metadata_fields" > "$published_metadata"
+              verify_remote_assets "$published_assets"
+              verify_release_state "$published_metadata"
+              echo "The published GitHub Release is already exact; no changes are required."
+              exit 0
+            fi
+            test "$release_is_draft" = true
+          fi
+
+          if test "$release_exists" = false; then
+            create_flags=(--draft)
+            if [[ "$version" =~ (a|b|rc)[0-9]+$ ]]; then
+              create_flags+=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "$title" \
+              --notes-file release-notes.md \
+              "${create_flags[@]}"
+          fi
+
+          existing_assets_path="$RUNNER_TEMP/draft-asset-names"
+          gh release view "$GITHUB_REF_NAME" \
+            --json assets \
+            --jq '.assets[].name' > "$existing_assets_path"
+          mapfile -t existing_assets < "$existing_assets_path"
+          for asset_name in "${existing_assets[@]}"; do
+            case "$asset_name" in
+              "pyinc-${version}.tar.gz"|"pyinc-${version}-py3-none-any.whl"|SHA256SUMS)
+                ;;
+              *)
+                echo "Unexpected asset on draft GitHub Release: ${asset_name}" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          draft_assets="$RUNNER_TEMP/current-draft-assets"
+          mkdir -p "$draft_assets"
+          sync_draft_asset() {
+            local local_path="$1"
+            local asset_name="${local_path##*/}"
+            local asset_exists=false
+            local existing_name
+            for existing_name in "${existing_assets[@]}"; do
+              if test "$existing_name" = "$asset_name"; then
+                asset_exists=true
+                break
+              fi
+            done
+            if test "$asset_exists" = true; then
+              if gh release download "$GITHUB_REF_NAME" \
+                --pattern "$asset_name" \
+                --dir "$draft_assets" && \
+                cmp -s "$local_path" "$draft_assets/$asset_name"; then
+                echo "Draft asset is already exact: ${asset_name}"
+                return
+              fi
+              gh release delete-asset "$GITHUB_REF_NAME" "$asset_name" --yes
+            fi
+            gh release upload "$GITHUB_REF_NAME" "$local_path"
+          }
+
+          sync_draft_asset "release-artifacts/dist/pyinc-${version}.tar.gz"
+          sync_draft_asset "release-artifacts/dist/pyinc-${version}-py3-none-any.whl"
+          sync_draft_asset release-artifacts/SHA256SUMS
+
+          verified_assets="$RUNNER_TEMP/verified-draft-assets"
+          mkdir -p "$verified_assets"
+          gh release download "$GITHUB_REF_NAME" --dir "$verified_assets"
+          verify_remote_assets "$verified_assets"
+
+          if [[ "$version" =~ (a|b|rc)[0-9]+$ ]]; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --draft=false \
+              --prerelease \
+              --latest=false \
+              --title "$title" \
+              --notes-file release-notes.md
+          else
+            gh release edit "$GITHUB_REF_NAME" \
+              --draft=false \
+              --prerelease=false \
+              --latest \
+              --title "$title" \
+              --notes-file release-notes.md
+          fi
+
+          published_metadata="$RUNNER_TEMP/published-release.json"
+          gh release view "$GITHUB_REF_NAME" \
+            --json "$metadata_fields" > "$published_metadata"
+          verify_release_state "$published_metadata"

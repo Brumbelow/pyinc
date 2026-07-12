@@ -11,8 +11,9 @@ python3 -m pip install -e '.[dev]'
 pytest -q                          # full test suite (default addopts: -q --tb=no)
 pytest -q tests/test_runtime.py    # a single test file
 pytest -q tests/test_properties.py::test_incremental_results_match_fresh_recomputation  # single test
-python3 -m mypy src tests          # strict mypy (see [tool.mypy] in pyproject.toml)
-python3 -m ruff check src tests    # lint (E,F,I,UP,B,SIM,TID; line-length 100; E501 ignored)
+python3 -m mypy src tests bench scripts  # strict mypy (see [tool.mypy] in pyproject.toml)
+python3 -m ruff check src tests bench scripts  # lint (E,F,I,UP,B,SIM,TID; E501 ignored)
+python3 scripts/check_docs.py      # offline links, anchors, examples, CLI, public API
 ```
 
 Python ≥3.11 (the matrix is 3.11 / 3.12 / 3.13 / 3.14). `pyproject.toml` pins `target-version = "py311"` and `python_version = "3.11"`.
@@ -21,10 +22,12 @@ The installed console script is `pyinc-tools` (→ `pyinc_tools.cli:main`), with
 
 ## Releasing
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the
-sdist + wheel, validates the exact wheel in a clean environment, and publishes
-to PyPI via trusted publishing (OIDC, no stored token). The tag name must equal
-the `pyproject.toml` `version` (e.g. `version = "3.0.0rc1"` →
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which first requires
+reusable CI, CodeQL, and five-run benchmark gates. It then builds the sdist and
+wheel, validates the exact wheel in a clean environment, publishes to PyPI via
+trusted publishing (OIDC, no stored token), and creates or repairs a GitHub
+Release containing those exact distributions and `SHA256SUMS`. The tag name must
+equal the `pyproject.toml` `version` (e.g. `version = "3.0.0rc1"` →
 `git tag -s v3.0.0rc1`), and the version bump must land together with its
 `CHANGELOG.md` section cut in the same PR. The release workflow verifies the
 annotated tag, configured signing-key fingerprint, every commit since the
@@ -78,7 +81,7 @@ A reproducible benchmark + correctness harness lives under `bench/` (not shipped
 
 `pyinc` guarantees **from-scratch consistency** (incremental result == fresh-database result) only when all three conditions hold. When recomputation yields a semantically equal value, the record is **backdated** (early cutoff) so downstream dependents stay green.
 
-1. **Value boundary ownership.** Everything crossing a cached boundary (query args, query returns, `Input` values) must be snapshot-safe: scalars, tuples, or values that `freeze` can deep-convert (`list→tuple`, `dict→FrozenDict`, `set→frozenset`, dataclass→`FrozenRecord`), plus registered `ValueAdapter`s. Public dataclasses are `@dataclass(frozen=True)` with `tuple[T, ...]` fields — never `list`/`dict`/`set`.
+1. **Value boundary ownership.** Everything crossing a cached boundary (query args, query returns, `Input` values) must be snapshot-safe: scalars, tuples, or values that `freeze` can deep-convert (`list`→`FrozenList`, `dict`→`FrozenDict`, `set`/`frozenset`→`FrozenSet`, dataclass→`FrozenRecord`), plus registered `ValueAdapter`s. Public dataclasses are `@dataclass(frozen=True)` with `tuple[T, ...]` fields — never `list`/`dict`/`set`.
 2. **Tracked ambient reads.** Inside a query, the runtime intercepts `builtins.open` / `io.open`, `os.getenv`, `os.environ`, `os.listdir`, `os.scandir`, and `Path.iterdir` — any of these outside a `Resource`'s scope raises `UntrackedReadError`. For reads the guard can't see (`os.open`, C extensions, subprocess, network, time, random), the query must call `db.report_untracked_read(reason)`. The guard is installed **once globally** and dispatches per active `Database` via a `ContextVar` stack, so multiple `Database` instances across threads don't interfere.
 3. **Deterministic queries.** Same tracked inputs ⇒ semantically equal return. Mutable closure/global captures and local/dynamically unbound type objects in query definitions are rejected when identity is established (normally the first `db.get()`); equality/cutoff policy captures and callable state must likewise be snapshot-safe. Preview classification via `pyinc.explain_query_captures(fn)` is available beforehand. Query, policy, resource, and adapter trust identities include the relevant interpreter version and build flags. Interpreter/build changes intentionally move the identity so checkpoints miss safely; only the `K2` snapshot byte grammar is cross-minor stable.
 

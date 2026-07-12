@@ -105,10 +105,13 @@ jobs:
           python -m pip install -e '.[dev]'
 
       - name: Type check
-        run: python -m mypy src tests
+        run: python -m mypy src tests bench scripts
 
       - name: Lint
-        run: python -m ruff check src tests
+        run: python -m ruff check src tests bench scripts
+
+      - name: Check documentation
+        run: python scripts/check_docs.py
 
       - name: Measure branch coverage
         run: pytest --cov=pyinc --cov=pyinc_codegen --cov=pyinc_tools --cov-branch --cov-report=term-missing --cov-fail-under=90
@@ -137,7 +140,7 @@ jobs:
 
       - name: Validate installed packages and generated fixtures
         run: |
-          .artifact-venv/bin/python scripts/validate_install.py
+          .artifact-venv/bin/python scripts/validate_install.py --sdist dist/pyinc-*.tar.gz
           .artifact-venv/bin/pyinc-tools --version
 
       - name: Execute shipped examples

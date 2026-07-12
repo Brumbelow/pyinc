@@ -1,10 +1,10 @@
-## Kernel Contract — Soundness Envelope
+# Kernel Contract — Soundness Envelope
 
 `pyinc` is a correctness-first, in-memory incremental query kernel. This
 document defines the guarantee it makes and the exact conditions under which the
 guarantee holds; it is the stable semver contract for `src/pyinc`.
 
-### The Guarantee
+## The Guarantee
 
 pyinc guarantees **from-scratch consistency** — the result of incremental
 evaluation matches a fresh evaluation on the same declared inputs and resources —
@@ -15,7 +15,7 @@ the record is **backdated** (also called **early cutoff**): its `changed_at`
 revision is not advanced, so downstream dependents remain green and avoid
 unnecessary recomputation.
 
-### Conditions for From-Scratch Consistency
+## Conditions for From-Scratch Consistency
 
 **1. Value boundary ownership.**
 All values crossing cached boundaries (query arguments, query return values,
@@ -32,6 +32,12 @@ reconstruct arbitrary user classes. A dataclass, frozen wrapper, or composite
 containing one cannot therefore be used as a mapping key or set member unless a
 `ValueAdapter` reconstructs a hashable value; `freeze` rejects such positions
 before they can produce a snapshot that later fails to thaw.
+
+`freeze()` and `thaw()` are boundary utilities, not a general object
+serializer. Passing an adapter registry to `freeze()` does not embed executable
+reconstruction logic in the snapshot; the matching registry must also be
+available to `thaw()`. Without an adapter, a dataclass's class identity is not
+reconstructed.
 
 The kernel stores frozen snapshots internally. `strict` exposes the immutable
 `Frozen*` views themselves (a query receives, for example, a `FrozenDict` where
@@ -73,7 +79,7 @@ numbers, process state) must either be routed through a Resource or declared via
 fingerprintable implementations and snapshot-safe captures. Dynamically scoped
 local classes are rejected; define stable implementation types at module scope.
 
-### Mode-Specific Enforcement
+## Mode-Specific Enforcement
 
 | Mechanism | `strict` | `checked` | `fast` |
 |---|---|---|---|
@@ -84,7 +90,7 @@ local classes are rejected; define stable implementation types at module scope.
 | Semantic equality for cutoffs | Yes | Yes | Yes |
 | Backdating on equal recomputation | Yes | Yes | Yes |
 
-### Explicit Limitations
+## Explicit Limitations
 
 These fall **outside** the soundness envelope. The kernel does not guarantee
 from-scratch consistency when any of these apply.
@@ -190,7 +196,7 @@ a dependent is still active, the dependent will re-execute the intermediate from
 scratch on its next request. This is correct but may degrade performance.
 (See: `test_rewiring_with_lru_eviction`)
 
-### Escape Hatches
+## Escape Hatches
 
 - **`db.report_untracked_read(reason)`** — marks the current query as impure;
   forces re-execution on every request and disables backdating for that node.
@@ -208,7 +214,7 @@ scratch on its next request. This is correct but may degrade performance.
   (See: `test_input_cutoff_suppresses_equal_updates`,
   `test_query_cutoff_backdates_and_skips_downstream`)
 
-### Output Reconciliation (Actions)
+## Output Reconciliation (Actions)
 
 Queries are pure and never write. The separate **action layer** (`@action`,
 `Output`, `ReconcileResult`; see [action-contract.md](action-contract.md))
@@ -221,7 +227,7 @@ kernel's from-scratch guarantee lifts to the filesystem: an incremental
 sequence of reconciles yields the same output files as a single reconcile from
 a fresh `Database` into an empty directory.
 
-### Additional Kernel Properties
+## Additional Kernel Properties
 
 - Query identity includes the function-definition payload — supported captured
   values and the full definition payloads of transitively captured queries, so
@@ -258,7 +264,7 @@ a fresh `Database` into an empty directory.
   dangling dependency edge.
 - The distributed package is PEP 561 typed via `py.typed`.
 
-### Interpreter and Build Identity
+## Interpreter and Build Identity
 
 Query identities, input policy digests, resource identities, and adapter
 digests each embed a common interpreter/build identity. Its components include
@@ -267,7 +273,7 @@ level), the `-O` optimize flag, the platform, `os.name`, UTF-8 mode, the
 API/ABI tag, the multiarch/platform tag, the extension suffix, the build
 string, and the pointer width.
 
-### Thread Safety
+## Thread Safety
 
 Within a process, `Database` is thread-safe for concurrent use both across
 independent instances and on a single shared instance. Each `Database` holds
@@ -283,30 +289,29 @@ to work unaffected. If many threads share a single `Database`, work serialises
 on the per-instance lock; if they hold separate `Database` instances they run
 in parallel.
 
-### Snapshot Fingerprints and Serialization
+## Snapshot Serialization and Store Keys
 
-`fingerprint_snapshot(snapshot)` is a deterministic, stable function of the
-`Snapshot` union (scalars, `FrozenList`, `FrozenDict`, `FrozenSet`,
-`FrozenRecord`, `FrozenAdapterValue`, `FrozenGraph`, `FrozenRef`, and tuples of
-the same). Digests are an injective-by-construction length-prefixed,
-type-tagged encoding finalized with sha256 and prefixed with the kernel
-fingerprint version (`K2;` — the prefix version tracks the byte grammar, which
-3.0.0 leaves unchanged). They are stable across CPython minor versions and safe
-to persist into an `ArtifactStore`.
+The kernel derives deterministic content keys from the `Snapshot` union
+(scalars, `FrozenList`, `FrozenDict`, `FrozenSet`, `FrozenRecord`,
+`FrozenAdapterValue`, `FrozenGraph`, `FrozenRef`, and tuples of the same). The
+length-prefixed, type-tagged byte grammar is stable across supported CPython
+minor versions. Its digest helper is internal and is intentionally not exported
+from `pyinc`; consumers use the `ArtifactStore` and checkpoint APIs rather than
+constructing store keys themselves.
 
-Snapshot bytes are produced by `serialize_snapshot` and consumed by
-`deserialize_snapshot`; both round-trip the full snapshot grammar, including
-`FrozenGraph` / `FrozenRef`. Any change to the encoder counts as a cache-key
-break and must be accompanied by a bump of the kernel identity prefix so older
-fingerprints are rejected rather than silently reused.
+The public `serialize_snapshot` and `deserialize_snapshot` functions round-trip
+the full snapshot grammar, including `FrozenGraph` / `FrozenRef`. Serialized
+snapshots contain data only; adapted values still require the matching adapter
+registry when they are thawed. A byte-grammar change is a cache-key break, so
+older persisted records are rejected rather than silently reused.
 
-### Checkpoint Save and Load
+## Checkpoint Save and Load
 
 An outbound `ArtifactStore` (`InMemoryArtifactStore` /
 `FileSystemArtifactStore`) optionally accepts every snapshot the kernel
-freezes, keyed by its `fingerprint_snapshot` digest, via `Database(store=...)`.
+freezes, keyed by its internally derived content digest, via `Database(store=...)`.
 Snapshot bytes use the encoding described in
-[Snapshot Fingerprints and Serialization](#snapshot-fingerprints-and-serialization).
+[Snapshot Serialization and Store Keys](#snapshot-serialization-and-store-keys).
 
 On top of this, `Database.save_checkpoint(store=None) -> str` serialises the
 current query and resource records — their snapshot bytes, call snapshots,
@@ -332,7 +337,7 @@ injection; the store passed to `load_checkpoint` is also used for subsequent
 snapshot loading if the `Database` was not constructed with a `store=`
 argument.
 
-### FileSystemArtifactStore
+## FileSystemArtifactStore
 
 `FileSystemArtifactStore` accepts only digest-shaped keys, serializes each
 digest with an OS-native process lock, and publishes flushed same-directory
@@ -352,7 +357,7 @@ directory handle chain for the lock's lifetime.
 Unsafe object, directory, or lock paths surface a typed `ArtifactStoreError`;
 lock timeouts surface `ArtifactStoreLockError`.
 
-### Push Observers
+## Push Observers
 
 `Database.observe(callback, query, *args, **kwargs)` registers a callback that
 fires when the identified query node's stored value changes. It returns a
@@ -395,7 +400,7 @@ Dispatch model:
 `args_digest`, decision (`"executed"`), and the `changed_at` / `verified_at`
 revisions at the time of execution.
 
-### Verification
+## Verification
 
 The from-scratch consistency guarantee is mechanically verified by property tests
 that compare incremental results against fresh-database recomputation for the same

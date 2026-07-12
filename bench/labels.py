@@ -1,17 +1,6 @@
-"""Human-readable display names for the benchmark report.
-
-The ``target`` / ``scenario`` / ``engine`` strings on :class:`ScenarioResult`
-are canonical identifiers — tests assert on them and they must stay stable. This
-module maps those identifiers to readable titles, plain-English descriptions,
-and column metadata used only when rendering the CSV and markdown reports. It is
-presentation only; it never changes what is measured.
-"""
+"""Stable benchmark identifiers and human-readable report labels."""
 
 from __future__ import annotations
-
-# --------------------------------------------------------------------------- #
-# Targets — the four things the harness exercises.
-# --------------------------------------------------------------------------- #
 
 TARGET_LABELS: dict[str, str] = {
     "synthetic": "Synthetic query graph",
@@ -20,137 +9,55 @@ TARGET_LABELS: dict[str, str] = {
     "action": "Action reconciliation",
 }
 
-# One-line context per target, shown under its heading. Notably, the synthetic
-# target's "full recompute" is a trivial arithmetic sum, so pyinc's graph
-# machinery is *slower* there — that target exists to stress graph mechanics and
-# correctness, not to win on raw speed. The realistic targets (calc, codegen)
-# are where incremental reuse pays off.
 TARGET_NOTES: dict[str, str] = {
     "synthetic": (
-        "A minimal query graph. Its full-recompute baseline is a trivial "
-        "arithmetic sum measured in microseconds, so pyinc is *slower* in "
-        "absolute terms here — this target checks graph mechanics and "
-        "correctness, not raw speed."
+        "A minimal graph whose full baseline is arithmetic; it checks dependency "
+        "tracking and bounded work rather than speed."
     ),
-    "calc": (
-        "A small include-aware expression language reconciled to disk — a "
-        "realistic workload where incremental reuse pays off."
-    ),
-    "codegen": (
-        "The JSON-Schema → typed-Python compiler. Edits touch only the affected "
-        "models, so incremental runs stay well under a full recompile."
-    ),
-    "action": (
-        "Declared-output reconciliation: only changed files are written, and "
-        "tampered outputs are repaired via content hash."
-    ),
+    "calc": "An include-aware expression language with declared output reconciliation.",
+    "codegen": "The JSON-Schema to typed-Python compiler and its output action.",
+    "action": "Declared-output creation, reuse, deletion, and tamper repair.",
 }
 
-# --------------------------------------------------------------------------- #
-# Engines — pyinc versus the comparators it is measured against.
-# --------------------------------------------------------------------------- #
-
 ENGINE_LABELS: dict[str, str] = {
-    "pyinc": "pyinc (incremental)",
+    "pyinc": "pyinc",
     "full": "full recompute",
-    "naive": "naive per-key cache",
+    "naive": "naive cache",
     "joblib": "joblib.Memory",
 }
 
-# The engine every scenario's speedup is measured against.
-BASELINE_ENGINE = "full"
-
-# --------------------------------------------------------------------------- #
-# Scenarios — one canonical edit each, with a plain-English description of what
-# the edit is and what a correct incremental engine should do with it.
-# --------------------------------------------------------------------------- #
-
-# token -> (short title, one-line description)
 SCENARIO_LABELS: dict[str, tuple[str, str]] = {
-    "cold": (
-        "Cold build",
-        "first run with an empty cache — everything computes from scratch",
-    ),
-    "unchanged": (
-        "No-op rebuild",
-        "re-run with nothing changed — everything should be reused",
-    ),
+    "cold": ("Cold build", "compute from an empty cache"),
+    "unchanged": ("No-op rebuild", "reuse the unchanged graph"),
     "unreferenced_file_edit": (
         "Edit an unused file",
-        "change a file nothing depends on — no downstream work should run",
+        "change a file outside the dependency graph",
     ),
     "comment_only_referenced_edit": (
-        "Comment-only edit",
-        "edit only comments/whitespace of a referenced file — should backdate "
-        "to zero downstream work",
+        "Formatting-only edit",
+        "backdate an equal semantic value and reuse downstream work",
     ),
     "localized_semantic_edit": (
         "Localized edit",
-        "change one value used by one output — only that output recomputes",
+        "recompute only the affected path and output",
     ),
     "high_fanout_shared_edit": (
-        "Shared edit, high fan-out",
-        "change one input many outputs depend on — every dependent recomputes",
+        "Shared edit",
+        "recompute every dependent of one shared input",
     ),
     "removed_emitted_artifact": (
         "Remove an artifact",
-        "stop declaring a previously emitted output — it is deleted from disk",
+        "delete an output no longer declared by the action",
     ),
     "tampered_generated_output": (
         "Tampered output",
-        "an out-of-band edit corrupts a generated file — content-hash repair restores it",
+        "repair an out-of-band output change without query work",
     ),
     "checkpoint_restore": (
         "Checkpoint restore",
-        "warm a fresh database from a saved checkpoint instead of recomputing",
+        "load a pre-saved checkpoint and request the warmed result",
     ),
 }
-
-# --------------------------------------------------------------------------- #
-# Metrics — CSV column name, readable header, and what each column means. Order
-# matches the report layout. ``pyinc_only`` columns are blank for other engines
-# because the harness does not compute a dependency graph or memo count for the
-# comparators.
-# --------------------------------------------------------------------------- #
-
-
-class Metric:
-    __slots__ = ("csv_field", "header", "description", "pyinc_only")
-
-    def __init__(
-        self, csv_field: str, header: str, description: str, *, pyinc_only: bool = False
-    ) -> None:
-        self.csv_field = csv_field
-        self.header = header
-        self.description = description
-        self.pyinc_only = pyinc_only
-
-
-WALL = Metric(
-    "wall_seconds",
-    "wall (ms)",
-    "wall-clock time for the run (CSV in seconds, table in milliseconds)",
-)
-PEAK = Metric("peak_memory_kib", "peak (KiB)", "peak traced memory during the run, in KiB")
-GRAPH = Metric(
-    "dep_graph_edges",
-    "graph edges",
-    "edges in pyinc's dependency graph (pyinc only)",
-    pyinc_only=True,
-)
-NODES = Metric(
-    "memo_nodes",
-    "memo nodes",
-    "memoized nodes pyinc is holding — inputs, resources, and queries (pyinc only)",
-    pyinc_only=True,
-)
-CORRECT = Metric(
-    "matches_fresh",
-    "correct?",
-    "does the engine's output equal a fresh, cache-free run? pyinc is always yes",
-)
-
-METRICS: tuple[Metric, ...] = (WALL, PEAK, GRAPH, NODES, CORRECT)
 
 
 def target_label(token: str) -> str:

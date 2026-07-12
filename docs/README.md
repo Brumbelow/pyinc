@@ -1,40 +1,33 @@
-# pyinc documentation
+# pyinc Documentation
 
-Start with the project [README](../README.md) for the pitch and a runnable
-example. These docs go deeper, in the order below — each builds on the ones
-before it.
+Start with [Getting Started](getting-started.md) for a runnable path through
+inputs, queries, resources, modes, inspection, and actions. The documents below
+each have one job.
 
-## Reading order
+## Learn and operate
 
-1. **[architecture.md](architecture.md)** — the map: how the kernel, the value
-   membrane, the durable cache, integrations, and the consumer layers
-   (`pyinc_tools`, `pyinc_codegen`) fit together, and where the boundaries are.
-2. **[kernel-contract.md](kernel-contract.md)** — the guarantee
-   (*from-scratch consistency*), the three conditions it depends on, the
-   `strict` / `checked` / `fast` modes, and the documented limitations and
-   escape hatches. Read this before relying on the cache for correctness.
-3. **[action-contract.md](action-contract.md)** — the `@action` layer that turns
-   query-derived *desired* artifacts into files on disk: atomic writes, the
-   ownership ledger, tamper repair, and the dry-run `plan`.
-4. **[integration-contract.md](integration-contract.md)** — the stable public
-   API surface, integration by integration. What you may import and rely on.
-5. **[integration-authoring.md](integration-authoring.md)** — the three-layer
-   pattern for writing a new integration, with `python_source` as the worked
-   template.
-6. **[codegen-guide.md](codegen-guide.md)** — `pyinc_codegen`, the JSON-Schema →
-   typed-Python compiler: a public-API-only consumer that shows dependency-
-   decomposed file→file generation.
-7. **[pyinc-tools-guide.md](pyinc-tools-guide.md)** — the `pyinc-tools` CLI and
-   LSP server: capabilities, editor wiring, the overlay/mirror model, and the
-   full LSP feature reference.
-8. **[migration-v3.md](migration-v3.md)** — upgrading from 2.x? Read this
-   before reusing persisted state: the required state cleanup and the API
-   changes in 3.0.0.
+| Document | Use it when you need to… |
+|---|---|
+| [Getting Started](getting-started.md) | Build and run a first incremental graph and declared-output action. |
+| [`pyinc-tools` Guide](pyinc-tools-guide.md) | Install or operate the CLI/LSP, configure an editor, understand overlays, or troubleshoot. |
+| [LSP Reference](lsp-reference.md) | Check an advertised method or its user-visible limitations. |
+| [Codegen Guide](codegen-guide.md) | Generate typed Python models from JSON Schema through the action layer. |
+| [Migrating from 2.x](migration-v3.md) | Discard incompatible state and update code for 3.0. |
 
-## By role
+## Depend on a contract
 
-- **Using pyinc as a library** → README → kernel-contract → action-contract.
-- **Writing an integration** → integration-authoring → integration-contract.
-- **Wiring an editor / watcher** → pyinc-tools-guide.
-- **Building a compiler on pyinc** → codegen-guide → action-contract.
-- **Upgrading from 2.x** → migration-v3.
+| Document | Contract it defines |
+|---|---|
+| [Kernel Contract](kernel-contract.md) | From-scratch consistency, its three conditions, execution modes, checkpoints, and limits. |
+| [Action Contract](action-contract.md) | Portable declared outputs, atomic publication, ownership, repair, deletion, and dry runs. |
+| [Integration Contract](integration-contract.md) | Stable integration entrypoints/result types, supported input shapes, and key limits. |
+
+## Extend or understand the project
+
+| Document | Purpose |
+|---|---|
+| [Architecture](architecture.md) | Package ownership and the boundaries between kernel, integrations, tools, and codegen. |
+| [Integration Authoring](integration-authoring.md) | Normative three-layer pattern for adding an integration without widening the kernel. |
+
+The project [README](../README.md) remains the concise package overview and
+documentation map used on GitHub and PyPI.

@@ -1,0 +1,43 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Benchmark correctness and work counts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14'
+
+      - name: Install benchmark dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[bench]'
+
+      - name: Run benchmark
+        env:
+          PYTHONHASHSEED: '0'
+          PYTHONPATH: src
+        run: python -m bench.run --output bench/results --repetitions 5
+
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: benchmark-${{ github.sha }}
+          path: |
+            bench/results/samples.csv
+            bench/results/benchmark.csv
+            bench/results/benchmark.md
+            bench/results/metadata.json
+          if-no-files-found: error
+          retention-days: 90

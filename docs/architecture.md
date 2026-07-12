@@ -70,11 +70,12 @@ the boundary.
 `Database(store=...)` accepts any object satisfying the `ArtifactStore`
 protocol (`InMemoryArtifactStore` and `FileSystemArtifactStore` ship in
 `pyinc.store`). The kernel writes serialized snapshot bytes for every value
-crossing the membrane, keyed by its `fingerprint_snapshot` digest. Bytes are
-produced by `serialize_snapshot` and consumed by `deserialize_snapshot`; the
-encoding is byte-stable and both round-trip the full snapshot grammar
-including `FrozenGraph` / `FrozenRef`. External tools may use this for
-cross-run sharing.
+crossing the membrane, keyed by an internally derived content digest. Bytes are
+produced by the public `serialize_snapshot` and consumed by
+`deserialize_snapshot`; the encoding is byte-stable and both round-trip the
+full snapshot grammar including `FrozenGraph` / `FrozenRef`. The digest helper
+is not public API: callers use the artifact-store and checkpoint operations
+instead of manufacturing kernel store keys.
 
 `Database.save_checkpoint(store=None) -> str` serializes current node records,
 snapshot addresses, and dependency edges to a content-addressed key prefixed
@@ -183,10 +184,8 @@ imports the `environment_index` query to classify non-workspace imports as
 changes (e.g., a package is installed or removed), `python_source`'s import
 resolution results are automatically invalidated and recomputed on the next
 request. `deep_module_resolution` and `dependency_check` compose with
-`installed_packages` the same way. The canonical inventory of shipped edges is
-[Cross-Integration Composition
-Edges](integration-contract.md#cross-integration-composition-edges) in the
-integration contract.
+`installed_packages` the same way. The stable surface and composition boundary
+are summarized in the [integration contract](integration-contract.md#composition-and-experimental-helpers).
 
 Composition queries like `environment_index` are public `@query` functions
 exported in their module's `__all__`, but they are intentionally not

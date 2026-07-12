@@ -1,25 +1,33 @@
-"""Comparison baselines. ``joblib`` is imported lazily and only when present."""
+"""Fixed comparison baselines for the release benchmark."""
 
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Callable
+from typing import ParamSpec, Protocol, TypeVar, cast
+
+FIXED_COMPARATORS: tuple[str, ...] = ("full", "naive", "joblib")
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
-def joblib_available() -> bool:
-    return importlib.util.find_spec("joblib") is not None
+class Memory(Protocol):
+    def cache(self, func: Callable[_P, _R]) -> Callable[_P, _R]: ...
 
 
-def available_comparators() -> list[str]:
-    """Comparators that can run in this environment (joblib only if installed)."""
-    comparators = ["full", "naive"]
-    if joblib_available():
-        comparators.append("joblib")
-    return comparators
+def required_comparators() -> tuple[str, ...]:
+    """Return the release comparator set, failing if joblib is unavailable."""
+    if importlib.util.find_spec("joblib") is None:
+        raise RuntimeError(
+            "the benchmark requires joblib; install the fixed comparator set with "
+            "`python -m pip install -e '.[bench]'`"
+        )
+    return FIXED_COMPARATORS
 
 
-def make_joblib_memory(cache_dir: str):  # type: ignore[no-untyped-def]
-    """Build a ``joblib.Memory`` cache. Imported lazily so the dependency stays
-    optional and is never pulled in by the shipped packages."""
-    import joblib
+def make_joblib_memory(cache_dir: str) -> Memory:
+    """Build the required joblib cache without importing it from shipped code."""
+    import joblib  # type: ignore[import-untyped]
 
-    return joblib.Memory(location=cache_dir, verbose=0)
+    return cast(Memory, joblib.Memory(location=cache_dir, verbose=0))

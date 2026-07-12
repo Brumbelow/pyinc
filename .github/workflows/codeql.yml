@@ -2,6 +2,9 @@ name: "CodeQL Advanced"
 
 on:
   push:
+    branches:
+      - '**'
+  workflow_call:
 
 jobs:
   analyze:

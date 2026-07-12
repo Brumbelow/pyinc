@@ -6,28 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-
-- `python -m pyinc_tools` (and `python -m pyinc_tools.cli`) now runs the CLI;
-  previously module execution was a silent no-op because the package had no
-  `__main__.py` and `cli.py` had no main guard.
-
-### Changed
-
-- `pyinc_tools` no longer imports the kernel-private `pyinc._python_lexing`
-  module; it carries its own copy of the small identifier-lexing helper, so
-  both consumer packages build strictly on public `pyinc` /
-  `pyinc.integrations` contracts.
-- Documentation overhaul for 3.0.0: corrected the `freeze` conversion table in
-  the kernel contract (`list` → `FrozenList`, `set`/`frozenset` → `FrozenSet`,
-  `dict` → `FrozenDict`), the `report_untracked_read` description (it marks a
-  query impure; it does not permit guarded reads), the module attribution of
-  the shared lexical-scope surface (`scope_resolution`), the
-  cross-integration composition edge inventory, and the `pyinc-tools analyze`
-  output example; consolidated the duplicated LSP feature reference in the
-  tools guide; reordered the docs reading order for new users.
-
-## [3.0.0rc1] - 2026-07-09
+## [3.0.0rc1] - 2026-07-12
 
 ### Added
 
@@ -42,6 +21,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exists.
 - `pyinc-tools --version`, LSP 3.18 position-encoding negotiation, Python 3.14
   support, and installed-wheel validation in CI.
+- `python -m pyinc_tools` and `python -m pyinc_tools.cli` module execution.
+- Task-oriented getting-started and LSP references, plus an offline
+  documentation checker for links, anchors, executable examples, CLI output,
+  and the documented stable integration surface.
+- A correctness-first benchmark workflow that uploads five isolated-run
+  `samples.csv`, summarized `benchmark.csv`, `benchmark.md`, and provenance-rich
+  `metadata.json` artifacts.
+- Automated GitHub Releases after PyPI publication and a manual 12-environment
+  workflow that validates exact published artifacts and compares PyPI and
+  GitHub Release hashes.
 
 ### Changed
 
@@ -76,9 +65,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   edit generation, workspace mirroring/watching, and JSON-RPC framing behind
   the lock-owning `WorkspaceSession` façade. Tools consume the stable public
   integration surface instead of private resolver internals.
+- `pyinc_tools` carries its identifier-lexing helper instead of importing the
+  kernel-private `pyinc._python_lexing` module, keeping both consumer packages
+  on public `pyinc` / `pyinc.integrations` contracts.
 - Generated model packages use deferred annotations and type-checking-only
   imports for cyclic local references. Definition/module collisions are
   checked after Unicode normalization, snake conversion, and case folding.
+- Documentation now has one purpose per guide or contract, uses PyPI-safe
+  navigation, describes the exact from-scratch-consistency guarantee and
+  frozen container types, and keeps protocol operation details in a compact
+  LSP reference.
+- Benchmark correctness, fixed row coverage, deterministic work counts, and
+  node ceilings are release gates. Wall timings are informational medians with
+  min/max ranges and no `tracemalloc` instrumentation; generated reports are no
+  longer checked into the repository.
 
 ### Fixed
 
@@ -95,6 +95,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   honor exclusion globs, retain recursively referenced requirements files
   regardless of suffix, surface requirements-chain diagnostics, and reject
   escaping symlinks.
+- XML analysis rejects every `DOCTYPE` and entity declaration before parsing,
+  including external-entity and entity-expansion payloads.
 
 ### Security
 
@@ -107,6 +109,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Artifact-store keys are restricted to lowercase SHA-256 digests (optionally
   checkpoint-prefixed with `ck`), preventing path traversal and platform path
   injection.
+- Tag publication waits for reusable CI, CodeQL, and benchmark gates. The
+  GitHub Release job receives only `contents: write`, reuses the exact verified
+  distributions, and publishes their `SHA256SUMS` file.
 
 ### Migration
 

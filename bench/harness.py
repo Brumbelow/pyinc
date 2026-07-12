@@ -1,13 +1,231 @@
-"""Timing/memory measurement, scenario orchestration, and report writing."""
+"""Scenario orchestration, release-gate validation, and artifact writing."""
 
 from __future__ import annotations
 
 import csv
-from collections.abc import Iterable, Sequence
+import json
+import statistics
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import labels
-from .measure import ScenarioResult
+from .baselines import required_comparators
+from .measure import ScenarioResult, WorkMetrics
+
+ALL_TARGETS: tuple[str, ...] = ("synthetic", "calc", "codegen", "action")
+REPETITIONS = 5
+ROWS_PER_REPETITION = 67
+
+_TARGET_MATRIX: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    "synthetic": (
+        ("cold", ("pyinc", "full", "naive", "joblib")),
+        ("unchanged", ("pyinc", "full", "naive", "joblib")),
+        ("localized_semantic_edit", ("pyinc", "full", "naive", "joblib")),
+        ("high_fanout_shared_edit", ("pyinc", "full", "naive", "joblib")),
+        ("checkpoint_restore", ("pyinc",)),
+    ),
+    "calc": (
+        ("cold", ("pyinc", "full", "naive")),
+        ("unchanged", ("pyinc", "full", "naive")),
+        ("unreferenced_file_edit", ("pyinc", "full", "naive")),
+        ("comment_only_referenced_edit", ("pyinc", "full", "naive")),
+        ("localized_semantic_edit", ("pyinc", "full", "naive")),
+        ("high_fanout_shared_edit", ("pyinc", "full", "naive")),
+        ("removed_emitted_artifact", ("pyinc", "full", "naive")),
+        ("tampered_generated_output", ("pyinc", "full", "naive")),
+        ("checkpoint_restore", ("pyinc",)),
+    ),
+    "codegen": (
+        ("cold", ("pyinc", "full")),
+        ("unchanged", ("pyinc", "full")),
+        ("comment_only_referenced_edit", ("pyinc", "full")),
+        ("localized_semantic_edit", ("pyinc", "full")),
+        ("high_fanout_shared_edit", ("pyinc", "full")),
+        ("removed_emitted_artifact", ("pyinc", "full")),
+        ("tampered_generated_output", ("pyinc", "full")),
+        ("checkpoint_restore", ("pyinc",)),
+    ),
+    "action": (
+        ("cold", ("pyinc", "full")),
+        ("unchanged", ("pyinc", "full")),
+        ("high_fanout_shared_edit", ("pyinc", "full")),
+        ("removed_emitted_artifact", ("pyinc", "full")),
+        ("tampered_generated_output", ("pyinc", "full")),
+    ),
+}
+
+
+def _expected_rows(targets: Sequence[str]) -> tuple[tuple[str, str, str], ...]:
+    rows: list[tuple[str, str, str]] = []
+    for target in targets:
+        try:
+            matrix = _TARGET_MATRIX[target]
+        except KeyError as error:
+            raise KeyError(f"unknown bench target: {target!r}") from error
+        rows.extend(
+            (target, scenario, engine)
+            for scenario, engines in matrix
+            for engine in engines
+        )
+    return tuple(rows)
+
+
+EXPECTED_ROW_KEYS = _expected_rows(ALL_TARGETS)
+INTENTIONAL_STALE: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        ("synthetic", "high_fanout_shared_edit", "naive"),
+        ("calc", "tampered_generated_output", "naive"),
+    }
+)
+NODE_CEILINGS: dict[str, int] = {
+    "synthetic": 16,
+    "calc": 24,
+    "codegen": 40,
+    "action": 8,
+}
+
+CountExpectation = int | tuple[int, int]
+
+
+@dataclass(frozen=True)
+class WorkExpectation:
+    query_executions: CountExpectation
+    query_reuses: CountExpectation
+    query_backdates: CountExpectation
+    resource_loads: CountExpectation
+    memo_nodes: CountExpectation
+    memo_node_delta: CountExpectation
+    dep_graph_edges: CountExpectation
+    dep_graph_edge_delta: CountExpectation
+
+
+def _work(
+    query_executions: CountExpectation,
+    query_reuses: CountExpectation,
+    query_backdates: CountExpectation,
+    resource_loads: CountExpectation,
+    memo_nodes: CountExpectation,
+    memo_node_delta: CountExpectation,
+    dep_graph_edges: CountExpectation,
+    dep_graph_edge_delta: CountExpectation,
+) -> WorkExpectation:
+    return WorkExpectation(
+        query_executions,
+        query_reuses,
+        query_backdates,
+        resource_loads,
+        memo_nodes,
+        memo_node_delta,
+        dep_graph_edges,
+        dep_graph_edge_delta,
+    )
+
+
+# These envelopes are the reviewed deterministic-work contract for the release
+# harness. Ranges are used only for call-level reuse counts affected by
+# digest-sorted verification order, and for codegen removal where that order can
+# execute either 8 or 12 nodes. Execution ceilings remain far below a cold/full
+# graph, so deterministic over-recomputation fails the release gate.
+PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
+    ("synthetic", "cold"): _work(7, 0, 0, 0, 14, 7, 18, 18),
+    ("synthetic", "unchanged"): _work(0, 7, 0, 0, 14, 0, 18, 0),
+    ("synthetic", "localized_semantic_edit"): _work(2, 11, 0, 0, 14, 0, 18, 0),
+    ("synthetic", "high_fanout_shared_edit"): _work(7, 1, 0, 0, 14, 0, 18, 0),
+    ("synthetic", "checkpoint_restore"): _work(1, 6, 0, 0, 14, 7, 18, 18),
+    ("calc", "cold"): _work(15, 23, 0, 2, 17, 17, 22, 22),
+    ("calc", "unchanged"): _work(0, 38, 0, 0, 17, 0, 22, 0),
+    ("calc", "unreferenced_file_edit"): _work(0, 38, 0, 0, 17, 0, 22, 0),
+    ("calc", "comment_only_referenced_edit"): _work(0, 37, 1, 1, 17, 0, 22, 0),
+    ("calc", "localized_semantic_edit"): _work(5, (38, 39), 5, 1, 17, 0, 22, 0),
+    ("calc", "high_fanout_shared_edit"): _work(7, (42, 43), 4, 1, 17, 0, 22, 0),
+    ("calc", "removed_emitted_artifact"): _work(4, (28, 29), 4, 1, 17, 0, 22, 0),
+    ("calc", "tampered_generated_output"): _work(0, 29, 0, 0, 17, 0, 22, 0),
+    ("calc", "checkpoint_restore"): _work(0, 3, 0, 0, 15, 15, 19, 19),
+    ("codegen", "cold"): _work(28, 116, 0, 1, 29, 29, 38, 38),
+    ("codegen", "unchanged"): _work(0, 144, 0, 0, 29, 0, 38, 0),
+    ("codegen", "comment_only_referenced_edit"): _work(0, 143, 1, 1, 29, 0, 38, 0),
+    ("codegen", "localized_semantic_edit"): _work(6, (144, 148), 9, 1, 29, 0, 38, 0),
+    ("codegen", "high_fanout_shared_edit"): _work(6, (146, 152), 13, 1, 29, 0, 38, 0),
+    ("codegen", "removed_emitted_artifact"): _work(
+        (8, 12), (108, 116), 6, 1, 29, 0, 36, -2
+    ),
+    ("codegen", "tampered_generated_output"): _work(0, 108, 0, 0, 29, 0, 36, 0),
+    ("codegen", "checkpoint_restore"): _work(0, 27, 0, 0, 23, 23, 29, 29),
+    ("action", "cold"): _work(3, 0, 0, 0, 5, 3, 3, 3),
+    ("action", "unchanged"): _work(0, 3, 0, 0, 5, 0, 3, 0),
+    ("action", "high_fanout_shared_edit"): _work(3, 0, 0, 0, 5, 0, 3, 0),
+    ("action", "removed_emitted_artifact"): _work(0, 2, 0, 0, 5, 0, 3, 0),
+    ("action", "tampered_generated_output"): _work(0, 2, 0, 0, 5, 0, 3, 0),
+}
+
+
+def _minimum(expectation: CountExpectation) -> int:
+    return expectation if isinstance(expectation, int) else expectation[0]
+
+
+def expected_work_metrics(target: str, scenario: str) -> WorkMetrics:
+    """Return one valid fixture value for the authoritative work envelope."""
+    expectation = PYINC_WORK_EXPECTATIONS[(target, scenario)]
+    return WorkMetrics(
+        query_executions=_minimum(expectation.query_executions),
+        query_reuses=_minimum(expectation.query_reuses),
+        query_backdates=_minimum(expectation.query_backdates),
+        resource_loads=_minimum(expectation.resource_loads),
+        memo_nodes=_minimum(expectation.memo_nodes),
+        memo_node_delta=_minimum(expectation.memo_node_delta),
+        dep_graph_edges=_minimum(expectation.dep_graph_edges),
+        dep_graph_edge_delta=_minimum(expectation.dep_graph_edge_delta),
+    )
+
+_WORK_FIELDS = (
+    "query_executions",
+    "query_reuses",
+    "query_backdates",
+    "resource_loads",
+    "memo_nodes",
+    "memo_node_delta",
+    "dep_graph_edges",
+    "dep_graph_edge_delta",
+)
+_SAMPLE_FIELDS = (
+    "repetition",
+    "target",
+    "scenario",
+    "engine",
+    "wall_seconds",
+    *_WORK_FIELDS,
+    "matches_fresh",
+)
+_SUMMARY_FIELDS = (
+    "target",
+    "scenario",
+    "engine",
+    "median_wall_seconds",
+    "min_wall_seconds",
+    "max_wall_seconds",
+    *_WORK_FIELDS,
+    "matches_fresh",
+)
+
+
+@dataclass(frozen=True)
+class BenchmarkSummary:
+    target: str
+    scenario: str
+    engine: str
+    median_seconds: float
+    min_seconds: float
+    max_seconds: float
+    matches_fresh: bool
+    query_executions: int | None
+    query_reuses: int | None
+    query_backdates: int | None
+    resource_loads: int | None
+    memo_nodes: int | None
+    memo_node_delta: int | None
+    dep_graph_edges: int | None
+    dep_graph_edge_delta: int | None
 
 
 def run_scenarios(
@@ -18,7 +236,9 @@ def run_scenarios(
 ) -> list[ScenarioResult]:
     from . import scenarios
 
-    comps = list(comparators) if comparators is not None else ["full", "naive"]
+    comps = required_comparators()
+    if comparators is not None and tuple(comparators) != comps:
+        raise ValueError(f"benchmark comparator set is fixed at {comps!r}")
     results: list[ScenarioResult] = []
     for name in targets:
         target = scenarios.TARGETS.get(name)
@@ -28,176 +248,283 @@ def run_scenarios(
     return results
 
 
-# CSV header: identity columns followed by one column per metric. The metric
-# fields (and their pyinc-only semantics) live in ``labels`` so the CSV and the
-# markdown report stay in sync.
-_ID_FIELDS = ("target", "scenario", "engine")
-_FIELDS = _ID_FIELDS + tuple(m.csv_field for m in labels.METRICS)
+def _key(result: ScenarioResult) -> tuple[str, str, str]:
+    return (result.target, result.scenario, result.engine)
 
 
-def _metric_value(result: ScenarioResult, metric: labels.Metric) -> object:
-    """Raw cell value for ``metric``; ``None`` when it does not apply (rendered
-    as a blank cell rather than a misleading ``0``)."""
-    is_pyinc = result.engine == "pyinc"
-    if metric is labels.WALL:
-        return f"{result.seconds:.6f}"
-    if metric is labels.PEAK:
-        return f"{result.peak_kib:.1f}"
-    if metric is labels.GRAPH:
-        return result.graph_size if is_pyinc else None
-    if metric is labels.NODES:
-        return result.node_count if is_pyinc else None
-    if metric is labels.CORRECT:
-        return result.correct
-    raise AssertionError(f"unhandled metric: {metric.csv_field}")
+def _work_values(result: ScenarioResult) -> tuple[int | None, ...]:
+    return (
+        result.query_executions,
+        result.query_reuses,
+        result.query_backdates,
+        result.resource_loads,
+        result.memo_nodes,
+        result.memo_node_delta,
+        result.dep_graph_edges,
+        result.dep_graph_edge_delta,
+    )
 
 
-def _write_csv(results: Sequence[ScenarioResult], csv_path: Path) -> None:
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+def _expectation_values(expectation: WorkExpectation) -> tuple[CountExpectation, ...]:
+    return (
+        expectation.query_executions,
+        expectation.query_reuses,
+        expectation.query_backdates,
+        expectation.resource_loads,
+        expectation.memo_nodes,
+        expectation.memo_node_delta,
+        expectation.dep_graph_edges,
+        expectation.dep_graph_edge_delta,
+    )
+
+
+def _matches_expectation(actual: int, expected: CountExpectation) -> bool:
+    if isinstance(expected, int):
+        return actual == expected
+    return expected[0] <= actual <= expected[1]
+
+
+def _validate_authoritative_work(result: ScenarioResult) -> None:
+    expectation = PYINC_WORK_EXPECTATIONS[(result.target, result.scenario)]
+    for field, actual, expected in zip(
+        _WORK_FIELDS,
+        _work_values(result),
+        _expectation_values(expectation),
+        strict=True,
+    ):
+        if actual is None or not _matches_expectation(actual, expected):
+            raise AssertionError(
+                f"authoritative work gate failed for {_key(result)!r}: "
+                f"{field} expected {expected!r}, got {actual!r}"
+            )
+
+
+def validate_repetition(
+    results: Sequence[ScenarioResult], targets: Sequence[str] = ALL_TARGETS
+) -> None:
+    """Enforce the correctness, coverage, work, and node gates for one run."""
+    expected = _expected_rows(targets)
+    actual = tuple(_key(result) for result in results)
+    if actual != expected:
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        raise AssertionError(
+            f"benchmark row matrix changed: expected={len(expected)}, actual={len(actual)}, "
+            f"missing={missing!r}, extra={extra!r}"
+        )
+    if tuple(targets) == ALL_TARGETS and len(results) != ROWS_PER_REPETITION:
+        raise AssertionError(
+            f"benchmark must emit {ROWS_PER_REPETITION} rows, emitted {len(results)}"
+        )
+
+    expected_stale = INTENTIONAL_STALE.intersection(expected)
+    actual_stale = {_key(result) for result in results if not result.matches_fresh}
+    if actual_stale != expected_stale:
+        raise AssertionError(
+            f"unexpected correctness results: expected stale={sorted(expected_stale)!r}, "
+            f"actual stale={sorted(actual_stale)!r}"
+        )
+
+    for result in results:
+        values = _work_values(result)
+        if result.engine == "pyinc":
+            if any(value is None for value in values):
+                raise AssertionError(f"missing pyinc work metrics for {_key(result)!r}")
+            _validate_authoritative_work(result)
+            assert result.memo_nodes is not None
+            ceiling = NODE_CEILINGS[result.target]
+            if result.memo_nodes > ceiling:
+                raise AssertionError(
+                    f"{result.target} memo nodes {result.memo_nodes} exceed ceiling {ceiling}"
+                )
+        elif any(value is not None for value in values):
+            raise AssertionError(f"comparator row has pyinc-only metrics: {_key(result)!r}")
+
+
+def validate_repetitions(
+    repetitions: Sequence[Sequence[ScenarioResult]],
+    targets: Sequence[str] = ALL_TARGETS,
+) -> None:
+    if len(repetitions) != REPETITIONS:
+        raise AssertionError(
+            f"benchmark requires {REPETITIONS} isolated repetitions, got {len(repetitions)}"
+        )
+    for results in repetitions:
+        validate_repetition(results, targets)
+
+    for row_index, expected_key in enumerate(_expected_rows(targets)):
+        first = repetitions[0][row_index]
+        signature = (_key(first), first.matches_fresh, _work_values(first))
+        for repetition, results in enumerate(repetitions[1:], start=2):
+            current = results[row_index]
+            current_signature = (_key(current), current.matches_fresh, _work_values(current))
+            if current_signature != signature:
+                raise AssertionError(
+                    f"non-deterministic work counts for {expected_key!r} in repetition "
+                    f"{repetition}: expected={signature!r}, actual={current_signature!r}"
+                )
+
+
+def aggregate_repetitions(
+    repetitions: Sequence[Sequence[ScenarioResult]],
+    targets: Sequence[str] = ALL_TARGETS,
+) -> list[BenchmarkSummary]:
+    validate_repetitions(repetitions, targets)
+    summaries: list[BenchmarkSummary] = []
+    for row_index, _expected_key in enumerate(_expected_rows(targets)):
+        rows = [results[row_index] for results in repetitions]
+        first = rows[0]
+        seconds = [row.seconds for row in rows]
+        summaries.append(
+            BenchmarkSummary(
+                target=first.target,
+                scenario=first.scenario,
+                engine=first.engine,
+                median_seconds=statistics.median(seconds),
+                min_seconds=min(seconds),
+                max_seconds=max(seconds),
+                matches_fresh=first.matches_fresh,
+                query_executions=first.query_executions,
+                query_reuses=first.query_reuses,
+                query_backdates=first.query_backdates,
+                resource_loads=first.resource_loads,
+                memo_nodes=first.memo_nodes,
+                memo_node_delta=first.memo_node_delta,
+                dep_graph_edges=first.dep_graph_edges,
+                dep_graph_edge_delta=first.dep_graph_edge_delta,
+            )
+        )
+    return summaries
+
+
+def _write_samples_csv(
+    repetitions: Sequence[Sequence[ScenarioResult]], path: Path
+) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(_FIELDS)
-        for r in results:
-            row = [r.target, r.scenario, r.engine]
-            for metric in labels.METRICS:
-                value = _metric_value(r, metric)
-                row.append("" if value is None else value)
-            writer.writerow(row)
+        writer.writerow(_SAMPLE_FIELDS)
+        for repetition, results in enumerate(repetitions, start=1):
+            for result in results:
+                writer.writerow(
+                    (
+                        repetition,
+                        result.target,
+                        result.scenario,
+                        result.engine,
+                        f"{result.seconds:.9f}",
+                        *_work_values(result),
+                        result.matches_fresh,
+                    )
+                )
 
 
-def _grouped(
-    results: Sequence[ScenarioResult],
-) -> list[tuple[tuple[str, str], list[ScenarioResult]]]:
-    """Group results by (target, scenario), preserving first-seen order."""
-    order: list[tuple[str, str]] = []
-    buckets: dict[tuple[str, str], list[ScenarioResult]] = {}
-    for r in results:
-        key = (r.target, r.scenario)
-        if key not in buckets:
-            buckets[key] = []
-            order.append(key)
-        buckets[key].append(r)
-    return [(key, buckets[key]) for key in order]
+def _write_summary_csv(summaries: Sequence[BenchmarkSummary], path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(_SUMMARY_FIELDS)
+        for result in summaries:
+            writer.writerow(
+                (
+                    result.target,
+                    result.scenario,
+                    result.engine,
+                    f"{result.median_seconds:.9f}",
+                    f"{result.min_seconds:.9f}",
+                    f"{result.max_seconds:.9f}",
+                    result.query_executions,
+                    result.query_reuses,
+                    result.query_backdates,
+                    result.resource_loads,
+                    result.memo_nodes,
+                    result.memo_node_delta,
+                    result.dep_graph_edges,
+                    result.dep_graph_edge_delta,
+                    result.matches_fresh,
+                )
+            )
 
 
-def _speedup(baseline_seconds: float | None, seconds: float) -> str:
-    """Human phrasing of ``seconds`` relative to the ``full`` baseline."""
-    if baseline_seconds is None:
-        return "—"
-    if seconds <= 0 or baseline_seconds <= 0:
-        return "—"
-    factor = baseline_seconds / seconds
-    if abs(factor - 1.0) < 0.05:
-        return "≈ baseline"
-    if factor >= 1.0:
-        return f"{factor:.1f}× faster"
-    return f"{1.0 / factor:.1f}× slower"
+def _display_work(result: BenchmarkSummary) -> str:
+    if result.engine != "pyinc":
+        return "-"
+    return (
+        f"{result.query_executions}/{result.query_reuses}/"
+        f"{result.query_backdates}/{result.resource_loads}"
+    )
 
 
-def _correct_cell(correct: bool, engine: str) -> str:
-    if correct:
-        return "✅ yes"
-    return "⚠️ **STALE**" if engine != "pyinc" else "❌ **WRONG**"
+def _display_graph(result: BenchmarkSummary) -> str:
+    if result.engine != "pyinc":
+        return "-"
+    return f"{result.memo_nodes}/{result.dep_graph_edges}"
 
 
-def _write_markdown(results: Sequence[ScenarioResult], md_path: Path) -> None:
-    engines = [e for e in labels.ENGINE_LABELS if any(r.engine == e for r in results)]
-    scenarios_present = [s for s in labels.SCENARIO_LABELS if any(r.scenario == s for r in results)]
-    stale = [r for r in results if r.engine != "pyinc" and not r.correct]
-
-    lines: list[str] = [
+def _write_markdown(summaries: Sequence[BenchmarkSummary], path: Path) -> None:
+    stale = [result for result in summaries if not result.matches_fresh]
+    lines = [
         "# pyinc benchmark",
         "",
-        "Each scenario applies one canonical edit and times every engine on it. "
-        "The **correct?** column compares that engine's output against a fresh, "
-        "cache-free recomputation of the same scenario.",
+        (
+            "Correctness and deterministic work are release gates. Timings are informational "
+            "and report the median and range from five isolated `PYTHONHASHSEED=0` processes."
+        ),
         "",
-        f"**pyinc is correct in every scenario below.** The comparators "
-        f"(`{labels.BASELINE_ENGINE}` recompute, naive per-key cache, "
-        "`joblib.Memory`) are included to show the trade-off: a naive cache can "
-        "be faster than pyinc yet serve a **stale** result where a real "
-        "dependency changed.",
+        (
+            f"Validated {len(summaries)} rows per repetition. Every pyinc, full-recompute, and "
+            "joblib row matched fresh recomputation; the two naive-cache rows below are "
+            "intentional stale controls."
+        ),
+        "",
+        "## Intentional stale controls",
         "",
     ]
-
-    if stale:
-        lines.append("## ⚠️ Stale results (fast but wrong)")
-        lines.append("")
+    for result in stale:
         lines.append(
-            "These comparator runs finished quickly but returned output that does "
-            "**not** match a fresh recomputation — the exact failure pyinc "
-            "prevents:"
+            f"- {labels.target_label(result.target)} / "
+            f"{labels.scenario_title(result.scenario)} / {labels.engine_label(result.engine)}"
         )
-        lines.append("")
-        for r in stale:
-            lines.append(
-                f"- **{labels.engine_label(r.engine)}** on "
-                f"*{labels.target_label(r.target)} → "
-                f"{labels.scenario_title(r.scenario)}* "
-                f"({labels.scenario_description(r.scenario)})"
-            )
-        lines.append("")
-
-    # Legends.
-    lines.append("## Scenarios")
-    lines.append("")
-    lines.append("| scenario | what it does |")
-    lines.append("|---|---|")
-    for s in scenarios_present:
-        lines.append(f"| **{labels.scenario_title(s)}** | {labels.scenario_description(s)} |")
-    lines.append("")
-
-    lines.append("## Metrics")
-    lines.append("")
-    lines.append("| column | meaning |")
-    lines.append("|---|---|")
-    for metric in labels.METRICS:
-        lines.append(f"| {metric.header} | {metric.description} |")
-    lines.append(
-        f"| speedup | wall time relative to the `{labels.BASELINE_ENGINE}` "
-        "recompute for that scenario |"
+    lines.extend(
+        [
+            "",
+            "## Results",
+            "",
+            "Work is `executions/reuses/backdates/resource loads`; graph is `nodes/edges`.",
+            "",
+            "| target | scenario | engine | median ms | min-max ms | work | graph | fresh |",
+            "|---|---|---|---:|---:|---:|---:|:---:|",
+        ]
     )
-    lines.append("")
-    lines.append(
-        "Engines: " + ", ".join(f"`{e}` — {labels.engine_label(e)}" for e in engines) + "."
-    )
-    lines.append("")
-
-    # Per-target, per-scenario comparison tables.
-    current_target: str | None = None
-    for (target, scenario), rows in _grouped(results):
-        if target != current_target:
-            lines.append(f"## {labels.target_label(target)}")
-            lines.append("")
-            note = labels.TARGET_NOTES.get(target)
-            if note:
-                lines.append(note)
-                lines.append("")
-            current_target = target
-        lines.append(f"### {labels.scenario_title(scenario)}")
-        lines.append("")
-        lines.append(f"_{labels.scenario_description(scenario)}_")
-        lines.append("")
-        baseline = next((r.seconds for r in rows if r.engine == labels.BASELINE_ENGINE), None)
-        lines.append("| engine | wall (ms) | peak (KiB) | correct? | speedup |")
-        lines.append("|---|---|---|---|---|")
-        for r in rows:
-            speedup = (
-                "baseline" if r.engine == labels.BASELINE_ENGINE else _speedup(baseline, r.seconds)
-            )
-            lines.append(
-                f"| {labels.engine_label(r.engine)} | {r.seconds * 1000:.2f} | "
-                f"{r.peak_kib:.1f} | {_correct_cell(r.correct, r.engine)} | {speedup} |"
-            )
-        lines.append("")
-
-    md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    for result in summaries:
+        fresh = "yes" if result.matches_fresh else "STALE CONTROL"
+        lines.append(
+            f"| {labels.target_label(result.target)} | "
+            f"{labels.scenario_title(result.scenario)} | "
+            f"{labels.engine_label(result.engine)} | "
+            f"{result.median_seconds * 1000:.3f} | "
+            f"{result.min_seconds * 1000:.3f}-{result.max_seconds * 1000:.3f} | "
+            f"{_display_work(result)} | {_display_graph(result)} | {fresh} |"
+        )
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def write_reports(results: Sequence[ScenarioResult], out_dir: str | Path) -> tuple[Path, Path]:
+def write_reports(
+    repetitions: Sequence[Sequence[ScenarioResult]],
+    out_dir: str | Path,
+    metadata: Mapping[str, object],
+    targets: Sequence[str] = ALL_TARGETS,
+) -> tuple[Path, Path, Path, Path]:
+    """Validate five repetitions and write the four workflow artifacts."""
+    summaries = aggregate_repetitions(repetitions, targets)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    csv_path = out / "benchmark.csv"
-    md_path = out / "benchmark.md"
-    _write_csv(results, csv_path)
-    _write_markdown(results, md_path)
-    return csv_path, md_path
+    samples_path = out / "samples.csv"
+    summary_path = out / "benchmark.csv"
+    markdown_path = out / "benchmark.md"
+    metadata_path = out / "metadata.json"
+    _write_samples_csv(repetitions, samples_path)
+    _write_summary_csv(summaries, summary_path)
+    _write_markdown(summaries, markdown_path)
+    metadata_path.write_text(
+        json.dumps(dict(metadata), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return samples_path, summary_path, markdown_path, metadata_path

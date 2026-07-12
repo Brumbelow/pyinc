@@ -1,0 +1,78 @@
+name: Validate published artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact published version, without the v tag prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  artifact-hashes:
+    name: Compare PyPI and GitHub Release hashes
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: v${{ inputs.version }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14'
+
+      - name: Compare published artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYINC_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          python scripts/release_artifacts.py verify-published \
+            --version "$PYINC_VERSION" \
+            --repository "$GITHUB_REPOSITORY" \
+            --output-directory published-artifacts
+
+  validate-install:
+    name: Install (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    needs: artifact-hashes
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+    steps:
+      - name: Check out the exact release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: v${{ inputs.version }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install exact version from PyPI
+        env:
+          PYINC_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            --index-url https://pypi.org/simple/ \
+            --no-cache-dir \
+            --no-deps \
+            --only-binary=:all: \
+            "pyinc==${PYINC_VERSION}"
+          python -m pip check
+
+      - name: Validate packages, CLI, imports, and generated cyclic fixtures
+        env:
+          PYINC_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: python scripts/validate_install.py --expected-version "$PYINC_VERSION"

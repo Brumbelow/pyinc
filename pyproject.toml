@@ -31,12 +31,14 @@ pyinc-tools = "pyinc_tools.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/Brumbelow/pyinc"
+Documentation = "https://github.com/Brumbelow/pyinc/blob/main/docs/README.md"
 Repository = "https://github.com/Brumbelow/pyinc"
 Issues = "https://github.com/Brumbelow/pyinc/issues"
 
 [project.optional-dependencies]
 dev = [
   "hypothesis>=6.0",
+  "joblib>=1.3",
   "mypy>=1.10",
   "packaging>=24.0",
   "pytest>=8.0",
@@ -92,15 +94,7 @@ no_implicit_reexport = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 warn_unused_configs = true
-files = ["src", "tests"]
-
-# bench/ ships in the source distribution, but not the wheel, and is not part of
-# the gate paths (`mypy src tests`). The smoke test imports it, so silence it here
-# rather than type-checking it strictly.
-[[tool.mypy.overrides]]
-module = ["bench", "bench.*"]
-ignore_missing_imports = true
-ignore_errors = true
+files = ["src", "tests", "bench", "scripts"]
 
 [tool.ruff]
 line-length = 100
