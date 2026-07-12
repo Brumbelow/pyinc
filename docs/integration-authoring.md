@@ -14,10 +14,12 @@ This guide extracts the shared patterns from the shipped integrations, using
 
 Integrations use a layered query architecture:
 
-**Layer 1 -- Payload queries.** `@query`-decorated functions that return tuple-typed
-payloads. These are the kernel-level cached nodes. They read resources, parse data, and
-return simple hashable structures. Examples include `source_text`, `imports_for_file`,
-and `definitions_for_file`.
+**Layer 1 -- Payload queries.** `@query`-decorated functions that return
+snapshot-safe payloads -- typically tuples, though a raw-text query such as
+`source_text` returns a plain `str`. These are the kernel-level cached nodes. They
+read resources, parse data, and return simple hashable structures. Examples include
+`source_text`, plus `imports_for_file` and `definitions_for_file`, which return
+tuple payloads.
 
 **Layer 2 -- Composition queries.** Queries that call other queries and assemble richer
 composite payloads. Example: `workspace_analysis_payload` calls `module_analysis_payload`
@@ -65,8 +67,9 @@ boundary so UTF-8 byte columns are converted exactly once. Reference:
 `ImportPayload`, `FileAnalysisPayload`, `_decode_import`, and
 `_decode_file_analysis`.
 
-**Why?** Tuples are snapshot-safe and hashable by default -- zero-cost for the kernel's
-caching and comparison. The `TypeAlias` makes the bidirectional conversion self-documenting.
+**Why?** Tuple payloads are cheap for the kernel to cache and compare (see *Three-Layer
+Query Structure*), and the `TypeAlias` makes the bidirectional conversion
+self-documenting.
 
 ### Resources
 
@@ -199,9 +202,10 @@ helpers are not re-exported. Reference:
 `test_package_namespace_exports_only_stable_api` in `tests/test_python_source.py`.
 
 **Mode-parametrized correctness tests.** Verify results across `strict`, `checked`, and
-`fast` modes. Verify backdating explicitly: non-semantic edits should trigger backdating
-and downstream reuse. Reference: `test_file_analysis_reports_top_level_symbols_by_mode`
-in `tests/test_python_source.py`.
+`fast` modes. Reference: `test_file_analysis_reports_top_level_symbols_by_mode` in
+`tests/test_python_source.py`. Verify backdating explicitly: non-semantic edits should
+trigger backdating and downstream reuse. Reference:
+`test_comment_only_edit_backdates_source_and_reuses_downstream` in the same file.
 
 **From-scratch consistency tests.** The gold standard: compare incremental results against
 fresh-database recomputation over a sequence of state changes. Reference:
@@ -214,8 +218,9 @@ A new integration needs:
 
 - [ ] All public result types are `@dataclass(frozen=True)` with snapshot-safe fields
 - [ ] All ambient reads go through resources or `db.report_untracked_read()`
-- [ ] Payload queries return documented `TypeAlias`-typed tuples, with explicit decode
-      transformations where the public dataclass shape differs
+- [ ] Payload queries return documented snapshot-safe payloads (`TypeAlias`-typed
+      tuples, or a plain string for raw text), with explicit decode transformations
+      where the public dataclass shape differs
 - [ ] High-level entrypoints decode payloads into frozen dataclasses
 - [ ] Custom resources implement the public
       `read`/`label`/`probe`/`load`/`probe_and_load`/`identity` hooks as frozen dataclasses

@@ -10,7 +10,7 @@ python3 -m pip install -e '.[dev]'
 
 pytest -q                          # full test suite (default addopts: -q --tb=no)
 pytest -q tests/test_runtime.py    # a single test file
-pytest -q tests/test_runtime.py::test_incremental_results_match_fresh_recomputation  # single test
+pytest -q tests/test_properties.py::test_incremental_results_match_fresh_recomputation  # single test
 python3 -m mypy src tests          # strict mypy (see [tool.mypy] in pyproject.toml)
 python3 -m ruff check src tests    # lint (E,F,I,UP,B,SIM,TID; line-length 100; E501 ignored)
 ```

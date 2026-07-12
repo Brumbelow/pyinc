@@ -8,7 +8,6 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Literal, cast, overload
 
 from pyinc import Database
-from pyinc._python_lexing import identifier_tokens
 from pyinc.integrations import (
     DocumentMap,
     ModuleSymbolTable,
@@ -47,6 +46,7 @@ from ._models import (
     SemanticTokenType,
     SignatureParameterInfo,
 )
+from ._python_lexing import identifier_tokens
 
 _MAX_RESOLUTION_DEPTH = 8
 

@@ -2,7 +2,8 @@
 
 ## Kernel
 
-`pyinc` is a pull-based incremental query runtime. The database stores query memos, inputs, and resources as revisioned node records with:
+`pyinc` is a pull-based incremental query runtime. The database stores query
+memos, inputs, and resources as revisioned node records with:
 
 - a stable node key
 - a frozen boundary snapshot
@@ -11,11 +12,17 @@
 - `changed_at` and `verified_at` revisions
 - the last decision: `executed`, `reused`, or `backdated`
 
-`Database.inspect(...)` returns the last recorded provenance tree for a query key, and `Database.explain(...)` formats that tree without changing the node's recorded decision just by inspecting it.
+`Database.inspect(...)` returns the last recorded provenance tree for a query
+key, and `Database.explain(...)` formats that tree; inspection never changes a
+node's recorded decision.
 
-Evaluation is top-down. `db.get()` verifies dependencies first, then either reuses the memo or re-executes the query. If a re-executed query returns a semantically equal value, the record is **backdated** (also called **early cutoff**) so downstream nodes stay clean.
+Evaluation is top-down. `db.get()` verifies dependencies first, then either
+reuses the memo or re-executes the query. If a re-executed query returns a
+semantically equal value, the record is **backdated** (also called **early
+cutoff**) so downstream nodes stay clean.
 
-`Database(max_query_nodes=...)` bounds only query memo nodes via LRU at top-level request boundaries. Inputs and resources remain resident.
+`Database(max_query_nodes=...)` bounds only query memo nodes via LRU at
+top-level request boundaries. Inputs and resources remain resident.
 
 ## Value Membrane
 
@@ -25,11 +32,21 @@ Values crossing cached boundaries are frozen snapshots.
 - `checked`: expose thawed copies and verify that queries did not mutate them.
 - `fast`: expose thawed copies without mutation checks.
 
-Hidden reads are not allowed in the core. Raw `open()` inside a query raises `UntrackedReadError` unless the access is routed through a resource object or explicitly marked via `db.report_untracked_read(...)`.
+Hidden reads are not allowed in the core. Raw `open()` inside a query raises
+`UntrackedReadError` unless the access is routed through a `Resource`.
+`db.report_untracked_read(reason)` does not lift that guard: it exists for
+reads the guard cannot intercept — `os.open`, C extensions, subprocesses,
+time, randomness — and declaring one marks the query node always-re-executing,
+so its memo is never reused and never backdated.
 
-The runtime also blocks raw ambient reads through `os.getenv`, `os.environ`, `os.listdir`, `os.scandir`, and `Path.iterdir` during query execution. Resource `probe`/`load` hooks run in an internal allow-scope so resource implementations can perform those reads safely.
+The runtime also blocks raw ambient reads through `os.getenv`, `os.environ`,
+`os.listdir`, `os.scandir`, and `Path.iterdir` during query execution.
+Resource `probe`/`load` hooks run in an internal allow-scope so resource
+implementations can perform those reads safely.
 
-Query definitions are also checked for ambient state. Immutable constants and explicit `Input`/resource/query handles are allowed; mutable closure or global data is rejected so memo reuse never depends on hidden Python object mutation.
+Query definitions are also checked for ambient state. Immutable constants and
+explicit `Input`/resource/query handles are allowed; mutable closure or global
+data is rejected so memo reuse never depends on hidden Python object mutation.
 
 Query identity is based on a stable key and a canonical typed encoding of the
 complete supported function definition. It includes code objects and nested
@@ -42,44 +59,67 @@ Resource node identity includes configuration plus the implementations of
 `Resource[KeyT, ValueT, ProbeT]` contract exposes those hooks; callers use
 `Database.read_resource` instead of a private database method.
 
-Mutable object graphs with shared or cyclic references are supported in v2.0.0 via the `FrozenGraph` / `FrozenRef` snapshot variants. `freeze` memoizes mutable containers by id; pure trees retain the v1 flat shape. `thaw` runs a two-pass allocate-then-fill so cycles and shared identity are preserved across the boundary.
+Mutable object graphs with shared or cyclic references are supported via the
+`FrozenGraph` / `FrozenRef` snapshot variants. `freeze` memoizes mutable
+containers by id; pure trees retain the flat snapshot shape. `thaw` runs a
+two-pass allocate-then-fill so cycles and shared identity are preserved across
+the boundary.
 
 ## Durable Cache
 
-`Database(store=...)` accepts any object satisfying the `ArtifactStore` protocol (`InMemoryArtifactStore` and `FileSystemArtifactStore` ship in `pyinc.store`). The kernel writes serialized snapshot bytes for every value crossing the membrane, keyed by its `fingerprint_snapshot` digest. Bytes are produced by `serialize_snapshot` and consumed by `deserialize_snapshot`; both round-trip the full snapshot grammar including `FrozenGraph` / `FrozenRef`. External tools may use this for cross-run sharing.
+`Database(store=...)` accepts any object satisfying the `ArtifactStore`
+protocol (`InMemoryArtifactStore` and `FileSystemArtifactStore` ship in
+`pyinc.store`). The kernel writes serialized snapshot bytes for every value
+crossing the membrane, keyed by its `fingerprint_snapshot` digest. Bytes are
+produced by `serialize_snapshot` and consumed by `deserialize_snapshot`; the
+encoding is byte-stable and both round-trip the full snapshot grammar
+including `FrozenGraph` / `FrozenRef`. External tools may use this for
+cross-run sharing.
 
 `Database.save_checkpoint(store=None) -> str` serializes current node records,
 snapshot addresses, and dependency edges to a content-addressed key prefixed
-with `"ck"`. `load_checkpoint` accepts manifest schema v4 only and validates the
-entire manifest before staging any record: kernel version, identities, input
-keys, dependency references, duplicates, types, and content addresses. Records
-whose live code/resources no longer match miss safely; structurally malformed
-or foreign manifests raise a typed checkpoint error without partially warming
-the database.
+with `"ck"`. `Database.load_checkpoint(key, store=None)` accepts manifest
+schema v4 only and validates the entire manifest before staging any record:
+kernel version, identities, input keys, dependency references, duplicates,
+types, and content addresses. Records whose live code/resources no longer
+match miss safely; structurally malformed or foreign manifests raise a typed
+checkpoint error without partially warming the database.
 
 `FileSystemArtifactStore` accepts only digest-shaped keys and serializes each
 digest across processes. It flushes a same-directory temporary file before
 atomic publication and refuses conflicting bytes.
 
-## Package Shape Today
+## Package shape
 
-`pyinc` exposes a stable kernel surface from the top-level package:
+### Kernel surface (`pyinc`)
 
-- `Database`, stable keyed `Input`, public `Query`, and `@query` for the query runtime
+The top-level package exposes a stable kernel surface:
+
+- `Database`, stable keyed `Input`, public `Query`, and `@query` for the
+  query runtime
 - public generic `Resource`, `Database.read_resource`, `FileResource`,
   `BinaryFileResource`, `FileStatResource`, `EnvResource`, and
   `DirectoryResource` for tracked external reads
-- value-boundary helpers such as `freeze`, `thaw`, `semantic_equal`, and `ValueAdapter`
-- structured inspection via `InspectionNode`, `Database.inspect(...)`, `Database.inspect_fresh(...)`, and `Database.explain(...)`
-- observability via `Database.dependency_graph()`, `Database.statistics()`, and `Database.query_profile()`
-- push observers via `Database.observe(callback, query, *args, **kwargs)` returning a `Subscription`, with `QueryChangeEvent` payloads *(added in the v2 development cycle)*
-- mutable graph support via `FrozenGraph` / `FrozenRef` and the byte-stable `serialize_snapshot` / `deserialize_snapshot` helpers *(v2.0.0)*
-- content-addressed artifact storage via `ArtifactStore`, `InMemoryArtifactStore`, `FileSystemArtifactStore`, and `Database(store=...)`, plus the durable checkpoint API `Database.save_checkpoint(store=None)` / `Database.load_checkpoint(key, store=None)` for cross-run cache reuse *(v2.0.0)*
+- value-boundary helpers such as `freeze`, `thaw`, `semantic_equal`, and
+  `ValueAdapter`
+- structured inspection via `InspectionNode`, `Database.inspect(...)`,
+  `Database.inspect_fresh(...)`, and `Database.explain(...)`
+- observability via `Database.dependency_graph()`, `Database.statistics()`,
+  and `Database.query_profile()`
+- push observers via `Database.observe(callback, query, *args, **kwargs)`
+  returning a `Subscription`, with `QueryChangeEvent` payloads
+- mutable graph snapshots (`FrozenGraph`, `FrozenRef`) and the
+  `serialize_snapshot` / `deserialize_snapshot` helpers, described in
+  [Value Membrane](#value-membrane) and [Durable Cache](#durable-cache)
+- content-addressed artifact stores and the durable checkpoint API for
+  cross-run cache reuse, described in [Durable Cache](#durable-cache)
 - declared-output reconciliation via the `@action` layer (`Output`,
   `ReconcileResult`, `Action.reconcile`/`plan`): the complete cycle is
   cross-process locked, path/manifest trust is prevalidated, files publish
   atomically, and the schema-v2 ledger is published last; see
   [action-contract.md](action-contract.md)
+
+### Integrations (`pyinc.integrations`)
 
 `pyinc.integrations` exposes the stable dataclass/result types and high-level
 entrypoints from the shipped integrations. Its shared public infrastructure
@@ -98,33 +138,60 @@ includes `SourcePosition`, `SourceRange`, `DocumentMap`, `PositionEncoding`,
 - `deep_module_resolution`
 - `requirement_evaluation`
 - `symbol_resolution`
-- `notebook` *(added in v2 development cycle; see `docs/integration-contract.md`)*
+- `notebook`
 
-Low-level payload queries, decode helpers, and resource helpers remain module-local experimental helpers. The public integration boundary is the dataclass/result layer plus the documented high-level entrypoints in `docs/integration-contract.md`.
+Low-level payload queries, decode helpers, and resource helpers remain
+module-local experimental helpers. The public integration boundary is the
+dataclass/result layer plus the documented high-level entrypoints in
+[integration-contract.md](integration-contract.md).
 
-The repository also includes small examples under `examples/`, dedicated tests
-for kernel semantics and from-scratch consistency, and two consumer layers
-built on top of the stable kernel: `pyinc_tools` for editor/watcher-facing
-behavior, and `pyinc_codegen`, a JSON-Schema → typed-Python compiler.
-`WorkspaceSession` remains the cohesive, lock-owning tools façade; internal
-modules separately own document geometry, analysis/resolution, edit generation,
-workspace mirroring/watching, and JSON-RPC framing. Both consumers use only
-public `pyinc` and `pyinc.integrations` contracts. The include-aware `calc`
-fixture under `examples/calc/` is the canonical worked example of a small query
-graph that reconciles outputs to disk. A reproducible benchmark + correctness
-harness lives under `bench/` (not shipped in the wheel); it exercises the
-kernel, calc, codegen, and action targets across a canonical edit sequence and
-pairs every timing with an incremental-equals-fresh correctness assertion. Its
-only comparison dependency, `joblib`, sits in the `bench` optional-dependency
-group and is never imported by runtime packages.
+### Consumer layers and supporting material
+
+Two consumer layers build on the stable kernel: `pyinc_tools` for
+editor/watcher-facing behavior, and `pyinc_codegen`, a JSON-Schema →
+typed-Python compiler. Both consumers use only public `pyinc` and
+`pyinc.integrations` contracts. Within `pyinc_tools`, `WorkspaceSession`
+remains the cohesive, lock-owning tools façade; internal modules separately
+own document geometry, analysis/resolution, edit generation, workspace
+mirroring/watching, and JSON-RPC framing. The [Scope](#scope) section states
+which responsibilities belong to which layer.
+
+The repository also includes small examples under `examples/` and dedicated
+tests for kernel semantics and from-scratch consistency. The include-aware
+`calc` fixture under `examples/calc/` is the canonical worked example of a
+small query graph that reconciles outputs to disk.
+
+A reproducible benchmark + correctness harness lives under `bench/` (not
+shipped in the wheel); it exercises the kernel, calc, codegen, and action
+targets across a canonical edit sequence and pairs every timing with an
+incremental-equals-fresh correctness assertion. Its only comparison
+dependency, `joblib`, sits in the `bench` optional-dependency group and is
+never imported by runtime packages.
 
 ## Cross-Integration Composition
 
-Integrations can compose at the query layer by importing `@query` functions from other integration modules. The kernel's dependency tracking extends automatically across integration boundaries -- no special wiring is required. When an upstream integration's query result changes, downstream queries that depend on it are re-verified and re-executed through the normal red-green algorithm.
+Integrations can compose at the query layer by importing `@query` functions
+from other integration modules. The kernel's dependency tracking extends
+automatically across integration boundaries -- no special wiring is required.
+When an upstream integration's query result changes, downstream queries that
+depend on it are re-verified and re-executed through the normal red-green
+algorithm.
 
-Currently, `python_source` composes with `installed_packages`: it imports the `environment_index` query to classify non-workspace imports as `stdlib`, `installed`, or `missing`. This means that if the installed package environment changes (e.g., a package is installed or removed), `python_source`'s import resolution results are automatically invalidated and recomputed on the next request.
+As a worked example, `python_source` composes with `installed_packages`: it
+imports the `environment_index` query to classify non-workspace imports as
+`stdlib`, `installed`, or `missing`. If the installed package environment
+changes (e.g., a package is installed or removed), `python_source`'s import
+resolution results are automatically invalidated and recomputed on the next
+request. `deep_module_resolution` and `dependency_check` compose with
+`installed_packages` the same way. The canonical inventory of shipped edges is
+[Cross-Integration Composition
+Edges](integration-contract.md#cross-integration-composition-edges) in the
+integration contract.
 
-Composition queries like `environment_index` are public `@query` functions exported in their module's `__all__`, but they are intentionally not re-exported from `pyinc.integrations`. They exist for query-layer composition between integrations, not as user-facing entrypoints.
+Composition queries like `environment_index` are public `@query` functions
+exported in their module's `__all__`, but they are intentionally not
+re-exported from `pyinc.integrations`. They exist for query-layer composition
+between integrations, not as user-facing entrypoints.
 
 ## Scope
 

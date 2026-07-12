@@ -6,6 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `python -m pyinc_tools` (and `python -m pyinc_tools.cli`) now runs the CLI;
+  previously module execution was a silent no-op because the package had no
+  `__main__.py` and `cli.py` had no main guard.
+
+### Changed
+
+- `pyinc_tools` no longer imports the kernel-private `pyinc._python_lexing`
+  module; it carries its own copy of the small identifier-lexing helper, so
+  both consumer packages build strictly on public `pyinc` /
+  `pyinc.integrations` contracts.
+- Documentation overhaul for 3.0.0: corrected the `freeze` conversion table in
+  the kernel contract (`list` → `FrozenList`, `set`/`frozenset` → `FrozenSet`,
+  `dict` → `FrozenDict`), the `report_untracked_read` description (it marks a
+  query impure; it does not permit guarded reads), the module attribution of
+  the shared lexical-scope surface (`scope_resolution`), the
+  cross-integration composition edge inventory, and the `pyinc-tools analyze`
+  output example; consolidated the duplicated LSP feature reference in the
+  tools guide; reordered the docs reading order for new users.
+
 ## [3.0.0rc1] - 2026-07-09
 
 ### Added

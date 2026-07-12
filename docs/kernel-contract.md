@@ -19,10 +19,13 @@ unnecessary recomputation.
 
 **1. Value boundary ownership.**
 All values crossing cached boundaries (query arguments, query return values,
-`Input` values) must be snapshot-safe: either immutable scalars, containers that
-`freeze` can deep-convert to owned representations (`list` → `tuple`,
-`dict` → `FrozenDict`, `set` → `frozenset`), or values handled by registered
-`ValueAdapter` instances.
+`Input` values) must be snapshot-safe: either immutable scalars, containers
+that `freeze` can deep-convert to owned snapshot representations, or values
+handled by registered `ValueAdapter` instances. `freeze` converts
+`list` → `FrozenList`, `dict` → `FrozenDict`, `set` → `FrozenSet`
+(kind `"set"`), `frozenset` → `FrozenSet` (kind `"frozenset"`), and
+dataclasses → `FrozenRecord`; tuples are a native member of the `Snapshot`
+union and are frozen element-wise.
 
 Dataclasses thaw to dictionaries because the kernel does not import and
 reconstruct arbitrary user classes. A dataclass, frozen wrapper, or composite
@@ -30,9 +33,11 @@ containing one cannot therefore be used as a mapping key or set member unless a
 `ValueAdapter` reconstructs a hashable value; `freeze` rejects such positions
 before they can produce a snapshot that later fails to thaw.
 
-The kernel stores frozen snapshots internally. `strict` exposes immutable
-frozen views; `checked` and `fast` expose owned thawed values. No external alias
-to a value that crossed the boundary can influence the stored snapshot.
+The kernel stores frozen snapshots internally. `strict` exposes the immutable
+`Frozen*` views themselves (a query receives, for example, a `FrozenDict` where
+the other modes hand it a `dict`); `checked` and `fast` expose owned thawed
+values. No external alias to a value that crossed the boundary can influence
+the stored snapshot.
 
 Cyclic and shared object graphs are supported via the `FrozenGraph` /
 `FrozenRef` snapshot variants: `freeze` memoizes mutable containers (`list`,
@@ -57,8 +62,8 @@ The kernel intercepts the following during query execution and raises
 - `os.listdir` and `os.scandir`
 - `Path.iterdir`
 
-Reads not intercepted by this mechanism (see Limitations below) must be declared
-via `db.report_untracked_read()`.
+Reads not intercepted by this mechanism (see limitation 1) must be declared
+via `db.report_untracked_read()` ([Escape Hatches](#escape-hatches)).
 
 **3. Deterministic queries w.r.t. tracked dependencies.**
 Given the same tracked inputs, resources, and sub-query results, a query function
@@ -108,34 +113,35 @@ for mutation safety.
 (See: `test_fast_mode_uses_owned_values_without_mutation_detection`)
 
 **4. Durable cross-run cache (trusted, under stated conditions).**
-The kernel is in-memory, but a durable `ArtifactStore` checkpoint is trusted for
-from-scratch consistency across processes and runs when **all** of the following
-hold:
+The kernel is in-memory, but a durable `ArtifactStore` checkpoint (see
+[Checkpoint Save and Load](#checkpoint-save-and-load) for the API) is trusted
+for from-scratch consistency across processes and runs when **all** of the
+following hold:
 
-(i) every `Input` the checkpoint depends on is set before `load_checkpoint`,
-uses the same explicit non-empty key across runs, and has the same equality or
-cutoff policy; compatible aliases resolve to one logical input and a database
-rejects aliases with divergent policies;
-(ii) resources satisfy the probe contract across runs — a resource's probe
-changes whenever its `load` result changes, and probe values are snapshot-safe
-and process-independent;
-(iii) adapters for any adapted snapshot type are registered in the loading
-process with unchanged `freeze`/`thaw` implementations.
+- **(i)** every `Input` the checkpoint depends on is set before
+  `load_checkpoint`, uses the same explicit non-empty key across runs, and has
+  the same equality or cutoff policy; compatible aliases resolve to one logical
+  input, and a database rejects aliases with divergent policies;
+- **(ii)** resources satisfy the probe contract across runs — a resource's
+  probe changes whenever its `load` result changes, and probe values are
+  snapshot-safe and process-independent;
+- **(iii)** adapters for any adapted snapshot type are registered in the
+  loading process with unchanged `freeze`/`thaw` implementations.
 
 Under these conditions `load_checkpoint(key)` followed by `db.get(query)`
 returns the value a fresh recomputation on the same declared state would, in all
 three modes. The mechanisms that earn this:
 
 - **Query identities are recomputed live in the loading process.** A query's
-  identity pins the interpreter (implementation, version tuple, `-O` optimize
-  flag, platform / `os.name` / UTF-8 mode, API/ABI tag, multiarch/platform tag,
-  extension suffix, build string, and pointer width) and the full function-definition
-  payload — a canonical typed code-object encoding, defaults, keyword defaults,
-  comparator policies, and the definitions of transitively captured queries,
-  functions, and modules — so a body or policy edit anywhere in the captured
-  graph, or a build-configuration change, produces a different identity and the
-  stale record simply misses. This encoding never depends on object reference
-  counts and supports nested code and slice constants.
+  identity pins the interpreter/build identity (see
+  [Interpreter and Build Identity](#interpreter-and-build-identity)) and the
+  full function-definition payload — a canonical typed code-object encoding,
+  defaults, keyword defaults, comparator policies, and the definitions of
+  transitively captured queries, functions, and modules — so a body or policy
+  edit anywhere in the captured graph, or a build-configuration change,
+  produces a different identity and the stale record simply misses. This
+  encoding never depends on object reference counts and supports nested code
+  and slice constants.
 - **Inputs and dependency edges verify exactly.** Warmed records carry their
   real dependency edges; each input and sub-query dependency is re-checked
   against the live graph by digest before the record is trusted. Input policy
@@ -144,8 +150,8 @@ three modes. The mechanisms that earn this:
   is a resource is re-probed against the real world; a sub-query dependency that
   cannot be warmed is re-executed from its pinned code (the execute-to-verify
   frontier) and its result digest compared to the manifest. Resource identity
-  pins the implementations of `probe`, `load`, `probe_and_load`, and `identity`
-  in addition to resource configuration and the interpreter/build identity.
+  is pinned as described under
+  [Additional Kernel Properties](#additional-kernel-properties).
 - **Bytes verify against their content addresses.** Every snapshot loaded from
   the store is rejected unless `sha256` of its raw bytes equals the digest it was
   keyed by, and the manifest itself is re-hashed against the checkpoint key
@@ -162,74 +168,6 @@ Residual limitations that stay outside the envelope: the module-monkey-patch
 gap of limitation 5 applies across runs exactly as it does in-process; and a
 checkpoint does not survive an interpreter or build-configuration change — such
 records miss safely (they re-execute) rather than being trusted.
-
-An outbound `ArtifactStore` (`InMemoryArtifactStore` / `FileSystemArtifactStore`)
-optionally accepts every snapshot the kernel freezes, keyed by its
-`fingerprint_snapshot` digest, via `Database(store=...)`. Bytes are produced by
-`serialize_snapshot` and consumed by `deserialize_snapshot`; both round-trip the
-full snapshot grammar including `FrozenGraph` / `FrozenRef`. On top of this,
-`Database.save_checkpoint(store=None) -> str` serialises the current query and
-resource records — their snapshot bytes, call snapshots, resource parameters,
-dependency edges, and per-adapter implementation digests — into a
-content-addressed manifest (schema v4), returning a key prefixed with `"ck"`.
-Adapter digests include `freeze`/`thaw` code, snapshot-safe instance
-configuration, and the interpreter/build identity. Saving rejects an adapter whose captures or state cannot be
-pinned; loading under such an adapter safely misses and re-executes instead of
-thawing checkpoint bytes across an unverifiable implementation boundary.
-Records whose cached value no longer matches the live graph (a "dirty" save with
-no intervening `get`) are omitted rather than persisted stale, so a reload never
-warms a value a fresh run would not produce. `Database.load_checkpoint(key,
-store=None)` re-hashes the manifest against the requested key, validates every
-record, dependency, input policy, probe, and referenced content address before
-atomically staging any records, and rejects a foreign manifest schema or
-kernel-fingerprint version loudly. The next `db.get(query)` verifies dependencies
-as described above and reuses the
-stored result without re-executing when everything checks out, or re-executes
-the affected query otherwise. Both methods accept an optional `store=` kwarg for
-call-site store injection; the store passed to `load_checkpoint` is also used for
-subsequent snapshot loading if the Database was not constructed with a `store=`
-argument.
-
-Within a process, `Database` is thread-safe for concurrent use both across
-independent instances and on a single shared instance. Each `Database` holds
-a `threading.RLock` that serialises every public state read and mutation,
-including queries, resources, inputs, statistics, profiles, dependency graphs,
-resets, checkpoint operations, and subscriptions. The ambient-read
-guard is installed globally exactly once and dispatches per-context via a
-`ContextVar` stack of active databases — two threads inside queries on
-different `Database` instances do not stomp each other's enforcement, and
-raw I/O from a thread that is *not* inside any query continues to work
-unaffected. If many threads share a single `Database`, work serialises on the
-per-instance lock; if they hold separate `Database` instances they run in
-parallel.
-
-`fingerprint_snapshot(snapshot)` is a deterministic, stable function of the
-`Snapshot` union (scalars, `FrozenList`, `FrozenDict`, `FrozenSet`,
-`FrozenRecord`, `FrozenAdapterValue`, `FrozenGraph`, `FrozenRef`, tuples of
-the same). Digests are an injective-by-construction length-prefixed,
-type-tagged encoding finalized with sha256, prefixed with the kernel
-fingerprint version (`K2;`, retained in v3 because its byte grammar is unchanged).
-They are stable across CPython minor versions and safe to persist via
-`serialize_snapshot` /
-`deserialize_snapshot` into an `ArtifactStore`. Any change to the encoder
-counts as a cache-key break and must be accompanied by a bump of the kernel
-identity prefix so older fingerprints are rejected rather than silently
-reused.
-
-`FileSystemArtifactStore` accepts only digest-shaped keys, serializes each
-digest with an OS-native process lock, and publishes flushed same-directory
-temporary files atomically. POSIX uses no-follow directory-relative operations;
-reopens the expected parent and verifies its filesystem identity immediately
-before publication; and rejects a directory rename it observes. POSIX cannot
-portably exclude a hostile rename in the final interval between that check and
-the mutation, so store roots must not be concurrently renamed by non-cooperating
-processes.
-Windows pins every non-reparse directory component with a handle that denies
-delete sharing, publishes from the temporary-file handle, and deletes only
-through a validated file handle. Lock files retain the same protected directory
-handle chain for the lock's lifetime. Unsafe object, directory, or lock paths
-surface a typed `ArtifactStoreError`; lock timeouts surface
-`ArtifactStoreLockError`.
 
 **5. Ambient module or class monkey-patching.**
 Captured modules contribute their `__version__`, a SHA-256 digest of their
@@ -285,23 +223,24 @@ a fresh `Database` into an empty directory.
 
 ### Additional Kernel Properties
 
-- Query identity includes the function definition payload, including supported
-  captured values, the full definition payloads of transitively captured queries
-  (a body edit to a dependency query moves the parent's identity), and the build
-  configuration (Python implementation and version, `-O` optimize flag, platform,
-  `os.name`, UTF-8 mode, full prerelease tuple, and ABI/architecture identity).
-  Mutable closure/global captures and local/dynamically
-  unbound type objects are rejected. Module-level types are pinned through their
-  defining module identity. Use
-  `pyinc.explain_query_captures(fn)` to preview how each capture will be
-  classified before the first `db.get()`.
+- Query identity includes the function-definition payload — supported captured
+  values and the full definition payloads of transitively captured queries, so
+  a body edit to a dependency query moves the parent's identity — plus the
+  interpreter/build identity (see
+  [Interpreter and Build Identity](#interpreter-and-build-identity)).
+  Mutable closure/global captures and local/dynamically unbound type objects
+  are rejected. Module-level types are pinned through their defining module
+  identity. Use `pyinc.explain_query_captures(fn)` to preview how each capture
+  will be classified before the first `db.get()`.
 - `Query` is public, and `@query(key=...)` accepts an explicit stable key; the
   default is `module:qualname`. Coroutine and generator queries are rejected at
   decoration time.
 - `Resource[KeyT, ValueT, ProbeT]` and `Database.read_resource(...)` are public.
-  Resource identity includes configuration and the implementations of every
-  state-observation hook plus the runtime/build identity. Built-ins observe probe/value pairs from one state and
-  include text, binary, environment, stat, and directory resources.
+  Resource identity includes the resource's configuration, the implementations
+  of every state-observation hook (`probe`, `load`, `probe_and_load`, and
+  `identity`), and the interpreter/build identity. The built-in resources
+  (condition 2) cover text, binary, environment, stat, and directory
+  observation.
 - `Database.inspect(...)` exposes the last recorded provenance tree as structured
   data. `Database.explain(...)` formats it for humans. Inspection is
   observational and does not force an extra verification pass;
@@ -311,12 +250,107 @@ a fresh `Database` into an empty directory.
   at top-level request boundaries and affects query nodes only. Per-node timing
   uses fixed-size count/total/min/max/last aggregates; eviction also removes the
   node's call snapshot, timing profile, and unused query registry entry.
-- Query labels contain only the query key and a short argument digest; formatting
-  a graph or profile never calls argument `repr` or embeds argument values.
+- Query labels consist of the query key, a short argument digest, and the query
+  function's name — nothing else; formatting a graph or profile never calls
+  argument `repr` or embeds argument values.
 - Query records and dependency rewiring publish only after successful execution.
   A failed or cyclic evaluation keeps an earlier record usable and cannot leave a
   dangling dependency edge.
 - The distributed package is PEP 561 typed via `py.typed`.
+
+### Interpreter and Build Identity
+
+Query identities, input policy digests, resource identities, and adapter
+digests each embed a common interpreter/build identity. Its components include
+the Python implementation, the full version tuple (including the prerelease
+level), the `-O` optimize flag, the platform, `os.name`, UTF-8 mode, the
+API/ABI tag, the multiarch/platform tag, the extension suffix, the build
+string, and the pointer width.
+
+### Thread Safety
+
+Within a process, `Database` is thread-safe for concurrent use both across
+independent instances and on a single shared instance. Each `Database` holds
+a `threading.RLock` that serialises every public state read and mutation,
+including queries, resources, inputs, statistics, profiles, dependency graphs,
+resets, checkpoint operations, and subscriptions.
+
+The ambient-read guard is installed globally exactly once and dispatches
+per-context via a `ContextVar` stack of active databases — two threads inside
+queries on different `Database` instances do not stomp each other's
+enforcement, and raw I/O from a thread that is *not* inside any query continues
+to work unaffected. If many threads share a single `Database`, work serialises
+on the per-instance lock; if they hold separate `Database` instances they run
+in parallel.
+
+### Snapshot Fingerprints and Serialization
+
+`fingerprint_snapshot(snapshot)` is a deterministic, stable function of the
+`Snapshot` union (scalars, `FrozenList`, `FrozenDict`, `FrozenSet`,
+`FrozenRecord`, `FrozenAdapterValue`, `FrozenGraph`, `FrozenRef`, and tuples of
+the same). Digests are an injective-by-construction length-prefixed,
+type-tagged encoding finalized with sha256 and prefixed with the kernel
+fingerprint version (`K2;` — the prefix version tracks the byte grammar, which
+3.0.0 leaves unchanged). They are stable across CPython minor versions and safe
+to persist into an `ArtifactStore`.
+
+Snapshot bytes are produced by `serialize_snapshot` and consumed by
+`deserialize_snapshot`; both round-trip the full snapshot grammar, including
+`FrozenGraph` / `FrozenRef`. Any change to the encoder counts as a cache-key
+break and must be accompanied by a bump of the kernel identity prefix so older
+fingerprints are rejected rather than silently reused.
+
+### Checkpoint Save and Load
+
+An outbound `ArtifactStore` (`InMemoryArtifactStore` /
+`FileSystemArtifactStore`) optionally accepts every snapshot the kernel
+freezes, keyed by its `fingerprint_snapshot` digest, via `Database(store=...)`.
+Snapshot bytes use the encoding described in
+[Snapshot Fingerprints and Serialization](#snapshot-fingerprints-and-serialization).
+
+On top of this, `Database.save_checkpoint(store=None) -> str` serialises the
+current query and resource records — their snapshot bytes, call snapshots,
+resource parameters, dependency edges, and per-adapter implementation digests —
+into a content-addressed manifest (schema v4), returning a key prefixed with
+`"ck"`. Adapter digests include `freeze`/`thaw` code, snapshot-safe instance
+configuration, and the interpreter/build identity. Saving rejects an adapter
+whose captures or state cannot be pinned; loading under such an adapter safely
+misses and re-executes instead of thawing checkpoint bytes across an
+unverifiable implementation boundary. Records whose cached value no longer
+matches the live graph (a "dirty" save with no intervening `get`) are omitted
+rather than persisted stale, so a reload never warms a value a fresh run would
+not produce.
+
+`Database.load_checkpoint(key, store=None)` validates every record, dependency,
+input policy, probe, and referenced content address before atomically staging
+any records; the manifest and byte-level checks that gate this are part of the
+trust envelope described under limitation 4. The next `db.get(query)` verifies
+dependencies as described there and reuses the stored result without
+re-executing when everything checks out, or re-executes the affected query
+otherwise. Both methods accept an optional `store=` kwarg for call-site store
+injection; the store passed to `load_checkpoint` is also used for subsequent
+snapshot loading if the `Database` was not constructed with a `store=`
+argument.
+
+### FileSystemArtifactStore
+
+`FileSystemArtifactStore` accepts only digest-shaped keys, serializes each
+digest with an OS-native process lock, and publishes flushed same-directory
+temporary files atomically.
+
+On POSIX it uses no-follow directory-relative operations, reopens the expected
+parent and verifies its filesystem identity immediately before publication, and
+rejects a directory rename it observes. POSIX cannot portably exclude a hostile
+rename in the final interval between that check and the mutation, so store
+roots must not be concurrently renamed by non-cooperating processes.
+
+On Windows it pins every non-reparse directory component with a handle that
+denies delete sharing, publishes from the temporary-file handle, and deletes
+only through a validated file handle. Lock files retain the same protected
+directory handle chain for the lock's lifetime.
+
+Unsafe object, directory, or lock paths surface a typed `ArtifactStoreError`;
+lock timeouts surface `ArtifactStoreLockError`.
 
 ### Push Observers
 
@@ -335,7 +369,8 @@ Fires exactly when:
 
 Does **not** fire on:
 
-- `"backdated"` — recomputation produced a semantically equal value;
+- `"backdated"` — the recomputation was backdated (see
+  [The Guarantee](#the-guarantee));
 - `"reused"` — dependencies were unchanged so no recomputation happened;
 - `db.set(...)` / `db.set_many(...)` — input mutation alone does not
   execute any query. Observers fire on the next `get` that triggers

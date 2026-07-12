@@ -47,7 +47,7 @@ as well as a set that treats one output as both a file and a directory (for
 example `pkg` and `pkg/model.py`). The ownership manifest receives the same
 whole-set validation before any desired output is touched.
 
-The root is resolved once. Every owned target is checked before preflight and
+The root is resolved once. Every owned target is checked during preflight and
 again immediately before a write or deletion. Existing path components may not
 be symbolic links, all resolved parents must remain under the root, and an
 owned target must be a regular file. An orphan that has become a directory,
@@ -100,9 +100,11 @@ foreign identities, old schema versions, malformed paths, and malformed hashes
 raise `ActionManifestError` before mutation. v1 manifests are intentionally not
 compatible with v3 and may be discarded.
 
-An action deletes only regular files recorded by its own validated ledger. The
-manifest is left byte-identical on a no-op reconcile, so no-op operation does
-not rewrite user-visible outputs or state.
+An action deletes only files recorded by its own validated ledger, subject to
+the regular-file-only constraint described in [Preflight and portable
+paths](#preflight-and-portable-paths). The manifest is left byte-identical on
+a no-op reconcile, so no-op operation does not rewrite user-visible outputs or
+state.
 
 ## Soundness boundary
 
