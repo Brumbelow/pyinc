@@ -13,7 +13,8 @@ _R = TypeVar("_R")
 
 
 class Memory(Protocol):
-    def cache(self, func: Callable[_P, _R]) -> Callable[_P, _R]: ...
+    def cache(self, func: Callable[_P, _R]) -> Callable[_P, _R]:
+        raise NotImplementedError
 
 
 def required_comparators() -> tuple[str, ...]:

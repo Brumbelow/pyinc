@@ -11,6 +11,10 @@ from scripts import release_artifacts
 VERSION = "3.0.0rc1"
 SDIST = f"pyinc-{VERSION}.tar.gz"
 WHEEL = f"pyinc-{VERSION}-py3-none-any.whl"
+PYPI_API_URL = f"https://pypi.org/pypi/pyinc/{VERSION}/json"
+GITHUB_API_URL = (
+    f"https://api.github.com/repos/Brumbelow/pyinc/releases/tags/v{VERSION}"
+)
 
 
 def _sha256(payload: bytes) -> str:
@@ -156,10 +160,11 @@ def test_verifies_pypi_and_github_release_artifacts(
 ) -> None:
     payloads = {SDIST: b"sdist", WHEEL: b"wheel"}
     pypi, github, urls = _published_documents(payloads, payloads)
+    documents = {PYPI_API_URL: pypi, GITHUB_API_URL: github}
 
     def request_json(url: str, token: str | None = None) -> dict[str, object]:
         del token
-        return github if "api.github.com" in url else pypi
+        return documents[url]
 
     def download(url: str, destination: Path) -> str:
         payload = urls[url]
@@ -209,10 +214,11 @@ def test_rejects_pypi_and_github_artifact_hash_mismatch(
     pypi_payloads = {SDIST: b"sdist", WHEEL: b"wheel"}
     github_payloads = {SDIST: b"sdist", WHEEL: b"different wheel"}
     pypi, github, urls = _published_documents(pypi_payloads, github_payloads)
+    documents = {PYPI_API_URL: pypi, GITHUB_API_URL: github}
 
     def request_json(url: str, token: str | None = None) -> dict[str, object]:
         del token
-        return github if "api.github.com" in url else pypi
+        return documents[url]
 
     def download(url: str, destination: Path) -> str:
         payload = urls[url]
