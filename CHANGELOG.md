@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-07-12
+
+### Release validation
+
+- RC candidate: `v3.0.0rc1` at `6296106725e372a428dfeca5e45390f8cd2821fa`
+- [x] Clean installations from the published RC artifacts passed.
+- [x] The benchmark/correctness report was reviewed; every pyinc result matched a fresh run.
+- [x] Final promotion approved.
+
 ## [3.0.0rc1] - 2026-07-12
 
 ### Added
@@ -1410,3 +1419,4 @@ The first stable v1 release.
 [2.5.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.5.0
 [2.6.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.6.0
 [3.0.0rc1]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0rc1
+[3.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0
