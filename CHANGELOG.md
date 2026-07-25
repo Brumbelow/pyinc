@@ -6,6 +6,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `pyinc-tools analyze` can report diagnostics and gate a CI job: `--format
+  text` prints one `path:line:col: severity code message` line per diagnostic,
+  `--diagnostics-only` emits just the diagnostics array instead of the full
+  result, and `--fail-on` exits with status `3` when a diagnostic reaches the
+  given severity. Diagnostics are sorted by location so output is stable, and
+  the report is always printed before the exit status is decided.
+- PEP 440 arbitrary equality (`===`) is evaluated in version specifiers,
+  requirement evaluation, and dependency checking. It compares the version
+  exactly as written — no normalization, padding, or case folding — so it is
+  decided without parsing and works against versions that do not conform to
+  PEP 440.
+- Semantic tokens classify a `from ... import ...` use by the workspace
+  declaration it resolves to, instead of leaving it unstyled. Imports that
+  resolve outside the workspace, or ambiguously, remain unclassified.
+
+### Changed
+
+- `pyinc-tools analyze --fail-on` combined with `--watch` is rejected as a
+  usage error (exit status `2`), because watch mode never terminates normally.
+  The default remains `--fail-on none`, so existing invocations keep their
+  previous output and exit status.
+- `===` clauses now evaluate instead of reporting `ambiguous`.
+- Documented three previously unstated limits: cyclic-graph support covers
+  mutable containers only, so values crossing through a `ValueAdapter`, `tuple`,
+  or `frozenset` cannot be the target of a back-edge; CSV dialect and header
+  sniffing inspect only the first 8192 characters; and re-export and base-class
+  following both stop at depth 8, the latter silently.
+
 ## [3.0.0] - 2026-07-12
 
 ### Release validation

@@ -1630,10 +1630,52 @@ def _iter_function_args(args: ast.arguments) -> list[ast.arg]:
     return entries
 
 
+def from_import_semantic_token_types(
+    db: Database,
+    root: str,
+    path: str,
+    symbol_table: ModuleSymbolTable,
+) -> dict[str, SemanticTokenType]:
+    """Classify ``from X import name`` bindings by the kind they actually name.
+
+    The symbol table records such a binding as ``from_import_alias``, which says
+    nothing about what was imported, so a use site would otherwise go
+    unclassified. Following the single cross-module hop lets it be highlighted
+    as the function, class, or variable it resolves to. Anything that does not
+    land on a workspace declaration — installed, stdlib, missing, or ambiguous —
+    is left out so the editor's default highlighting still handles it.
+    """
+
+    resolved: dict[str, SemanticTokenType] = {}
+    for symbol in symbol_table.symbols:
+        if symbol.kind != "from_import_alias" or "." in symbol.qualified_name:
+            continue
+        target = resolve_target(db, root, path, symbol.qualified_name)
+        if target.resolution != "workspace" or target.defining_path is None:
+            continue
+        defining_table = module_symbol_table(db, root, target.defining_path)
+        defining = next(
+            (
+                item
+                for item in defining_table.symbols
+                if item.qualified_name == target.qualified_name
+            ),
+            None,
+        )
+        if defining is None:
+            continue
+        token_type = _SYMBOL_KIND_TO_SEMANTIC_TOKEN_TYPE.get(defining.kind)
+        if token_type is not None:
+            resolved[symbol.qualified_name] = token_type
+    return resolved
+
+
 def _compute_semantic_tokens(
     source: str,
     symbol_table: ModuleSymbolTable,
     lexical: ScopeTree,
+    *,
+    import_token_types: Mapping[str, SemanticTokenType] | None = None,
 ) -> tuple[SemanticToken, ...]:
     """Walk ``source``'s AST and emit semantic tokens for declarations
     (function / method / class headers and function parameters) and for bare
@@ -1645,8 +1687,9 @@ def _compute_semantic_tokens(
 
     Use-site classification combines the module symbol table with the shared
     lexical scope tree.  A local binding therefore wins over an identically
-    named module binding; attribute access and cross-module re-export
-    following remain out of scope for semantic-token classification.
+    named module binding; attribute access remains out of scope. Cross-module
+    ``from``-import kinds are supplied by the caller through
+    ``import_token_types`` so this function stays pure.
     """
     try:
         tree = _parse_python(source)
@@ -1663,6 +1706,8 @@ def _compute_semantic_tokens(
         if token_type is None:
             continue
         name_to_token_type.setdefault(symbol.qualified_name, token_type)
+    for imported_name, imported_type in (import_token_types or {}).items():
+        name_to_token_type.setdefault(imported_name, imported_type)
 
     occurrences = {occurrence.range: occurrence for occurrence in lexical.occurrences}
     bindings = {binding.symbol_id: binding for binding in lexical.bindings}
@@ -1834,6 +1879,7 @@ __all__ = [
     "_source_parses",
     "_unwrap_base_expression",
     "_walk_class_definitions",
+    "from_import_semantic_token_types",
     "resolve_target",
     "target_from_symbol_id",
 ]

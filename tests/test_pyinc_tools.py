@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import pyinc_tools.cli as cli
 from pyinc.integrations import SourcePosition, SourceRange, SymbolId
 from pyinc_tools.lsp import LanguageServer, _package_version, _RequestFailed
 from pyinc_tools.session import (
@@ -5703,13 +5704,12 @@ def test_semantic_tokens_missing_file_raises_filenotfound(tmp_path: Path) -> Non
         session.semantic_tokens_for_file(root / "nope.py")
 
 
-def test_semantic_tokens_from_import_alias_use_is_not_emitted(
+def test_semantic_tokens_from_import_alias_use_resolves_to_target_kind(
     tmp_path: Path,
 ) -> None:
-    """`from helper import greet` makes ``greet`` a `from_import_alias` entry
-    in the symbol table; resolving it to its real kind requires a cross-module
-    hop. The first cut conservatively skips such uses so the editor's default
-    highlighting handles them.
+    """`from helper import greet` makes ``greet`` a `from_import_alias` entry in
+    the symbol table; following the single cross-module hop classifies the use
+    site as the function it actually names.
     """
     root = tmp_path / "workspace"
     root.mkdir()
@@ -5718,7 +5718,47 @@ def test_semantic_tokens_from_import_alias_use_is_not_emitted(
     _write(consumer, "from helper import greet\n\ngreet()\n")
     with WorkspaceSession(root) as session:
         tokens = session.semantic_tokens_for_file(consumer)
-    assert all(t.token_modifiers != () or t.token_type != "function" for t in tokens)
+    uses = [t for t in tokens if t.token_modifiers == ()]
+    assert [(t.range.start.line, t.token_type) for t in uses] == [(2, "function")]
+
+
+def test_semantic_tokens_from_import_alias_resolves_class_kind(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "models.py", "class Box:\n    pass\n")
+    consumer = root / "app.py"
+    _write(consumer, "from models import Box\n\nBox()\n")
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_for_file(consumer)
+    uses = [t for t in tokens if t.token_modifiers == ()]
+    assert [(t.range.start.line, t.token_type) for t in uses] == [(2, "class")]
+
+
+def test_semantic_tokens_from_import_of_non_workspace_target_is_not_emitted(
+    tmp_path: Path,
+) -> None:
+    """Only workspace declarations are classified; stdlib imports stay unstyled."""
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "app.py"
+    _write(consumer, "from json import dumps\n\ndumps({})\n")
+    with WorkspaceSession(root) as session:
+        tokens = session.semantic_tokens_for_file(consumer)
+    assert [t for t in tokens if t.token_modifiers == ()] == []
+
+
+def test_semantic_tokens_range_agrees_with_full_for_from_imports(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "helper.py", "def greet() -> None:\n    pass\n")
+    consumer = root / "app.py"
+    _write(consumer, "from helper import greet\n\ngreet()\n")
+    with WorkspaceSession(root) as session:
+        full = session.semantic_tokens_for_file(consumer)
+        ranged = session.semantic_tokens_range_for_file(consumer, start_line=2)
+    assert ranged == tuple(t for t in full if t.range.start.line >= 2)
+    assert any(t.token_type == "function" for t in ranged)
 
 
 def test_semantic_tokens_overlay_change_reflected(tmp_path: Path) -> None:
@@ -8439,3 +8479,70 @@ def test_signature_help_at_class_init_defaults_strip_self(tmp_path: Path) -> Non
             signature_help.label[parameter.label_offset_start : parameter.label_offset_end]
             == parameter.label
         )
+
+
+# ---------------------------------------------------------------------------
+# CLI diagnostic reporting against a real workspace
+# ---------------------------------------------------------------------------
+
+
+def test_cli_text_output_uses_one_based_real_geometry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The text formatter's 1-based conversion, proven against real analysis."""
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "app.py", "x = 1\nimport definitely_not_installed\n")
+
+    exit_code = cli.main(["analyze", str(root), "--format", "text"])
+    assert exit_code == cli.EXIT_SUCCESS
+
+    lines = capsys.readouterr().out.splitlines()
+    missing = [line for line in lines if "missing-import" in line]
+    assert len(missing) == 1
+    # The import sits on source line index 1, so it must render as line 2.
+    assert missing[0].startswith(f"{root / 'app.py'}:2:1: error missing-import ")
+
+
+def test_cli_fail_on_error_gates_a_real_workspace(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "app.py", "import definitely_not_installed\n")
+
+    assert cli.main(["analyze", str(root), "--format", "text"]) == cli.EXIT_SUCCESS
+    capsys.readouterr()
+    assert (
+        cli.main(["analyze", str(root), "--format", "text", "--fail-on", "error"])
+        == cli.EXIT_DIAGNOSTICS
+    )
+    capsys.readouterr()
+
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    _write(clean / "ok.py", "x = 1\n")
+    assert (
+        cli.main(["analyze", str(clean), "--format", "text", "--fail-on", "error"])
+        == cli.EXIT_SUCCESS
+    )
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_text_output_omits_position_for_rangeless_diagnostic(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`source-decode-error` is the real producer of a diagnostic with no range."""
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "bad.py").write_bytes(b'# -*- coding: ascii -*-\nx = "\xff\xfe"\n')
+
+    assert cli.main(["analyze", str(root), "--format", "text"]) == cli.EXIT_SUCCESS
+
+    lines = capsys.readouterr().out.splitlines()
+    decode_errors = [line for line in lines if "source-decode-error" in line]
+    assert len(decode_errors) == 1
+    # No `:line:col` segment — the path is followed directly by the severity.
+    assert decode_errors[0].startswith(f"{root / 'bad.py'}: error source-decode-error ")

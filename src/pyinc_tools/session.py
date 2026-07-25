@@ -81,6 +81,7 @@ from ._analysis import (
     _source_parses,
     _unwrap_base_expression,
     _walk_class_definitions,
+    from_import_semantic_token_types,
 )
 from ._analysis import (
     resolve_target as _resolve_target,
@@ -1822,11 +1823,16 @@ class WorkspaceSession:
             source = self.source_text(real_path)
             if source is None:
                 return ()
-            table = self._remap_module_symbol_table(
-                module_symbol_table(self.db, self.mirror_root, str(mirror_path))
-            )
+            mirror_table = module_symbol_table(self.db, self.mirror_root, str(mirror_path))
+            table = self._remap_module_symbol_table(mirror_table)
             lexical = scope_tree(self.db, str(mirror_path))
-            return _compute_semantic_tokens(source, table, lexical)
+            # Resolution runs against mirror paths; only the names are consumed.
+            import_token_types = from_import_semantic_token_types(
+                self.db, self.mirror_root, str(mirror_path), mirror_table
+            )
+            return _compute_semantic_tokens(
+                source, table, lexical, import_token_types=import_token_types
+            )
 
     def semantic_tokens_range_for_file(
         self,

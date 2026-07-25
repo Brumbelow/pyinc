@@ -1632,7 +1632,13 @@ def test_fast_mode_frozen_snapshot_safe_despite_mutation() -> None:
     assert second["items"] == [1, 2, 3]
 
 
-# Limitation 5 — Cycle-adjacent partial state
+# Limitation 4 (durable cross-run cache) is exercised in
+# tests/test_checkpoint_trust.py and tests/test_checkpoint_cross_process.py.
+# Limitation 5 (in-process module/class monkey-patching is not detected) has no
+# dedicated test: the documented behaviour is that the kernel cannot observe it.
+
+
+# Cycle detection and recovery — a guarantee, not a contract limitation
 
 
 def test_indirect_cycle_three_node_chain_recovery() -> None:

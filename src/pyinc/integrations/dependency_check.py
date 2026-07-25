@@ -61,9 +61,6 @@ def _check_version_constraints(declared_spec: str, installed_version: str) -> tu
     spec_set = parse_specifier_set(declared_spec)
     if spec_set is None:
         return "ambiguous", f"cannot parse specifier: {declared_spec}"
-    for op, _ver in spec_set:
-        if op == "===":
-            return "ambiguous", f"cannot evaluate: {op}{_ver}"
     ok, detail = satisfies(spec_set, installed_version, include_prerelease=True)
     if not ok:
         if "unparseable" in detail or "cannot evaluate" in detail:

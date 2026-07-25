@@ -661,21 +661,6 @@ def _evaluate_requirement(
             tuple(diagnostics),
         )
 
-    for op, _v in spec_set:
-        if op == "===":
-            return (
-                (
-                    normalized,
-                    version_spec,
-                    markers,
-                    True,
-                    installed,
-                    "ambiguous",
-                    f"=== is not supported: {version_spec}",
-                ),
-                tuple(diagnostics),
-            )
-
     ok, detail = satisfies(spec_set, installed, include_prerelease=False)
     status: ApplicableStatus = "satisfied" if ok else "version_mismatch"
     return (

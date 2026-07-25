@@ -57,7 +57,7 @@ this contract.
 | Purpose | Compare declared requirements with installed versions and optionally identify undeclared imports in a workspace. |
 | Entrypoints | `dependency_check_analysis`, `workspace_dependency_check` |
 | Result types | `DependencyCheckAnalysis`, `DependencyStatus`, `UndeclaredImport` |
-| Supported shapes | Normalized distribution names and common PEP 440 comparisons, including compatible and wildcard equality forms. |
+| Supported shapes | Normalized distribution names and common PEP 440 comparisons, including compatible, wildcard, and arbitrary (`===`) equality forms. |
 | Key limits | This is not a resolver: it does not install packages, traverse transitive dependencies, evaluate markers, or compare lock files. Unsupported or unparseable constraints are ambiguous rather than guessed. |
 
 ## TOML configuration
@@ -97,8 +97,8 @@ this contract.
 | Purpose | Evaluate version specifiers and environment markers, then combine requirements with the installed environment. |
 | Entrypoints | `evaluate_version_specifier`, `evaluate_markers`, `applicable_requirements`, `workspace_applicable_requirements` |
 | Result types | `ApplicableRequirement`, `ApplicableRequirementsAnalysis`, `MarkerEvaluation`, `PythonEnvironmentSnapshot`, `VersionSpecifierEvaluation` |
-| Supported shapes | PEP 440 epochs, prerelease/post/dev/local labels, wildcards and compatible releases; PEP 508 boolean marker expressions against the running Python environment. |
-| Key limits | Evaluation targets the current process environment only. Extras are not modeled, noisy or unknown marker variables produce diagnostics, and this API does not resolve or install dependencies. |
+| Supported shapes | PEP 440 epochs, prerelease/post/dev/local labels, wildcards, compatible releases, and arbitrary equality (`===`); PEP 508 boolean marker expressions against the running Python environment. |
+| Key limits | Evaluation targets the current process environment only. Extras are not modeled, noisy or unknown marker variables produce diagnostics, and this API does not resolve or install dependencies. `===` compares the version exactly as written — no normalization, padding, or case folding — so it is decided without parsing and is not subject to pre-release exclusion. |
 
 ## Environment files
 
@@ -128,7 +128,7 @@ this contract.
 | Entrypoints | `csv_analysis`, `workspace_csv_analysis` |
 | Result types | `CsvAnalysis`, `CsvColumn` |
 | Supported shapes | CSV/TSV text handled by the stdlib CSV parser, delimiter/header sniffing, columns, row counts, and inconsistent-column diagnostics. Workspace discovery defaults to `data.csv`. |
-| Key limits | The complete file is read. There is no schema/type inference, streaming result API, or guarantee for dialects the stdlib sniffer cannot identify. |
+| Key limits | The complete file is read and parsed, but delimiter and header sniffing inspect only the first 8192 characters, so a file whose dialect or header shape becomes apparent only later may be misclassified. There is no schema/type inference, streaming result API, or guarantee for dialects the stdlib sniffer cannot identify. |
 
 ## Lexical scope
 
@@ -148,7 +148,7 @@ this contract.
 | Entrypoints | `module_symbol_table`, `workspace_symbol_index`, `find_references`, `class_model` |
 | Result types | `ClassMember`, `ClassModel`, `ModuleSymbolTable`, `Parameter`, `Reference`, `ReferenceQueryResult`, `Signature`, `Symbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex` |
 | Supported shapes | Functions, methods, classes, variables, imports/re-exports, annotations as source text, lexical references, workspace inheritance, and `self` attributes assigned directly in methods. |
-| Key limits | No runtime attribute inference, type evaluation/checking, decorator semantics, installed-source navigation, or complete Python method-resolution-order model. Re-export and inheritance cycles or ambiguous chains produce conservative results. |
+| Key limits | No runtime attribute inference, type evaluation/checking, decorator semantics, installed-source navigation, or complete Python method-resolution-order model. Re-export and inheritance cycles or ambiguous chains produce conservative results. Both walks stop at depth 8: re-export following reports an `ambiguous` result observable through `follow_depth`/`trail`, while base-class following stops silently, so members inherited more than eight levels above a class are omitted from `ClassModel`. |
 
 ## Notebooks
 
