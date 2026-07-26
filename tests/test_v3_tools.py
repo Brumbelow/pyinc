@@ -513,14 +513,19 @@ def test_workspace_mirror_defers_nonfile_reference_diagnostics(
 
 
 @pytest.mark.parametrize(
-    ("requirements", "code"),
+    ("requirements", "code", "message_prefix", "named_file"),
     [
-        ("-r missing.in\n", "missing-requirements-file"),
-        ("-r cycle.in\n", "cycle"),
+        (
+            "-r missing.in\n",
+            "missing-requirements-file",
+            "referenced requirements file is missing: ",
+            "missing.in",
+        ),
+        ("-r cycle.in\n", "cycle", "circular -r reference: ", "requirements.txt"),
     ],
 )
 def test_workspace_surfaces_recursive_requirements_diagnostics(
-    tmp_path: Path, requirements: str, code: str
+    tmp_path: Path, requirements: str, code: str, message_prefix: str, named_file: str
 ) -> None:
     root_requirements = tmp_path / "requirements.txt"
     root_requirements.write_text(requirements, encoding="utf-8")
@@ -535,6 +540,29 @@ def test_workspace_surfaces_recursive_requirements_diagnostics(
     assert matching[0].path == str(root_requirements)
     assert matching[0].source == "pyinc.requirements_txt"
     assert matching[0].severity == "error"
+    # These messages name the file inline, so they need the same remapping the
+    # `path` field gets.
+    assert matching[0].message == f"{message_prefix}{tmp_path / named_file}"
+    assert session.mirror_root not in matching[0].message
+
+
+def test_workspace_remaps_out_of_project_requirements_reference(tmp_path: Path) -> None:
+    """A `-r` target that escapes the root resolves *beside* the mirror, not under
+    it, so remapping the mirror root alone leaves the temporary directory in the
+    message.
+    """
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "requirements.txt").write_text("-r ../outside.in\n", encoding="utf-8")
+
+    with WorkspaceSession(root) as session:
+        diagnostics = session.analyze_workspace().diagnostics
+
+    matching = [diagnostic for diagnostic in diagnostics if diagnostic.code == "error"]
+    assert len(matching) == 1
+    assert matching[0].message == f"-r path outside project: {tmp_path / 'outside.in'}"
+    assert session.mirror_root not in matching[0].message
+    assert "pyinc-tools-" not in matching[0].message
 
 
 def test_workspace_mirror_rejects_referenced_file_symlink(tmp_path: Path) -> None:

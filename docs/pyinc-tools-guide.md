@@ -202,7 +202,8 @@ to the source tree.
    mirror copy only.
 3. `refresh_paths(paths)`—used by polling and watched-file notifications—syncs
    saved disk changes into files without an active overlay.
-4. Results are mapped back to real workspace paths before they reach callers.
+4. Results are mapped back to real workspace paths before they reach callers,
+   including paths embedded in diagnostic message text.
 5. `close()` stops mutation and removes the temporary mirror.
 
 The root requirements file's in-workspace include closure is mirrored even

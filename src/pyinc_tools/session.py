@@ -19,6 +19,7 @@ from pyinc.integrations import (
     DependencyCheckAnalysis,
     DependencyStatus,
     DependencySurface,
+    Diagnostic,
     ModuleSymbolTable,
     PythonModuleAnalysis,
     PythonWorkspaceAnalysis,
@@ -3743,7 +3744,14 @@ class WorkspaceSession:
             module=analysis.module,
             imports=analysis.imports,
             definitions=analysis.definitions,
-            diagnostics=analysis.diagnostics,
+            diagnostics=tuple(
+                Diagnostic(
+                    code=diagnostic.code,
+                    message=self._remap_message(diagnostic.message),
+                    range=diagnostic.range,
+                )
+                for diagnostic in analysis.diagnostics
+            ),
             resolved_imports=tuple(
                 ResolvedImportRef(
                     module=item.module,
@@ -3824,7 +3832,9 @@ class WorkspaceSession:
             dependencies=analysis.dependencies,
             optional_dependency_groups=analysis.optional_dependency_groups,
             tool_configs=analysis.tool_configs,
-            diagnostics=analysis.diagnostics,
+            diagnostics=tuple(
+                (code, self._remap_message(message)) for code, message in analysis.diagnostics
+            ),
         )
 
     def _remap_requirements_analysis(
@@ -3837,8 +3847,29 @@ class WorkspaceSession:
             requirements=analysis.requirements,
             file_references=analysis.file_references,
             index_directives=analysis.index_directives,
-            diagnostics=analysis.diagnostics,
+            diagnostics=tuple(
+                (code, self._remap_message(message)) for code, message in analysis.diagnostics
+            ),
         )
+
+    def _remap_message(self, message: str) -> str:
+        """Rewrite mirror paths embedded in kernel diagnostic text.
+
+        `pyinc.integrations.Diagnostic` has no path field, so an integration that
+        needs to name a file interpolates it into the message. Under a session
+        that file is the mirror copy, whose temporary directory is randomly
+        named, which would make the message differ between otherwise identical
+        runs.
+
+        A `-r` target that escapes the root resolves *beside* the mirror rather
+        than under it, so the mirror's parent is mapped too. That pass must come
+        second: the parent is a prefix of the mirror root, so running it first
+        would rewrite every ordinary mirror path.
+        """
+
+        remapped = message.replace(self.mirror_root, self.root)
+        mirror_parent = str(Path(self.mirror_root).parent)
+        return remapped.replace(mirror_parent, str(Path(self.root).parent))
 
     def _remap_path(self, path: str | None) -> str | None:
         if path is None:

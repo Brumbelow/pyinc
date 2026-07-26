@@ -171,6 +171,32 @@ def test_workspace_session_cross_file_invalidation_and_path_remap(
         assert consumer_module.dependencies[0].path == str(provider)
 
 
+def test_workspace_session_remaps_mirror_paths_inside_diagnostic_messages(
+    tmp_path: Path,
+) -> None:
+    """A kernel `Diagnostic` has no path field, so an integration that needs to
+    name a file interpolates it into the message. Under a session that file is
+    the mirror copy, in a randomly named temporary directory, so the message has
+    to be remapped just like the `path` field is.
+    """
+    root = tmp_path / "workspace"
+    root.mkdir()
+    bad = root / "bad.py"
+    bad.write_bytes(b'# -*- coding: ascii -*-\nx = "\xff\xfe"\n')
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(bad)
+        mirror_root = session.mirror_root
+
+    decode_errors = [d for d in result.diagnostics if d.code == "source-decode-error"]
+    assert len(decode_errors) == 1
+    assert mirror_root not in decode_errors[0].message
+    assert decode_errors[0].message.startswith(f"{bad}: ")
+    # The exposed module analysis carries the same corrected text.
+    assert result.module is not None
+    assert [d.message for d in result.module.diagnostics] == [decode_errors[0].message]
+
+
 def test_polling_workspace_watcher_batches_changes(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
@@ -8546,3 +8572,7 @@ def test_cli_text_output_omits_position_for_rangeless_diagnostic(
     assert len(decode_errors) == 1
     # No `:line:col` segment — the path is followed directly by the severity.
     assert decode_errors[0].startswith(f"{root / 'bad.py'}: error source-decode-error ")
+    # The message body names the real path too, not the temporary mirror, so the
+    # line is identical across runs. "pyinc-tools-" is the mirror tempdir prefix.
+    assert decode_errors[0].count(str(root / "bad.py")) == 2
+    assert "pyinc-tools-" not in decode_errors[0]

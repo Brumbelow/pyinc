@@ -36,6 +36,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sniffing inspect only the first 8192 characters; and re-export and base-class
   following both stop at depth 8, the latter silently.
 
+### Fixed
+
+- `WorkspaceSession` diagnostics no longer leak the temporary workspace-mirror
+  path through their message text. A kernel `Diagnostic` has no path field, so an
+  integration that needs to name a file interpolates it into the message; under a
+  session that file was the mirror copy, in a randomly named temporary directory.
+  `source-decode-error`, `cycle`, `missing-requirements-file`, and the `-r path
+  outside project` error now name the real workspace path, matching the already
+  correct `path` field. Affected messages are therefore identical across runs,
+  which `pyinc-tools analyze --format text` and LSP `publishDiagnostics` both
+  depend on.
+
 ## [3.0.0] - 2026-07-12
 
 ### Release validation
