@@ -502,8 +502,11 @@ def _allocate_shell(node: Any, registry: _AdapterRegistry) -> Any:
     if isinstance(node, FrozenRecord):
         return {}
     if isinstance(node, FrozenAdapterValue):
-        # Adapter cycles are not supported in v2.0.0. The shell is None and any
-        # back-reference into this node will raise during fill.
+        # Defensive only: adapted values are never legal graph nodes. `_freeze`
+        # routes them through `_active_guard`, so a cyclic adapted value raises
+        # before a graph is built, and `_validate_snapshot` rejects
+        # `FrozenAdapterValue` as a `FrozenGraph` node. See the cycle carve-out
+        # in docs/kernel-contract.md.
         return None
     raise UnsupportedValueError(
         f"Cannot allocate shell for node of type {type(node).__qualname__}."

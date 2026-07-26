@@ -26,8 +26,10 @@ python -m pyinc_tools --help
 python -m pyinc_tools --version
 ```
 
-Exit status `0` means success, `1` means an analysis/workspace failure, and `2`
-means invalid command-line usage.
+Exit status `0` means success, `1` means an analysis/workspace failure, `2`
+means invalid command-line usage, and `3` means the `--fail-on` diagnostic gate
+tripped. `1` and `3` are deliberately distinct: `1` says the analyzer could not
+run, `3` says it ran and found something.
 
 ## Analyze a workspace
 
@@ -45,6 +47,38 @@ readable JSON.
 `--path` must resolve inside the workspace. Invalid roots, escaping paths, and
 unsafe filesystem links fail without analyzing an outside target.
 
+### Report diagnostics and gate a CI job
+
+The full JSON result embeds the workspace symbol index, which is large. For
+reporting, ask for just the diagnostics — as one line each, or as a JSON array:
+
+```console
+pyinc-tools analyze /path/to/workspace --format text
+pyinc-tools analyze /path/to/workspace --diagnostics-only
+```
+
+Text lines are `path:line:col: severity code message`. Line and column are
+1-based for display, converted from the zero-based source geometry. A
+diagnostic with no range — a file that cannot be decoded, for example — keeps
+its `path:` prefix and omits the position instead of pointing at an unrelated
+line. Diagnostics are sorted by location, with rangeless ones first per file,
+so output is stable across runs. A workspace with no diagnostics prints
+nothing.
+
+`--fail-on` turns the run into a gate. It exits `3` when any diagnostic is at or
+above the given severity, and the threshold is inclusive, so `--fail-on warning`
+also fails on errors:
+
+```console
+pyinc-tools analyze /path/to/workspace --format text --fail-on error
+```
+
+The report is always printed before the exit status is decided, so a failing
+gate still tells you what failed. The default is `--fail-on none`, which never
+gates — upgrading `pyinc-tools` cannot turn a green pipeline red until you opt
+in. `--fail-on` cannot be combined with `--watch`, which never terminates
+normally; that combination is rejected as a usage error.
+
 ### Watch mode
 
 ```console
@@ -57,6 +91,12 @@ Watch mode emits the initial analysis, then a JSON object containing
 debounce window. The watcher polls in a daemon thread and exits cleanly on
 Ctrl-C. Polling is stdlib-only and portable; platform-specific push watcher
 backends are not included.
+
+With `--format text`, each batch is introduced by a `# changed: <paths>` header
+followed by that run's diagnostic lines, so the headers can be filtered out with
+`grep -v '^#'`. With `--diagnostics-only`, the `analysis` key holds the
+diagnostics array rather than the full result, keeping the event wrapper shape
+unchanged.
 
 For an embedded watcher, use the public classes directly:
 
@@ -162,7 +202,8 @@ to the source tree.
    mirror copy only.
 3. `refresh_paths(paths)`—used by polling and watched-file notifications—syncs
    saved disk changes into files without an active overlay.
-4. Results are mapped back to real workspace paths before they reach callers.
+4. Results are mapped back to real workspace paths before they reach callers,
+   including paths embedded in diagnostic message text.
 5. `close()` stops mutation and removes the temporary mirror.
 
 The root requirements file's in-workspace include closure is mirrored even

@@ -147,10 +147,29 @@ def test_ambiguous_for_complex_specifier(
     _patch_site(monkeypatch, site_dir)
 
     db = Database(mode=mode)
-    # Use a specifier the parser cannot handle
-    result = dependency_check_analysis(db, ("requests===2.31.0",))
+    # `~=1` is a compatible-release clause with too few release segments, so the
+    # evaluator cannot decide it and reports `ambiguous` rather than guessing.
+    result = dependency_check_analysis(db, ("requests~=1",))
     assert len(result.statuses) == 1
     assert result.statuses[0].status == "ambiguous"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_arbitrary_equality_compares_version_strings(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "2.31.0", top_level="requests")
+    _patch_site(monkeypatch, site_dir)
+
+    db = Database(mode=mode)
+    exact = dependency_check_analysis(db, ("requests===2.31.0",))
+    assert exact.statuses[0].status == "satisfied"
+    # PEP 440 `===` does not normalize, so a differently written but equal
+    # version does not match.
+    padded = dependency_check_analysis(db, ("requests===2.31",))
+    assert padded.statuses[0].status == "version_mismatch"
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

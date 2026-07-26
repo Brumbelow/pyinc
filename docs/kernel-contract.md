@@ -53,6 +53,15 @@ faithfully via two-pass allocate-then-fill so a list-with-itself round-trips to
 an actual self-referential list. Pure trees pay no overhead — they continue to
 return the bare flat snapshot shape.
 
+Memoization is by **mutable container** identity, so the graph support above
+covers exactly those four types. Values crossing through a `ValueAdapter`, a
+`tuple`, or a `frozenset` are not memoized and cannot be the target of a
+back-edge: `freeze` rejects such a graph with `UnsupportedValueError` rather
+than emitting a node, and `FrozenAdapterValue` is not a legal `FrozenGraph`
+node. A cyclic adapted object (for example `obj.child.parent is obj`) must
+therefore route its cycle through a `list`, `dict`, `set`, or dataclass — or be
+decomposed by the adapter into one.
+
 **2. Tracked ambient reads.**
 All reads of external state within a query must go through the Resource API
 (`FileResource`, `BinaryFileResource`, `FileStatResource`, `EnvResource`,

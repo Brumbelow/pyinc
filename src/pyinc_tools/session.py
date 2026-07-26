@@ -19,6 +19,7 @@ from pyinc.integrations import (
     DependencyCheckAnalysis,
     DependencyStatus,
     DependencySurface,
+    Diagnostic,
     ModuleSymbolTable,
     PythonModuleAnalysis,
     PythonWorkspaceAnalysis,
@@ -81,6 +82,7 @@ from ._analysis import (
     _source_parses,
     _unwrap_base_expression,
     _walk_class_definitions,
+    from_import_semantic_token_types,
 )
 from ._analysis import (
     resolve_target as _resolve_target,
@@ -1822,11 +1824,16 @@ class WorkspaceSession:
             source = self.source_text(real_path)
             if source is None:
                 return ()
-            table = self._remap_module_symbol_table(
-                module_symbol_table(self.db, self.mirror_root, str(mirror_path))
-            )
+            mirror_table = module_symbol_table(self.db, self.mirror_root, str(mirror_path))
+            table = self._remap_module_symbol_table(mirror_table)
             lexical = scope_tree(self.db, str(mirror_path))
-            return _compute_semantic_tokens(source, table, lexical)
+            # Resolution runs against mirror paths; only the names are consumed.
+            import_token_types = from_import_semantic_token_types(
+                self.db, self.mirror_root, str(mirror_path), mirror_table
+            )
+            return _compute_semantic_tokens(
+                source, table, lexical, import_token_types=import_token_types
+            )
 
     def semantic_tokens_range_for_file(
         self,
@@ -3737,7 +3744,14 @@ class WorkspaceSession:
             module=analysis.module,
             imports=analysis.imports,
             definitions=analysis.definitions,
-            diagnostics=analysis.diagnostics,
+            diagnostics=tuple(
+                Diagnostic(
+                    code=diagnostic.code,
+                    message=self._remap_message(diagnostic.message),
+                    range=diagnostic.range,
+                )
+                for diagnostic in analysis.diagnostics
+            ),
             resolved_imports=tuple(
                 ResolvedImportRef(
                     module=item.module,
@@ -3818,7 +3832,9 @@ class WorkspaceSession:
             dependencies=analysis.dependencies,
             optional_dependency_groups=analysis.optional_dependency_groups,
             tool_configs=analysis.tool_configs,
-            diagnostics=analysis.diagnostics,
+            diagnostics=tuple(
+                (code, self._remap_message(message)) for code, message in analysis.diagnostics
+            ),
         )
 
     def _remap_requirements_analysis(
@@ -3831,8 +3847,29 @@ class WorkspaceSession:
             requirements=analysis.requirements,
             file_references=analysis.file_references,
             index_directives=analysis.index_directives,
-            diagnostics=analysis.diagnostics,
+            diagnostics=tuple(
+                (code, self._remap_message(message)) for code, message in analysis.diagnostics
+            ),
         )
+
+    def _remap_message(self, message: str) -> str:
+        """Rewrite mirror paths embedded in kernel diagnostic text.
+
+        `pyinc.integrations.Diagnostic` has no path field, so an integration that
+        needs to name a file interpolates it into the message. Under a session
+        that file is the mirror copy, whose temporary directory is randomly
+        named, which would make the message differ between otherwise identical
+        runs.
+
+        A `-r` target that escapes the root resolves *beside* the mirror rather
+        than under it, so the mirror's parent is mapped too. That pass must come
+        second: the parent is a prefix of the mirror root, so running it first
+        would rewrite every ordinary mirror path.
+        """
+
+        remapped = message.replace(self.mirror_root, self.root)
+        mirror_parent = str(Path(self.mirror_root).parent)
+        return remapped.replace(mirror_parent, str(Path(self.root).parent))
 
     def _remap_path(self, path: str | None) -> str | None:
         if path is None:

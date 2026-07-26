@@ -265,7 +265,7 @@ def test_requirement_status_edges() -> None:
     arbitrary, _ = requirement_evaluation._evaluate_requirement(
         requirement("===1.0"), {"demo-name": "1.0"}, env
     )
-    assert arbitrary[5] == "ambiguous"
+    assert arbitrary[5] == "satisfied"
     mismatch, _ = requirement_evaluation._evaluate_requirement(
         requirement(">=2"), {"demo-name": "1.0"}, env
     )
@@ -472,7 +472,9 @@ def test_site_packages_resource_probe_and_load(
 
 def test_dependency_specifier_extraction_edge_cases() -> None:
     assert dependency_check._check_version_constraints("not a spec", "1.0")[0] == "ambiguous"
-    assert dependency_check._check_version_constraints("===1", "1.0")[0] == "ambiguous"
+    # Arbitrary equality compares strings, so "1" does not match "1.0".
+    assert dependency_check._check_version_constraints("===1", "1.0")[0] == "version_mismatch"
+    assert dependency_check._check_version_constraints("===1.0", "1.0")[0] == "satisfied"
     assert dependency_check._check_version_constraints(">=1", "bad")[0] == "ambiguous"
     assert dependency_check._extract_dep_name_and_spec("Demo @ https://example.invalid/x") == (
         "demo",

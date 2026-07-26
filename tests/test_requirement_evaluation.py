@@ -151,6 +151,14 @@ def test_requirement_evaluation_stable_api() -> None:
         (">1.0rc1", "1.0.post1"),
         ("<=1.0", "1.0+local"),
         (">=1.0", "1.0+local"),
+        # Arbitrary equality, restricted to operands where both implementations
+        # agree. `packaging` case-folds and compares against the *normalized*
+        # version, so e.g. `===V1.0` against `V1.0` diverges; that case is pinned
+        # locally in `test_version_specifier_arbitrary_equality` instead.
+        ("===1.0", "1.0"),
+        ("===1.0", "1.0.0"),
+        ("===1.0.0", "1.0"),
+        ("===1!2.0", "1!2.0"),
     ],
 )
 def test_supported_pep440_vectors_match_packaging(specifier: str, version: str) -> None:
@@ -212,6 +220,13 @@ def test_supported_pep508_marker_vectors_match_packaging(marker: str) -> None:
         ("==1!2.0", "2.0", False),
         ("==1.0+local", "1.0+local", True),
         ("==1.0", "1.0+local", True),
+        # PEP 440 arbitrary equality: string equality, no normalization. Contrast
+        # ("==1.0", "1.0.0", True) above — `===` does not pad the release.
+        ("===1.0", "1.0", True),
+        ("===1.0", "1.0.0", False),
+        ("===1.0.0", "1.0", False),
+        ("===1!2.0", "1!2.0", True),
+        ("===1.0", "1.1", False),
     ],
 )
 def test_version_specifier_table(mode: str, specifier: str, version: str, expected: bool) -> None:
@@ -251,12 +266,28 @@ def test_version_specifier_unparsable(mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_version_specifier_triple_equals_deferred(mode: str) -> None:
+def test_version_specifier_arbitrary_equality(mode: str) -> None:
+    """PEP 440 `===` is string equality against the version as written."""
     db = Database(mode=mode)
-    # === is deferred; surfaces as a non-satisfied "cannot evaluate".
-    result = evaluate_version_specifier(db, "===1.0", "1.0")
-    assert result.satisfied is False
-    assert "cannot evaluate" in result.detail
+    assert evaluate_version_specifier(db, "===1.0", "1.0").satisfied is True
+    # No normalization: `==1.0` matches `1.0.0`, `===1.0` does not.
+    assert evaluate_version_specifier(db, "===1.0", "1.0.0").satisfied is False
+    # No case folding either — this is where the local rule diverges from
+    # `packaging`, which compares against the normalized version and says False.
+    assert evaluate_version_specifier(db, "===V1.0", "V1.0").satisfied is True
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_version_specifier_arbitrary_equality_accepts_unparseable_version(mode: str) -> None:
+    """`===` is decidable without a PEP 440-conforming version — its whole point."""
+    db = Database(mode=mode)
+    weird = "1.0-weird+not!pep440"
+    assert evaluate_version_specifier(db, f"==={weird}", weird).satisfied is True
+    assert evaluate_version_specifier(db, f"==={weird}", "1.0").satisfied is False
+    # A mixed set still needs a parseable version for the non-`===` clause.
+    mixed = evaluate_version_specifier(db, ">=1.0,===weird", "weird")
+    assert mixed.satisfied is False
+    assert "unparseable version" in mixed.detail
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -460,7 +491,8 @@ def test_applicable_requirements_status_matrix(
     assert by_spec[("requests", ">=2.0")].status == "satisfied"
     assert by_spec[("flask", ">=1.0")].status == "missing"
     assert by_spec[("requests", ">=5.0")].status == "version_mismatch"
-    assert by_spec[("requests", "===2.31.0")].status == "ambiguous"
+    # Installed version is exactly "2.31.0", so arbitrary equality matches.
+    assert by_spec[("requests", "===2.31.0")].status == "satisfied"
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

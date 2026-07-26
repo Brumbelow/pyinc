@@ -204,10 +204,12 @@ def _satisfies_single(
     spec_version_str: str,
     version: Version,
 ) -> bool | None:
-    """Return whether one clause matches, or ``None`` when it is unsupported."""
-    if operator == "===":
-        return None
+    """Return whether one clause matches, or ``None`` when it is unsupported.
 
+    ``===`` never reaches here: `satisfies` evaluates arbitrary equality against
+    the raw version string before parsing, since that operator is defined on the
+    version as written.
+    """
     is_wildcard = spec_version_str.endswith(".*")
     if is_wildcard:
         base_str = spec_version_str[:-2]
@@ -341,6 +343,19 @@ def satisfies(
     *,
     include_prerelease: bool,
 ) -> tuple[bool, str]:
+    # PEP 440 arbitrary equality compares the version exactly as written, so it
+    # is evaluated before parsing: `===` exists precisely for versions that do
+    # not conform to this specification. Pre-release exclusion is a
+    # version-matching rule and does not apply to an exact string match either,
+    # so an all-`===` specifier set is answered here in full.
+    for operator, spec_version in spec_set:
+        if operator == "===" and version_str != spec_version:
+            return False, f"{version_str} does not satisfy ==={spec_version}"
+    remaining = tuple((op, spec) for op, spec in spec_set if op != "===")
+    if spec_set and not remaining:
+        joined = ",".join(f"{op}{spec}" for op, spec in spec_set)
+        return True, f"{version_str} satisfies {joined}"
+
     version = parse_version(version_str)
     if version is None:
         return False, f"unparseable version: {version_str}"
@@ -355,7 +370,7 @@ def satisfies(
             f"pre-release {version_str} excluded by default; specifier does not opt in",
         )
 
-    for operator, spec_version in spec_set:
+    for operator, spec_version in remaining:
         result = _satisfies_single(operator, spec_version, version)
         if result is None:
             return False, f"cannot evaluate: {operator}{spec_version}"
