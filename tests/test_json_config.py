@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
 import pyinc.integrations as integrations
 from pyinc import Database
+from pyinc.integrations import json_config, xml_config
 from pyinc.integrations.json_config import (
+    _MAX_JSON_DEPTH,
     JsonAnalysis,
+    _load_json,
+    _text_nesting_depth,
+    _walk_sections,
     json_analysis,
     workspace_json_analysis,
 )
+from pyinc.value import _MAX_SNAPSHOT_DEPTH
 
 Operation = tuple[Literal["write", "delete"], str, str | None]
 
@@ -323,41 +331,262 @@ def test_workspace_json_analysis_returns_none_when_missing(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# Nesting limit
+# ---------------------------------------------------------------------------
+
+
+def _nested_json(containers: int, key: str = "configuration") -> str:
+    """A document `containers` objects deep — `containers - 1` wrappers plus a leaf."""
+    return f'{{"{key}": ' * (containers - 1) + '{"leaf": 1}' + "}" * (containers - 1)
+
+
+# Alternating object/array nesting far past the cap: both bracket kinds count
+# toward the depth, and the text scan rejects this before the scanner sees it.
+_OVER_DEEP_JSON = '{"a":[' * 2000 + "1" + "]}" * 2000
+
+
+@pytest.mark.parametrize(
+    ("text", "depth"),
+    [
+        ("", 0),
+        ("42", 0),
+        ("{}", 1),
+        ("[[[]]]", 3),
+        ('{"a": {"b": [1]}}', 3),
+        # Brackets inside string literals are not structure.
+        ('{"a": "{{{[[["}', 1),
+        ('{"a": "\\\\"}', 1),
+        ('{"a": "\\""}', 1),
+        # The escaped character has to go with its backslash: dropping only the
+        # `u00e9` would leave `\"` and swallow the quote that ends the key.
+        ('{"\\u00e9": {"x": 1}}', 2),
+    ],
+)
+def test_text_nesting_depth_counts_only_structure(text: str, depth: int) -> None:
+    assert _text_nesting_depth(text) == depth
+
+
+def test_json_analysis_accepts_a_document_at_the_nesting_cap(tmp_path: Path) -> None:
+    path = tmp_path / "deep.json"
+    path.write_text(_nested_json(_MAX_JSON_DEPTH), encoding="utf-8")
+
+    result = json_analysis(Database(), str(path))
+
+    assert result.diagnostics == ()
+    assert len(result.sections) == _MAX_JSON_DEPTH
+    assert result.sections[-1].name.count(".") == _MAX_JSON_DEPTH - 2
+
+
+def test_json_nesting_past_the_cap_is_rejected_with_a_diagnostic(tmp_path: Path) -> None:
+    path = tmp_path / "deeper.json"
+    path.write_text(_nested_json(_MAX_JSON_DEPTH + 1), encoding="utf-8")
+
+    result = json_analysis(Database(), str(path))
+
+    assert result.sections == ()
+    assert result.diagnostics == (
+        (
+            "json-decode-error",
+            f"JSON nesting exceeds the supported limit of {_MAX_JSON_DEPTH} levels",
+        ),
+    )
+
+
+def test_json_and_xml_report_a_nesting_limit_in_the_same_words(tmp_path: Path) -> None:
+    json_path = tmp_path / "deep.json"
+    json_path.write_text(_nested_json(_MAX_JSON_DEPTH + 1), encoding="utf-8")
+    levels = xml_config._MAX_XML_DEPTH
+    xml_path = tmp_path / "deep.xml"
+    xml_path.write_text(
+        "<root>" + "<level>" * levels + "leaf" + "</level>" * levels + "</root>",
+        encoding="utf-8",
+    )
+
+    # A user who hits a depth limit in one format should get the same answer in the
+    # other, down to the wording.
+    limit_template = "{format} nesting exceeds the supported limit of {limit} levels"
+    stack_template = "{format} parsing exhausted the interpreter stack"
+
+    assert json_analysis(Database(), str(json_path)).diagnostics == (
+        ("json-decode-error", limit_template.format(format="JSON", limit=_MAX_JSON_DEPTH)),
+    )
+    assert xml_config.xml_analysis(Database(), str(xml_path)).diagnostics == (
+        ("xml-parse-error", limit_template.format(format="XML", limit=levels)),
+    )
+    json_stack_message = json_config._STACK_EXHAUSTED_DIAGNOSTIC
+    xml_stack_message = xml_config._STACK_EXHAUSTED_DIAGNOSTIC
+    assert json_stack_message == stack_template.format(format="JSON")
+    assert xml_stack_message == stack_template.format(format="XML")
+
+
+def test_over_deep_json_reports_the_same_result_at_every_caller_stack_depth(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "over-deep.json"
+    path.write_text(_nested_json(_MAX_JSON_DEPTH + 101), encoding="utf-8")
+
+    observed: list[tuple[int, tuple[tuple[str, str], ...]]] = []
+
+    def _analyse_at_depth(remaining: int) -> tuple[int, tuple[tuple[str, str], ...]]:
+        if remaining:
+            return _analyse_at_depth(remaining - 1)
+        result = json_analysis(Database(), str(path))
+        return (len(result.sections), result.diagnostics)
+
+    def _probe() -> None:
+        observed.extend(_analyse_at_depth(pad) for pad in (0, 400, 800))
+
+    # A fresh thread starts at the bottom of its own Python stack, so the limit set
+    # here is the whole budget the run gets. Without the cap the scanner descends
+    # once per level and this document is accepted from a shallow caller but
+    # exhausts the stack from a deep one — the same file, two cached payloads.
+    original = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        thread = threading.Thread(target=_probe)
+        thread.start()
+        thread.join()
+    finally:
+        sys.setrecursionlimit(original)
+
+    assert len(observed) == 3
+    assert set(observed) == {
+        (
+            0,
+            (
+                (
+                    "json-decode-error",
+                    f"JSON nesting exceeds the supported limit of {_MAX_JSON_DEPTH} levels",
+                ),
+            ),
+        )
+    }
+
+
+def test_the_section_walk_does_not_consume_the_interpreter_recursion_budget() -> None:
+    parsed = _load_json(_nested_json(_MAX_JSON_DEPTH))
+    walked: list[int] = []
+
+    def _walk() -> None:
+        walked.append(len(_walk_sections(parsed, "")))
+
+    # The document is parsed outside the lowered limit; what is measured here is the
+    # walk alone, two orders of magnitude below the document's own nesting.
+    original = sys.getrecursionlimit()
+    sys.setrecursionlimit(120)
+    try:
+        thread = threading.Thread(target=_walk)
+        thread.start()
+        thread.join()
+    finally:
+        sys.setrecursionlimit(original)
+
+    assert walked == [_MAX_JSON_DEPTH]
+
+
+def test_the_nesting_cap_keeps_every_accepted_document_snapshot_safe(tmp_path: Path) -> None:
+    # `freeze` refuses to snapshot a value nested deeper than this, and a JSON
+    # document's container depth is exactly its snapshot depth.
+    assert _MAX_JSON_DEPTH <= _MAX_SNAPSHOT_DEPTH
+
+    path = tmp_path / "over-deep.json"
+    path.write_text(_nested_json(_MAX_JSON_DEPTH + 1), encoding="utf-8")
+    observed: list[Any] = []
+
+    def _recompute() -> None:
+        db = Database()
+        try:
+            json_analysis(db, str(path))
+            # The cutoff runs only on recomputation, so the edit is what reaches it.
+            path.write_text(_nested_json(_MAX_JSON_DEPTH + 1) + " ", encoding="utf-8")
+            observed.append(json_analysis(db, str(path)).diagnostics)
+        except Exception as exc:
+            observed.append(exc)
+
+    # Enough stack that the parse and the cutoff's `freeze` both get far enough to
+    # reach the kernel's snapshot-nesting limit rather than running out first.
+    original_limit = sys.getrecursionlimit()
+    original_stack = threading.stack_size(64 * 1024 * 1024)
+    sys.setrecursionlimit(5000)
+    try:
+        thread = threading.Thread(target=_recompute)
+        thread.start()
+        thread.join()
+    finally:
+        sys.setrecursionlimit(original_limit)
+        threading.stack_size(original_stack)
+
+    assert observed == [
+        (
+            (
+                "json-decode-error",
+                f"JSON nesting exceeds the supported limit of {_MAX_JSON_DEPTH} levels",
+            ),
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Amplification budget
+# ---------------------------------------------------------------------------
+
+
+# Every section re-emits the dot path of all its ancestors, once as its own name
+# and again in its parent's `subsections`, so the cached payload grows
+# quadratically in nesting depth and linearly in key length. `_MAX_JSON_DEPTH`
+# holds the worst case the budget covers — a key of `_BUDGETED_KEY_LENGTH`
+# characters at the cap — under this ceiling, the same ceiling `xml_config` uses.
+_SECTIONS_PAYLOAD_BUDGET = 1024 * 1024
+_BUDGETED_KEY_LENGTH = 20
+
+
+def test_sections_payload_at_the_cap_stays_within_the_amplification_budget() -> None:
+    text = _nested_json(_MAX_JSON_DEPTH, key="k" * _BUDGETED_KEY_LENGTH)
+    sections = _walk_sections(_load_json(text), "")
+
+    assert len(sections) == _MAX_JSON_DEPTH
+    assert len(repr(tuple(sections))) < _SECTIONS_PAYLOAD_BUDGET
+
+
+# ---------------------------------------------------------------------------
 # Stack exhaustion
 # ---------------------------------------------------------------------------
 
 
-# Alternating object/array nesting, so that consecutive scanner frames report
-# different constructs when CPython's recursion check trips.
-_DEEP_JSON = '{"a":[' * 2000 + "1" + "]}" * 2000
-
-
-def test_stack_exhaustion_diagnostic_does_not_vary_with_caller_stack_depth(
-    tmp_path: Path,
+def test_stack_exhaustion_diagnostic_does_not_vary_with_the_recursion_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    path = tmp_path / "deep.json"
-    path.write_text(_DEEP_JSON, encoding="utf-8")
+    path = tmp_path / "config.json"
+    path.write_text('{"a": 1}', encoding="utf-8")
 
-    def _analyse_at_depth(remaining: int) -> tuple[tuple[str, str], ...]:
-        if remaining:
-            return _analyse_at_depth(remaining - 1)
-        return json_analysis(Database(), str(path)).diagnostics
+    # CPython names whichever frame ran out of budget, which is a property of the
+    # call site rather than of the file. A cached payload must not carry it.
+    messages = (
+        "maximum recursion depth exceeded",
+        "maximum recursion depth exceeded while decoding a JSON object from a unicode string",
+        "maximum recursion depth exceeded while decoding a JSON array from a unicode string",
+    )
 
-    # Which frame runs out of budget — and so which message CPython raises — is a
-    # property of the call site, so a cached payload must not carry it.
-    observed = {_analyse_at_depth(pad) for pad in range(6)}
+    observed = set()
+    for message in messages:
 
-    assert observed == {
-        (("json-decode-error", "JSON parsing exhausted the interpreter stack"),)
-    }
+        def _exhaust_the_stack(_text: str, _message: str = message) -> Any:
+            raise RecursionError(_message)
+
+        monkeypatch.setattr(json_config, "_load_json", _exhaust_the_stack)
+        observed.add(json_analysis(Database(), str(path)).diagnostics)
+
+    assert observed == {(("json-decode-error", "JSON parsing exhausted the interpreter stack"),)}
 
 
-def test_stack_exhaustion_diagnostic_matches_fresh_recomputation(tmp_path: Path) -> None:
+def test_nesting_limit_diagnostic_matches_fresh_recomputation(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
 
     steps: tuple[tuple[str, str], ...] = (
         ("shallow", '{"a": 1}'),
-        ("too deep to scan", _DEEP_JSON),
+        ("at the cap", _nested_json(_MAX_JSON_DEPTH)),
+        ("past the cap", _nested_json(_MAX_JSON_DEPTH + 1)),
+        ("far past the cap", _OVER_DEEP_JSON),
         ("shallow again", '{"a": 1}'),
     )
 

@@ -770,6 +770,41 @@ def test_directory_replaced_by_a_file_matches_a_fresh_database(mode: str, tmp_pa
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_directory_restored_after_an_unprobeable_failure_matches_a_fresh_database(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    directories = DirectoryResource()
+    path = tmp_path / "listing"
+    path.mkdir()
+    (path / "a.txt").write_text("a", encoding="utf-8")
+
+    @query
+    def names(db: Database, dirname: str) -> tuple[str, ...]:
+        try:
+            return directories.read(db, dirname)
+        except NotADirectoryError:
+            return ("<caught>",)
+
+    db = Database(mode=mode)
+    assert db.get(names, str(path)) == ("a.txt",)
+
+    (path / "a.txt").unlink()
+    path.rmdir()
+    path.write_text("not a directory", encoding="utf-8")
+    assert db.get(names, str(path)) == ("<caught>",)
+
+    # The world returns to exactly the state the resource record still describes
+    # (a branch switch, an undo). Its probe matches again, but an observation it
+    # never recorded happened in between, and the reader's cached value came from
+    # that observation -- the probe may not be allowed to certify the interval.
+    path.unlink()
+    path.mkdir()
+    (path / "a.txt").write_text("a", encoding="utf-8")
+    assert db.get(names, str(path)) == Database(mode=mode).get(names, str(path)) == ("a.txt",)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_missing_file_replaced_by_a_directory_matches_a_fresh_database(
     mode: str,
     tmp_path: Path,

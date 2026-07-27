@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeAlias, cast
@@ -87,6 +88,63 @@ class _DuplicateJsonKeyError(ValueError):
     pass
 
 
+class _JsonNestingLimitError(ValueError):
+    pass
+
+
+# Object and array nesting is capped before parsing because every section re-emits
+# the dot path of all its ancestors: `json_sections_payload` grows with the square
+# of the nesting depth, so this cap is what bounds the *cache*, not just the parse.
+# `xml_config` caps `_MAX_XML_DEPTH` for the same reason and against the same
+# budget — a document at the cap must not cache more than ~1 MiB.
+#
+# Two constraints meet at 200. The budget: measured with 20-character keys, a
+# document at this cap caches 832 KB of section payload text (422 KB of it section
+# names); at 256 levels, the cap `xml_config` carries, the same document would
+# cache 1.33 MiB, over budget. XML sits higher under one budget because an XML
+# element emits its path once where a JSON object emits it twice, as its own
+# section name and again in its parent's `subsections`. Independently, `freeze`
+# refuses to snapshot a value nested deeper than 200 levels, and a JSON document's
+# container depth is exactly its snapshot depth, so a document past 200 could never
+# be cached at all — it raises `UnsupportedValueError` out of the cutoff instead.
+# 200 is still an order of magnitude deeper than any real configuration document.
+_MAX_JSON_DEPTH = 200
+
+# Every byte that cannot change the nesting depth, so that only quotes and brackets
+# are left to walk. Backslash escape pairs go first, separately: dropping just the
+# escaped character would let a `\uXXXX` key leave a bare `\"` behind and swallow
+# the quote that ends the string.
+_NON_STRUCTURAL = bytes(byte for byte in range(256) if byte not in b'{}[]"')
+
+
+def _text_nesting_depth(text: str) -> int:
+    """Report the deepest object/array nesting in `text` without recursing.
+
+    Well-formed JSON yields the exact depth the scanner would descend to. Input
+    that is not well-formed yields an estimate, and is rejected either way; what
+    matters is that neither answer depends on the caller's remaining stack.
+    """
+    encoded = text.encode("utf-8", "surrogatepass")
+    unescaped = re.sub(rb"\\.", b"", encoded, flags=re.DOTALL)
+    tokens = unescaped.translate(None, _NON_STRUCTURAL).decode("ascii")
+
+    depth = 0
+    deepest = 0
+    in_string = False
+    for token in tokens:
+        if token == '"':
+            in_string = not in_string
+        elif in_string:
+            continue
+        elif token in "{[":
+            depth += 1
+            if depth > deepest:
+                deepest = depth
+        else:
+            depth -= 1
+    return deepest
+
+
 def _reject_json_constant(value: str) -> object:
     raise ValueError(f"non-finite JSON number {value!r} is not permitted")
 
@@ -108,6 +166,11 @@ def _json_object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _load_json(text: str) -> Any:
+    depth = _text_nesting_depth(text)
+    if depth > _MAX_JSON_DEPTH:
+        raise _JsonNestingLimitError(
+            f"JSON nesting exceeds the supported limit of {_MAX_JSON_DEPTH} levels"
+        )
     return json.loads(
         text,
         object_pairs_hook=_json_object_from_pairs,
@@ -124,9 +187,16 @@ def _load_json(text: str) -> Any:
 # runs out — and so which message it raises — depends on how much stack the caller
 # had already spent, not on the file. The same document reports "...while decoding
 # a JSON object..." or "...while decoding a JSON array..." from different call
-# depths. This payload is cached, so a fixed string is emitted instead and the
-# payload stays a function of the tracked inputs. `xml_config` emits the same
-# shape for the same reason.
+# depths. This payload is cached, so a fixed string is emitted instead.
+#
+# `_MAX_JSON_DEPTH` is measured off the text rather than by descending, so runaway
+# nesting is rejected as a decode error before the scanner ever runs, and a
+# RecursionError here means only that the caller entered with its stack nearly
+# spent. That closes the message axis, not the outcome axis: the scanner still
+# descends once per container level, so whether a document within the cap parses
+# at all remains a property of the call site as well as of the file. The residual
+# is disclosed in `docs/integration-contract.md`. `xml_config` emits the same shape
+# for the same reason and carries the same residual.
 _STACK_EXHAUSTED_DIAGNOSTIC = "JSON parsing exhausted the interpreter stack"
 
 
@@ -156,27 +226,41 @@ def _walk_sections(
     data: dict[str, Any],
     prefix: str,
 ) -> list[JsonSectionPayload]:
+    """Collect every object in document pre-order, deepest nesting included.
+
+    The traversal keeps its own stack rather than recursing, so the payload a
+    document produces depends only on the document — never on how much of the
+    interpreter's recursion budget the caller has already spent.
+    """
     sections: list[JsonSectionPayload] = []
-    keys: list[JsonKeyPayload] = []
-    subsections: list[str] = []
-    section_name = prefix or "<root>"
+    pending: list[tuple[dict[str, Any], str]] = [(data, prefix)]
 
-    for key, value in sorted(data.items()):
-        if isinstance(value, dict):
-            child_prefix = f"{prefix}.{key}" if prefix else key
-            subsections.append(child_prefix)
-            sections.extend(_walk_sections(value, child_prefix))
-        else:
-            keys.append(
-                (
-                    section_name,
-                    key,
-                    _json_value_type(value),
-                    _json_value_to_string(value),
+    while pending:
+        current, current_prefix = pending.pop()
+        section_name = current_prefix or "<root>"
+        keys: list[JsonKeyPayload] = []
+        subsections: list[str] = []
+        children: list[tuple[dict[str, Any], str]] = []
+
+        for key, value in sorted(current.items()):
+            if isinstance(value, dict):
+                child_prefix = f"{current_prefix}.{key}" if current_prefix else key
+                subsections.append(child_prefix)
+                children.append((value, child_prefix))
+            else:
+                keys.append(
+                    (
+                        section_name,
+                        key,
+                        _json_value_type(value),
+                        _json_value_to_string(value),
+                    )
                 )
-            )
 
-    sections.insert(0, (section_name, tuple(keys), tuple(subsections)))
+        sections.append((section_name, tuple(keys), tuple(subsections)))
+        # Reversed so the first subsection is popped first, preserving document order.
+        pending.extend(reversed(children))
+
     return sections
 
 

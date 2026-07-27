@@ -121,8 +121,13 @@ probe-comparison machinery drive invalidation:
   reads that follow it *within that request* re-raise the exception that load
   produced, exactly as a successful load's value is reused for the rest of the
   request. A failing resource costs one load per request, not one per reader.
+  The exception is dropped when that request ends — nothing outside it may
+  re-raise it — so a node that keeps failing never pins the frames, or the
+  allocations, of the load that raised.
   (See: `test_failing_resource_loads_once_per_request_across_a_fan_out`,
-  `test_repeated_failing_reads_within_one_query_body_load_once`)
+  `test_repeated_failing_reads_within_one_query_body_load_once`,
+  `test_failing_load_exception_is_reused_only_inside_its_own_request`,
+  `test_failing_load_frames_are_released_when_the_request_ends`)
 - Behaviour is identical in `strict`, `checked`, and `fast`.
 
 Optional external state is therefore from-scratch consistent: a query that
@@ -141,20 +146,27 @@ Two boundaries apply:
   kernel does then depends on what it already knows about that node. With **no
   record** (the read is the node's first), nothing is recorded, the exception
   propagates unchanged, and a query that catches it is cached as if it had no
-  dependency at all — a later `get()` does not re-check it. With a **record
-  already there** — an earlier success, or an earlier recorded failure — that
-  record describes a world the kernel can no longer confirm, so the node is
-  reported as *changed*: every dependent re-executes and the exception surfaces
-  inside the query body again. That stays consistent with a fresh `Database`,
-  but it never settles; the readers re-run for as long as the probe keeps
-  raising. A file replaced by a directory (`FileResource`, `DirectoryResource`,
-  and the `python_source` module → package refactor) is the ordinary way to
-  reach this state.
+  dependency at all — a later `get()` in that same process does not re-check it
+  (it is still refused a checkpoint, see below). With a **record already there**
+  — an earlier success, or an earlier recorded failure — that record describes a
+  world the kernel can no longer confirm, so the node is reported as *changed*:
+  every dependent re-executes and the exception surfaces inside the query body
+  again. The record is also marked unconfirmed, which retires its stored probe
+  until a real observation rewrites the record: a world that returns to exactly
+  the state that probe describes — an undo, a branch switch back — re-loads
+  instead of reusing, and the readers that consumed the raise re-execute rather
+  than staying green on a value only the failure explains. That stays consistent
+  with a fresh `Database` throughout, and it settles as soon as a load succeeds
+  again; while the probe keeps raising, the readers re-run every request. A file
+  replaced by a directory (`FileResource`, `DirectoryResource`, and the
+  `python_source` module → package refactor) is the ordinary way to reach this
+  state.
   (See: `test_failed_resource_loads_are_recorded_only_when_the_probe_is_total`,
   `test_file_replaced_by_a_directory_matches_a_fresh_database`,
   `test_directory_replaced_by_a_file_matches_a_fresh_database`,
   `test_missing_file_replaced_by_a_directory_matches_a_fresh_database`,
-  `test_module_replaced_by_a_package_matches_a_fresh_database`)
+  `test_module_replaced_by_a_package_matches_a_fresh_database`,
+  `test_directory_restored_after_an_unprobeable_failure_matches_a_fresh_database`)
 
   The probe contract extends to failures for the same reason it covers values: a
   resource whose `load` can raise *different* exceptions for one probe value must
@@ -164,8 +176,14 @@ Two boundaries apply:
   reader that handled a failure is only reproducible while the load keeps
   failing. The failure record and every record that transitively depends on it
   are omitted from a checkpoint, so they re-execute against live state after
-  `load_checkpoint`.
-  (See: `test_checkpoints_omit_failed_resource_records_and_their_readers`)
+  `load_checkpoint`. A failure the kernel could not record is excluded the same
+  way, and it has to be: the resource record an unprobeable raise contradicted
+  still carries the probe and digest from before that raise, which verify against
+  a world that healed back into exactly that state, and the reader that consumed
+  the raise carries a handled-failure value no record explains. Both are dropped,
+  and with them every record above them.
+  (See: `test_checkpoints_omit_failed_resource_records_and_their_readers`,
+  `test_checkpoints_omit_readers_of_an_unrecordable_failure`)
 
 `inspect()` and `explain()` show the failure node with decision `failed` and a
 reason naming the exception; it counts in `DatabaseStatistics.resource_count`

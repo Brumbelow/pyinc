@@ -9,6 +9,7 @@ import pytest
 from pyinc import Database
 from pyinc_codegen.models import DiagnosticPayload, ModelPayload
 from pyinc_codegen.schema import (
+    _IGNORED_KEYWORDS,
     _annotation_diagnostics,
     _build_enum,
     _build_model,
@@ -783,6 +784,50 @@ def test_document_queries_cover_invalid_roots_sections_duplicates_and_empty_inde
 
     _write_schema(schema_path, {})
     assert index_init(db, str(schema_path)) == "__all__: list[str] = []\n"
+
+
+_ROOT_IGNORED_VALUES: dict[str, object] = {
+    "additionalProperties": False,
+    "default": 1,
+    "deprecated": True,
+    "examples": [1],
+    "exclusiveMaximum": 10,
+    "exclusiveMinimum": 0,
+    "format": "email",
+    "maxItems": 5,
+    "maxLength": 5,
+    "maximum": 10,
+    "minItems": 1,
+    "minLength": 1,
+    "minimum": 0,
+    "multipleOf": 2,
+    "pattern": "^a$",
+    "readOnly": True,
+    "uniqueItems": True,
+    "writeOnly": True,
+}
+
+
+def test_ignored_keywords_at_the_document_root_warn_without_blocking(tmp_path: Path) -> None:
+    assert set(_ROOT_IGNORED_VALUES) == set(_IGNORED_KEYWORDS)
+    schema_path = tmp_path / "schema.json"
+    db = Database()
+    defs = {"$defs": {"K": {"type": "object", "properties": {"a": {"type": "string"}}}}}
+
+    for keyword, value in _ROOT_IGNORED_VALUES.items():
+        _write_schema(schema_path, {**defs, keyword: value})
+        assert [
+            (code, severity, pointer)
+            for code, _message, severity, pointer in document_diagnostics(db, str(schema_path))
+        ] == [("ignored-constraint", "warning", f"/{keyword}")]
+
+    # A model keyword and an unrecognized keyword state the same rule once,
+    # against the whole document, and do block.
+    _write_schema(schema_path, {**defs, "type": "object", "wibble": 1})
+    assert [
+        (code, severity, pointer)
+        for code, _message, severity, pointer in document_diagnostics(db, str(schema_path))
+    ] == [("unsupported-root-schema", "error", "")]
 
 
 def test_definition_queries_return_safe_fallbacks_for_malformed_and_missing_data(

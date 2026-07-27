@@ -686,6 +686,66 @@ def test_object_definition_without_properties_warns_without_blocking(tmp_path: P
     )
 
 
+_FIELDLESS_MODEL = (
+    "from __future__ import annotations\n"
+    "\n"
+    "from dataclasses import dataclass\n"
+    "\n"
+    "\n"
+    "@dataclass(frozen=True)\n"
+    "class K:\n"
+    "    pass\n"
+)
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        {"type": "object", "properties": {}},
+        {"properties": {}},
+        {"type": "object", "properties": {}, "required": []},
+    ],
+    ids=["typed", "type-less", "empty-required"],
+)
+def test_empty_properties_definition_emits_a_fieldless_dataclass_with_no_diagnostic(
+    definition: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(schema_path, {"$defs": {"K": definition}})
+    db = Database(mode="strict")
+    assert schema_analysis(db, schema_path).diagnostics == ()
+
+    generate(db, schema_path, out)
+    assert (out / "k.py").read_text(encoding="utf-8") == _FIELDLESS_MODEL
+    assert (out / "docs" / "k.md").read_text(encoding="utf-8") == "# K\n\nFields:\n"
+
+
+def test_absent_properties_emits_the_same_model_and_differs_only_in_the_doc(
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(schema_path, {"$defs": {"K": {"type": "object"}}})
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    assert [(d.code, d.json_pointer) for d in analysis.diagnostics] == [
+        ("unconstrained-object-model", "/$defs/K")
+    ]
+
+    generate(db, schema_path, out)
+    assert (out / "k.py").read_text(encoding="utf-8") == _FIELDLESS_MODEL
+    assert (out / "docs" / "k.md").read_text(encoding="utf-8") == (
+        "# K\n"
+        "\n"
+        "Fields:\n"
+        "- warning diagnostic `unconstrained-object-model` at `/$defs/K`: an object definition "
+        "without 'properties' generates a model with no fields, so it represents none of the "
+        "data it accepts\n"
+    )
+
+
 def test_tuple_form_items_is_reported_as_an_unsupported_tuple(tmp_path: Path) -> None:
     schema_path = tmp_path / "schema.json"
     _write_schema(

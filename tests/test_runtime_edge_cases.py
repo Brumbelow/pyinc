@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import json
 import os
 import sys
 import typing
+import weakref
 from dataclasses import MISSING, dataclass, field
 from pathlib import Path
 from types import FunctionType
@@ -18,6 +20,7 @@ from pyinc import (
     CheckpointManifestError,
     CheckpointVersionError,
     Database,
+    DirectoryResource,
     FileResource,
     InMemoryArtifactStore,
     Input,
@@ -266,6 +269,34 @@ class _TallyingFailingResource(Resource[str, str, tuple[str, ...]]):
         return f"tallying[{key}]"
 
 
+class _LoadPayload:
+    """Stands in for whatever a load allocates before it raises."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray(4 * 1024 * 1024)
+
+
+class _PayloadError(RuntimeError):
+    def __init__(self, payload: weakref.ref[_LoadPayload]) -> None:
+        super().__init__("payload load failed")
+        self.payload = payload
+
+
+@dataclass(frozen=True)
+class _AllocatingFailingResource(Resource[str, str, str]):
+    """Allocates in the frame that raises, reachable only through its traceback."""
+
+    def probe(self, key: str) -> str:
+        return f"probe:{key}"
+
+    def load(self, db: Database, key: str) -> str:
+        payload = _LoadPayload()
+        raise _PayloadError(weakref.ref(payload))
+
+    def label(self, key: str) -> str:
+        return f"allocating[{key}]"
+
+
 @dataclass(frozen=True)
 class _UnprobeableResource(Resource[str, str, str]):
     def probe(self, key: str) -> str:
@@ -402,7 +433,7 @@ def test_failed_resource_loads_are_recorded_only_when_the_probe_is_total() -> No
     assert record.snapshot is None
     assert record.digest == ""
     assert record.checked_in_request == db._request_counter
-    assert isinstance(record.failure_exc, RuntimeError)
+    assert record.failure_exc is None
     assert db.statistics().resource_count == 1
 
 
@@ -457,6 +488,49 @@ def test_repeated_failing_reads_within_one_query_body_load_once(tmp_path: Path) 
     assert _tallied(target) == "plp"
 
 
+def test_failing_load_exception_is_reused_only_inside_its_own_request() -> None:
+    db = Database()
+    resource = _AllocatingFailingResource()
+
+    with db._request_scope():
+        with pytest.raises(_PayloadError) as first:
+            resource.read(db, "value")
+        record = db._records[db._resource_key(resource, "value")]
+        assert record.failure_exc is first.value
+        with pytest.raises(_PayloadError) as second:
+            resource.read(db, "value")
+        assert second.value is first.value
+
+    assert record.failure_exc is None
+    assert record.failure_traceback is None
+    with pytest.raises(_PayloadError) as later:
+        resource.read(db, "value")
+    assert later.value is not first.value
+
+
+def test_failing_load_frames_are_released_when_the_request_ends() -> None:
+    db = Database()
+    resource = _AllocatingFailingResource()
+
+    payload: weakref.ref[_LoadPayload] | None = None
+    try:
+        resource.read(db, "value")
+    except _PayloadError as exc:
+        payload = exc.payload
+
+    record = db._records[db._resource_key(resource, "value")]
+    assert record.is_failed
+    # The exception serves re-reads inside its own request and nothing else, so
+    # the record stops pinning the load frame (and its 4 MiB local) once that
+    # request is over. Resource records are never evicted; this one would
+    # otherwise hold the frame until a load finally succeeded.
+    assert record.failure_exc is None
+    assert record.failure_traceback is None
+    gc.collect()
+    assert payload is not None
+    assert payload() is None
+
+
 def test_checkpoints_omit_failed_resource_records_and_their_readers(tmp_path: Path) -> None:
     files = FileResource()
     missing = tmp_path / "missing.txt"
@@ -488,6 +562,49 @@ def test_checkpoints_omit_failed_resource_records_and_their_readers(tmp_path: Pa
     warmed.load_checkpoint(checkpoint)
     missing.write_text("late", encoding="utf-8")
     assert warmed.get(read_optional, str(missing)) == "late"
+
+
+def test_checkpoints_omit_readers_of_an_unrecordable_failure(tmp_path: Path) -> None:
+    directories = DirectoryResource()
+    path = tmp_path / "listing"
+    path.mkdir()
+    (path / "a.txt").write_text("a", encoding="utf-8")
+
+    @query(key="checkpoint-optional-listing")
+    def names(db: Database, dirname: str) -> tuple[str, ...]:
+        try:
+            return directories.read(db, dirname)
+        except NotADirectoryError:
+            return ("<caught>",)
+
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+    assert db.get(names, str(path)) == ("a.txt",)
+
+    # Neither the load nor the probe survives a directory replaced by a file, so
+    # the resource record keeps the listing it last saw while the reader is
+    # correctly re-executed and caches the handled failure. Persisting that pair
+    # would warm a value the record cannot re-derive.
+    (path / "a.txt").unlink()
+    path.rmdir()
+    path.write_text("not a directory", encoding="utf-8")
+    assert db.get(names, str(path)) == ("<caught>",)
+
+    checkpoint = db.save_checkpoint()
+    manifest = json.loads(cast(bytes, store.get(checkpoint)).decode("utf-8"))
+    saved = {(entry["identity"], entry["args_digest"]) for entry in manifest["records"]}
+    reader_key, _ = db._query_key(names, (str(path),), {})
+    assert (reader_key.identity, reader_key.args_digest) not in saved
+    assert not any(entry["kind"] == "resource" for entry in manifest["records"])
+
+    path.unlink()
+    path.mkdir()
+    (path / "a.txt").write_text("a", encoding="utf-8")
+
+    warmed = Database(store=store)
+    warmed.load_checkpoint(checkpoint)
+    assert warmed.get(names, str(path)) == Database().get(names, str(path)) == ("a.txt",)
+    assert warmed.statistics().query_executions == 1
 
 
 def test_materialized_call_validation_covers_strict_and_checked_modes() -> None:

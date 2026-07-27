@@ -95,14 +95,21 @@ producing an unimportable or non-portable package.
 
 Combinators and conditionals on the document root are errors, each reported at
 its own keyword; the two supported combinator spellings are compiled inside
-definitions only, because the root declares no model. Any other schema keyword at the document root
-produces exactly one `unsupported-root-schema` error, pointed at the whole
-document (`json_pointer == ""`) and naming the rule it violates: **models must
-be declared under `$defs` or `definitions`**, because the root is metadata-only
-and its schema keywords describe no model. Root metadata such as `$schema`,
-`$id`, `title`, and `description` remains accepted. An unsupported root cannot
-be mistaken for an empty desired model set, so the validation boundary
-described in [Usage](#usage) applies.
+definitions only, because the root declares no model. A model keyword at the
+document root — `type`, `properties`, `required`, `items`, `enum`, `const`, or
+`$ref` — and any keyword the compiler does not recognize are collected into
+exactly one `unsupported-root-schema` error, pointed at the whole document
+(`json_pointer == ""`), naming every keyword it collected and the rule they
+violate: **models must be declared under `$defs` or `definitions`**, because
+the root is metadata-only and its schema keywords describe no model. Root
+metadata such as `$schema`, `$id`, `title`, and `description` remains accepted.
+So are the annotation- and validation-only keywords in [Ignored
+keywords](#ignored-keywords): the root is a schema node like any other for
+them, so `{"$defs": {...}, "minimum": 0}` records the same non-blocking
+`ignored-constraint` warning at `/minimum` that it would record anywhere else,
+and generation proceeds. An unsupported root cannot be mistaken for an empty
+desired model set, so the validation boundary described in [Usage](#usage)
+applies.
 
 The accepted non-semantic metadata policy is deliberately narrow. `title` and
 `$comment` are accepted as string annotations on schema nodes and ignored by
@@ -155,9 +162,15 @@ with no `properties` at all is accepted, but records a non-blocking
 what downstream code imports, so that is a major-version decision rather than
 part of this subset.
 
-That warning names the empty dataclass, so it is reported exactly where one is
-emitted and nowhere else — one cause, one diagnostic:
+That warning is keyed on the *absence* of `properties`, not on the emitted
+dataclass — one cause, one diagnostic:
 
+- a definition that carries `properties` at all is silent, even when the map is
+  empty. `{"type": "object", "properties": {}}` emits the same fieldless
+  dataclass with no diagnostic, because declaring the empty set says the model
+  has no fields where omitting the keyword leaves that unsaid. Presence of the
+  keyword, not the emitted dataclass, is what the warning tests — so the
+  type-less spelling `{"properties": {}}` is silent too.
 - a definition with a schema-valued `additionalProperties` does constrain its
   instances, and is rejected on that keyword alone; the warning would misname
   the cause and is not also reported
