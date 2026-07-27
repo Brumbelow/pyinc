@@ -830,6 +830,141 @@ def test_missing_file_replaced_by_a_directory_matches_a_fresh_database(
     assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_handled_unrecordable_failure_invalidates_a_transitive_reader(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+    path = tmp_path / "thing.txt"
+    path.write_text("text", encoding="utf-8")
+
+    @query
+    def reader(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except IsADirectoryError:
+            return "<isdir>"
+
+    @query
+    def parent(db: Database, filename: str) -> str:
+        return "P:" + reader(db, filename)
+
+    db = Database(mode=mode)
+    assert db.get(parent, str(path)) == "P:text"
+
+    # Neither the load nor the probe survives a file replaced by a directory, so
+    # nothing about the failure can be recorded. Reporting the resource changed
+    # is enough for `reader`, which re-executes and catches; it is *not* enough
+    # for `parent` unless the transition also moves the revision, because
+    # otherwise `reader` re-executes at the revision `parent` already verified.
+    path.unlink()
+    path.mkdir()
+    assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:<isdir>"
+    # Still right when the transitive reader is asked repeatedly, not just once.
+    assert db.get(parent, str(path)) == "P:<isdir>"
+
+    # ... and it settles: once the world heals, the parent follows the value back.
+    path.rmdir()
+    path.write_text("text", encoding="utf-8")
+    assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:text"
+
+    # A second break is a second transition and must invalidate again.
+    path.unlink()
+    path.mkdir()
+    assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:<isdir>"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_handled_unrecordable_failure_propagates_more_than_one_hop(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+    path = tmp_path / "thing.txt"
+    path.write_text("text", encoding="utf-8")
+
+    @query
+    def leaf(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except IsADirectoryError:
+            return "<isdir>"
+
+    @query
+    def middle(db: Database, filename: str) -> str:
+        return "M:" + leaf(db, filename)
+
+    @query
+    def top(db: Database, filename: str) -> str:
+        return "T:" + middle(db, filename)
+
+    db = Database(mode=mode)
+    assert db.get(top, str(path)) == "T:M:text"
+    executions = db.statistics().query_executions
+
+    path.unlink()
+    path.mkdir()
+    assert db.get(top, str(path)) == Database(mode=mode).get(top, str(path)) == "T:M:<isdir>"
+    # Every hop of the chain agrees, not only the root that was asked for.
+    assert db.get(middle, str(path)) == "M:<isdir>"
+    assert db.get(leaf, str(path)) == "<isdir>"
+
+    # All three hops re-executed in that one request: the invalidation reached
+    # past `middle`, which is the hop a direct-reader-only fix leaves behind.
+    assert db.statistics().query_executions == executions + 3
+    revision = db.revision
+    for node in (leaf, middle, top):
+        assert _query_record(db, node, str(path)).changed_at == revision
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_permanently_unrecordable_failure_settles_the_revision(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+    path = tmp_path / "thing.txt"
+    path.write_text("text", encoding="utf-8")
+
+    @query
+    def reader(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except IsADirectoryError:
+            return "<isdir>"
+
+    @query
+    def parent(db: Database, filename: str) -> str:
+        return "P:" + reader(db, filename)
+
+    db = Database(mode=mode)
+    assert db.get(parent, str(path)) == "P:text"
+    before = db.revision
+
+    path.unlink()
+    path.mkdir()
+    assert db.get(parent, str(path)) == "P:<isdir>"
+    # One bump for the transition into "unconfirmed" -- not one per observation.
+    transitioned = db.revision
+    assert transitioned == before + 1
+
+    for _ in range(5):
+        assert db.get(parent, str(path)) == "P:<isdir>"
+        assert db.revision == transitioned
+
+    # A read that ultimately succeeds is not a transition either: the healing
+    # load moves the revision once, and the requests after it leave it alone.
+    path.rmdir()
+    path.write_text("text", encoding="utf-8")
+    assert db.get(parent, str(path)) == "P:text"
+    healed = db.revision
+    assert healed > transitioned
+    for _ in range(5):
+        assert db.get(parent, str(path)) == "P:text"
+        assert db.revision == healed
+
+
 def test_module_replaced_by_a_package_matches_a_fresh_database(tmp_path: Path) -> None:
     from pyinc.integrations import python_source
 

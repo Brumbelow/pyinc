@@ -22,6 +22,58 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Semantic tokens classify a `from ... import ...` use by the workspace
   declaration it resolves to, instead of leaving it unstyled. Imports that
   resolve outside the workspace, or ambiguously, remain unclassified.
+- A resource whose `load` or `probe_and_load` raises now gets a *failure
+  record* carrying the probe observed alongside the failure, and the reading
+  query records its dependency edge on that node before the exception
+  propagates. A later `get()` therefore re-checks the resource instead of
+  treating the reader as dependency-free. `inspect()` and `explain()` show the
+  node with decision `failed` and a reason naming the exception, and it counts
+  in `DatabaseStatistics.resource_count`. An unchanged failing probe does not
+  move the revision, so a query that handled the failure stays green across
+  requests; a changed probe, or a transition between success and failure in
+  either direction, invalidates its readers. Behaviour is identical in
+  `strict`, `checked`, and `fast`.
+- `ClassModel.truncated_bases` names every base that resolved to a workspace
+  class but sat past the `MAX_BASE_DEPTH` cap and so was not walked, reported
+  as written at the stopped edge and deduplicated in first-encounter order.
+  Members inherited more than eight levels above a class are still omitted, but
+  no longer silently.
+- Code generation compiles four constructs that were previously
+  `unsupported-construct` errors: `const` and inline `enum` render as
+  `typing.Literal[...]`, schema-valued `additionalProperties` in property
+  position renders as `dict[str, T]` (recursively, and a referenced definition
+  joins the model's reference graph), and the two combinator spellings that
+  name exactly one type — single-branch `{"allOf": [S]}` and
+  `{"anyOf": [S, {"type": "null"}]}` in either branch order — render as `S` and
+  as `S` made optional. `Literal` is imported only when a rendered type uses
+  it. Multi-branch composition remains an error.
+- Code generation accepts annotation- and validation-only keywords wherever a
+  schema node is accepted — `format`, `pattern`, `minimum`, `maximum`,
+  `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`,
+  `maxLength`, `minItems`, `maxItems`, `uniqueItems`, `deprecated`, `readOnly`,
+  `writeOnly`, boolean `additionalProperties`, `examples`, and `default` — with
+  a non-blocking `ignored-constraint` warning naming the keyword. Previously a
+  single `"format": "email"` made an entire document fatal. A JSON `default`
+  still does not become a dataclass default.
+- New code-generation diagnostic codes: `ignored-constraint` (warning),
+  `invalid-constraint` (error), `unconstrained-object-model` (warning),
+  `unsupported-const-value` (error), `const-type-mismatch` (error), and
+  `unsupported-tuple-items` (error).
+- Notebook code cells that fail to parse as Python are re-parsed after
+  neutralizing IPython syntax: line magics, shell escapes, help forms, and
+  capture assignments are replaced by equal-width placeholders, so the rest of
+  the cell is still analyzed and every range still names its real notebook line
+  and column. A first-line cell magic claims the whole cell, and its body is
+  dropped unless the magic runs that body as Python. Recognition is lexical and
+  only at the start of a logical line, so magic-shaped lines inside string
+  literals or bracketed continuations are left alone.
+- New notebook diagnostic code `notebook-non-python-cell`, for a cell that
+  still does not parse after neutralization; it carries a source range like
+  `syntax-error` does.
+- Nesting caps for the three structured-configuration integrations, each
+  reported as an ordinary diagnostic rather than an exception: XML at 256
+  element levels, JSON at 200 object/array levels, and TOML at 100 container
+  levels.
 
 ### Changed
 
@@ -34,7 +86,82 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mutable containers only, so values crossing through a `ValueAdapter`, `tuple`,
   or `frozenset` cannot be the target of a back-edge; CSV dialect and header
   sniffing inspect only the first 8192 characters; and re-export and base-class
-  following both stop at depth 8, the latter silently.
+  following both stop at depth 8. Re-export following reports `ambiguous`
+  through `follow_depth`/`trail`; base-class following now names the bases it
+  stopped at in `ClassModel.truncated_bases`.
+- Inheritance flattening resolves a member name to the definition at the
+  shortest inheritance distance from the starting class, rather than to
+  whichever definition the depth-first walk reached first. Ties at equal
+  distance still go to the earlier depth-first left-to-right arrival, and a
+  class reached again at a strictly shallower distance is re-walked with the
+  larger remaining budget. Every flattened `ClassMember` field —
+  `defining_path`, `defining_class`, `range`, `annotation`, `signature` — is
+  now fixed by the inheritance graph, base declaration order, and the depth
+  cap, never by traversal order. This changes which definition wins where a
+  base and a derived class both declare a name: for `class A3: m`,
+  `class A2(A3)`, `class A1(A2)`, `class B1: m`, `class D(A1, B1)`,
+  `class_model(D)` previously resolved `m` to `A3` and now resolves it to
+  `B1`. The rule is not C3, so it can differ from CPython's MRO, which
+  resolves that example to `A3`; this is stated as a limit in
+  `docs/integration-contract.md`.
+- A failing resource costs one load per request rather than one per reader.
+  The first read in a request re-runs the load; reads that follow it within
+  that request re-raise the exception that load produced. The retained
+  exception and its traceback are dropped when the request ends, so a
+  permanently failing node no longer pins the load frame or anything it
+  allocated.
+- A failure record, and every record that transitively depends on it, is
+  omitted from a checkpoint and re-executes against live state after
+  `load_checkpoint`. The same exclusion covers a failure the kernel could not
+  record: the resource record an unprobeable raise contradicted, and the
+  reader that consumed such a raise, plus everything above it.
+- A load that raised is not counted as a `resource_load`, and re-running a
+  load on an unchanged failing probe is not counted as a `resource_probe_hit`.
+- The XML element walk, the JSON section walk, and the TOML section walk are
+  iterative. Payloads and their order are unchanged.
+- Configuration nesting past a cap is rejected rather than analyzed. XML at
+  257 element levels, JSON at 201 container levels, and TOML at 101 container
+  levels (array-of-tables costs two containers per header, so `[[a.b.c…]]`
+  crosses at 51 headers) now yield an empty payload and one diagnostic naming
+  the limit. Below each cap, payloads and cutoff tokens are byte-identical to
+  the previous release, verified across 871 constructed plus 16,000 fuzzed
+  JSON documents and 16,840 TOML documents with zero differences. The JSON cap
+  is set by two measured constraints: a document at the cap with 20-character
+  keys caches 823 KiB of section payload, and `pyinc.value._MAX_SNAPSHOT_DEPTH`
+  is 200, so nothing the integration accepts can fail to `freeze`. The TOML cap
+  is half that because `_toml_cutoff_value` rewrites each table as a tuple of
+  pairs, costing two snapshot levels per table.
+- The JSON integration's pre-parse depth scan moves the query fingerprints of
+  `json_file_text`, `json_sections_payload`, `json_diagnostics_payload`, and
+  `json_analysis_payload`, so checkpoints saved by an earlier release miss for
+  these queries and safely re-execute.
+- Code generation selects a schema node's shape by one precedence everywhere —
+  `$ref`, then `allOf`/`anyOf`, then `enum`, then `const`, then `type`.
+- Root-schema violations are reported as one `unsupported-root-schema` error at
+  the document root naming every keyword collected, instead of one error per
+  keyword, and the message states the rule that models must be declared under
+  `$defs` or `definitions`. An ignored keyword at the root no longer blocks
+  generation at all.
+- A definition that declares `type: object` with no `properties` records a
+  non-blocking `unconstrained-object-model` warning; the emitted `.py` is
+  unchanged, byte for byte. The warning is keyed on the absence of the keyword,
+  so `{"type": "object", "properties": {}}` stays silent.
+- Malformed ignored-keyword values are `invalid-constraint` errors naming the
+  expected shape, the draft-07 tuple form of `items` is `unsupported-tuple-items`
+  rather than `invalid-schema-node`, `unconstrained-array-items` is no longer
+  reported when `prefixItems` is present, and rejection messages for unsupported
+  combinators name the specific rule instead of accompanying a generic
+  `unconstrained-schema` warning.
+- Cells whose only problem was IPython syntax report their imports and
+  definitions with no diagnostic, where they previously reported one
+  `syntax-error` and nothing else. A cell mixing notebook syntax with genuinely
+  broken Python is reported as `notebook-non-python-cell`.
+- `docs/kernel-contract.md` gained a "Failing Resource Loads" section, and its
+  "Explicit Limitations" now names three ambient-read gaps individually: file
+  metadata (`os.stat`, `Path.exists`, `Path.is_file`, `os.path.getsize` and
+  `getmtime`), the byte-oriented environment (`os.getenvb`, `os.environb`), and
+  the working directory (`os.getcwd`, `Path.cwd`). These are not intercepted;
+  route them through `FileStatResource` or `db.report_untracked_read`.
 
 ### Fixed
 
@@ -47,6 +174,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   correct `path` field. Affected messages are therefore identical across runs,
   which `pyinc-tools analyze --format text` and LSP `publishDiagnostics` both
   depend on.
+- A query that catches an error from a resource read is now from-scratch
+  consistent across the file appearing and disappearing. Reading an optional
+  configuration file — the ordinary `try: ... except FileNotFoundError:`
+  pattern — recorded no dependency at all, so after the file was created
+  `db.get()` kept returning the default while a fresh `Database` returned the
+  file's contents, and `inspect()` reported `dependencies=()` with reason
+  `dependencies unchanged`. Deleting a file the query had already read was the
+  mirror-image failure: `FileNotFoundError` propagated out of `db.get()` from
+  inside the invalidation machinery, before the query body ran, so the query's
+  own `except` clause never saw it. Both now match a fresh `Database`.
+- An observation that raises without leaving a record retires the record's
+  stored probe, so a world that returns to exactly the state that probe
+  describes — an undo, a branch switch back — re-loads instead of reusing it,
+  and the queries reading it are invalidated rather than answering at a
+  revision their own dependents already verified past. Before, replacing a
+  tracked file with a directory and then restoring it left every transitive
+  dependent holding a stale value permanently.
+- `json_analysis` can no longer raise `UnsupportedValueError`, and
+  `config_analysis` can no longer raise it either, out of their cutoff
+  functions for an over-deep document — previously reachable on a post-edit
+  recomputation with enough stack. `xml_analysis` can no longer raise
+  `RecursionError` for a deeply nested document.
+- Stack-exhaustion diagnostics carry fixed text rather than `RecursionError`'s
+  message, which varies with where the stack blew and was flowing into a cached
+  payload.
+- Base-class flattening no longer loses members depending on traversal order.
+  A class first reached at the depth cap was recorded as visited without
+  contributing anything, so a later, shallower reach of that same class was
+  skipped — which could report a subclass as having strictly fewer members than
+  a base it inherits from.
+- `{"type": "object", "const": V}` in a definition reports `const-type-mismatch`
+  instead of dropping the `const` and emitting an empty dataclass. Annotations
+  on an `anyOf` null branch are validated like annotations anywhere else, and an
+  `anyOf` whose branches are both `{"type": "null"}` is rejected rather than
+  compiling to a bare `None` type.
 
 ## [3.0.0] - 2026-07-12
 

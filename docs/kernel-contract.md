@@ -146,27 +146,40 @@ Two boundaries apply:
   kernel does then depends on what it already knows about that node. With **no
   record** (the read is the node's first), nothing is recorded, the exception
   propagates unchanged, and a query that catches it is cached as if it had no
-  dependency at all — a later `get()` in that same process does not re-check it
-  (it is still refused a checkpoint, see below). With a **record already there**
+  dependency at all — a later `get()` in that same process does not re-check it,
+  and neither does anything that depends on it (it is still refused a
+  checkpoint, see below). With a **record already there**
   — an earlier success, or an earlier recorded failure — that record describes a
   world the kernel can no longer confirm, so the node is reported as *changed*:
-  every dependent re-executes and the exception surfaces inside the query body
-  again. The record is also marked unconfirmed, which retires its stored probe
-  until a real observation rewrites the record: a world that returns to exactly
-  the state that probe describes — an undo, a branch switch back — re-loads
-  instead of reusing, and the readers that consumed the raise re-execute rather
-  than staying green on a value only the failure explains. That stays consistent
-  with a fresh `Database` throughout, and it settles as soon as a load succeeds
-  again; while the probe keeps raising, the readers re-run every request. A file
-  replaced by a directory (`FileResource`, `DirectoryResource`, and the
-  `python_source` module → package refactor) is the ordinary way to reach this
-  state.
+  the queries that read it directly re-execute and the exception surfaces inside
+  their query bodies again. The record is also marked unconfirmed, which retires
+  its stored probe until a real observation rewrites the record: a world that
+  returns to exactly the state that probe describes — an undo, a branch switch
+  back — re-loads instead of reusing, and the readers that consumed the raise
+  re-execute rather than staying green on a value only the failure explains.
+  Entering that unconfirmed state also **moves the revision**, exactly as a
+  recorded failure does. A direct reader that handles the exception is otherwise
+  the end of the story: it would return at the revision its own dependents had
+  already verified, so nothing above it would ever learn that the world moved,
+  and a transitive dependent would keep a pre-failure value permanently. The
+  bump is per *transition*, not per request — one on the way in, one on the way
+  out — so `revision` settles while a resource stays unprobeable instead of
+  churning on every `get()`, and a resource that heals and breaks again bumps
+  again. That stays consistent with a fresh `Database` throughout, and it
+  settles as soon as a load succeeds again; while the probe keeps raising, the
+  queries that read it directly re-run every request, and *their* dependents
+  re-run only when the handled value actually differs. A file replaced by a
+  directory (`FileResource`, `DirectoryResource`, and the `python_source`
+  module → package refactor) is the ordinary way to reach this state.
   (See: `test_failed_resource_loads_are_recorded_only_when_the_probe_is_total`,
   `test_file_replaced_by_a_directory_matches_a_fresh_database`,
   `test_directory_replaced_by_a_file_matches_a_fresh_database`,
   `test_missing_file_replaced_by_a_directory_matches_a_fresh_database`,
   `test_module_replaced_by_a_package_matches_a_fresh_database`,
-  `test_directory_restored_after_an_unprobeable_failure_matches_a_fresh_database`)
+  `test_directory_restored_after_an_unprobeable_failure_matches_a_fresh_database`,
+  `test_handled_unrecordable_failure_invalidates_a_transitive_reader`,
+  `test_handled_unrecordable_failure_propagates_more_than_one_hop`,
+  `test_permanently_unrecordable_failure_settles_the_revision`)
 
   The probe contract extends to failures for the same reason it covers values: a
   resource whose `load` can raise *different* exceptions for one probe value must
@@ -193,6 +206,15 @@ counted as a `resource_probe_hit`. Unless the resource overrides
 `probe_and_load` to observe both from one read, the probe stored with a failure
 is taken just after it, so a `failed` node can display a probe describing an
 already-healed world; the next request re-runs the load and clears it.
+
+A failure the kernel could **not** record writes no record at all, so there is
+nothing for `inspect()` to relabel: the node keeps the decision, probe, digest,
+and `changed_at` of its last real observation, which is now older than the
+database `revision`. Read a resource node that way — as the last observation the
+kernel could describe, not as a claim about the world right now. Invalidation
+does not consult that stale `changed_at`: the unconfirmed mark reports the node
+changed on every refresh and retires its probe until a real observation replaces
+it.
 
 ## Explicit Limitations
 

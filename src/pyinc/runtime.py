@@ -2280,6 +2280,21 @@ class Database:
         consumed the exception then stay green on a value no fresh ``Database``
         produces. Mark it here instead, so the stored probe stops deciding
         anything until a real observation rewrites the record.
+
+        Marking alone only repairs the resource's *direct* readers. Reporting the
+        node as changed makes each direct reader re-execute and see the exception,
+        but a reader that handles it returns at the current revision, so its own
+        ``changed_at`` does not move and its parents never learn that anything
+        happened -- they keep a value derived from the pre-failure world forever.
+        The transition into "unconfirmed" is a change in the graph exactly as a
+        recorded failure is, so it moves the revision too, and the reader's
+        re-execution then lands on a revision its parents have not verified past.
+        The bump is guarded on the mark not already being set: one bump per
+        transition, not one per request, so a permanently unprobeable resource
+        settles at a fixed revision instead of churning it on every ``get()``.
+        Every path that rewrites the record from a real observation -- a
+        successful load and a recordable failure alike -- clears the mark, so a
+        resource that heals and breaks again bumps again.
         """
         outcome = outcome if outcome is not None else _RefreshOutcome()
         try:
@@ -2288,6 +2303,8 @@ class Database:
             if not outcome.failure_recorded:
                 record = self._records.get(key)
                 if record is not None:
+                    if not record.probe_unconfirmed:
+                        self._revision += 1
                     record.probe_unconfirmed = True
             raise
 
