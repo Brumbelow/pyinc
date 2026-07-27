@@ -323,6 +323,52 @@ def test_workspace_json_analysis_returns_none_when_missing(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# Stack exhaustion
+# ---------------------------------------------------------------------------
+
+
+# Alternating object/array nesting, so that consecutive scanner frames report
+# different constructs when CPython's recursion check trips.
+_DEEP_JSON = '{"a":[' * 2000 + "1" + "]}" * 2000
+
+
+def test_stack_exhaustion_diagnostic_does_not_vary_with_caller_stack_depth(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "deep.json"
+    path.write_text(_DEEP_JSON, encoding="utf-8")
+
+    def _analyse_at_depth(remaining: int) -> tuple[tuple[str, str], ...]:
+        if remaining:
+            return _analyse_at_depth(remaining - 1)
+        return json_analysis(Database(), str(path)).diagnostics
+
+    # Which frame runs out of budget — and so which message CPython raises — is a
+    # property of the call site, so a cached payload must not carry it.
+    observed = {_analyse_at_depth(pad) for pad in range(6)}
+
+    assert observed == {
+        (("json-decode-error", "JSON parsing exhausted the interpreter stack"),)
+    }
+
+
+def test_stack_exhaustion_diagnostic_matches_fresh_recomputation(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+
+    steps: tuple[tuple[str, str], ...] = (
+        ("shallow", '{"a": 1}'),
+        ("too deep to scan", _DEEP_JSON),
+        ("shallow again", '{"a": 1}'),
+    )
+
+    incremental = Database()
+    for _label, content in steps:
+        path.write_text(content, encoding="utf-8")
+        fresh = Database()
+        assert json_analysis(incremental, str(path)) == json_analysis(fresh, str(path))
+
+
+# ---------------------------------------------------------------------------
 # From-scratch oracle
 # ---------------------------------------------------------------------------
 

@@ -120,6 +120,15 @@ def _load_json(text: str) -> Any:
 # Helpers
 # ---------------------------------------------------------------------------
 
+# CPython's JSON scanner checks the interpreter's recursion budget, so which frame
+# runs out — and so which message it raises — depends on how much stack the caller
+# had already spent, not on the file. The same document reports "...while decoding
+# a JSON object..." or "...while decoding a JSON array..." from different call
+# depths. This payload is cached, so a fixed string is emitted instead and the
+# payload stays a function of the tracked inputs. `xml_config` emits the same
+# shape for the same reason.
+_STACK_EXHAUSTED_DIAGNOSTIC = "JSON parsing exhausted the interpreter stack"
+
 
 def _json_value_type(value: Any) -> str:
     if value is None:
@@ -217,8 +226,10 @@ def json_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload
     try:
         _load_json(text)
         return ()
-    except (ValueError, RecursionError, OverflowError) as exc:
+    except (ValueError, OverflowError) as exc:
         return (("json-decode-error", str(exc)),)
+    except RecursionError:
+        return (("json-decode-error", _STACK_EXHAUSTED_DIAGNOSTIC),)
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ from __future__ import annotations
 import mmap
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -59,6 +60,13 @@ def _find_node(root: InspectionNode, needle: str) -> InspectionNode:
         except LookupError:
             continue
     raise LookupError(needle)
+
+
+def _outcome(call: Callable[[], Any]) -> tuple[Any, ...]:
+    try:
+        return ("value", call())
+    except Exception as exc:
+        return (type(exc).__name__, str(exc))
 
 
 @pytest.mark.parametrize("limit", [0, -1, 1.5, float("nan"), True, "1"])
@@ -711,6 +719,100 @@ def test_resource_create_delete_recreate_cycles_track_a_fresh_database(tmp_path:
         expected = "<default>" if content is None else content
         assert Database().get(read_optional, str(path)) == expected
         assert db.get(read_optional, str(path)) == expected
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_file_replaced_by_a_directory_matches_a_fresh_database(mode: str, tmp_path: Path) -> None:
+    files = FileResource()
+    path = tmp_path / "o.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database(mode=mode)
+    assert db.get(read_optional, str(path)) == "hello"
+
+    path.unlink()
+    path.mkdir()
+    # Both the load and the probe raise here, so no failure record can be
+    # written; the record describing the file that used to be there must not be
+    # allowed to report "unchanged" and hand back a value fresh cannot produce.
+    fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
+    assert fresh[0] == "IsADirectoryError"
+    assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_directory_replaced_by_a_file_matches_a_fresh_database(mode: str, tmp_path: Path) -> None:
+    directories = DirectoryResource()
+    path = tmp_path / "listing"
+    path.mkdir()
+    (path / "a.txt").write_text("a", encoding="utf-8")
+
+    @query
+    def names(db: Database, dirname: str) -> tuple[str, ...]:
+        return directories.read(db, dirname)
+
+    db = Database(mode=mode)
+    assert db.get(names, str(path)) == ("a.txt",)
+
+    (path / "a.txt").unlink()
+    path.rmdir()
+    path.write_text("not a directory", encoding="utf-8")
+    fresh = _outcome(lambda: Database(mode=mode).get(names, str(path)))
+    assert fresh[0] == "NotADirectoryError"
+    assert _outcome(lambda: db.get(names, str(path))) == fresh
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_missing_file_replaced_by_a_directory_matches_a_fresh_database(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+    path = tmp_path / "optional.txt"
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database(mode=mode)
+    assert db.get(read_optional, str(path)) == "<default>"
+
+    # The failure record left by the absent file goes stale the same way a value
+    # record does: once the path is a directory, neither load nor probe survives.
+    path.mkdir()
+    fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
+    assert fresh[0] == "IsADirectoryError"
+    assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
+
+
+def test_module_replaced_by_a_package_matches_a_fresh_database(tmp_path: Path) -> None:
+    from pyinc.integrations import python_source
+
+    path = tmp_path / "mod.py"
+    path.write_text("import os\n", encoding="utf-8")
+
+    db = Database()
+    imports = python_source.file_analysis(db, str(path)).imports
+    assert tuple(ref.module for ref in imports) == ("os",)
+
+    # A module -> package refactor is the shipped-integration form of the same
+    # trap: _SourceTextResource probes with exists() then read_bytes().
+    path.unlink()
+    path.mkdir()
+    (path / "__init__.py").write_text("import os\n", encoding="utf-8")
+    fresh = _outcome(lambda: python_source.file_analysis(Database(), str(path)))
+    assert fresh[0] == "IsADirectoryError"
+    assert _outcome(lambda: python_source.file_analysis(db, str(path))) == fresh
 
 
 def test_untracked_queries_rerun_without_backdating_the_impure_node() -> None:

@@ -50,6 +50,18 @@ class _FailingResource(Resource[str, str, str]):
         return f"failing[{key}]"
 
 
+@dataclass(frozen=True)
+class _UnprobeableResource(Resource[str, str, str]):
+    def probe(self, key: str) -> str:
+        raise RuntimeError(f"cannot probe {key}")
+
+    def load(self, db: Database, key: str) -> str:
+        raise AssertionError("load must not run")
+
+    def label(self, key: str) -> str:
+        return f"unprobeable[{key}]"
+
+
 @pytest.mark.parametrize("key", ["", 0, None])
 def test_input_rejects_invalid_keys(key: object) -> None:
     with pytest.raises(InputKeyError, match="non-empty string"):
@@ -161,12 +173,22 @@ def test_base_resource_contract_and_default_probe_and_load() -> None:
         abstract.label("x")
 
 
-def test_failed_resource_read_does_not_leave_a_stale_runtime_binding() -> None:
+def test_failed_resource_read_leaves_no_binding_without_a_record_behind_it() -> None:
     db = Database()
     resource = _FailingResource()
     with pytest.raises(RuntimeError, match="cannot load x"):
         resource.read(db, "x")
-    assert not db._resource_objects()
+    key = db._resource_key(resource, "x")
+    assert db._records[key].is_failed
+    # The binding is retained deliberately: it is what lets a later request
+    # re-check the failure record. A binding with no record behind it would be
+    # the stale one, and a load whose probe raises leaves neither.
+    assert set(db._resource_objects()) == {key}
+
+    with pytest.raises(RuntimeError, match="cannot probe y"):
+        _UnprobeableResource().read(db, "y")
+    assert set(db._resource_objects()) == {key}
+    assert set(db._records) == {key}
 
 
 def test_text_and_binary_file_resources_cover_present_and_missing_paths(

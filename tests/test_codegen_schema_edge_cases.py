@@ -345,6 +345,30 @@ def test_render_combinator_reports_each_unsupported_shape_at_its_keyword() -> No
     ]
 
 
+def test_two_null_branches_name_no_type_to_make_optional() -> None:
+    rendered, refs, diagnostics, allows_none = _render_combinator(
+        "anyOf", [{"type": "null"}, {"type": "null"}], lambda name: True, "/node"
+    )
+    assert (rendered, refs, allows_none) == ("object", (), False)
+    assert [(code, pointer) for code, _m, _s, pointer in diagnostics] == [
+        ("unsupported-construct", "/node/anyOf")
+    ]
+    assert "names no type" in diagnostics[0][1]
+
+
+def test_null_branch_annotations_are_reported_in_branch_order() -> None:
+    _rendered, _refs, diagnostics, _allows_none = _render_combinator(
+        "anyOf",
+        [{"type": "null", "title": 1}, {"$ref": "#/$defs/Missing"}],
+        lambda name: False,
+        "/node",
+    )
+    assert [(code, pointer) for code, _m, _s, pointer in diagnostics] == [
+        ("invalid-annotation", "/node/anyOf/0/title"),
+        ("unknown-ref", "/node/anyOf/1/$ref"),
+    ]
+
+
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
@@ -619,6 +643,37 @@ def test_bare_object_definition_warns_while_the_same_property_is_a_mapping() -> 
         (),
         False,
     )
+    # A mapping value schema does constrain the instance. It is rejected on its
+    # own keyword, and one cause reports one diagnostic.
+    mapping = _build_model(
+        "Bag",
+        {"type": "object", "additionalProperties": {"type": "string"}},
+        lambda name: False,
+        "/$defs/Bag",
+    )
+    assert [(code, pointer) for code, _message, _severity, pointer in mapping[7]] == [
+        ("unsupported-construct", "/$defs/Bag/additionalProperties")
+    ]
+
+
+def test_build_model_selects_a_shape_keyword_before_the_type_driven_branch() -> None:
+    const_model = _build_model(
+        "Kind",
+        {"type": "object", "const": "ticket"},
+        lambda name: False,
+        "/$defs/Kind",
+    )
+    assert (const_model[1], const_model[4]) == ("alias", "Literal['ticket']")
+    assert _codes(const_model[7]) == {"const-type-mismatch"}
+
+    ref_model = _build_model(
+        "Ref",
+        {"$ref": "#/$defs/Target", "type": "object", "properties": {}},
+        lambda name: True,
+        "/$defs/Ref",
+    )
+    assert (ref_model[1], ref_model[4], ref_model[6]) == ("alias", "Target", ("Target",))
+    assert _codes(ref_model[7]) == {"ambiguous-schema-combination"}
 
 
 def test_build_model_reports_invalid_required_and_properties_containers() -> None:

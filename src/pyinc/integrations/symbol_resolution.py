@@ -1667,9 +1667,10 @@ def resolved_class_model_payload(
         return (path, qualified_name, tuple(), tuple(), tuple())
 
     # Flatten the inheritance graph: DEPTH-FIRST, LEFT-TO-RIGHT,
-    # FIRST-DEFINITION-WINS by member name (derived shadows base). This is not
-    # C3 MRO. Cycles are cut by a `(path, class_qname)` key, and the walk is
-    # bounded by `MAX_BASE_DEPTH`. Base files are queried one at a time via
+    # SHALLOWEST-DEFINITION-WINS by member name (derived shadows base), ties at
+    # equal depth going to the earlier arrival. This is not C3 MRO. Cycles are
+    # cut by a `(path, class_qname)` key, and the walk is bounded by
+    # `MAX_BASE_DEPTH`. Base files are queried one at a time via
     # `class_models_for_file`, so an edit to one base invalidates per file.
     #
     # `reached` holds the SHALLOWEST depth each key was walked at, not mere
@@ -1678,15 +1679,24 @@ def resolved_class_model_payload(
     # budget — otherwise which members survive depends on traversal order. That
     # depth strictly decreases per revisit, so a key is walked at most
     # `MAX_BASE_DEPTH` times and a wide diamond cannot revisit exponentially.
+    #
+    # `member_depth` makes the winning DEFINITION depth-canonical the same way:
+    # a revisit can splice a previously-cut ancestor into the walk ahead of a
+    # sibling subtree that overrides it, so arrival order alone would let a base
+    # claim a name over a nearer override. Claims are therefore replaced when a
+    # class reached strictly shallower defines the same name.
     members: dict[str, ResolvedClassMemberPayload] = {}
+    member_depth: dict[str, int] = {}
     unresolved: list[str] = []
     seen_unresolved: set[str] = set()
     reached: dict[tuple[str, str], int] = {}
     # One resolution per base expression, shared across a key's revisits.
     base_sites: dict[tuple[str, EncodedBasePayload], tuple[str, str] | None] = {}
     # Bases that resolved to a workspace class the cap stopped us from walking,
-    # keyed by site so a later shallower reach can retract the report.
-    cut: dict[tuple[str, str], str] = {}
+    # in first-encounter order and paired with the site so a later shallower
+    # reach can retract the report.
+    cut: list[tuple[tuple[str, str], str]] = []
+    seen_cut: set[tuple[tuple[str, str], str]] = set()
 
     def visit(cur_path: str, cur_qname: str, depth: int) -> None:
         key = (cur_path, cur_qname)
@@ -1704,16 +1714,19 @@ def resolved_class_model_payload(
             return
         cur_bases, cur_members = own
         for name, kind, lineno, annotation, signature in cur_members:
-            if name not in members:
-                members[name] = (
-                    name,
-                    kind,
-                    lineno,
-                    annotation,
-                    signature,
-                    cur_path,
-                    cur_qname,
-                )
+            claimed = member_depth.get(name)
+            if claimed is not None and claimed <= depth:
+                continue
+            member_depth[name] = depth
+            members[name] = (
+                name,
+                kind,
+                lineno,
+                annotation,
+                signature,
+                cur_path,
+                cur_qname,
+            )
         for base in cur_bases:
             site_key = (cur_path, base)
             if site_key not in base_sites:
@@ -1726,7 +1739,10 @@ def resolved_class_model_payload(
                     unresolved.append(text)
                 continue
             if depth + 1 >= MAX_BASE_DEPTH:
-                cut.setdefault(site, _base_text(base))
+                entry = (site, _base_text(base))
+                if entry not in seen_cut:
+                    seen_cut.add(entry)
+                    cut.append(entry)
                 continue
             visit(site[0], site[1], depth + 1)
 
@@ -1734,7 +1750,7 @@ def resolved_class_model_payload(
     # A site the cap stopped is only truly lost if no other reach walked it.
     truncated: list[str] = []
     seen_truncated: set[str] = set()
-    for site, text in cut.items():
+    for site, text in cut:
         if site in reached or text in seen_truncated:
             continue
         seen_truncated.add(text)

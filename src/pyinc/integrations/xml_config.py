@@ -97,11 +97,31 @@ _DIRECTORIES = DirectoryResource()
 
 _NS_PAT = "}"
 
-# Element nesting is capped during parsing: every element records the dot path
-# of its ancestors, so a deeply nested document costs memory quadratic in its
-# nesting. The cap sits far above any real configuration document and above the
-# interpreter's default recursion limit, so it only ever rejects hostile input.
-_MAX_XML_DEPTH = 2000
+# Element nesting is capped during parsing because every element re-emits the dot
+# path of all its ancestors: the cached cutoff token grows with the square of the
+# nesting depth, so this cap is what bounds the *cache*, not just the parse.
+#
+# It is therefore set from an explicit amplification budget, not from the
+# interpreter's recursion limit — the walk keeps its own stack and needs under 20
+# frames at any depth, so the interpreter's ceiling is not the constraint here.
+# Budget: a document at the cap must not cache more than ~1 MiB of cutoff token.
+# At 256 levels that holds for element names up to 20 characters (measured: 708 KB
+# for a 20-character name, 207 KB for a 5-character one, 74 KB for a 1-character
+# one). The token scales linearly in name length on top of the quadratic depth
+# term, so the budget is stated for that name length rather than unconditionally.
+# 256 is still an order of magnitude deeper than any real configuration document.
+_MAX_XML_DEPTH = 256
+
+# A RecursionError raised anywhere under `_safe_parse` cannot be a property of the
+# document: `_MAX_XML_DEPTH` rejects runaway nesting as a ParseError before the
+# tree is built, and the element walk is iterative. It means only that the caller
+# entered with the interpreter's stack all but spent, because expat invokes
+# `_start_element` as a Python frame. CPython names whichever frame ran out
+# ("...while calling a Python object", "...while getting the str of an object"),
+# so the message describes the call site rather than the file. These payloads are
+# cached, so a fixed string is emitted instead and the payload stays a function of
+# the tracked inputs. `json_config` emits the same shape for the same reason.
+_STACK_EXHAUSTED_DIAGNOSTIC = "XML parsing exhausted the interpreter stack"
 
 
 def _strip_namespace(tag: str) -> str:
@@ -236,8 +256,10 @@ def xml_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload,
     try:
         _safe_parse(text)
         return ()
-    except (ET.ParseError, RecursionError) as exc:
+    except ET.ParseError as exc:
         return (("xml-parse-error", str(exc)),)
+    except RecursionError:
+        return (("xml-parse-error", _STACK_EXHAUSTED_DIAGNOSTIC),)
 
 
 # ---------------------------------------------------------------------------

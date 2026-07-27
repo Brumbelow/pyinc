@@ -50,6 +50,14 @@ imports guarded by `TYPE_CHECKING`; aliases store their type expression as a
 forward-reference string. Mutually recursive models and aliases therefore
 compile and import on every supported Python version.
 
+A schema node's shape is selected in one order everywhere the compiler reads
+one — `$ref`, then a combinator, then `enum`, then `const`, and only then
+`type`. A definition is no exception: `{"type": "object", "const": "ticket"}`
+is read as the `const` it declares, so its member checks report a
+`const-type-mismatch` error rather than the keyword being dropped into an empty
+dataclass. Which keywords may legitimately sit beside the selected shape is
+covered by the ambiguity rules in [Ignored keywords](#ignored-keywords).
+
 ## Supported subset
 
 - local JSON documents; `$defs` and legacy `definitions`
@@ -147,6 +155,16 @@ with no `properties` at all is accepted, but records a non-blocking
 what downstream code imports, so that is a major-version decision rather than
 part of this subset.
 
+That warning names the empty dataclass, so it is reported exactly where one is
+emitted and nowhere else — one cause, one diagnostic:
+
+- a definition with a schema-valued `additionalProperties` does constrain its
+  instances, and is rejected on that keyword alone; the warning would misname
+  the cause and is not also reported
+- `{"type": ["object", "null"]}` takes the alias path and renders
+  `dict[str, object] | None`, which keeps the instance data rather than typing
+  it away, so it is accepted with no diagnostic at all
+
 ### Nullable and single-branch references
 
 The subset cannot otherwise express an *optional reference* to another model —
@@ -157,10 +175,16 @@ idiomatic spellings that name exactly one type are compiled:
 - `{"anyOf": [S, {"type": "null"}]}` renders as `S` made optional, in either
   branch order (and is not made optional twice if `S` is already nullable)
 
-The null branch must be exactly `{"type": "null"}`, apart from annotations.
+The null branch must be exactly `{"type": "null"}`, apart from annotations, and
+those annotations are validated there exactly as they are on any other schema
+node — `{"type": "null", "description": 123}` is an `invalid-description` error
+even though the branch itself names no type.
+
 Everything else remains an `unsupported-construct` error reported at the
 keyword: a multi-branch `allOf`, an `anyOf` that is not one schema plus
-`{"type": "null"}`, and `oneOf` in every shape. General unions are out of
+`{"type": "null"}`, and `oneOf` in every shape. An `anyOf` whose branches are
+*both* `{"type": "null"}` is rejected for the same reason a one- or three-branch
+`anyOf` is: it names no type to make optional. General unions are out of
 scope — the compiler has no rule for choosing one Python type for them.
 
 ### Ignored keywords

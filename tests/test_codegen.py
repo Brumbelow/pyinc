@@ -381,6 +381,33 @@ def test_const_value_must_agree_with_the_declared_type(tmp_path: Path) -> None:
     assert diagnostic.json_pointer == "/$defs/Thing/properties/flag/const"
 
 
+@pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        pytest.param("ticket", "const-type-mismatch", id="scalar"),
+        pytest.param({"a": 1}, "unsupported-const-value", id="non-scalar"),
+    ],
+)
+def test_const_beside_type_object_is_rejected_at_definition_position(
+    value: object,
+    code: str,
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(schema_path, {"$defs": {"Kind": {"type": "object", "const": value}}})
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    # A definition selects its shape before ``type`` is read, so the const is
+    # diagnosed instead of being dropped into an empty frozen dataclass.
+    assert [(d.code, d.json_pointer) for d in analysis.diagnostics] == [
+        (code, "/$defs/Kind/const")
+    ]
+    with pytest.raises(SchemaGenerationError):
+        generate(db, schema_path, out)
+    assert _tree(out) == {}
+
+
 def test_nullable_and_single_branch_references_render_model_types(tmp_path: Path) -> None:
     schema_path = tmp_path / "schema.json"
     out = tmp_path / "generated"
@@ -439,6 +466,51 @@ def test_nullable_and_single_branch_references_render_model_types(tmp_path: Path
         "\n"
         "MaybeAddress: TypeAlias = 'Address | None'\n"
     )
+
+
+def test_null_branch_annotations_are_validated_like_every_other_node(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Thing": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "anyOf": [{"type": "string"}, {"type": "null", "description": 123}]
+                        }
+                    },
+                }
+            }
+        },
+    )
+    analysis = schema_analysis(Database(mode="strict"), schema_path)
+    # The null branch names optionality rather than a type, but it is still a
+    # schema node, so a malformed annotation blocks there as it does anywhere.
+    assert [(d.code, d.json_pointer) for d in analysis.diagnostics] == [
+        ("invalid-description", "/$defs/Thing/properties/name/anyOf/1/description")
+    ]
+
+
+def test_any_of_two_null_branches_is_rejected(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Thing": {
+                    "type": "object",
+                    "properties": {"name": {"anyOf": [{"type": "null"}, {"type": "null"}]}},
+                }
+            }
+        },
+    )
+    analysis = schema_analysis(Database(mode="strict"), schema_path)
+    # Neither branch names a type to make optional, so the union carries no
+    # information — a one- or three-branch 'anyOf' is an error for the same reason.
+    diagnostic = next(d for d in analysis.errors if d.code == "unsupported-construct")
+    assert diagnostic.json_pointer == "/$defs/Thing/properties/name/anyOf"
 
 
 @pytest.mark.parametrize(
@@ -545,6 +617,43 @@ def test_schema_valued_additional_properties_stays_unsupported(tmp_path: Path) -
     analysis = schema_analysis(Database(mode="strict"), schema_path)
     diagnostic = next(d for d in analysis.errors if d.code == "unsupported-construct")
     assert diagnostic.json_pointer == "/$defs/Bag/additionalProperties"
+
+
+def test_a_rejected_mapping_definition_reports_only_its_own_cause(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(
+        schema_path,
+        {"$defs": {"Bag": {"type": "object", "additionalProperties": {"type": "string"}}}},
+    )
+    analysis = schema_analysis(Database(mode="strict"), schema_path)
+    # The author did constrain the instance, so the 'model with no fields'
+    # warning would name a cause that is not the one being reported.
+    assert [(d.code, d.json_pointer) for d in analysis.diagnostics] == [
+        ("unsupported-construct", "/$defs/Bag/additionalProperties")
+    ]
+
+
+def test_nullable_object_definition_renders_a_mapping_alias_without_warning(
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(schema_path, {"$defs": {"Bag": {"type": ["object", "null"]}}})
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    # ``unconstrained-object-model`` names the empty dataclass that a bare
+    # ``{"type": "object"}`` definition generates. This spelling takes the alias
+    # path instead and keeps the instance data, so it has nothing to warn about.
+    assert analysis.diagnostics == ()
+
+    generate(db, schema_path, out)
+    assert (out / "bag.py").read_text(encoding="utf-8") == (
+        "from __future__ import annotations\n"
+        "\n"
+        "from typing import TypeAlias\n"
+        "\n"
+        "Bag: TypeAlias = 'dict[str, object] | None'\n"
+    )
 
 
 def test_object_definition_without_properties_warns_without_blocking(tmp_path: Path) -> None:

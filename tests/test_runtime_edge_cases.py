@@ -45,6 +45,11 @@ _DIGEST = "a" * 64
 _IMPLEMENTATION_DIGEST = "b" * 64
 
 
+def _tallied(key: str) -> str:
+    calls = Path(f"{key}.calls")
+    return calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
 class _RuntimeType:
     pass
 
@@ -237,6 +242,31 @@ class _UnloadableResource(Resource[str, str, str]):
 
 
 @dataclass(frozen=True)
+class _TallyingFailingResource(Resource[str, str, tuple[str, ...]]):
+    """Never loads, appending one character per call to ``<key>.calls``.
+
+    The tally lives beside the resource's own key because a query's capture set
+    may not contain mutable state -- a counter attribute or module global is
+    rejected before the first ``get()``.
+    """
+
+    def _tally(self, key: str, event: str) -> None:
+        with open(f"{key}.calls", "a", encoding="utf-8") as handle:
+            handle.write(event)
+
+    def probe(self, key: str) -> tuple[str, ...]:
+        self._tally(key, "p")
+        return ("missing",)
+
+    def load(self, db: Database, key: str) -> str:
+        self._tally(key, "l")
+        raise FileNotFoundError(key)
+
+    def label(self, key: str) -> str:
+        return f"tallying[{key}]"
+
+
+@dataclass(frozen=True)
 class _UnprobeableResource(Resource[str, str, str]):
     def probe(self, key: str) -> str:
         raise RuntimeError(f"cannot probe {key}")
@@ -371,8 +401,60 @@ def test_failed_resource_loads_are_recorded_only_when_the_probe_is_total() -> No
     assert record.probe == "probe:value"
     assert record.snapshot is None
     assert record.digest == ""
-    assert record.checked_in_request == -1
+    assert record.checked_in_request == db._request_counter
+    assert isinstance(record.failure_exc, RuntimeError)
     assert db.statistics().resource_count == 1
+
+
+def test_failing_resource_loads_once_per_request_across_a_fan_out(tmp_path: Path) -> None:
+    resource = _TallyingFailingResource()
+    target = str(tmp_path / "target")
+
+    @query
+    def reader(db: Database, key: str, index: int) -> str:
+        try:
+            return resource.read(db, key)
+        except FileNotFoundError:
+            return f"<default-{index}>"
+
+    @query
+    def fan_out(db: Database, key: str) -> tuple[str, ...]:
+        return tuple(reader(db, key, index) for index in range(20))
+
+    db = Database()
+    assert db.get(fan_out, target)[0] == "<default-0>"
+    # One load per request, however many readers observe it. The probe either
+    # side of it is probe_and_load's default implementation followed by the
+    # second observation taken alongside the failure.
+    assert _tallied(target) == "plp"
+    revision = db.revision
+    executions = db.statistics().query_executions
+
+    for _ in range(10):
+        assert len(db.get(fan_out, target)) == 20
+
+    assert _tallied(target) == "plp" * 11
+    assert db.revision == revision
+    assert db.statistics().query_executions == executions
+
+
+def test_repeated_failing_reads_within_one_query_body_load_once(tmp_path: Path) -> None:
+    resource = _TallyingFailingResource()
+    target = str(tmp_path / "target")
+
+    @query
+    def read_repeatedly(db: Database, key: str, times: int) -> int:
+        handled = 0
+        for _ in range(times):
+            try:
+                resource.read(db, key)
+            except FileNotFoundError:
+                handled += 1
+        return handled
+
+    db = Database()
+    assert db.get(read_repeatedly, target, 50) == 50
+    assert _tallied(target) == "plp"
 
 
 def test_checkpoints_omit_failed_resource_records_and_their_readers(tmp_path: Path) -> None:

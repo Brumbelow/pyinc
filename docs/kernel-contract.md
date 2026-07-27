@@ -116,9 +116,13 @@ probe-comparison machinery drive invalidation:
   the failure stays green across repeated requests. A changed probe — or a
   transition between success and failure in either direction — invalidates the
   readers.
-- A failure record never satisfies a read: the load is re-run (yielding a live
-  exception) rather than a stored one being re-raised, and the record is never
-  treated as settled for the remainder of a request.
+- A failure record never satisfies a read with a value — it holds none. The
+  first read in a request re-runs the load, so the exception is a live one; the
+  reads that follow it *within that request* re-raise the exception that load
+  produced, exactly as a successful load's value is reused for the rest of the
+  request. A failing resource costs one load per request, not one per reader.
+  (See: `test_failing_resource_loads_once_per_request_across_a_fan_out`,
+  `test_repeated_failing_reads_within_one_query_body_load_once`)
 - Behaviour is identical in `strict`, `checked`, and `fast`.
 
 Optional external state is therefore from-scratch consistent: a query that
@@ -133,14 +137,29 @@ Two boundaries apply:
 
 - **The probe must be total.** This rests on `probe()` modelling failure instead
   of raising — `FileResource.probe` returns `("missing",)` for an absent file. A
-  resource whose `probe` *also* raises is outside the contract: nothing is
-  recorded, the exception propagates unchanged, and a query that catches it is
-  cached as if it had no dependency at all. The probe contract extends to
-  failures for the same reason it covers values: a resource whose `load` can
-  raise *different* exceptions for one probe value must fold that distinction
-  into the probe. Invalidation compares probes only, never exception messages,
-  which are frequently nondeterministic.
-  (See: `test_failed_resource_loads_are_recorded_only_when_the_probe_is_total`)
+  resource whose `probe` *also* raises is outside the contract, and what the
+  kernel does then depends on what it already knows about that node. With **no
+  record** (the read is the node's first), nothing is recorded, the exception
+  propagates unchanged, and a query that catches it is cached as if it had no
+  dependency at all — a later `get()` does not re-check it. With a **record
+  already there** — an earlier success, or an earlier recorded failure — that
+  record describes a world the kernel can no longer confirm, so the node is
+  reported as *changed*: every dependent re-executes and the exception surfaces
+  inside the query body again. That stays consistent with a fresh `Database`,
+  but it never settles; the readers re-run for as long as the probe keeps
+  raising. A file replaced by a directory (`FileResource`, `DirectoryResource`,
+  and the `python_source` module → package refactor) is the ordinary way to
+  reach this state.
+  (See: `test_failed_resource_loads_are_recorded_only_when_the_probe_is_total`,
+  `test_file_replaced_by_a_directory_matches_a_fresh_database`,
+  `test_directory_replaced_by_a_file_matches_a_fresh_database`,
+  `test_missing_file_replaced_by_a_directory_matches_a_fresh_database`,
+  `test_module_replaced_by_a_package_matches_a_fresh_database`)
+
+  The probe contract extends to failures for the same reason it covers values: a
+  resource whose `load` can raise *different* exceptions for one probe value must
+  fold that distinction into the probe. Invalidation compares probes only, never
+  exception messages, which are frequently nondeterministic.
 - **Failures are not checkpointed.** A failure record holds no value, and a
   reader that handled a failure is only reproducible while the load keeps
   failing. The failure record and every record that transitively depends on it
@@ -152,7 +171,10 @@ Two boundaries apply:
 reason naming the exception; it counts in `DatabaseStatistics.resource_count`
 like any other resource node. A load that raised is not counted as a
 `resource_load`, and re-running a load on an unchanged failing probe is not
-counted as a `resource_probe_hit`.
+counted as a `resource_probe_hit`. Unless the resource overrides
+`probe_and_load` to observe both from one read, the probe stored with a failure
+is taken just after it, so a `failed` node can display a probe describing an
+already-healed world; the next request re-runs the load and clears it.
 
 ## Explicit Limitations
 

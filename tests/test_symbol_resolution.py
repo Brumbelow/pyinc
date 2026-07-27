@@ -2450,3 +2450,125 @@ def test_class_model_multi_class_cycle_terminates(tmp_path: Path) -> None:
     selfish = class_model(db, root, path, "Selfish")
     assert {member.name for member in selfish.members} == {"sm"}
     assert selfish.truncated_bases == ()
+
+
+def test_class_model_shallower_override_wins_over_revisited_base(tmp_path: Path) -> None:
+    # `Root(A1, Repo, Widget)`. The A spine reaches `X` at depth 7, so `X`'s
+    # base `Z` sits at the cap and is cut. `Repo` re-reaches `X` at depth 2, so
+    # `Z` is walked at depth 3 — ahead of `Widget` at depth 1, which overrides
+    # `save`. Arrival order alone would hand `save` to the base `Z`; the
+    # winning definition is the one at the shortest inheritance distance.
+    root = tmp_path / "workspace"
+    path = root / "deep.py"
+    _write_file(
+        path,
+        "class Z:\n    def save(self) -> None:\n        pass\n"
+        "class X(Z):\n    pass\n"
+        "class Repo(X):\n    def from_repo(self) -> None:\n        pass\n"
+        + _base_chain("A", 6, "X")
+        + "class Widget(Z):\n    def save(self, force: bool) -> int:\n        return 0\n"
+        "class Root(A1, Repo, Widget):\n    pass\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "Root")
+    by_name = {member.name: member for member in model.members}
+    assert by_name["save"].defining_class == "Widget"
+    assert by_name["save"].defining_path == str(path)
+    assert by_name["save"].range.start.line == 27
+    assert by_name["save"].signature == Signature(
+        parameters=(
+            Parameter(name="self", annotation=None),
+            Parameter(name="force", annotation="bool"),
+        ),
+        return_annotation="int",
+    )
+    # Nothing is actually lost, so neither report fires.
+    assert model.truncated_bases == ()
+    assert model.unresolved_bases == ()
+
+
+def test_class_model_diamond_prefers_the_nearer_definition(tmp_path: Path) -> None:
+    # A plain diamond well inside the cap: `Z.m` sits at depth 2 through `A`
+    # while `W.m` sits at depth 1, so `W` wins even though depth-first arrival
+    # reaches `Z` first.
+    root = tmp_path / "workspace"
+    path = root / "diamond.py"
+    _write_file(
+        path,
+        "class Z:\n    def m(self) -> None:\n        pass\n"
+        "class A(Z):\n    def am(self) -> None:\n        pass\n"
+        "class W(Z):\n    def m(self, times: int) -> str:\n        return ''\n"
+        "class Root(A, W):\n    pass\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "Root")
+    by_name = {member.name: member for member in model.members}
+    assert by_name["m"].defining_class == "W"
+    assert by_name["m"].range.start.line == 7
+    assert by_name["m"].signature == Signature(
+        parameters=(
+            Parameter(name="self", annotation=None),
+            Parameter(name="times", annotation="int"),
+        ),
+        return_annotation="str",
+    )
+    assert {member.name for member in model.members} == {"am", "m"}
+
+
+def test_class_model_equal_depth_tie_goes_left_to_right(tmp_path: Path) -> None:
+    # Nearest-definition-wins only reorders across depths; at equal depth the
+    # depth-first left-to-right arrival still decides, both for direct bases
+    # and for definitions one level further out.
+    root = tmp_path / "workspace"
+    path = root / "tie.py"
+    _write_file(
+        path,
+        "class L:\n    def m(self) -> int:\n        return 0\n"
+        "class R:\n    def m(self) -> str:\n        return ''\n"
+        "class GrandL(L):\n    pass\n"
+        "class GrandR(R):\n    pass\n"
+        "class Direct(L, R):\n    pass\n"
+        "class Indirect(GrandL, GrandR):\n    pass\n",
+    )
+    db = Database(mode="strict")
+
+    direct = {m.name: m for m in class_model(db, root, path, "Direct").members}
+    assert direct["m"].defining_class == "L"
+    assert direct["m"].signature == Signature(
+        parameters=(Parameter(name="self", annotation=None),),
+        return_annotation="int",
+    )
+
+    indirect = {m.name: m for m in class_model(db, root, path, "Indirect").members}
+    assert indirect["m"].defining_class == "L"
+
+
+def test_class_model_truncation_reports_every_stopped_edge(tmp_path: Path) -> None:
+    # `Root(A1, B1)`. Both spines end one step short of the same class `Deep`,
+    # each importing it under its own alias, so the cap stops two distinct
+    # edges onto one site. Both edges are named, not just the first.
+    root = tmp_path / "workspace"
+    _write_file(root / "deep.py", "class Deep:\n    def dm(self) -> None:\n        pass\n")
+    for prefix, alias in (("A", "Alpha"), ("B", "Beta")):
+        _write_file(
+            root / f"{prefix.lower()}7.py",
+            f"from deep import Deep as {alias}\n\n\n"
+            f"class {prefix}7({alias}):\n"
+            f"    def from_{prefix.lower()}7(self) -> None:\n        pass\n",
+        )
+        for index in range(1, 7):
+            _write_file(
+                root / f"{prefix.lower()}{index}.py",
+                f"from {prefix.lower()}{index + 1} import {prefix}{index + 1}\n\n\n"
+                f"class {prefix}{index}({prefix}{index + 1}):\n"
+                f"    def from_{prefix.lower()}{index}(self) -> None:\n        pass\n",
+            )
+    _write_file(
+        root / "root.py",
+        "from a1 import A1\nfrom b1 import B1\n\n\nclass Root(A1, B1):\n    pass\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, root / "root.py", "Root")
+    assert "dm" not in {member.name for member in model.members}
+    assert model.truncated_bases == ("Alpha", "Beta")
+    assert model.unresolved_bases == ()

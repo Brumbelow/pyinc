@@ -32,8 +32,10 @@ _ROOT_METADATA_KEYS = _SCHEMA_ANNOTATION_KEYS | frozenset({"$id", "$schema"})
 _SHAPE_KEYWORDS = frozenset({"$ref", "const", "enum", "items", "properties", "required"})
 # The combinator spellings that select a shape, in the order they are selected.
 _SUPPORTED_COMBINATORS = ("allOf", "anyOf")
-# Keywords that select a schema shape before the ``type``-driven branches run.
-_SHAPE_SELECTORS = frozenset({"$ref", "const", "enum", *_SUPPORTED_COMBINATORS})
+# Keywords that select a schema shape before the ``type``-driven branches run,
+# in the order they are applied wherever the compiler reads a schema node.
+_SHAPE_SELECTOR_ORDER = ("$ref", *_SUPPORTED_COMBINATORS, "enum", "const")
+_SHAPE_SELECTORS = frozenset(_SHAPE_SELECTOR_ORDER)
 _IGNORED_NUMBER_KEYWORDS = frozenset({"exclusiveMaximum", "exclusiveMinimum", "maximum", "minimum"})
 _IGNORED_SIZE_KEYWORDS = frozenset({"maxItems", "maxLength", "minItems", "minLength"})
 _IGNORED_STRING_KEYWORDS = frozenset({"format", "pattern"})
@@ -556,16 +558,41 @@ def _render_combinator(
     if isinstance(branches, list) and keyword == "allOf" and len(branches) == 1:
         return _render_type(branches[0], definition_exists, _pointer(keyword_pointer, "0"))
     if isinstance(branches, list) and keyword == "anyOf" and len(branches) == 2:
-        null_index = next(
-            (index for index, branch in enumerate(branches) if _is_null_schema(branch)),
-            None,
-        )
-        if null_index is not None:
+        null_indexes = [index for index, branch in enumerate(branches) if _is_null_schema(branch)]
+        if len(null_indexes) == 2:
+            return (
+                "object",
+                (),
+                (
+                    _diagnostic(
+                        "unsupported-construct",
+                        "an 'anyOf' whose branches are both {\"type\": \"null\"} names no type "
+                        "to make optional",
+                        keyword_pointer,
+                    ),
+                ),
+                False,
+            )
+        if len(null_indexes) == 1:
+            null_index = null_indexes[0]
             value_index = 1 - null_index
-            inner, refs, diagnostics, allows_none = _render_type(
+            inner, refs, value_diagnostics, allows_none = _render_type(
                 branches[value_index],
                 definition_exists,
                 _pointer(keyword_pointer, str(value_index)),
+            )
+            # The null branch selects optionality rather than a type, so it never
+            # reaches ``_render_type``; its annotations are validated here so a
+            # malformed one is not the single place the check does not run.
+            null_diagnostics = _annotation_diagnostics(
+                branches[null_index],
+                _pointer(keyword_pointer, str(null_index)),
+                _SCHEMA_ANNOTATION_KEYS,
+            )
+            diagnostics = (
+                null_diagnostics + value_diagnostics
+                if null_index < value_index
+                else value_diagnostics + null_diagnostics
             )
             return (inner if allows_none else f"{inner} | None", refs, diagnostics, True)
     problem = (
@@ -1019,13 +1046,19 @@ def _build_model(
     raw_description = fragment.get("description", "")
     description = raw_description if isinstance(raw_description, str) else ""
 
-    if "enum" in fragment:
+    # A definition selects its shape in the same precedence ``_render_type``
+    # uses, so a shape-selecting keyword is never dropped by the type-driven
+    # object branch running first.
+    selector = next((name for name in _SHAPE_SELECTOR_ORDER if name in fragment), None)
+    if selector == "enum":
         return _build_enum(name, fragment, description, json_pointer, diagnostics)
 
-    if fragment.get("type") == "object" or "properties" in fragment:
-        if "properties" not in fragment:
+    if selector is None and (fragment.get("type") == "object" or "properties" in fragment):
+        if "properties" not in fragment and _mapping_value_schema(fragment) is None:
             # A dataclass with no fields cannot hold the instance data such a
-            # definition accepts, and a $ref to it would type that data away.
+            # definition accepts, and a $ref to it would type that data away. A
+            # mapping value schema does constrain that data; it is rejected on
+            # its own keyword, so repeating it here would misname the cause.
             diagnostics += (
                 _diagnostic(
                     "unconstrained-object-model",
