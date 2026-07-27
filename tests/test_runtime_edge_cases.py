@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import sys
 import typing
@@ -17,6 +18,7 @@ from pyinc import (
     CheckpointManifestError,
     CheckpointVersionError,
     Database,
+    FileResource,
     InMemoryArtifactStore,
     Input,
     InputKeyError,
@@ -223,6 +225,30 @@ class _InvalidLabelResource(Resource[str, str, str]):
 
 
 @dataclass(frozen=True)
+class _UnloadableResource(Resource[str, str, str]):
+    def probe(self, key: str) -> str:
+        return f"probe:{key}"
+
+    def load(self, db: Database, key: str) -> str:
+        raise RuntimeError(f"cannot load {key}")
+
+    def label(self, key: str) -> str:
+        return f"unloadable[{key}]"
+
+
+@dataclass(frozen=True)
+class _UnprobeableResource(Resource[str, str, str]):
+    def probe(self, key: str) -> str:
+        raise RuntimeError(f"cannot probe {key}")
+
+    def load(self, db: Database, key: str) -> str:
+        raise AssertionError("load must not run")
+
+    def label(self, key: str) -> str:
+        return f"unprobeable[{key}]"
+
+
+@dataclass(frozen=True)
 class _RichDataclass:
     count: int = 1
     values: list[int] = field(default_factory=list)
@@ -325,6 +351,61 @@ def test_resource_labels_must_be_nonempty_strings() -> None:
         _InvalidLabelResource(1).read(db, "value")
     with pytest.raises(ValueError, match="non-empty string"):
         _InvalidLabelResource("").read(db, "value")
+
+
+def test_failed_resource_loads_are_recorded_only_when_the_probe_is_total() -> None:
+    db = Database()
+
+    partial = _UnprobeableResource()
+    with pytest.raises(RuntimeError, match="cannot probe"):
+        partial.read(db, "value")
+    assert not db._resource_registry
+    assert db.statistics().resource_count == 0
+
+    total = _UnloadableResource()
+    with pytest.raises(RuntimeError, match="cannot load"):
+        total.read(db, "value")
+    record = db._records[db._resource_key(total, "value")]
+    assert record.is_failed
+    assert record.failure == "RuntimeError: cannot load value"
+    assert record.probe == "probe:value"
+    assert record.snapshot is None
+    assert record.digest == ""
+    assert record.checked_in_request == -1
+    assert db.statistics().resource_count == 1
+
+
+def test_checkpoints_omit_failed_resource_records_and_their_readers(tmp_path: Path) -> None:
+    files = FileResource()
+    missing = tmp_path / "missing.txt"
+    present = tmp_path / "present.txt"
+    present.write_text("here", encoding="utf-8")
+
+    @query(key="checkpoint-optional-read")
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+    assert db.get(read_optional, str(missing)) == "<default>"
+    assert db.get(read_optional, str(present)) == "here"
+
+    checkpoint = db.save_checkpoint()
+    manifest = json.loads(cast(bytes, store.get(checkpoint)).decode("utf-8"))
+    saved = {(entry["identity"], entry["args_digest"]) for entry in manifest["records"]}
+    missing_key, _ = db._query_key(read_optional, (str(missing),), {})
+    present_key, _ = db._query_key(read_optional, (str(present),), {})
+    assert (present_key.identity, present_key.args_digest) in saved
+    assert (missing_key.identity, missing_key.args_digest) not in saved
+    assert not any(str(missing) in entry["label"] for entry in manifest["records"])
+
+    warmed = Database(store=store)
+    warmed.load_checkpoint(checkpoint)
+    missing.write_text("late", encoding="utf-8")
+    assert warmed.get(read_optional, str(missing)) == "late"
 
 
 def test_materialized_call_validation_covers_strict_and_checked_modes() -> None:

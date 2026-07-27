@@ -604,7 +604,113 @@ def test_failed_resource_reads_do_not_leave_dangling_dependencies(
     assert db.get(classify, str(path)) == "file"
     inspection = _inspect_node(db, classify, str(path))
     assert inspection.last_decision == "executed"
+    # A directory probe of a non-directory raises rather than reporting a state,
+    # so the failure cannot be recorded and no edge is published.
     assert inspection.dependencies == ()
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_appearing_resource_invalidates_the_query_that_handled_its_absence(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+    path = tmp_path / "optional.txt"
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database(mode=mode)
+    assert db.get(read_optional, str(path)) == "<default>"
+    inspection = _inspect_node(db, read_optional, str(path))
+    failed = _find_node(inspection, "file[")
+    assert failed.last_decision == "failed"
+    assert "FileNotFoundError" in failed.reason
+    assert db.statistics().resource_count == 1
+
+    path.write_text("hello", encoding="utf-8")
+    assert db.get(read_optional, str(path)) == Database(mode=mode).get(read_optional, str(path))
+    assert db.get(read_optional, str(path)) == "hello"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_disappearing_resource_raises_inside_the_query_body(mode: str, tmp_path: Path) -> None:
+    files = FileResource()
+    path = tmp_path / "optional.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database(mode=mode)
+    assert db.get(read_optional, str(path)) == "hello"
+
+    path.unlink()
+    assert db.get(read_optional, str(path)) == Database(mode=mode).get(read_optional, str(path))
+    assert db.get(read_optional, str(path)) == "<default>"
+
+
+def test_unchanged_failing_resource_probe_keeps_dependents_green(tmp_path: Path) -> None:
+    files = FileResource()
+    path = tmp_path / "missing.txt"
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    @query
+    def shout(db: Database, filename: str) -> str:
+        return read_optional(db, filename).upper()
+
+    db = Database()
+    assert db.get(shout, str(path)) == "<DEFAULT>"
+    revision = db.revision
+    executions = db.statistics().query_executions
+
+    for _ in range(3):
+        assert db.get(shout, str(path)) == "<DEFAULT>"
+
+    assert db.revision == revision
+    assert db.statistics().query_executions == executions
+    inspection = _inspect_node(db, shout, str(path))
+    assert inspection.last_decision == "reused"
+    assert _find_node(inspection, "read_optional").last_decision == "reused"
+    failed = _find_node(inspection, "file[")
+    assert failed.last_decision == "failed"
+    assert failed.changed_at == revision
+
+
+def test_resource_create_delete_recreate_cycles_track_a_fresh_database(tmp_path: Path) -> None:
+    files = FileResource()
+    path = tmp_path / "toggle.txt"
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database()
+    for content in (None, "alpha", None, "beta", "beta", None, "alpha"):
+        if content is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(content, encoding="utf-8")
+        expected = "<default>" if content is None else content
+        assert Database().get(read_optional, str(path)) == expected
+        assert db.get(read_optional, str(path)) == expected
 
 
 def test_untracked_queries_rerun_without_backdating_the_impure_node() -> None:

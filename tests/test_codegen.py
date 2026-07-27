@@ -103,7 +103,17 @@ def test_model_captures_fields_required_enum_nullable_refs(tmp_path: Path) -> No
 
 def test_unsupported_construct_yields_diagnostic(tmp_path: Path) -> None:
     p = tmp_path / "s.json"
-    _write_schema(p, {"$defs": {"A": {"type": "object", "properties": {"x": {"allOf": [{}]}}}}})
+    _write_schema(
+        p,
+        {
+            "$defs": {
+                "A": {
+                    "type": "object",
+                    "properties": {"x": {"allOf": [{"type": "string"}, {"type": "integer"}]}},
+                }
+            }
+        },
+    )
     db = Database(mode="strict")
     analysis = schema_analysis(db, str(p))
     codes = {d.code for d in analysis.diagnostics}
@@ -113,8 +123,9 @@ def test_unsupported_construct_yields_diagnostic(tmp_path: Path) -> None:
     assert diagnostic.json_pointer == "/$defs/A/properties/x/allOf"
 
 
-def test_unsupported_keywords_are_rejected_in_each_supported_context(tmp_path: Path) -> None:
+def test_validation_keywords_warn_in_each_supported_context(tmp_path: Path) -> None:
     schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
     _write_schema(
         schema_path,
         {
@@ -136,18 +147,30 @@ def test_unsupported_keywords_are_rejected_in_each_supported_context(tmp_path: P
         },
     )
 
-    errors = schema_analysis(Database(mode="strict"), schema_path).errors
-    unsupported = {
-        diagnostic.json_pointer: diagnostic.code
-        for diagnostic in errors
-        if diagnostic.code == "unsupported-construct"
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    assert analysis.errors == ()
+    ignored = {
+        diagnostic.json_pointer: diagnostic
+        for diagnostic in analysis.diagnostics
+        if diagnostic.code == "ignored-constraint"
     }
-    assert unsupported == {
-        "/$defs/Thing/additionalProperties": "unsupported-construct",
-        "/$defs/Thing/properties/code/format": "unsupported-construct",
-        "/$defs/Thing/properties/count/minimum": "unsupported-construct",
-        "/$defs/Thing/properties/tags/minItems": "unsupported-construct",
+    assert set(ignored) == {
+        "/$defs/Thing/additionalProperties",
+        "/$defs/Thing/properties/code/format",
+        "/$defs/Thing/properties/count/minimum",
+        "/$defs/Thing/properties/tags/minItems",
     }
+    for pointer, diagnostic in ignored.items():
+        assert diagnostic.severity is DiagnosticSeverity.WARNING
+        # The warning names the keyword it is not enforcing.
+        assert repr(pointer.rsplit("/", 1)[-1]) in diagnostic.message
+
+    generate(db, schema_path, out)
+    source = (out / "thing.py").read_text(encoding="utf-8")
+    assert "code: str | None = None" in source
+    assert "count: int | None = None" in source
+    assert "tags: list[str] | None = None" in source
 
 
 def test_nested_array_schema_keywords_are_validated_recursively(tmp_path: Path) -> None:
@@ -173,15 +196,412 @@ def test_nested_array_schema_keywords_are_validated_recursively(tmp_path: Path) 
         },
     )
 
-    errors = schema_analysis(Database(mode="strict"), schema_path).errors
+    analysis = schema_analysis(Database(mode="strict"), schema_path)
+    assert analysis.errors == ()
     assert {
         diagnostic.json_pointer
-        for diagnostic in errors
-        if diagnostic.code == "unsupported-construct"
+        for diagnostic in analysis.diagnostics
+        if diagnostic.code == "ignored-constraint"
     } == {
         "/$defs/Nested/properties/values/items/minItems",
         "/$defs/Nested/properties/values/items/items/format",
     }
+
+
+def test_malformed_constraint_values_are_errors(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(schema_path, {"$defs": {"Good": {"type": "object"}}})
+    db = Database(mode="strict")
+    generate(db, schema_path, out)
+    before = _tree(out)
+
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Good": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "format": 7, "pattern": "^ok$"},
+                        "count": {"type": "integer", "minimum": True, "multipleOf": 0},
+                        "tags": {"type": "array", "items": {"type": "string"}, "maxItems": -1},
+                    },
+                }
+            }
+        },
+    )
+    analysis = schema_analysis(db, schema_path)
+    assert {
+        diagnostic.json_pointer
+        for diagnostic in analysis.errors
+        if diagnostic.code == "invalid-constraint"
+    } == {
+        "/$defs/Good/properties/code/format",
+        "/$defs/Good/properties/count/minimum",
+        "/$defs/Good/properties/count/multipleOf",
+        "/$defs/Good/properties/tags/maxItems",
+    }
+    # A well-formed sibling of a malformed keyword is still merely ignored.
+    assert "/$defs/Good/properties/code/pattern" in {
+        diagnostic.json_pointer
+        for diagnostic in analysis.diagnostics
+        if diagnostic.code == "ignored-constraint"
+    }
+
+    with pytest.raises(SchemaGenerationError):
+        generate(db, schema_path, out)
+    assert _tree(out) == before
+
+
+def test_inline_enum_and_const_render_literal_types(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Status": {"type": "string", "enum": ["open", "closed"]},
+                "Ticket": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "ticket"},
+                        "priority": {"type": "integer", "enum": [1, 2, 3]},
+                        "state": {"enum": ["open", "closed", None]},
+                        "labels": {"type": "array", "items": {"enum": ["red", "blue"]}},
+                        "status": {"$ref": "#/$defs/Status"},
+                    },
+                    "required": ["kind", "priority"],
+                },
+            }
+        },
+    )
+    db = Database(mode="strict")
+    assert schema_analysis(db, schema_path).errors == ()
+    generate(db, schema_path, out)
+
+    # ``Literal`` is imported exactly once, after ``TYPE_CHECKING``, and the
+    # enum member that is ``null`` makes the field nullable without a second
+    # ``| None``.
+    assert (out / "ticket.py").read_text(encoding="utf-8") == (
+        "from __future__ import annotations\n"
+        "\n"
+        "from dataclasses import dataclass\n"
+        "from typing import TYPE_CHECKING, Literal\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from .status import Status\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Ticket:\n"
+        "    kind: Literal['ticket']\n"
+        "    priority: Literal[1, 2, 3]\n"
+        "    labels: list[Literal['red', 'blue']] | None = None\n"
+        "    state: Literal['open', 'closed', None] = None\n"
+        "    status: Status | None = None\n"
+    )
+    compile((out / "ticket.py").read_text(encoding="utf-8"), "ticket.py", "exec")
+
+
+def test_const_definition_renders_a_literal_alias(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(schema_path, {"$defs": {"Kind": {"const": "ticket"}}})
+    db = Database(mode="strict")
+    assert schema_analysis(db, schema_path).errors == ()
+    generate(db, schema_path, out)
+
+    # The alias branch needs ``Literal`` too: the forward reference is a string,
+    # but the name must still resolve for a type checker.
+    assert (out / "kind.py").read_text(encoding="utf-8") == (
+        "from __future__ import annotations\n"
+        "\n"
+        "from typing import Literal, TypeAlias\n"
+        "\n"
+        "Kind: TypeAlias = \"Literal['ticket']\"\n"
+    )
+    compile((out / "kind.py").read_text(encoding="utf-8"), "kind.py", "exec")
+
+
+def test_models_without_literals_import_nothing_extra(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {"$defs": {"Plain": {"type": "object", "properties": {"name": {"type": "string"}}}}},
+    )
+    generate(Database(mode="strict"), schema_path, out)
+    assert "from typing import" not in (out / "plain.py").read_text(encoding="utf-8")
+
+
+def test_float_literal_members_are_rejected_for_const_and_enum(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Ratio": {
+                    "type": "object",
+                    "properties": {
+                        "exact": {"const": 1.5},
+                        "choice": {"enum": [1.5, 2.5]},
+                    },
+                }
+            }
+        },
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    assert {(d.code, d.json_pointer) for d in analysis.errors} == {
+        ("unsupported-const-value", "/$defs/Ratio/properties/exact/const"),
+        ("unsupported-enum-value", "/$defs/Ratio/properties/choice/enum/0"),
+        ("unsupported-enum-value", "/$defs/Ratio/properties/choice/enum/1"),
+    }
+    with pytest.raises(SchemaGenerationError):
+        generate(db, schema_path, out)
+
+
+def test_const_value_must_agree_with_the_declared_type(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Thing": {
+                    "type": "object",
+                    "properties": {"flag": {"type": "integer", "const": "yes"}},
+                }
+            }
+        },
+    )
+    analysis = schema_analysis(Database(mode="strict"), schema_path)
+    diagnostic = next(d for d in analysis.errors if d.code == "const-type-mismatch")
+    assert diagnostic.json_pointer == "/$defs/Thing/properties/flag/const"
+
+
+def test_nullable_and_single_branch_references_render_model_types(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Address": {"type": "object", "properties": {"city": {"type": "string"}}},
+                "MaybeAddress": {"anyOf": [{"$ref": "#/$defs/Address"}, {"type": "null"}]},
+                "Profile": {
+                    "type": "object",
+                    "properties": {
+                        "billing": {"allOf": [{"$ref": "#/$defs/Address"}]},
+                        "home": {"anyOf": [{"$ref": "#/$defs/Address"}, {"type": "null"}]},
+                        "work": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/Address"}]},
+                    },
+                    "required": ["billing"],
+                },
+            }
+        },
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    assert analysis.errors == ()
+    # References found through a combinator join the model's reference graph.
+    assert {model.name: model.refs for model in analysis.models} == {
+        "Address": (),
+        "MaybeAddress": ("Address",),
+        "Profile": ("Address",),
+    }
+
+    generate(db, schema_path, out)
+    assert (out / "profile.py").read_text(encoding="utf-8") == (
+        "from __future__ import annotations\n"
+        "\n"
+        "from dataclasses import dataclass\n"
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from .address import Address\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Profile:\n"
+        "    billing: Address\n"
+        "    home: Address | None = None\n"
+        "    work: Address | None = None\n"
+    )
+    assert (out / "maybe_address.py").read_text(encoding="utf-8") == (
+        "from __future__ import annotations\n"
+        "\n"
+        "from typing import TYPE_CHECKING, TypeAlias\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from .address import Address\n"
+        "\n"
+        "MaybeAddress: TypeAlias = 'Address | None'\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec", "keyword"),
+    [
+        ({"allOf": [{"$ref": "#/$defs/Address"}, {"type": "object"}]}, "allOf"),
+        ({"anyOf": [{"$ref": "#/$defs/Address"}, {"type": "string"}]}, "anyOf"),
+        ({"anyOf": [{"$ref": "#/$defs/Address"}]}, "anyOf"),
+        ({"oneOf": [{"$ref": "#/$defs/Address"}, {"type": "null"}]}, "oneOf"),
+    ],
+)
+def test_multi_branch_combinators_remain_errors(
+    spec: dict[str, Any],
+    keyword: str,
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Address": {"type": "object", "properties": {"city": {"type": "string"}}},
+                "Holder": {"type": "object", "properties": {"value": spec}},
+            }
+        },
+    )
+    analysis = schema_analysis(Database(mode="strict"), schema_path)
+    diagnostic = next(d for d in analysis.errors if d.code == "unsupported-construct")
+    assert diagnostic.json_pointer == f"/$defs/Holder/properties/value/{keyword}"
+
+
+def test_schema_valued_additional_properties_compile_to_mappings(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Address": {"type": "object", "properties": {"city": {"type": "string"}}},
+                "Registry": {
+                    "type": "object",
+                    "properties": {
+                        "free": {"type": "object", "additionalProperties": True},
+                        "labels": {"type": "object", "additionalProperties": {"type": "string"}},
+                        "matrix": {
+                            "additionalProperties": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                            }
+                        },
+                        "places": {
+                            "type": "object",
+                            "additionalProperties": {"$ref": "#/$defs/Address"},
+                        },
+                    },
+                },
+            }
+        },
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    assert analysis.errors == ()
+    # A boolean value is still unenforceable and still merely ignored.
+    assert [(d.code, d.json_pointer) for d in analysis.diagnostics] == [
+        ("ignored-constraint", "/$defs/Registry/properties/free/additionalProperties")
+    ]
+
+    generate(db, schema_path, out)
+    assert (out / "registry.py").read_text(encoding="utf-8") == (
+        "from __future__ import annotations\n"
+        "\n"
+        "from dataclasses import dataclass\n"
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from .address import Address\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Registry:\n"
+        "    free: dict[str, object] | None = None\n"
+        "    labels: dict[str, str] | None = None\n"
+        "    matrix: dict[str, list[int]] | None = None\n"
+        "    places: dict[str, Address] | None = None\n"
+    )
+
+
+def test_schema_valued_additional_properties_stays_unsupported(tmp_path: Path) -> None:
+    # A definition of type object generates a dataclass, which cannot carry
+    # free-form entries: the keyword is only compiled in property position.
+    schema_path = tmp_path / "schema.json"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Bag": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "properties": {"name": {"type": "string"}},
+                }
+            }
+        },
+    )
+    analysis = schema_analysis(Database(mode="strict"), schema_path)
+    diagnostic = next(d for d in analysis.errors if d.code == "unsupported-construct")
+    assert diagnostic.json_pointer == "/$defs/Bag/additionalProperties"
+
+
+def test_object_definition_without_properties_warns_without_blocking(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Bag": {"type": "object"},
+                "Declared": {"type": "object", "properties": {}},
+            }
+        },
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    assert analysis.errors == ()
+    # Declaring an empty property set is a statement about the model; omitting
+    # the keyword entirely is the case that silently drops instance data.
+    assert [(d.code, d.json_pointer) for d in analysis.diagnostics] == [
+        ("unconstrained-object-model", "/$defs/Bag")
+    ]
+    assert next(d for d in analysis.diagnostics).severity is DiagnosticSeverity.WARNING
+
+    generate(db, schema_path, out)
+    assert "    pass" in (out / "bag.py").read_text(encoding="utf-8")
+    assert "unconstrained-object-model" in (out / "docs" / "bag.md").read_text(encoding="utf-8")
+    assert "unconstrained-object-model" not in (out / "docs" / "declared.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_tuple_form_items_is_reported_as_an_unsupported_tuple(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(
+        schema_path,
+        {"$defs": {"Pair": {"type": "array", "items": [{"type": "string"}, {"type": "integer"}]}}},
+    )
+    analysis = schema_analysis(Database(mode="strict"), schema_path)
+    codes = {diagnostic.code for diagnostic in analysis.diagnostics}
+    # The draft-07 tuple form is a valid schema node, so it must not be reported
+    # as one that is neither an object nor a boolean.
+    assert "invalid-schema-node" not in codes
+    diagnostic = next(d for d in analysis.errors if d.code == "unsupported-tuple-items")
+    assert diagnostic.json_pointer == "/$defs/Pair/items"
+
+
+def test_prefix_items_does_not_also_report_unconstrained_items(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(
+        schema_path,
+        {"$defs": {"Pair": {"type": "array", "prefixItems": [{"type": "string"}]}}},
+    )
+    analysis = schema_analysis(Database(mode="strict"), schema_path)
+    assert "unconstrained-array-items" not in {d.code for d in analysis.diagnostics}
+    diagnostic = next(d for d in analysis.errors if d.code == "unsupported-construct")
+    assert diagnostic.json_pointer == "/$defs/Pair/prefixItems"
 
 
 def test_ambiguous_schema_combinations_are_rejected_at_each_sibling(
@@ -208,18 +628,24 @@ def test_ambiguous_schema_combinations_are_rejected_at_each_sibling(
         },
     )
 
-    errors = schema_analysis(Database(mode="strict"), schema_path).errors
+    analysis = schema_analysis(Database(mode="strict"), schema_path)
     assert {
         diagnostic.json_pointer
-        for diagnostic in errors
+        for diagnostic in analysis.errors
         if diagnostic.code == "ambiguous-schema-combination"
     } == {
         "/$defs/EnumObject/properties",
-        "/$defs/RefConstraint/minimum",
         "/$defs/RefEnum/enum",
         "/$defs/RefObject/properties",
         "/$defs/RefObject/type",
     }
+    # A validation-only keyword never competes with the selected shape: it is
+    # ignored beside a $ref exactly as it is anywhere else.
+    constraint = next(
+        d for d in analysis.diagnostics if d.json_pointer == "/$defs/RefConstraint/minimum"
+    )
+    assert constraint.code == "ignored-constraint"
+    assert constraint.severity is DiagnosticSeverity.WARNING
 
 
 def test_documented_annotations_are_accepted_without_affecting_generation(
@@ -732,13 +1158,12 @@ def test_root_unsupported_construct_preserves_existing_outputs(tmp_path: Path) -
     assert _tree(out) == before
 
 
-def test_nested_unsupported_keyword_fails_before_reconciliation(tmp_path: Path) -> None:
+def test_nested_ignored_keyword_generates_and_records_its_warning(tmp_path: Path) -> None:
     schema_path = tmp_path / "schema.json"
     out = tmp_path / "generated"
     _write_schema(schema_path, {"$defs": {"Old": {"type": "object"}}})
     db = Database(mode="strict")
     generate(db, schema_path, out)
-    before = _tree(out)
 
     _write_schema(
         schema_path,
@@ -759,8 +1184,50 @@ def test_nested_unsupported_keyword_fails_before_reconciliation(tmp_path: Path) 
     analysis = schema_analysis(db, schema_path)
     diagnostic = next(
         item
-        for item in analysis.errors
+        for item in analysis.diagnostics
         if item.json_pointer == "/$defs/Replacement/properties/identifiers/items/format"
+    )
+    assert diagnostic.code == "ignored-constraint"
+    assert analysis.errors == ()
+
+    result = generate(db, schema_path, out)
+    assert set(result.deleted) == {"old.py", "docs/old.md"}
+    assert "identifiers: list[str] | None = None" in (out / "replacement.py").read_text(
+        encoding="utf-8"
+    )
+    # The ignored constraint is recorded where a reader of the model will see it.
+    assert "ignored-constraint" in (out / "docs" / "replacement.md").read_text(encoding="utf-8")
+
+
+def test_nested_unsupported_keyword_fails_before_reconciliation(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(schema_path, {"$defs": {"Old": {"type": "object"}}})
+    db = Database(mode="strict")
+    generate(db, schema_path, out)
+    before = _tree(out)
+
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Replacement": {
+                    "type": "object",
+                    "properties": {
+                        "identifiers": {
+                            "type": "array",
+                            "items": {"patternProperties": {"^x": {"type": "string"}}},
+                        }
+                    },
+                }
+            }
+        },
+    )
+    analysis = schema_analysis(db, schema_path)
+    diagnostic = next(
+        item
+        for item in analysis.errors
+        if item.json_pointer == "/$defs/Replacement/properties/identifiers/items/patternProperties"
     )
     assert diagnostic.code == "unsupported-construct"
 
@@ -783,19 +1250,50 @@ def test_root_model_schema_preserves_existing_outputs(tmp_path: Path) -> None:
 
     _write_schema(
         schema_path,
-        {"type": "object", "properties": {"value": {"type": "string"}}},
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Value holder",
+            "type": "object",
+            "required": ["value"],
+            "properties": {"value": {"type": "string"}},
+        },
     )
     analysis = schema_analysis(db, schema_path)
-    pointers = {
-        diagnostic.json_pointer
-        for diagnostic in analysis.errors
-        if diagnostic.code == "unsupported-root-schema"
-    }
-    assert pointers == {"/properties", "/type"}
+    # One diagnostic that states the rule, not one per root keyword.
+    root_errors = [
+        diagnostic for diagnostic in analysis.errors if diagnostic.code == "unsupported-root-schema"
+    ]
+    assert len(root_errors) == 1
+    assert root_errors[0].json_pointer == ""
+    assert "$defs" in root_errors[0].message
+    assert all(
+        keyword in root_errors[0].message for keyword in ("'properties'", "'required'", "'type'")
+    )
 
     with pytest.raises(SchemaGenerationError):
         generate(db, schema_path, out)
     assert _tree(out) == before
+
+
+def test_root_annotation_keywords_are_ignored_without_blocking(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "examples": [{"name": "example"}],
+            "$defs": {"Thing": {"type": "object", "properties": {"name": {"type": "string"}}}},
+        },
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    assert analysis.errors == ()
+    diagnostic = next(d for d in analysis.diagnostics if d.code == "ignored-constraint")
+    assert diagnostic.json_pointer == "/examples"
+
+    generate(db, schema_path, out)
+    assert (out / "thing.py").is_file()
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, cast
@@ -148,20 +149,174 @@ def _first_markdown_heading(source: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# IPython syntax
+# ---------------------------------------------------------------------------
+
+# A cell magic owns the rest of its cell. These hand that body back to the
+# Python compiler; every other cell magic hands it to something else entirely,
+# so the body holds no Python to import from or define.
+_PYTHON_BODY_CELL_MAGICS = frozenset(
+    {"capture", "debug", "prun", "python", "python2", "python3", "time", "timeit"}
+)
+
+# Patterns stay uncompiled: a compiled ``re.Pattern`` is not a snapshot-safe
+# capture, and these helpers are reached from cached queries.
+_LINE_BREAK = r"\r\n|\r|\n"
+_CELL_MAGIC = r"%%([A-Za-z_]\w*)"
+# ``%`` is modulo and ``!`` is half of ``!=``, so these only read as notebook
+# syntax where IPython itself reads them: at the start of a logical line.
+_MAGIC_LINE = r"[ \t]*%{1,2}[A-Za-z_]"
+_SHELL_LINE = r"[ \t]*!{1,2}(?!=)"
+_HELP_PREFIX_LINE = r"[ \t]*\?{1,2}[ \t]*(?:[A-Za-z_%*]|$)"
+_HELP_SUFFIX_LINE = r"[ \t]*[A-Za-z_][\w.]*(?:\(.*\))?\?{1,2}[ \t]*$"
+_CAPTURE_LINE = (
+    r"[ \t]*[A-Za-z_]\w*(?:[ \t]*,[ \t]*[A-Za-z_]\w*)*[ \t]*=[ \t]*(?:%{1,2}[A-Za-z_]|!(?!=))"
+)
+_IPYTHON_LINES = (
+    _MAGIC_LINE,
+    _SHELL_LINE,
+    _HELP_PREFIX_LINE,
+    _HELP_SUFFIX_LINE,
+    _CAPTURE_LINE,
+)
+
+
+def _split_lines(source: str) -> tuple[tuple[str, str], ...]:
+    """Split into ``(content, terminator)`` pairs the way ``DocumentMap`` does."""
+    parts: list[tuple[str, str]] = []
+    position = 0
+    for match in re.finditer(_LINE_BREAK, source):
+        parts.append((source[position : match.start()], match.group()))
+        position = match.end()
+    parts.append((source[position:], ""))
+    return tuple(parts)
+
+
+def _logical_line_starts(contents: tuple[str, ...]) -> tuple[bool, ...]:
+    """Mark the physical lines that open a logical line.
+
+    IPython only reads a magic where a statement could start, so this is what
+    keeps a string literal or a bracketed continuation that happens to hold a
+    magic-looking line from being rewritten.
+    """
+    starts: list[bool] = []
+    quote = ""
+    depth = 0
+    continued = False
+    for content in contents:
+        starts.append(not quote and depth == 0 and not continued)
+        commented = False
+        index = 0
+        while index < len(content):
+            character = content[index]
+            if quote:
+                if character == "\\":
+                    index += 2
+                elif content.startswith(quote, index):
+                    index += len(quote)
+                    quote = ""
+                else:
+                    index += 1
+                continue
+            if character == "#":
+                commented = True
+                break
+            if character in "\"'":
+                quote = character * 3 if content.startswith(character * 3, index) else character
+                index += len(quote)
+                continue
+            if character in "([{":
+                depth += 1
+            elif character in ")]}":
+                depth = max(depth - 1, 0)
+            index += 1
+        if len(quote) == 1:
+            # Only a triple-quoted string carries across a line break on its own.
+            quote = ""
+        continued = not quote and not commented and content.endswith("\\")
+    return tuple(starts)
+
+
+def _placeholder_line(content: str) -> str:
+    """Return an equal-width Python statement standing in for ``content``."""
+    stripped = content.lstrip(" \t")
+    indent = content[: len(content) - len(stripped)]
+    return f"{indent}0{' ' * (len(stripped) - 1)}"
+
+
+def _neutralize_notebook_syntax(source: str) -> tuple[str, bool]:
+    """Replace IPython-only lines with equal-width Python placeholders.
+
+    Real notebooks open with lines such as ``%matplotlib inline`` that ``ast``
+    rejects, which would otherwise cost the whole cell its imports and
+    definitions. Every rewritten line keeps its exact width and terminator, so
+    each position in the result still names the same position in the notebook
+    and the ranges decoded from it stay truthful. Returns the rewritten source
+    and whether anything was rewritten.
+    """
+    lines = _split_lines(source)
+    contents = tuple(content for content, _ in lines)
+    cell_magic = re.match(_CELL_MAGIC, contents[0])
+    if cell_magic is not None and cell_magic.group(1) not in _PYTHON_BODY_CELL_MAGICS:
+        # The magic claims the rest of the cell, and that body is not Python.
+        return "".join(" " * len(content) + eol for content, eol in lines), True
+    rewritten: list[str] = []
+    changed = False
+    for (content, eol), starts_line in zip(lines, _logical_line_starts(contents), strict=True):
+        if starts_line and any(re.match(pattern, content) for pattern in _IPYTHON_LINES):
+            rewritten.append(_placeholder_line(content) + eol)
+            changed = True
+        else:
+            rewritten.append(content + eol)
+    return "".join(rewritten), changed
+
+
+def _parse_cell_source(
+    source: str,
+) -> tuple[ast.Module | None, str, tuple[str, SyntaxError] | None]:
+    """Parse a code cell, neutralizing notebook syntax when plain Python fails.
+
+    Returns the module, the source it was parsed from — geometrically identical
+    to ``source`` — and a ``(code, error)`` pair when it never parsed. A cell
+    that holds notebook syntax reports a different code than a cell whose
+    Python is simply wrong.
+    """
+    try:
+        return ast.parse(source), source, None
+    except SyntaxError as python_error:
+        neutralized, rewritten = _neutralize_notebook_syntax(source)
+        if not rewritten:
+            return None, source, ("syntax-error", python_error)
+        try:
+            return ast.parse(neutralized), neutralized, None
+        except SyntaxError as exc:
+            return None, neutralized, ("notebook-non-python-cell", exc)
+
+
+_CELL_PARSE_CODES = ("syntax-error", "notebook-non-python-cell")
+
+
+def _cell_parse_diagnostic(parse_error: tuple[str, SyntaxError] | None) -> tuple[str, str] | None:
+    if parse_error is None:
+        return None
+    code, error = parse_error
+    if code == "syntax-error":
+        return code, error.msg
+    return code, f"cell is not Python after neutralizing notebook syntax: {error.msg}"
+
+
 def _extract_code_imports_and_defs(
     source: str,
 ) -> tuple[
     tuple[NotebookImportPayload, ...],
     tuple[NotebookDefinitionPayload, ...],
-    str | None,
+    tuple[str, str] | None,
 ]:
-    try:
-        tree = ast.parse(source)
-    except SyntaxError as exc:
-        return (), (), exc.msg
+    tree, _parsed_source, parse_error = _parse_cell_source(source)
     imports: list[NotebookImportPayload] = []
     defs: list[NotebookDefinitionPayload] = []
-    for node in tree.body:
+    for node in tree.body if tree is not None else ():
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imports.append((alias.name, "import", node.lineno))
@@ -172,7 +327,7 @@ def _extract_code_imports_and_defs(
             defs.append((node.name, "function", node.lineno))
         elif isinstance(node, ast.ClassDef):
             defs.append((node.name, "class", node.lineno))
-    return tuple(imports), tuple(defs), None
+    return tuple(imports), tuple(defs), _cell_parse_diagnostic(parse_error)
 
 
 def _try_parse_notebook(text: str) -> dict[str, Any] | None:
@@ -295,9 +450,10 @@ def notebook_diagnostics_payload(db: Database, path: str) -> tuple[NotebookDiagn
         cell_type = _classify_cell_type(raw_cell.get("cell_type"))
         if cell_type == "code":
             source = _coerce_source(raw_cell.get("source"))
-            _, _, err = _extract_code_imports_and_defs(source)
-            if err is not None:
-                diagnostics.append(("syntax-error", err, index))
+            _, _, diagnostic = _extract_code_imports_and_defs(source)
+            if diagnostic is not None:
+                code, message = diagnostic
+                diagnostics.append((code, message, index))
     return tuple(diagnostics)
 
 
@@ -357,11 +513,12 @@ def _definition_name_range(
 def _cell_ranges(
     source: str,
 ) -> tuple[dict[int, SourceRange], dict[tuple[int, str], SourceRange]]:
-    document = DocumentMap(source)
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
+    tree, parsed_source, _parse_error = _parse_cell_source(source)
+    if tree is None:
         return {}, {}
+    # Neutralization preserves every line and column, so ranges taken from the
+    # parsed source still name notebook positions.
+    document = DocumentMap(parsed_source)
     imports: dict[int, SourceRange] = {}
     definitions: dict[tuple[int, str], SourceRange] = {}
     for node in tree.body:
@@ -400,20 +557,20 @@ def _decode_cell(payload: NotebookCellPayload) -> NotebookCell:
 
 
 def _syntax_error_range(source: str) -> SourceRange | None:
-    try:
-        ast.parse(source)
-    except SyntaxError as exc:
-        if exc.lineno is None:
-            return None
-        start = SourcePosition(max(exc.lineno - 1, 0), max((exc.offset or 1) - 1, 0))
-        end = SourcePosition(
-            max((exc.end_lineno or exc.lineno) - 1, 0),
-            max((exc.end_offset or exc.offset or 1) - 1, 0),
-        )
-        if end <= start:
-            end = SourcePosition(start.line, start.character + 1)
-        return SourceRange(start, end)
-    return None
+    _tree, _parsed_source, parse_error = _parse_cell_source(source)
+    if parse_error is None:
+        return None
+    _code, exc = parse_error
+    if exc.lineno is None:
+        return None
+    start = SourcePosition(max(exc.lineno - 1, 0), max((exc.offset or 1) - 1, 0))
+    end = SourcePosition(
+        max((exc.end_lineno or exc.lineno) - 1, 0),
+        max((exc.end_offset or exc.offset or 1) - 1, 0),
+    )
+    if end <= start:
+        end = SourcePosition(start.line, start.character + 1)
+    return SourceRange(start, end)
 
 
 def _decode_diagnostic(
@@ -423,7 +580,7 @@ def _decode_diagnostic(
 ) -> NotebookDiagnostic:
     code, message, cell_index = payload
     source_range: SourceRange | None = None
-    if code == "syntax-error" and cell_index is not None:
+    if code in _CELL_PARSE_CODES and cell_index is not None:
         cell = next((item for item in cells if item.index == cell_index), None)
         if cell is not None:
             source_range = _syntax_error_range(cell.source)

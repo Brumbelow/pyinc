@@ -188,10 +188,15 @@ class NodeRecord:
     probe: Any = None
     checked_in_request: int = -1
     checkpoint_loaded: bool = False
+    failure: str | None = None
 
     @property
     def is_untracked(self) -> bool:
         return bool(self.untracked_reasons)
+
+    @property
+    def is_failed(self) -> bool:
+        return self.failure is not None
 
 
 @dataclass
@@ -982,6 +987,11 @@ class Database:
             key
             for key, record in self._records.items()
             if key.kind in ("query", "resource")
+            # A failure record has no value to persist, and a reader that handled
+            # the failure is only reproducible while the load keeps failing. Both
+            # are omitted -- the dep-closure below drops every parent too -- so a
+            # checkpoint never warms a result derived from an absent value.
+            and not record.is_failed
             and not self._record_is_stale_for_save(record)
             and (
                 key.args_digest in self._checkpoint_snapshot_cache
@@ -1953,7 +1963,12 @@ class Database:
                 self._record_dependency(key)
                 result = self._expose_boundary_snapshot(self._records[key].snapshot)
             except Exception:
-                if key not in self._records:
+                # A load that raised is still an observation: when it left a
+                # failure record behind, the reader depends on it exactly as it
+                # would on a value, so the edge is recorded before unwinding.
+                if key in self._records:
+                    self._record_dependency(key)
+                else:
                     self._resource_objects().pop(key, None)
                 raise
         self._dispatch_events(pending)
@@ -2160,7 +2175,15 @@ class Database:
             if resource_pair is None:
                 return True
             resource, parameter = resource_pair
-            self._refresh_resource(resource, parameter, key)
+            try:
+                self._refresh_resource(resource, parameter, key)
+            except Exception:
+                # A refresh that raises must not escape a dependent's
+                # verification pass: with a failure record the probe comparison
+                # below decides, and the dependent re-reads inside its own body
+                # where its own handler can see the exception.
+                if key not in self._records:
+                    return True
         return self._records[key].is_untracked or self._records[key].changed_at > revision
 
     def _verify_checkpoint_loaded_record(self, record: NodeRecord) -> bool:
@@ -2180,18 +2203,33 @@ class Database:
     def _refresh_resource(self, resource: Any, parameter: Any, key: NodeKey) -> None:
         record = self._records.get(key)
         current_request = self._current_request_id()
-        if record is not None and record.checked_in_request == current_request:
+        # A failure record holds no value, so it is never settled for a request:
+        # every read has to re-run the load and raise again.
+        if (
+            record is not None
+            and not record.is_failed
+            and record.checked_in_request == current_request
+        ):
             return
         atomic = callable(getattr(resource, "probe_and_load", None))
         if atomic:
-            with self._allow_raw_reads_scope():
-                probe, loaded_value = resource.probe_and_load(self, parameter)
+            try:
+                with self._allow_raw_reads_scope():
+                    probe, loaded_value = resource.probe_and_load(self, parameter)
+            except Exception as exc:
+                self._record_resource_failure(
+                    key, record, self._observe_failure_probe(resource, parameter), exc
+                )
+                raise
         else:
             with self._allow_raw_reads_scope():
                 probe = resource.probe(parameter)
             loaded_value = None
         probe_snapshot = freeze(probe, adapters=self._adapters)
-        if record is not None and record.probe == probe_snapshot:
+        # A failure record must never take the probe-hit early exit as if it had
+        # a value. Re-running the load on an unchanged failing probe is cheap and
+        # yields a genuine live exception instead of a reconstructed one.
+        if record is not None and not record.is_failed and record.probe == probe_snapshot:
             record.verified_at = self._revision
             record.last_decision = "reused"
             record.reason = "resource probe unchanged"
@@ -2234,8 +2272,12 @@ class Database:
                     self._stats["resource_probe_hits"] += 1
                     return
         if not atomic:
-            with self._allow_raw_reads_scope():
-                loaded_value = resource.load(self, parameter)
+            try:
+                with self._allow_raw_reads_scope():
+                    loaded_value = resource.load(self, parameter)
+            except Exception as exc:
+                self._record_resource_failure(key, record, probe_snapshot, exc)
+                raise
         snapshot = self._freeze_value(loaded_value)
         digest = fingerprint_snapshot(snapshot)
         if record is None:
@@ -2269,6 +2311,67 @@ class Database:
         self._stats["resource_loads"] += 1
         record.probe = probe_snapshot
         record.checked_in_request = current_request
+        record.failure = None
+
+    def _observe_failure_probe(self, resource: Any, parameter: Any) -> Any:
+        """Frozen probe observed alongside a load that raised.
+
+        Returns ``_MISSING_SNAPSHOT`` when the probe itself cannot be observed: a
+        resource that cannot even be probed models its failures partially and is
+        outside the contract, so it gets no record at all.
+        """
+        try:
+            with self._allow_raw_reads_scope():
+                return freeze(resource.probe(parameter), adapters=self._adapters)
+        except Exception:
+            return _MISSING_SNAPSHOT
+
+    def _record_resource_failure(
+        self, key: NodeKey, record: NodeRecord | None, probe_snapshot: Any, exc: BaseException
+    ) -> None:
+        """Record that this resource's load raised, carrying the observed probe.
+
+        A failed load is an observation, not the absence of one, so the node keeps
+        a record and the ordinary probe comparison decides when dependents must
+        re-run. The changed_at discipline matches the success path: an unchanged
+        failing probe keeps dependents green, while a changed probe or a
+        transition between success and failure bumps the revision.
+        """
+        if probe_snapshot is _MISSING_SNAPSHOT:
+            return
+        failure = f"{type(exc).__name__}: {exc}"
+        if record is None:
+            changed_at = self._revision
+        elif record.is_failed and record.probe == probe_snapshot:
+            changed_at = record.changed_at
+        else:
+            self._revision += 1
+            changed_at = self._revision
+        if record is None:
+            self._records[key] = NodeRecord(
+                key=key,
+                label=key.label,
+                snapshot=None,
+                digest="",
+                changed_at=changed_at,
+                verified_at=self._revision,
+                last_decision="failed",
+                last_recompute="failed",
+                reason=f"resource load failed: {failure}",
+                probe=probe_snapshot,
+                failure=failure,
+            )
+            return
+        record.snapshot = None
+        record.digest = ""
+        record.changed_at = changed_at
+        record.verified_at = self._revision
+        record.last_decision = "failed"
+        record.last_recompute = "failed"
+        record.reason = f"resource load failed: {failure}"
+        record.probe = probe_snapshot
+        record.checked_in_request = -1
+        record.failure = failure
 
     def _query_key(
         self, query: Any, args: tuple[Any, ...], kwargs: dict[str, Any]

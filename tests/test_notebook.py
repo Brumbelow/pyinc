@@ -189,6 +189,209 @@ def test_notebook_records_per_cell_syntax_error(tmp_path: Path) -> None:
     assert diag.range.start.line == 0
 
 
+def test_notebook_line_magic_keeps_the_rest_of_the_cell(tmp_path: Path) -> None:
+    nb = _notebook(
+        [
+            {
+                "cell_type": "code",
+                "source": (
+                    "%matplotlib inline\n"
+                    "import os\n"
+                    "from pathlib import Path\n"
+                    "\n"
+                    "def load():\n"
+                    "    return Path(os.curdir)\n"
+                    "\n"
+                    "class Loader:\n"
+                    "    pass\n"
+                ),
+            }
+        ]
+    )
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(path, nb)
+
+    result = notebook_analysis(Database(), str(path))
+    cell = result.cells[0]
+
+    assert result.diagnostics == ()
+    assert tuple((i.module, i.kind, i.range.start.line) for i in cell.imports) == (
+        ("os", "import", 1),
+        ("pathlib", "from", 2),
+    )
+    assert tuple((d.name, d.kind, d.range.start.line) for d in cell.definitions) == (
+        ("load", "function", 4),
+        ("Loader", "class", 7),
+    )
+
+
+def test_notebook_definition_range_survives_neutralization(tmp_path: Path) -> None:
+    source = (
+        "%matplotlib inline\n"
+        "import pandas as pd\n"
+        "\n"
+        "def load(path):\n"
+        "    return pd.read_csv(path)\n"
+    )
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(path, _notebook([{"cell_type": "code", "source": source}]))
+
+    cell = notebook_analysis(Database(), str(path)).cells[0]
+    definition = cell.definitions[0]
+    import_range = cell.imports[0].range
+
+    # The placeholder is exactly as wide as the magic it replaced, so every
+    # reported range still names its notebook line and column.
+    assert (definition.range.start.line, definition.range.start.character) == (3, 4)
+    assert (definition.range.end.line, definition.range.end.character) == (3, 8)
+    assert cell.source.splitlines()[3][4:8] == "load"
+    assert (import_range.start.line, import_range.start.character) == (1, 0)
+    assert (import_range.end.line, import_range.end.character) == (1, 19)
+
+
+def test_notebook_cell_magic_suppresses_the_rest_of_the_cell(tmp_path: Path) -> None:
+    source = "%%bash\nimport os\ndef install():\n    pass\n"
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(
+        path,
+        _notebook(
+            [
+                {"cell_type": "code", "source": source},
+                {"cell_type": "code", "source": "import json\n"},
+            ]
+        ),
+    )
+
+    result = notebook_analysis(Database(), str(path))
+
+    assert result.diagnostics == ()
+    assert result.cells[0].source == source
+    assert result.cells[0].imports == ()
+    assert result.cells[0].definitions == ()
+    # The suppression is scoped to its own cell.
+    assert tuple(i.module for i in result.cells[1].imports) == ("json",)
+
+
+def test_notebook_python_bodied_cell_magic_keeps_its_body(tmp_path: Path) -> None:
+    nb = _notebook(
+        [
+            {
+                "cell_type": "code",
+                "source": "%%capture\nimport os\n\ndef timed():\n    return os.getpid()\n",
+            }
+        ]
+    )
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(path, nb)
+
+    cell = notebook_analysis(Database(), str(path)).cells[0]
+    assert tuple((i.module, i.range.start.line) for i in cell.imports) == (("os", 1),)
+    assert tuple((d.name, d.range.start.line) for d in cell.definitions) == (("timed", 3),)
+
+
+def test_notebook_shell_escape_and_help_lines_are_neutralized(tmp_path: Path) -> None:
+    nb = _notebook(
+        [
+            {
+                "cell_type": "code",
+                "source": (
+                    "!pip install pandas\n"
+                    "import pandas\n"
+                    "?pandas\n"
+                    "pandas.read_csv?\n"
+                    "pandas.read_csv??\n"
+                    "listing = !ls -la\n"
+                    "\n"
+                    "def frame():\n"
+                    "    return pandas.DataFrame()\n"
+                ),
+            }
+        ]
+    )
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(path, nb)
+
+    result = notebook_analysis(Database(), str(path))
+    cell = result.cells[0]
+    assert result.diagnostics == ()
+    assert tuple((i.module, i.range.start.line) for i in cell.imports) == (("pandas", 1),)
+    assert tuple((d.name, d.range.start.line) for d in cell.definitions) == (("frame", 7),)
+
+
+def test_notebook_magic_shaped_lines_inside_strings_and_brackets_are_kept(tmp_path: Path) -> None:
+    source = (
+        "%matplotlib inline\n"
+        'BANNER = """\n'
+        '%matplotlib inline"""\n'
+        "\n"
+        "rate = (total\n"
+        "%count)\n"
+        "flag = (left\n"
+        "!= right)\n"
+        "\n"
+        "def report():\n"
+        "    return BANNER, rate, flag\n"
+    )
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(path, _notebook([{"cell_type": "code", "source": source}]))
+
+    result = notebook_analysis(Database(), str(path))
+
+    # Rewriting the string's closing line would leave it unterminated, and
+    # rewriting either continuation line would leave a bracket open; both would
+    # surface here as a diagnostic.
+    assert result.diagnostics == ()
+    assert tuple((d.name, d.range.start.line) for d in result.cells[0].definitions) == (
+        ("report", 9),
+    )
+
+
+def test_notebook_comment_does_not_continue_onto_a_magic_line(tmp_path: Path) -> None:
+    source = "# a backslash in a comment continues nothing \\\n%matplotlib inline\nimport os\n"
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(path, _notebook([{"cell_type": "code", "source": source}]))
+
+    result = notebook_analysis(Database(), str(path))
+    assert result.diagnostics == ()
+    assert tuple((i.module, i.range.start.line) for i in result.cells[0].imports) == (("os", 2),)
+
+
+def test_notebook_reports_a_plain_syntax_error_with_its_position(tmp_path: Path) -> None:
+    source = "import os\n\ndef broken(:\n    pass\n"
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(path, _notebook([{"cell_type": "code", "source": source}]))
+
+    result = notebook_analysis(Database(), str(path))
+    assert len(result.diagnostics) == 1
+    diag = result.diagnostics[0]
+    assert diag.code == "syntax-error"
+    assert diag.cell_index == 0
+    assert diag.range is not None
+    assert diag.range.start.line == 2
+    broken_line = source.splitlines()[diag.range.start.line]
+    assert broken_line == "def broken(:"
+    assert broken_line[diag.range.start.character] in "(:"
+
+
+def test_notebook_non_python_cell_is_distinguishable_from_a_syntax_error(tmp_path: Path) -> None:
+    source = "%matplotlib inline\nimport os\n\ndef broken(:\n    pass\n"
+    path = tmp_path / "nb.ipynb"
+    _write_notebook(path, _notebook([{"cell_type": "code", "source": source}]))
+
+    result = notebook_analysis(Database(), str(path))
+    assert len(result.diagnostics) == 1
+    diag = result.diagnostics[0]
+    assert diag.code == "notebook-non-python-cell"
+    assert "invalid syntax" in diag.message
+    assert diag.cell_index == 0
+    assert diag.range is not None
+    assert diag.range.start.line == 3
+    broken_line = source.splitlines()[diag.range.start.line]
+    assert broken_line == "def broken(:"
+    assert broken_line[diag.range.start.character] in "(:"
+    assert result.cells[0].imports == ()
+
+
 def test_notebook_decode_error(tmp_path: Path) -> None:
     path = tmp_path / "broken.ipynb"
     path.write_text("{not json", encoding="utf-8")

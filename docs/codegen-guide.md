@@ -44,11 +44,11 @@ For each definition `D` (under `$defs` or legacy `definitions`):
 - `__init__.py` — re-exports every model (owned by the aggregate index)
 
 A definition rendered as an `object` becomes a frozen `@dataclass`; an `enum`
-becomes a `typing.Literal` alias; a top-level `$ref`/primitive becomes a type
-alias. Model references use deferred annotations and imports guarded by
-`TYPE_CHECKING`; aliases store their type expression as a forward-reference
-string. Mutually recursive models and aliases therefore compile and import on
-every supported Python version.
+becomes a `typing.Literal` alias; a top-level `$ref`/primitive, `const`, or
+combinator becomes a type alias. Model references use deferred annotations and
+imports guarded by `TYPE_CHECKING`; aliases store their type expression as a
+forward-reference string. Mutually recursive models and aliases therefore
+compile and import on every supported Python version.
 
 ## Supported subset
 
@@ -56,13 +56,21 @@ every supported Python version.
 - local `$ref` (`#/$defs/X`, `#/definitions/X`)
 - object `properties`, `required` vs optional
 - arrays (`items`), primitives (`string`/`integer`/`number`/`boolean`/`null`)
-- `enum`
+- `enum` and `const`, rendered as `typing.Literal` (see [Literal
+  types](#literal-types))
 - nullable unions (`type: ["X", "null"]`)
+- schema-valued `additionalProperties` in property position, compiled to
+  `dict[str, T]` (see [Mappings and object models](#mappings-and-object-models))
+- single-branch `allOf` and nullable `anyOf` (see [Nullable and single-branch
+  references](#nullable-and-single-branch-references))
 - `description` (rendered for definitions and properties; accepted as an
   annotation on nested schema nodes)
+- annotation- and validation-only keywords, accepted with an
+  `ignored-constraint` warning (see [Ignored keywords](#ignored-keywords))
 - deterministic error diagnostics for malformed schema shapes, remote or
-  unresolved `$ref`, schema combinators and conditionals, unsupported unions,
-  invalid enum members, and names that cannot be emitted safely
+  unresolved `$ref`, unsupported combinators and conditionals, unsupported
+  unions, invalid `enum`/`const` members, and names that cannot be emitted
+  safely
 - portable module collision checks after Unicode normalization, snake-case
   conversion, and case folding
 
@@ -77,32 +85,136 @@ itself be a non-keyword Python identifier and may not be a Windows-reserved
 device name, so names such as `Class` and `CON` fail analysis instead of
 producing an unimportable or non-portable package.
 
-Unsupported combinators, conditionals, and direct model keywords on the
-document root are errors too. Models must live in `$defs` or `definitions`;
-root metadata such as `$schema`, `$id`, `title`, and `description` remains
-accepted. An unsupported root cannot be mistaken for an empty desired model
-set, so the validation boundary described in [Usage](#usage) applies.
+Combinators and conditionals on the document root are errors, each reported at
+its own keyword; the two supported combinator spellings are compiled inside
+definitions only, because the root declares no model. Any other schema keyword at the document root
+produces exactly one `unsupported-root-schema` error, pointed at the whole
+document (`json_pointer == ""`) and naming the rule it violates: **models must
+be declared under `$defs` or `definitions`**, because the root is metadata-only
+and its schema keywords describe no model. Root metadata such as `$schema`,
+`$id`, `title`, and `description` remains accepted. An unsupported root cannot
+be mistaken for an empty desired model set, so the validation boundary
+described in [Usage](#usage) applies.
 
 The accepted non-semantic metadata policy is deliberately narrow. `title` and
 `$comment` are accepted as string annotations on schema nodes and ignored by
-generation. At the document root, `$schema` and `$id` are also accepted as
-string metadata and ignored: they do not select a dialect, change reference
-resolution, or enable remote references. Nested `description` values are
-accepted but only definition and property descriptions are emitted into the
-generated documentation. Every other keyword outside the supported subset is
-an error, including validation-only constraints such as `format`, `minimum`,
-`additionalProperties`, and `minItems`.
+generation, silently — they are documentation, not constraints. At the document
+root, `$schema` and `$id` are also accepted as string metadata and ignored:
+they do not select a dialect, change reference resolution, or enable remote
+references. Nested `description` values are accepted but only definition and
+property descriptions are emitted into the generated documentation.
+
+### Literal types
+
+`const` and `enum` name a closed set of values, so they compile to
+`typing.Literal`:
+
+| Schema node | Emitted type |
+| --- | --- |
+| `{"const": "user"}` | `Literal['user']` |
+| `{"enum": ["red", "green"]}` | `Literal['red', 'green']` |
+| `{"enum": ["on", null]}` | `Literal['on', None]` (already nullable) |
+
+A definition whose body is an `enum` becomes a `Literal` type alias, as before.
+In property, array-item, mapping-value, and combinator-branch position both
+keywords render inline; the member checks that were always performed — at least
+one member, no duplicates, supported member type, agreement with a declared
+`type` — are reported against the same node and still block generation.
+
+Members must be strings, integers, booleans, or `null`. PEP 586 does not allow
+a `float` in a `Literal`, so `{"const": 1.5}` is an `unsupported-const-value`
+error and a float `enum` member is an `unsupported-enum-value` error. A member
+that contradicts a declared `type` is a `const-type-mismatch` or
+`enum-type-mismatch` error. `Literal` is imported into a generated module only
+when that module's rendered types actually use it.
+
+### Mappings and object models
+
+`additionalProperties` is compiled where it can be expressed as a type. In
+**property** position an object node with a schema-valued `additionalProperties`
+becomes `dict[str, T]`, recursively: `$ref`, array, and nested-mapping values
+all work, and a referenced definition joins the model's reference graph. An
+object property without it stays `dict[str, object]`.
+
+In **definition** position an object generates a frozen `@dataclass` whose
+fields are its `properties`, and a dataclass cannot carry free-form entries.
+Schema-valued `additionalProperties` therefore remains an
+`unsupported-construct` error there. A definition that declares `type: object`
+with no `properties` at all is accepted, but records a non-blocking
+`unconstrained-object-model` warning: it generates a model with no fields, so a
+`$ref` to it types instance data away. Compiling either case into a
+`dict[str, T]` alias would change what already-generated definitions emit and
+what downstream code imports, so that is a major-version decision rather than
+part of this subset.
+
+### Nullable and single-branch references
+
+The subset cannot otherwise express an *optional reference* to another model —
+a JSON-Schema `type` union carries type names, not a `$ref` — so the two
+idiomatic spellings that name exactly one type are compiled:
+
+- `{"allOf": [S]}` renders as whatever `S` renders as
+- `{"anyOf": [S, {"type": "null"}]}` renders as `S` made optional, in either
+  branch order (and is not made optional twice if `S` is already nullable)
+
+The null branch must be exactly `{"type": "null"}`, apart from annotations.
+Everything else remains an `unsupported-construct` error reported at the
+keyword: a multi-branch `allOf`, an `anyOf` that is not one schema plus
+`{"type": "null"}`, and `oneOf` in every shape. General unions are out of
+scope — the compiler has no rule for choosing one Python type for them.
+
+### Ignored keywords
+
+Annotation- and validation-only keywords are accepted wherever a schema node is
+accepted, including beside `$ref` and `enum`. They never change the emitted
+type, so each one records a **non-blocking `ignored-constraint` warning** that
+names the keyword and points at it. Generation proceeds; the warning is
+rendered into the definition's `docs/<x>.md` alongside the model.
+
+| Keyword | Accepted value shape |
+| --- | --- |
+| `format`, `pattern` | a string |
+| `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum` | a number |
+| `multipleOf` | a number greater than zero |
+| `minLength`, `maxLength`, `minItems`, `maxItems` | a non-negative integer |
+| `uniqueItems`, `deprecated`, `readOnly`, `writeOnly` | a boolean |
+| `additionalProperties` | a boolean (`false` or `true`) |
+| `examples` | an array |
+| `default` | any JSON value |
+
+The value shape is still validated: a malformed value (`"minItems": -1`,
+`"format": 7`, `"multipleOf": 0`) is an `invalid-constraint` **error** that
+blocks generation, because a schema that cannot be read cannot be honoured
+silently either. A *boolean* `additionalProperties` is unenforceable by a
+dataclass or a mapping and is merely ignored; a *schema* value is compiled or
+rejected per [Mappings and object models](#mappings-and-object-models). Nothing
+in this table changes a field's Python type — in particular a JSON `default`
+does not become a dataclass default; optional fields default to `None`.
+
+Every keyword outside both the supported subset and this table remains an
+error, including `patternProperties`, `prefixItems`, `unevaluatedProperties`,
+`not`, `oneOf`, and conditionals.
 
 **Fallback policy.** The supported subset never silently guesses. An explicitly
 unconstrained schema is represented as `object` with a non-blocking
 `unconstrained-schema` warning; an array without `items` similarly uses
-`list[object]` with a warning. Unsupported constructs and invalid data are
-errors. Empty enums render internally as `Never` so inspection output remains
-valid Python, but their `empty-enum` error prevents reconciliation.
+`list[object]` with an `unconstrained-array-items` warning — but not when
+`prefixItems` is present, because the items are constrained there and that
+keyword is reported where it appears. Unsupported constructs and invalid data
+are errors. The draft-07 tuple form of `items` (an array of positional schemas)
+is a valid schema node, so it is reported as `unsupported-tuple-items` rather
+than as a malformed node. An `enum` definition with no usable members renders
+internally as `Never`, and an unusable inline `enum` or `const` falls back to
+`object`, so inspection output remains valid Python — but the `empty-enum`,
+`unsupported-enum-value`, and `unsupported-const-value` errors prevent
+reconciliation.
 
-Out of scope for v3: remote/HTTP `$ref`, combinators, conditional schemas
-(`if`/`then`/`else`), `patternProperties`, validation constraints, and code
-*validation* (the compiler emits models; it does not validate instances).
+Out of scope for v3: remote/HTTP `$ref`, general combinators (anything beyond
+the two spellings in [Nullable and single-branch
+references](#nullable-and-single-branch-references)), conditional schemas
+(`if`/`then`/`else`), `patternProperties`, positional (tuple) array types, and
+code *validation* — the compiler emits models and reports what it ignores; it
+does not validate instances.
 
 ## Incremental behavior
 

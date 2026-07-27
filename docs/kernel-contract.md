@@ -99,17 +99,101 @@ local classes are rejected; define stable implementation types at module scope.
 | Semantic equality for cutoffs | Yes | Yes | Yes |
 | Backdating on equal recomputation | Yes | Yes | Yes |
 
+## Failing Resource Loads
+
+A resource whose `load` (or `probe_and_load`) raises is an **observation**, not
+the absence of one. The kernel stores a *failure record* for that resource node,
+carrying the probe observed alongside the failure, and lets the ordinary
+probe-comparison machinery drive invalidation:
+
+- The reading query records its dependency edge on the failing resource before
+  the exception propagates, so a later `get()` re-checks that node instead of
+  treating the reader as dependency-free.
+- The exception surfaces **inside the query body**, where the query's own
+  `try`/`except` can see it. A refresh that raises while a dependent is being
+  verified never escapes `get()`.
+- An unchanged failing probe does not move the revision, so a query that handled
+  the failure stays green across repeated requests. A changed probe — or a
+  transition between success and failure in either direction — invalidates the
+  readers.
+- A failure record never satisfies a read: the load is re-run (yielding a live
+  exception) rather than a stored one being re-raised, and the record is never
+  treated as settled for the remainder of a request.
+- Behaviour is identical in `strict`, `checked`, and `fast`.
+
+Optional external state is therefore from-scratch consistent: a query that
+returns a default when a file is missing returns the file's contents once it
+appears, and the default again once it is removed, matching a fresh `Database`
+at every step.
+(See: `test_appearing_resource_invalidates_the_query_that_handled_its_absence`,
+`test_disappearing_resource_raises_inside_the_query_body`,
+`test_optional_resource_queries_match_fresh_recomputation`)
+
+Two boundaries apply:
+
+- **The probe must be total.** This rests on `probe()` modelling failure instead
+  of raising — `FileResource.probe` returns `("missing",)` for an absent file. A
+  resource whose `probe` *also* raises is outside the contract: nothing is
+  recorded, the exception propagates unchanged, and a query that catches it is
+  cached as if it had no dependency at all. The probe contract extends to
+  failures for the same reason it covers values: a resource whose `load` can
+  raise *different* exceptions for one probe value must fold that distinction
+  into the probe. Invalidation compares probes only, never exception messages,
+  which are frequently nondeterministic.
+  (See: `test_failed_resource_loads_are_recorded_only_when_the_probe_is_total`)
+- **Failures are not checkpointed.** A failure record holds no value, and a
+  reader that handled a failure is only reproducible while the load keeps
+  failing. The failure record and every record that transitively depends on it
+  are omitted from a checkpoint, so they re-execute against live state after
+  `load_checkpoint`.
+  (See: `test_checkpoints_omit_failed_resource_records_and_their_readers`)
+
+`inspect()` and `explain()` show the failure node with decision `failed` and a
+reason naming the exception; it counts in `DatabaseStatistics.resource_count`
+like any other resource node. A load that raised is not counted as a
+`resource_load`, and re-running a load on an unchanged failing probe is not
+counted as a `resource_probe_hit`.
+
 ## Explicit Limitations
 
 These fall **outside** the soundness envelope. The kernel does not guarantee
 from-scratch consistency when any of these apply.
 
 **1. Unintercepted ambient reads.**
+The condition 2 guard covers an enumerated set of entry points, not a category of
+behaviour. Everything else that observes external state bypasses it and silently
+violates condition 2 unless declared via `db.report_untracked_read(reason)`:
 `os.open()` (the low-level syscall), C-extension I/O, subprocess output, network
-calls, `ctypes` memory access, and similar are not intercepted. These bypass the
-guard and silently violate condition 2 unless declared via
-`db.report_untracked_read()`.
-(See: `test_os_open_bypasses_untracked_read_guard`)
+calls, `ctypes` memory access, and similar.
+(See: `test_os_open_bypasses_untracked_read_guard`,
+`test_condition_two_entry_points_stay_guarded`)
+
+Three of those gaps sit close enough to the guarded set to be named individually.
+
+- **File metadata.** The guard sees file *contents* and directory *listings*; it
+  does not see `stat`. `os.stat`, `os.lstat`, `os.access`, `Path.stat`,
+  `Path.exists`, `Path.is_file`, `Path.is_dir`, `Path.resolve`, and the
+  `os.path` helpers built on them (`exists`, `isfile`, `getsize`, `getmtime`)
+  each reach the live filesystem from inside a query and return normally. A
+  query that asks whether a file exists, or how large or how recently modified
+  it is, rather than opening it, is therefore silently untracked: no dependency
+  edge is recorded, so the query is reused unchanged after that file appears,
+  disappears, or is rewritten, while a fresh `Database` reports the new state.
+  Route the observation through `FileStatResource`, whose probe covers
+  existence, size, and mtime, or declare it with
+  `db.report_untracked_read(reason)`.
+  (See: `test_file_metadata_reads_bypass_untracked_read_guard`,
+  `test_stat_only_query_is_never_invalidated_by_the_file_it_stats`,
+  `test_report_untracked_read_restores_consistency_for_a_stat_only_query`,
+  `test_file_stat_resource_tracks_metadata_changes`)
+- **The byte-oriented environment.** `os.getenv` and `os.environ` are
+  intercepted; `os.getenvb` and `os.environb` — the same process environment
+  under a second name where `os.supports_bytes_environ` holds — are not.
+  (See: `test_byte_environment_views_bypass_untracked_read_guard`)
+- **The working directory.** `os.getcwd` and `Path.cwd` are not intercepted, so
+  a query whose result varies with the process working directory is untracked.
+  Pass absolute paths as query arguments instead.
+  (See: `test_working_directory_reads_bypass_untracked_read_guard`)
 
 **2. Custom `eq=`/`cutoff=` with side effects.**
 If `eq=` or `cutoff=` callbacks perform ambient reads or mutations, the
