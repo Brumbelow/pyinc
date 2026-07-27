@@ -69,6 +69,16 @@ def _outcome(call: Callable[[], Any]) -> tuple[Any, ...]:
         return (type(exc).__name__, str(exc))
 
 
+# Opening a directory as a file raises IsADirectoryError on POSIX, and
+# PermissionError (Win32 ERROR_ACCESS_DENIED) on Windows. Listing a file as a
+# directory raises NotADirectoryError on both, so only this direction needs the
+# split. The kernel treats any raise from a resource the same way; the tests
+# name the exact type so a scenario that stops failing cannot pass silently.
+DIRECTORY_AS_FILE_ERROR: type[OSError] = (
+    PermissionError if os.name == "nt" else IsADirectoryError
+)
+
+
 @pytest.mark.parametrize("limit", [0, -1, 1.5, float("nan"), True, "1"])
 def test_max_query_nodes_must_be_a_positive_integer(limit: object) -> None:
     with pytest.raises(ValueError, match="positive integer"):
@@ -743,7 +753,7 @@ def test_file_replaced_by_a_directory_matches_a_fresh_database(mode: str, tmp_pa
     # written; the record describing the file that used to be there must not be
     # allowed to report "unchanged" and hand back a value fresh cannot produce.
     fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
-    assert fresh[0] == "IsADirectoryError"
+    assert fresh[0] == DIRECTORY_AS_FILE_ERROR.__name__
     assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
 
 
@@ -826,7 +836,7 @@ def test_missing_file_replaced_by_a_directory_matches_a_fresh_database(
     # record does: once the path is a directory, neither load nor probe survives.
     path.mkdir()
     fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
-    assert fresh[0] == "IsADirectoryError"
+    assert fresh[0] == DIRECTORY_AS_FILE_ERROR.__name__
     assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
 
 
@@ -843,7 +853,7 @@ def test_handled_unrecordable_failure_invalidates_a_transitive_reader(
     def reader(db: Database, filename: str) -> str:
         try:
             return files.read(db, filename)
-        except IsADirectoryError:
+        except DIRECTORY_AS_FILE_ERROR:
             return "<isdir>"
 
     @query
@@ -888,7 +898,7 @@ def test_handled_unrecordable_failure_propagates_more_than_one_hop(
     def leaf(db: Database, filename: str) -> str:
         try:
             return files.read(db, filename)
-        except IsADirectoryError:
+        except DIRECTORY_AS_FILE_ERROR:
             return "<isdir>"
 
     @query
@@ -931,7 +941,7 @@ def test_permanently_unrecordable_failure_settles_the_revision(
     def reader(db: Database, filename: str) -> str:
         try:
             return files.read(db, filename)
-        except IsADirectoryError:
+        except DIRECTORY_AS_FILE_ERROR:
             return "<isdir>"
 
     @query
@@ -981,7 +991,7 @@ def test_module_replaced_by_a_package_matches_a_fresh_database(tmp_path: Path) -
     path.mkdir()
     (path / "__init__.py").write_text("import os\n", encoding="utf-8")
     fresh = _outcome(lambda: python_source.file_analysis(Database(), str(path)))
-    assert fresh[0] == "IsADirectoryError"
+    assert fresh[0] == DIRECTORY_AS_FILE_ERROR.__name__
     assert _outcome(lambda: python_source.file_analysis(db, str(path))) == fresh
 
 
