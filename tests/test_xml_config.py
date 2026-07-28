@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -7,9 +9,14 @@ import pytest
 
 import pyinc.integrations as integrations
 from pyinc import Database
+from pyinc.integrations import xml_config
 from pyinc.integrations.xml_config import (
+    _MAX_XML_DEPTH,
     XmlAnalysis,
     _safe_parse,
+    _try_parse_xml,
+    _walk_elements,
+    _xml_cutoff_token,
     workspace_xml_analysis,
     xml_analysis,
 )
@@ -380,3 +387,213 @@ def test_xml_analysis_matches_fresh_recomputation_with_adversarial_payloads(
         path.write_text(content, encoding="utf-8")
         fresh = Database(mode=mode)
         assert xml_analysis(incremental, str(path)) == xml_analysis(fresh, str(path))
+
+
+# ---------------------------------------------------------------------------
+# Nesting depth
+# ---------------------------------------------------------------------------
+
+
+def _nested_xml(levels: int, tag: str = "level") -> str:
+    """A document `levels + 1` elements deep — `<root>` plus `levels` nestings."""
+    return "<root>" + f"<{tag}>" * levels + "leaf" + f"</{tag}>" * levels + "</root>"
+
+
+def test_safe_parse_stops_at_the_nesting_limit() -> None:
+    with pytest.raises(ET.ParseError) as exc_info:
+        _safe_parse(_nested_xml(_MAX_XML_DEPTH))
+
+    assert str(exc_info.value) == (
+        f"XML nesting exceeds the supported limit of {_MAX_XML_DEPTH} levels"
+    )
+
+
+def test_safe_parse_accepts_a_document_exactly_at_the_nesting_limit() -> None:
+    root = _safe_parse(_nested_xml(_MAX_XML_DEPTH - 1))
+    assert root.tag == "root"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_xml_analysis_diagnoses_runaway_nesting(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "deep.xml"
+    path.write_text(_nested_xml(_MAX_XML_DEPTH + 500), encoding="utf-8")
+
+    db = Database(mode=mode)
+    result = xml_analysis(db, str(path))
+
+    assert result.elements == ()
+    assert result.root_tag == ""
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0][0] == "xml-parse-error"
+
+
+def test_xml_nesting_diagnostic_names_the_limit(tmp_path: Path) -> None:
+    path = tmp_path / "deep.xml"
+    path.write_text(_nested_xml(_MAX_XML_DEPTH), encoding="utf-8")
+
+    result = xml_analysis(Database(), str(path))
+
+    assert result.diagnostics == (
+        (
+            "xml-parse-error",
+            f"XML nesting exceeds the supported limit of {_MAX_XML_DEPTH} levels",
+        ),
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_xml_analysis_walks_a_document_at_the_nesting_cap(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "deep.xml"
+    path.write_text(_nested_xml(_MAX_XML_DEPTH - 1), encoding="utf-8")
+
+    db = Database(mode=mode)
+    result = xml_analysis(db, str(path))
+
+    assert result.diagnostics == ()
+    assert len(result.elements) == _MAX_XML_DEPTH
+    assert result.elements[-1].path.count(".") == _MAX_XML_DEPTH - 1
+
+
+def test_the_element_walk_does_not_consume_the_interpreter_recursion_budget() -> None:
+    text = _nested_xml(_MAX_XML_DEPTH - 1)
+    walked: list[int] = []
+
+    def _walk() -> None:
+        walked.append(len(_walk_elements(_safe_parse(text), "")))
+
+    # A fresh thread starts at the bottom of its own Python stack, so the lowered
+    # limit is the whole budget the parse and walk get — two orders of magnitude
+    # below the document's own nesting.
+    original = sys.getrecursionlimit()
+    sys.setrecursionlimit(120)
+    try:
+        thread = threading.Thread(target=_walk)
+        thread.start()
+        thread.join()
+    finally:
+        sys.setrecursionlimit(original)
+
+    assert walked == [_MAX_XML_DEPTH]
+
+
+def test_xml_analysis_matches_fresh_recomputation_across_the_nesting_limit(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "shifty.xml"
+
+    steps: tuple[tuple[str, str], ...] = (
+        ("shallow", "<root><child>hi</child></root>"),
+        ("at the limit", _nested_xml(_MAX_XML_DEPTH - 1)),
+        ("past the limit", _nested_xml(_MAX_XML_DEPTH)),
+        ("shallow again", "<root><child>hi</child></root>"),
+    )
+
+    incremental = Database()
+    for _label, content in steps:
+        path.write_text(content, encoding="utf-8")
+        fresh = Database()
+        assert xml_analysis(incremental, str(path)) == xml_analysis(fresh, str(path))
+
+
+def test_a_recursion_error_never_escapes_the_parse_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _exhaust_the_stack(_text: str) -> ET.Element:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(xml_config, "_safe_parse", _exhaust_the_stack)
+
+    assert _try_parse_xml("<root/>") is None
+    assert _xml_cutoff_token("<root/>") == ("raw", "<root/>")
+
+
+def test_stack_exhaustion_diagnostic_does_not_vary_with_the_recursion_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "config.xml"
+    path.write_text("<root/>", encoding="utf-8")
+
+    # CPython names whichever frame ran out of budget, which is a property of the
+    # call site rather than of the file. A cached payload must not carry it.
+    messages = (
+        "maximum recursion depth exceeded",
+        "maximum recursion depth exceeded while calling a Python object",
+        "maximum recursion depth exceeded while getting the str of an object",
+    )
+
+    observed = set()
+    for message in messages:
+
+        def _exhaust_the_stack(_text: str, _message: str = message) -> ET.Element:
+            raise RecursionError(_message)
+
+        monkeypatch.setattr(xml_config, "_safe_parse", _exhaust_the_stack)
+        observed.add(xml_analysis(Database(), str(path)).diagnostics)
+
+    assert observed == {(("xml-parse-error", "XML parsing exhausted the interpreter stack"),)}
+
+
+# ---------------------------------------------------------------------------
+# Amplification budget
+# ---------------------------------------------------------------------------
+
+
+# Every element re-emits the dot path of all its ancestors, so the cached token
+# grows quadratically in nesting depth and linearly in element-name length.
+# `_MAX_XML_DEPTH` is chosen to hold the worst case the budget covers — an element
+# name of `_BUDGETED_NAME_LENGTH` characters at the cap — under this ceiling.
+_CUTOFF_TOKEN_BUDGET = 1024 * 1024
+_BUDGETED_NAME_LENGTH = 20
+
+
+def test_cutoff_token_at_the_cap_stays_within_the_amplification_budget() -> None:
+    tag = "c" * _BUDGETED_NAME_LENGTH
+    kind, token = _xml_cutoff_token(_nested_xml(_MAX_XML_DEPTH - 1, tag=tag))
+
+    assert kind == "parsed"
+    assert len(token) < _CUTOFF_TOKEN_BUDGET
+
+
+def test_element_payload_at_the_cap_stays_within_the_amplification_budget(
+    tmp_path: Path,
+) -> None:
+    tag = "c" * _BUDGETED_NAME_LENGTH
+    path = tmp_path / "deep.xml"
+    path.write_text(_nested_xml(_MAX_XML_DEPTH - 1, tag=tag), encoding="utf-8")
+
+    elements = xml_analysis(Database(), str(path)).elements
+
+    assert len(elements) == _MAX_XML_DEPTH
+    assert sum(len(e.path) for e in elements) < _CUTOFF_TOKEN_BUDGET
+
+
+# ---------------------------------------------------------------------------
+# Payload and cutoff stability
+# ---------------------------------------------------------------------------
+
+
+def test_elements_are_emitted_in_document_pre_order(tmp_path: Path) -> None:
+    path = tmp_path / "tree.xml"
+    path.write_text("<a><b><c/><d/></b><e><f/></e></a>", encoding="utf-8")
+
+    result = xml_analysis(Database(), str(path))
+
+    assert tuple(e.path for e in result.elements) == (
+        "a",
+        "a.b",
+        "a.b.c",
+        "a.b.d",
+        "a.e",
+        "a.e.f",
+    )
+
+
+def test_cutoff_token_is_byte_for_byte_stable() -> None:
+    assert _xml_cutoff_token('<root attr="v"><child>text</child><other/></root>') == (
+        "parsed",
+        "FrozenList(items=("
+        "('root', 'root', '', (('attr', 'v'),), ('child', 'other')), "
+        "('child', 'root.child', 'text', (), ()), "
+        "('other', 'root.other', '', (), ())))",
+    )
+    assert _xml_cutoff_token("<root><unclosed>") == ("raw", "<root><unclosed>")

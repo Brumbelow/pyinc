@@ -140,8 +140,9 @@ ResolvedClassModelPayload: TypeAlias = tuple[
     str,
     tuple[ResolvedClassMemberPayload, ...],
     tuple[str, ...],
+    tuple[str, ...],
 ]
-#   path, qualified_name, members, unresolved_bases
+#   path, qualified_name, members, unresolved_bases, truncated_bases
 
 # ---------------------------------------------------------------------------
 # Result dataclasses (Layer 3 public API)
@@ -238,6 +239,7 @@ class ClassModel:
     qualified_name: str
     members: tuple[ClassMember, ...]
     unresolved_bases: tuple[str, ...]
+    truncated_bases: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +251,8 @@ MAX_FOLLOW_DEPTH = 8
 # Depth bound for base-class following in `resolved_class_model_payload`.
 # Mirrors `MAX_FOLLOW_DEPTH`'s trail/cap idiom: the starting class sits at depth
 # 0, so classes at depths 0..MAX_BASE_DEPTH-1 contribute members and the class
-# reached at depth MAX_BASE_DEPTH (and beyond) is not walked.
+# reached at depth MAX_BASE_DEPTH (and beyond) is not walked. A base stopped by
+# the cap is named in `ClassModel.truncated_bases`, so the loss is observable.
 MAX_BASE_DEPTH = 8
 
 # ---------------------------------------------------------------------------
@@ -1661,23 +1664,46 @@ def resolved_class_model_payload(
 ) -> ResolvedClassModelPayload:
     workspace_files = workspace_python_files(db, root)
     if path not in workspace_files:
-        return (path, qualified_name, tuple(), tuple())
+        return (path, qualified_name, tuple(), tuple(), tuple())
 
     # Flatten the inheritance graph: DEPTH-FIRST, LEFT-TO-RIGHT,
-    # FIRST-DEFINITION-WINS by member name (derived shadows base). This is not
-    # C3 MRO. Cycles are cut by a `(path, class_qname)` visited set, and the
-    # walk is bounded by `MAX_BASE_DEPTH`. Base files are queried one at a time
-    # via `class_models_for_file`, so an edit to one base invalidates per file.
+    # SHALLOWEST-DEFINITION-WINS by member name (derived shadows base), ties at
+    # equal depth going to the earlier arrival. This is not C3 MRO. Cycles are
+    # cut by a `(path, class_qname)` key, and the walk is bounded by
+    # `MAX_BASE_DEPTH`. Base files are queried one at a time via
+    # `class_models_for_file`, so an edit to one base invalidates per file.
+    #
+    # `reached` holds the SHALLOWEST depth each key was walked at, not mere
+    # membership: a class first met near the cap has its own bases cut short, so
+    # a strictly-shallower reach has to walk it again with the larger remaining
+    # budget — otherwise which members survive depends on traversal order. That
+    # depth strictly decreases per revisit, so a key is walked at most
+    # `MAX_BASE_DEPTH` times and a wide diamond cannot revisit exponentially.
+    #
+    # `member_depth` makes the winning DEFINITION depth-canonical the same way:
+    # a revisit can splice a previously-cut ancestor into the walk ahead of a
+    # sibling subtree that overrides it, so arrival order alone would let a base
+    # claim a name over a nearer override. Claims are therefore replaced when a
+    # class reached strictly shallower defines the same name.
     members: dict[str, ResolvedClassMemberPayload] = {}
+    member_depth: dict[str, int] = {}
     unresolved: list[str] = []
     seen_unresolved: set[str] = set()
-    visited: set[tuple[str, str]] = set()
+    reached: dict[tuple[str, str], int] = {}
+    # One resolution per base expression, shared across a key's revisits.
+    base_sites: dict[tuple[str, EncodedBasePayload], tuple[str, str] | None] = {}
+    # Bases that resolved to a workspace class the cap stopped us from walking,
+    # in first-encounter order and paired with the site so a later shallower
+    # reach can retract the report.
+    cut: list[tuple[tuple[str, str], str]] = []
+    seen_cut: set[tuple[tuple[str, str], str]] = set()
 
     def visit(cur_path: str, cur_qname: str, depth: int) -> None:
         key = (cur_path, cur_qname)
-        if key in visited or depth >= MAX_BASE_DEPTH:
+        best = reached.get(key)
+        if best is not None and best <= depth:
             return
-        visited.add(key)
+        reached[key] = depth
         own: tuple[tuple[EncodedBasePayload, ...], tuple[ClassMemberPayload, ...]] | None
         own = None
         for model_qname, bases, own_members in class_models_for_file(db, cur_path):
@@ -1688,28 +1714,54 @@ def resolved_class_model_payload(
             return
         cur_bases, cur_members = own
         for name, kind, lineno, annotation, signature in cur_members:
-            if name not in members:
-                members[name] = (
-                    name,
-                    kind,
-                    lineno,
-                    annotation,
-                    signature,
-                    cur_path,
-                    cur_qname,
-                )
+            claimed = member_depth.get(name)
+            if claimed is not None and claimed <= depth:
+                continue
+            member_depth[name] = depth
+            members[name] = (
+                name,
+                kind,
+                lineno,
+                annotation,
+                signature,
+                cur_path,
+                cur_qname,
+            )
         for base in cur_bases:
-            site = _resolve_base_to_class(db, root, cur_path, base)
+            site_key = (cur_path, base)
+            if site_key not in base_sites:
+                base_sites[site_key] = _resolve_base_to_class(db, root, cur_path, base)
+            site = base_sites[site_key]
             if site is None:
                 text = _base_text(base)
                 if text not in seen_unresolved:
                     seen_unresolved.add(text)
                     unresolved.append(text)
                 continue
+            if depth + 1 >= MAX_BASE_DEPTH:
+                entry = (site, _base_text(base))
+                if entry not in seen_cut:
+                    seen_cut.add(entry)
+                    cut.append(entry)
+                continue
             visit(site[0], site[1], depth + 1)
 
     visit(path, qualified_name, 0)
-    return (path, qualified_name, tuple(members.values()), tuple(unresolved))
+    # A site the cap stopped is only truly lost if no other reach walked it.
+    truncated: list[str] = []
+    seen_truncated: set[str] = set()
+    for site, text in cut:
+        if site in reached or text in seen_truncated:
+            continue
+        seen_truncated.add(text)
+        truncated.append(text)
+    return (
+        path,
+        qualified_name,
+        tuple(members.values()),
+        tuple(unresolved),
+        tuple(truncated),
+    )
 
 
 def _decode_class_member(payload: ResolvedClassMemberPayload) -> ClassMember:
@@ -1734,12 +1786,13 @@ def _decode_class_member(payload: ResolvedClassMemberPayload) -> ClassMember:
 
 
 def _decode_class_model(payload: ResolvedClassModelPayload) -> ClassModel:
-    path, qualified_name, members, unresolved_bases = payload
+    path, qualified_name, members, unresolved_bases, truncated_bases = payload
     return ClassModel(
         path=path,
         qualified_name=qualified_name,
         members=tuple(_decode_class_member(item) for item in members),
         unresolved_bases=unresolved_bases,
+        truncated_bases=truncated_bases,
     )
 
 

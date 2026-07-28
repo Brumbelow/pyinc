@@ -3,6 +3,7 @@ from __future__ import annotations
 import mmap
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -59,6 +60,23 @@ def _find_node(root: InspectionNode, needle: str) -> InspectionNode:
         except LookupError:
             continue
     raise LookupError(needle)
+
+
+def _outcome(call: Callable[[], Any]) -> tuple[Any, ...]:
+    try:
+        return ("value", call())
+    except Exception as exc:
+        return (type(exc).__name__, str(exc))
+
+
+# Opening a directory as a file raises IsADirectoryError on POSIX, and
+# PermissionError (Win32 ERROR_ACCESS_DENIED) on Windows. Listing a file as a
+# directory raises NotADirectoryError on both, so only this direction needs the
+# split. The kernel treats any raise from a resource the same way; the tests
+# name the exact type so a scenario that stops failing cannot pass silently.
+DIRECTORY_AS_FILE_ERROR: type[OSError] = (
+    PermissionError if os.name == "nt" else IsADirectoryError
+)
 
 
 @pytest.mark.parametrize("limit", [0, -1, 1.5, float("nan"), True, "1"])
@@ -604,7 +622,377 @@ def test_failed_resource_reads_do_not_leave_dangling_dependencies(
     assert db.get(classify, str(path)) == "file"
     inspection = _inspect_node(db, classify, str(path))
     assert inspection.last_decision == "executed"
+    # A directory probe of a non-directory raises rather than reporting a state,
+    # so the failure cannot be recorded and no edge is published.
     assert inspection.dependencies == ()
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_appearing_resource_invalidates_the_query_that_handled_its_absence(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+    path = tmp_path / "optional.txt"
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database(mode=mode)
+    assert db.get(read_optional, str(path)) == "<default>"
+    inspection = _inspect_node(db, read_optional, str(path))
+    failed = _find_node(inspection, "file[")
+    assert failed.last_decision == "failed"
+    assert "FileNotFoundError" in failed.reason
+    assert db.statistics().resource_count == 1
+
+    path.write_text("hello", encoding="utf-8")
+    assert db.get(read_optional, str(path)) == Database(mode=mode).get(read_optional, str(path))
+    assert db.get(read_optional, str(path)) == "hello"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_disappearing_resource_raises_inside_the_query_body(mode: str, tmp_path: Path) -> None:
+    files = FileResource()
+    path = tmp_path / "optional.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database(mode=mode)
+    assert db.get(read_optional, str(path)) == "hello"
+
+    path.unlink()
+    assert db.get(read_optional, str(path)) == Database(mode=mode).get(read_optional, str(path))
+    assert db.get(read_optional, str(path)) == "<default>"
+
+
+def test_unchanged_failing_resource_probe_keeps_dependents_green(tmp_path: Path) -> None:
+    files = FileResource()
+    path = tmp_path / "missing.txt"
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    @query
+    def shout(db: Database, filename: str) -> str:
+        return read_optional(db, filename).upper()
+
+    db = Database()
+    assert db.get(shout, str(path)) == "<DEFAULT>"
+    revision = db.revision
+    executions = db.statistics().query_executions
+
+    for _ in range(3):
+        assert db.get(shout, str(path)) == "<DEFAULT>"
+
+    assert db.revision == revision
+    assert db.statistics().query_executions == executions
+    inspection = _inspect_node(db, shout, str(path))
+    assert inspection.last_decision == "reused"
+    assert _find_node(inspection, "read_optional").last_decision == "reused"
+    failed = _find_node(inspection, "file[")
+    assert failed.last_decision == "failed"
+    assert failed.changed_at == revision
+
+
+def test_resource_create_delete_recreate_cycles_track_a_fresh_database(tmp_path: Path) -> None:
+    files = FileResource()
+    path = tmp_path / "toggle.txt"
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database()
+    for content in (None, "alpha", None, "beta", "beta", None, "alpha"):
+        if content is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(content, encoding="utf-8")
+        expected = "<default>" if content is None else content
+        assert Database().get(read_optional, str(path)) == expected
+        assert db.get(read_optional, str(path)) == expected
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_file_replaced_by_a_directory_matches_a_fresh_database(mode: str, tmp_path: Path) -> None:
+    files = FileResource()
+    path = tmp_path / "o.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database(mode=mode)
+    assert db.get(read_optional, str(path)) == "hello"
+
+    path.unlink()
+    path.mkdir()
+    # Both the load and the probe raise here, so no failure record can be
+    # written; the record describing the file that used to be there must not be
+    # allowed to report "unchanged" and hand back a value fresh cannot produce.
+    fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
+    assert fresh[0] == DIRECTORY_AS_FILE_ERROR.__name__
+    assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_directory_replaced_by_a_file_matches_a_fresh_database(mode: str, tmp_path: Path) -> None:
+    directories = DirectoryResource()
+    path = tmp_path / "listing"
+    path.mkdir()
+    (path / "a.txt").write_text("a", encoding="utf-8")
+
+    @query
+    def names(db: Database, dirname: str) -> tuple[str, ...]:
+        return directories.read(db, dirname)
+
+    db = Database(mode=mode)
+    assert db.get(names, str(path)) == ("a.txt",)
+
+    (path / "a.txt").unlink()
+    path.rmdir()
+    path.write_text("not a directory", encoding="utf-8")
+    fresh = _outcome(lambda: Database(mode=mode).get(names, str(path)))
+    assert fresh[0] == "NotADirectoryError"
+    assert _outcome(lambda: db.get(names, str(path))) == fresh
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_directory_restored_after_an_unprobeable_failure_matches_a_fresh_database(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    directories = DirectoryResource()
+    path = tmp_path / "listing"
+    path.mkdir()
+    (path / "a.txt").write_text("a", encoding="utf-8")
+
+    @query
+    def names(db: Database, dirname: str) -> tuple[str, ...]:
+        try:
+            return directories.read(db, dirname)
+        except NotADirectoryError:
+            return ("<caught>",)
+
+    db = Database(mode=mode)
+    assert db.get(names, str(path)) == ("a.txt",)
+
+    (path / "a.txt").unlink()
+    path.rmdir()
+    path.write_text("not a directory", encoding="utf-8")
+    assert db.get(names, str(path)) == ("<caught>",)
+
+    # The world returns to exactly the state the resource record still describes
+    # (a branch switch, an undo). Its probe matches again, but an observation it
+    # never recorded happened in between, and the reader's cached value came from
+    # that observation -- the probe may not be allowed to certify the interval.
+    path.unlink()
+    path.mkdir()
+    (path / "a.txt").write_text("a", encoding="utf-8")
+    assert db.get(names, str(path)) == Database(mode=mode).get(names, str(path)) == ("a.txt",)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_missing_file_replaced_by_a_directory_matches_a_fresh_database(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+    path = tmp_path / "optional.txt"
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database(mode=mode)
+    assert db.get(read_optional, str(path)) == "<default>"
+
+    # The failure record left by the absent file goes stale the same way a value
+    # record does: once the path is a directory, neither load nor probe survives.
+    path.mkdir()
+    fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
+    assert fresh[0] == DIRECTORY_AS_FILE_ERROR.__name__
+    assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_handled_unrecordable_failure_invalidates_a_transitive_reader(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+    path = tmp_path / "thing.txt"
+    path.write_text("text", encoding="utf-8")
+
+    @query
+    def reader(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except DIRECTORY_AS_FILE_ERROR:
+            return "<isdir>"
+
+    @query
+    def parent(db: Database, filename: str) -> str:
+        return "P:" + reader(db, filename)
+
+    db = Database(mode=mode)
+    assert db.get(parent, str(path)) == "P:text"
+
+    # Neither the load nor the probe survives a file replaced by a directory, so
+    # nothing about the failure can be recorded. Reporting the resource changed
+    # is enough for `reader`, which re-executes and catches; it is *not* enough
+    # for `parent` unless the transition also moves the revision, because
+    # otherwise `reader` re-executes at the revision `parent` already verified.
+    path.unlink()
+    path.mkdir()
+    assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:<isdir>"
+    # Still right when the transitive reader is asked repeatedly, not just once.
+    assert db.get(parent, str(path)) == "P:<isdir>"
+
+    # ... and it settles: once the world heals, the parent follows the value back.
+    path.rmdir()
+    path.write_text("text", encoding="utf-8")
+    assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:text"
+
+    # A second break is a second transition and must invalidate again.
+    path.unlink()
+    path.mkdir()
+    assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:<isdir>"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_handled_unrecordable_failure_propagates_more_than_one_hop(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+    path = tmp_path / "thing.txt"
+    path.write_text("text", encoding="utf-8")
+
+    @query
+    def leaf(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except DIRECTORY_AS_FILE_ERROR:
+            return "<isdir>"
+
+    @query
+    def middle(db: Database, filename: str) -> str:
+        return "M:" + leaf(db, filename)
+
+    @query
+    def top(db: Database, filename: str) -> str:
+        return "T:" + middle(db, filename)
+
+    db = Database(mode=mode)
+    assert db.get(top, str(path)) == "T:M:text"
+    executions = db.statistics().query_executions
+
+    path.unlink()
+    path.mkdir()
+    assert db.get(top, str(path)) == Database(mode=mode).get(top, str(path)) == "T:M:<isdir>"
+    # Every hop of the chain agrees, not only the root that was asked for.
+    assert db.get(middle, str(path)) == "M:<isdir>"
+    assert db.get(leaf, str(path)) == "<isdir>"
+
+    # All three hops re-executed in that one request: the invalidation reached
+    # past `middle`, which is the hop a direct-reader-only fix leaves behind.
+    assert db.statistics().query_executions == executions + 3
+    revision = db.revision
+    for node in (leaf, middle, top):
+        assert _query_record(db, node, str(path)).changed_at == revision
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_permanently_unrecordable_failure_settles_the_revision(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+    path = tmp_path / "thing.txt"
+    path.write_text("text", encoding="utf-8")
+
+    @query
+    def reader(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except DIRECTORY_AS_FILE_ERROR:
+            return "<isdir>"
+
+    @query
+    def parent(db: Database, filename: str) -> str:
+        return "P:" + reader(db, filename)
+
+    db = Database(mode=mode)
+    assert db.get(parent, str(path)) == "P:text"
+    before = db.revision
+
+    path.unlink()
+    path.mkdir()
+    assert db.get(parent, str(path)) == "P:<isdir>"
+    # One bump for the transition into "unconfirmed" -- not one per observation.
+    transitioned = db.revision
+    assert transitioned == before + 1
+
+    for _ in range(5):
+        assert db.get(parent, str(path)) == "P:<isdir>"
+        assert db.revision == transitioned
+
+    # A read that ultimately succeeds is not a transition either: the healing
+    # load moves the revision once, and the requests after it leave it alone.
+    path.rmdir()
+    path.write_text("text", encoding="utf-8")
+    assert db.get(parent, str(path)) == "P:text"
+    healed = db.revision
+    assert healed > transitioned
+    for _ in range(5):
+        assert db.get(parent, str(path)) == "P:text"
+        assert db.revision == healed
+
+
+def test_module_replaced_by_a_package_matches_a_fresh_database(tmp_path: Path) -> None:
+    from pyinc.integrations import python_source
+
+    path = tmp_path / "mod.py"
+    path.write_text("import os\n", encoding="utf-8")
+
+    db = Database()
+    imports = python_source.file_analysis(db, str(path)).imports
+    assert tuple(ref.module for ref in imports) == ("os",)
+
+    # A module -> package refactor is the shipped-integration form of the same
+    # trap: _SourceTextResource probes with exists() then read_bytes().
+    path.unlink()
+    path.mkdir()
+    (path / "__init__.py").write_text("import os\n", encoding="utf-8")
+    fresh = _outcome(lambda: python_source.file_analysis(Database(), str(path)))
+    assert fresh[0] == DIRECTORY_AS_FILE_ERROR.__name__
+    assert _outcome(lambda: python_source.file_analysis(db, str(path))) == fresh
 
 
 def test_untracked_queries_rerun_without_backdating_the_impure_node() -> None:

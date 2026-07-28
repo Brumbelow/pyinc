@@ -97,6 +97,32 @@ _DIRECTORIES = DirectoryResource()
 
 _NS_PAT = "}"
 
+# Element nesting is capped during parsing because every element re-emits the dot
+# path of all its ancestors: the cached cutoff token grows with the square of the
+# nesting depth, so this cap is what bounds the *cache*, not just the parse.
+#
+# It is therefore set from an explicit amplification budget, not from the
+# interpreter's recursion limit — the walk keeps its own stack and needs under 20
+# frames at any depth, so the interpreter's ceiling is not the constraint here.
+# Budget: a document at the cap must not cache more than ~1 MiB of cutoff token.
+# At 256 levels that holds for element names up to 20 characters (measured: 708 KB
+# for a 20-character name, 207 KB for a 5-character one, 74 KB for a 1-character
+# one). The token scales linearly in name length on top of the quadratic depth
+# term, so the budget is stated for that name length rather than unconditionally.
+# 256 is still an order of magnitude deeper than any real configuration document.
+_MAX_XML_DEPTH = 256
+
+# A RecursionError raised anywhere under `_safe_parse` cannot be a property of the
+# document: `_MAX_XML_DEPTH` rejects runaway nesting as a ParseError before the
+# tree is built, and the element walk is iterative. It means only that the caller
+# entered with the interpreter's stack all but spent, because expat invokes
+# `_start_element` as a Python frame. CPython names whichever frame ran out
+# ("...while calling a Python object", "...while getting the str of an object"),
+# so the message describes the call site rather than the file. These payloads are
+# cached, so a fixed string is emitted instead and the payload stays a function of
+# the tracked inputs. `json_config` emits the same shape for the same reason.
+_STACK_EXHAUSTED_DIAGNOSTIC = "XML parsing exhausted the interpreter stack"
+
 
 def _strip_namespace(tag: str) -> str:
     if tag.startswith("{"):
@@ -110,47 +136,68 @@ def _walk_elements(
     elem: ET.Element,
     prefix: str,
 ) -> list[XmlElementPayload]:
+    """Collect every element in document pre-order, deepest nesting included.
+
+    The traversal keeps its own stack rather than recursing, so the payload a
+    document produces depends only on the document — never on how much of the
+    interpreter's recursion budget the caller has already spent.
+    """
     elements: list[XmlElementPayload] = []
+    pending: list[tuple[ET.Element, str]] = [(elem, prefix)]
 
-    local_tag = _strip_namespace(elem.tag)
-    current_path = f"{prefix}.{local_tag}" if prefix else local_tag
+    while pending:
+        current, current_prefix = pending.pop()
 
-    attrs: tuple[XmlAttributePayload, ...] = tuple(
-        (_strip_namespace(k), v) for k, v in sorted(elem.attrib.items())
-    )
-    child_tags: tuple[str, ...] = tuple(_strip_namespace(child.tag) for child in elem)
-    text = (elem.text or "").strip()
+        local_tag = _strip_namespace(current.tag)
+        current_path = f"{current_prefix}.{local_tag}" if current_prefix else local_tag
 
-    elements.append((local_tag, current_path, text, attrs, child_tags))
+        attrs: tuple[XmlAttributePayload, ...] = tuple(
+            (_strip_namespace(k), v) for k, v in sorted(current.attrib.items())
+        )
+        child_tags: tuple[str, ...] = tuple(_strip_namespace(child.tag) for child in current)
+        text = (current.text or "").strip()
 
-    for child in elem:
-        elements.extend(_walk_elements(child, current_path))
+        elements.append((local_tag, current_path, text, attrs, child_tags))
+
+        # Reversed so the first child is popped first, preserving document order.
+        pending.extend((child, current_path) for child in reversed(current))
 
     return elements
 
 
 def _safe_parse(text: str) -> ET.Element:
-    """Parse XML with DOCTYPE and entity declarations rejected.
+    """Parse XML with DOCTYPE, entity declarations, and runaway nesting rejected.
 
     DTDs and entity declarations are blocked at parse time; this neutralises
     billion-laughs expansion and external-DTD exfiltration regardless of the
-    underlying expat version's default handling. Namespace-qualified tags are
-    normalised to Clark notation (`{uri}localname`) so the result is shaped
-    identically to `ET.fromstring`. Malformed input and rejected constructs
-    both surface as `ET.ParseError`.
+    underlying expat version's default handling. Nesting past `_MAX_XML_DEPTH`
+    is rejected at the element that crosses the cap, so the tree stops growing
+    there rather than being built in full and rejected afterwards.
+    Namespace-qualified tags are normalised to Clark notation
+    (`{uri}localname`) so the result is shaped identically to `ET.fromstring`.
+    Malformed input and rejected constructs both surface as `ET.ParseError`.
     """
     builder = ET.TreeBuilder()
     parser = xml.parsers.expat.ParserCreate(encoding=None, namespace_separator="}")
+    depth = 0
 
     def _forbid(*_args: object, **_kwargs: object) -> None:
         raise ET.ParseError("DTD / entity declarations disabled for safety")
 
     def _start_element(tag: str, attrs: dict[str, str]) -> None:
+        nonlocal depth
+        depth += 1
+        if depth > _MAX_XML_DEPTH:
+            raise ET.ParseError(
+                f"XML nesting exceeds the supported limit of {_MAX_XML_DEPTH} levels"
+            )
         normalised_tag = "{" + tag if "}" in tag else tag
         normalised_attrs = {("{" + k if "}" in k else k): v for k, v in attrs.items()}
         builder.start(normalised_tag, normalised_attrs)
 
     def _end_element(tag: str) -> None:
+        nonlocal depth
+        depth -= 1
         builder.end("{" + tag if "}" in tag else tag)
 
     parser.StartDoctypeDeclHandler = _forbid
@@ -171,14 +218,14 @@ def _xml_cutoff_token(text: str) -> tuple[str, str]:
         elements = _walk_elements(root, "")
         snapshot = freeze(elements)
         return ("parsed", repr(snapshot))
-    except ET.ParseError:
+    except (ET.ParseError, RecursionError):
         return ("raw", text)
 
 
 def _try_parse_xml(text: str) -> ET.Element | None:
     try:
         return _safe_parse(text)
-    except ET.ParseError:
+    except (ET.ParseError, RecursionError):
         return None
 
 
@@ -211,6 +258,8 @@ def xml_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload,
         return ()
     except ET.ParseError as exc:
         return (("xml-parse-error", str(exc)),)
+    except RecursionError:
+        return (("xml-parse-error", _STACK_EXHAUSTED_DIAGNOSTIC),)
 
 
 # ---------------------------------------------------------------------------

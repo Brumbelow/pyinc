@@ -31,6 +31,7 @@ from types import (
     MethodDescriptorType,
     MethodType,
     ModuleType,
+    TracebackType,
     UnionType,
     WrapperDescriptorType,
 )
@@ -188,10 +189,47 @@ class NodeRecord:
     probe: Any = None
     checked_in_request: int = -1
     checkpoint_loaded: bool = False
+    failure: str | None = None
+    # The exception the failing load raised, kept only so the reads that follow
+    # it *within the same request* re-raise it instead of re-running the load.
+    # `failure_traceback` is the chain captured at that raise, restored on every
+    # re-raise so the object's traceback stays bounded and points at the load.
+    # A traceback pins its frames and every local in them, so both are dropped
+    # when the request that produced them ends: nothing outside that request may
+    # re-raise them, and a permanently failing node must not pin a load frame
+    # (and whatever it allocated) until the next successful load.
+    failure_exc: BaseException | None = None
+    failure_traceback: TracebackType | None = None
+    # True once an observation of this node raised without being recorded (an
+    # unprobeable failure, or a freeze that failed after the load). The stored
+    # probe then describes a world that has since been contradicted, so it may
+    # no longer prove "unchanged" -- see `_refresh_resource`.
+    probe_unconfirmed: bool = False
+    # False once this record's value derived from an exception the graph could
+    # not describe, which makes it reproducible only by re-running it. Such a
+    # record is omitted from checkpoints exactly as a failure record is.
+    checkpointable: bool = True
 
     @property
     def is_untracked(self) -> bool:
         return bool(self.untracked_reasons)
+
+    @property
+    def is_failed(self) -> bool:
+        return self.failure is not None
+
+
+@dataclass
+class _RefreshOutcome:
+    """Whether a raising resource refresh left the record describing that attempt.
+
+    ``_maybe_changed_after`` may only let a record's ``changed_at`` decide when
+    the refresh it just ran actually (re)wrote that record. A refresh that raises
+    without recording anything leaves whatever the record said before, and a
+    stale "unchanged" there is a from-scratch consistency violation.
+    """
+
+    failure_recorded: bool = False
 
 
 @dataclass
@@ -201,6 +239,7 @@ class ExecutionFrame:
     boundary_fingerprints: list[str] = field(default_factory=list)
     boundary_values: list[Any] = field(default_factory=list)
     untracked_reasons: list[str] = field(default_factory=list)
+    checkpointable: bool = True
 
 
 @dataclass(frozen=True)
@@ -542,6 +581,11 @@ class Database:
         )
         self._pending_events: ContextVar[list[tuple[NodeKey, QueryChangeEvent]] | None] = (
             ContextVar("pyinc_pending_events", default=None)
+        )
+        # Resource nodes whose failure record holds this request's exception, so
+        # the request scope can drop it (and the frames it pins) on the way out.
+        self._request_failures: ContextVar[list[NodeKey] | None] = ContextVar(
+            "pyinc_request_failures", default=None
         )
         # Scope-B: checkpoint records loaded from a durable store for cross-run reuse.
         self._checkpoint_query_records: dict[NodeKey, dict[str, Any]] = {}
@@ -982,6 +1026,19 @@ class Database:
             key
             for key, record in self._records.items()
             if key.kind in ("query", "resource")
+            # A failure record has no value to persist, and a reader that handled
+            # the failure is only reproducible while the load keeps failing. Both
+            # are omitted -- the dep-closure below drops every parent too -- so a
+            # checkpoint never warms a result derived from an absent value.
+            and not record.is_failed
+            # The same exclusion for a failure the graph could not record: the
+            # resource record whose probe an unrecorded raise contradicted (it
+            # still holds the pre-failure probe and digest, which would verify
+            # against a world that healed back into that state), and the reader
+            # that consumed such a raise (its value is a handled failure no
+            # record describes).
+            and record.checkpointable
+            and not record.probe_unconfirmed
             and not self._record_is_stale_for_save(record)
             and (
                 key.args_digest in self._checkpoint_snapshot_cache
@@ -1948,13 +2005,27 @@ class Database:
     def read_resource(self, resource: Any, parameter: Any) -> Any:
         with self._state_lock, self._request_scope() as pending:
             key = self._resource_key(resource, parameter)
+            outcome = _RefreshOutcome()
             try:
-                self._refresh_resource(resource, parameter, key)
+                self._refresh_resource(resource, parameter, key, outcome)
                 self._record_dependency(key)
                 result = self._expose_boundary_snapshot(self._records[key].snapshot)
             except Exception:
-                if key not in self._records:
+                # A load that raised is still an observation: when it left a
+                # failure record behind, the reader depends on it exactly as it
+                # would on a value, so the edge is recorded before unwinding.
+                if key in self._records:
+                    self._record_dependency(key)
+                else:
                     self._resource_objects().pop(key, None)
+                if not outcome.failure_recorded:
+                    # Nothing in the graph describes the exception this reader is
+                    # about to see, so whatever it returns cannot be re-derived
+                    # from records at load time. A failure record is excluded from
+                    # checkpoints for that reason; a reader of an *unrecordable*
+                    # raise has to be excluded for it too, and with it -- through
+                    # the save-time dependency closure -- everything above it.
+                    self._mark_frame_uncheckpointable()
                 raise
         self._dispatch_events(pending)
         return result
@@ -2075,6 +2146,7 @@ class Database:
             record.last_recompute = decision
             record.reason = reason
             record.untracked_reasons = list(frame.untracked_reasons)
+            record.checkpointable = frame.checkpointable
             record.checked_in_request = self._current_request_id()
             if decision == "backdated":
                 self._stats["query_backdates"] += 1
@@ -2160,7 +2232,20 @@ class Database:
             if resource_pair is None:
                 return True
             resource, parameter = resource_pair
-            self._refresh_resource(resource, parameter, key)
+            outcome = _RefreshOutcome()
+            try:
+                self._refresh_resource(resource, parameter, key, outcome)
+            except Exception:
+                # A refresh that raises must not escape a dependent's
+                # verification pass: with a failure record describing *this*
+                # attempt the probe comparison below decides, and the dependent
+                # re-reads inside its own body where its own handler can see the
+                # exception. When nothing was recorded -- an unobservable probe,
+                # or a freeze that failed after a successful load -- the record
+                # still describes an older world, so its changed_at may not be
+                # trusted: report changed and let the dependent re-read.
+                if not outcome.failure_recorded:
+                    return True
         return self._records[key].is_untracked or self._records[key].changed_at > revision
 
     def _verify_checkpoint_loaded_record(self, record: NodeRecord) -> bool:
@@ -2177,21 +2262,104 @@ class Database:
         record.verified_at = self._revision
         return False
 
-    def _refresh_resource(self, resource: Any, parameter: Any, key: NodeKey) -> None:
+    def _refresh_resource(
+        self,
+        resource: Any,
+        parameter: Any,
+        key: NodeKey,
+        outcome: _RefreshOutcome | None = None,
+    ) -> None:
+        """Bring this resource node up to date, raising what its load raised.
+
+        An observation that raises without being recorded leaves the record
+        describing a world that has just been contradicted. Reporting the node as
+        changed for that one refresh is not enough: the record keeps its old
+        probe, so once the world returns to the state it describes -- an undo, a
+        branch switch back -- the probe matches again and the record claims
+        "unchanged" across an interval it never observed. Dependents that
+        consumed the exception then stay green on a value no fresh ``Database``
+        produces. Mark it here instead, so the stored probe stops deciding
+        anything until a real observation rewrites the record.
+
+        Marking alone only repairs the resource's *direct* readers. Reporting the
+        node as changed makes each direct reader re-execute and see the exception,
+        but a reader that handles it returns at the current revision, so its own
+        ``changed_at`` does not move and its parents never learn that anything
+        happened -- they keep a value derived from the pre-failure world forever.
+        The transition into "unconfirmed" is a change in the graph exactly as a
+        recorded failure is, so it moves the revision too, and the reader's
+        re-execution then lands on a revision its parents have not verified past.
+        The bump is guarded on the mark not already being set: one bump per
+        transition, not one per request, so a permanently unprobeable resource
+        settles at a fixed revision instead of churning it on every ``get()``.
+        Every path that rewrites the record from a real observation -- a
+        successful load and a recordable failure alike -- clears the mark, so a
+        resource that heals and breaks again bumps again.
+        """
+        outcome = outcome if outcome is not None else _RefreshOutcome()
+        try:
+            self._observe_resource(resource, parameter, key, outcome)
+        except Exception:
+            if not outcome.failure_recorded:
+                record = self._records.get(key)
+                if record is not None:
+                    if not record.probe_unconfirmed:
+                        self._revision += 1
+                    record.probe_unconfirmed = True
+            raise
+
+    def _observe_resource(
+        self,
+        resource: Any,
+        parameter: Any,
+        key: NodeKey,
+        outcome: _RefreshOutcome,
+    ) -> None:
         record = self._records.get(key)
         current_request = self._current_request_id()
         if record is not None and record.checked_in_request == current_request:
-            return
+            if not record.is_failed:
+                return
+            if record.failure_exc is not None:
+                # A resource is observed at most once per request; a failure is
+                # settled for the request exactly as a value is. Re-raising the
+                # exception that this request's load produced keeps a fan-out of
+                # readers at one load instead of one per reader, and the object
+                # is never older than the observation the request already made.
+                outcome.failure_recorded = True
+                raise record.failure_exc.with_traceback(record.failure_traceback)
         atomic = callable(getattr(resource, "probe_and_load", None))
         if atomic:
-            with self._allow_raw_reads_scope():
-                probe, loaded_value = resource.probe_and_load(self, parameter)
+            try:
+                with self._allow_raw_reads_scope():
+                    probe, loaded_value = resource.probe_and_load(self, parameter)
+            except Exception as exc:
+                outcome.failure_recorded = self._record_resource_failure(
+                    key,
+                    record,
+                    self._observe_failure_probe(resource, parameter),
+                    exc,
+                    current_request,
+                )
+                raise
         else:
             with self._allow_raw_reads_scope():
                 probe = resource.probe(parameter)
             loaded_value = None
         probe_snapshot = freeze(probe, adapters=self._adapters)
-        if record is not None and record.probe == probe_snapshot:
+        # A failure record must never take the probe-hit early exit as if it had
+        # a value: it holds no snapshot to reuse. The first read of each request
+        # re-runs the load on an unchanged failing probe, which is what keeps the
+        # exception a live one; the rest of the request re-raises it above. A
+        # record whose probe was contradicted by an unrecorded raise is excluded
+        # for the same reason its changed_at is: matching a probe the node has
+        # since failed to confirm proves nothing about the interval between.
+        if (
+            record is not None
+            and not record.is_failed
+            and not record.probe_unconfirmed
+            and record.probe == probe_snapshot
+        ):
             record.verified_at = self._revision
             record.last_decision = "reused"
             record.reason = "resource probe unchanged"
@@ -2234,8 +2402,14 @@ class Database:
                     self._stats["resource_probe_hits"] += 1
                     return
         if not atomic:
-            with self._allow_raw_reads_scope():
-                loaded_value = resource.load(self, parameter)
+            try:
+                with self._allow_raw_reads_scope():
+                    loaded_value = resource.load(self, parameter)
+            except Exception as exc:
+                outcome.failure_recorded = self._record_resource_failure(
+                    key, record, probe_snapshot, exc, current_request
+                )
+                raise
         snapshot = self._freeze_value(loaded_value)
         digest = fingerprint_snapshot(snapshot)
         if record is None:
@@ -2269,6 +2443,115 @@ class Database:
         self._stats["resource_loads"] += 1
         record.probe = probe_snapshot
         record.checked_in_request = current_request
+        record.failure = None
+        record.failure_exc = None
+        record.failure_traceback = None
+        record.probe_unconfirmed = False
+
+    def _observe_failure_probe(self, resource: Any, parameter: Any) -> Any:
+        """Frozen probe observed alongside a load that raised.
+
+        Returns ``_MISSING_SNAPSHOT`` when the probe itself cannot be observed: a
+        resource that cannot even be probed models its failures partially and is
+        outside the contract, so it gets no record at all.
+
+        The base ``Resource`` supplies ``probe_and_load``, so every resource takes
+        the atomic branch and this observation happens at a *later* instant than
+        the load that raised: ``inspect()`` can show a failed node whose probe
+        already describes a healed world. That is self-correcting rather than
+        sticky -- a failure record never takes the probe-unchanged early exit, so
+        the next request re-runs the load and succeeds. Overriding
+        ``probe_and_load`` to observe both from one read is what removes the gap.
+        """
+        try:
+            with self._allow_raw_reads_scope():
+                return freeze(resource.probe(parameter), adapters=self._adapters)
+        except Exception:
+            return _MISSING_SNAPSHOT
+
+    def _record_resource_failure(
+        self,
+        key: NodeKey,
+        record: NodeRecord | None,
+        probe_snapshot: Any,
+        exc: BaseException,
+        current_request: int,
+    ) -> bool:
+        """Record that this resource's load raised, carrying the observed probe.
+
+        A failed load is an observation, not the absence of one, so the node keeps
+        a record and the ordinary probe comparison decides when dependents must
+        re-run. The changed_at discipline matches the success path: an unchanged
+        failing probe keeps dependents green, while a changed probe or a
+        transition between success and failure bumps the revision.
+
+        Returns whether a record was written. ``False`` means the node still
+        describes an older world, which callers must treat as "changed" rather
+        than trusting the record's ``changed_at``.
+        """
+        if probe_snapshot is _MISSING_SNAPSHOT:
+            return False
+        failure = f"{type(exc).__name__}: {exc}"
+        if record is None:
+            changed_at = self._revision
+        elif record.is_failed and not record.probe_unconfirmed and record.probe == probe_snapshot:
+            changed_at = record.changed_at
+        else:
+            self._revision += 1
+            changed_at = self._revision
+        # Outside a request nothing can re-raise this exception, so holding it
+        # (and the load frame its traceback pins) would buy nothing.
+        pending = self._request_failures.get()
+        retained = exc if pending is not None else None
+        retained_traceback = exc.__traceback__ if pending is not None else None
+        if record is None:
+            self._records[key] = NodeRecord(
+                key=key,
+                label=key.label,
+                snapshot=None,
+                digest="",
+                changed_at=changed_at,
+                verified_at=self._revision,
+                last_decision="failed",
+                last_recompute="failed",
+                reason=f"resource load failed: {failure}",
+                probe=probe_snapshot,
+                checked_in_request=current_request,
+                failure=failure,
+                failure_exc=retained,
+                failure_traceback=retained_traceback,
+            )
+        else:
+            record.snapshot = None
+            record.digest = ""
+            record.changed_at = changed_at
+            record.verified_at = self._revision
+            record.last_decision = "failed"
+            record.last_recompute = "failed"
+            record.reason = f"resource load failed: {failure}"
+            record.probe = probe_snapshot
+            record.checked_in_request = current_request
+            record.failure = failure
+            record.failure_exc = retained
+            record.failure_traceback = retained_traceback
+            record.probe_unconfirmed = False
+        if pending is not None:
+            pending.append(key)
+        return True
+
+    def _release_failure_exceptions(self, keys: list[NodeKey]) -> None:
+        """Drop the exceptions this request stored on its failure records.
+
+        Only reads *within* the request that produced one may re-raise it, so the
+        request boundary is where the traceback -- and every frame and local it
+        keeps alive -- stops being useful. Records are never evicted, so leaving
+        them attached would pin one load frame per permanently failing node.
+        """
+        for key in keys:
+            record = self._records.get(key)
+            if record is not None:
+                record.failure_exc = None
+                record.failure_traceback = None
 
     def _query_key(
         self, query: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -2491,6 +2774,12 @@ class Database:
         if frame is None:
             return
         frame.dependencies.add(key)
+
+    def _mark_frame_uncheckpointable(self) -> None:
+        frame = self._current_frame()
+        if frame is None:
+            return
+        frame.checkpointable = False
 
     def _inspect_record(self, key: NodeKey) -> InspectionNode:
         record = self._records[key]
@@ -5206,10 +5495,14 @@ class Database:
         token = self._request_token.set(self._request_counter)
         pending: list[tuple[NodeKey, QueryChangeEvent]] = []
         events_token = self._pending_events.set(pending)
+        failures: list[NodeKey] = []
+        failures_token = self._request_failures.set(failures)
         try:
             yield pending
         finally:
             self._pending_events.reset(events_token)
+            self._release_failure_exceptions(failures)
+            self._request_failures.reset(failures_token)
             self._request_token.reset(token)
             self._evict_query_nodes_if_needed()
 

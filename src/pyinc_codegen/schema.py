@@ -1,7 +1,9 @@
 """Incremental JSON-Schema analysis and rendering queries.
 
 Only the deliberately small subset documented in ``docs/codegen-guide.md`` is
-accepted. Unsupported or malformed shapes produce structured diagnostics; the
+compiled into types. Annotation- and validation-only keywords are accepted with
+a non-blocking ``ignored-constraint`` warning naming what the emitted type does
+not enforce; unsupported or malformed shapes produce error diagnostics, and the
 high-level generator refuses to reconcile outputs while any error is present.
 """
 
@@ -27,7 +29,32 @@ _INVALID_UTF8_PREFIX = "\0pyinc-invalid-utf8:"
 _DEFINITION_SECTIONS = ("$defs", "definitions")
 _SCHEMA_ANNOTATION_KEYS = frozenset({"$comment", "description", "title"})
 _ROOT_METADATA_KEYS = _SCHEMA_ANNOTATION_KEYS | frozenset({"$id", "$schema"})
-_SHAPE_KEYWORDS = frozenset({"$ref", "enum", "items", "properties", "required"})
+_SHAPE_KEYWORDS = frozenset({"$ref", "const", "enum", "items", "properties", "required"})
+# The combinator spellings that select a shape, in the order they are selected.
+_SUPPORTED_COMBINATORS = ("allOf", "anyOf")
+# Keywords that select a schema shape before the ``type``-driven branches run,
+# in the order they are applied wherever the compiler reads a schema node.
+_SHAPE_SELECTOR_ORDER = ("$ref", *_SUPPORTED_COMBINATORS, "enum", "const")
+_SHAPE_SELECTORS = frozenset(_SHAPE_SELECTOR_ORDER)
+_IGNORED_NUMBER_KEYWORDS = frozenset({"exclusiveMaximum", "exclusiveMinimum", "maximum", "minimum"})
+_IGNORED_SIZE_KEYWORDS = frozenset({"maxItems", "maxLength", "minItems", "minLength"})
+_IGNORED_STRING_KEYWORDS = frozenset({"format", "pattern"})
+_IGNORED_BOOLEAN_KEYWORDS = frozenset(
+    {"additionalProperties", "deprecated", "readOnly", "uniqueItems", "writeOnly"}
+)
+_IGNORED_ANNOTATION_KEYWORDS = frozenset(
+    {"default", "deprecated", "examples", "readOnly", "writeOnly"}
+)
+# Annotation- and validation-only keywords: accepted everywhere a schema node is
+# accepted, validated for value shape, and reported as non-blocking
+# ``ignored-constraint`` warnings because the emitted type cannot enforce them.
+_IGNORED_KEYWORDS = (
+    _IGNORED_NUMBER_KEYWORDS
+    | _IGNORED_SIZE_KEYWORDS
+    | _IGNORED_STRING_KEYWORDS
+    | _IGNORED_BOOLEAN_KEYWORDS
+    | frozenset({"default", "examples", "multipleOf"})
+)
 _ROOT_UNSUPPORTED_CONSTRUCTS = frozenset(
     {
         "allOf",
@@ -337,6 +364,90 @@ def _effective_type(type_field: object) -> object:
     return non_null[0] if len(non_null) == 1 else type_field
 
 
+def _constraint_shape_problem(name: str, value: object) -> str | None:
+    """Return the expected value shape when an ignored keyword is malformed."""
+
+    if name == "multipleOf":
+        valid = isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+        return None if valid else "a number greater than zero"
+    if name in _IGNORED_NUMBER_KEYWORDS:
+        valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+        return None if valid else "a number"
+    if name in _IGNORED_SIZE_KEYWORDS:
+        valid = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        return None if valid else "a non-negative integer"
+    if name in _IGNORED_STRING_KEYWORDS:
+        return None if isinstance(value, str) else "a string"
+    if name in _IGNORED_BOOLEAN_KEYWORDS:
+        return None if isinstance(value, bool) else "a boolean"
+    if name == "examples":
+        return None if isinstance(value, list) else "an array"
+    return None  # "default" carries an instance value of any JSON shape.
+
+
+def _mapping_value_schema(spec: dict[str, object]) -> dict[str, object] | None:
+    """Return the ``additionalProperties`` schema this node renders as ``dict[str, T]``."""
+
+    value = spec.get("additionalProperties")
+    if not isinstance(value, dict):
+        return None
+    if set(spec) & _SHAPE_SELECTORS:
+        return None
+    if _effective_type(spec.get("type")) not in (None, "object"):
+        return None
+    return value
+
+
+def _ignored_keyword_diagnostics(
+    spec: dict[str, object],
+    json_pointer: str,
+    *,
+    renders_additional_properties: bool = False,
+) -> tuple[DiagnosticPayload, ...]:
+    """Accept annotation- and validation-only keywords, naming what is ignored."""
+
+    diagnostics: list[DiagnosticPayload] = []
+    for name in sorted(set(spec) & _IGNORED_KEYWORDS):
+        value = spec[name]
+        keyword_pointer = _pointer(json_pointer, name)
+        if name == "additionalProperties" and isinstance(value, dict):
+            if renders_additional_properties:
+                # Compiled into the mapping's value type, so nothing is ignored.
+                continue
+            diagnostics.append(
+                _diagnostic(
+                    "unsupported-construct",
+                    "schema-valued 'additionalProperties' is not supported in this schema context",
+                    keyword_pointer,
+                )
+            )
+            continue
+        problem = _constraint_shape_problem(name, value)
+        if problem is not None:
+            diagnostics.append(
+                _diagnostic(
+                    "invalid-constraint",
+                    f"JSON Schema keyword {name!r} must be {problem}",
+                    keyword_pointer,
+                )
+            )
+            continue
+        detail = (
+            "it does not affect the generated type"
+            if name in _IGNORED_ANNOTATION_KEYWORDS
+            else "the generated type does not enforce it"
+        )
+        diagnostics.append(
+            _diagnostic(
+                "ignored-constraint",
+                f"JSON Schema keyword {name!r} is accepted and ignored: {detail}",
+                keyword_pointer,
+                severity=_WARNING,
+            )
+        )
+    return tuple(diagnostics)
+
+
 def _keyword_diagnostic(
     name: str,
     json_pointer: str,
@@ -365,17 +476,35 @@ def _schema_node_diagnostics(
     """Validate the complete keyword set for one supported schema-node context."""
 
     diagnostics = list(_annotation_diagnostics(spec, json_pointer, _SCHEMA_ANNOTATION_KEYS))
-    structural = set(spec) - set(_SCHEMA_ANNOTATION_KEYS)
+    diagnostics.extend(
+        _ignored_keyword_diagnostics(
+            spec,
+            json_pointer,
+            renders_additional_properties=(
+                not definition_context and _mapping_value_schema(spec) is not None
+            ),
+        )
+    )
+    structural = set(spec) - set(_SCHEMA_ANNOTATION_KEYS) - _IGNORED_KEYWORDS
 
     if "$ref" in structural:
         for name in sorted(structural - {"$ref"}):
             diagnostics.append(_keyword_diagnostic(name, json_pointer, ambiguous=True))
         return tuple(diagnostics)
 
-    if "enum" in structural:
-        if not definition_context:
-            diagnostics.append(_keyword_diagnostic("enum", json_pointer))
-        for name in sorted(structural - {"enum", "type"}):
+    combinator = next((name for name in _SUPPORTED_COMBINATORS if name in structural), None)
+    if combinator is not None:
+        for name in sorted(structural - {combinator}):
+            diagnostics.append(_keyword_diagnostic(name, json_pointer, ambiguous=True))
+        return tuple(diagnostics)
+
+    # Both keywords select a closed set of literal values and admit only a
+    # ``type`` beside them; whichever comes first wins, and the other reads as
+    # a competing shape.
+    for selector in ("enum", "const"):
+        if selector not in structural:
+            continue
+        for name in sorted(structural - {selector, "type"}):
             diagnostics.append(
                 _keyword_diagnostic(
                     name,
@@ -407,6 +536,71 @@ def _schema_node_diagnostics(
         shape_conflict = name in _SHAPE_KEYWORDS and bool(allowed)
         diagnostics.append(_keyword_diagnostic(name, json_pointer, ambiguous=shape_conflict))
     return tuple(diagnostics)
+
+
+def _is_null_schema(branch: object) -> bool:
+    return (
+        isinstance(branch, dict)
+        and branch.get("type") == "null"
+        and not set(branch) - _SCHEMA_ANNOTATION_KEYS - {"type"}
+    )
+
+
+def _render_combinator(
+    keyword: str,
+    branches: object,
+    definition_exists: Callable[[str], bool],
+    json_pointer: str,
+) -> tuple[str, tuple[str, ...], tuple[DiagnosticPayload, ...], bool]:
+    """Render the two supported combinator spellings, both of which name one type."""
+
+    keyword_pointer = _pointer(json_pointer, keyword)
+    if isinstance(branches, list) and keyword == "allOf" and len(branches) == 1:
+        return _render_type(branches[0], definition_exists, _pointer(keyword_pointer, "0"))
+    if isinstance(branches, list) and keyword == "anyOf" and len(branches) == 2:
+        null_indexes = [index for index, branch in enumerate(branches) if _is_null_schema(branch)]
+        if len(null_indexes) == 2:
+            return (
+                "object",
+                (),
+                (
+                    _diagnostic(
+                        "unsupported-construct",
+                        "an 'anyOf' whose branches are both {\"type\": \"null\"} names no type "
+                        "to make optional",
+                        keyword_pointer,
+                    ),
+                ),
+                False,
+            )
+        if len(null_indexes) == 1:
+            null_index = null_indexes[0]
+            value_index = 1 - null_index
+            inner, refs, value_diagnostics, allows_none = _render_type(
+                branches[value_index],
+                definition_exists,
+                _pointer(keyword_pointer, str(value_index)),
+            )
+            # The null branch selects optionality rather than a type, so it never
+            # reaches ``_render_type``; its annotations are validated here so a
+            # malformed one is not the single place the check does not run.
+            null_diagnostics = _annotation_diagnostics(
+                branches[null_index],
+                _pointer(keyword_pointer, str(null_index)),
+                _SCHEMA_ANNOTATION_KEYS,
+            )
+            diagnostics = (
+                null_diagnostics + value_diagnostics
+                if null_index < value_index
+                else value_diagnostics + null_diagnostics
+            )
+            return (inner if allows_none else f"{inner} | None", refs, diagnostics, True)
+    problem = (
+        "only a single-branch 'allOf' is supported, not multi-branch composition"
+        if keyword == "allOf"
+        else 'only an \'anyOf\' of one schema and {"type": "null"} is supported, not a union'
+    )
+    return ("object", (), (_diagnostic("unsupported-construct", problem, keyword_pointer),), False)
 
 
 def _render_type(
@@ -497,9 +691,18 @@ def _render_type(
             return ("object", (), tuple(diagnostics), False)
         return (_python_identifier(target), (target,), tuple(diagnostics), False)
 
+    for combinator in _SUPPORTED_COMBINATORS:
+        if combinator in spec:
+            inner, refs, nested, allows_none = _render_combinator(
+                combinator, spec[combinator], definition_exists, json_pointer
+            )
+            return (inner, refs, tuple(diagnostics) + nested, allows_none)
+
     if "enum" in spec:
         enum_values = spec["enum"]
         enum_pointer = _pointer(json_pointer, "enum")
+        members: list[str] = []
+        nullable = False
         if not isinstance(enum_values, list):
             diagnostics.append(_diagnostic("invalid-enum", "enum must be an array", enum_pointer))
         else:
@@ -513,7 +716,8 @@ def _render_type(
                 )
             for index, value in enumerate(enum_values):
                 value_pointer = _pointer(enum_pointer, str(index))
-                if _enum_value(value) is None:
+                literal = _enum_value(value)
+                if literal is None:
                     diagnostics.append(
                         _diagnostic(
                             "unsupported-enum-value",
@@ -521,7 +725,8 @@ def _render_type(
                             value_pointer,
                         )
                     )
-                elif not _enum_type_matches(value, spec.get("type")):
+                    continue
+                if not _enum_type_matches(value, spec.get("type")):
                     diagnostics.append(
                         _diagnostic(
                             "enum-type-mismatch",
@@ -529,6 +734,34 @@ def _render_type(
                             value_pointer,
                         )
                     )
+                members.append(literal)
+                nullable = nullable or value is None
+        if not members:
+            return ("object", (), tuple(diagnostics), False)
+        return (f"Literal[{', '.join(members)}]", (), tuple(diagnostics), nullable)
+
+    if "const" in spec:
+        const_value = spec["const"]
+        const_pointer = _pointer(json_pointer, "const")
+        literal = _enum_value(const_value)
+        if literal is None:
+            diagnostics.append(
+                _diagnostic(
+                    "unsupported-const-value",
+                    "const must be a string, integer, boolean, or null",
+                    const_pointer,
+                )
+            )
+            return ("object", (), tuple(diagnostics), False)
+        if not _enum_type_matches(const_value, spec.get("type")):
+            diagnostics.append(
+                _diagnostic(
+                    "const-type-mismatch",
+                    f"const value {const_value!r} does not match type {spec.get('type')!r}",
+                    const_pointer,
+                )
+            )
+        return (f"Literal[{literal}]", (), tuple(diagnostics), const_value is None)
 
     type_field = spec.get("type")
     if isinstance(type_field, list):
@@ -563,12 +796,25 @@ def _render_type(
 
     if type_field == "array":
         if "items" not in spec:
+            # ``prefixItems`` constrains the items positionally; it is reported
+            # where it appears, so the item type is not unconstrained here.
+            if "prefixItems" not in spec:
+                diagnostics.append(
+                    _diagnostic(
+                        "unconstrained-array-items",
+                        "missing items is represented as object by policy",
+                        json_pointer,
+                        severity=_WARNING,
+                    )
+                )
+            return ("list[object]", (), tuple(diagnostics), False)
+        if isinstance(spec["items"], list):
             diagnostics.append(
                 _diagnostic(
-                    "unconstrained-array-items",
-                    "missing items is represented as object by policy",
-                    json_pointer,
-                    severity=_WARNING,
+                    "unsupported-tuple-items",
+                    "the draft-07 tuple form of 'items' (an array of positional schemas) "
+                    "is not supported",
+                    _pointer(json_pointer, "items"),
                 )
             )
             return ("list[object]", (), tuple(diagnostics), False)
@@ -580,7 +826,8 @@ def _render_type(
     if isinstance(type_field, str) and type_field in primitives:
         return (primitives[type_field], (), tuple(diagnostics), type_field == "null")
 
-    if type_field == "object" or "properties" in spec:
+    value_schema = _mapping_value_schema(spec)
+    if type_field == "object" or "properties" in spec or value_schema is not None:
         if "properties" in spec and not isinstance(spec["properties"], dict):
             diagnostics.append(
                 _diagnostic(
@@ -589,7 +836,12 @@ def _render_type(
                     _pointer(json_pointer, "properties"),
                 )
             )
-        return ("dict[str, object]", (), tuple(diagnostics), False)
+        if value_schema is None:
+            return ("dict[str, object]", (), tuple(diagnostics), False)
+        value_type, refs, nested, _value_allows_none = _render_type(
+            value_schema, definition_exists, _pointer(json_pointer, "additionalProperties")
+        )
+        return (f"dict[str, {value_type}]", refs, tuple(diagnostics) + nested, False)
 
     if isinstance(type_field, str):
         diagnostics.append(
@@ -794,10 +1046,28 @@ def _build_model(
     raw_description = fragment.get("description", "")
     description = raw_description if isinstance(raw_description, str) else ""
 
-    if "enum" in fragment:
+    # A definition selects its shape in the same precedence ``_render_type``
+    # uses, so a shape-selecting keyword is never dropped by the type-driven
+    # object branch running first.
+    selector = next((name for name in _SHAPE_SELECTOR_ORDER if name in fragment), None)
+    if selector == "enum":
         return _build_enum(name, fragment, description, json_pointer, diagnostics)
 
-    if fragment.get("type") == "object" or "properties" in fragment:
+    if selector is None and (fragment.get("type") == "object" or "properties" in fragment):
+        if "properties" not in fragment and _mapping_value_schema(fragment) is None:
+            # A dataclass with no fields cannot hold the instance data such a
+            # definition accepts, and a $ref to it would type that data away. A
+            # mapping value schema does constrain that data; it is rejected on
+            # its own keyword, so repeating it here would misname the cause.
+            diagnostics += (
+                _diagnostic(
+                    "unconstrained-object-model",
+                    "an object definition without 'properties' generates a model with no "
+                    "fields, so it represents none of the data it accepts",
+                    json_pointer,
+                    severity=_WARNING,
+                ),
+            )
         properties = fragment.get("properties", {})
         required_raw = fragment.get("required", [])
         required: set[str] = set()
@@ -913,6 +1183,15 @@ def _build_model(
     )
 
 
+def _typing_import_names(expressions: Iterable[str], *, type_checking: bool) -> list[str]:
+    """Typing names the rendered expressions need, in the project's import order."""
+
+    names = ["TYPE_CHECKING"] if type_checking else []
+    if any("Literal[" in expression for expression in expressions):
+        names.append("Literal")
+    return names
+
+
 def _type_checking_imports(refs: tuple[str, ...], name: str) -> list[str]:
     return [
         f"    from .{_snake(ref)} import {_python_identifier(ref)}"
@@ -940,16 +1219,22 @@ def _render_python(payload: ModelPayload) -> str:
         return "\n".join(lines)
 
     if kind == "alias":
-        typing_names = "TYPE_CHECKING, TypeAlias" if imports else "TypeAlias"
-        lines += [f"from typing import {typing_names}", ""]
+        typing_names = [
+            *_typing_import_names([base_type], type_checking=bool(imports)),
+            "TypeAlias",
+        ]
+        lines += [f"from typing import {', '.join(typing_names)}", ""]
         if imports:
             lines += ["if TYPE_CHECKING:", *imports, ""]
         lines += [f"{python_name}: TypeAlias = {base_type!r}", ""]
         return "\n".join(lines)
 
     lines += ["from dataclasses import dataclass"]
+    typing_names = _typing_import_names([field[1] for field in fields], type_checking=bool(imports))
+    if typing_names:
+        lines.append(f"from typing import {', '.join(typing_names)}")
     if imports:
-        lines += ["from typing import TYPE_CHECKING", "", "if TYPE_CHECKING:", *imports]
+        lines += ["", "if TYPE_CHECKING:", *imports]
     lines += ["", "", "@dataclass(frozen=True)", f"class {python_name}:"]
     required_fields = [field for field in fields if field[2]]
     optional_fields = [field for field in fields if not field[2]]
@@ -1017,17 +1302,30 @@ def document_diagnostics(db: Database, path: str) -> tuple[DiagnosticPayload, ..
 
     diagnostics = list(_annotation_diagnostics(data, "", _ROOT_METADATA_KEYS))
     allowed_root_keys = set(_DEFINITION_SECTIONS) | set(_ROOT_METADATA_KEYS)
+    root_model_keys: list[str] = []
     for root_key in sorted(set(data) - allowed_root_keys):
-        code = (
-            "unsupported-construct"
-            if root_key in _ROOT_UNSUPPORTED_CONSTRUCTS
-            else "unsupported-root-schema"
-        )
+        if root_key in _ROOT_UNSUPPORTED_CONSTRUCTS:
+            diagnostics.append(
+                _diagnostic(
+                    "unsupported-construct",
+                    f"schema keyword {root_key!r} is not supported at the document root",
+                    _pointer("", root_key),
+                )
+            )
+        elif root_key in _IGNORED_KEYWORDS:
+            diagnostics.extend(_ignored_keyword_diagnostics({root_key: data[root_key]}, ""))
+        else:
+            root_model_keys.append(root_key)
+    if root_model_keys:
+        # One rule, stated once: the root carries metadata, models live in a
+        # definition section. Listing every root keyword separately said neither.
+        rendered = ", ".join(repr(root_key) for root_key in root_model_keys)
         diagnostics.append(
             _diagnostic(
-                code,
-                f"schema keyword {root_key!r} is not supported at the document root",
-                _pointer("", root_key),
+                "unsupported-root-schema",
+                "models must be declared under '$defs' or 'definitions': the document root "
+                f"is metadata-only, so its schema keywords ({rendered}) describe no model",
+                "",
             )
         )
     locations_by_name: dict[str, list[str]] = {}

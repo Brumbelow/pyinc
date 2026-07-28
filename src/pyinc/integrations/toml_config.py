@@ -94,6 +94,108 @@ _DIRECTORIES = DirectoryResource()
 # ---------------------------------------------------------------------------
 
 
+class _TomlNestingLimitError(ValueError):
+    pass
+
+
+# Table and array nesting is capped because every section re-emits the dot path of
+# all its ancestors: `config_sections_payload` grows with the square of the nesting
+# depth, so this cap is what bounds the *cache*, not just the parse. `json_config`
+# caps `_MAX_JSON_DEPTH` and `xml_config` caps `_MAX_XML_DEPTH` for the same reason
+# and against the same budget — a document at the cap must not cache more than
+# ~1 MiB.
+#
+# Unlike in those two, the budget is not what binds here. Depth counts the
+# document's implicit top-level table as level 1, the way `json_config` counts the
+# outermost `{`, so `[a.b]` is three levels. `freeze` refuses to snapshot a value
+# nested deeper than `value._MAX_SNAPSHOT_DEPTH`, which is 200, and
+# `_toml_cutoff_value` spends *two* snapshot levels on every table against one on
+# every array: it rewrites each table as a tuple of `(key, value)` pairs, so the
+# pair tuple is a level of its own. An all-table document therefore reaches snapshot
+# depth 2 x 100 = exactly 200 at this cap and cannot exceed it — measured, 99 nested
+# inline tables (100 levels with the root) freeze and 100 raise
+# `UnsupportedValueError` out of the cutoff, while an all-array document at the same
+# cap reaches snapshot depth 101 and every mixture of the two falls between. That
+# relation is what makes the escape unreachable rather than merely caught, and it is
+# the reason this cap sits at half of `json_config`'s: TOML's cutoff value costs
+# twice as much per table as JSON's, which freezes the parsed document as-is.
+#
+# The ~1 MiB budget would have allowed considerably more. Measured with 20-character
+# table names, a document at this cap caches 205 KiB of section payload text
+# (101 KiB of it section names); at 200 levels the same document would cache
+# 824 KiB, still inside the budget but past what `freeze` will accept. 100 levels is
+# an order of magnitude deeper than any real configuration document.
+_MAX_TOML_DEPTH = 100
+
+
+def _structure_depth(value: object) -> int:
+    """Report the deepest table/array nesting in a parsed document without recursing.
+
+    The document's own top-level table is level 1, so a flat file is 1 and `[a.b]`
+    is 3. The traversal keeps its own stack, so the answer depends only on the
+    parsed document — never on how much of the interpreter's recursion budget the
+    caller has already spent.
+    """
+    deepest = 0
+    pending: list[tuple[object, int]] = [(value, 1)]
+
+    while pending:
+        current, depth = pending.pop()
+        children: list[object]
+        if isinstance(current, dict):
+            children = list(current.values())
+        elif isinstance(current, list):
+            children = list(current)
+        else:
+            continue
+        if depth > deepest:
+            deepest = depth
+        pending.extend((child, depth + 1) for child in children)
+
+    return deepest
+
+
+def _load_toml(text: str) -> dict[str, Any]:
+    """Parse `text`, rejecting nesting past `_MAX_TOML_DEPTH` as a decode error.
+
+    The depth is measured on the parsed document rather than on the file text.
+    TOML spreads nesting across table headers, dotted keys, inline tables, and
+    arrays, and brackets and braces also appear inside comments and in four kinds
+    of string literal, so counting depth from the text would mean re-lexing the
+    grammar — and any disagreement with `tomllib` would reject documents this
+    integration accepts today. `tomllib` builds header-nested and dotted-key tables
+    iteratively, so those reach the check however deep they go (measured to 1500
+    levels under the default recursion limit); inline tables and arrays recurse, so
+    a document nested hundreds of levels deep in *those* can exhaust the parser
+    before the cap is reported (measured, again under the default limit and from a
+    fresh thread: 330 inline-table levels and 495 array levels still parse). Both
+    outcomes are fixed strings under `toml-decode-error`; the residual is disclosed
+    in `docs/integration-contract.md`.
+    """
+    parsed = tomllib.loads(text)
+    if _structure_depth(parsed) > _MAX_TOML_DEPTH:
+        raise _TomlNestingLimitError(
+            f"TOML nesting exceeds the supported limit of {_MAX_TOML_DEPTH} levels"
+        )
+    return parsed
+
+
+# `tomllib` recurses once per inline-table and once per array level, so which frame
+# runs out of the interpreter's recursion budget — and so which message CPython
+# raises — depends on how much stack the caller had already spent, not on the file.
+# CPython names whichever frame ran out, so the same document can report a different
+# message from different call depths. These payloads are cached, so a fixed string
+# is emitted instead and the message stops recording which frame ran out.
+#
+# That closes the message axis, not the outcome axis: `tomllib` still descends once
+# per inline-table and array level, so whether a document within the cap parses at
+# all remains a property of the call site as well as of the file, and a caller
+# entering with its stack nearly spent turns a valid document into this diagnostic
+# and drops its cutoff token back to the raw file text. `json_config` and
+# `xml_config` emit the same shape for the same reason and carry the same residual.
+_STACK_EXHAUSTED_DIAGNOSTIC = "TOML parsing exhausted the interpreter stack"
+
+
 def _toml_value_type(value: Any) -> str:
     if isinstance(value, bool):
         return "boolean"
@@ -124,36 +226,54 @@ def _walk_sections(
     data: dict[str, Any],
     prefix: str,
 ) -> list[ConfigSectionPayload]:
+    """Collect every table in document pre-order, deepest nesting included.
+
+    The traversal keeps its own stack rather than recursing, so the payload a
+    document produces depends only on the document — never on how much of the
+    interpreter's recursion budget the caller has already spent.
+    """
     sections: list[ConfigSectionPayload] = []
-    keys: list[ConfigKeyPayload] = []
-    subsections: list[str] = []
-    section_name = prefix or "<root>"
+    pending: list[tuple[dict[str, Any], str]] = [(data, prefix)]
 
-    for key, value in sorted(data.items()):
-        if isinstance(value, dict):
-            child_prefix = f"{prefix}.{key}" if prefix else key
-            subsections.append(child_prefix)
-            sections.extend(_walk_sections(value, child_prefix))
-        else:
-            keys.append(
-                (
-                    section_name,
-                    key,
-                    _toml_value_type(value),
-                    _toml_value_to_string(value),
+    while pending:
+        current, current_prefix = pending.pop()
+        section_name = current_prefix or "<root>"
+        keys: list[ConfigKeyPayload] = []
+        subsections: list[str] = []
+        children: list[tuple[dict[str, Any], str]] = []
+
+        for key, value in sorted(current.items()):
+            if isinstance(value, dict):
+                child_prefix = f"{current_prefix}.{key}" if current_prefix else key
+                subsections.append(child_prefix)
+                children.append((value, child_prefix))
+            else:
+                keys.append(
+                    (
+                        section_name,
+                        key,
+                        _toml_value_type(value),
+                        _toml_value_to_string(value),
+                    )
                 )
-            )
 
-    sections.insert(0, (section_name, tuple(keys), tuple(subsections)))
+        sections.append((section_name, tuple(keys), tuple(subsections)))
+        # Reversed so the first subsection is popped first, preserving document order.
+        pending.extend(reversed(children))
+
     return sections
 
 
 def _config_cutoff_token(text: str) -> tuple[str, str]:
     try:
-        parsed = tomllib.loads(text)
+        parsed = _load_toml(text)
         snapshot = freeze(_toml_cutoff_value(parsed))
         return ("parsed", repr(snapshot))
-    except tomllib.TOMLDecodeError:
+    except (ValueError, RecursionError, OverflowError):
+        # `_load_toml` bounds `_toml_cutoff_value`'s recursion and `freeze`'s walk
+        # at the cap, so neither can raise for a document that got this far. The
+        # clause stays defensive anyway: an unforeseen path degrades to the raw
+        # text, which only misses a cutoff, rather than escaping `config_analysis`.
         return ("raw", text)
 
 
@@ -173,8 +293,8 @@ def _toml_cutoff_value(value: Any) -> object:
 
 def _try_parse_toml(text: str) -> dict[str, Any] | None:
     try:
-        return tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
+        return _load_toml(text)
+    except (ValueError, RecursionError, OverflowError):
         return None
 
 
@@ -283,9 +403,11 @@ def config_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPaylo
     if not text:
         return ()
     try:
-        parsed = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
+        parsed = _load_toml(text)
+    except (ValueError, OverflowError) as exc:
         return (("toml-decode-error", str(exc)),)
+    except RecursionError:
+        return (("toml-decode-error", _STACK_EXHAUSTED_DIAGNOSTIC),)
     return _config_shape_diagnostics(parsed)
 
 

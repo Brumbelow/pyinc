@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
+import json
 import os
 import sys
 import typing
+import weakref
 from dataclasses import MISSING, dataclass, field
 from pathlib import Path
 from types import FunctionType
@@ -17,6 +20,8 @@ from pyinc import (
     CheckpointManifestError,
     CheckpointVersionError,
     Database,
+    DirectoryResource,
+    FileResource,
     InMemoryArtifactStore,
     Input,
     InputKeyError,
@@ -41,6 +46,11 @@ from pyinc.value import (
 
 _DIGEST = "a" * 64
 _IMPLEMENTATION_DIGEST = "b" * 64
+
+
+def _tallied(key: str) -> str:
+    calls = Path(f"{key}.calls")
+    return calls.read_text(encoding="utf-8") if calls.exists() else ""
 
 
 class _RuntimeType:
@@ -223,6 +233,83 @@ class _InvalidLabelResource(Resource[str, str, str]):
 
 
 @dataclass(frozen=True)
+class _UnloadableResource(Resource[str, str, str]):
+    def probe(self, key: str) -> str:
+        return f"probe:{key}"
+
+    def load(self, db: Database, key: str) -> str:
+        raise RuntimeError(f"cannot load {key}")
+
+    def label(self, key: str) -> str:
+        return f"unloadable[{key}]"
+
+
+@dataclass(frozen=True)
+class _TallyingFailingResource(Resource[str, str, tuple[str, ...]]):
+    """Never loads, appending one character per call to ``<key>.calls``.
+
+    The tally lives beside the resource's own key because a query's capture set
+    may not contain mutable state -- a counter attribute or module global is
+    rejected before the first ``get()``.
+    """
+
+    def _tally(self, key: str, event: str) -> None:
+        with open(f"{key}.calls", "a", encoding="utf-8") as handle:
+            handle.write(event)
+
+    def probe(self, key: str) -> tuple[str, ...]:
+        self._tally(key, "p")
+        return ("missing",)
+
+    def load(self, db: Database, key: str) -> str:
+        self._tally(key, "l")
+        raise FileNotFoundError(key)
+
+    def label(self, key: str) -> str:
+        return f"tallying[{key}]"
+
+
+class _LoadPayload:
+    """Stands in for whatever a load allocates before it raises."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray(4 * 1024 * 1024)
+
+
+class _PayloadError(RuntimeError):
+    def __init__(self, payload: weakref.ref[_LoadPayload]) -> None:
+        super().__init__("payload load failed")
+        self.payload = payload
+
+
+@dataclass(frozen=True)
+class _AllocatingFailingResource(Resource[str, str, str]):
+    """Allocates in the frame that raises, reachable only through its traceback."""
+
+    def probe(self, key: str) -> str:
+        return f"probe:{key}"
+
+    def load(self, db: Database, key: str) -> str:
+        payload = _LoadPayload()
+        raise _PayloadError(weakref.ref(payload))
+
+    def label(self, key: str) -> str:
+        return f"allocating[{key}]"
+
+
+@dataclass(frozen=True)
+class _UnprobeableResource(Resource[str, str, str]):
+    def probe(self, key: str) -> str:
+        raise RuntimeError(f"cannot probe {key}")
+
+    def load(self, db: Database, key: str) -> str:
+        raise AssertionError("load must not run")
+
+    def label(self, key: str) -> str:
+        return f"unprobeable[{key}]"
+
+
+@dataclass(frozen=True)
 class _RichDataclass:
     count: int = 1
     values: list[int] = field(default_factory=list)
@@ -325,6 +412,199 @@ def test_resource_labels_must_be_nonempty_strings() -> None:
         _InvalidLabelResource(1).read(db, "value")
     with pytest.raises(ValueError, match="non-empty string"):
         _InvalidLabelResource("").read(db, "value")
+
+
+def test_failed_resource_loads_are_recorded_only_when_the_probe_is_total() -> None:
+    db = Database()
+
+    partial = _UnprobeableResource()
+    with pytest.raises(RuntimeError, match="cannot probe"):
+        partial.read(db, "value")
+    assert not db._resource_registry
+    assert db.statistics().resource_count == 0
+
+    total = _UnloadableResource()
+    with pytest.raises(RuntimeError, match="cannot load"):
+        total.read(db, "value")
+    record = db._records[db._resource_key(total, "value")]
+    assert record.is_failed
+    assert record.failure == "RuntimeError: cannot load value"
+    assert record.probe == "probe:value"
+    assert record.snapshot is None
+    assert record.digest == ""
+    assert record.checked_in_request == db._request_counter
+    assert record.failure_exc is None
+    assert db.statistics().resource_count == 1
+
+
+def test_failing_resource_loads_once_per_request_across_a_fan_out(tmp_path: Path) -> None:
+    resource = _TallyingFailingResource()
+    target = str(tmp_path / "target")
+
+    @query
+    def reader(db: Database, key: str, index: int) -> str:
+        try:
+            return resource.read(db, key)
+        except FileNotFoundError:
+            return f"<default-{index}>"
+
+    @query
+    def fan_out(db: Database, key: str) -> tuple[str, ...]:
+        return tuple(reader(db, key, index) for index in range(20))
+
+    db = Database()
+    assert db.get(fan_out, target)[0] == "<default-0>"
+    # One load per request, however many readers observe it. The probe either
+    # side of it is probe_and_load's default implementation followed by the
+    # second observation taken alongside the failure.
+    assert _tallied(target) == "plp"
+    revision = db.revision
+    executions = db.statistics().query_executions
+
+    for _ in range(10):
+        assert len(db.get(fan_out, target)) == 20
+
+    assert _tallied(target) == "plp" * 11
+    assert db.revision == revision
+    assert db.statistics().query_executions == executions
+
+
+def test_repeated_failing_reads_within_one_query_body_load_once(tmp_path: Path) -> None:
+    resource = _TallyingFailingResource()
+    target = str(tmp_path / "target")
+
+    @query
+    def read_repeatedly(db: Database, key: str, times: int) -> int:
+        handled = 0
+        for _ in range(times):
+            try:
+                resource.read(db, key)
+            except FileNotFoundError:
+                handled += 1
+        return handled
+
+    db = Database()
+    assert db.get(read_repeatedly, target, 50) == 50
+    assert _tallied(target) == "plp"
+
+
+def test_failing_load_exception_is_reused_only_inside_its_own_request() -> None:
+    db = Database()
+    resource = _AllocatingFailingResource()
+
+    with db._request_scope():
+        with pytest.raises(_PayloadError) as first:
+            resource.read(db, "value")
+        record = db._records[db._resource_key(resource, "value")]
+        assert record.failure_exc is first.value
+        with pytest.raises(_PayloadError) as second:
+            resource.read(db, "value")
+        assert second.value is first.value
+
+    assert record.failure_exc is None
+    assert record.failure_traceback is None
+    with pytest.raises(_PayloadError) as later:
+        resource.read(db, "value")
+    assert later.value is not first.value
+
+
+def test_failing_load_frames_are_released_when_the_request_ends() -> None:
+    db = Database()
+    resource = _AllocatingFailingResource()
+
+    payload: weakref.ref[_LoadPayload] | None = None
+    try:
+        resource.read(db, "value")
+    except _PayloadError as exc:
+        payload = exc.payload
+
+    record = db._records[db._resource_key(resource, "value")]
+    assert record.is_failed
+    # The exception serves re-reads inside its own request and nothing else, so
+    # the record stops pinning the load frame (and its 4 MiB local) once that
+    # request is over. Resource records are never evicted; this one would
+    # otherwise hold the frame until a load finally succeeded.
+    assert record.failure_exc is None
+    assert record.failure_traceback is None
+    gc.collect()
+    assert payload is not None
+    assert payload() is None
+
+
+def test_checkpoints_omit_failed_resource_records_and_their_readers(tmp_path: Path) -> None:
+    files = FileResource()
+    missing = tmp_path / "missing.txt"
+    present = tmp_path / "present.txt"
+    present.write_text("here", encoding="utf-8")
+
+    @query(key="checkpoint-optional-read")
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+    assert db.get(read_optional, str(missing)) == "<default>"
+    assert db.get(read_optional, str(present)) == "here"
+
+    checkpoint = db.save_checkpoint()
+    manifest = json.loads(cast(bytes, store.get(checkpoint)).decode("utf-8"))
+    saved = {(entry["identity"], entry["args_digest"]) for entry in manifest["records"]}
+    missing_key, _ = db._query_key(read_optional, (str(missing),), {})
+    present_key, _ = db._query_key(read_optional, (str(present),), {})
+    assert (present_key.identity, present_key.args_digest) in saved
+    assert (missing_key.identity, missing_key.args_digest) not in saved
+    assert not any(str(missing) in entry["label"] for entry in manifest["records"])
+
+    warmed = Database(store=store)
+    warmed.load_checkpoint(checkpoint)
+    missing.write_text("late", encoding="utf-8")
+    assert warmed.get(read_optional, str(missing)) == "late"
+
+
+def test_checkpoints_omit_readers_of_an_unrecordable_failure(tmp_path: Path) -> None:
+    directories = DirectoryResource()
+    path = tmp_path / "listing"
+    path.mkdir()
+    (path / "a.txt").write_text("a", encoding="utf-8")
+
+    @query(key="checkpoint-optional-listing")
+    def names(db: Database, dirname: str) -> tuple[str, ...]:
+        try:
+            return directories.read(db, dirname)
+        except NotADirectoryError:
+            return ("<caught>",)
+
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+    assert db.get(names, str(path)) == ("a.txt",)
+
+    # Neither the load nor the probe survives a directory replaced by a file, so
+    # the resource record keeps the listing it last saw while the reader is
+    # correctly re-executed and caches the handled failure. Persisting that pair
+    # would warm a value the record cannot re-derive.
+    (path / "a.txt").unlink()
+    path.rmdir()
+    path.write_text("not a directory", encoding="utf-8")
+    assert db.get(names, str(path)) == ("<caught>",)
+
+    checkpoint = db.save_checkpoint()
+    manifest = json.loads(cast(bytes, store.get(checkpoint)).decode("utf-8"))
+    saved = {(entry["identity"], entry["args_digest"]) for entry in manifest["records"]}
+    reader_key, _ = db._query_key(names, (str(path),), {})
+    assert (reader_key.identity, reader_key.args_digest) not in saved
+    assert not any(entry["kind"] == "resource" for entry in manifest["records"])
+
+    path.unlink()
+    path.mkdir()
+    (path / "a.txt").write_text("a", encoding="utf-8")
+
+    warmed = Database(store=store)
+    warmed.load_checkpoint(checkpoint)
+    assert warmed.get(names, str(path)) == Database().get(names, str(path)) == ("a.txt",)
+    assert warmed.statistics().query_executions == 1
 
 
 def test_materialized_call_validation_covers_strict_and_checked_modes() -> None:

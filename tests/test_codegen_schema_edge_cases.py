@@ -9,10 +9,12 @@ import pytest
 from pyinc import Database
 from pyinc_codegen.models import DiagnosticPayload, ModelPayload
 from pyinc_codegen.schema import (
+    _IGNORED_KEYWORDS,
     _annotation_diagnostics,
     _build_enum,
     _build_model,
     _canonical_json_token,
+    _constraint_shape_problem,
     _decode_pointer_segment,
     _definition_entries,
     _DuplicateKeyError,
@@ -20,19 +22,24 @@ from pyinc_codegen.schema import (
     _effective_type,
     _enum_type_matches,
     _field_collision_diagnostics,
+    _ignored_keyword_diagnostics,
     _InvalidJsonError,
+    _is_null_schema,
     _load,
     _local_ref_target,
+    _mapping_value_schema,
     _module_name_diagnostics,
     _object_from_pairs,
     _parse_float,
     _percent_decode,
+    _render_combinator,
     _render_doc,
     _render_python,
     _render_type,
     _schema_node_diagnostics,
     _snake,
     _type_checking_imports,
+    _typing_import_names,
     definition_model,
     definition_names,
     definition_pointer,
@@ -165,10 +172,8 @@ def test_annotation_and_schema_node_diagnostics_cover_context_branches() -> None
     assert _effective_type(["string"]) == ["string"]
     assert _effective_type(["string", 1]) == ["string", 1]
 
-    enum_codes = _codes(
-        _schema_node_diagnostics({"enum": ["x"]}, "/enum", definition_context=False)
-    )
-    assert enum_codes == {"unsupported-construct"}
+    # An inline enum selects the shape in every context, so nothing is reported.
+    assert _schema_node_diagnostics({"enum": ["x"]}, "/enum", definition_context=False) == ()
 
     conflict_codes = _codes(
         _schema_node_diagnostics(
@@ -187,6 +192,221 @@ def test_annotation_and_schema_node_diagnostics_cover_context_branches() -> None
         )
     )
     assert object_codes == set()
+
+    # Ignored keywords are removed from the structural set, so they are never
+    # reported as unsupported or as conflicting with the selected shape.
+    ignored_cases: tuple[tuple[dict[str, object], bool], ...] = (
+        ({"type": "string", "format": "email"}, False),
+        ({"$ref": "#/$defs/A", "minimum": 0}, False),
+        ({"enum": ["x"], "default": "x"}, True),
+    )
+    for spec, definition_context in ignored_cases:
+        codes = _codes(
+            _schema_node_diagnostics(spec, "/node", definition_context=definition_context)
+        )
+        assert codes == {"ignored-constraint"}
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "problem"),
+    [
+        ("minimum", 0, None),
+        ("minimum", 1.5, None),
+        ("minimum", True, "a number"),
+        ("exclusiveMaximum", "10", "a number"),
+        ("multipleOf", 2, None),
+        ("multipleOf", 0, "a number greater than zero"),
+        ("maxLength", 0, None),
+        ("minItems", -1, "a non-negative integer"),
+        ("maxItems", 1.0, "a non-negative integer"),
+        ("format", "email", None),
+        ("pattern", 7, "a string"),
+        ("uniqueItems", True, None),
+        ("readOnly", "yes", "a boolean"),
+        ("examples", [1], None),
+        ("examples", {}, "an array"),
+        ("default", {"anything": [1, None]}, None),
+    ],
+)
+def test_constraint_shape_problem_pins_each_accepted_value_shape(
+    name: str,
+    value: object,
+    problem: str | None,
+) -> None:
+    assert _constraint_shape_problem(name, value) == problem
+
+
+def test_ignored_keyword_diagnostics_sort_by_keyword_and_separate_shape_failures() -> None:
+    diagnostics = _ignored_keyword_diagnostics(
+        {
+            "type": "string",
+            "minLength": 1,
+            "format": 7,
+            "default": "x",
+            "additionalProperties": {"type": "string"},
+        },
+        "/node",
+    )
+    assert [(code, pointer) for code, _message, _severity, pointer in diagnostics] == [
+        ("unsupported-construct", "/node/additionalProperties"),
+        ("ignored-constraint", "/node/default"),
+        ("invalid-constraint", "/node/format"),
+        ("ignored-constraint", "/node/minLength"),
+    ]
+    severities = {code: severity for code, _message, severity, _pointer in diagnostics}
+    assert severities == {
+        "unsupported-construct": "error",
+        "ignored-constraint": "warning",
+        "invalid-constraint": "error",
+    }
+    assert _ignored_keyword_diagnostics({"type": "string"}, "/node") == ()
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ({"type": "object", "additionalProperties": {"type": "string"}}, {"type": "string"}),
+        ({"additionalProperties": {"type": "string"}}, {"type": "string"}),
+        ({"type": ["object", "null"], "additionalProperties": {}}, {}),
+        ({"type": "object", "additionalProperties": False}, None),
+        ({"type": "string", "additionalProperties": {"type": "string"}}, None),
+        ({"$ref": "#/$defs/A", "additionalProperties": {"type": "string"}}, None),
+        ({"enum": ["a"], "additionalProperties": {"type": "string"}}, None),
+        ({"allOf": [{}], "additionalProperties": {"type": "string"}}, None),
+        ({"type": "object"}, None),
+    ],
+)
+def test_mapping_value_schema_only_claims_nodes_that_render_as_mappings(
+    spec: dict[str, object],
+    expected: dict[str, object] | None,
+) -> None:
+    assert _mapping_value_schema(spec) == expected
+
+
+def test_schema_valued_additional_properties_is_reported_only_where_it_is_ignored() -> None:
+    spec: dict[str, object] = {"type": "object", "additionalProperties": {"type": "string"}}
+    # Property position compiles it into the value type; a definition generates a
+    # dataclass instead, so there the keyword really is dropped.
+    assert _schema_node_diagnostics(spec, "/node", definition_context=False) == ()
+    assert [
+        (code, pointer)
+        for code, _message, _severity, pointer in _schema_node_diagnostics(
+            spec, "/node", definition_context=True
+        )
+    ] == [("unsupported-construct", "/node/additionalProperties")]
+
+
+@pytest.mark.parametrize(
+    ("branch", "is_null"),
+    [
+        ({"type": "null"}, True),
+        ({"type": "null", "title": "nothing"}, True),
+        ({"type": "null", "minimum": 0}, False),
+        ({"type": ["null"]}, False),
+        ({"enum": [None]}, False),
+        ("null", False),
+    ],
+)
+def test_null_branch_recognition_is_limited_to_the_bare_null_schema(
+    branch: object,
+    is_null: bool,
+) -> None:
+    assert _is_null_schema(branch) is is_null
+
+
+def test_render_combinator_reports_each_unsupported_shape_at_its_keyword() -> None:
+    for keyword, branches, fragment in (
+        ("allOf", [{}, {}], "single-branch"),
+        ("allOf", {"$ref": "#/$defs/A"}, "single-branch"),
+        ("anyOf", [{"type": "string"}, {"type": "integer"}], "union"),
+        ("anyOf", [], "union"),
+    ):
+        rendered, refs, diagnostics, allows_none = _render_combinator(
+            keyword, branches, lambda name: True, "/node"
+        )
+        assert (rendered, refs, allows_none) == ("object", (), False)
+        assert [(code, pointer) for code, _m, _s, pointer in diagnostics] == [
+            ("unsupported-construct", f"/node/{keyword}")
+        ]
+        assert fragment in diagnostics[0][1]
+
+    # A branch that is itself nullable is not wrapped twice.
+    assert _render_combinator(
+        "anyOf",
+        [{"type": ["string", "null"]}, {"type": "null"}],
+        lambda name: False,
+        "/node",
+    ) == ("str | None", (), (), True)
+    # Diagnostics from inside the selected branch are reported at that branch.
+    _rendered, _refs, diagnostics, _allows_none = _render_combinator(
+        "allOf", [{"$ref": "#/$defs/Missing"}], lambda name: False, "/node"
+    )
+    assert [(code, pointer) for code, _m, _s, pointer in diagnostics] == [
+        ("unknown-ref", "/node/allOf/0/$ref")
+    ]
+
+
+def test_two_null_branches_name_no_type_to_make_optional() -> None:
+    rendered, refs, diagnostics, allows_none = _render_combinator(
+        "anyOf", [{"type": "null"}, {"type": "null"}], lambda name: True, "/node"
+    )
+    assert (rendered, refs, allows_none) == ("object", (), False)
+    assert [(code, pointer) for code, _m, _s, pointer in diagnostics] == [
+        ("unsupported-construct", "/node/anyOf")
+    ]
+    assert "names no type" in diagnostics[0][1]
+
+
+def test_null_branch_annotations_are_reported_in_branch_order() -> None:
+    _rendered, _refs, diagnostics, _allows_none = _render_combinator(
+        "anyOf",
+        [{"type": "null", "title": 1}, {"$ref": "#/$defs/Missing"}],
+        lambda name: False,
+        "/node",
+    )
+    assert [(code, pointer) for code, _m, _s, pointer in diagnostics] == [
+        ("invalid-annotation", "/node/anyOf/0/title"),
+        ("unknown-ref", "/node/anyOf/1/$ref"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ({"allOf": [{}], "type": "object"}, [("ambiguous-schema-combination", "/node/type")]),
+        ({"anyOf": [{}], "oneOf": [{}]}, [("ambiguous-schema-combination", "/node/oneOf")]),
+        ({"allOf": [{}], "anyOf": [{}]}, [("ambiguous-schema-combination", "/node/anyOf")]),
+        ({"const": "x", "type": "string"}, []),
+        ({"const": "x", "enum": ["x"]}, [("ambiguous-schema-combination", "/node/const")]),
+        ({"const": "x", "not": {}}, [("unsupported-construct", "/node/not")]),
+    ],
+)
+def test_shape_selecting_keywords_report_their_siblings(
+    spec: dict[str, object],
+    expected: list[tuple[str, str]],
+) -> None:
+    diagnostics = _schema_node_diagnostics(spec, "/node", definition_context=False)
+    assert [(code, pointer) for code, _message, _severity, pointer in diagnostics] == expected
+
+
+def test_typing_import_names_are_ordered_and_only_emitted_when_used() -> None:
+    assert _typing_import_names(["str | None"], type_checking=False) == []
+    assert _typing_import_names(["str | None"], type_checking=True) == ["TYPE_CHECKING"]
+    assert _typing_import_names(["Literal['a']"], type_checking=False) == ["Literal"]
+    assert _typing_import_names(["Literal['a']", "list[Literal[1]]"], type_checking=True) == [
+        "TYPE_CHECKING",
+        "Literal",
+    ]
+
+
+def test_prefix_items_suppresses_only_the_unconstrained_items_warning() -> None:
+    rendered, refs, diagnostics, allows_none = _render_type(
+        {"type": "array", "prefixItems": [{"type": "string"}]},
+        lambda name: False,
+        "/tuple",
+        validate_current=False,
+    )
+    assert (rendered, refs, diagnostics, allows_none) == ("list[object]", (), (), False)
 
 
 @pytest.mark.parametrize(
@@ -211,13 +431,39 @@ def test_annotation_and_schema_node_diagnostics_cover_context_branches() -> None
         ),
         ({"enum": "bad"}, lambda name: False, "object", {"invalid-enum"}),
         ({"enum": []}, lambda name: False, "object", {"empty-enum"}),
-        ({"enum": [1, 1]}, lambda name: False, "object", {"duplicate-enum-value"}),
+        ({"enum": [1, 1]}, lambda name: False, "Literal[1, 1]", {"duplicate-enum-value"}),
         ({"enum": [[]]}, lambda name: False, "object", {"unsupported-enum-value"}),
         (
             {"type": "string", "enum": [1]},
             lambda name: False,
-            "str",
+            "Literal[1]",
             {"enum-type-mismatch"},
+        ),
+        ({"const": 1.5}, lambda name: False, "object", {"unsupported-const-value"}),
+        (
+            {"type": "integer", "const": "x"},
+            lambda name: False,
+            "Literal['x']",
+            {"const-type-mismatch"},
+        ),
+        (
+            {"allOf": [{"type": "string"}, {"type": "integer"}]},
+            lambda name: False,
+            "object",
+            {"unsupported-construct"},
+        ),
+        ({"allOf": "one"}, lambda name: False, "object", {"unsupported-construct"}),
+        (
+            {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            lambda name: False,
+            "object",
+            {"unsupported-construct"},
+        ),
+        (
+            {"anyOf": [{"type": "string"}, {"type": "null", "minimum": 0}]},
+            lambda name: False,
+            "object",
+            {"unsupported-construct"},
         ),
         ({"type": []}, lambda name: False, "object", {"unsupported-union"}),
         ({"type": ["string", 1]}, lambda name: False, "object", {"unsupported-union"}),
@@ -232,6 +478,12 @@ def test_annotation_and_schema_node_diagnostics_cover_context_branches() -> None
             lambda name: False,
             "list[object]",
             {"unconstrained-array-items"},
+        ),
+        (
+            {"type": "array", "items": [{"type": "string"}]},
+            lambda name: False,
+            "list[object]",
+            {"unsupported-tuple-items"},
         ),
         (
             {"type": "object", "properties": []},
@@ -378,6 +630,53 @@ def test_build_model_covers_invalid_definition_and_object_metadata() -> None:
     assert valid_field[3] == ""
 
 
+def test_bare_object_definition_warns_while_the_same_property_is_a_mapping() -> None:
+    model = _build_model("Bag", {"type": "object"}, lambda name: False, "/$defs/Bag")
+    assert (model[1], model[2]) == ("object", ())
+    assert [(code, severity, pointer) for code, _message, severity, pointer in model[7]] == [
+        ("unconstrained-object-model", "warning", "/$defs/Bag")
+    ]
+    # In property position the same schema keeps its data as a mapping, so the
+    # asymmetry that motivates the warning does not exist there.
+    assert _render_type({"type": "object"}, lambda name: False, "/value") == (
+        "dict[str, object]",
+        (),
+        (),
+        False,
+    )
+    # A mapping value schema does constrain the instance. It is rejected on its
+    # own keyword, and one cause reports one diagnostic.
+    mapping = _build_model(
+        "Bag",
+        {"type": "object", "additionalProperties": {"type": "string"}},
+        lambda name: False,
+        "/$defs/Bag",
+    )
+    assert [(code, pointer) for code, _message, _severity, pointer in mapping[7]] == [
+        ("unsupported-construct", "/$defs/Bag/additionalProperties")
+    ]
+
+
+def test_build_model_selects_a_shape_keyword_before_the_type_driven_branch() -> None:
+    const_model = _build_model(
+        "Kind",
+        {"type": "object", "const": "ticket"},
+        lambda name: False,
+        "/$defs/Kind",
+    )
+    assert (const_model[1], const_model[4]) == ("alias", "Literal['ticket']")
+    assert _codes(const_model[7]) == {"const-type-mismatch"}
+
+    ref_model = _build_model(
+        "Ref",
+        {"$ref": "#/$defs/Target", "type": "object", "properties": {}},
+        lambda name: True,
+        "/$defs/Ref",
+    )
+    assert (ref_model[1], ref_model[4], ref_model[6]) == ("alias", "Target", ("Target",))
+    assert _codes(ref_model[7]) == {"ambiguous-schema-combination"}
+
+
 def test_build_model_reports_invalid_required_and_properties_containers() -> None:
     invalid_required = _build_model(
         "Model",
@@ -471,8 +770,64 @@ def test_document_queries_cover_invalid_roots_sections_duplicates_and_empty_inde
     codes = _codes(document_diagnostics(db, str(schema_path)))
     assert {"invalid-description", "invalid-annotation", "duplicate-definition"} <= codes
 
+    _write_schema(
+        schema_path,
+        {"oneOf": [{"type": "string"}], "type": "object", "properties": {}, "default": 1},
+    )
+    root = document_diagnostics(db, str(schema_path))
+    assert [(code, pointer) for code, _message, _severity, pointer in root] == [
+        ("ignored-constraint", "/default"),
+        ("unsupported-construct", "/oneOf"),
+        ("unsupported-root-schema", ""),
+    ]
+    assert "'properties', 'type'" in root[2][1]
+
     _write_schema(schema_path, {})
     assert index_init(db, str(schema_path)) == "__all__: list[str] = []\n"
+
+
+_ROOT_IGNORED_VALUES: dict[str, object] = {
+    "additionalProperties": False,
+    "default": 1,
+    "deprecated": True,
+    "examples": [1],
+    "exclusiveMaximum": 10,
+    "exclusiveMinimum": 0,
+    "format": "email",
+    "maxItems": 5,
+    "maxLength": 5,
+    "maximum": 10,
+    "minItems": 1,
+    "minLength": 1,
+    "minimum": 0,
+    "multipleOf": 2,
+    "pattern": "^a$",
+    "readOnly": True,
+    "uniqueItems": True,
+    "writeOnly": True,
+}
+
+
+def test_ignored_keywords_at_the_document_root_warn_without_blocking(tmp_path: Path) -> None:
+    assert set(_ROOT_IGNORED_VALUES) == set(_IGNORED_KEYWORDS)
+    schema_path = tmp_path / "schema.json"
+    db = Database()
+    defs = {"$defs": {"K": {"type": "object", "properties": {"a": {"type": "string"}}}}}
+
+    for keyword, value in _ROOT_IGNORED_VALUES.items():
+        _write_schema(schema_path, {**defs, keyword: value})
+        assert [
+            (code, severity, pointer)
+            for code, _message, severity, pointer in document_diagnostics(db, str(schema_path))
+        ] == [("ignored-constraint", "warning", f"/{keyword}")]
+
+    # A model keyword and an unrecognized keyword state the same rule once,
+    # against the whole document, and do block.
+    _write_schema(schema_path, {**defs, "type": "object", "wibble": 1})
+    assert [
+        (code, severity, pointer)
+        for code, _message, severity, pointer in document_diagnostics(db, str(schema_path))
+    ] == [("unsupported-root-schema", "error", "")]
 
 
 def test_definition_queries_return_safe_fallbacks_for_malformed_and_missing_data(

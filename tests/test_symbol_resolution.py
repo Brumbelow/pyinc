@@ -1769,6 +1769,8 @@ def test_class_model_captures_class_body_and_init_members(mode: str, tmp_path: P
 
     # A single base is recorded but not followed in Stage 1.
     assert model.unresolved_bases == ("Base",)
+    # An unresolvable base name is not a depth-cap truncation.
+    assert model.truncated_bases == ()
 
 
 def test_class_model_deterministic_member_order(tmp_path: Path) -> None:
@@ -1944,9 +1946,10 @@ def test_resolved_class_model_out_of_workspace_is_empty(tmp_path: Path) -> None:
 
     db = Database(mode="strict")
     payload = resolved_class_model_payload(db, str(root), str(outside), "Widget")
-    # path, qualified_name, members, unresolved_bases
+    # path, qualified_name, members, unresolved_bases, truncated_bases
     assert payload[2] == ()
     assert payload[3] == ()
+    assert payload[4] == ()
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -2120,6 +2123,8 @@ def test_class_model_base_cycle_terminates(tmp_path: Path) -> None:
     names = {member.name for member in model.members}
     # Cycle guard terminates and both classes contribute their own members.
     assert names == {"am", "bm"}
+    # Nothing is lost to a cycle, so nothing is reported as truncated.
+    assert model.truncated_bases == ()
 
 
 def test_class_model_base_depth_cap(tmp_path: Path) -> None:
@@ -2139,6 +2144,7 @@ def test_class_model_base_depth_cap(tmp_path: Path) -> None:
     assert "m7" in names
     assert "m8" not in names  # depth 8 is at the cap boundary
     assert "m9" not in names
+    assert model.truncated_bases == ("C8",)
 
 
 def test_class_model_subscripted_base_unwraps(tmp_path: Path) -> None:
@@ -2263,3 +2269,306 @@ def test_class_model_unrelated_edit_leaves_model_green(tmp_path: Path) -> None:
 
     assert first == second
     assert {m.name for m in second.members} == {"shared"}
+
+
+# ---------------------------------------------------------------------------
+# class_model (depth-aware base walk and truncation reporting)
+# ---------------------------------------------------------------------------
+
+
+def _base_chain(prefix: str, length: int, tail: str) -> str:
+    """``prefix1(prefix2)`` … ``prefixN(tail)``, one method per class."""
+    parts = []
+    for index in range(1, length + 1):
+        base = f"{prefix}{index + 1}" if index < length else tail
+        parts.append(
+            f"class {prefix}{index}({base}):\n"
+            f"    def from_{prefix.lower()}{index}(self) -> None:\n"
+            "        pass\n"
+        )
+    return "".join(parts)
+
+
+def test_class_model_subclass_never_reports_fewer_members_than_its_base(
+    tmp_path: Path,
+) -> None:
+    # `Root(L1, Mid)`. The L spine reaches `X` at depth 6, so `X`'s own base
+    # chain runs out of budget and `XBase2` is cut. `Mid` reaches the same `X`
+    # at depth 2, where the whole chain fits — but recording `X` as merely
+    # "visited" on the deep reach made the shallow one a no-op. `Root` then
+    # reported strictly fewer members than `Mid`, one of its own direct bases,
+    # and said nothing about the loss. Nothing here is past the cap (see
+    # `truncated_bases` below), so `Root` must cover `Mid` exactly.
+    root = tmp_path / "workspace"
+    path = root / "spine.py"
+    _write_file(
+        path,
+        "class XBase2:\n    def from_xbase2(self) -> None:\n        pass\n"
+        "class XBase(XBase2):\n    def from_xbase(self) -> None:\n        pass\n"
+        "class X(XBase):\n    def from_x(self) -> None:\n        pass\n"
+        + _base_chain("L", 5, "X")
+        + "class Mid(X):\n    def from_mid(self) -> None:\n        pass\n"
+        "class Root(L1, Mid):\n    def from_root(self) -> None:\n        pass\n",
+    )
+
+    db = Database(mode="strict")
+    model = class_model(db, root, path, "Root")
+    root_names = {member.name for member in model.members}
+    mid_names = {member.name for member in class_model(db, root, path, "Mid").members}
+
+    assert mid_names <= root_names
+    assert "from_xbase2" in root_names
+    assert model.unresolved_bases == ()
+    assert model.truncated_bases == ()
+
+
+@pytest.mark.parametrize(
+    ("right_length", "reaches_deep", "expected_truncated"),
+    [(6, False, ("Deep",)), (5, True, ())],
+)
+def test_class_model_revisits_only_strictly_shallower_reaches(
+    right_length: int,
+    reaches_deep: bool,
+    expected_truncated: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    # `Root(A1, B1)`. The A spine reaches `Near` at depth 7, leaving its base
+    # `Deep` at the cap. A B spine of the same length reaches `Near` at depth 7
+    # again — not strictly shallower, so nothing is re-walked and the loss
+    # stands and is reported. One link shorter reaches `Near` at depth 6, where
+    # `Deep` fits, so the walk is redone and the truncation report retracted.
+    root = tmp_path / "workspace"
+    path = root / "spines.py"
+    _write_file(
+        path,
+        "class Deep:\n    def from_deep(self) -> None:\n        pass\n"
+        "class Near(Deep):\n    def from_near(self) -> None:\n        pass\n"
+        + _base_chain("A", 6, "Near")
+        + _base_chain("B", right_length, "Near")
+        + "class Root(A1, B1):\n    def from_root(self) -> None:\n        pass\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "Root")
+    names = {member.name for member in model.members}
+    assert "from_near" in names
+    assert ("from_deep" in names) is reaches_deep
+    assert model.truncated_bases == expected_truncated
+    assert model.unresolved_bases == ()
+
+
+def test_class_model_names_the_base_the_depth_cap_stopped(tmp_path: Path) -> None:
+    # The same linear chain C0(C1(...(C9))) as the cap test, read from three
+    # starting points. Whatever the cap drops is named in `truncated_bases`
+    # instead of vanishing.
+    root = tmp_path / "workspace"
+    path = root / "chain.py"
+    lines = []
+    for i in range(10):
+        base = f"(C{i + 1})" if i < 9 else ""
+        lines.append(f"class C{i}{base}:\n    def m{i}(self) -> None:\n        pass\n")
+    _write_file(path, "".join(lines))
+    db = Database(mode="strict")
+
+    from_c0 = class_model(db, root, path, "C0")
+    assert "m8" not in {member.name for member in from_c0.members}
+    assert from_c0.truncated_bases == ("C8",)
+    assert from_c0.unresolved_bases == ()
+
+    # One link down the chain, the cap lands on C9 instead.
+    assert class_model(db, root, path, "C1").truncated_bases == ("C9",)
+
+    # Two links down, the whole remaining chain fits within the cap.
+    from_c2 = class_model(db, root, path, "C2")
+    assert {f"m{i}" for i in range(2, 10)} == {member.name for member in from_c2.members}
+    assert from_c2.truncated_bases == ()
+
+
+def test_class_model_truncated_base_reports_the_alias_as_written(tmp_path: Path) -> None:
+    # The same chain split one class per file, each importing the next as `Up`.
+    # Like `unresolved_bases`, the report names the base expression at the edge
+    # the cap stopped — the alias, not the class it resolves to.
+    root = tmp_path / "workspace"
+    for index in range(10):
+        body = f"class C{index}:\n    def m{index}(self) -> None:\n        pass\n"
+        if index < 9:
+            body = (
+                f"from c{index + 1} import C{index + 1} as Up\n\n\n"
+                f"class C{index}(Up):\n    def m{index}(self) -> None:\n        pass\n"
+            )
+        _write_file(root / f"c{index}.py", body)
+
+    model = class_model(Database(mode="strict"), root, root / "c0.py", "C0")
+    assert {member.name for member in model.members} == {f"m{i}" for i in range(8)}
+    assert model.truncated_bases == ("Up",)
+    assert model.unresolved_bases == ()
+
+
+def test_class_model_wide_diamond_keeps_every_reachable_member(tmp_path: Path) -> None:
+    # `N{k}` inherits from the next six classes, so nearly every class is
+    # reachable at several depths and the deepest reach comes first. Each one
+    # sits within `MAX_BASE_DEPTH` of `N0` by its shortest path, so a
+    # depth-aware walk recovers all twenty member sets. The recorded depth
+    # strictly decreases per revisit, which is what keeps this shape from
+    # re-walking exponentially.
+    levels, width = 20, 6
+    root = tmp_path / "workspace"
+    path = root / "wide.py"
+    blocks = []
+    for index in range(levels):
+        bases = ", ".join(f"N{j}" for j in range(index + 1, min(index + 1 + width, levels)))
+        suffix = f"({bases})" if bases else ""
+        blocks.append(f"class N{index}{suffix}:\n    def m{index}(self) -> None:\n        pass\n")
+    _write_file(path, "".join(reversed(blocks)))
+
+    model = class_model(Database(mode="strict"), root, path, "N0")
+    assert {member.name for member in model.members} == {f"m{i}" for i in range(levels)}
+    assert model.truncated_bases == ()
+    assert model.unresolved_bases == ()
+
+
+def test_class_model_multi_class_cycle_terminates(tmp_path: Path) -> None:
+    # A three-class cycle entered from outside it, plus a self-inheriting class.
+    # The depth-aware map still cuts both: a second lap around a cycle is never
+    # strictly shallower than the first, so it is never re-walked.
+    root = tmp_path / "workspace"
+    path = root / "cycle.py"
+    _write_file(
+        path,
+        "class A(B):\n    def am(self) -> None:\n        pass\n"
+        "class B(C):\n    def bm(self) -> None:\n        pass\n"
+        "class C(A):\n    def cm(self) -> None:\n        pass\n"
+        "class Enter(A):\n    def em(self) -> None:\n        pass\n"
+        "class Selfish(Selfish):\n    def sm(self) -> None:\n        pass\n",
+    )
+    db = Database(mode="strict")
+
+    model = class_model(db, root, path, "Enter")
+    assert {member.name for member in model.members} == {"em", "am", "bm", "cm"}
+    assert model.truncated_bases == ()
+    assert model.unresolved_bases == ()
+
+    selfish = class_model(db, root, path, "Selfish")
+    assert {member.name for member in selfish.members} == {"sm"}
+    assert selfish.truncated_bases == ()
+
+
+def test_class_model_shallower_override_wins_over_revisited_base(tmp_path: Path) -> None:
+    # `Root(A1, Repo, Widget)`. The A spine reaches `X` at depth 7, so `X`'s
+    # base `Z` sits at the cap and is cut. `Repo` re-reaches `X` at depth 2, so
+    # `Z` is walked at depth 3 — ahead of `Widget` at depth 1, which overrides
+    # `save`. Arrival order alone would hand `save` to the base `Z`; the
+    # winning definition is the one at the shortest inheritance distance.
+    root = tmp_path / "workspace"
+    path = root / "deep.py"
+    _write_file(
+        path,
+        "class Z:\n    def save(self) -> None:\n        pass\n"
+        "class X(Z):\n    pass\n"
+        "class Repo(X):\n    def from_repo(self) -> None:\n        pass\n"
+        + _base_chain("A", 6, "X")
+        + "class Widget(Z):\n    def save(self, force: bool) -> int:\n        return 0\n"
+        "class Root(A1, Repo, Widget):\n    pass\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "Root")
+    by_name = {member.name: member for member in model.members}
+    assert by_name["save"].defining_class == "Widget"
+    assert by_name["save"].defining_path == str(path)
+    assert by_name["save"].range.start.line == 27
+    assert by_name["save"].signature == Signature(
+        parameters=(
+            Parameter(name="self", annotation=None),
+            Parameter(name="force", annotation="bool"),
+        ),
+        return_annotation="int",
+    )
+    # Nothing is actually lost, so neither report fires.
+    assert model.truncated_bases == ()
+    assert model.unresolved_bases == ()
+
+
+def test_class_model_diamond_prefers_the_nearer_definition(tmp_path: Path) -> None:
+    # A plain diamond well inside the cap: `Z.m` sits at depth 2 through `A`
+    # while `W.m` sits at depth 1, so `W` wins even though depth-first arrival
+    # reaches `Z` first.
+    root = tmp_path / "workspace"
+    path = root / "diamond.py"
+    _write_file(
+        path,
+        "class Z:\n    def m(self) -> None:\n        pass\n"
+        "class A(Z):\n    def am(self) -> None:\n        pass\n"
+        "class W(Z):\n    def m(self, times: int) -> str:\n        return ''\n"
+        "class Root(A, W):\n    pass\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, path, "Root")
+    by_name = {member.name: member for member in model.members}
+    assert by_name["m"].defining_class == "W"
+    assert by_name["m"].range.start.line == 7
+    assert by_name["m"].signature == Signature(
+        parameters=(
+            Parameter(name="self", annotation=None),
+            Parameter(name="times", annotation="int"),
+        ),
+        return_annotation="str",
+    )
+    assert {member.name for member in model.members} == {"am", "m"}
+
+
+def test_class_model_equal_depth_tie_goes_left_to_right(tmp_path: Path) -> None:
+    # Nearest-definition-wins only reorders across depths; at equal depth the
+    # depth-first left-to-right arrival still decides, both for direct bases
+    # and for definitions one level further out.
+    root = tmp_path / "workspace"
+    path = root / "tie.py"
+    _write_file(
+        path,
+        "class L:\n    def m(self) -> int:\n        return 0\n"
+        "class R:\n    def m(self) -> str:\n        return ''\n"
+        "class GrandL(L):\n    pass\n"
+        "class GrandR(R):\n    pass\n"
+        "class Direct(L, R):\n    pass\n"
+        "class Indirect(GrandL, GrandR):\n    pass\n",
+    )
+    db = Database(mode="strict")
+
+    direct = {m.name: m for m in class_model(db, root, path, "Direct").members}
+    assert direct["m"].defining_class == "L"
+    assert direct["m"].signature == Signature(
+        parameters=(Parameter(name="self", annotation=None),),
+        return_annotation="int",
+    )
+
+    indirect = {m.name: m for m in class_model(db, root, path, "Indirect").members}
+    assert indirect["m"].defining_class == "L"
+
+
+def test_class_model_truncation_reports_every_stopped_edge(tmp_path: Path) -> None:
+    # `Root(A1, B1)`. Both spines end one step short of the same class `Deep`,
+    # each importing it under its own alias, so the cap stops two distinct
+    # edges onto one site. Both edges are named, not just the first.
+    root = tmp_path / "workspace"
+    _write_file(root / "deep.py", "class Deep:\n    def dm(self) -> None:\n        pass\n")
+    for prefix, alias in (("A", "Alpha"), ("B", "Beta")):
+        _write_file(
+            root / f"{prefix.lower()}7.py",
+            f"from deep import Deep as {alias}\n\n\n"
+            f"class {prefix}7({alias}):\n"
+            f"    def from_{prefix.lower()}7(self) -> None:\n        pass\n",
+        )
+        for index in range(1, 7):
+            _write_file(
+                root / f"{prefix.lower()}{index}.py",
+                f"from {prefix.lower()}{index + 1} import {prefix}{index + 1}\n\n\n"
+                f"class {prefix}{index}({prefix}{index + 1}):\n"
+                f"    def from_{prefix.lower()}{index}(self) -> None:\n        pass\n",
+            )
+    _write_file(
+        root / "root.py",
+        "from a1 import A1\nfrom b1 import B1\n\n\nclass Root(A1, B1):\n    pass\n",
+    )
+
+    model = class_model(Database(mode="strict"), root, root / "root.py", "Root")
+    assert "dm" not in {member.name for member in model.members}
+    assert model.truncated_bases == ("Alpha", "Beta")
+    assert model.unresolved_bases == ()

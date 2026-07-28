@@ -169,6 +169,51 @@ def test_resource_backed_queries_match_fresh_recomputation(
             assert incremental.get(diagnostics, str(path)) == fresh.get(diagnostics, str(path))
 
 
+def optional_file_contents() -> st.SearchStrategy[list[str | None]]:
+    return st.lists(
+        st.sampled_from([None, "", "alpha\n", "beta\n"]),
+        min_size=1,
+        max_size=15,
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("max_query_nodes", [None, 2])
+@settings(max_examples=20, deadline=None)
+@given(contents=optional_file_contents())
+def test_optional_resource_queries_match_fresh_recomputation(
+    mode: str,
+    max_query_nodes: int | None,
+    contents: list[str | None],
+) -> None:
+    files = FileResource()
+
+    @query
+    def source(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<missing>"
+
+    @query
+    def diagnostics(db: Database, filename: str) -> tuple[bool, int]:
+        current = source(db, filename)
+        return current == "<missing>", len(current)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "optional.txt"
+        incremental = Database(mode=mode, max_query_nodes=max_query_nodes)
+
+        for content in contents:
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(content, encoding="utf-8")
+
+            fresh = Database(mode=mode, max_query_nodes=max_query_nodes)
+            assert incremental.get(diagnostics, str(path)) == fresh.get(diagnostics, str(path))
+
+
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("max_query_nodes", [None, 2])
 @settings(max_examples=10, deadline=None)

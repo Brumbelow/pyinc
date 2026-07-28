@@ -3807,6 +3807,7 @@ class WorkspaceSession:
                 for member in model.members
             ),
             unresolved_bases=model.unresolved_bases,
+            truncated_bases=model.truncated_bases,
         )
 
     def _remap_resolved_target(self, symbol: ResolvedTarget) -> ResolvedTarget:
