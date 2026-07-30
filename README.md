@@ -60,8 +60,9 @@ from 232.99 s to 101.72 s (~2.3x), re-analyzing the workspace after a one-file
 edit from 160.311 s to 1.687 s (~95x), and a warm single-file re-analysis from
 10.010 s to 0.273 s (~37x). Those timings are from one machine and will differ
 on yours. The work counts behind that one-file edit — 270 queries executed,
-17,778 results reused, 86 backdated — are properties of the engine and the edit
-rather than of the machine.
+17,778 results reused, 86 backdated — depend on the engine and the edit rather
+than on the machine: the executed and backdated counts reproduce exactly, and
+the reused count varies slightly from run to run.
 [The demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md)
 walks through the pipeline, the measurements, and a trace of which queries one
 update actually re-ran.

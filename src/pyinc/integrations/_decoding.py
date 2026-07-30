@@ -40,9 +40,12 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T")
 
-# Entries are small (one decoded value each) but unbounded growth in a
-# long-lived server is not acceptable; past the limit the cache starts over
-# rather than evicting one at a time, which keeps lookups a single dict hit.
+# The bound is on entry count, not on bytes: an entry holds one decoded value,
+# and a workspace-level entry is a whole analysis rather than a small object.
+# What keeps the total in hand is that those values share substructure with the
+# query results they were decoded from, which the kernel retains anyway. Past
+# the limit the cache is cleared wholesale rather than evicted one entry at a
+# time, which keeps lookups a single dict hit.
 _MAX_ENTRIES = 8192
 
 _CACHE: dict[tuple[Any, ...], tuple[tuple[Any, ...], Any]] = {}

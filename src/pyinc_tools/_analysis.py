@@ -211,11 +211,11 @@ def resolve_target(
         db,
         "resolve_target",
         (root, path, qualified_name, _visited, _trail),
-        lambda: _resolve_target(db, root, path, qualified_name, _visited, _trail),
+        lambda: _resolve_target_uncached(db, root, path, qualified_name, _visited, _trail),
     )
 
 
-def _resolve_target(
+def _resolve_target_uncached(
     db: Database,
     root: str,
     path: str,

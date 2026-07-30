@@ -980,9 +980,12 @@ class WorkspaceSession:
         """Is ``resolved`` referenced from inside ``mirror_path`` itself?
 
         The unused-import check only ever asks about hits in the importing
-        file, so it scans that one file's occurrences under the same matching
-        rule `find_references` uses rather than resolving every same-named
-        occurrence in the workspace and then discarding the other files' hits.
+        file, so it scans that one file's occurrences rather than resolving
+        every same-named occurrence in the workspace and then discarding the
+        other files' hits. It matches on `find_references`' rule minus the
+        ``include_declaration`` filter, so a declaration of the target counts
+        as a use here; that can only overreport use, and so never reports a
+        live import as unused.
         """
         target = self._symbol_id_for_resolved(resolved)
         if target is None:

@@ -6,10 +6,12 @@ single edit costs, and which queries that edit actually re-ran.
 
 Wall-clock figures below were measured on one machine running alone. They will
 differ on yours and are diagnostics, not thresholds — the same convention the
-[benchmark harness](../bench/README.md) uses. Work counts — how many queries
-executed, how many results were reused, how many were backdated — are
-properties of the engine and the edit rather than of the machine, and are
-reproducible.
+[benchmark harness](../bench/README.md) uses. Of the work counts — how many
+queries executed, how many results were reused, how many were backdated — the
+executed and backdated counts are properties of the engine and the edit rather
+than of the machine, and reproduce exactly. The reused count is stable only to
+within run-to-run noise: two runs of the traced edit on the same engine and the
+same machine reported 17,758 and 17,735.
 
 ## Watching a real workspace
 
