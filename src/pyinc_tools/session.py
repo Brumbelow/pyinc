@@ -934,6 +934,34 @@ class WorkspaceSession:
             references=result.references,
         )
 
+    def _name_is_used_in_file(self, mirror_path: str, resolved: ResolvedTarget) -> bool:
+        """Is ``resolved`` referenced from inside ``mirror_path`` itself?
+
+        The unused-import check only ever asks about hits in the importing
+        file, so it scans that one file's occurrences under the same matching
+        rule `find_references` uses rather than resolving every same-named
+        occurrence in the workspace and then discarding the other files' hits.
+        """
+        target = self._symbol_id_for_resolved(resolved)
+        if target is None:
+            return False
+        for occurrence in scope_tree(self.db, mirror_path).occurrences:
+            if occurrence.name != target.name:
+                continue
+            # An import binding names the target but is not itself a
+            # declaration or usage of the target symbol.
+            if occurrence.is_declaration and occurrence.symbol_id != target:
+                continue
+            candidate = resolve_symbol_at(
+                self.db,
+                self.mirror_root,
+                mirror_path,
+                occurrence.range.start,
+            )
+            if candidate == target:
+                return True
+        return False
+
     def _symbol_id_for_resolved(self, resolved: ResolvedTarget) -> SymbolId | None:
         if (
             resolved.resolution != "workspace"
@@ -3584,16 +3612,13 @@ class WorkspaceSession:
                     continue
                 if binding in static_all:
                     continue
-                references = self._find_references_by_name(real_path, binding)
+                resolved = _resolve_target(self.db, self.mirror_root, mirror_path, binding)
                 # A binding that doesn't resolve to a workspace symbol is a
                 # *broken* import (its own `unresolved-symbol` diagnostic), not
                 # an unused one — leave it to that diagnostic + its quick fix.
-                if (
-                    not isinstance(references.target, ResolvedTarget)
-                    or references.target.resolution != "workspace"
-                ):
+                if resolved.resolution != "workspace":
                     continue
-                if any(ref.path == real_path for ref in references.references):
+                if self._name_is_used_in_file(mirror_path, resolved):
                     continue
                 diagnostics.append(
                     AnalysisDiagnostic(
