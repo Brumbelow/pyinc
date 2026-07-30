@@ -18,6 +18,8 @@ from typing import Any
 import pytest
 
 import pyinc_tools.session as session_module
+from pyinc import Database
+from pyinc.integrations import _decoding
 from pyinc.integrations.python_source import workspace_analysis
 from pyinc.integrations.scope_resolution import _decode_scope_tree
 from pyinc.integrations.symbol_resolution import _placed_module_symbol_table, find_references
@@ -227,3 +229,15 @@ def test_workspace_result_matches_a_cold_session(tmp_path: Path) -> None:
         )
 
     assert normalize(warm) == normalize(cold)
+
+
+def test_decode_memo_is_skipped_when_payload_identity_is_unstable(tmp_path: Path) -> None:
+    """Off `strict`, `db.get` thaws a fresh object per call, so every entry would miss."""
+
+    _write_workspace(tmp_path)
+    _decoding._CACHE.clear()
+    for mode in ("fast", "checked"):
+        workspace_analysis(Database(mode=mode), tmp_path)
+        assert _decoding._CACHE == {}, mode
+    workspace_analysis(Database(mode="strict"), tmp_path)
+    assert _decoding._CACHE

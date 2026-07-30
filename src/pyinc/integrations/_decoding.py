@@ -1,28 +1,29 @@
 """Memoized decoding of query payloads into the integration value types.
 
-A layer-3 entrypoint like :func:`scope_tree` is a pure function of the payloads
-it reads: given the same payload objects it builds the same dataclasses. The
-kernel already decides when a payload is stale — while a query's value stands it
-hands back the very same payload object, and when the value changes it hands
-back a different one. So a decode keyed on the *identity* of the payloads it was
-built from is valid for exactly as long as those values are, and nothing here
-has to reason about invalidation.
+`decoded` keys on payload *identity*. A layer-3 entrypoint is a pure function of
+the payloads it reads, and the kernel already decides when a payload is stale:
+while a query's value stands it hands back the very same payload object, and
+when the value changes it hands back a different one. So a decode keyed on the
+identity of the payloads it was built from is valid for exactly as long as those
+values are, and nothing here reasons about invalidation. It holds a reference to
+every payload it keys on, which is what makes `id()` safe: an entry's payload
+cannot be collected and its address reused while the entry still refers to it.
+It is bounded so a long-running process cannot grow it without limit.
 
-This matters because the entrypoints are called many times per request from
-different places (a reference scan, a symbol lookup, a diagnostic walk) and each
-call used to rebuild the whole tree of dataclasses again.
-
-The cache holds a reference to every payload it keys on, which is what makes
-`id()` safe to key on: an entry's payload cannot be collected and have its
-address reused while the entry still refers to it. It is bounded so a
-long-running process that has walked many workspaces cannot grow it without
-limit.
+Payload identity is only stable in `strict` mode. `checked` and `fast` thaw at
+the boundary (`Database._expose_snapshot`), handing back a fresh object per
+call, so every lookup would miss and every miss would pin one more payload tree
+and decoded tree until the bound reset the whole cache. Off `strict` the memo is
+skipped outright.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
+
+if TYPE_CHECKING:
+    from pyinc.runtime import Database
 
 _T = TypeVar("_T")
 
@@ -34,13 +35,17 @@ _MAX_ENTRIES = 8192
 _CACHE: dict[tuple[Any, ...], tuple[tuple[Any, ...], Any]] = {}
 
 
-def decoded(kind: str, sources: tuple[Any, ...], decode: Callable[[], _T]) -> _T:
+def decoded(
+    db: Database, kind: str, sources: tuple[Any, ...], decode: Callable[[], _T]
+) -> _T:
     """Return ``decode()`` for these ``sources``, reusing an earlier result.
 
     ``sources`` must name every value the decode reads, and ``kind`` keeps two
     decoders that read the same payload from colliding.
     """
 
+    if db.mode != "strict":
+        return decode()
     key = (kind, *(id(source) for source in sources))
     entry = _CACHE.get(key)
     if entry is not None:

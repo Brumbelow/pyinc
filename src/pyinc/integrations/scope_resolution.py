@@ -1069,7 +1069,7 @@ def _decode_scope_tree(payload: ScopeTreePayload) -> ScopeTree:
 def scope_tree(db: Database, path: str | os.PathLike[str]) -> ScopeTree:
     normalized = str(Path(path).resolve(strict=False))
     payload = db.get(scope_tree_payload, normalized)
-    return decoded("scope_tree", (payload,), lambda: _decode_scope_tree(payload))
+    return decoded(db, "scope_tree", (payload,), lambda: _decode_scope_tree(payload))
 
 
 @overload

@@ -1173,9 +1173,10 @@ def _apply_module_source_ranges(
 
 
 def _decoded_file_analysis(
-    payload: FileAnalysisPayload, ranges: FileSourceRangesPayload
+    db: Database, payload: FileAnalysisPayload, ranges: FileSourceRangesPayload
 ) -> PythonFileAnalysis:
     return decoded(
+        db,
         "file_analysis",
         (payload, ranges),
         lambda: _apply_file_source_ranges(_decode_file_analysis(payload), ranges),
@@ -1183,9 +1184,10 @@ def _decoded_file_analysis(
 
 
 def _decoded_module_analysis(
-    payload: ModuleAnalysisPayload, ranges: FileSourceRangesPayload
+    db: Database, payload: ModuleAnalysisPayload, ranges: FileSourceRangesPayload
 ) -> PythonModuleAnalysis:
     return decoded(
+        db,
         "module_analysis",
         (payload, ranges),
         lambda: _apply_module_source_ranges(_decode_module_analysis(payload), ranges),
@@ -1199,7 +1201,7 @@ def _decoded_module_analysis(
 def file_analysis(db: Database, path: str | os.PathLike[str]) -> PythonFileAnalysis:
     normalized_path = _normalize_path(path)
     payload = db.get(file_analysis_payload, normalized_path)
-    return _decoded_file_analysis(payload, source_ranges_for_file(db, normalized_path))
+    return _decoded_file_analysis(db, payload, source_ranges_for_file(db, normalized_path))
 
 
 def directory_analysis(
@@ -1208,7 +1210,8 @@ def directory_analysis(
     normalized_root = _normalize_path(root)
     payload = db.get(directory_analysis_payload, normalized_root)
     return tuple(
-        _decoded_file_analysis(item, source_ranges_for_file(db, item[0])) for item in payload
+        _decoded_file_analysis(db, item, source_ranges_for_file(db, item[0]))
+        for item in payload
     )
 
 
@@ -1223,7 +1226,7 @@ def module_analysis(
             f"{normalized_path!r} is not a Python source file under {normalized_root!r}."
         )
     payload = db.get(module_analysis_payload, normalized_root, normalized_path)
-    return _decoded_module_analysis(payload, source_ranges_for_file(db, normalized_path))
+    return _decoded_module_analysis(db, payload, source_ranges_for_file(db, normalized_path))
 
 
 def workspace_analysis(db: Database, root: str | os.PathLike[str]) -> PythonWorkspaceAnalysis:
@@ -1233,7 +1236,7 @@ def workspace_analysis(db: Database, root: str | os.PathLike[str]) -> PythonWork
     return PythonWorkspaceAnalysis(
         root=workspace_root,
         modules=tuple(
-            _decoded_module_analysis(item, source_ranges_for_file(db, item[0]))
+            _decoded_module_analysis(db, item, source_ranges_for_file(db, item[0]))
             for item in modules
         ),
     )

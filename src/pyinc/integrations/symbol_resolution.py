@@ -1199,6 +1199,7 @@ def _source_ranges_for_path(db: Database, path: str) -> dict[tuple[str, int], So
     lexical = scope_tree(db, path)
     source = source_text(db, path)
     return decoded(
+        db,
         "source_ranges_for_path",
         (lexical, source),
         lambda: _build_source_ranges(lexical, source),
@@ -1250,6 +1251,7 @@ def module_symbol_table(
     payload = db.get(module_symbol_table_for_module, normalized_root, normalized_path)
     ranges_by_name_and_line = _source_ranges_for_path(db, normalized_path)
     return decoded(
+        db,
         "module_symbol_table",
         (payload, ranges_by_name_and_line),
         lambda: _placed_module_symbol_table(payload, ranges_by_name_and_line),
