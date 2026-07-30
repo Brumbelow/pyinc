@@ -263,8 +263,18 @@ def check_cli_examples(root: Path) -> tuple[str, ...]:
         if text not in guide:
             errors.append(f"docs/pyinc-tools-guide.md: missing CLI example {text!r}")
 
+    # argparse colorizes help output from 3.14 on, and honours FORCE_COLOR even
+    # when it is writing to a pipe. The comparison below is against the literal
+    # usage line the guide documents, so ask for plain text explicitly.
     environment = os.environ.copy()
-    environment.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": os.fspath(root / "src")})
+    environment.update(
+        {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": os.fspath(root / "src"),
+            "PYTHON_COLORS": "0",
+            "NO_COLOR": "1",
+        }
+    )
     help_result = subprocess.run(
         [sys.executable, "-m", "pyinc_tools", "--help"],
         cwd=root,
