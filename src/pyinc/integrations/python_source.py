@@ -15,8 +15,8 @@ from pyinc.integrations.deep_module_resolution import resolve_module_location
 from pyinc.integrations.installed_packages import environment_index
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
-from pyinc.value import thaw
 
+from ._decoding import decoded
 from .source_geometry import (
     DocumentMap,
     SourcePosition,
@@ -1172,25 +1172,43 @@ def _apply_module_source_ranges(
     )
 
 
+def _decoded_file_analysis(
+    payload: FileAnalysisPayload, ranges: FileSourceRangesPayload
+) -> PythonFileAnalysis:
+    return decoded(
+        "file_analysis",
+        (payload, ranges),
+        lambda: _apply_file_source_ranges(_decode_file_analysis(payload), ranges),
+    )
+
+
+def _decoded_module_analysis(
+    payload: ModuleAnalysisPayload, ranges: FileSourceRangesPayload
+) -> PythonModuleAnalysis:
+    return decoded(
+        "module_analysis",
+        (payload, ranges),
+        lambda: _apply_module_source_ranges(_decode_module_analysis(payload), ranges),
+    )
+
+
+# Every payload below is declared as nested tuples of primitives, and `freeze`
+# leaves such a value as plain tuples, so what `db.get` hands back in any mode is
+# already the payload. Thawing it again only walks and copies the whole tree --
+# on a workspace-sized request that copy dominated the cost of decoding.
 def file_analysis(db: Database, path: str | os.PathLike[str]) -> PythonFileAnalysis:
     normalized_path = _normalize_path(path)
-    payload = cast(FileAnalysisPayload, thaw(db.get(file_analysis_payload, normalized_path)))
-    return _apply_file_source_ranges(
-        _decode_file_analysis(payload), source_ranges_for_file(db, normalized_path)
-    )
+    payload = db.get(file_analysis_payload, normalized_path)
+    return _decoded_file_analysis(payload, source_ranges_for_file(db, normalized_path))
 
 
 def directory_analysis(
     db: Database, root: str | os.PathLike[str]
 ) -> tuple[PythonFileAnalysis, ...]:
     normalized_root = _normalize_path(root)
-    payload = cast(
-        DirectoryAnalysisPayload,
-        thaw(db.get(directory_analysis_payload, normalized_root)),
-    )
+    payload = db.get(directory_analysis_payload, normalized_root)
     return tuple(
-        _apply_file_source_ranges(_decode_file_analysis(item), source_ranges_for_file(db, item[0]))
-        for item in payload
+        _decoded_file_analysis(item, source_ranges_for_file(db, item[0])) for item in payload
     )
 
 
@@ -1199,33 +1217,23 @@ def module_analysis(
 ) -> PythonModuleAnalysis:
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
-    workspace_files = cast(tuple[str, ...], thaw(db.get(workspace_python_files, normalized_root)))
+    workspace_files = db.get(workspace_python_files, normalized_root)
     if normalized_path not in workspace_files:
         raise ValueError(
             f"{normalized_path!r} is not a Python source file under {normalized_root!r}."
         )
-    payload = cast(
-        ModuleAnalysisPayload,
-        thaw(db.get(module_analysis_payload, normalized_root, normalized_path)),
-    )
-    return _apply_module_source_ranges(
-        _decode_module_analysis(payload), source_ranges_for_file(db, normalized_path)
-    )
+    payload = db.get(module_analysis_payload, normalized_root, normalized_path)
+    return _decoded_module_analysis(payload, source_ranges_for_file(db, normalized_path))
 
 
 def workspace_analysis(db: Database, root: str | os.PathLike[str]) -> PythonWorkspaceAnalysis:
     normalized_root = _normalize_path(root)
-    payload = cast(
-        WorkspaceAnalysisPayload,
-        thaw(db.get(workspace_analysis_payload, normalized_root)),
-    )
+    payload = db.get(workspace_analysis_payload, normalized_root)
     workspace_root, modules = payload
     return PythonWorkspaceAnalysis(
         root=workspace_root,
         modules=tuple(
-            _apply_module_source_ranges(
-                _decode_module_analysis(item), source_ranges_for_file(db, item[0])
-            )
+            _decoded_module_analysis(item, source_ranges_for_file(db, item[0]))
             for item in modules
         ),
     )

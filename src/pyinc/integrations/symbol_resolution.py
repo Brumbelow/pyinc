@@ -4,7 +4,7 @@ import ast
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, TypeAlias, cast
+from typing import Literal, TypeAlias
 
 from pyinc.core import query
 from pyinc.integrations.python_source import (
@@ -14,10 +14,11 @@ from pyinc.integrations.python_source import (
     source_text,
     workspace_python_files,
 )
-from pyinc.integrations.scope_resolution import SymbolId, scope_tree, symbol_at
+from pyinc.integrations.scope_resolution import ScopeTree, SymbolId, scope_tree, symbol_at
 from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
 from pyinc.runtime import Database
-from pyinc.value import thaw
+
+from ._decoding import decoded
 
 # ---------------------------------------------------------------------------
 # Literal aliases
@@ -1195,11 +1196,27 @@ def _decode_workspace_symbol_index(
 
 
 def _source_ranges_for_path(db: Database, path: str) -> dict[tuple[str, int], SourceRange]:
+    lexical = scope_tree(db, path)
+    source = source_text(db, path)
+    return decoded(
+        "source_ranges_for_path",
+        (lexical, source),
+        lambda: _build_source_ranges(lexical, source),
+    )
+
+
+def _build_source_ranges(
+    lexical: ScopeTree, source: str
+) -> dict[tuple[str, int], SourceRange]:
+    """Exact source spans for a file's bindings, keyed by name and line.
+
+    The result is memoized and handed to every caller, so it is read-only by
+    contract: the three call sites only look names up in it.
+    """
     ranges = {
         (binding.name, binding.range.start.line): binding.range
-        for binding in scope_tree(db, path).bindings
+        for binding in lexical.bindings
     }
-    source = source_text(db, path)
     tree = _try_parse(source)
     if tree is None:
         return ranges
@@ -1217,6 +1234,11 @@ def _source_ranges_for_path(db: Database, path: str) -> dict[tuple[str, int], So
 # Layer 3 entrypoints
 # ---------------------------------------------------------------------------
 
+# Every payload below is declared as nested tuples of primitives, and `freeze`
+# leaves such a value as plain tuples, so what `db.get` hands back in any mode is
+# already the payload. Thawing it again only walks and copies the whole tree --
+# on a workspace-sized request that copy dominated the cost of decoding.
+
 
 def module_symbol_table(
     db: Database,
@@ -1225,12 +1247,20 @@ def module_symbol_table(
 ) -> ModuleSymbolTable:
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
-    payload = cast(
-        ModuleSymbolTablePayload,
-        thaw(db.get(module_symbol_table_for_module, normalized_root, normalized_path)),
-    )
-    decoded = _decode_module_symbol_table(payload)
+    payload = db.get(module_symbol_table_for_module, normalized_root, normalized_path)
     ranges_by_name_and_line = _source_ranges_for_path(db, normalized_path)
+    return decoded(
+        "module_symbol_table",
+        (payload, ranges_by_name_and_line),
+        lambda: _placed_module_symbol_table(payload, ranges_by_name_and_line),
+    )
+
+
+def _placed_module_symbol_table(
+    payload: ModuleSymbolTablePayload,
+    ranges_by_name_and_line: dict[tuple[str, int], SourceRange],
+) -> ModuleSymbolTable:
+    table = _decode_module_symbol_table(payload)
     symbols = tuple(
         replace(
             symbol,
@@ -1242,9 +1272,9 @@ def module_symbol_table(
                 symbol.range,
             ),
         )
-        for symbol in decoded.symbols
+        for symbol in table.symbols
     )
-    return replace(decoded, symbols=symbols)
+    return replace(table, symbols=symbols)
 
 
 def resolve_qualified_name(
@@ -1255,16 +1285,11 @@ def resolve_qualified_name(
 ) -> _ResolvedSymbol:
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
-    payload = cast(
-        _ResolvedSymbolPayload,
-        thaw(
-            db.get(
-                _resolve_symbol_payload,
-                normalized_root,
-                normalized_path,
-                qualified_name,
-            )
-        ),
+    payload = db.get(
+        _resolve_symbol_payload,
+        normalized_root,
+        normalized_path,
+        qualified_name,
     )
     decoded = _decode_resolved_symbol(payload)
     defining_lineno = payload[5]
@@ -1285,10 +1310,7 @@ def resolve_qualified_name(
 
 def workspace_symbol_index(db: Database, root: str | os.PathLike[str]) -> WorkspaceSymbolIndex:
     normalized_root = _normalize_path(root)
-    payload = cast(
-        WorkspaceSymbolIndexPayload,
-        thaw(db.get(workspace_symbol_index_payload, normalized_root)),
-    )
+    payload = db.get(workspace_symbol_index_payload, normalized_root)
     decoded = _decode_workspace_symbol_index(payload)
     module_paths = {
         _module_name_for_path(normalized_root, path): path
@@ -1347,7 +1369,7 @@ def _find_references_for_symbol(
     is never included.
     """
 
-    files = cast(tuple[str, ...], thaw(db.get(workspace_python_files, root)))
+    files = db.get(workspace_python_files, root)
     references: list[Reference] = []
     seen_locations: set[tuple[str, SourceRange]] = set()
     for path in files:
@@ -1804,16 +1826,11 @@ def class_model(
 ) -> ClassModel:
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
-    payload = cast(
-        ResolvedClassModelPayload,
-        thaw(
-            db.get(
-                resolved_class_model_payload,
-                normalized_root,
-                normalized_path,
-                qualified_name,
-            )
-        ),
+    payload = db.get(
+        resolved_class_model_payload,
+        normalized_root,
+        normalized_path,
+        qualified_name,
     )
     decoded = _decode_class_model(payload)
     ranges_by_path: dict[str, dict[tuple[str, int], SourceRange]] = {}

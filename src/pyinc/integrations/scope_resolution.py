@@ -5,14 +5,15 @@ import os
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TypeAlias, cast, overload
+from typing import Literal, TypeAlias, overload
 
 from pyinc._python_lexing import identifier_tokens
 from pyinc.core import query
 from pyinc.integrations.python_source import source_text
 from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
 from pyinc.runtime import Database
-from pyinc.value import thaw
+
+from ._decoding import decoded
 
 ScopeKind: TypeAlias = Literal[
     "module", "class", "function", "lambda", "comprehension", "type_alias"
@@ -1017,9 +1018,11 @@ def scope_tree_payload(db: Database, path: str) -> ScopeTreePayload:
     return path, scopes, bindings, occurrences
 
 
-def scope_tree(db: Database, path: str | os.PathLike[str]) -> ScopeTree:
-    normalized = str(Path(path).resolve(strict=False))
-    payload = cast(ScopeTreePayload, thaw(db.get(scope_tree_payload, normalized)))
+# Every payload below is declared as nested tuples of primitives, and `freeze`
+# leaves such a value as plain tuples, so what `db.get` hands back in any mode is
+# already the payload. Thawing it again only walks and copies the whole tree --
+# on a workspace-sized request that copy dominated the cost of decoding.
+def _decode_scope_tree(payload: ScopeTreePayload) -> ScopeTree:
     result_path, scopes_payload, bindings_payload, occurrences_payload = payload
     scopes = tuple(
         Scope(scope_id, kind, _decode_range(source_range), parent_id)
@@ -1061,6 +1064,12 @@ def scope_tree(db: Database, path: str | os.PathLike[str]) -> ScopeTree:
         ) in occurrences_payload
     )
     return ScopeTree(result_path, scopes, tuple(bindings), occurrences)
+
+
+def scope_tree(db: Database, path: str | os.PathLike[str]) -> ScopeTree:
+    normalized = str(Path(path).resolve(strict=False))
+    payload = db.get(scope_tree_payload, normalized)
+    return decoded("scope_tree", (payload,), lambda: _decode_scope_tree(payload))
 
 
 @overload
