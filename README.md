@@ -53,6 +53,8 @@ action.
 
 ## See it on a real workspace
 
+![Editing pytest under pyinc's watcher](https://raw.githubusercontent.com/Brumbelow/pyinc/main/docs/assets/demo.gif)
+
 `pyinc-tools` was pointed at a pinned checkout of pytest — 270 Python files,
 nothing adapted for `pyinc` — and watched while single files were edited.
 Measured against an earlier build of the same engine, the initial analysis went

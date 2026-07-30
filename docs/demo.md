@@ -28,7 +28,12 @@ it cheap is that evaluation is pull-based: `db.get()` verifies a node's
 dependencies before deciding whether to execute it, so a query whose tracked
 reads have not changed answers from its memo without running.
 
-<!-- recording -->
+![Editing pytest under pyinc's watcher](assets/demo.gif)
+
+The loop above is the comment edit and the broken-import edit back to back: a
+no-op change backdates instead of re-executing, then a real mistake shows up
+as a new diagnostic in under two seconds. The [full recording](assets/demo.mp4)
+covers the initial analysis and all four edits in the workspace above.
 
 ## How an update flows
 
