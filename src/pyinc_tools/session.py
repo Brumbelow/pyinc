@@ -3551,7 +3551,7 @@ class WorkspaceSession:
 
         Conservative by design (see the guide's ``unused-import``
         limitations): only ``from`` imports whose target resolves to a
-        workspace module are considered, so that ``find_references`` can
+        workspace module are considered, so that the occurrence scan can
         actually verify usage. ``import M`` is skipped (attribute usage is
         under-reported) and stdlib / installed targets are skipped (their
         usage cannot be verified). ``__init__.py`` files, self-alias
@@ -3564,14 +3564,10 @@ class WorkspaceSession:
         # A parse error anywhere makes the occurrence scan unreliable.
         if module_result.diagnostics:
             return []
-        source = self.source_text(real_path)
-        if source is None:
-            return []
-        try:
-            tree = _parse_python(source)
-        except SyntaxError:
-            return []
 
+        # Deciding there is nothing to check needs only the module analysis, so
+        # it happens before the file is read and parsed: most files import no
+        # workspace name at all and never reach the scan below.
         workspace_from: dict[tuple[int, str], ResolvedImportRef] = {}
         for resolved_import in module_result.resolved_imports:
             if (
@@ -3586,6 +3582,14 @@ class WorkspaceSession:
                 )
                 workspace_from[key] = resolved_import
         if not workspace_from:
+            return []
+
+        source = self.source_text(real_path)
+        if source is None:
+            return []
+        try:
+            tree = _parse_python(source)
+        except SyntaxError:
             return []
 
         reexported = self._reexported_names_for_module(
