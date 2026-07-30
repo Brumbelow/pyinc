@@ -94,9 +94,12 @@ engine. Its edit appends an unresolvable import to one file:
 
 ## Tracing an update
 
-The diagram below is the recorded decision for every node in the edited file's
-own re-derivation cascade, taken from the engine's dependency graph after that
-update. Red is `executed`, yellow is `backdated`, green is `reused`.
+The diagram below is the edited file's own re-derivation cascade, taken from the
+engine's dependency graph after that update. Each node carries its **last
+recorded decision** for that request — the value `Database.inspect(...)` reports
+— colored red for `executed`, yellow for `backdated`, green for `reused`. Its
+arrows run from a node to a dependency it read, the opposite of the data-flow
+arrows in the diagram above.
 
 ```mermaid
 graph LR
@@ -144,13 +147,14 @@ graph LR
     classDef reuse fill:#dfd,stroke:#3a3
 ```
 
-Six nodes executed: the file's source ranges, its scope tree, its resolved
-imports, its module analysis payload, and the two workspace-level aggregates
-that read them. One backdated — the file's syntax diagnostics re-ran and
-returned a result semantically equal to the one already recorded, so the kernel
-backdated that node and nothing downstream of it was invalidated. The remaining
-eleven carried a `reused` decision: the kernel verified their dependencies and
-handed back the memo without running the query body.
+Six nodes recorded `executed`: the file's source ranges, its scope tree, its
+resolved imports, its module analysis payload, and the two workspace-level
+aggregates above them. One recorded `backdated` — the file's syntax diagnostics
+re-ran and returned a result semantically equal to the one already recorded, so
+it did not invalidate anything downstream. A node that consumes it may still
+have re-executed, but not on its account. The remaining eleven recorded
+`reused`, the decision the kernel records when it verified a node's dependencies
+and the memo stood.
 
 Two things the diagram deliberately does not show. First, the
 `resolve_module_location` nodes are a disconnected concern — other call sites in
@@ -173,8 +177,12 @@ comment edit: a change to the file's bytes with no consequence for anything
 derived from them. That edit dirties the file's tracked reads, so the queries
 that read it are re-executed — but they return results semantically equal to the
 ones already recorded, so those nodes are **backdated** rather than invalidated,
-and nothing downstream of them runs at all. In a dry run of the same edit
-sequence, that edit backdated 86 results and produced no new diagnostics.
+and nothing downstream re-runs on their account. It is the middle row of the
+table above: 270 queries executed, 17,778 results reused, 86 backdated. The
+same probe's no-change re-request — a re-analysis with nothing edited at all —
+executed 270 queries too, so the comment edit cost no execution beyond the price
+of asking the question again. In a dry run of the same edit sequence it produced
+no new diagnostics.
 
 Backdating is why the correctness guarantee is affordable rather than merely
 true. The [kernel contract](kernel-contract.md) guarantees **from-scratch
