@@ -19,13 +19,13 @@ and decoded tree until the bound reset the whole cache. Off `strict` the memo is
 skipped outright.
 
 `once_per_request` keys on the call itself, and lives only for the span a caller
-declares with `request`. A `WorkspaceSession` holds its lock for the whole of
+declares with `request_scope`. A `WorkspaceSession` holds its lock for the whole of
 each public method and its inputs cannot change while it is held, so an
 entrypoint asked the same question twice inside one method must answer the same
 both times. Outside such a span the memo does not exist, so a caller driving the
 integrations directly around a file edit still sees the edit. A session that
 does rewrite the mirror inside one of its own methods calls
-`invalidate_request` when it does.
+`request_inputs_changed` when it does.
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ def decoded(
 
 
 @contextmanager
-def request(db: Database) -> Iterator[None]:
+def request_scope(db: Database) -> Iterator[None]:
     """Declare that ``db``'s inputs cannot change for the duration.
 
     Repeated entrypoint calls inside the span answer from the first one.
@@ -90,11 +90,11 @@ def request(db: Database) -> Iterator[None]:
         _REQUEST.reset(token)
 
 
-def invalidate_request() -> None:
+def request_inputs_changed() -> None:
     """Drop what this request has memoized, because its inputs just moved.
 
     A caller that mutates what the integrations read part-way through its own
-    request has broken the promise `request` makes and must say so.
+    request has broken the promise `request_scope` makes and must say so.
     """
 
     scope = _REQUEST.get()

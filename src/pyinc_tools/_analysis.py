@@ -21,10 +21,10 @@ from pyinc.integrations import (
     SymbolId,
     module_analysis,
     module_symbol_table,
+    once_per_request,
     scope_tree,
     symbol_at,
 )
-from pyinc.integrations._decoding import once_per_request
 
 from ._document import (
     _next_source_line_start,

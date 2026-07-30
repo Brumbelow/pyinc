@@ -41,6 +41,8 @@ from pyinc.integrations import (
     find_references,
     module_analysis,
     module_symbol_table,
+    request_inputs_changed,
+    request_scope,
     scope_tree,
     workspace_analysis,
     workspace_config_analysis,
@@ -51,8 +53,6 @@ from pyinc.integrations import (
 from pyinc.integrations import (
     symbol_at as resolve_symbol_at,
 )
-from pyinc.integrations._decoding import invalidate_request as integration_invalidate
-from pyinc.integrations._decoding import request as integration_request
 
 from ._analysis import (
     _BINDING_TO_COMPLETION_KIND,
@@ -282,7 +282,7 @@ class _RequestLock:
         self._lock.acquire()
         try:
             if self._depth == 0:
-                scope = integration_request(self._db)
+                scope = request_scope(self._db)
                 scope.__enter__()
                 self._scope = scope
             self._depth += 1
@@ -398,7 +398,7 @@ class WorkspaceSession:
             mirror_path = self._mirror_path_for_real(real_path)
             mirror_path.parent.mkdir(parents=True, exist_ok=True)
             mirror_path.write_bytes(_encode_python_text(text))
-            integration_invalidate()
+            request_inputs_changed()
             self._overlays[real_path] = text
             self._scheduled_paths.add(real_path)
             return real_path
@@ -1208,12 +1208,12 @@ class WorkspaceSession:
             yield False
             return
         mirror_path.write_bytes(_encode_python_text(repaired))
-        integration_invalidate()
+        request_inputs_changed()
         try:
             yield True
         finally:
             mirror_path.write_bytes(_encode_python_text(original))
-            integration_invalidate()
+            request_inputs_changed()
 
     def _symbol_completion_item(
         self, label: str, symbol: Symbol, sort_group: str
@@ -3834,7 +3834,7 @@ class WorkspaceSession:
 
     def _sync_path_from_disk(self, real_path: str) -> None:
         self._mirror.sync_path_from_disk(real_path)
-        integration_invalidate()
+        request_inputs_changed()
 
     def _remap_workspace_analysis(
         self, analysis: PythonWorkspaceAnalysis
