@@ -13,7 +13,7 @@ from pyinc.integrations.python_source import source_text
 from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
 from pyinc.runtime import Database
 
-from ._decoding import decoded
+from ._decoding import decoded, once_per_request
 
 ScopeKind: TypeAlias = Literal[
     "module", "class", "function", "lambda", "comprehension", "type_alias"
@@ -1068,6 +1068,12 @@ def _decode_scope_tree(payload: ScopeTreePayload) -> ScopeTree:
 
 def scope_tree(db: Database, path: str | os.PathLike[str]) -> ScopeTree:
     normalized = str(Path(path).resolve(strict=False))
+    return once_per_request(
+        db, "scope_tree", (normalized,), lambda: _scope_tree(db, normalized)
+    )
+
+
+def _scope_tree(db: Database, normalized: str) -> ScopeTree:
     payload = db.get(scope_tree_payload, normalized)
     return decoded(db, "scope_tree", (payload,), lambda: _decode_scope_tree(payload))
 
@@ -1114,6 +1120,17 @@ def symbol_at(
         path = os.fspath(path_or_position)
         actual_position = position
 
+    return once_per_request(
+        db,
+        "symbol_at",
+        (root, path, actual_position),
+        lambda: _symbol_at(db, root, path, actual_position),
+    )
+
+
+def _symbol_at(
+    db: Database, root: str | None, path: str, actual_position: SourcePosition
+) -> SymbolId | None:
     tree = scope_tree(db, path)
     occurrence = tree.occurrence_at(actual_position)
     if occurrence is None:

@@ -16,7 +16,7 @@ from pyinc.integrations.installed_packages import environment_index
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 
-from ._decoding import decoded
+from ._decoding import decoded, once_per_request
 from .source_geometry import (
     DocumentMap,
     SourcePosition,
@@ -641,6 +641,11 @@ def _collect_python_files(
 
 @query(cutoff=_source_cutoff_token)
 def source_text(db: Database, path: str) -> str:
+    # Deliberately not memoized per request: query bodies read the source
+    # through here, and answering one from an earlier call would rob the second
+    # query of the resource dependency the kernel needs to invalidate it. The
+    # kernel enforces this -- `once_per_request` closes over a ContextVar, which
+    # it refuses to source-pin, so any query that reached it would fail loudly.
     return _FILES.read(db, path)[0]
 
 
@@ -1220,6 +1225,15 @@ def module_analysis(
 ) -> PythonModuleAnalysis:
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
+    return once_per_request(
+        db,
+        "module_analysis",
+        (normalized_root, normalized_path),
+        lambda: _module_analysis(db, normalized_root, normalized_path),
+    )
+
+
+def _module_analysis(db: Database, normalized_root: str, normalized_path: str) -> PythonModuleAnalysis:
     workspace_files = db.get(workspace_python_files, normalized_root)
     if normalized_path not in workspace_files:
         raise ValueError(
@@ -1231,6 +1245,15 @@ def module_analysis(
 
 def workspace_analysis(db: Database, root: str | os.PathLike[str]) -> PythonWorkspaceAnalysis:
     normalized_root = _normalize_path(root)
+    return once_per_request(
+        db,
+        "workspace_analysis",
+        (normalized_root,),
+        lambda: _workspace_analysis(db, normalized_root),
+    )
+
+
+def _workspace_analysis(db: Database, normalized_root: str) -> PythonWorkspaceAnalysis:
     payload = db.get(workspace_analysis_payload, normalized_root)
     workspace_root, modules = payload
     return PythonWorkspaceAnalysis(

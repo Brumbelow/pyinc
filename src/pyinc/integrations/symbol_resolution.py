@@ -18,7 +18,7 @@ from pyinc.integrations.scope_resolution import ScopeTree, SymbolId, scope_tree,
 from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
 from pyinc.runtime import Database
 
-from ._decoding import decoded
+from ._decoding import decoded, once_per_request
 
 # ---------------------------------------------------------------------------
 # Literal aliases
@@ -1196,6 +1196,12 @@ def _decode_workspace_symbol_index(
 
 
 def _source_ranges_for_path(db: Database, path: str) -> dict[tuple[str, int], SourceRange]:
+    return once_per_request(
+        db, "source_ranges_for_path", (path,), lambda: _ranges_for_path(db, path)
+    )
+
+
+def _ranges_for_path(db: Database, path: str) -> dict[tuple[str, int], SourceRange]:
     lexical = scope_tree(db, path)
     source = source_text(db, path)
     return decoded(
@@ -1248,6 +1254,17 @@ def module_symbol_table(
 ) -> ModuleSymbolTable:
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
+    return once_per_request(
+        db,
+        "module_symbol_table",
+        (normalized_root, normalized_path),
+        lambda: _module_symbol_table(db, normalized_root, normalized_path),
+    )
+
+
+def _module_symbol_table(
+    db: Database, normalized_root: str, normalized_path: str
+) -> ModuleSymbolTable:
     payload = db.get(module_symbol_table_for_module, normalized_root, normalized_path)
     ranges_by_name_and_line = _source_ranges_for_path(db, normalized_path)
     return decoded(
@@ -1287,6 +1304,17 @@ def resolve_qualified_name(
 ) -> _ResolvedSymbol:
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
+    return once_per_request(
+        db,
+        "resolve_qualified_name",
+        (normalized_root, normalized_path, qualified_name),
+        lambda: _resolve_qualified_name(db, normalized_root, normalized_path, qualified_name),
+    )
+
+
+def _resolve_qualified_name(
+    db: Database, normalized_root: str, normalized_path: str, qualified_name: str
+) -> _ResolvedSymbol:
     payload = db.get(
         _resolve_symbol_payload,
         normalized_root,

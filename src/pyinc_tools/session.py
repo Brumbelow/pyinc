@@ -8,6 +8,7 @@ import tempfile
 import threading
 import tokenize
 from collections.abc import Iterator, Sequence
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import TypeAlias
 
@@ -50,6 +51,8 @@ from pyinc.integrations import (
 from pyinc.integrations import (
     symbol_at as resolve_symbol_at,
 )
+from pyinc.integrations._decoding import invalidate_request as integration_invalidate
+from pyinc.integrations._decoding import request as integration_request
 
 from ._analysis import (
     _BINDING_TO_COMPLETION_KIND,
@@ -258,6 +261,44 @@ def _build_reexport_index(modules: Sequence[PythonModuleAnalysis]) -> _ReexportI
     return index
 
 
+class _RequestLock:
+    """The session lock, which also bounds one request's view of the graph.
+
+    Every public method holds this for the whole of its work, and nothing can
+    change the mirror or the overlays while it is held, so an integration
+    entrypoint asked the same question twice inside one method has to answer the
+    same both times. Tying the integrations' per-request memo to the lock is
+    what keeps it from outliving that guarantee: outside a session it does not
+    exist, so a caller driving the integrations directly still sees its edits.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self._lock = threading.RLock()
+        self._db = db
+        self._depth = 0
+        self._scope: AbstractContextManager[None] | None = None
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+        try:
+            if self._depth == 0:
+                scope = integration_request(self._db)
+                scope.__enter__()
+                self._scope = scope
+            self._depth += 1
+        except BaseException:
+            self._lock.release()
+            raise
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._depth -= 1
+        scope = self._scope
+        if self._depth == 0 and scope is not None:
+            self._scope = None
+            scope.__exit__(None, None, None)
+        self._lock.release()
+
+
 class WorkspaceSession:
     def __init__(
         self,
@@ -290,7 +331,7 @@ class WorkspaceSession:
         )
         self._overlays: dict[str, str] = {}
         self._scheduled_paths: set[str] = set()
-        self._state_lock = threading.RLock()
+        self._state_lock = _RequestLock(self.db)
         self._watchers: set[PollingWorkspaceWatcher] = set()
         self._close_complete = threading.Event()
         self._closed = False
@@ -357,6 +398,7 @@ class WorkspaceSession:
             mirror_path = self._mirror_path_for_real(real_path)
             mirror_path.parent.mkdir(parents=True, exist_ok=True)
             mirror_path.write_bytes(_encode_python_text(text))
+            integration_invalidate()
             self._overlays[real_path] = text
             self._scheduled_paths.add(real_path)
             return real_path
@@ -1166,10 +1208,12 @@ class WorkspaceSession:
             yield False
             return
         mirror_path.write_bytes(_encode_python_text(repaired))
+        integration_invalidate()
         try:
             yield True
         finally:
             mirror_path.write_bytes(_encode_python_text(original))
+            integration_invalidate()
 
     def _symbol_completion_item(
         self, label: str, symbol: Symbol, sort_group: str
@@ -3790,6 +3834,7 @@ class WorkspaceSession:
 
     def _sync_path_from_disk(self, real_path: str) -> None:
         self._mirror.sync_path_from_disk(real_path)
+        integration_invalidate()
 
     def _remap_workspace_analysis(
         self, analysis: PythonWorkspaceAnalysis

@@ -21,8 +21,13 @@ import pyinc_tools.session as session_module
 from pyinc import Database
 from pyinc.integrations import _decoding
 from pyinc.integrations.python_source import workspace_analysis
-from pyinc.integrations.scope_resolution import _decode_scope_tree
-from pyinc.integrations.symbol_resolution import _placed_module_symbol_table, find_references
+from pyinc.integrations.scope_resolution import _decode_scope_tree, scope_tree
+from pyinc.integrations.symbol_resolution import (
+    _module_symbol_table,
+    _placed_module_symbol_table,
+    find_references,
+    module_symbol_table,
+)
 from pyinc_tools import WorkspaceSession
 
 _TraceFunc = Callable[[FrameType, str, Any], Any]
@@ -231,6 +236,39 @@ def test_workspace_result_matches_a_cold_session(tmp_path: Path) -> None:
     assert normalize(warm) == normalize(cold)
 
 
+def test_entrypoints_answer_once_per_session_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_workspace(tmp_path)
+    with WorkspaceSession(tmp_path) as session:
+        session.analyze_workspace()
+        counter = _count_calls(monkeypatch, _module_symbol_table)
+        session.analyze_workspace()
+        # Three modules. The request builds each file's result and resolves its
+        # imports, which asks for the same tables again; within one request they
+        # are answered once each.
+        assert counter["n"] == 3
+
+
+def test_entrypoints_outside_a_session_still_see_edits(tmp_path: Path) -> None:
+    """The per-request memo must not exist for a caller driving the layer directly."""
+
+    _write_workspace(tmp_path)
+    db = Database(mode="strict")
+    alpha = tmp_path / "alpha.py"
+    before = module_symbol_table(db, tmp_path, alpha)
+    assert sorted(symbol.qualified_name for symbol in before.symbols) == ["one", "two"]
+    assert len(scope_tree(db, alpha).bindings) == 2
+
+    alpha.write_text(
+        "def one():\n    return 1\n\n\ndef two():\n    return 2\n\n\ndef three():\n    return 3\n",
+        encoding="utf-8",
+    )
+    after = module_symbol_table(db, tmp_path, alpha)
+    assert sorted(symbol.qualified_name for symbol in after.symbols) == ["one", "three", "two"]
+    assert len(scope_tree(db, alpha).bindings) == 3
+
+
 def test_decode_memo_is_skipped_when_payload_identity_is_unstable(tmp_path: Path) -> None:
     """Off `strict`, `db.get` thaws a fresh object per call, so every entry would miss."""
 
@@ -241,3 +279,29 @@ def test_decode_memo_is_skipped_when_payload_identity_is_unstable(tmp_path: Path
         assert _decoding._CACHE == {}, mode
     workspace_analysis(Database(mode="strict"), tmp_path)
     assert _decoding._CACHE
+
+
+def test_a_mid_request_mirror_rewrite_drops_the_memo(tmp_path: Path) -> None:
+    """Completion repairs the file in the mirror mid-method; the memo must follow."""
+
+    _write_workspace(tmp_path)
+    (tmp_path / "delta.py").write_text(
+        "from alpha import one\n\n\ndef five():\n    value = one()\n    return value\n",
+        encoding="utf-8",
+    )
+    with WorkspaceSession(tmp_path) as session:
+        assert _codes(session, "delta.py") == []
+        # A caret line that does not parse: completion writes a repaired buffer
+        # into the mirror, queries against it, and restores the original bytes.
+        session.set_overlay(
+            "delta.py",
+            "from alpha import one\n\n\ndef five():\n    value = one()\n    return value.\n",
+        )
+        session.completions_at("delta.py", 5, 17)
+        # Reads after the restore must describe the file as it stands, not the
+        # repaired buffer an entrypoint saw a moment earlier in the same request.
+        session.clear_overlay("delta.py")
+        assert _codes(session, "delta.py") == []
+        result = session.analyze_file("delta.py")
+        assert result.symbols is not None
+        assert [symbol.qualified_name for symbol in result.symbols.symbols] == ["one", "five"]
