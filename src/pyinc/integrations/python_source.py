@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
+from pyinc._python_lexing import identifier_tokens
 from pyinc.core import query
 from pyinc.integrations.deep_module_resolution import resolve_module_location
 from pyinc.integrations.installed_packages import environment_index
@@ -16,7 +17,12 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
-from .source_geometry import DocumentMap, SourcePosition, SourceRange, identifier_range
+from .source_geometry import (
+    DocumentMap,
+    SourcePosition,
+    SourceRange,
+    identifier_range_in_tokens,
+)
 
 ImportKind: TypeAlias = Literal["import", "from"]
 DefinitionKind: TypeAlias = Literal["function", "class"]
@@ -69,6 +75,12 @@ FileAnalysisPayload: TypeAlias = tuple[
     tuple[DiagnosticPayload, ...],
 ]
 DirectoryAnalysisPayload: TypeAlias = tuple[FileAnalysisPayload, ...]
+RangePayload: TypeAlias = tuple[int, int, int, int]
+FileSourceRangesPayload: TypeAlias = tuple[
+    tuple[tuple[int, RangePayload], ...],
+    tuple[tuple[int, str, RangePayload], ...],
+    RangePayload | None,
+]
 
 
 @dataclass(frozen=True)
@@ -632,6 +644,55 @@ def source_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)[0]
 
 
+def _encode_range(value: SourceRange) -> RangePayload:
+    return (value.start.line, value.start.character, value.end.line, value.end.character)
+
+
+def _decode_range(payload: RangePayload) -> SourceRange:
+    return SourceRange(
+        SourcePosition(payload[0], payload[1]), SourcePosition(payload[2], payload[3])
+    )
+
+
+@query
+def source_ranges_for_file(db: Database, path: str) -> FileSourceRangesPayload:
+    source = source_text(db, path)
+    document = DocumentMap(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        if exc.lineno is None:
+            return ((), (), None)
+        start = SourcePosition(max(exc.lineno - 1, 0), max((exc.offset or 1) - 1, 0))
+        end = SourcePosition(
+            max((exc.end_lineno or exc.lineno) - 1, 0),
+            max((exc.end_offset or exc.offset or 1) - 1, 0),
+        )
+        if end <= start:
+            end = SourcePosition(start.line, start.character + 1)
+        return ((), (), _encode_range(SourceRange(start, end)))
+
+    normalized_source = "\n".join(document.lines)
+    tokens = identifier_tokens(normalized_source)
+    import_ranges: dict[int, RangePayload] = {}
+    definition_ranges: dict[tuple[int, str], RangePayload] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            import_ranges.setdefault(node.lineno, _encode_range(document.ast_range(node)))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definition_ranges[(node.lineno, node.name)] = _encode_range(
+                identifier_range_in_tokens(document, tokens, node, node.name)
+            )
+    return (
+        tuple(sorted(import_ranges.items())),
+        tuple(
+            (line, name, payload)
+            for (line, name), payload in sorted(definition_ranges.items())
+        ),
+        None,
+    )
+
+
 def _is_type_checking_test(test: ast.expr) -> bool:
     """Return True if *test* is ``TYPE_CHECKING`` or ``typing.TYPE_CHECKING``."""
     if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
@@ -1052,64 +1113,51 @@ def _decode_module_analysis(payload: ModuleAnalysisPayload) -> PythonModuleAnaly
     )
 
 
-def _definition_name_range(
-    document: DocumentMap, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
-) -> SourceRange:
-    return identifier_range(document.source, node, node.name)
-
-
-def _add_file_source_ranges(analysis: PythonFileAnalysis, source: str) -> PythonFileAnalysis:
-    document = DocumentMap(source)
-    try:
-        tree = ast.parse(source)
-    except SyntaxError as exc:
+def _apply_file_source_ranges(
+    analysis: PythonFileAnalysis, ranges: FileSourceRangesPayload
+) -> PythonFileAnalysis:
+    import_payloads, definition_payloads, error_range = ranges
+    if error_range is not None:
         diagnostics = analysis.diagnostics
-        if diagnostics and exc.lineno is not None:
-            start = SourcePosition(max(exc.lineno - 1, 0), max((exc.offset or 1) - 1, 0))
-            end = SourcePosition(
-                max((exc.end_lineno or exc.lineno) - 1, 0),
-                max((exc.end_offset or exc.offset or 1) - 1, 0),
+        if diagnostics:
+            diagnostics = (
+                replace(diagnostics[0], range=_decode_range(error_range)),
+                *diagnostics[1:],
             )
-            if end <= start:
-                end = SourcePosition(start.line, start.character + 1)
-            diagnostics = (replace(diagnostics[0], range=SourceRange(start, end)), *diagnostics[1:])
         return replace(analysis, diagnostics=diagnostics)
-
-    import_ranges: dict[int, SourceRange] = {}
-    definition_ranges: dict[tuple[int, str], SourceRange] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            import_ranges.setdefault(node.lineno, document.ast_range(node))
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            definition_ranges[(node.lineno, node.name)] = _definition_name_range(document, node)
+    import_ranges = {line: _decode_range(item) for line, item in import_payloads}
+    definition_ranges = {
+        (line, name): _decode_range(item) for line, name, item in definition_payloads
+    }
     return replace(
         analysis,
         imports=tuple(
-            replace(
-                item,
-                range=import_ranges.get(item.range.start.line + 1, item.range),
-            )
+            replace(item, range=import_ranges.get(item.range.start.line + 1, item.range))
             for item in analysis.imports
         ),
         definitions=tuple(
             replace(
                 item,
-                range=definition_ranges.get((item.range.start.line + 1, item.name), item.range),
+                range=definition_ranges.get(
+                    (item.range.start.line + 1, item.name), item.range
+                ),
             )
             for item in analysis.definitions
         ),
     )
 
 
-def _add_module_source_ranges(analysis: PythonModuleAnalysis, source: str) -> PythonModuleAnalysis:
-    file_part = _add_file_source_ranges(
+def _apply_module_source_ranges(
+    analysis: PythonModuleAnalysis, ranges: FileSourceRangesPayload
+) -> PythonModuleAnalysis:
+    file_part = _apply_file_source_ranges(
         PythonFileAnalysis(
             analysis.path,
             analysis.imports,
             analysis.definitions,
             analysis.diagnostics,
         ),
-        source,
+        ranges,
     )
     ranges_by_line = {item.range.start.line: item.range for item in file_part.imports}
     return replace(
@@ -1118,10 +1166,7 @@ def _add_module_source_ranges(analysis: PythonModuleAnalysis, source: str) -> Py
         definitions=file_part.definitions,
         diagnostics=file_part.diagnostics,
         resolved_imports=tuple(
-            replace(
-                item,
-                range=ranges_by_line.get(item.range.start.line, item.range),
-            )
+            replace(item, range=ranges_by_line.get(item.range.start.line, item.range))
             for item in analysis.resolved_imports
         ),
     )
@@ -1130,7 +1175,9 @@ def _add_module_source_ranges(analysis: PythonModuleAnalysis, source: str) -> Py
 def file_analysis(db: Database, path: str | os.PathLike[str]) -> PythonFileAnalysis:
     normalized_path = _normalize_path(path)
     payload = cast(FileAnalysisPayload, thaw(db.get(file_analysis_payload, normalized_path)))
-    return _add_file_source_ranges(_decode_file_analysis(payload), source_text(db, normalized_path))
+    return _apply_file_source_ranges(
+        _decode_file_analysis(payload), source_ranges_for_file(db, normalized_path)
+    )
 
 
 def directory_analysis(
@@ -1142,7 +1189,7 @@ def directory_analysis(
         thaw(db.get(directory_analysis_payload, normalized_root)),
     )
     return tuple(
-        _add_file_source_ranges(_decode_file_analysis(item), source_text(db, item[0]))
+        _apply_file_source_ranges(_decode_file_analysis(item), source_ranges_for_file(db, item[0]))
         for item in payload
     )
 
@@ -1161,8 +1208,8 @@ def module_analysis(
         ModuleAnalysisPayload,
         thaw(db.get(module_analysis_payload, normalized_root, normalized_path)),
     )
-    return _add_module_source_ranges(
-        _decode_module_analysis(payload), source_text(db, normalized_path)
+    return _apply_module_source_ranges(
+        _decode_module_analysis(payload), source_ranges_for_file(db, normalized_path)
     )
 
 
@@ -1176,7 +1223,9 @@ def workspace_analysis(db: Database, root: str | os.PathLike[str]) -> PythonWork
     return PythonWorkspaceAnalysis(
         root=workspace_root,
         modules=tuple(
-            _add_module_source_ranges(_decode_module_analysis(item), source_text(db, item[0]))
+            _apply_module_source_ranges(
+                _decode_module_analysis(item), source_ranges_for_file(db, item[0])
+            )
             for item in modules
         ),
     )
