@@ -1,3 +1,4 @@
+from ._decoding import once_per_request, request_inputs_changed, request_scope
 from .csv_data import (
     CsvAnalysis,
     CsvColumn,
@@ -206,6 +207,9 @@ __all__ = [
     "module_analysis",
     "module_symbol_table",
     "notebook_analysis",
+    "once_per_request",
+    "request_inputs_changed",
+    "request_scope",
     "requirements_analysis",
     "resolve_import_name",
     "resolve_module_path",

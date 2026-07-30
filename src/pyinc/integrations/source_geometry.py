@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import re
+import tokenize
 import unicodedata
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
@@ -165,21 +166,20 @@ def ast_range(source: str, node: ast.AST) -> SourceRange:
     return DocumentMap(source).ast_range(node)
 
 
-def identifier_range(
-    source: str,
+def identifier_range_in_tokens(
+    document: DocumentMap,
+    tokens: tuple[tokenize.TokenInfo, ...],
     node: ast.AST,
     name: str,
     *,
     reverse: bool = False,
 ) -> SourceRange:
-    """Return the exact source spelling for an AST-normalized identifier."""
+    """identifier_range against a pre-computed token stream for document."""
 
-    document = DocumentMap(source)
     full = document.ast_range(node)
-    normalized_source = "\n".join(document.lines)
     candidates = [
         token
-        for token in identifier_tokens(normalized_source)
+        for token in tokens
         if unicodedata.normalize("NFKC", token.string) == name
         and full.start <= SourcePosition(token.start[0] - 1, token.start[1])
         and SourcePosition(token.end[0] - 1, token.end[1]) <= full.end
@@ -195,6 +195,22 @@ def identifier_range(
     return SourceRange(full.start, full.start)
 
 
+def identifier_range(
+    source: str,
+    node: ast.AST,
+    name: str,
+    *,
+    reverse: bool = False,
+) -> SourceRange:
+    """Return the exact source spelling for an AST-normalized identifier."""
+
+    document = DocumentMap(source)
+    normalized_source = "\n".join(document.lines)
+    return identifier_range_in_tokens(
+        document, identifier_tokens(normalized_source), node, name, reverse=reverse
+    )
+
+
 __all__ = [
     "DocumentMap",
     "PositionEncoding",
@@ -202,4 +218,5 @@ __all__ = [
     "SourceRange",
     "ast_range",
     "identifier_range",
+    "identifier_range_in_tokens",
 ]

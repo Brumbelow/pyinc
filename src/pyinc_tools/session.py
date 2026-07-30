@@ -8,7 +8,9 @@ import tempfile
 import threading
 import tokenize
 from collections.abc import Iterator, Sequence
+from contextlib import AbstractContextManager
 from pathlib import Path
+from typing import TypeAlias
 
 from pyinc import Database
 from pyinc.integrations import (
@@ -39,6 +41,8 @@ from pyinc.integrations import (
     find_references,
     module_analysis,
     module_symbol_table,
+    request_inputs_changed,
+    request_scope,
     scope_tree,
     workspace_analysis,
     workspace_config_analysis,
@@ -236,6 +240,64 @@ from ._workspace import (
 # Diagnostic codes that `code_actions_for_range` can offer a quick fix for.
 _CODE_ACTION_CODES = frozenset({"unused-import", "missing-import", "unresolved-symbol"})
 
+# Target module -> the (importing file, imported name) pairs that name it in a
+# `from` import. `_reexported_names_for_module` needs one entry of this per file
+# it examines; building it once per request keeps the workspace analysis from
+# being re-decoded for every file in the workspace.
+_ReexportIndex: TypeAlias = dict[str, list[tuple[str, str]]]
+
+
+def _build_reexport_index(modules: Sequence[PythonModuleAnalysis]) -> _ReexportIndex:
+    index: _ReexportIndex = {}
+    for analysis in modules:
+        for resolved_import in analysis.resolved_imports:
+            if resolved_import.kind != "from":
+                continue
+            resolved_module = resolved_import.resolved_module
+            imported_name = resolved_import.imported_name
+            if resolved_module is None or imported_name is None:
+                continue
+            index.setdefault(resolved_module, []).append((analysis.path, imported_name))
+    return index
+
+
+class _RequestLock:
+    """The session lock, which also bounds one request's view of the graph.
+
+    Every public method holds this for the whole of its work, and nothing can
+    change the mirror or the overlays while it is held, so an integration
+    entrypoint asked the same question twice inside one method has to answer the
+    same both times. Tying the integrations' per-request memo to the lock is
+    what keeps it from outliving that guarantee: outside a session it does not
+    exist, so a caller driving the integrations directly still sees its edits.
+    """
+
+    def __init__(self, db: Database) -> None:
+        self._lock = threading.RLock()
+        self._db = db
+        self._depth = 0
+        self._scope: AbstractContextManager[None] | None = None
+
+    def __enter__(self) -> None:
+        self._lock.acquire()
+        try:
+            if self._depth == 0:
+                scope = request_scope(self._db)
+                scope.__enter__()
+                self._scope = scope
+            self._depth += 1
+        except BaseException:
+            self._lock.release()
+            raise
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._depth -= 1
+        scope = self._scope
+        if self._depth == 0 and scope is not None:
+            self._scope = None
+            scope.__exit__(None, None, None)
+        self._lock.release()
+
 
 class WorkspaceSession:
     def __init__(
@@ -269,7 +331,7 @@ class WorkspaceSession:
         )
         self._overlays: dict[str, str] = {}
         self._scheduled_paths: set[str] = set()
-        self._state_lock = threading.RLock()
+        self._state_lock = _RequestLock(self.db)
         self._watchers: set[PollingWorkspaceWatcher] = set()
         self._close_complete = threading.Event()
         self._closed = False
@@ -336,6 +398,7 @@ class WorkspaceSession:
             mirror_path = self._mirror_path_for_real(real_path)
             mirror_path.parent.mkdir(parents=True, exist_ok=True)
             mirror_path.write_bytes(_encode_python_text(text))
+            request_inputs_changed()
             self._overlays[real_path] = text
             self._scheduled_paths.add(real_path)
             return real_path
@@ -391,18 +454,19 @@ class WorkspaceSession:
                 self.mirror_root,
                 dependency_inputs.declared_dependencies,
             )
-            python_analysis = self._remap_workspace_analysis(
-                workspace_analysis(self.db, self.mirror_root)
-            )
+            workspace = workspace_analysis(self.db, self.mirror_root)
+            python_analysis = self._remap_workspace_analysis(workspace)
             symbol_index = self._remap_workspace_symbol_index(
                 workspace_symbol_index(self.db, self.mirror_root)
             )
+            reexports = _build_reexport_index(workspace.modules)
             files = tuple(
                 self._build_file_result(
                     module.path,
                     dependency_inputs,
                     dependency_check,
                     module=module,
+                    reexports=reexports,
                 )
                 for module in python_analysis.modules
             )
@@ -912,6 +976,37 @@ class WorkspaceSession:
             references=result.references,
         )
 
+    def _name_is_used_in_file(self, mirror_path: str, resolved: ResolvedTarget) -> bool:
+        """Is ``resolved`` referenced from inside ``mirror_path`` itself?
+
+        The unused-import check only ever asks about hits in the importing
+        file, so it scans that one file's occurrences rather than resolving
+        every same-named occurrence in the workspace and then discarding the
+        other files' hits. It matches on `find_references`' rule minus the
+        ``include_declaration`` filter, so a declaration of the target counts
+        as a use here; that can only overreport use, and so never reports a
+        live import as unused.
+        """
+        target = self._symbol_id_for_resolved(resolved)
+        if target is None:
+            return False
+        for occurrence in scope_tree(self.db, mirror_path).occurrences:
+            if occurrence.name != target.name:
+                continue
+            # An import binding names the target but is not itself a
+            # declaration or usage of the target symbol.
+            if occurrence.is_declaration and occurrence.symbol_id != target:
+                continue
+            candidate = resolve_symbol_at(
+                self.db,
+                self.mirror_root,
+                mirror_path,
+                occurrence.range.start,
+            )
+            if candidate == target:
+                return True
+        return False
+
     def _symbol_id_for_resolved(self, resolved: ResolvedTarget) -> SymbolId | None:
         if (
             resolved.resolution != "workspace"
@@ -1116,10 +1211,12 @@ class WorkspaceSession:
             yield False
             return
         mirror_path.write_bytes(_encode_python_text(repaired))
+        request_inputs_changed()
         try:
             yield True
         finally:
             mirror_path.write_bytes(_encode_python_text(original))
+            request_inputs_changed()
 
     def _symbol_completion_item(
         self, label: str, symbol: Symbol, sort_group: str
@@ -3333,6 +3430,7 @@ class WorkspaceSession:
         dependency_check: DependencyCheckAnalysis,
         *,
         module: PythonModuleAnalysis | None = None,
+        reexports: _ReexportIndex | None = None,
     ) -> FileAnalysisResult:
         diagnostics = list(
             self._dependency_status_diagnostics(
@@ -3363,6 +3461,7 @@ class WorkspaceSession:
                 str(mirror_path),
                 module_result,
                 dependency_check,
+                reexports,
             )
         )
         return FileAnalysisResult(
@@ -3379,6 +3478,7 @@ class WorkspaceSession:
         mirror_path: str,
         module_result: PythonModuleAnalysis,
         dependency_check: DependencyCheckAnalysis,
+        reexports: _ReexportIndex | None = None,
     ) -> tuple[AnalysisDiagnostic, ...]:
         diagnostics: list[AnalysisDiagnostic] = []
         declared_names = {status.name for status in dependency_check.statuses}
@@ -3481,7 +3581,9 @@ class WorkspaceSession:
                         )
                     )
 
-        diagnostics.extend(self._unused_import_diagnostics(real_path, mirror_path, module_result))
+        diagnostics.extend(
+            self._unused_import_diagnostics(real_path, mirror_path, module_result, reexports)
+        )
 
         return tuple(diagnostics)
 
@@ -3490,12 +3592,13 @@ class WorkspaceSession:
         real_path: str,
         mirror_path: str,
         module_result: PythonModuleAnalysis,
+        reexports: _ReexportIndex | None = None,
     ) -> list[AnalysisDiagnostic]:
         """Flag workspace ``from M import name`` bindings that are never used.
 
         Conservative by design (see the guide's ``unused-import``
         limitations): only ``from`` imports whose target resolves to a
-        workspace module are considered, so that ``find_references`` can
+        workspace module are considered, so that the occurrence scan can
         actually verify usage. ``import M`` is skipped (attribute usage is
         under-reported) and stdlib / installed targets are skipped (their
         usage cannot be verified). ``__init__.py`` files, self-alias
@@ -3508,14 +3611,10 @@ class WorkspaceSession:
         # A parse error anywhere makes the occurrence scan unreliable.
         if module_result.diagnostics:
             return []
-        source = self.source_text(real_path)
-        if source is None:
-            return []
-        try:
-            tree = _parse_python(source)
-        except SyntaxError:
-            return []
 
+        # Deciding there is nothing to check needs only the module analysis, so
+        # it happens before the file is read and parsed: most files import no
+        # workspace name at all and never reach the scan below.
         workspace_from: dict[tuple[int, str], ResolvedImportRef] = {}
         for resolved_import in module_result.resolved_imports:
             if (
@@ -3532,7 +3631,17 @@ class WorkspaceSession:
         if not workspace_from:
             return []
 
-        reexported = self._reexported_names_for_module(module_result.module, mirror_path)
+        source = self.source_text(real_path)
+        if source is None:
+            return []
+        try:
+            tree = _parse_python(source)
+        except SyntaxError:
+            return []
+
+        reexported = self._reexported_names_for_module(
+            module_result.module, mirror_path, reexports
+        )
         # A name listed in this module's own static `__all__` is an intentional
         # public re-export; removing it would break the facade's API.
         static_all = _static_module_all_names(tree)
@@ -3554,16 +3663,13 @@ class WorkspaceSession:
                     continue
                 if binding in static_all:
                     continue
-                references = self._find_references_by_name(real_path, binding)
+                resolved = _resolve_target(self.db, self.mirror_root, mirror_path, binding)
                 # A binding that doesn't resolve to a workspace symbol is a
                 # *broken* import (its own `unresolved-symbol` diagnostic), not
                 # an unused one — leave it to that diagnostic + its quick fix.
-                if (
-                    not isinstance(references.target, ResolvedTarget)
-                    or references.target.resolution != "workspace"
-                ):
+                if resolved.resolution != "workspace":
                     continue
-                if any(ref.path == real_path for ref in references.references):
+                if self._name_is_used_in_file(mirror_path, resolved):
                     continue
                 diagnostics.append(
                     AnalysisDiagnostic(
@@ -3586,28 +3692,30 @@ class WorkspaceSession:
                 )
         return diagnostics
 
-    def _reexported_names_for_module(self, file_module: str, self_mirror_path: str) -> set[str]:
+    def _reexported_names_for_module(
+        self,
+        file_module: str,
+        self_mirror_path: str,
+        reexports: _ReexportIndex | None = None,
+    ) -> set[str]:
         """Names other workspace modules import ``from <file_module>``.
 
         Removing a ``from M import name`` binding in this file is only safe
         when the file does not itself re-export ``name`` — i.e. no *other*
         workspace module does ``from <this_module> import name`` (or
         ``from <this_module> import *``, which could re-export anything).
-        Reuses the already-decoded workspace analysis; no per-name queries.
+
+        A workspace request passes the index it built once for the whole run;
+        single-file callers fall back to building it from the workspace
+        analysis, which is the same walk this used to do per file.
         """
-        names: set[str] = set()
-        workspace = workspace_analysis(self.db, self.mirror_root)
-        for analysis in workspace.modules:
-            if analysis.path == self_mirror_path:
-                continue
-            for resolved_import in analysis.resolved_imports:
-                if resolved_import.kind != "from":
-                    continue
-                if resolved_import.resolved_module != file_module:
-                    continue
-                if resolved_import.imported_name is not None:
-                    names.add(resolved_import.imported_name)
-        return names
+        if reexports is None:
+            reexports = _build_reexport_index(workspace_analysis(self.db, self.mirror_root).modules)
+        return {
+            name
+            for importer_path, name in reexports.get(file_module, ())
+            if importer_path != self_mirror_path
+        }
 
     def _dependency_inputs(self) -> _DependencyInputs:
         config = workspace_config_analysis(self.db, self.mirror_root)
@@ -3729,6 +3837,7 @@ class WorkspaceSession:
 
     def _sync_path_from_disk(self, real_path: str) -> None:
         self._mirror.sync_path_from_disk(real_path)
+        request_inputs_changed()
 
     def _remap_workspace_analysis(
         self, analysis: PythonWorkspaceAnalysis

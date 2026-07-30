@@ -21,6 +21,7 @@ from pyinc.integrations import (
     SymbolId,
     module_analysis,
     module_symbol_table,
+    once_per_request,
     scope_tree,
     symbol_at,
 )
@@ -206,6 +207,22 @@ def resolve_target(
 ) -> ResolvedTarget:
     """Resolve a declaration through only public integration contracts."""
 
+    return once_per_request(
+        db,
+        "resolve_target",
+        (root, path, qualified_name, _visited, _trail),
+        lambda: _resolve_target_uncached(db, root, path, qualified_name, _visited, _trail),
+    )
+
+
+def _resolve_target_uncached(
+    db: Database,
+    root: str,
+    path: str,
+    qualified_name: str,
+    _visited: frozenset[tuple[str, str]],
+    _trail: tuple[tuple[str, str], ...],
+) -> ResolvedTarget:
     table = module_symbol_table(db, root, path)
     original_module = table.module
     key = (path, qualified_name)

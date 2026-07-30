@@ -45,6 +45,10 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
 
 def test_package_namespace_exports_only_stable_api() -> None:
     assert set(integrations.__all__) == {
+        # _decoding
+        "once_per_request",
+        "request_inputs_changed",
+        "request_scope",
         # csv_data
         "CsvAnalysis",
         "CsvColumn",
