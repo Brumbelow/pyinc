@@ -51,6 +51,20 @@ than reading ambient state directly inside a query. The
 walks through inputs, resources, modes, inspection, and a first declared-output
 action.
 
+## See it on a real workspace
+
+`pyinc-tools` was pointed at a pinned checkout of pytest — 270 Python files,
+nothing adapted for `pyinc` — and watched while single files were edited. On
+that workspace, re-analysing after a one-file edit went from 160.311 s to
+1.687 s (~95x) and a warm single-file re-analysis from 10.010 s to 0.273 s
+against an earlier build of the same engine. Those timings are from one machine
+and will differ on yours; the work counts behind them — 282 queries executed,
+17,758 results reused, 84 backdated for one update — are properties of the
+engine and the edit.
+[The demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md)
+walks through the pipeline, the measurements, and a trace of which queries that
+update actually re-ran.
+
 ## Correctness contract
 
 `pyinc` guarantees **from-scratch consistency**: incremental evaluation matches
