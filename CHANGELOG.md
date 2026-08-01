@@ -8,6 +8,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Database.request_span()`, a public context manager holding one kernel
+  request open across several `get`/`inspect`/`inspect_fresh`/`read_resource`
+  calls, and `Database.request_inputs_changed()` to declare mid-span input
+  changes. Entering a span declares that the world the database reads from
+  is stable until the span closes; `set`/`set_many` declare their own
+  changes, a change committed by any thread rolls the span, buffered
+  observer events are delivered when the outermost span closes even if the
+  span body raises, and a failing load's exception lives to span end.
+  `pyinc.integrations.request_inputs_changed()` rolls a held span, and
+  `WorkspaceSession` holds a span for each public method.
+
 - `pyinc-tools analyze` can report diagnostics and gate a CI job: `--format
   text` prints one `path:line:col: severity code message` line per diagnostic,
   `--diagnostics-only` emits just the diagnostics array instead of the full
@@ -77,6 +88,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The default backdate decision in `checked` and `fast` now matches `strict`
+  in three corners it previously diverged on: a recomputed dataclass whose
+  type changed while its fields stayed equal, and a dataclass replaced by a
+  dict of the same shape, both count as changes in every mode (previously
+  backdated in `checked`/`fast` because thawing dropped the type identity),
+  and default comparisons no longer invoke `ValueAdapter` `thaw`/`freeze`
+  hooks in any mode. Queries with an `eq=` or `cutoff=` policy are
+  unaffected.
 - `pyinc-tools analyze --fail-on` combined with `--watch` is rejected as a
   usage error (exit status `2`), because watch mode never terminates normally.
   The default remains `--fail-on none`, so existing invocations keep their
@@ -163,8 +182,116 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the working directory (`os.getcwd`, `Path.cwd`). These are not intercepted;
   route them through `FileStatResource` or `db.report_untracked_read`.
 
+### Performance
+
+- The default backdate comparison runs on the canonical stored snapshots
+  themselves instead of exposing both values and re-freezing them, so the
+  warm recompute path no longer pays a deep thaw, validation walk, or
+  re-freeze per comparison. Queries with an `eq=` or `cutoff=` policy keep
+  the previous path and continue to receive mode-exposed values.
+- Warm resource validation answers an unchanged-probe check from `probe()`
+  alone and runs `probe_and_load` only on a probe miss, so unchanged file
+  reads no longer decode their contents and no longer allocate the decoded
+  value they would have discarded. Stored probe/value pairs still originate
+  from a single atomic observation, and a content change under a stable stat
+  signature is still detected.
+- `WorkspaceSession` holds one kernel request span per public method, so a
+  warm `analyze_workspace` validates each resource once per call instead of
+  once per internal request.
+
+### Removed
+
+- The demo page, its recordings, and the measured-timing claims in the README.
+  The workspace demo will be re-recorded and republished with the next
+  release; until then the repository makes no wall-clock claims. Dropping the
+  recordings also removes 7.3 MB of media from the sdist.
+
 ### Fixed
 
+- `~=` implements its PEP 440 definition: the upper bound is a prefix match,
+  not an ordered comparison, so prereleases and dev releases of the excluded
+  next release (`3.0a1` against `~=2.2`) no longer satisfy — an installed
+  prerelease of the next major can no longer report a compatible-release
+  requirement as satisfied. Wildcard matching compares the epoch, so `1!1.1`
+  no longer satisfies `==1.1.*`. Both verified against `packaging` across
+  epoch, post, dev, and prerelease shapes.
+- `applicable_requirements` checks an installed version with pre-releases
+  allowed, through the same helper dependency checking uses, so the two
+  entrypoints agree that an installed `2.0.0rc1` satisfies `>=1.20` instead
+  of reporting `version_mismatch` and `satisfied` for the same requirement in
+  the same environment. `evaluate_version_specifier` keeps resolver-style
+  exclusion unless the specifier opts in.
+- Marker comparisons route wildcard literals through PEP 440 prefix matching:
+  `python_version == "3.*"` is true on any 3.x interpreter and
+  `python_version != "2.7.*"` no longer evaluates false, so requirements
+  guarded by such markers are applicable again.
+- `document_diagnostics` orders module-name diagnostics canonically, so a
+  `$defs` key reorder — which backdates the canonicalized schema text — can
+  no longer leave an incremental database returning a differently ordered
+  diagnostics tuple than a fresh one.
+- A definition named after a binding the generated module itself uses
+  (`str`, `Literal`, `dataclass`, and the rest of the emitter's closed set)
+  is rejected with the blocking `reserved-definition-name` diagnostic instead
+  of emitting code whose imports silently shadow `typing` and builtins under
+  type checking.
+- `{"type": null}` produces the blocking `invalid-type` error at the `/type`
+  pointer like any other invalid type value, instead of being conflated with
+  an absent key and generating with only an `unconstrained-schema` warning.
+- The polling watcher no longer loses updates. Its baseline reflects the
+  content the mirror was actually synced from, so a file edited between
+  session construction and the first poll — the whole initial analysis runs
+  in that window — is detected and refreshed, and a failed refresh returns
+  its paths to pending so the next tick retries instead of dropping the
+  change forever.
+- An LSP notification handler that fails with an unexpected error — a mirror
+  write hitting a full disk, a client opening a directory URI — is logged and
+  the server keeps serving, matching the request path's guard, instead of
+  terminating the process with a traceback.
+- A value change two levels above an untracked query invalidates its
+  transitive dependents. A recomputation that lands a changed value now moves
+  the revision the way input and resource changes always did; before, the
+  parent of a `report_untracked_read` query re-executed and stored its new
+  value at exactly the revision its own dependents had already verified, so a
+  grandparent kept reporting `dependencies unchanged` and `db.get()` diverged
+  from a fresh `Database`. An untracked query that re-executes to a
+  byte-identical value does not move the revision, so warm requests over a
+  stable graph still settle.
+- Strict mode exposes cyclic and shared query results — and `read_input`
+  values — through the same immutable container views it already used for
+  query arguments, instead of leaking the raw graph envelope, which crashed
+  `len()` and iteration with `TypeError`. Those views also freeze back:
+  passing one into `db.set` or as a query argument re-encodes it to the
+  identical canonical snapshot (same fingerprint, same cache node) where it
+  previously hit `RecursionError`.
+- The environment guard installed by `Database` matches `os._Environ` again:
+  both `|` union directions and `|=` work (previously `TypeError` for any
+  code in the process once a `Database` had ever been constructed), and the
+  `encodekey`/`decodekey`/`encodevalue`/`decodevalue` helpers are reachable.
+  Every other attribute — including the raw backing mapping — raises
+  `AttributeError`, and union reads inside a query still require a `Resource`
+  scope.
+- An `@action` whose output layout migrates between a file and a directory
+  (`pkg` ↔ `pkg/model.py`) reconciles instead of wedging permanently on its
+  own ledger. Manifest entries that conflict with the new layout are deleted
+  as orphans of the previous layout — before publication, under the usual
+  tamper policy, pruning only directories the deletion left empty — and
+  `plan()` reports those deletions without mutating. Previously every
+  reconcile and every `plan()` raised `ActionPathError` until the manifest was
+  edited by hand.
+- Requirement lines carrying pip per-requirement options parse correctly:
+  `pip-compile --generate-hashes` output no longer folds `--hash=...`
+  continuation lines into the version text, which corrupted the specifier and
+  misreported every requirement in a hashed lockfile. An undecidable
+  specifier is reported `ambiguous` by `applicable_requirements`, matching
+  dependency checking, instead of `version_mismatch`.
+- The LSP server serializes writes to its output stream, so a watcher-thread
+  diagnostics notification can no longer interleave with a main-loop response
+  and corrupt `Content-Length` framing. The published-diagnostics bookkeeping
+  is guarded by the same lock.
+- The session lookups behind `textDocument/declaration` and the rename
+  preflight take the session lock like every other entry point, so they no
+  longer read the workspace mirror mid-refresh, and they raise `RuntimeError`
+  after `close()` like the rest of the session surface.
 - `WorkspaceSession` diagnostics no longer leak the temporary workspace-mirror
   path through their message text. A kernel `Diagnostic` has no path field, so an
   integration that needs to name a file interpolates it into the message; under a

@@ -270,20 +270,35 @@ class _RequestLock:
     same both times. Tying the integrations' per-request memo to the lock is
     what keeps it from outliving that guarantee: outside a session it does not
     exist, so a caller driving the integrations directly still sees its edits.
+
+    The lock holds a kernel request span for the same reason it holds the
+    memo: the stability it guarantees is exactly what ``Database.request_span``
+    asks a caller to declare, so the several gets a public method fans out to
+    share one request and validate each resource once. The methods that do
+    rewrite the mirror mid-hold already call ``request_inputs_changed()``,
+    which rolls the held span onto a fresh request.
     """
 
     def __init__(self, db: Database) -> None:
         self._lock = threading.RLock()
         self._db = db
         self._depth = 0
+        self._span: AbstractContextManager[None] | None = None
         self._scope: AbstractContextManager[None] | None = None
 
     def __enter__(self) -> None:
         self._lock.acquire()
         try:
             if self._depth == 0:
-                scope = request_scope(self._db)
-                scope.__enter__()
+                span = self._db.request_span()
+                span.__enter__()
+                try:
+                    scope = request_scope(self._db)
+                    scope.__enter__()
+                except BaseException:
+                    span.__exit__(None, None, None)
+                    raise
+                self._span = span
                 self._scope = scope
             self._depth += 1
         except BaseException:
@@ -293,9 +308,13 @@ class _RequestLock:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self._depth -= 1
         scope = self._scope
+        span = self._span
         if self._depth == 0 and scope is not None:
             self._scope = None
             scope.__exit__(None, None, None)
+        if self._depth == 0 and span is not None:
+            self._span = None
+            span.__exit__(None, None, None)
         self._lock.release()
 
 
@@ -875,37 +894,41 @@ class WorkspaceSession:
         path: str | os.PathLike[str],
         position: SourcePosition,
     ) -> SymbolId | None:
-        real_path = self._normalize_real_path(path)
-        mirror_path = self._mirror_path_for_real(real_path)
-        if not mirror_path.exists() or mirror_path.suffix != ".py":
-            raise FileNotFoundError(real_path)
-        symbol_id = scope_tree(self.db, str(mirror_path)).symbol_at(position)
-        if symbol_id is None:
-            return None
-        return SymbolId(
-            self._remap_path(symbol_id.path) or symbol_id.path,
-            symbol_id.scope_id,
-            symbol_id.name,
-            symbol_id.declaration,
-        )
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            symbol_id = scope_tree(self.db, str(mirror_path)).symbol_at(position)
+            if symbol_id is None:
+                return None
+            return SymbolId(
+                self._remap_path(symbol_id.path) or symbol_id.path,
+                symbol_id.scope_id,
+                symbol_id.name,
+                symbol_id.declaration,
+            )
 
     def _local_binding_at(
         self,
         path: str | os.PathLike[str],
         position: SourcePosition,
     ) -> Binding | None:
-        real_path = self._normalize_real_path(path)
-        mirror_path = self._mirror_path_for_real(real_path)
-        if not mirror_path.exists() or mirror_path.suffix != ".py":
-            raise FileNotFoundError(real_path)
-        tree = scope_tree(self.db, str(mirror_path))
-        symbol_id = tree.symbol_at(position)
-        if symbol_id is None:
-            return None
-        return next(
-            (binding for binding in tree.bindings if binding.symbol_id == symbol_id),
-            None,
-        )
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            tree = scope_tree(self.db, str(mirror_path))
+            symbol_id = tree.symbol_at(position)
+            if symbol_id is None:
+                return None
+            return next(
+                (binding for binding in tree.bindings if binding.symbol_id == symbol_id),
+                None,
+            )
 
     def find_references(
         self,
@@ -3838,6 +3861,15 @@ class WorkspaceSession:
     def _sync_path_from_disk(self, real_path: str) -> None:
         self._mirror.sync_path_from_disk(real_path)
         request_inputs_changed()
+
+    def _mirrored_content_hashes(self) -> dict[str, str]:
+        """Sha256 per real path of the disk content the mirror was synced from.
+
+        Watchers seed their first-poll baseline from this instead of the
+        current disk state, so an edit landing between the mirror copy and
+        watcher construction is still detected."""
+        with self._state_lock:
+            return self._mirror.content_hashes()
 
     def _remap_workspace_analysis(
         self, analysis: PythonWorkspaceAnalysis

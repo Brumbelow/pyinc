@@ -21,6 +21,16 @@ class Resource(Generic[KeyT, ValueT, ProbeT]):
     Implementations provide a cheap probe and a load operation. Resources whose
     probe and value can race should override :meth:`probe_and_load` and observe
     both from one underlying read, as all built-in resources do.
+
+    On a warm request the kernel may answer an unchanged-probe check from
+    :meth:`probe` alone and calls :meth:`probe_and_load` only when that probe
+    misses or the record cannot answer, so :meth:`probe` and the probe
+    component of :meth:`probe_and_load` must agree on an unchanged world. The
+    kernel may spend one standalone :meth:`probe` per warm request, and a miss
+    then pays the full :meth:`probe_and_load` on top, so :meth:`probe` should
+    cost no more than :meth:`probe_and_load` and must answer "unchanged" only
+    when it genuinely is: a probe that advances on every call defeats the
+    warm-path check and turns each warm request into two reads.
     """
 
     def read(self, db: _runtime.Database, key: KeyT) -> ValueT:

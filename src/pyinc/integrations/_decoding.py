@@ -98,11 +98,16 @@ def request_inputs_changed() -> None:
 
     A caller that mutates what the integrations read part-way through its own
     request has broken the promise `request_scope` makes and must say so.
+    Saying so reaches the kernel too: when the caller also holds a
+    `Database.request_span`, the span rolls onto a fresh request, so the
+    kernel's own once-per-request work -- resource validation above all --
+    re-runs against the moved inputs.
     """
 
     scope = _REQUEST.get()
     if scope is not None:
         scope[1].clear()
+        scope[0].request_inputs_changed()
 
 
 def once_per_request(

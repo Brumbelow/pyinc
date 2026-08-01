@@ -6,6 +6,7 @@ import pytest
 
 import pyinc.integrations as integrations
 from pyinc import Database
+from pyinc.integrations._pep440 import parse_specifier_set, satisfies
 from pyinc.integrations.dependency_check import (
     dependency_check_analysis,
     workspace_dependency_check,
@@ -315,6 +316,92 @@ def test_compatible_release_three_component(
         dependency_check_analysis(db, ("requests~=2.30.0",)).statuses[0].status
         == "version_mismatch"
     )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_compatible_release_excludes_next_release_prereleases(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "3.0a1", top_level="requests")
+    _make_dist_info(site_dir, "example", "3.0.dev1", top_level="example")
+    _patch_site(monkeypatch, site_dir)
+
+    db = Database(mode=mode)
+    # ~=2.2 means >=2.2, ==2.* — 3.0a1 and 3.0.dev1 sort before 3.0 but are
+    # not 2.x releases, so the compatible-release upper bound excludes them.
+    assert (
+        dependency_check_analysis(db, ("requests~=2.2",)).statuses[0].status == "version_mismatch"
+    )
+    assert dependency_check_analysis(db, ("example~=2.2",)).statuses[0].status == "version_mismatch"
+    # The pre-release itself is visible here (installed versions are evaluated
+    # with pre-releases allowed) — the mismatch above is the upper bound, not
+    # pre-release gating.
+    assert dependency_check_analysis(db, ("requests>=2.2",)).statuses[0].status == "satisfied"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_wildcard_specifier_requires_matching_epoch(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "mypkg", "1!1.1", top_level="mypkg")
+    _patch_site(monkeypatch, site_dir)
+
+    db = Database(mode=mode)
+    # An epoch-less prefix only matches epoch-0 versions.
+    assert (
+        dependency_check_analysis(db, ("mypkg==1.1.*",)).statuses[0].status == "version_mismatch"
+    )
+    assert dependency_check_analysis(db, ("mypkg!=1.1.*",)).statuses[0].status == "satisfied"
+    assert dependency_check_analysis(db, ("mypkg==1!1.1.*",)).statuses[0].status == "satisfied"
+    assert (
+        dependency_check_analysis(db, ("mypkg==1!1.0.*",)).statuses[0].status == "version_mismatch"
+    )
+
+
+def test_pep440_compatible_release_upper_bound_is_prefix_match() -> None:
+    # The upper bound of ~=2.2 is ==2.* (prefix match), not an ordered <3.0:
+    # pre-releases and dev releases of 3.0 sort before 3.0 yet are not 2.x.
+    spec = parse_specifier_set("~=2.2")
+    assert spec is not None
+    assert satisfies(spec, "2.9", include_prerelease=True)[0] is True
+    assert satisfies(spec, "3.0a1", include_prerelease=True)[0] is False
+    assert satisfies(spec, "3.0.dev1", include_prerelease=True)[0] is False
+    assert satisfies(spec, "3.0", include_prerelease=True)[0] is False
+
+    # Suffix segments are dropped from the prefix, not from the lower bound.
+    post_spec = parse_specifier_set("~=2.2.post3")
+    assert post_spec is not None
+    assert satisfies(post_spec, "2.2", include_prerelease=True)[0] is False
+    assert satisfies(post_spec, "2.2.post4", include_prerelease=True)[0] is True
+    assert satisfies(post_spec, "2.3", include_prerelease=True)[0] is True
+    assert satisfies(post_spec, "3.0", include_prerelease=True)[0] is False
+
+    # The prefix keeps the specifier's epoch.
+    epoch_spec = parse_specifier_set("~=1!2.2")
+    assert epoch_spec is not None
+    assert satisfies(epoch_spec, "1!2.5", include_prerelease=True)[0] is True
+    assert satisfies(epoch_spec, "2.5", include_prerelease=True)[0] is False
+    assert satisfies(epoch_spec, "2!1.0", include_prerelease=True)[0] is False
+
+
+def test_pep440_wildcard_prefix_compares_epoch() -> None:
+    spec = parse_specifier_set("==1.1.*")
+    assert spec is not None
+    assert satisfies(spec, "1!1.1", include_prerelease=True)[0] is False
+    assert satisfies(spec, "1.1.post1", include_prerelease=True)[0] is True
+
+    negated = parse_specifier_set("!=1.1.*")
+    assert negated is not None
+    assert satisfies(negated, "1!1.1", include_prerelease=True)[0] is True
+
+    epoch_spec = parse_specifier_set("==1!1.1.*")
+    assert epoch_spec is not None
+    assert satisfies(epoch_spec, "1!1.1.5", include_prerelease=True)[0] is True
+    assert satisfies(epoch_spec, "1.1.5", include_prerelease=True)[0] is False
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

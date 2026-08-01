@@ -26,6 +26,7 @@ from pyinc.integrations import (
     toml_config,
     xml_config,
 )
+from pyinc.integrations._version_policy import check_version_constraints
 from pyinc.integrations.requirements_txt import RequirementPayload
 from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
 
@@ -471,11 +472,11 @@ def test_site_packages_resource_probe_and_load(
 
 
 def test_dependency_specifier_extraction_edge_cases() -> None:
-    assert dependency_check._check_version_constraints("not a spec", "1.0")[0] == "ambiguous"
+    assert check_version_constraints("not a spec", "1.0")[0] == "ambiguous"
     # Arbitrary equality compares strings, so "1" does not match "1.0".
-    assert dependency_check._check_version_constraints("===1", "1.0")[0] == "version_mismatch"
-    assert dependency_check._check_version_constraints("===1.0", "1.0")[0] == "satisfied"
-    assert dependency_check._check_version_constraints(">=1", "bad")[0] == "ambiguous"
+    assert check_version_constraints("===1", "1.0")[0] == "version_mismatch"
+    assert check_version_constraints("===1.0", "1.0")[0] == "satisfied"
+    assert check_version_constraints(">=1", "bad")[0] == "ambiguous"
     assert dependency_check._extract_dep_name_and_spec("Demo @ https://example.invalid/x") == (
         "demo",
         "",

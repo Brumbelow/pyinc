@@ -316,6 +316,75 @@ def test_guarded_environ_checks_every_read_but_allows_mutation() -> None:
     assert len(reads) == 10
 
 
+def test_guarded_environ_union_operators_read_through_the_guard() -> None:
+    wrapped = {"A": "1"}
+    reads: list[None] = []
+    environ = _GuardedEnviron(wrapped, lambda: reads.append(None))
+
+    assert environ | {"B": "2"} == {"A": "1", "B": "2"}
+    assert reads
+    reads.clear()
+
+    assert {"A": "0", "B": "2"} | environ == {"A": "1", "B": "2"}
+    assert reads
+    reads.clear()
+
+    environ |= {"B": "2"}
+    environ |= [("C", "3")]
+    assert wrapped == {"A": "1", "B": "2", "C": "3"}
+    assert reads == []
+
+
+def test_environ_union_operators_return_plain_dicts_after_database_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Database()
+    monkeypatch.setenv("PYINC_UNION_RIGHT", "right")
+    monkeypatch.delenv("PYINC_UNION_ADDED", raising=False)
+
+    merged = os.environ | {"PYINC_UNION_ADDED": "added"}
+    assert type(merged) is dict
+    assert merged["PYINC_UNION_ADDED"] == "added"
+    assert merged["PYINC_UNION_RIGHT"] == "right"
+    assert "PYINC_UNION_ADDED" not in os.environ
+
+    reflected = {"PYINC_UNION_ADDED": "added", "PYINC_UNION_RIGHT": "shadowed"} | os.environ
+    assert type(reflected) is dict
+    assert reflected["PYINC_UNION_ADDED"] == "added"
+    assert reflected["PYINC_UNION_RIGHT"] == "right"
+
+
+def test_environ_in_place_union_updates_the_process_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Database()
+    monkeypatch.setenv("PYINC_IOR_MAPPING", "before")
+    monkeypatch.setenv("PYINC_IOR_PAIRS", "before")
+    environ_before = os.environ
+
+    os.environ |= {"PYINC_IOR_MAPPING": "after"}
+    os.environ |= [("PYINC_IOR_PAIRS", "after")]
+
+    assert os.environ is environ_before
+    assert os.environ["PYINC_IOR_MAPPING"] == "after"
+    assert os.getenv("PYINC_IOR_PAIRS") == "after"
+
+
+def test_environ_codec_helpers_survive_database_construction() -> None:
+    Database()
+    assert os.environ.decodekey(os.environ.encodekey("PYINC_CODEC_KEY")) == "PYINC_CODEC_KEY"
+    assert os.environ.decodevalue(os.environ.encodevalue("codec-value")) == "codec-value"
+
+
+def test_environ_raw_data_mapping_stays_hidden_after_database_construction() -> None:
+    # `os._Environ` keeps the live process environment in `_data`, reachable as
+    # a plain attribute without ever touching the mapping protocol. The wrapper
+    # therefore refuses everything beyond the four codec helpers.
+    Database()
+    with pytest.raises(AttributeError, match="_data"):
+        _ = os.environ._data  # type: ignore[attr-defined]
+
+
 def test_default_observer_error_hook_writes_a_concise_message(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

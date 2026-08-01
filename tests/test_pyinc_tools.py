@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, BinaryIO, cast
 
 import pytest
 
 import pyinc_tools.cli as cli
 from pyinc.integrations import SourcePosition, SourceRange, SymbolId
+from pyinc_tools._jsonrpc import ParseError, read_message
 from pyinc_tools.lsp import LanguageServer, _package_version, _RequestFailed
 from pyinc_tools.session import (
     AnalysisDiagnostic,
@@ -225,6 +228,74 @@ def test_polling_workspace_watcher_batches_changes(tmp_path: Path) -> None:
             str(first),
             str(second),
         }
+
+
+def test_polling_workspace_watcher_first_poll_detects_edits_made_before_watcher_construction(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "def a() -> int:\n    return 1\n")
+
+    clock_state = {"now": 0.0}
+
+    def fake_clock() -> float:
+        return clock_state["now"]
+
+    with WorkspaceSession(root) as session:
+        # The mirror was populated at session construction; an edit landing
+        # before the watcher exists (e.g. during the initial analysis) must
+        # still be picked up by the first polls.
+        _write(target, "def a() -> int:\n    return 2\n")
+        watcher = PollingWorkspaceWatcher(session, debounce_ms=100, clock=fake_clock)
+
+        assert watcher.poll() == ()  # detected, still debouncing
+        clock_state["now"] = 0.11
+        assert watcher.poll() == (str(target),)
+
+        mirror_copy = Path(session.mirror_root) / "a.py"
+        assert mirror_copy.read_text(encoding="utf-8") == "def a() -> int:\n    return 2\n"
+
+
+def test_polling_workspace_watcher_retries_paths_whose_refresh_failed_transiently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "def a() -> int:\n    return 1\n")
+
+    clock_state = {"now": 0.0}
+
+    def fake_clock() -> float:
+        return clock_state["now"]
+
+    with WorkspaceSession(root) as session:
+        watcher = PollingWorkspaceWatcher(session, debounce_ms=100, clock=fake_clock)
+        _write(target, "def a() -> int:\n    return 2\n")
+        assert watcher.poll() == ()  # detected, still debouncing
+
+        real_refresh = session.refresh_paths
+        failures = {"remaining": 1}
+
+        def flaky_refresh(paths: list[str]) -> tuple[str, ...]:
+            if failures["remaining"]:
+                failures["remaining"] -= 1
+                raise OSError("transient mirror write failure")
+            return real_refresh(paths)
+
+        monkeypatch.setattr(session, "refresh_paths", flaky_refresh)
+
+        clock_state["now"] = 0.11
+        with pytest.raises(OSError):
+            watcher.poll()
+
+        clock_state["now"] = 0.22
+        assert watcher.poll() == (str(target),)
+
+        mirror_copy = Path(session.mirror_root) / "a.py"
+        assert mirror_copy.read_text(encoding="utf-8") == "def a() -> int:\n    return 2\n"
 
 
 def test_language_server_reports_document_and_workspace_symbols(tmp_path: Path) -> None:
@@ -2037,6 +2108,20 @@ def test_session_raises_after_close(tmp_path: Path) -> None:
     assert session.source_text(target) is None
 
 
+def test_local_symbol_and_binding_lookups_raise_after_close(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "x = 1\n")
+
+    session = WorkspaceSession(root)
+    session.close()
+    with pytest.raises(RuntimeError):
+        session._local_symbol_at(target, SourcePosition(0, 0))
+    with pytest.raises(RuntimeError):
+        session._local_binding_at(target, SourcePosition(0, 0))
+
+
 def test_language_server_initialize_starts_watcher_and_shutdown_stops_it(
     tmp_path: Path,
 ) -> None:
@@ -2087,6 +2172,86 @@ def test_language_server_watcher_opt_out(tmp_path: Path) -> None:
     finally:
         if server._session is not None:
             server._session.close()
+
+
+class _PairedWriteStream:
+    """In-memory output stream that stalls after each write until the other
+    writer thread has also written.
+
+    ``write_message`` emits a frame as two writes — header, then body. The
+    rendezvous forces both writers' headers onto the stream before either
+    body, so frames interleave unless each writer keeps whole frames atomic.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: list[bytes] = []
+        self._chunks_lock = threading.Lock()
+        self._rendezvous = threading.Barrier(2)
+
+    def write(self, data: bytes) -> int:
+        with self._chunks_lock:
+            self._chunks.append(bytes(data))
+        # A timeout breaks the barrier for good: once one writer holds its
+        # frame together, the peer is blocked outside the stream rather than
+        # mid-frame, and every later write proceeds without waiting.
+        with contextlib.suppress(threading.BrokenBarrierError):
+            self._rendezvous.wait(timeout=1.0)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def getvalue(self) -> bytes:
+        with self._chunks_lock:
+            return b"".join(self._chunks)
+
+
+def test_concurrent_response_and_watcher_notification_writes_keep_framing_parseable() -> None:
+    stream = _PairedWriteStream()
+    server = LanguageServer(in_stream=io.BytesIO(), out_stream=cast(BinaryIO, stream))
+    message_count = 8
+    ready = threading.Barrier(2)
+
+    def send_responses() -> None:
+        # The request loop's side of the race: responses on the main thread.
+        ready.wait(timeout=5.0)
+        for sequence in range(message_count):
+            server._send({"jsonrpc": "2.0", "id": sequence, "result": {"writer": "loop"}})
+
+    def send_notifications() -> None:
+        # The watcher callback's side: publishes on the polling thread.
+        ready.wait(timeout=5.0)
+        for sequence in range(message_count):
+            server._send_notification("test/ping", {"writer": "watcher", "sequence": sequence})
+
+    writers = (
+        threading.Thread(target=send_responses),
+        threading.Thread(target=send_notifications),
+    )
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(timeout=30.0)
+    assert all(not writer.is_alive() for writer in writers)
+
+    replay = io.BytesIO(stream.getvalue())
+    messages: list[dict[str, Any]] = []
+    while True:
+        try:
+            message = read_message(replay)
+        except ParseError as exc:
+            pytest.fail(f"interleaved writers corrupted the Content-Length framing: {exc}")
+        if message is None:
+            break
+        messages.append(message)
+
+    assert len(messages) == 2 * message_count
+    response_ids = sorted(message["id"] for message in messages if "id" in message)
+    notification_sequences = sorted(
+        message["params"]["sequence"] for message in messages if "method" in message
+    )
+    assert response_ids == list(range(message_count))
+    assert notification_sequences == list(range(message_count))
 
 
 def _apply_rename_edits(edits: tuple[RenameEdit, ...]) -> None:
@@ -8576,3 +8741,57 @@ def test_cli_text_output_omits_position_for_rangeless_diagnostic(
     # line is identical across runs. "pyinc-tools-" is the mirror tempdir prefix.
     assert decode_errors[0].count(str(root / "bad.py")) == 2
     assert "pyinc-tools-" not in decode_errors[0]
+
+
+# ---------------------------------------------------------------------------
+# Session request spans
+# ---------------------------------------------------------------------------
+
+
+def test_warm_workspace_analysis_validates_each_resource_once(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "alpha.py", "import beta\n\n\ndef top() -> int:\n    return beta.helper()\n")
+    _write(root / "beta.py", "def helper() -> int:\n    return 1\n")
+    _write(root / "gamma.py", "VALUE = 3\n")
+
+    with WorkspaceSession(str(root)) as session:
+        session.analyze_workspace()
+        settled = session.analyze_workspace()
+
+        stats_before = session.db.statistics()
+        warm = session.analyze_workspace()
+        stats_after = session.db.statistics()
+
+        assert warm.python == settled.python
+        # One public method holds one kernel request span, so every resource
+        # the analysis walks is validated at most once for the whole call --
+        # not once per entrypoint the method fans out to.
+        assert stats_after.total_requests == stats_before.total_requests + 1
+        assert stats_after.resource_loads == stats_before.resource_loads
+        probes = stats_after.resource_probe_hits - stats_before.resource_probe_hits
+        assert 0 < probes <= stats_after.resource_count
+
+
+def test_mirror_mutation_inside_one_session_request_is_visible(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "mod.py", "def one() -> int:\n    return 1\n")
+
+    with WorkspaceSession(str(root)) as session:
+        session.analyze_workspace()
+
+        # Hold the session lock -- and with it one request span -- across an
+        # analysis, an overlay edit, and a second analysis. The edit calls
+        # request_inputs_changed() under the same held span, which must make
+        # the later analysis re-validate and see the new content.
+        with session._state_lock:
+            warm = session.analyze_workspace()
+            session.set_overlay(
+                root / "mod.py",
+                "def one() -> int:\n    return 1\n\n\ndef extra() -> int:\n    return 2\n",
+            )
+            edited = session.analyze_workspace()
+
+        warm_module = next(m for m in warm.python.modules if m.path.endswith("mod.py"))
+        assert [d.name for d in warm_module.definitions] == ["one"]
+        edited_module = next(m for m in edited.python.modules if m.path.endswith("mod.py"))
+        assert any(d.name == "extra" for d in edited_module.definitions)

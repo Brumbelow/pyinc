@@ -13,7 +13,10 @@ when and only when the three conditions below hold.
 When a recomputed value is semantically equal to the previously stored value,
 the record is **backdated** (also called **early cutoff**): its `changed_at`
 revision is not advanced, so downstream dependents remain green and avoid
-unnecessary recomputation.
+unnecessary recomputation. For queries without an `eq=`/`cutoff=` policy, that
+equality decision is computed on the canonical stored snapshots themselves and
+is identical in `strict`, `checked`, and `fast`; `eq=`/`cutoff=` policies
+continue to receive mode-exposed values.
 
 ## Conditions for From-Scratch Consistency
 
@@ -67,7 +70,12 @@ All reads of external state within a query must go through the Resource API
 (`FileResource`, `BinaryFileResource`, `FileStatResource`, `EnvResource`,
 `DirectoryResource`) or a user-defined `Resource`. The public hooks are `read`,
 `probe`, `load`, `probe_and_load`, `identity`, and `label`; built-ins derive
-probe/value pairs from one observed state.
+probe/value pairs from one observed state. On a warm request the kernel may
+first check for an unchanged world with `probe` alone and calls
+`probe_and_load` only when that probe misses or the record cannot answer, so a
+resource's `probe` and the probe component of its `probe_and_load` must agree
+on an unchanged world; stored probe/value pairs always originate from one
+`probe_and_load` observation.
 
 The kernel intercepts the following during query execution and raises
 `UntrackedReadError` if they are called outside a resource scope:
@@ -123,7 +131,10 @@ probe-comparison machinery drive invalidation:
   request. A failing resource costs one load per request, not one per reader.
   The exception is dropped when that request ends — nothing outside it may
   re-raise it — so a node that keeps failing never pins the frames, or the
-  allocations, of the load that raised.
+  allocations, of the load that raised. A `request_span` moves the request
+  boundary with it: a failing load's exception is re-raised by reads
+  throughout the span and dropped when the outermost span closes, exactly as
+  it is for a single `get`.
   (See: `test_failing_resource_loads_once_per_request_across_a_fan_out`,
   `test_repeated_failing_reads_within_one_query_body_load_once`,
   `test_failing_load_exception_is_reused_only_inside_its_own_request`,
@@ -162,10 +173,11 @@ Two boundaries apply:
   the end of the story: it would return at the revision its own dependents had
   already verified, so nothing above it would ever learn that the world moved,
   and a transitive dependent would keep a pre-failure value permanently. The
-  bump is per *transition*, not per request — one on the way in, one on the way
-  out — so `revision` settles while a resource stays unprobeable instead of
-  churning on every `get()`, and a resource that heals and breaks again bumps
-  again. That stays consistent with a fresh `Database` throughout, and it
+  bump is per *transition* — one on the way in, one on the way out — plus one
+  for each re-executed query whose recomputed value actually changed, never one
+  per observation or request, so `revision` settles while a resource stays
+  unprobeable instead of churning on every `get()`, and a resource that heals
+  and breaks again bumps again. That stays consistent with a fresh `Database` throughout, and it
   settles as soon as a load succeeds again; while the probe keeps raising, the
   queries that read it directly re-run every request, and *their* dependents
   re-run only when the handled value actually differs. A file replaced by a
@@ -215,6 +227,29 @@ kernel could describe, not as a claim about the world right now. Invalidation
 does not consult that stale `changed_at`: the unconfirmed mark reports the node
 changed on every refresh and retires its probe until a real observation replaces
 it.
+
+## Request Spans
+
+`db.request_span()` is a context manager that holds one request open across
+several top-level `get` / `inspect` / `inspect_fresh` / `read_resource`
+calls, so once-per-request work — resource validation above all — happens
+once for the whole batch.
+
+Entering a span declares that the world the database reads from does not
+change until the span closes; a caller that changes it mid-span must declare
+the change with `db.request_inputs_changed()`, which rolls the span onto a
+fresh request so the next read of each node re-validates instead of answering
+from the span's earlier observation. The declaration is instance-wide: a
+change committed by any thread rolls the span. `db.set(...)` and
+`db.set_many(...)` declare their own changes — inside a span an input update
+that actually changed something rolls the request exactly as
+`request_inputs_changed()` does, so later gets re-derive from the new inputs,
+while an update the equality decision ignores rolls nothing.
+
+Outside a span `db.request_inputs_changed()` is a no-op — every top-level
+call already opens its own request. Spans are reentrant: an inner span, or
+one opened inside a `get`, joins the enclosing request, and only the
+outermost close ends it.
 
 ## Explicit Limitations
 
@@ -540,7 +575,11 @@ Dispatch model:
 
 - Events are buffered on the outermost request scope and delivered **after**
   the kernel lock is released. A callback may therefore re-enter the
-  database (e.g. call `db.get(...)`) without risk of deadlock.
+  database (e.g. call `db.get(...)`) without risk of deadlock. Inside a
+  `request_span` the outermost request scope is the span itself: events
+  buffered by gets inside the span are delivered when the outermost span
+  closes — on a clean close and when the span body raises — and an inner
+  span's close delivers nothing.
 - For each event, the callback list for that node is snapshotted once at
   dispatch time under the state lock, then dispatched lock-free. A
   subscription added during dispatch will not see the current batch; one

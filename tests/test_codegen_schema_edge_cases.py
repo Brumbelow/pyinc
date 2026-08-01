@@ -9,6 +9,7 @@ import pytest
 from pyinc import Database
 from pyinc_codegen.models import DiagnosticPayload, ModelPayload
 from pyinc_codegen.schema import (
+    _EMITTER_BOUND_NAMES,
     _IGNORED_KEYWORDS,
     _annotation_diagnostics,
     _build_enum,
@@ -17,6 +18,7 @@ from pyinc_codegen.schema import (
     _constraint_shape_problem,
     _decode_pointer_segment,
     _definition_entries,
+    _definition_name_diagnostics,
     _DuplicateKeyError,
     _duplicates,
     _effective_type,
@@ -121,6 +123,20 @@ def test_module_name_diagnostics_cover_every_portability_failure() -> None:
     assert _codes(_module_name_diagnostics("__INIT__", "/__INIT__")) == {"reserved-module-name"}
     assert _codes(_module_name_diagnostics("A" * 300, "/long")) == {"nonportable-module-name"}
     assert _module_name_diagnostics("SafeName", "/SafeName") == ()
+
+
+def test_definition_name_diagnostics_cover_every_emitter_binding() -> None:
+    for reserved in sorted(_EMITTER_BOUND_NAMES):
+        assert _codes(_definition_name_diagnostics(reserved, f"/$defs/{reserved}")) == {
+            "reserved-definition-name"
+        }
+    # The comparison runs on the NFKC-normalized name, like the emitted class name.
+    fullwidth = "\N{FULLWIDTH LATIN SMALL LETTER S}tr"
+    assert _codes(_definition_name_diagnostics(fullwidth, "/$defs/str")) == {
+        "reserved-definition-name"
+    }
+    assert _definition_name_diagnostics("Str2", "/$defs/Str2") == ()
+    assert _definition_name_diagnostics("STR", "/$defs/STR") == ()
 
 
 def test_pointer_decoders_cover_valid_escapes_and_malformed_sequences() -> None:
@@ -493,6 +509,13 @@ def test_prefix_items_suppresses_only_the_unconstrained_items_warning() -> None:
         ),
         ({"type": "mystery"}, lambda name: False, "object", {"unsupported-type"}),
         ({"type": 3}, lambda name: False, "object", {"invalid-type"}),
+        ({"type": None}, lambda name: False, "object", {"invalid-type"}),
+        (
+            {"type": None, "additionalProperties": {"type": "string"}},
+            lambda name: False,
+            "object",
+            {"invalid-type"},
+        ),
         ({}, lambda name: False, "object", {"unconstrained-schema"}),
     ],
 )
@@ -828,6 +851,27 @@ def test_ignored_keywords_at_the_document_root_warn_without_blocking(tmp_path: P
         (code, severity, pointer)
         for code, _message, severity, pointer in document_diagnostics(db, str(schema_path))
     ] == [("unsupported-root-schema", "error", "")]
+
+
+def test_reordering_definition_keys_keeps_incremental_document_diagnostics_identical_to_fresh(
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    fragments: dict[str, Any] = {
+        "Class": {"type": "string"},
+        "Import": {"type": "integer"},
+    }
+    states: tuple[dict[str, Any], ...] = (
+        {"$defs": {name: fragments[name] for name in ("Class", "Import")}},
+        {"$defs": {name: fragments[name] for name in ("Import", "Class")}},
+    )
+
+    incremental_db = Database()
+    for state in states:
+        _write_schema(schema_path, state)
+        incremental = document_diagnostics(incremental_db, str(schema_path))
+        fresh = document_diagnostics(Database(), str(schema_path))
+        assert incremental == fresh
 
 
 def test_definition_queries_return_safe_fallbacks_for_malformed_and_missing_data(

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import math
 import mmap
 import os
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 
@@ -21,14 +24,17 @@ from pyinc import (
     FrozenDict,
     FrozenGraph,
     FrozenList,
+    InMemoryArtifactStore,
     Input,
     InspectionNode,
     MutationError,
     QueryChangeEvent,
     QueryProfile,
+    Resource,
     Subscription,
     UnsupportedValueError,
     UntrackedReadError,
+    ValueAdapter,
     freeze,
     query,
 )
@@ -283,7 +289,7 @@ def test_inspect_fresh_triggers_reverification_after_input_change() -> None:
 
     fresh = db.inspect_fresh(double)
     assert fresh.last_decision == "executed"
-    assert fresh.verified_at == 2
+    assert fresh.verified_at > stale.verified_at
     assert db.get(double) == 10
 
 
@@ -408,6 +414,142 @@ def test_strict_query_call_exposes_safe_cyclic_view() -> None:
         True,
         False,
     )
+
+
+def test_strict_get_exposes_cyclic_result_as_safe_view() -> None:
+    @query
+    def make_cycle(db: Database) -> list[Any]:
+        value: list[Any] = []
+        value.append(value)
+        return value
+
+    result = Database(mode="strict").get(make_cycle)
+
+    assert isinstance(result, FrozenList)
+    assert len(result) == 1
+    (element,) = result
+    assert element is result
+    assert not hasattr(result, "append")
+
+
+def test_strict_get_exposes_shared_acyclic_result_as_usable_containers() -> None:
+    @query
+    def make_diamond(db: Database) -> list[list[int]]:
+        inner = [1, 2]
+        return [inner, inner]
+
+    result = Database(mode="strict").get(make_diamond)
+
+    assert isinstance(result, FrozenList)
+    assert len(result) == 2
+    left, right = result
+    assert isinstance(left, FrozenList)
+    assert left is right
+    assert list(left) == [1, 2]
+
+
+def test_strict_dependent_query_computes_over_cyclic_result_from_db_get() -> None:
+    @query
+    def make_cycle(db: Database) -> list[Any]:
+        value: list[Any] = []
+        value.append(value)
+        return value
+
+    @query
+    def measure_cycle(db: Database) -> tuple[int, bool]:
+        value = db.get(make_cycle)
+        return (len(value), value[0] is value)
+
+    assert Database(mode="strict").get(measure_cycle) == (1, True)
+
+
+def test_strict_read_input_exposes_cyclic_value_as_safe_view() -> None:
+    payload = Input[Any]("payload")
+    cyclic: list[Any] = []
+    cyclic.append(cyclic)
+
+    db = Database(mode="strict")
+    db.set(payload, cyclic)
+    value = payload.read(db)
+
+    assert isinstance(value, FrozenList)
+    assert len(value) == 1
+    assert value[0] is value
+
+
+def test_strict_set_round_trips_cyclic_view_from_db_get() -> None:
+    payload = Input[Any]("payload")
+
+    @query
+    def make_cycle(db: Database) -> list[Any]:
+        value: list[Any] = []
+        value.append(value)
+        return value
+
+    @query
+    def measure_payload(db: Database) -> tuple[int, bool]:
+        value = payload.read(db)
+        return (len(value), value[0] is value)
+
+    db = Database(mode="strict")
+    view = db.get(make_cycle)
+
+    db.set(payload, view)
+
+    assert db.get(measure_payload) == (1, True)
+    # From-scratch consistency: re-freezing the view lands the exact snapshot
+    # the raw cyclic structure produces.
+    expected: list[Any] = []
+    expected.append(expected)
+    assert fingerprint_snapshot(freeze(view)) == fingerprint_snapshot(freeze(expected))
+
+
+def test_strict_query_argument_accepts_cyclic_view_from_db_get() -> None:
+    @query
+    def make_cycle(db: Database) -> list[Any]:
+        value: list[Any] = []
+        value.append(value)
+        return value
+
+    @query
+    def inspect_value(db: Database, value: list[Any]) -> tuple[bool, int, bool]:
+        return (isinstance(value, FrozenList), len(value), value[0] is value)
+
+    db = Database(mode="strict")
+    view = db.get(make_cycle)
+
+    assert db.get(inspect_value, view) == (True, 1, True)
+
+    # The view addresses the same cache node as the raw cyclic structure.
+    cyclic: list[Any] = []
+    cyclic.append(cyclic)
+    key_from_view, _ = db._query_key(inspect_value, (view,), {})
+    key_from_raw, _ = db._query_key(inspect_value, (cyclic,), {})
+    assert key_from_view.args_digest == key_from_raw.args_digest
+
+
+def test_strict_set_round_trips_shared_diamond_view_preserving_sharing() -> None:
+    payload = Input[Any]("payload")
+
+    @query
+    def make_diamond(db: Database) -> list[list[int]]:
+        inner = [1, 2]
+        return [inner, inner]
+
+    db = Database(mode="strict")
+    view = db.get(make_diamond)
+
+    db.set(payload, view)
+    value = payload.read(db)
+
+    assert isinstance(value, FrozenList)
+    left, right = value
+    assert left is right
+    assert list(left) == [1, 2]
+    # From-scratch consistency: re-freezing the view lands the exact snapshot
+    # the raw shared structure produces.
+    inner = [1, 2]
+    assert fingerprint_snapshot(freeze(view)) == fingerprint_snapshot(freeze([inner, inner]))
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked"])
@@ -912,6 +1054,7 @@ def test_handled_unrecordable_failure_propagates_more_than_one_hop(
     db = Database(mode=mode)
     assert db.get(top, str(path)) == "T:M:text"
     executions = db.statistics().query_executions
+    verified = db.revision
 
     path.unlink()
     path.mkdir()
@@ -923,9 +1066,8 @@ def test_handled_unrecordable_failure_propagates_more_than_one_hop(
     # All three hops re-executed in that one request: the invalidation reached
     # past `middle`, which is the hop a direct-reader-only fix leaves behind.
     assert db.statistics().query_executions == executions + 3
-    revision = db.revision
     for node in (leaf, middle, top):
-        assert _query_record(db, node, str(path)).changed_at == revision
+        assert _query_record(db, node, str(path)).changed_at > verified
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -955,9 +1097,10 @@ def test_permanently_unrecordable_failure_settles_the_revision(
     path.unlink()
     path.mkdir()
     assert db.get(parent, str(path)) == "P:<isdir>"
-    # One bump for the transition into "unconfirmed" -- not one per observation.
+    # The transition into "unconfirmed" moves the revision (once per node that
+    # actually changed) -- not once per observation.
     transitioned = db.revision
-    assert transitioned == before + 1
+    assert transitioned > before
 
     for _ in range(5):
         assert db.get(parent, str(path)) == "P:<isdir>"
@@ -1078,7 +1221,7 @@ def test_file_resource_detects_content_changes_even_when_stat_signature_is_stabl
     assert db.get(read_file, str(path)) == "bravo"
     record = _inspect_node(db, read_file, str(path))
     assert record.last_decision == "executed"
-    assert record.changed_at == 1
+    assert record.changed_at == db.revision
 
 
 def test_file_stat_resource_tracks_metadata_changes(tmp_path: Path) -> None:
@@ -1815,6 +1958,79 @@ def test_impure_child_prevents_parent_backdating_unless_result_unchanged() -> No
 
     consumer_node = _inspect_node(db, consumer)
     assert consumer_node.last_decision == "backdated"
+
+
+def test_untracked_leaf_value_change_two_levels_up_matches_a_fresh_database(
+    tmp_path: Path,
+) -> None:
+    counter = tmp_path / "counter.txt"
+    counter.write_text("1", encoding="utf-8")
+
+    @query
+    def unstable(db: Database) -> int:
+        db.report_untracked_read("counter file read via os.open")
+        fd = os.open(str(counter), os.O_RDONLY)
+        try:
+            data = os.read(fd, 64)
+        finally:
+            os.close(fd)
+        return int(data.decode("utf-8"))
+
+    @query
+    def middle(db: Database) -> int:
+        return unstable(db) * 10
+
+    @query
+    def top(db: Database) -> int:
+        return middle(db) + 1
+
+    db = Database()
+    assert db.get(top) == 11
+
+    # The external state moves between requests. Being untracked keeps the
+    # leaf's *direct* parent honest; the new value must also reach the
+    # grandparent, which only re-verifies through the middle hop's changed_at.
+    counter.write_text("2", encoding="utf-8")
+    assert db.get(middle) == Database().get(middle) == 20
+    assert db.get(top) == Database().get(top) == 21
+
+
+def test_stable_untracked_leaf_keeps_the_revision_settled_across_warm_requests(
+    tmp_path: Path,
+) -> None:
+    counter = tmp_path / "counter.txt"
+    counter.write_text("1", encoding="utf-8")
+
+    @query
+    def stable(db: Database) -> int:
+        db.report_untracked_read("counter file read via os.open")
+        fd = os.open(str(counter), os.O_RDONLY)
+        try:
+            data = os.read(fd, 64)
+        finally:
+            os.close(fd)
+        return int(data.decode("utf-8"))
+
+    @query
+    def parent(db: Database) -> int:
+        return stable(db) * 10
+
+    db = Database()
+    assert db.get(parent) == 10
+    settled = db.revision
+
+    # The untracked leaf re-executes on every request -- its result is never
+    # trusted -- but it keeps landing the identical value, so nothing in the
+    # graph has changed and the revision must not move.
+    for _ in range(5):
+        assert db.get(parent) == 10
+    assert db.revision == settled
+
+    # A real change in the external state is still a change in the graph and
+    # still moves the counter.
+    counter.write_text("2", encoding="utf-8")
+    assert db.get(parent) == 20
+    assert db.revision > settled
 
 
 def test_cycle_error_does_not_corrupt_database_for_subsequent_queries() -> None:
@@ -3202,3 +3418,828 @@ def test_observe_evicted_node_does_not_raise_and_refires_after_reload() -> None:
     # a is no longer a record, but observer is still registered
     db.get(a)  # re-executes a from scratch → event 2 fires
     assert len(events) == 2
+
+
+# ---------------------------------------------------------------------------
+# Backdate decision on recomputation
+# ---------------------------------------------------------------------------
+#
+# The default (no eq=, no cutoff=) backdate decision is computed on the stored
+# canonical snapshots and must be identical in every mode. The tests below pin
+# the decision for the value shapes where snapshot equality, digest equality,
+# and live-value equality could plausibly disagree.
+
+
+@dataclass(frozen=True)
+class GridPoint:
+    x: int
+    y: int
+
+
+@dataclass(frozen=True)
+class MapPoint:
+    x: int
+    y: int
+
+
+class Boxed:
+    def __init__(self, payload: int) -> None:
+        self.payload = payload
+
+
+class BoxedAdapter(ValueAdapter):
+    thaw_calls: ClassVar[int] = 0
+
+    def freeze(self, value: Boxed, freeze: Any) -> object:
+        assert callable(freeze)
+        return {"payload": freeze(value.payload)}
+
+    def thaw(self, snapshot: Any, thaw: Any) -> Boxed:
+        type(self).thaw_calls += 1
+        data = cast(dict[str, Any], snapshot)
+        return Boxed(thaw(data["payload"]))
+
+
+# A module-level pre-frozen wrapper: freeze passes it through by identity, so
+# every execution stores the very same snapshot object, NaN payload included.
+_NAN_ITEMS = cast(FrozenList, freeze([float("nan")]))
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_dataclass_type_change_with_equal_fields_executes(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def locate(db: Database) -> object:
+        if stage.read(db) == 0:
+            return GridPoint(1, 2)
+        return MapPoint(1, 2)
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(locate)
+
+    db.set(stage, 1)
+    revision_after_set = db.revision
+    db.get(locate)
+    record = _inspect_node(db, locate)
+    assert record.last_decision == "executed"
+    assert db.revision == revision_after_set + 1
+    assert record.changed_at == db.revision
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_dataclass_to_dict_with_equal_shape_executes(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def shape(db: Database) -> object:
+        if stage.read(db) == 0:
+            return GridPoint(1, 2)
+        return {"x": 1, "y": 2}
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(shape)
+
+    db.set(stage, 1)
+    revision_after_set = db.revision
+    db.get(shape)
+    record = _inspect_node(db, shape)
+    assert record.last_decision == "executed"
+    assert db.revision == revision_after_set + 1
+
+
+@pytest.mark.parametrize("mode", ["checked", "fast"])
+def test_backdate_compare_does_not_thaw_adapted_values(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def boxed(db: Database) -> Boxed:
+        stage.read(db)
+        return Boxed(7)
+
+    db = Database(mode=mode, adapters={Boxed: BoxedAdapter()})
+    db.set(stage, 0)
+    first = db.get(boxed)
+    assert isinstance(first, Boxed)
+    assert first.payload == 7
+
+    BoxedAdapter.thaw_calls = 0
+    db.set(stage, 1)
+    second = db.get(boxed)
+    assert isinstance(second, Boxed)
+    assert second.payload == 7
+    record = _inspect_node(db, boxed)
+    assert record.last_decision == "backdated"
+    # The only thaw on the warm request is the caller-boundary exposure; the
+    # equality decision runs on the stored snapshots directly.
+    assert BoxedAdapter.thaw_calls == 1
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_prefrozen_nan_wrapper_result_backdates(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def constant_items(db: Database) -> object:
+        stage.read(db)
+        return _NAN_ITEMS
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(constant_items)
+
+    db.set(stage, 1)
+    revision_after_set = db.revision
+    second = db.get(constant_items)
+    record = _inspect_node(db, constant_items)
+    assert record.last_decision == "backdated"
+    assert db.revision == revision_after_set
+
+    fresh = Database(mode=mode)
+    fresh.set(stage, 1)
+    fresh_value = fresh.get(constant_items)
+    assert math.isnan(list(cast(Any, second))[0])
+    assert math.isnan(list(cast(Any, fresh_value))[0])
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_equal_int_float_recompute_backdates(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def measure(db: Database) -> object:
+        return 1 if stage.read(db) == 0 else 1.0
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    assert db.get(measure) == 1
+    changed_at = _inspect_node(db, measure).changed_at
+    backdates = db.statistics().query_backdates
+
+    db.set(stage, 1)
+    revision_after_set = db.revision
+    assert db.get(measure) == 1.0
+    record = _inspect_node(db, measure)
+    assert record.last_decision == "backdated"
+    assert record.changed_at == changed_at
+    assert db.revision == revision_after_set
+    assert db.statistics().query_backdates == backdates + 1
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_equal_bool_int_recompute_backdates(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def flag(db: Database) -> object:
+        return True if stage.read(db) == 0 else 1
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(flag)
+    changed_at = _inspect_node(db, flag).changed_at
+
+    db.set(stage, 1)
+    db.get(flag)
+    record = _inspect_node(db, flag)
+    assert record.last_decision == "backdated"
+    assert record.changed_at == changed_at
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_negative_zero_recompute_backdates(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def bare(db: Database) -> object:
+        return 0.0 if stage.read(db) == 0 else -0.0
+
+    @query
+    def nested(db: Database) -> object:
+        if stage.read(db) == 0:
+            return (0.0, {"k": 0.0})
+        return (-0.0, {"k": -0.0})
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(bare)
+    db.get(nested)
+
+    db.set(stage, 1)
+    db.get(bare)
+    db.get(nested)
+    assert _inspect_node(db, bare).last_decision == "backdated"
+    assert _inspect_node(db, nested).last_decision == "backdated"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_numeric_dict_key_recompute_decisions(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def single_entry(db: Database) -> object:
+        return {1: "a"} if stage.read(db) == 0 else {1.0: "a"}
+
+    # With two entries the canonical entry order distinguishes the int key
+    # from the float key, so the stored snapshots differ and the recompute
+    # executes. Pinned exactly as it behaves today.
+    @query
+    def double_entry(db: Database) -> object:
+        return {1: "a", 2: "b"} if stage.read(db) == 0 else {1.0: "a", 2: "b"}
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(single_entry)
+    db.get(double_entry)
+
+    db.set(stage, 1)
+    db.get(single_entry)
+    db.get(double_entry)
+    assert _inspect_node(db, single_entry).last_decision == "backdated"
+    assert _inspect_node(db, double_entry).last_decision == "executed"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("shape", ["bare", "tuple", "dict_value", "set_member", "dict_key"])
+def test_nan_result_executes_on_every_recompute(mode: str, shape: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def produce(db: Database) -> object:
+        stage.read(db)
+        nan = float("nan")
+        if shape == "bare":
+            return nan
+        if shape == "tuple":
+            return (nan, 1)
+        if shape == "dict_value":
+            return {"k": nan}
+        if shape == "set_member":
+            return {nan}
+        return {nan: 1}
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(produce)
+
+    for step in (1, 2):
+        db.set(stage, step)
+        revision_after_set = db.revision
+        db.get(produce)
+        record = _inspect_node(db, produce)
+        assert record.last_decision == "executed"
+        assert db.revision == revision_after_set + 1
+        assert record.changed_at == db.revision
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_str_to_bytes_recompute_executes(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def text(db: Database) -> object:
+        return "x" if stage.read(db) == 0 else b"x"
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(text)
+
+    db.set(stage, 1)
+    db.get(text)
+    assert _inspect_node(db, text).last_decision == "executed"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_set_to_frozenset_recompute_executes(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def members(db: Database) -> object:
+        return {1, 2} if stage.read(db) == 0 else frozenset({1, 2})
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(members)
+
+    db.set(stage, 1)
+    db.get(members)
+    assert _inspect_node(db, members).last_decision == "executed"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_shared_graph_construction_order_recompute_backdates(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def linked(db: Database) -> object:
+        if stage.read(db) == 0:
+            first = {"k": 1}
+            second = {"k": 1}
+            shared = [first, second]
+            return {"left": shared, "right": shared, "z": 9}
+        out: dict[str, object] = {"z": 9}
+        shared_again: list[object] = [{"k": 1}, {"k": 1}]
+        out["right"] = shared_again
+        out["left"] = shared_again
+        return out
+
+    @query
+    def looped(db: Database) -> object:
+        if stage.read(db) == 0:
+            items: list[object] = [1, 2]
+            items.append(items)
+            return {"c": items}
+        rebuilt: list[object] = [1]
+        rebuilt.extend([2])
+        rebuilt.append(rebuilt)
+        return {"c": rebuilt}
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(linked)
+    db.get(looped)
+
+    db.set(stage, 1)
+    db.get(linked)
+    db.get(looped)
+    assert _inspect_node(db, linked).last_decision == "backdated"
+    assert _inspect_node(db, looped).last_decision == "backdated"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_checkpoint_loaded_record_backdates_on_equal_recompute(mode: str) -> None:
+    number = Input[int]("number")
+
+    @query
+    def parity_word(db: Database) -> str:
+        return "even" if number.read(db) % 2 == 0 else "odd"
+
+    store = InMemoryArtifactStore()
+    first_db = Database(mode=mode, store=store)
+    first_db.set(number, 2)
+    assert first_db.get(parity_word) == "even"
+    ck_key = first_db.save_checkpoint()
+
+    second_db = Database(mode=mode, store=store)
+    second_db.set(number, 2)
+    second_db.load_checkpoint(ck_key)
+    assert second_db.get(parity_word) == "even"
+    loaded = _inspect_node(second_db, parity_word)
+    assert loaded.last_decision == "reused"
+
+    second_db.set(number, 4)
+    assert second_db.get(parity_word) == "even"
+    record = _inspect_node(second_db, parity_word)
+    assert record.last_decision == "backdated"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_operand_type"),
+    [("strict", "FrozenDict"), ("checked", "dict"), ("fast", "dict")],
+)
+def test_custom_eq_receives_mode_exposed_operands(
+    mode: str, expected_operand_type: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stage = Input[int]("stage")
+
+    def typed_eq(left: object, right: object) -> bool:
+        print(f"eq-operands:{type(left).__name__}:{type(right).__name__}")
+        return left == right
+
+    @query(eq=typed_eq)
+    def mapping(db: Database) -> dict[str, int]:
+        stage.read(db)
+        return {"x": 1}
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(mapping)
+    assert capsys.readouterr().out == ""
+
+    db.set(stage, 1)
+    db.get(mapping)
+    expected = f"eq-operands:{expected_operand_type}:{expected_operand_type}\n"
+    assert capsys.readouterr().out == expected
+    assert _inspect_node(db, mapping).last_decision == "backdated"
+
+
+@pytest.mark.parametrize("mode", ["checked", "fast"])
+def test_impure_custom_eq_skips_policy_but_still_exposes(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    def never_called(left: object, right: object) -> bool:
+        raise AssertionError("eq policy must not run for an impure recompute")
+
+    @query(eq=never_called)
+    def impure_boxed(db: Database) -> Boxed:
+        stage.read(db)
+        db.report_untracked_read("external state")
+        return Boxed(3)
+
+    db = Database(mode=mode, adapters={Boxed: BoxedAdapter()})
+    db.set(stage, 0)
+    db.get(impure_boxed)
+
+    BoxedAdapter.thaw_calls = 0
+    db.set(stage, 1)
+    value = db.get(impure_boxed)
+    assert isinstance(value, Boxed)
+    assert value.payload == 3
+    record = _inspect_node(db, impure_boxed)
+    assert record.last_decision == "executed"
+    # The custom-policy branch exposes both sides before the impure
+    # short-circuit forces the decision: two compare exposures plus the
+    # caller-boundary thaw.
+    assert BoxedAdapter.thaw_calls == 3
+
+
+# ---------------------------------------------------------------------------
+# Request spans
+# ---------------------------------------------------------------------------
+# The tallies live in side files next to each resource key because a query's
+# capture set may not contain mutable state -- a counter attribute or module
+# global is rejected before the first get().
+
+
+def _span_tally(key: str, event: str) -> None:
+    with open(f"{key}.calls", "a", encoding="utf-8") as handle:
+        handle.write(event)
+
+
+def _span_tallied(key: str) -> str:
+    calls = Path(f"{key}.calls")
+    return calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
+@dataclass(frozen=True)
+class _SpanTalliedResource(Resource[str, str, tuple[str, str]]):
+    """Reads ``<key>``, tallying every probe ('p') and load ('l') call."""
+
+    def probe(self, key: str) -> tuple[str, str]:
+        _span_tally(key, "p")
+        return ("present", hashlib.sha256(Path(key).read_bytes()).hexdigest())
+
+    def load(self, db: Database, key: str) -> str:
+        _span_tally(key, "l")
+        return Path(key).read_text(encoding="utf-8")
+
+    def label(self, key: str) -> str:
+        return f"span-tallied[{key}]"
+
+
+@dataclass(frozen=True)
+class _SpanFailingResource(Resource[str, str, tuple[str, ...]]):
+    """Never loads; the probe models the file as missing rather than raising."""
+
+    def probe(self, key: str) -> tuple[str, ...]:
+        _span_tally(key, "p")
+        return ("missing",)
+
+    def load(self, db: Database, key: str) -> str:
+        _span_tally(key, "l")
+        raise FileNotFoundError(key)
+
+    def label(self, key: str) -> str:
+        return f"span-failing[{key}]"
+
+
+def test_request_span_validates_a_shared_resource_once(tmp_path: Path) -> None:
+    resource = _SpanTalliedResource()
+    target = str(tmp_path / "data.txt")
+    Path(target).write_text("hello", encoding="utf-8")
+
+    @query
+    def raw_text(db: Database) -> str:
+        return resource.read(db, target)
+
+    @query
+    def upper_text(db: Database) -> str:
+        return resource.read(db, target).upper()
+
+    @query
+    def text_size(db: Database) -> int:
+        return len(resource.read(db, target))
+
+    db = Database()
+    assert db.get(raw_text) == "hello"
+    assert _span_tallied(target) == "pl"
+
+    # Warm gets outside a span each open their own request: one validation
+    # probe per get.
+    assert db.get(raw_text) == "hello"
+    assert db.get(upper_text) == "HELLO"
+    assert db.get(text_size) == 5
+    assert _span_tallied(target) == "pl" + "ppp"
+
+    # The same three gets inside one span share one request: the resource is
+    # validated once for the whole batch.
+    requests_before = db.statistics().total_requests
+    with db.request_span():
+        assert db.get(raw_text) == "hello"
+        assert db.get(upper_text) == "HELLO"
+        assert db.get(text_size) == 5
+    assert _span_tallied(target) == "pl" + "ppp" + "p"
+    assert db.statistics().total_requests == requests_before + 1
+
+
+def test_request_inputs_changed_reopens_the_span_to_the_world(tmp_path: Path) -> None:
+    resource = _SpanTalliedResource()
+    target = str(tmp_path / "data.txt")
+    Path(target).write_text("old", encoding="utf-8")
+
+    @query
+    def read_text(db: Database) -> str:
+        return resource.read(db, target)
+
+    @query
+    def echo_text(db: Database) -> str:
+        return resource.read(db, target)
+
+    db = Database()
+    assert db.get(read_text) == "old"
+
+    with db.request_span():
+        assert db.get(read_text) == "old"
+        Path(target).write_text("new!", encoding="utf-8")
+        # The span declares the world stable, so the write stays invisible --
+        # even to a query executing for the first time.
+        assert db.get(read_text) == "old"
+        assert db.get(echo_text) == "old"
+        db.request_inputs_changed()
+        # The declaration rolls the span onto a fresh request: the next reads
+        # re-validate and see the write.
+        assert db.get(read_text) == "new!"
+        assert db.get(echo_text) == "new!"
+
+    # Outside a span every call opens its own request; declaring a change is
+    # a no-op rather than the start of anything.
+    requests_before = db.statistics().total_requests
+    db.request_inputs_changed()
+    assert db.statistics().total_requests == requests_before
+    assert db.get(read_text) == "new!"
+
+
+def test_request_span_delivers_observer_events_at_close() -> None:
+    number = Input[int]("number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 1)
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+
+    with db.request_span():
+        assert db.get(doubled) == 2  # cold execution
+        assert events == []
+        # set() declares its own change: the next get inside the span must
+        # re-execute rather than reuse the request's earlier answer.
+        db.set(number, 5)
+        assert db.get(doubled) == 10
+        assert events == []
+    assert [event.decision for event in events] == ["executed", "executed"]
+    assert events[1].changed_at > events[0].changed_at
+
+
+def test_request_span_delivers_committed_events_when_the_span_body_raises() -> None:
+    number = Input[int]("number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    @query
+    def exploding(db: Database) -> int:
+        raise RuntimeError("mid-span failure")
+
+    db = Database()
+    db.set(number, 3)
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+
+    with pytest.raises(RuntimeError, match="mid-span failure"), db.request_span():
+        assert db.get(doubled) == 6  # committed before the failure
+        assert events == []
+        db.get(exploding)
+
+    # A failing remainder of the request does not undo the committed work: a
+    # plain top-level get delivers events for what it committed even when a
+    # later part of the request fails, and the span must match.
+    assert [event.decision for event in events] == ["executed"]
+    assert events[0].query_id == doubled.key
+
+
+def test_outer_span_continues_and_delivers_after_an_inner_span_raises() -> None:
+    number = Input[int]("number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    @query
+    def exploding(db: Database) -> int:
+        raise RuntimeError("inner failure")
+
+    db = Database()
+    db.set(number, 2)
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+
+    with db.request_span():
+        assert db.get(doubled) == 4
+        with pytest.raises(RuntimeError, match="inner failure"), db.request_span():
+            db.get(exploding)
+        # The inner span joined the outer request: its failing close neither
+        # delivered events early nor ended the request.
+        assert events == []
+        db.set(number, 5)
+        assert db.get(doubled) == 10
+    assert [event.decision for event in events] == ["executed", "executed"]
+    assert events[1].changed_at > events[0].changed_at
+
+
+def test_request_span_extends_failure_exception_lifetime(tmp_path: Path) -> None:
+    resource = _SpanFailingResource()
+    target = str(tmp_path / "absent.txt")
+    db = Database()
+
+    with db.request_span():
+        with pytest.raises(FileNotFoundError) as first:
+            resource.read(db, target)
+        with pytest.raises(FileNotFoundError) as second:
+            resource.read(db, target)
+        # One load serves the whole span; later reads re-raise its exception.
+        assert second.value is first.value
+        assert _span_tallied(target).count("l") == 1
+        record = db._records[db._resource_key(resource, target)]
+        assert record.failure_exc is first.value
+
+    # The span end is the request end: the retained exception and traceback
+    # are dropped, and the next read re-runs the load for a live one.
+    assert record.failure_exc is None
+    assert record.failure_traceback is None
+    with pytest.raises(FileNotFoundError) as later:
+        resource.read(db, target)
+    assert later.value is not first.value
+    assert _span_tallied(target).count("l") == 2
+
+
+def test_nested_request_spans_join_the_outermost(tmp_path: Path) -> None:
+    resource = _SpanTalliedResource()
+    target = str(tmp_path / "data.txt")
+    Path(target).write_text("hello", encoding="utf-8")
+
+    @query
+    def read_text(db: Database) -> str:
+        return resource.read(db, target)
+
+    number = Input[int]("number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 1)
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+    assert db.get(read_text) == "hello"
+    requests_before = db.statistics().total_requests
+
+    with db.request_span():
+        assert db.get(read_text) == "hello"
+        with db.request_span():
+            assert db.get(read_text) == "hello"
+            assert db.get(doubled) == 2
+        # The inner span joined the outer request: closing it neither
+        # delivered events nor ended the request.
+        assert events == []
+        assert db.get(read_text) == "hello"
+    assert [event.decision for event in events] == ["executed"]
+    assert _span_tallied(target) == "pl" + "p"
+    assert db.statistics().total_requests == requests_before + 1
+
+
+def test_request_span_inside_a_get_joins_that_request(tmp_path: Path) -> None:
+    resource = _SpanTalliedResource()
+    target = str(tmp_path / "data.txt")
+    Path(target).write_text("hi", encoding="utf-8")
+
+    @query
+    def child(db: Database) -> str:
+        return resource.read(db, target)
+
+    @query
+    def parent(db: Database) -> str:
+        with db.request_span():
+            return db.get(child) + "!"
+
+    db = Database()
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, child)
+    requests_before = db.statistics().total_requests
+    assert db.get(parent) == "hi!"
+    # The get already holds the request; the span joined it instead of
+    # opening (or closing) one of its own, and the child's event was
+    # delivered by the get exactly as without the span.
+    assert db.statistics().total_requests == requests_before + 1
+    assert [event.query_id for event in events] == [child.key]
+
+    assert db.get(parent) == "hi!"
+    assert _span_tallied(target) == "pl" + "p"
+
+
+def test_cross_thread_set_rolls_an_open_span_onto_the_new_input() -> None:
+    number = Input[int]("number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 1)
+    assert db.get(doubled) == 2
+
+    with db.request_span():
+        assert db.get(doubled) == 2
+        # A committed set from another thread is the same declared change a
+        # same-thread set is: the span must stop answering from the request
+        # it settled before the commit.
+        writer = threading.Thread(target=db.set, args=(number, 5))
+        writer.start()
+        writer.join()
+        assert db.get(doubled) == 10
+
+
+def test_cross_thread_set_many_rolls_an_open_span_onto_the_new_inputs() -> None:
+    first = Input[int]("first")
+    second = Input[int]("second")
+
+    @query
+    def total(db: Database) -> int:
+        return first.read(db) + second.read(db)
+
+    db = Database()
+    db.set_many([(first, 1), (second, 2)])
+    assert db.get(total) == 3
+
+    with db.request_span():
+        assert db.get(total) == 3
+        writer = threading.Thread(target=db.set_many, args=([(first, 10), (second, 20)],))
+        writer.start()
+        writer.join()
+        assert db.get(total) == 30
+
+
+def test_equal_ignored_cross_thread_set_keeps_the_span_settled(tmp_path: Path) -> None:
+    resource = _SpanTalliedResource()
+    target = str(tmp_path / "data.txt")
+    Path(target).write_text("hello", encoding="utf-8")
+    number = Input[int]("number")
+
+    @query
+    def read_text(db: Database) -> str:
+        return resource.read(db, target)
+
+    db = Database()
+    db.set(number, 1)
+    assert db.get(read_text) == "hello"
+
+    with db.request_span():
+        assert db.get(read_text) == "hello"
+        writer = threading.Thread(target=db.set, args=(number, 1))
+        writer.start()
+        writer.join()
+        # The equal update was ignored -- nothing changed, so the span stays
+        # on its request and the next get re-validates nothing.
+        assert db.statistics().input_equal_ignores == 1
+        assert db.get(read_text) == "hello"
+    assert _span_tallied(target) == "pl" + "p"
+
+
+def test_cross_thread_request_inputs_changed_reopens_the_span(tmp_path: Path) -> None:
+    resource = _SpanTalliedResource()
+    target = str(tmp_path / "data.txt")
+    Path(target).write_text("old", encoding="utf-8")
+
+    @query
+    def read_text(db: Database) -> str:
+        return resource.read(db, target)
+
+    db = Database()
+    assert db.get(read_text) == "old"
+
+    with db.request_span():
+        assert db.get(read_text) == "old"
+        Path(target).write_text("new!", encoding="utf-8")
+        # The span declares the world stable, so the write stays invisible
+        # until some thread declares the change.
+        assert db.get(read_text) == "old"
+        declarer = threading.Thread(target=db.request_inputs_changed)
+        declarer.start()
+        declarer.join()
+        assert db.get(read_text) == "new!"

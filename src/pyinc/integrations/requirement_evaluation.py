@@ -15,6 +15,9 @@ from pyinc.integrations._pep440 import (
     parse_version,
     satisfies,
 )
+from pyinc.integrations._version_policy import (
+    check_version_constraints as _check_version_constraints,
+)
 from pyinc.integrations.installed_packages import installed_distributions_index
 from pyinc.integrations.requirements_txt import (
     RequirementPayload,
@@ -481,6 +484,30 @@ def _eval_compare(
         ok, _ = satisfies(spec_set, left_val, include_prerelease=True)
         return ok
 
+    if (
+        use_version_compare
+        and op in ("==", "!=")
+        and node.right_kind == "string"
+        and right_val.endswith(".*")
+    ):
+        # PEP 440 prefix matching: ==/!= against a wildcard literal compares
+        # the release prefix, exactly as a specifier built from the clause
+        # would. Wildcards with ordered operators are not valid clauses and
+        # fall through to the unparseable-version diagnostic below.
+        left_v = parse_version(left_val)
+        right_v = parse_version(right_val[:-2])
+        if left_v is None or right_v is None:
+            diagnostics.append(
+                (
+                    "unparseable-version",
+                    f"cannot parse version in marker: {left_val} {op} {right_val}",
+                )
+            )
+            return False
+        spec_set = ((op, right_val),)
+        ok, _ = satisfies(spec_set, left_val, include_prerelease=True)
+        return ok
+
     if use_version_compare:
         left_v = parse_version(left_val)
         right_v = parse_version(right_val)
@@ -646,23 +673,12 @@ def _evaluate_requirement(
             tuple(diagnostics),
         )
 
-    spec_set = parse_specifier_set(version_spec)
-    if spec_set is None:
-        return (
-            (
-                normalized,
-                version_spec,
-                markers,
-                True,
-                installed,
-                "ambiguous",
-                f"cannot parse specifier: {version_spec}",
-            ),
-            tuple(diagnostics),
-        )
-
-    ok, detail = satisfies(spec_set, installed, include_prerelease=False)
-    status: ApplicableStatus = "satisfied" if ok else "version_mismatch"
+    # Shared with dependency_check so the two installed-version surfaces
+    # cannot diverge: an already-installed pre-release is evaluated against
+    # the specifier rather than excluded (exclusion is a resolver
+    # candidate-selection rule), and a constraint the evaluator cannot decide
+    # is ambiguous, never reported as a mismatch.
+    status, detail = _check_version_constraints(version_spec, installed)
     return (
         (normalized, version_spec, markers, True, installed, status, detail),
         tuple(diagnostics),

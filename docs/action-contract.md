@@ -43,12 +43,18 @@ drive-qualified, UNC, backslash-containing, dot, traversal, duplicate, and
 NUL-containing paths are rejected with `ActionPathError`.
 
 The action rejects collisions after Unicode NFC normalization and case folding,
-as well as a set that treats one output as both a file and a directory (for
-example `pkg` and `pkg/model.py`). The ownership manifest receives the same
-whole-set validation before any desired output is touched.
+as well as a desired set that treats one output as both a file and a directory
+(for example `pkg` and `pkg/model.py`). The ownership manifest receives the
+same whole-set validation when it is read back. A manifest entry that conflicts
+with the new desired layout — a file where the layout now needs a directory, or
+the reverse — is not an error: it is an orphan of the previous layout, deleted
+before the new set is published, so a reconcile converges across a layout
+migration instead of wedging on its own ledger.
 
 The root is resolved once. Every owned target is checked during preflight and
-again immediately before a write or deletion. Existing path components may not
+again immediately before a write or deletion; a desired target still sitting
+beneath a previous layout's orphan file at preflight is validated at write
+time, after that orphan and any directories it emptied are removed. Existing path components may not
 be symbolic links, all resolved parents must remain under the root, and an
 owned target must be a regular file. An orphan that has become a directory,
 device, or symbolic link is never deleted.
@@ -76,13 +82,17 @@ publication or deletion, rejecting a parent that was renamed after traversal.
 POSIX has no portable mechanism that prevents a hostile process from renaming a
 directory in the final interval between that identity check and the mutation;
 action roots must therefore not be concurrently renamed by non-cooperating
-processes. Desired files are published first, validated orphans are deleted
-second, and the new ledger is published last. Each file is atomic, but the set
-is deliberately not transactional. If a process stops mid-run, the prior ledger
-remains sufficient for the next locked reconcile to repair and converge the set.
+processes. Validated orphans are deleted first, directories that the previous
+layout's outputs left empty are pruned second, desired files are published
+third, and the new ledger is published last. Each file is atomic, but the set
+is deliberately not transactional. If a process stops mid-run — including
+after deletions but before publication — the prior ledger remains sufficient
+for the next locked reconcile to repair and converge the set.
 
-Directory pruning, rollback of already-published files, and transactional
-directory swaps remain out of scope.
+Rollback of already-published files and transactional directory swaps remain
+out of scope. Directory pruning is limited to layout migration: only
+directories that orphan deletion left empty are removed, and a directory still
+holding an unowned entry is refused with `ActionPathError` rather than pruned.
 
 ## Ownership manifest
 

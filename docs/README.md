@@ -11,7 +11,6 @@ each have one job.
 | [Getting Started](getting-started.md) | Build and run a first incremental graph and declared-output action. |
 | [`pyinc-tools` Guide](pyinc-tools-guide.md) | Install or operate the CLI/LSP, configure an editor, understand overlays, or troubleshoot. |
 | [LSP Reference](lsp-reference.md) | Check an advertised method or its user-visible limitations. |
-| [Demo](demo.md) | See the watcher, work counts, and an update trace on a real workspace. |
 | [Codegen Guide](codegen-guide.md) | Generate typed Python models from JSON Schema through the action layer. |
 | [Migrating from 2.x](migration-v3.md) | Discard incompatible state and update code for 3.0. |
 

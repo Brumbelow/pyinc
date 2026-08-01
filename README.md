@@ -51,24 +51,6 @@ than reading ambient state directly inside a query. The
 walks through inputs, resources, modes, inspection, and a first declared-output
 action.
 
-## See it on a real workspace
-
-![Editing pytest under pyinc's watcher](https://raw.githubusercontent.com/Brumbelow/pyinc/main/docs/assets/demo.gif)
-
-`pyinc-tools` was pointed at a pinned checkout of pytest — 270 Python files,
-nothing adapted for `pyinc` — and watched while single files were edited.
-Measured against an earlier build of the same engine, the initial analysis went
-from 232.99 s to 101.72 s (~2.3x), re-analyzing the workspace after a one-file
-edit from 160.311 s to 1.687 s (~95x), and a warm single-file re-analysis from
-10.010 s to 0.273 s (~37x). Those timings are from one machine and will differ
-on yours. The work counts behind that one-file edit — 270 queries executed,
-17,778 results reused, 86 backdated — depend on the engine and the edit rather
-than on the machine: the executed and backdated counts reproduce exactly, and
-the reused count varies slightly from run to run.
-[The demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md)
-walks through the pipeline, the measurements, and a trace of which queries one
-update actually re-ran.
-
 ## Correctness contract
 
 `pyinc` guarantees **from-scratch consistency**: incremental evaluation matches
@@ -107,7 +89,6 @@ tamper repair, orphan cleanup, and dry-run planning. See the
 ## Documentation
 
 - [Getting started](https://github.com/Brumbelow/pyinc/blob/main/docs/getting-started.md) — build a small graph, add a tracked file, choose a mode, inspect work, and write a first action.
-- [Demo](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) — the watcher, work counts, and an update trace on a real workspace.
 - [Architecture](https://github.com/Brumbelow/pyinc/blob/main/docs/architecture.md) — package boundaries and how the kernel, integrations, tools, and codegen fit together.
 - [Kernel contract](https://github.com/Brumbelow/pyinc/blob/main/docs/kernel-contract.md) — the normative soundness envelope.
 - [Action contract](https://github.com/Brumbelow/pyinc/blob/main/docs/action-contract.md) — declared-output reconciliation.

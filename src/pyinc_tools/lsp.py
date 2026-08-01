@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import json
 import sys
+import threading
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -402,6 +403,12 @@ class LanguageServer:
         self._position_encoding: PositionEncoding = "utf-16"
         self._published_paths: set[str] = set()
         self._published_signatures: dict[str, tuple[tuple[Any, ...], ...]] = {}
+        # The watcher callback publishes diagnostics from its polling thread
+        # while the request loop writes responses, so both the output stream
+        # (each frame is two writes plus a flush) and the published-diagnostics
+        # bookkeeping need serializing. Reentrant because publishing sends
+        # notifications while holding the lock.
+        self._write_lock = threading.RLock()
 
     def serve(self) -> int:
         try:
@@ -468,6 +475,15 @@ class LanguageServer:
         try:
             return self._handle_notification(method, params)
         except (InvalidParams, KeyError, TypeError, ValueError):
+            return True
+        except Exception as exc:
+            # Notifications have no response to carry an error, so a failed
+            # handler (e.g. an OSError from a mirror write) is logged and the
+            # loop keeps serving, mirroring the request branch's catch-all.
+            print(
+                f"pyinc-tools lsp: {method} notification raised: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
             return True
 
     def _handle_request(self, method: str, params: Any) -> Any:
@@ -637,23 +653,27 @@ class LanguageServer:
             )
 
         current_paths = set(grouped)
-        for path in sorted(current_paths | self._published_paths):
-            diagnostics = grouped.get(path, [])
-            signature = tuple(_diagnostic_signature(item) for item in diagnostics)
-            if self._published_signatures.get(path) == signature:
-                continue
-            self._published_signatures[path] = signature
-            self._send_notification(
-                "textDocument/publishDiagnostics",
-                {
-                    "uri": _path_to_uri(path),
-                    "diagnostics": diagnostics,
-                },
-            )
-        for stale_path in self._published_paths - current_paths:
-            # Clear the cached signature so a future reappearance republishes.
-            self._published_signatures.pop(stale_path, None)
-        self._published_paths = current_paths
+        # Analysis above runs unlocked; the compare-update-send below holds the
+        # write lock so a publish from the watcher thread and one from the
+        # request loop cannot interleave their bookkeeping or notifications.
+        with self._write_lock:
+            for path in sorted(current_paths | self._published_paths):
+                diagnostics = grouped.get(path, [])
+                signature = tuple(_diagnostic_signature(item) for item in diagnostics)
+                if self._published_signatures.get(path) == signature:
+                    continue
+                self._published_signatures[path] = signature
+                self._send_notification(
+                    "textDocument/publishDiagnostics",
+                    {
+                        "uri": _path_to_uri(path),
+                        "diagnostics": diagnostics,
+                    },
+                )
+            for stale_path in self._published_paths - current_paths:
+                # Clear the cached signature so a future reappearance republishes.
+                self._published_signatures.pop(stale_path, None)
+            self._published_paths = current_paths
 
     def _document_diagnostic(self, params: Any) -> dict[str, Any]:
         document = params["textDocument"]
@@ -1646,7 +1666,8 @@ class LanguageServer:
         return read_message(self._input)
 
     def _send(self, payload: dict[str, Any]) -> None:
-        write_message(self._output, payload)
+        with self._write_lock:
+            write_message(self._output, payload)
 
     def _send_error(self, request_id: Any, code: int, message: str) -> None:
         self._send(

@@ -429,9 +429,11 @@ class WorkspaceMirror:
         self.ignored_dir_names = ignored_dir_names
         self.exclude_globs = exclude_globs
         self._referenced_paths: set[Path] = set()
+        self._content_hashes: dict[str, str] = {}
 
     def copy_workspace(self) -> None:
         files, referenced = _workspace_files(self.root, self.ignored_dir_names, self.exclude_globs)
+        hashes: dict[str, str] = {}
         for source_path in files:
             relative = source_path.relative_to(self.root_path)
             target_path = self.mirror_root_path / relative
@@ -441,7 +443,17 @@ class WorkspaceMirror:
             except FileNotFoundError:
                 continue
             target_path.write_bytes(content)
+            hashes[str(source_path)] = hashlib.sha256(content).hexdigest()
         self._referenced_paths = referenced
+        self._content_hashes = hashes
+
+    def content_hashes(self) -> dict[str, str]:
+        """Sha256, per real path, of the disk content each mirrored file holds.
+
+        This is the disk state the mirror was last synced from — not the disk
+        state right now — so a poller seeded from it detects edits that landed
+        after the copy but before the poller existed."""
+        return dict(self._content_hashes)
 
     def normalize_real_path(self, path: str | os.PathLike[str]) -> str:
         candidate = Path(path)
@@ -482,7 +494,9 @@ class WorkspaceMirror:
 
     def _sync_one_path(self, source_path: Path, *, relevant: bool) -> None:
         mirror_path = self.mirror_path_for_real(str(source_path))
+        key = str(source_path)
         if source_path.exists() and not relevant:
+            self._content_hashes.pop(key, None)
             if mirror_path.exists() and mirror_path.is_file():
                 mirror_path.unlink()
                 self._prune_empty_parents(mirror_path.parent)
@@ -493,13 +507,16 @@ class WorkspaceMirror:
             except FileNotFoundError:
                 pass
             except IsADirectoryError:
+                self._content_hashes.pop(key, None)
                 mirror_path.mkdir(parents=True, exist_ok=True)
                 return
             else:
                 mirror_path.parent.mkdir(parents=True, exist_ok=True)
                 mirror_path.write_bytes(content)
+                self._content_hashes[key] = hashlib.sha256(content).hexdigest()
                 return
 
+        self._content_hashes.pop(key, None)
         if mirror_path.is_dir():
             shutil.rmtree(mirror_path)
         elif mirror_path.exists():
@@ -530,17 +547,31 @@ class PollingWorkspaceWatcher:
         self._session = session
         self._debounce_seconds = debounce_ms / 1000.0
         self._clock = clock or time.monotonic
-        self._snapshot = _collect_filesystem_snapshot(
-            self._session.root,
-            self._session._ignored_dir_names,
-            self._session._exclude_globs,
-        )
+        self._snapshot = self._baseline_snapshot()
         self._pending: dict[str, float] = {}
         self._thread: threading.Thread | None = None
         self._lifecycle_lock = threading.RLock()
         self._stop_event = threading.Event()
         self._on_change: Callable[[tuple[str, ...]], None] | None = None
         self._on_error: Callable[[Exception], None] | None = None
+
+    def _baseline_snapshot(self) -> dict[str, str]:
+        """The disk state to diff the first poll against.
+
+        A session that mirrors the workspace reports the hashes its mirror was
+        synced from, so anything edited between that sync and this watcher's
+        construction still shows up as a difference. A driver without a mirror
+        starts from the current disk state.
+        """
+        mirrored = getattr(self._session, "_mirrored_content_hashes", None)
+        if mirrored is not None:
+            baseline: dict[str, str] = dict(mirrored())
+            return baseline
+        return _collect_filesystem_snapshot(
+            self._session.root,
+            self._session._ignored_dir_names,
+            self._session._exclude_globs,
+        )
 
     @property
     def is_running(self) -> bool:
@@ -577,12 +608,17 @@ class PollingWorkspaceWatcher:
                 if now - seen_at >= self._debounce_seconds
             )
         )
-        for path in ready:
-            self._pending.pop(path, None)
-        if ready:
-            self._session.refresh_paths(list(ready))
-
+        in_flight = {path: self._pending.pop(path) for path in ready}
         self._snapshot = current_snapshot
+        if ready:
+            try:
+                self._session.refresh_paths(list(ready))
+            except Exception:
+                # The snapshot already matches disk, so nothing would re-detect
+                # these paths; requeue them (original timestamps, already past
+                # the debounce) so the next tick retries the refresh.
+                self._pending.update(in_flight)
+                raise
         return ready
 
     def start(

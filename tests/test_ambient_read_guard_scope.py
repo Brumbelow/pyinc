@@ -198,3 +198,32 @@ def test_condition_two_entry_points_stay_guarded(
 
     with pytest.raises(UntrackedReadError, match="untracked"):
         Database().get(observe)
+
+
+@pytest.mark.parametrize("direction", ["environ | dict", "dict | environ"])
+def test_environ_union_operators_stay_guarded_inside_queries(direction: str) -> None:
+    """PEP 584 unions iterate the whole environment, so they are condition 2 reads."""
+
+    @query(key=f"environ-union-read:{direction}")
+    def merge(db: Database) -> tuple[tuple[str, str], ...]:
+        if direction == "environ | dict":
+            merged = os.environ | {"PYINC_UNION_PROBE": "probe"}
+        else:
+            merged = {"PYINC_UNION_PROBE": "probe"} | os.environ
+        return tuple(sorted(merged.items()))
+
+    with pytest.raises(UntrackedReadError, match="untracked"):
+        Database().get(merge)
+
+
+def test_environ_raw_data_mapping_stays_hidden_inside_queries() -> None:
+    """`os._Environ._data` bypasses the mapping protocol entirely, so the guard
+    refuses the attribute outright instead of leaking the live environment."""
+
+    @query(key="environ-raw-data-read")
+    def peek(db: Database) -> tuple[str, ...]:
+        raw = os.environ._data  # type: ignore[attr-defined]
+        return tuple(sorted(str(key) for key in raw))
+
+    with pytest.raises(AttributeError, match="_data"):
+        Database().get(peek)

@@ -68,6 +68,7 @@ from .value import (
     freeze,
     semantic_equal,
     serialize_snapshot,
+    snapshots_equal,
     thaw,
 )
 
@@ -465,6 +466,40 @@ class _GuardedEnviron(MutableMapping[str, str]):
         self._check_read()
         return key in self._wrapped
 
+    # The PEP 584 operators mirror `os._Environ` so `os.environ | {...}` keeps
+    # working after the guard is installed. Both `|` directions build their dict
+    # from `self`, so the reads go through the guarded `keys`/`__getitem__`;
+    # `|=` only writes, matching the unguarded `__setitem__`.
+    def __or__(self, other: object) -> dict[str, str]:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        new = dict(self)
+        new.update(other)
+        return new
+
+    def __ror__(self, other: object) -> dict[str, str]:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        new = dict(other)
+        new.update(self)
+        return new
+
+    def __ior__(  # type: ignore[misc]  # `|=` accepts pair iterables that `|` does not, as in os._Environ
+        self, other: Mapping[str, str] | Iterable[tuple[str, str]]
+    ) -> _GuardedEnviron:
+        self.update(other)
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        # `os._Environ` carries codec helpers beyond the mapping protocol
+        # (encodekey/decodekey/encodevalue/decodevalue); expose exactly those.
+        # Everything else stays hidden: `os._Environ` internals such as `_data`
+        # hold the live environment as a plain attribute, so delegating unknown
+        # names would hand queries an unchecked read path around the guard.
+        if name in ("encodekey", "decodekey", "encodevalue", "decodevalue"):
+            return getattr(self._wrapped, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
 
 class Subscription:
     """Handle returned by `Database.observe(...)`.
@@ -532,6 +567,8 @@ class Database:
         self._request_token: ContextVar[int | None] = ContextVar(
             "pyinc_request_token", default=None
         )
+        self._span_active: ContextVar[bool] = ContextVar("pyinc_span_active", default=False)
+        self._span_epoch_seen: ContextVar[int] = ContextVar("pyinc_span_epoch_seen", default=0)
         self._policy_fingerprint_stack: ContextVar[tuple[int, ...]] = ContextVar(
             "pyinc_policy_fingerprint_stack", default=()
         )
@@ -545,6 +582,7 @@ class Database:
             "pyinc_module_capture_stack", default=()
         )
         self._request_counter = 0
+        self._span_epoch = 0
         self._stats: dict[str, int] = {
             "query_executions": 0,
             "query_reuses": 0,
@@ -724,6 +762,10 @@ class Database:
                 record.reason = "input changed"
                 record.checked_in_request = self._current_request_id()
             self._stats["input_sets"] += 1
+            # A set is a declared change: inside a span the request must move
+            # so later gets re-derive from the new input instead of reusing
+            # answers the span settled before it.
+            self._roll_span_request()
 
     def set_many(self, updates: Iterable[tuple[Any, Any]]) -> None:
         from .core import Input
@@ -823,6 +865,10 @@ class Database:
                     record.reason = "input changed"
                     record.checked_in_request = request_id
                 self._stats["input_sets"] += 1
+            # A set is a declared change: inside a span the request must move
+            # so later gets re-derive from the new inputs instead of reusing
+            # answers the span settled before them.
+            self._roll_span_request()
 
     def get(self, query: _core.Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
         from .core import Query
@@ -892,6 +938,103 @@ class Database:
             node = self._inspect_record(key)
         self._dispatch_events(pending)
         return node
+
+    @contextmanager
+    def request_span(self) -> Iterator[None]:
+        """Hold one request open across several top-level calls.
+
+        ``get`` / ``inspect`` / ``inspect_fresh`` / ``read_resource`` calls
+        inside the span join a single request instead of opening one each, so
+        once-per-request work -- resource validation above all -- happens once
+        for the whole batch. Entering the span declares that the world the
+        database reads from does not change until it closes; a caller that
+        changes it mid-span must say so with :meth:`request_inputs_changed`
+        (``set`` and ``set_many`` declare their own changes). The request
+        boundary moves with the span: failure exceptions retained for
+        re-raising stay live to its end, and observer events are delivered
+        when the outermost span closes -- cleanly or on an exception --
+        exactly as they are for a single ``get``. Spans are reentrant -- an
+        inner span, or one opened inside a ``get``, joins the enclosing
+        request and its close does nothing.
+        """
+        scope = self._request_scope()
+        with self._state_lock:
+            pending = scope.__enter__()
+            span_token = self._span_active.set(True) if pending is not None else None
+            epoch_token = (
+                self._span_epoch_seen.set(self._span_epoch) if pending is not None else None
+            )
+        body_exc: BaseException | None = None
+        try:
+            yield
+        except BaseException as exc:
+            body_exc = exc
+            raise
+        finally:
+            with self._state_lock:
+                if span_token is not None:
+                    self._span_active.reset(span_token)
+                if epoch_token is not None:
+                    self._span_epoch_seen.reset(epoch_token)
+                scope.__exit__(None, None, None)
+            # Deliver outside the lock, exactly as a single get does. Work the
+            # span committed keeps its notifications even when a later part of
+            # the request fails, so delivery runs on the failure path too --
+            # where it must never mask the propagating span-body exception.
+            if body_exc is None:
+                self._dispatch_events(pending)
+            else:
+                with suppress(Exception):
+                    self._dispatch_events(pending)
+
+    def request_inputs_changed(self) -> None:
+        """Declare that the world outside the database changed mid-span.
+
+        The declaration rolls any open :meth:`request_span` -- held by this
+        thread or another -- onto a fresh request, so the span's next read of
+        each node re-validates instead of answering from its earlier
+        observation. Without a span open anywhere it changes nothing: every
+        top-level call already opens its own request.
+
+        Callers using `pyinc.integrations`' `request_scope` /
+        `once_per_request` should call the integrations-level
+        `request_inputs_changed()` instead: it clears that scope's memo and
+        forwards here, whereas this method alone leaves the integrations memo
+        answering from the old world.
+        """
+        with self._state_lock:
+            self._roll_span_request()
+
+    def _roll_span_request(self) -> None:
+        """Move any open span onto a fresh request id after a declared change.
+
+        Callers hold the state lock. The change is declared instance-wide by
+        bumping the span epoch: a span held by another thread catches up at
+        its next request boundary, where the epoch is compared before any
+        dedupe. A span on the calling thread moves immediately. Resetting the
+        span's token and seen epoch at exit restores the pre-span values, so
+        the intermediate ids need no bookkeeping.
+        """
+        self._span_epoch += 1
+        self._sync_span_to_epoch()
+
+    def _sync_span_to_epoch(self) -> None:
+        """Roll this thread's open span forward when the epoch moved past it.
+
+        Callers hold the state lock. Outside a span there is nothing to do:
+        each top-level call mints a fresh request id no record can already
+        carry. Inside one, a seen epoch behind the instance's means another
+        thread committed a change since the span last synced, so the request
+        id moves exactly as it does for a same-thread declaration and the
+        span's next reads re-validate against the committed state.
+        """
+        if not self._span_active.get():
+            return
+        if self._span_epoch_seen.get() == self._span_epoch:
+            return
+        self._request_counter += 1
+        self._request_token.set(self._request_counter)
+        self._span_epoch_seen.set(self._span_epoch)
 
     def observe(
         self,
@@ -2119,24 +2262,57 @@ class Database:
             else:
                 record = previous
                 previous_changed_at = previous.changed_at
-                old_value = self._expose_snapshot(previous.snapshot)
-                new_value = self._expose_snapshot(snapshot)
-                equal = (
-                    False
-                    if impure
-                    else self._compare_values(
-                        eq=query.eq,
-                        cutoff=query.cutoff,
-                        left=old_value,
-                        right=new_value,
+                previous_digest = previous.digest
+                if query.eq is None and query.cutoff is None:
+                    # Both operands are canonical freeze outputs: the fresh
+                    # snapshot from _freeze_value above, the previous one from
+                    # an earlier freeze or a validated checkpoint load. freeze
+                    # is ==-preserving on its own outputs, so the semantic
+                    # comparison of the exposed values reduces to comparing
+                    # the stored snapshots directly -- the same decision in
+                    # every mode, with no thaw or re-freeze on the warm path.
+                    equal = False if impure else snapshots_equal(previous.snapshot, snapshot)
+                else:
+                    old_value = self._expose_snapshot(previous.snapshot)
+                    new_value = self._expose_snapshot(snapshot)
+                    equal = (
+                        False
+                        if impure
+                        else self._compare_values(
+                            eq=query.eq,
+                            cutoff=query.cutoff,
+                            left=old_value,
+                            right=new_value,
+                        )
                     )
-                )
                 record.snapshot = snapshot
                 record.digest = digest
                 if equal:
                     record.changed_at = previous_changed_at
                     decision = "backdated"
+                elif impure and digest == previous_digest:
+                    # `equal` was forced above, not observed: an untracked
+                    # read skips the comparison entirely. When the re-run
+                    # then lands a byte-identical snapshot there is no new
+                    # value to propagate, so keep the old changed_at and
+                    # leave the revision alone -- otherwise a stable impure
+                    # leaf churns the counter on every warm request. This
+                    # digest short-circuit applies only to the forced case:
+                    # when a comparison actually ran and said unequal (a
+                    # custom eq policy may, even for identical snapshots),
+                    # the bump below stands.
+                    record.changed_at = previous_changed_at
+                    decision = "executed"
                 else:
+                    # A recompute that lands a new value is a change in the
+                    # graph exactly as an input set or a resource reload is,
+                    # so it moves the revision the same way. Without the bump
+                    # an untracked leaf's new value lands at the revision its
+                    # grandparent was verified at: the direct parent re-runs
+                    # (untracked forces that), but its own changed_at then
+                    # fails the strictly-greater check and every ancestor
+                    # above it keeps a value a fresh database never produces.
+                    self._revision += 1
                     record.changed_at = self._revision
                     decision = "executed"
             self._query_records.add(key)
@@ -2329,6 +2505,32 @@ class Database:
                 outcome.failure_recorded = True
                 raise record.failure_exc.with_traceback(record.failure_traceback)
         atomic = callable(getattr(resource, "probe_and_load", None))
+        if atomic and (
+            (record is not None and not record.is_failed and not record.probe_unconfirmed)
+            or (record is None and key in self._checkpoint_resource_probes)
+        ):
+            # A record (or checkpoint hint) that could answer this request makes
+            # a standalone probe worth taking before the combined read: for the
+            # built-in file resources that is read-plus-hash with no decode. The
+            # standalone result only ever answers "unchanged" against a stored
+            # atomic pair and is discarded on a miss, so every stored
+            # (probe, value) pair still originates from one observed read. A
+            # probe that raises is not an observation; fall through and let the
+            # combined read decide, exactly as it would have without the
+            # attempt.
+            try:
+                with self._allow_raw_reads_scope():
+                    early_probe = resource.probe(parameter)
+            except Exception:
+                pass
+            else:
+                early_probe_snapshot = freeze(early_probe, adapters=self._adapters)
+                if self._reuse_on_probe_hit(record, early_probe_snapshot, current_request):
+                    return
+                if record is None and self._restore_from_probe_hint(
+                    key, early_probe_snapshot, current_request
+                ):
+                    return
         if atomic:
             try:
                 with self._allow_raw_reads_scope():
@@ -2347,60 +2549,10 @@ class Database:
                 probe = resource.probe(parameter)
             loaded_value = None
         probe_snapshot = freeze(probe, adapters=self._adapters)
-        # A failure record must never take the probe-hit early exit as if it had
-        # a value: it holds no snapshot to reuse. The first read of each request
-        # re-runs the load on an unchanged failing probe, which is what keeps the
-        # exception a live one; the rest of the request re-raises it above. A
-        # record whose probe was contradicted by an unrecorded raise is excluded
-        # for the same reason its changed_at is: matching a probe the node has
-        # since failed to confirm proves nothing about the interval between.
-        if (
-            record is not None
-            and not record.is_failed
-            and not record.probe_unconfirmed
-            and record.probe == probe_snapshot
-        ):
-            record.verified_at = self._revision
-            record.last_decision = "reused"
-            record.reason = "resource probe unchanged"
-            record.checked_in_request = current_request
-            self._stats["resource_probe_hits"] += 1
+        if self._reuse_on_probe_hit(record, probe_snapshot, current_request):
             return
-        # Scope-B: if this resource has a checkpoint probe hint and the probe matches,
-        # restore its snapshot from the store without performing a full load. The
-        # hint is a FROZEN probe, so compare the live probe's frozen form: a live
-        # value and a thawed snapshot differ in shape (a frozen-dataclass probe
-        # thaws to a dict) and would never match.
-        if record is None and key in self._checkpoint_resource_probes:
-            expected_probe_snapshot, expected_digest = self._checkpoint_resource_probes[key]
-            if probe_snapshot == expected_probe_snapshot and self._adapter_keys_trusted(
-                collect_adapter_keys(expected_probe_snapshot)
-            ):
-                snapshot = self._load_snapshot_from_store(expected_digest)
-                # An adapter whose implementation changed (or vanished) since the
-                # save would thaw this restored snapshot into a value a fresh load
-                # never produces. The probe can stay stable while the adapter code
-                # moves, so gate the restore just like every other thaw-into-live
-                # path; on distrust fall through to the full load, which re-freezes
-                # a fresh load under the live adapter.
-                if snapshot is not _MISSING_SNAPSHOT and self._adapter_keys_trusted(
-                    collect_adapter_keys(snapshot)
-                ):
-                    self._records[key] = NodeRecord(
-                        key=key,
-                        label=key.label,
-                        snapshot=cast(Snapshot, snapshot),
-                        digest=expected_digest,
-                        changed_at=self._revision,
-                        verified_at=self._revision,
-                        last_decision="reused",
-                        last_recompute="reused",
-                        reason="restored from checkpoint",
-                        probe=probe_snapshot,
-                        checked_in_request=current_request,
-                    )
-                    self._stats["resource_probe_hits"] += 1
-                    return
+        if record is None and self._restore_from_probe_hint(key, probe_snapshot, current_request):
+            return
         if not atomic:
             try:
                 with self._allow_raw_reads_scope():
@@ -2447,6 +2599,84 @@ class Database:
         record.failure_exc = None
         record.failure_traceback = None
         record.probe_unconfirmed = False
+
+    def _reuse_on_probe_hit(
+        self,
+        record: NodeRecord | None,
+        probe_snapshot: Any,
+        current_request: int,
+    ) -> bool:
+        """Answer this request from the record when its probe is unchanged.
+
+        A failure record must never take the probe-hit early exit as if it had
+        a value: it holds no snapshot to reuse. The first read of each request
+        re-runs the load on an unchanged failing probe, which is what keeps the
+        exception a live one; the rest of the request re-raises it earlier. A
+        record whose probe was contradicted by an unrecorded raise is excluded
+        for the same reason its changed_at is: matching a probe the node has
+        since failed to confirm proves nothing about the interval between.
+        """
+        if (
+            record is not None
+            and not record.is_failed
+            and not record.probe_unconfirmed
+            and record.probe == probe_snapshot
+        ):
+            record.verified_at = self._revision
+            record.last_decision = "reused"
+            record.reason = "resource probe unchanged"
+            record.checked_in_request = current_request
+            self._stats["resource_probe_hits"] += 1
+            return True
+        return False
+
+    def _restore_from_probe_hint(
+        self,
+        key: NodeKey,
+        probe_snapshot: Any,
+        current_request: int,
+    ) -> bool:
+        """Scope-B: restore a recordless resource from its checkpoint probe hint.
+
+        When the hint's probe matches, the snapshot comes from the store without
+        performing a full load. The hint is a FROZEN probe, so callers compare
+        the live probe's frozen form: a live value and a thawed snapshot differ
+        in shape (a frozen-dataclass probe thaws to a dict) and would never
+        match.
+        """
+        hint = self._checkpoint_resource_probes.get(key)
+        if hint is None:
+            return False
+        expected_probe_snapshot, expected_digest = hint
+        if probe_snapshot == expected_probe_snapshot and self._adapter_keys_trusted(
+            collect_adapter_keys(expected_probe_snapshot)
+        ):
+            snapshot = self._load_snapshot_from_store(expected_digest)
+            # An adapter whose implementation changed (or vanished) since the
+            # save would thaw this restored snapshot into a value a fresh load
+            # never produces. The probe can stay stable while the adapter code
+            # moves, so gate the restore just like every other thaw-into-live
+            # path; on distrust fall through to the full load, which re-freezes
+            # a fresh load under the live adapter.
+            if snapshot is not _MISSING_SNAPSHOT and self._adapter_keys_trusted(
+                collect_adapter_keys(snapshot)
+            ):
+                self._records[key] = NodeRecord(
+                    key=key,
+                    label=key.label,
+                    snapshot=cast(Snapshot, snapshot),
+                    digest=expected_digest,
+                    changed_at=self._revision,
+                    verified_at=self._revision,
+                    last_decision="reused",
+                    last_recompute="reused",
+                    reason="restored from checkpoint",
+                    probe=probe_snapshot,
+                    checked_in_request=current_request,
+                )
+                self._stats["resource_probe_hits"] += 1
+                return True
+        return False
 
     def _observe_failure_probe(self, resource: Any, parameter: Any) -> Any:
         """Frozen probe observed alongside a load that raised.
@@ -2754,7 +2984,15 @@ class Database:
         record_boundaries: bool = False,
         frame: ExecutionFrame | None = None,
     ) -> Any:
-        exposed = snapshot if self.mode == "strict" else self._thaw_value(snapshot)
+        if self.mode == "strict":
+            # Callers never see the FrozenGraph envelope: a graph-shaped result
+            # is rebuilt into shared/cyclic Frozen* views at the boundary,
+            # exactly as _materialize_call does for call arguments. Non-boundary
+            # exposure feeds the equality/cutoff comparison and keeps the raw
+            # snapshot -- a cyclic view cannot be re-frozen for that check.
+            exposed = self._strict_snapshot_view(snapshot) if boundary else snapshot
+        else:
+            exposed = self._thaw_value(snapshot)
         if boundary and record_boundaries and frame is not None:
             frame.boundary_fingerprints.append(self._fingerprint_value(exposed))
             frame.boundary_values.append(exposed)
@@ -5489,6 +5727,11 @@ class Database:
     ) -> Iterator[list[tuple[NodeKey, QueryChangeEvent]] | None]:
         current = self._request_token.get()
         if current is not None:
+            # A span's request id must reflect every change committed while
+            # the span thread held no lock; catching up here, at the boundary
+            # of each call joining the span, is what keeps a cross-thread
+            # set from leaving the span's dedupe on stale answers.
+            self._sync_span_to_epoch()
             yield None
             return
         self._request_counter += 1

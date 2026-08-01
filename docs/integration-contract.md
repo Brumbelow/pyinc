@@ -87,7 +87,7 @@ this contract.
 | Purpose | Parse requirements files and optionally follow their requirement-file includes. |
 | Entrypoints | `requirements_analysis`, `deep_requirements_analysis`, `workspace_requirements_analysis` |
 | Result types | `FileReference`, `IndexDirective`, `RequirementRef`, `RequirementsAnalysis` |
-| Supported shapes | Names, extras, version text, markers, editable/direct URL lines, continuations, index/find-links directives, `-r` requirement references, and `-c` constraint references. Deep analysis follows in-root `-r` files with cycle and missing-file diagnostics. |
+| Supported shapes | Names, extras, version text, markers, editable/direct URL lines, continuations, index/find-links directives, `-r` requirement references, and `-c` constraint references. Per-requirement options (for example the `--hash=...` lines `pip-compile --generate-hashes` emits) are split off the requirement rather than folded into its version text; the options themselves are ignored, not verified. Deep analysis follows in-root `-r` files with cycle and missing-file diagnostics. |
 | Key limits | Marker evaluation is separate. No URL/VCS fetch, version solving, or recursive constraint application occurs; constraint references are recorded but not followed. Project-root escapes are diagnosed. |
 
 ## Requirement evaluation
@@ -98,7 +98,7 @@ this contract.
 | Entrypoints | `evaluate_version_specifier`, `evaluate_markers`, `applicable_requirements`, `workspace_applicable_requirements` |
 | Result types | `ApplicableRequirement`, `ApplicableRequirementsAnalysis`, `MarkerEvaluation`, `PythonEnvironmentSnapshot`, `VersionSpecifierEvaluation` |
 | Supported shapes | PEP 440 epochs, prerelease/post/dev/local labels, wildcards, compatible releases, and arbitrary equality (`===`); PEP 508 boolean marker expressions against the running Python environment. |
-| Key limits | Evaluation targets the current process environment only. Extras are not modeled, noisy or unknown marker variables produce diagnostics, and this API does not resolve or install dependencies. `===` compares the version exactly as written — no normalization, padding, or case folding — so it is decided without parsing and is not subject to pre-release exclusion. |
+| Key limits | Evaluation targets the current process environment only. Extras are not modeled, noisy or unknown marker variables produce diagnostics, and this API does not resolve or install dependencies. Unsupported or unparseable constraints are ambiguous rather than guessed. An installed version is checked with pre-releases allowed, matching dependency checking; `evaluate_version_specifier` keeps resolver-style pre-release exclusion unless the specifier opts in. `===` compares the version exactly as written — no normalization, padding, or case folding — so it is decided without parsing and is not subject to pre-release exclusion. |
 
 ## Environment files
 
@@ -166,7 +166,7 @@ this contract.
 |---|---|
 | Purpose | Let a caller declare a span during which the state the entrypoints read does not change, so repeated entrypoint calls inside it answer from the first one. |
 | Entrypoints | `request_scope`, `request_inputs_changed`, `once_per_request` |
-| Supported shapes | `request_scope(db)` is a context manager bound to one `Database` and to the calling context. `once_per_request(db, kind, args, compute)` returns `compute()`, answering from the open scope when the same `kind` and `args` already ran against that same `Database`. `request_inputs_changed()` drops what the open scope has memoized. |
+| Supported shapes | `request_scope(db)` is a context manager bound to one `Database` and to the calling context. `once_per_request(db, kind, args, compute)` returns `compute()`, answering from the open scope when the same `kind` and `args` already ran against that same `Database`. `request_inputs_changed()` drops what the open scope has memoized, and also reaches the kernel: when the caller holds a `Database.request_span`, the declaration rolls that span onto a fresh request, so kernel-level once-per-request work re-runs against the moved inputs. |
 | Key limits | The span is the caller's declaration, not a checked fact: a caller that changes what the integrations read part-way through its own scope must call `request_inputs_changed()`, and nothing detects the omission. Calls made with no scope open, or against a `Database` other than the one the scope was opened for, compute normally. The memo lives only for the span and is never durable. It answers a repeated question inside one request; it does not participate in the kernel's invalidation and is not a cache across requests. `request_inputs_changed()` clears the innermost open scope only, so under scopes nested for different `Database` objects it forgets nothing an outer scope memoized: mutate inputs only for the innermost scope's database, or re-enter the scopes that must forget. `once_per_request` keys its memo on `kind` and `args`, so `args` must be hashable; unhashable arguments raise `TypeError`, and only while a scope for that `Database` is open, so the failure shows up under scoping rather than without it. |
 
 ## Composition and experimental helpers

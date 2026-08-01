@@ -81,6 +81,29 @@ _WINDOWS_RESERVED_MODULE_STEMS = frozenset(
         *(f"lpt{number}" for number in range(1, 10)),
     }
 )
+# The closed set of names every generated module binds: the fixed imports
+# ``_render_python`` emits plus the builtins ``_render_type`` spells in type
+# expressions. A model class with one of these names would shadow the binding
+# in every module that imports it under ``TYPE_CHECKING``, silently changing
+# what the other annotations mean. Keep this in sync with the emitter.
+_EMITTER_BOUND_NAMES = frozenset(
+    {
+        # Fixed imports.
+        "dataclass",
+        "Literal",
+        "TypeAlias",
+        "TYPE_CHECKING",
+        "Never",
+        # Builtins used in rendered type expressions.
+        "str",
+        "int",
+        "float",
+        "bool",
+        "list",
+        "dict",
+        "object",
+    }
+)
 
 
 class _DuplicateKeyError(ValueError):
@@ -239,6 +262,19 @@ def _is_reserved_field_name(name: str) -> bool:
     return normalized.startswith("__") and normalized.endswith("__")
 
 
+def _definition_name_diagnostics(name: str, json_pointer: str) -> tuple[DiagnosticPayload, ...]:
+    normalized = _python_identifier(name)
+    if normalized in _EMITTER_BOUND_NAMES:
+        return (
+            _diagnostic(
+                "reserved-definition-name",
+                f"definition name shadows a binding the generated modules rely on: {normalized!r}",
+                json_pointer,
+            ),
+        )
+    return ()
+
+
 def _module_name_diagnostics(name: str, json_pointer: str) -> tuple[DiagnosticPayload, ...]:
     stem = _snake(name)
     if not stem.isidentifier() or keyword.iskeyword(stem):
@@ -393,7 +429,9 @@ def _mapping_value_schema(spec: dict[str, object]) -> dict[str, object] | None:
         return None
     if set(spec) & _SHAPE_SELECTORS:
         return None
-    if _effective_type(spec.get("type")) not in (None, "object"):
+    # Membership, not the value: a present ``"type": null`` is an invalid type,
+    # not an absent keyword, so it must not select the mapping rendering.
+    if "type" in spec and _effective_type(spec["type"]) != "object":
         return None
     return value
 
@@ -519,7 +557,7 @@ def _schema_node_diagnostics(
     has_properties = "properties" in structural
     if definition_context and has_properties:
         allowed = {"properties", "required", "type"}
-        if type_field is not None and type_field != "object":
+        if "type" in spec and type_field != "object":
             diagnostics.append(_keyword_diagnostic("type", json_pointer, ambiguous=True))
     elif effective_type == "object":
         allowed = {"type"}
@@ -853,7 +891,10 @@ def _render_type(
         )
         return ("object", (), tuple(diagnostics), False)
 
-    if type_field is not None:
+    if "type" in spec:
+        # A present ``type`` whose value is JSON null reaches here as Python
+        # ``None``; presence, not the value, distinguishes it from an absent
+        # keyword, so it is diagnosed instead of taking the warning below.
         diagnostics.append(
             _diagnostic(
                 "invalid-type",
@@ -1378,8 +1419,15 @@ def document_diagnostics(db: Database, path: str) -> tuple[DiagnosticPayload, ..
                 )
             )
 
-    for name in unique_names:
-        diagnostics.extend(_module_name_diagnostics(name, locations_by_name[name][0]))
+    # Canonical order, like every other diagnostic group here: the schema_text
+    # cutoff canonicalizes with sorted keys, so a key-reorder edit backdates and
+    # this query is not recomputed. Emitting in document key order would let an
+    # incremental database keep the pre-reorder ordering while a fresh database
+    # reads the new one.
+    for name in sorted(unique_names):
+        location = locations_by_name[name][0]
+        diagnostics.extend(_definition_name_diagnostics(name, location))
+        diagnostics.extend(_module_name_diagnostics(name, location))
     return tuple(diagnostics)
 
 
