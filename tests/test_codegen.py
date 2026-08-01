@@ -1546,6 +1546,52 @@ def test_reserved_package_index_name_is_an_error(tmp_path: Path) -> None:
     assert diagnostic.json_pointer == "/$defs/__INIT__"
 
 
+def test_definition_names_shadowing_generated_module_bindings_are_errors(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "str": {"type": "object", "properties": {"raw": {"type": "string"}}},
+                "Literal": {"enum": ["a", "b"]},
+                "Holder": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "mode": {"enum": ["x", "y"]},
+                        "value": {"$ref": "#/$defs/str"},
+                        "kind": {"$ref": "#/$defs/Literal"},
+                    },
+                },
+            }
+        },
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    diagnostics = [d for d in analysis.errors if d.code == "reserved-definition-name"]
+    # One error per shadowing definition, anchored at the definition itself:
+    # emitting these would let ``from .str import str`` and ``from .literal
+    # import Literal`` retype every other annotation in the importing module.
+    assert {d.json_pointer for d in diagnostics} == {"/$defs/Literal", "/$defs/str"}
+
+    with pytest.raises(SchemaGenerationError):
+        generate(db, schema_path, out)
+    assert _tree(out) == {}
+
+
+def test_definition_name_near_a_reserved_binding_still_generates(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(schema_path, {"$defs": {"Str2": {"type": "object"}}})
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    assert analysis.errors == ()
+
+    generate(db, schema_path, out)
+    assert (out / "str2.py").is_file()
+
+
 def test_json_pointer_escapes_invalid_property_names(tmp_path: Path) -> None:
     schema_path = tmp_path / "schema.json"
     _write_schema(
@@ -1578,6 +1624,39 @@ def test_unconstrained_schema_uses_explicit_warning_policy(tmp_path: Path) -> No
     source = (out / "anything.py").read_text(encoding="utf-8")
     assert "Anything: TypeAlias = 'object'" in source
     compile(source, "anything.py", "exec")
+
+
+def test_null_type_value_is_rejected_like_any_other_invalid_type(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {"$defs": {"Thing": {"type": "object", "properties": {"x": {"type": None}}}}},
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    # ``"type": null`` carries an explicit invalid value, so it is diagnosed on
+    # the keyword rather than falling back to the absent-type warning policy.
+    assert [(d.code, d.json_pointer) for d in analysis.errors] == [
+        ("invalid-type", "/$defs/Thing/properties/x/type")
+    ]
+    with pytest.raises(SchemaGenerationError):
+        generate(db, schema_path, out)
+    assert _tree(out) == {}
+
+    # Deleting the keyword — not just its value — is what selects the
+    # unconstrained-schema policy, which stays a non-blocking node warning.
+    _write_schema(
+        schema_path,
+        {"$defs": {"Thing": {"type": "object", "properties": {"x": {}}}}},
+    )
+    analysis = schema_analysis(db, schema_path)
+    warning = next(d for d in analysis.diagnostics if d.code == "unconstrained-schema")
+    assert warning.severity is DiagnosticSeverity.WARNING
+    assert warning.json_pointer == "/$defs/Thing/properties/x"
+    assert analysis.errors == ()
+    generate(db, schema_path, out)
+    assert "x: object | None = None" in (out / "thing.py").read_text(encoding="utf-8")
 
 
 def test_empty_and_invalid_enums_are_errors_but_render_valid_python(tmp_path: Path) -> None:
