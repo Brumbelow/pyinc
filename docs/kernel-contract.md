@@ -594,6 +594,95 @@ Dispatch model:
 `args_digest`, decision (`"executed"`), and the `changed_at` / `verified_at`
 revisions at the time of execution.
 
+## Public Surface
+
+Everything `pyinc` exports, and nothing else, carries the semver contract.
+The offline documentation check compares these tables against
+`pyinc.__all__` in both directions.
+
+Core:
+
+| Name | What it is |
+|---|---|
+| `Database` | The incremental query database: `get`, `set`, `set_many`, `inspect`, `inspect_fresh`, `explain`, `observe`, `request_span`, `request_inputs_changed`, checkpoint save/load. |
+| `Input` | A declared, keyed input whose values enter through `db.set`. |
+| `query` | Decorator declaring a pure incremental query. |
+| `Query` | The declared-query object `@query` returns; readable from other queries and from `db.get`. |
+| `Resource` | Base class for tracked external values; see the Resource hooks above. |
+| `FileResource` | Text-file resource: content-hash probe, decoded string value. |
+| `BinaryFileResource` | Byte-file resource: content-hash probe, raw bytes value. |
+| `FileStatResource` | Stat-signature resource for existence/shape checks without content reads. |
+| `FileStatSnapshot` | The frozen stat observation `FileStatResource` produces. |
+| `EnvResource` | Environment-variable resource. |
+| `DirectoryResource` | Directory-listing resource. |
+
+Values and snapshots:
+
+| Name | What it is |
+|---|---|
+| `freeze` | Deep-convert a value into its canonical immutable snapshot. |
+| `thaw` | Rebuild the mutable form of a snapshot. |
+| `semantic_equal` | The kernel's semantic-equality decision over two values. |
+| `serialize_snapshot` | Encode a canonical snapshot into the stable `K2` byte grammar. |
+| `deserialize_snapshot` | Decode and validate `K2` bytes back into a snapshot. |
+| `FrozenList` | Immutable list view crossing cached boundaries. |
+| `FrozenDict` | Immutable mapping view crossing cached boundaries. |
+| `FrozenSet` | Immutable set view crossing cached boundaries. |
+| `FrozenRecord` | Immutable dataclass snapshot preserving type identity. |
+| `FrozenGraph` | Canonical encoding of a cyclic or shared object graph. |
+| `FrozenRef` | Back-edge marker inside a `FrozenGraph` node table. |
+| `FrozenAdapterValue` | Snapshot produced by a registered `ValueAdapter`. |
+| `ValueAdapter` | Adapter making a foreign type snapshot-safe. |
+
+Actions and stores:
+
+| Name | What it is |
+|---|---|
+| `action` | Decorator declaring a filesystem-reconciling action over declared outputs. |
+| `Action` | The declared-action object: `reconcile` and `plan`. |
+| `Output` | One declared file output: relative path plus content. |
+| `ReconcileResult` | What a reconcile did: written, deleted, repaired, unchanged. |
+| `ArtifactStore` | Interface for durable content-addressed artifact storage. |
+| `InMemoryArtifactStore` | Process-local store for tests and ephemeral use. |
+| `FileSystemArtifactStore` | Durable on-disk store with advisory locking. |
+
+Inspection and observation:
+
+| Name | What it is |
+|---|---|
+| `DatabaseStatistics` | Node, edge, and work counters for one database. |
+| `InspectionNode` | One node in an `inspect`/`explain` report: decision, reason, dependencies. |
+| `DependencyGraphNode` | One labeled node in the exported dependency graph. |
+| `QueryProfile` | Per-query execution/reuse/backdate counts from profiling. |
+| `CaptureInfo` | One captured name in an `explain_query_captures` report. |
+| `explain_query_captures` | Preview how a query's captures will be classified before first `get`. |
+| `Subscription` | Handle returned by `Database.observe`; closes the subscription. |
+| `QueryChangeEvent` | Delivered to observers when a subscribed query's result changes. |
+| `ObserverCallback` | Callback type receiving `QueryChangeEvent`s. |
+| `ObserverErrorHook` | Callback type receiving exceptions raised by observers. |
+
+Errors:
+
+| Name | What it is |
+|---|---|
+| `PyIncError` | Base error for pyinc; every error below is catchable as this. |
+| `MutationError` | A query mutated one of its boundary inputs. |
+| `UntrackedReadError` | Code performed an undeclared external read. |
+| `UnsupportedValueError` | A value cannot cross a cached boundary safely. |
+| `CycleError` | Query evaluation encountered a dependency cycle. |
+| `InputKeyError` | An input key is invalid or conflicts within a database. |
+| `CheckpointError` | Base error for durable-checkpoint failures. |
+| `CheckpointVersionError` | A checkpoint uses an unsupported manifest or kernel version. |
+| `CheckpointManifestError` | A checkpoint manifest is malformed or internally inconsistent. |
+| `CheckpointIntegrityError` | Checkpoint bytes do not match their content address. |
+| `ActionError` | Base error for output reconciliation failures. |
+| `ActionPathError` | An action output path is unsafe or ambiguous. |
+| `ActionManifestError` | An action ownership manifest is malformed or untrusted. |
+| `ActionLockTimeoutError` | An action cannot acquire its filesystem lock in time. |
+| `ArtifactStoreError` | Base error for artifact-store failures. |
+| `ArtifactStoreKeyError` | An artifact key is malformed or unsafe. |
+| `ArtifactStoreLockError` | An artifact-store lock cannot be acquired. |
+
 ## Verification
 
 The from-scratch consistency guarantee is mechanically verified by property tests
