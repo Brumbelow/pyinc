@@ -163,8 +163,54 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the working directory (`os.getcwd`, `Path.cwd`). These are not intercepted;
   route them through `FileStatResource` or `db.report_untracked_read`.
 
+### Removed
+
+- The demo page, its recordings, and the measured-timing claims in the README.
+  The workspace demo will be re-recorded and republished with the next
+  release; until then the repository makes no wall-clock claims. Dropping the
+  recordings also removes 7.3 MB of media from the sdist.
+
 ### Fixed
 
+- `~=` implements its PEP 440 definition: the upper bound is a prefix match,
+  not an ordered comparison, so prereleases and dev releases of the excluded
+  next release (`3.0a1` against `~=2.2`) no longer satisfy — an installed
+  prerelease of the next major can no longer report a compatible-release
+  requirement as satisfied. Wildcard matching compares the epoch, so `1!1.1`
+  no longer satisfies `==1.1.*`. Both verified against `packaging` across
+  epoch, post, dev, and prerelease shapes.
+- `applicable_requirements` checks an installed version with pre-releases
+  allowed, through the same helper dependency checking uses, so the two
+  entrypoints agree that an installed `2.0.0rc1` satisfies `>=1.20` instead
+  of reporting `version_mismatch` and `satisfied` for the same requirement in
+  the same environment. `evaluate_version_specifier` keeps resolver-style
+  exclusion unless the specifier opts in.
+- Marker comparisons route wildcard literals through PEP 440 prefix matching:
+  `python_version == "3.*"` is true on any 3.x interpreter and
+  `python_version != "2.7.*"` no longer evaluates false, so requirements
+  guarded by such markers are applicable again.
+- `document_diagnostics` orders module-name diagnostics canonically, so a
+  `$defs` key reorder — which backdates the canonicalized schema text — can
+  no longer leave an incremental database returning a differently ordered
+  diagnostics tuple than a fresh one.
+- A definition named after a binding the generated module itself uses
+  (`str`, `Literal`, `dataclass`, and the rest of the emitter's closed set)
+  is rejected with the blocking `reserved-definition-name` diagnostic instead
+  of emitting code whose imports silently shadow `typing` and builtins under
+  type checking.
+- `{"type": null}` produces the blocking `invalid-type` error at the `/type`
+  pointer like any other invalid type value, instead of being conflated with
+  an absent key and generating with only an `unconstrained-schema` warning.
+- The polling watcher no longer loses updates. Its baseline reflects the
+  content the mirror was actually synced from, so a file edited between
+  session construction and the first poll — the whole initial analysis runs
+  in that window — is detected and refreshed, and a failed refresh returns
+  its paths to pending so the next tick retries instead of dropping the
+  change forever.
+- An LSP notification handler that fails with an unexpected error — a mirror
+  write hitting a full disk, a client opening a directory URI — is logged and
+  the server keeps serving, matching the request path's guard, instead of
+  terminating the process with a traceback.
 - A value change two levels above an untracked query invalidates its
   transitive dependents. A recomputation that lands a changed value now moves
   the revision the way input and resource changes always did; before, the
