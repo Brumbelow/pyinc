@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from typing import TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.integrations._pep440 import parse_specifier_set, satisfies
+from pyinc.integrations._version_policy import (
+    check_version_constraints as _check_version_constraints,
+)
 from pyinc.integrations.installed_packages import (
     environment_index,
     installed_distributions_index,
@@ -50,23 +52,6 @@ class DependencyCheckAnalysis:
     statuses: tuple[DependencyStatus, ...]
     undeclared_imports: tuple[UndeclaredImport, ...]
     diagnostics: tuple[tuple[str, str], ...]
-
-
-# ---------------------------------------------------------------------------
-# PEP 440 version matching
-# ---------------------------------------------------------------------------
-
-
-def _check_version_constraints(declared_spec: str, installed_version: str) -> tuple[str, str]:
-    spec_set = parse_specifier_set(declared_spec)
-    if spec_set is None:
-        return "ambiguous", f"cannot parse specifier: {declared_spec}"
-    ok, detail = satisfies(spec_set, installed_version, include_prerelease=True)
-    if not ok:
-        if "unparseable" in detail or "cannot evaluate" in detail:
-            return "ambiguous", detail
-        return "version_mismatch", detail
-    return "satisfied", detail
 
 
 # ---------------------------------------------------------------------------

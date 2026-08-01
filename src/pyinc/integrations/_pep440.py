@@ -218,13 +218,7 @@ def _satisfies_single(
             return None
         if operator not in ("==", "!="):
             return None
-        prefix = spec_version.release
-        installed_prefix = version.release[: len(prefix)]
-        padded_prefix = prefix + (0,) * max(0, len(installed_prefix) - len(prefix))
-        padded_installed = installed_prefix + (0,) * max(
-            0, len(padded_prefix) - len(installed_prefix)
-        )
-        matches = padded_installed == padded_prefix
+        matches = _release_prefix_matches(spec_version, version)
         return matches if operator == "==" else not matches
 
     spec_version = parse_version(spec_version_str)
@@ -234,22 +228,23 @@ def _satisfies_single(
     if operator == "~=":
         if len(spec_version.release) < 2:
             return None
-        lower = spec_version
-        upper_release = spec_version.release[:-1]
-        upper_release = upper_release[:-1] + (upper_release[-1] + 1,)
-        upper = Version(
+        public_version = _without_local(version)
+        if compare_versions(public_version, spec_version) < 0:
+            return False
+        # ``~= V.N`` is ``>= V.N, == V.*`` with the final release component
+        # dropped, so the upper bound is a prefix match rather than an ordered
+        # comparison: pre-releases and dev releases of the excluded next
+        # release (e.g. 3.0a1 against ~=2.2) sort before it but do not share
+        # the prefix, so they stay excluded.
+        prefix = Version(
             epoch=spec_version.epoch,
-            release=upper_release,
+            release=spec_version.release[:-1],
             pre=None,
             post=None,
             dev=None,
             local=(),
         )
-        public_version = _without_local(version)
-        return (
-            compare_versions(public_version, lower) >= 0
-            and compare_versions(public_version, upper) < 0
-        )
+        return _release_prefix_matches(prefix, public_version)
 
     comparison = compare_versions(version, spec_version)
     if operator == "==":
@@ -313,6 +308,22 @@ def _satisfies_single(
                 return False
         return True
     return None
+
+
+def _release_prefix_matches(spec_version: Version, version: Version) -> bool:
+    """Prefix-match the epoch and release segment against a wildcard base.
+
+    The candidate release is truncated to the prefix length and zero-padded, so
+    segments beyond the prefix — including pre/post/dev suffixes — are ignored
+    (``1.1.post1`` matches ``==1.1.*``). The epoch participates in the prefix,
+    so ``1!1.1`` does not match ``==1.1.*``.
+    """
+    if version.epoch != spec_version.epoch:
+        return False
+    prefix = spec_version.release
+    truncated = version.release[: len(prefix)]
+    padded = truncated + (0,) * (len(prefix) - len(truncated))
+    return padded == prefix
 
 
 def _without_local(version: Version) -> Version:

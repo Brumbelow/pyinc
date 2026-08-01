@@ -152,6 +152,11 @@ def test_requirement_evaluation_stable_api() -> None:
         (">1.0rc1", "1.0.post1"),
         ("<=1.0", "1.0+local"),
         (">=1.0", "1.0+local"),
+        ("==1.1.*", "1!1.1"),
+        ("==1.1.*", "1.1.post1"),
+        ("==1!1.1.*", "1.1.5"),
+        ("~=2.2", "3.0"),
+        ("~=2.2.post3", "2.3"),
         # Arbitrary equality, restricted to operands where both implementations
         # agree. `packaging` case-folds and compares against the *normalized*
         # version, so e.g. `===V1.0` against `V1.0` diverges; that case is pinned
@@ -252,6 +257,16 @@ def test_version_specifier_prerelease_excluded_by_default(mode: str) -> None:
 def test_version_specifier_post_release_accepted(mode: str) -> None:
     db = Database(mode=mode)
     assert evaluate_version_specifier(db, ">=1.0", "1.0.post1").satisfied is True
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_version_specifier_wildcard_prefix_compares_epoch(mode: str) -> None:
+    """PEP 440 prefix matching includes the epoch, not just the release digits."""
+    db = Database(mode=mode)
+    assert evaluate_version_specifier(db, "==1.1.*", "1!1.1").satisfied is False
+    assert evaluate_version_specifier(db, "!=1.1.*", "1!1.1").satisfied is True
+    assert evaluate_version_specifier(db, "==1!1.1.*", "1!1.1.5").satisfied is True
+    assert evaluate_version_specifier(db, "==1!1.1.*", "1.1.5").satisfied is False
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -408,6 +423,46 @@ def test_marker_version_variable_semantics(mode: str, monkeypatch: pytest.Monkey
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_marker_version_variable_wildcard_equality_is_prefix_matching(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PEP 508 ==/!= against a wildcard literal is PEP 440 prefix matching."""
+    _patch_env(monkeypatch, _fixed_env(python_version="3.12", python_full_version="3.12.3"))
+    db = Database(mode=mode)
+
+    result = evaluate_markers(db, 'python_version == "3.*"')
+    assert result.value is True
+    assert result.diagnostics == ()
+    negated = evaluate_markers(db, 'python_version != "2.7.*"')
+    assert negated.value is True
+    assert negated.diagnostics == ()
+
+    assert evaluate_markers(db, 'python_version == "2.7.*"').value is False
+    assert evaluate_markers(db, 'python_version != "3.*"').value is False
+    assert evaluate_markers(db, 'python_full_version == "3.12.*"').value is True
+
+    # A wildcard base that is not itself a version stays undecidable.
+    bad = evaluate_markers(db, 'python_version == "bad.*"')
+    assert bad.value is False
+    assert [code for code, _ in bad.diagnostics] == ["unparseable-version"]
+
+    # Wildcards are only defined for ==/!= in PEP 440; ordered operators keep
+    # the undecidable diagnostic.
+    ordered = evaluate_markers(db, 'python_version >= "3.*"')
+    assert ordered.value is False
+    assert [code for code, _ in ordered.diagnostics] == ["unparseable-version"]
+
+
+def test_marker_wildcard_equality_matches_packaging_on_running_interpreter() -> None:
+    db = Database()
+    environment = cast(Mapping[str, str], default_environment())
+    for marker in ('python_version == "3.*"', 'python_version != "2.7.*"'):
+        result = evaluate_markers(db, marker)
+        assert result.value is Marker(marker).evaluate(environment)
+        assert result.value is True
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_marker_string_variable_strict(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """Non-version marker variables compare as plain strings."""
     _patch_env(monkeypatch, _fixed_env(platform_machine="x86_64"))
@@ -467,6 +522,33 @@ def test_applicable_requirements_filters_by_markers(
 
     assert win_req.applicable is False
     assert win_req.status == "not_applicable"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_applicable_requirements_wildcard_marker_guard_is_applicable(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_env(monkeypatch, _fixed_env(python_version="3.12", python_full_version="3.12.3"))
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "2.31.0", top_level="requests")
+    _patch_site(monkeypatch, site_dir)
+
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text(
+        'requests>=2.0 ; python_version == "3.*"\n'
+        'requests>=2.0 ; python_version != "2.7.*"\n',
+        encoding="utf-8",
+    )
+
+    db = Database(mode=mode)
+    result = applicable_requirements(db, str(req_file))
+
+    assert len(result.requirements) == 2
+    for req in result.requirements:
+        assert req.applicable is True
+        assert req.status == "satisfied"
+        assert req.installed_version == "2.31.0"
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -550,6 +632,32 @@ def test_applicable_requirements_undecidable_spec_is_ambiguous_like_dependency_c
 
     assert len(result.requirements) == 1
     assert result.requirements[0].status == "ambiguous"
+    assert result.requirements[0].status == dep_result.statuses[0].status
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_applicable_requirements_installed_prerelease_agrees_with_dependency_check(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_env(monkeypatch, _fixed_env())
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "numpy", "2.0.0rc1", top_level="numpy")
+    _patch_site(monkeypatch, site_dir)
+
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text("numpy>=1.20\n", encoding="utf-8")
+
+    db = Database(mode=mode)
+    result = applicable_requirements(db, str(req_file))
+    dep_result = dependency_check_analysis(db, ("numpy>=1.20",))
+
+    # Pre-release exclusion is a resolver candidate-selection rule; an
+    # already-installed version is evaluated with pre-releases allowed, the
+    # same way dependency_check evaluates it (and pip check does).
+    assert len(result.requirements) == 1
+    assert result.requirements[0].installed_version == "2.0.0rc1"
+    assert dep_result.statuses[0].status == "satisfied"
     assert result.requirements[0].status == dep_result.statuses[0].status
 
 
