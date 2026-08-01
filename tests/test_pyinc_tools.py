@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, BinaryIO, cast
 
 import pytest
 
 import pyinc_tools.cli as cli
 from pyinc.integrations import SourcePosition, SourceRange, SymbolId
+from pyinc_tools._jsonrpc import ParseError, read_message
 from pyinc_tools.lsp import LanguageServer, _package_version, _RequestFailed
 from pyinc_tools.session import (
     AnalysisDiagnostic,
@@ -2037,6 +2040,20 @@ def test_session_raises_after_close(tmp_path: Path) -> None:
     assert session.source_text(target) is None
 
 
+def test_local_symbol_and_binding_lookups_raise_after_close(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "x = 1\n")
+
+    session = WorkspaceSession(root)
+    session.close()
+    with pytest.raises(RuntimeError):
+        session._local_symbol_at(target, SourcePosition(0, 0))
+    with pytest.raises(RuntimeError):
+        session._local_binding_at(target, SourcePosition(0, 0))
+
+
 def test_language_server_initialize_starts_watcher_and_shutdown_stops_it(
     tmp_path: Path,
 ) -> None:
@@ -2087,6 +2104,86 @@ def test_language_server_watcher_opt_out(tmp_path: Path) -> None:
     finally:
         if server._session is not None:
             server._session.close()
+
+
+class _PairedWriteStream:
+    """In-memory output stream that stalls after each write until the other
+    writer thread has also written.
+
+    ``write_message`` emits a frame as two writes — header, then body. The
+    rendezvous forces both writers' headers onto the stream before either
+    body, so frames interleave unless each writer keeps whole frames atomic.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: list[bytes] = []
+        self._chunks_lock = threading.Lock()
+        self._rendezvous = threading.Barrier(2)
+
+    def write(self, data: bytes) -> int:
+        with self._chunks_lock:
+            self._chunks.append(bytes(data))
+        # A timeout breaks the barrier for good: once one writer holds its
+        # frame together, the peer is blocked outside the stream rather than
+        # mid-frame, and every later write proceeds without waiting.
+        with contextlib.suppress(threading.BrokenBarrierError):
+            self._rendezvous.wait(timeout=1.0)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def getvalue(self) -> bytes:
+        with self._chunks_lock:
+            return b"".join(self._chunks)
+
+
+def test_concurrent_response_and_watcher_notification_writes_keep_framing_parseable() -> None:
+    stream = _PairedWriteStream()
+    server = LanguageServer(in_stream=io.BytesIO(), out_stream=cast(BinaryIO, stream))
+    message_count = 8
+    ready = threading.Barrier(2)
+
+    def send_responses() -> None:
+        # The request loop's side of the race: responses on the main thread.
+        ready.wait(timeout=5.0)
+        for sequence in range(message_count):
+            server._send({"jsonrpc": "2.0", "id": sequence, "result": {"writer": "loop"}})
+
+    def send_notifications() -> None:
+        # The watcher callback's side: publishes on the polling thread.
+        ready.wait(timeout=5.0)
+        for sequence in range(message_count):
+            server._send_notification("test/ping", {"writer": "watcher", "sequence": sequence})
+
+    writers = (
+        threading.Thread(target=send_responses),
+        threading.Thread(target=send_notifications),
+    )
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(timeout=30.0)
+    assert all(not writer.is_alive() for writer in writers)
+
+    replay = io.BytesIO(stream.getvalue())
+    messages: list[dict[str, Any]] = []
+    while True:
+        try:
+            message = read_message(replay)
+        except ParseError as exc:
+            pytest.fail(f"interleaved writers corrupted the Content-Length framing: {exc}")
+        if message is None:
+            break
+        messages.append(message)
+
+    assert len(messages) == 2 * message_count
+    response_ids = sorted(message["id"] for message in messages if "id" in message)
+    notification_sequences = sorted(
+        message["params"]["sequence"] for message in messages if "method" in message
+    )
+    assert response_ids == list(range(message_count))
+    assert notification_sequences == list(range(message_count))
 
 
 def _apply_rename_edits(edits: tuple[RenameEdit, ...]) -> None:

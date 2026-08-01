@@ -875,37 +875,41 @@ class WorkspaceSession:
         path: str | os.PathLike[str],
         position: SourcePosition,
     ) -> SymbolId | None:
-        real_path = self._normalize_real_path(path)
-        mirror_path = self._mirror_path_for_real(real_path)
-        if not mirror_path.exists() or mirror_path.suffix != ".py":
-            raise FileNotFoundError(real_path)
-        symbol_id = scope_tree(self.db, str(mirror_path)).symbol_at(position)
-        if symbol_id is None:
-            return None
-        return SymbolId(
-            self._remap_path(symbol_id.path) or symbol_id.path,
-            symbol_id.scope_id,
-            symbol_id.name,
-            symbol_id.declaration,
-        )
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            symbol_id = scope_tree(self.db, str(mirror_path)).symbol_at(position)
+            if symbol_id is None:
+                return None
+            return SymbolId(
+                self._remap_path(symbol_id.path) or symbol_id.path,
+                symbol_id.scope_id,
+                symbol_id.name,
+                symbol_id.declaration,
+            )
 
     def _local_binding_at(
         self,
         path: str | os.PathLike[str],
         position: SourcePosition,
     ) -> Binding | None:
-        real_path = self._normalize_real_path(path)
-        mirror_path = self._mirror_path_for_real(real_path)
-        if not mirror_path.exists() or mirror_path.suffix != ".py":
-            raise FileNotFoundError(real_path)
-        tree = scope_tree(self.db, str(mirror_path))
-        symbol_id = tree.symbol_at(position)
-        if symbol_id is None:
-            return None
-        return next(
-            (binding for binding in tree.bindings if binding.symbol_id == symbol_id),
-            None,
-        )
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                raise FileNotFoundError(real_path)
+            tree = scope_tree(self.db, str(mirror_path))
+            symbol_id = tree.symbol_at(position)
+            if symbol_id is None:
+                return None
+            return next(
+                (binding for binding in tree.bindings if binding.symbol_id == symbol_id),
+                None,
+            )
 
     def find_references(
         self,
