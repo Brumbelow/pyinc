@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,7 @@ from pyinc.value import (
     fingerprint,
     fingerprint_snapshot,
     semantic_equal,
+    snapshots_equal,
 )
 
 
@@ -919,3 +921,82 @@ def test_nan_payloads_are_canonicalized_and_prefrozen_payloads_are_validated() -
     )
     with pytest.raises(UnsupportedValueError, match="canonical bit pattern"):
         freeze(FrozenList((first,)))
+
+
+def test_semantic_equality_of_canonical_snapshots_matches_snapshot_equality() -> None:
+    """freeze is ==-preserving on its own outputs.
+
+    The runtime's default backdate decision relies on this reduction: for
+    canonical snapshots ``a`` and ``b`` (outputs of ``freeze``), re-freezing
+    never changes the encoding and ``semantic_equal(a, b)`` coincides with
+    comparing the snapshots directly.
+    """
+
+    @dataclass(frozen=True)
+    class Sample:
+        tag: str
+        payload: Any
+
+    adapters = {Point: PointAdapter()}
+    rng = random.Random(20260801)
+
+    scalar_pool: tuple[object, ...] = (
+        0,
+        1,
+        -7,
+        3.5,
+        -0.0,
+        0.0,
+        1e300,
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+        complex(2, -0.0),
+        complex(0, 1.5),
+        True,
+        False,
+        None,
+        "",
+        "a",
+        "é☃",
+        b"",
+        b"\x00\xff",
+    )
+    key_pool: tuple[object, ...] = (1, 1.0, 2, "k", "k2", True, (1, 2), frozenset({3}), b"k")
+
+    def build(depth: int) -> object:
+        kinds = ["scalar", "scalar", "dataclass", "adapter"]
+        if depth < 3:
+            kinds += ["list", "tuple", "dict", "set", "frozenset", "shared", "cycle"]
+        kind = rng.choice(kinds)
+        if kind == "scalar":
+            return rng.choice(scalar_pool)
+        if kind == "dataclass":
+            return Sample(rng.choice(["p", "q"]), build(depth + 1))
+        if kind == "adapter":
+            return Point(rng.randint(0, 2), rng.randint(0, 2))
+        if kind == "list":
+            return [build(depth + 1) for _ in range(rng.randint(0, 3))]
+        if kind == "tuple":
+            return tuple(build(depth + 1) for _ in range(rng.randint(0, 3)))
+        if kind == "dict":
+            return {rng.choice(key_pool): build(depth + 1) for _ in range(rng.randint(0, 3))}
+        if kind == "set":
+            return {rng.choice(key_pool) for _ in range(rng.randint(0, 3))}
+        if kind == "frozenset":
+            return frozenset(rng.choice(key_pool) for _ in range(rng.randint(0, 2)))
+        if kind == "shared":
+            inner = [build(depth + 1)]
+            return [inner, inner, {"s": inner}]
+        assert kind == "cycle"
+        loop: list[object] = [rng.randint(0, 3)]
+        loop.append(loop)
+        return {"c": loop, "o": build(depth + 1)}
+
+    for _ in range(600):
+        left_value = build(0)
+        right_value = left_value if rng.random() < 0.3 else build(0)
+        left = freeze(left_value, adapters=adapters)
+        right = freeze(right_value, adapters=adapters)
+        assert fingerprint_snapshot(freeze(left, adapters=adapters)) == fingerprint_snapshot(left)
+        assert semantic_equal(left, right, adapters=adapters) == snapshots_equal(left, right)
