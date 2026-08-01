@@ -662,6 +662,13 @@ def _evaluate_requirement(
         )
 
     ok, detail = satisfies(spec_set, installed, include_prerelease=False)
+    if not ok and ("unparseable" in detail or "cannot evaluate" in detail):
+        # Same rule as dependency_check: a constraint the evaluator cannot
+        # decide is ambiguous, never reported as a mismatch.
+        return (
+            (normalized, version_spec, markers, True, installed, "ambiguous", detail),
+            tuple(diagnostics),
+        )
     status: ApplicableStatus = "satisfied" if ok else "version_mismatch"
     return (
         (normalized, version_spec, markers, True, installed, status, detail),

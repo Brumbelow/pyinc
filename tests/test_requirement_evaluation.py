@@ -12,6 +12,7 @@ from packaging.version import Version
 import pyinc.integrations as integrations
 from pyinc import Database
 from pyinc.integrations import requirement_evaluation
+from pyinc.integrations.dependency_check import dependency_check_analysis
 from pyinc.integrations.requirement_evaluation import (
     ApplicableRequirement,
     ApplicableRequirementsAnalysis,
@@ -493,6 +494,63 @@ def test_applicable_requirements_status_matrix(
     assert by_spec[("requests", ">=5.0")].status == "version_mismatch"
     # Installed version is exactly "2.31.0", so arbitrary equality matches.
     assert by_spec[("requests", "===2.31.0")].status == "satisfied"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_applicable_requirements_evaluates_hashed_lockfile_lines(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_env(monkeypatch, _fixed_env())
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "2.31.0", top_level="requests")
+    _make_dist_info(site_dir, "urllib3", "1.26.0", top_level="urllib3")
+    _patch_site(monkeypatch, site_dir)
+
+    # pip-compile --generate-hashes output: per-requirement --hash options on
+    # backslash continuation lines.
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text(
+        "requests==2.31.0 \\\n"
+        "    --hash=sha256:aaaa \\\n"
+        "    --hash=sha256:bbbb\n"
+        "urllib3==2.0.7 \\\n"
+        "    --hash=sha256:cccc\n",
+        encoding="utf-8",
+    )
+
+    db = Database(mode=mode)
+    result = applicable_requirements(db, str(req_file))
+    by_name = {r.name: r for r in result.requirements}
+
+    assert by_name["requests"].version_spec == "==2.31.0"
+    assert by_name["requests"].status == "satisfied"
+    assert by_name["urllib3"].version_spec == "==2.0.7"
+    assert by_name["urllib3"].status == "version_mismatch"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_applicable_requirements_undecidable_spec_is_ambiguous_like_dependency_check(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_env(monkeypatch, _fixed_env())
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "2.31.0", top_level="requests")
+    _patch_site(monkeypatch, site_dir)
+
+    # `~=1` has too few release segments for a compatible-release clause, so it
+    # cannot be evaluated against any installed version.
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text("requests~=1\n", encoding="utf-8")
+
+    db = Database(mode=mode)
+    result = applicable_requirements(db, str(req_file))
+    dep_result = dependency_check_analysis(db, ("requests~=1",))
+
+    assert len(result.requirements) == 1
+    assert result.requirements[0].status == "ambiguous"
+    assert result.requirements[0].status == dep_result.statuses[0].status
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

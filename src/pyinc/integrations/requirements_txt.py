@@ -213,9 +213,25 @@ def _strip_inline_comment(line: str) -> str:
     return line
 
 
+def _strip_requirement_options(line: str) -> str:
+    """Remove pip per-requirement options from a requirement line.
+
+    pip's requirements-file grammar places options such as ``--hash=...``
+    after the requirement, whitespace-separated — pip-compile emits them on
+    backslash continuation lines, which ``_logical_lines`` joins back into
+    the requirement line.  A ``--`` token never occurs inside a PEP 508
+    requirement, so everything from the first whitespace-delimited ``--``
+    token onward is option text, not specifier text.
+    """
+    match = re.search(r"(?:^|\s)--", line)
+    if match is None:
+        return line
+    return line[: match.start()].rstrip()
+
+
 def _parse_requirement_line(line: str, lineno: int) -> RequirementPayload | None:
     """Parse a single PEP 508 specifier line into a RequirementPayload."""
-    stripped = _strip_inline_comment(line.strip())
+    stripped = _strip_requirement_options(_strip_inline_comment(line.strip()))
     if not stripped:
         return None
 

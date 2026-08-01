@@ -300,6 +300,27 @@ def test_requirements_analysis_handles_line_continuations(tmp_path: Path) -> Non
     assert by_name["click"].range.start.line == 2
 
 
+def test_requirements_analysis_splits_hash_options_from_pip_compile_lines(tmp_path: Path) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(
+        "requests==2.31.0 \\\n"
+        "    --hash=sha256:aaaa \\\n"
+        "    --hash=sha256:bbbb\n"
+        'pywin32==306 ; sys_platform == "win32" --hash=sha256:cccc\n',
+        encoding="utf-8",
+    )
+
+    db = Database()
+    result = requirements_analysis(db, str(path))
+
+    by_name = {r.name: r for r in result.requirements}
+    assert by_name["requests"].version_spec == "==2.31.0"
+    assert by_name["requests"].markers == ""
+    assert by_name["pywin32"].version_spec == "==306"
+    assert by_name["pywin32"].markers == 'sys_platform == "win32"'
+    assert result.diagnostics == ()
+
+
 def test_requirements_analysis_handles_empty_file(tmp_path: Path) -> None:
     path = tmp_path / "requirements.txt"
     path.write_text("", encoding="utf-8")
