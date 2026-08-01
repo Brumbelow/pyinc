@@ -3843,6 +3843,15 @@ class WorkspaceSession:
         self._mirror.sync_path_from_disk(real_path)
         request_inputs_changed()
 
+    def _mirrored_content_hashes(self) -> dict[str, str]:
+        """Sha256 per real path of the disk content the mirror was synced from.
+
+        Watchers seed their first-poll baseline from this instead of the
+        current disk state, so an edit landing between the mirror copy and
+        watcher construction is still detected."""
+        with self._state_lock:
+            return self._mirror.content_hashes()
+
     def _remap_workspace_analysis(
         self, analysis: PythonWorkspaceAnalysis
     ) -> PythonWorkspaceAnalysis:

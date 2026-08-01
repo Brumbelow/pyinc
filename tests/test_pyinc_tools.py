@@ -230,6 +230,74 @@ def test_polling_workspace_watcher_batches_changes(tmp_path: Path) -> None:
         }
 
 
+def test_polling_workspace_watcher_first_poll_detects_edits_made_before_watcher_construction(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "def a() -> int:\n    return 1\n")
+
+    clock_state = {"now": 0.0}
+
+    def fake_clock() -> float:
+        return clock_state["now"]
+
+    with WorkspaceSession(root) as session:
+        # The mirror was populated at session construction; an edit landing
+        # before the watcher exists (e.g. during the initial analysis) must
+        # still be picked up by the first polls.
+        _write(target, "def a() -> int:\n    return 2\n")
+        watcher = PollingWorkspaceWatcher(session, debounce_ms=100, clock=fake_clock)
+
+        assert watcher.poll() == ()  # detected, still debouncing
+        clock_state["now"] = 0.11
+        assert watcher.poll() == (str(target),)
+
+        mirror_copy = Path(session.mirror_root) / "a.py"
+        assert mirror_copy.read_text(encoding="utf-8") == "def a() -> int:\n    return 2\n"
+
+
+def test_polling_workspace_watcher_retries_paths_whose_refresh_failed_transiently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.py"
+    _write(target, "def a() -> int:\n    return 1\n")
+
+    clock_state = {"now": 0.0}
+
+    def fake_clock() -> float:
+        return clock_state["now"]
+
+    with WorkspaceSession(root) as session:
+        watcher = PollingWorkspaceWatcher(session, debounce_ms=100, clock=fake_clock)
+        _write(target, "def a() -> int:\n    return 2\n")
+        assert watcher.poll() == ()  # detected, still debouncing
+
+        real_refresh = session.refresh_paths
+        failures = {"remaining": 1}
+
+        def flaky_refresh(paths: list[str]) -> tuple[str, ...]:
+            if failures["remaining"]:
+                failures["remaining"] -= 1
+                raise OSError("transient mirror write failure")
+            return real_refresh(paths)
+
+        monkeypatch.setattr(session, "refresh_paths", flaky_refresh)
+
+        clock_state["now"] = 0.11
+        with pytest.raises(OSError):
+            watcher.poll()
+
+        clock_state["now"] = 0.22
+        assert watcher.poll() == (str(target),)
+
+        mirror_copy = Path(session.mirror_root) / "a.py"
+        assert mirror_copy.read_text(encoding="utf-8") == "def a() -> int:\n    return 2\n"
+
+
 def test_language_server_reports_document_and_workspace_symbols(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()

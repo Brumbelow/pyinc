@@ -476,6 +476,15 @@ class LanguageServer:
             return self._handle_notification(method, params)
         except (InvalidParams, KeyError, TypeError, ValueError):
             return True
+        except Exception as exc:
+            # Notifications have no response to carry an error, so a failed
+            # handler (e.g. an OSError from a mirror write) is logged and the
+            # loop keeps serving, mirroring the request branch's catch-all.
+            print(
+                f"pyinc-tools lsp: {method} notification raised: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return True
 
     def _handle_request(self, method: str, params: Any) -> Any:
         if method == "initialize":

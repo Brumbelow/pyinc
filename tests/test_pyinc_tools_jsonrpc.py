@@ -11,6 +11,7 @@ import pyinc_tools._jsonrpc as jsonrpc_module
 from pyinc_tools._document import InvalidParams, convert_payload_positions
 from pyinc_tools._jsonrpc import InvalidRequest, ParseError, read_message, write_message
 from pyinc_tools.lsp import LanguageServer
+from pyinc_tools.session import WorkspaceSession
 
 
 class _FlushTrackingBytesIO(io.BytesIO):
@@ -332,6 +333,70 @@ def test_language_server_exit_status_tracks_shutdown(tmp_path: Path) -> None:
         out_stream=io.BytesIO(),
     )
     assert server.serve() == 0
+
+
+def test_language_server_notification_oserror_is_logged_and_loop_keeps_serving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = tmp_path / "mod.py"
+    module.write_text("x = 1\n", encoding="utf-8")
+
+    def failing_set_overlay(self: WorkspaceSession, path: str, text: str) -> str:
+        raise OSError("mirror write failed")
+
+    monkeypatch.setattr(WorkspaceSession, "set_overlay", failing_set_overlay)
+
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "rootUri": tmp_path.as_uri(),
+            "initializationOptions": {"pyinc.watcher.enabled": False},
+        },
+    }
+    initialized = {"jsonrpc": "2.0", "method": "initialized", "params": {}}
+    did_open = {
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": module.as_uri(),
+                "languageId": "python",
+                "version": 1,
+                "text": "x = 1\n",
+            }
+        },
+    }
+    shutdown = {"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": {}}
+    exit_notification = {"jsonrpc": "2.0", "method": "exit", "params": {}}
+    output = io.BytesIO()
+    server = LanguageServer(
+        in_stream=io.BytesIO(
+            _frame(initialize)
+            + _frame(initialized)
+            + _frame(did_open)
+            + _frame(shutdown)
+            + _frame(exit_notification)
+        ),
+        out_stream=output,
+    )
+
+    assert server.serve() == 0
+
+    output.seek(0)
+    responses: dict[Any, dict[str, Any]] = {}
+    while True:
+        message = read_message(output)
+        if message is None:
+            break
+        if "id" in message:
+            responses[message["id"]] = message
+    assert "result" in responses[1]
+    assert responses[2] == {"jsonrpc": "2.0", "id": 2, "result": None}
+    assert "OSError" in capsys.readouterr().err
 
 
 def test_language_server_serves_parse_error_response() -> None:
