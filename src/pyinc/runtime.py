@@ -465,6 +465,40 @@ class _GuardedEnviron(MutableMapping[str, str]):
         self._check_read()
         return key in self._wrapped
 
+    # The PEP 584 operators mirror `os._Environ` so `os.environ | {...}` keeps
+    # working after the guard is installed. Both `|` directions build their dict
+    # from `self`, so the reads go through the guarded `keys`/`__getitem__`;
+    # `|=` only writes, matching the unguarded `__setitem__`.
+    def __or__(self, other: object) -> dict[str, str]:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        new = dict(self)
+        new.update(other)
+        return new
+
+    def __ror__(self, other: object) -> dict[str, str]:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        new = dict(other)
+        new.update(self)
+        return new
+
+    def __ior__(  # type: ignore[misc]  # `|=` accepts pair iterables that `|` does not, as in os._Environ
+        self, other: Mapping[str, str] | Iterable[tuple[str, str]]
+    ) -> _GuardedEnviron:
+        self.update(other)
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        # `os._Environ` carries codec helpers beyond the mapping protocol
+        # (encodekey/decodekey/encodevalue/decodevalue); expose exactly those.
+        # Everything else stays hidden: `os._Environ` internals such as `_data`
+        # hold the live environment as a plain attribute, so delegating unknown
+        # names would hand queries an unchecked read path around the guard.
+        if name in ("encodekey", "decodekey", "encodevalue", "decodevalue"):
+            return getattr(self._wrapped, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
 
 class Subscription:
     """Handle returned by `Database.observe(...)`.
@@ -2119,6 +2153,7 @@ class Database:
             else:
                 record = previous
                 previous_changed_at = previous.changed_at
+                previous_digest = previous.digest
                 old_value = self._expose_snapshot(previous.snapshot)
                 new_value = self._expose_snapshot(snapshot)
                 equal = (
@@ -2136,7 +2171,29 @@ class Database:
                 if equal:
                     record.changed_at = previous_changed_at
                     decision = "backdated"
+                elif impure and digest == previous_digest:
+                    # `equal` was forced above, not observed: an untracked
+                    # read skips the comparison entirely. When the re-run
+                    # then lands a byte-identical snapshot there is no new
+                    # value to propagate, so keep the old changed_at and
+                    # leave the revision alone -- otherwise a stable impure
+                    # leaf churns the counter on every warm request. This
+                    # digest short-circuit applies only to the forced case:
+                    # when a comparison actually ran and said unequal (a
+                    # custom eq policy may, even for identical snapshots),
+                    # the bump below stands.
+                    record.changed_at = previous_changed_at
+                    decision = "executed"
                 else:
+                    # A recompute that lands a new value is a change in the
+                    # graph exactly as an input set or a resource reload is,
+                    # so it moves the revision the same way. Without the bump
+                    # an untracked leaf's new value lands at the revision its
+                    # grandparent was verified at: the direct parent re-runs
+                    # (untracked forces that), but its own changed_at then
+                    # fails the strictly-greater check and every ancestor
+                    # above it keeps a value a fresh database never produces.
+                    self._revision += 1
                     record.changed_at = self._revision
                     decision = "executed"
             self._query_records.add(key)
@@ -2754,7 +2811,15 @@ class Database:
         record_boundaries: bool = False,
         frame: ExecutionFrame | None = None,
     ) -> Any:
-        exposed = snapshot if self.mode == "strict" else self._thaw_value(snapshot)
+        if self.mode == "strict":
+            # Callers never see the FrozenGraph envelope: a graph-shaped result
+            # is rebuilt into shared/cyclic Frozen* views at the boundary,
+            # exactly as _materialize_call does for call arguments. Non-boundary
+            # exposure feeds the equality/cutoff comparison and keeps the raw
+            # snapshot -- a cyclic view cannot be re-frozen for that check.
+            exposed = self._strict_snapshot_view(snapshot) if boundary else snapshot
+        else:
+            exposed = self._thaw_value(snapshot)
         if boundary and record_boundaries and frame is not None:
             frame.boundary_fingerprints.append(self._fingerprint_value(exposed))
             frame.boundary_values.append(exposed)

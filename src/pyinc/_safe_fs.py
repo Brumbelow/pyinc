@@ -476,6 +476,29 @@ def unlink_regular_file(path: Path) -> bool:
         os.close(parent_fd)
 
 
+def remove_empty_directory(path: Path) -> bool:
+    """Remove an empty directory through a no-follow parent handle and sync the parent."""
+    if os.name == "nt":
+        return _remove_empty_directory_windows(path)
+    try:
+        parent_fd = _open_directory(path.parent, create=False)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise UnsafeFilesystemPathError(f"Refusing to remove a non-directory: {path}")
+        _require_directory_identity(parent_fd, path.parent)
+        os.rmdir(path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        return True
+    finally:
+        os.close(parent_fd)
+
+
 def open_lock_file(path: Path) -> BinaryIO:
     """Open/create a regular lock file without following a path component."""
 
@@ -622,6 +645,32 @@ def _unlink_regular_file_windows(path: Path) -> bool:
     return True
 
 
+def _remove_empty_directory_windows(path: Path) -> bool:
+    api = _windows_api()
+    try:
+        directories = _WindowsDirectoryHandles.open(api, os.fspath(path.parent), create=False)
+    except FileNotFoundError:
+        return False
+    with directories:
+        try:
+            handle = api.open_handle(
+                os.fspath(path),
+                access=_WIN_DELETE | _WIN_FILE_READ_ATTRIBUTES,
+                creation=_WIN_OPEN_EXISTING,
+                flags=_WIN_FILE_FLAG_OPEN_REPARSE_POINT | _WIN_FILE_FLAG_BACKUP_SEMANTICS,
+            )
+        except OSError as error:
+            if _windows_error_code(error) in _WIN_MISSING_ERRORS:
+                return False
+            raise
+        try:
+            api.require_directory(handle, os.fspath(path))
+            api.delete_handle(handle, os.fspath(path))
+        finally:
+            api.close(handle)
+    return True
+
+
 def _open_lock_file_windows(path: Path) -> BinaryIO:
     api = _windows_api()
     directories = _WindowsDirectoryHandles.open(api, os.fspath(path.parent), create=True)
@@ -739,5 +788,6 @@ __all__ = [
     "ensure_directory",
     "open_lock_file",
     "read_regular_file",
+    "remove_empty_directory",
     "unlink_regular_file",
 ]

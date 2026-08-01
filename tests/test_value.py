@@ -587,6 +587,39 @@ def test_freeze_pure_tree_does_not_wrap_in_frozen_graph() -> None:
     assert isinstance(snapshot, FrozenList)
 
 
+def test_freeze_reencodes_shared_wrapper_structure_as_the_raw_frozen_graph() -> None:
+    # A strict-mode boundary view rebuilds a graph snapshot into wrapper
+    # objects that genuinely alias each other. Feeding such a view back into
+    # freeze must restore the graph encoding the view came from, so the
+    # round-trip lands the exact snapshot the raw structure produces.
+    inner_raw = [1, 2]
+    original = freeze([inner_raw, inner_raw])
+    assert isinstance(original, FrozenGraph)
+
+    inner = FrozenList((1, 2))
+    shared = FrozenList((inner, inner))
+    snapshot = freeze(shared)
+
+    assert isinstance(snapshot, FrozenGraph)
+    assert snapshot == original
+    assert fingerprint_snapshot(snapshot) == fingerprint_snapshot(original)
+
+
+def test_freeze_reencodes_cyclic_wrapper_structure_as_the_raw_frozen_graph() -> None:
+    raw: list[Any] = []
+    raw.append(raw)
+    original = freeze(raw)
+    assert isinstance(original, FrozenGraph)
+
+    shell = FrozenList(())
+    object.__setattr__(shell, "items", (shell,))
+    snapshot = freeze(shell)
+
+    assert isinstance(snapshot, FrozenGraph)
+    assert snapshot == original
+    assert fingerprint_snapshot(snapshot) == fingerprint_snapshot(original)
+
+
 def test_frozen_graph_digest_is_deterministic_across_construction_orders() -> None:
     a: list[Any] = []
     a.append(a)

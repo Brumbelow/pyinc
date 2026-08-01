@@ -816,6 +816,10 @@ def test_public_safe_fs_functions_dispatch_to_windows_boundaries(
         calls.append(("unlink", candidate))
         return True
 
+    def remove_windows(candidate: Path) -> bool:
+        calls.append(("remove", candidate))
+        return True
+
     def lock_windows(candidate: Path) -> _TrackingStream:
         calls.append(("lock", candidate))
         return stream
@@ -837,6 +841,11 @@ def test_public_safe_fs_functions_dispatch_to_windows_boundaries(
     )
     monkeypatch.setattr(
         safe_fs,
+        "_remove_empty_directory_windows",
+        remove_windows,
+    )
+    monkeypatch.setattr(
+        safe_fs,
         "_open_lock_file_windows",
         lock_windows,
     )
@@ -846,10 +855,11 @@ def test_public_safe_fs_functions_dispatch_to_windows_boundaries(
     assert safe_fs.read_regular_file(path) == b"data"
     safe_fs.atomic_write(path, b"payload")
     assert safe_fs.unlink_regular_file(path)
+    assert safe_fs.remove_empty_directory(path)
     assert safe_fs.open_lock_file(path) is stream
     safe_fs.ensure_directory(path)
 
-    assert [call[0] for call in calls] == ["read", "write", "unlink", "lock"]
+    assert [call[0] for call in calls] == ["read", "write", "unlink", "remove", "lock"]
     assert context.enter_calls == 1
     assert context.close_calls == 1
 
@@ -1094,6 +1104,83 @@ def test_windows_unlink_handles_missing_and_regular_files(
     with pytest.raises(OSError) as raised:
         safe_fs._unlink_regular_file_windows(path)
     assert cast(Any, raised.value).winerror == 5
+
+
+class _RemoveDirectoryWindowsApi:
+    def __init__(self, open_result: int | BaseException = 77) -> None:
+        self.open_result = open_result
+        self.required: list[int] = []
+        self.deleted: list[int] = []
+        self.closed: list[int] = []
+
+    def open_handle(self, _path: str, **_kwargs: object) -> int:
+        if isinstance(self.open_result, BaseException):
+            raise self.open_result
+        return self.open_result
+
+    def require_directory(self, handle: int, _path: str) -> None:
+        self.required.append(handle)
+
+    def delete_handle(self, handle: int, _path: str) -> None:
+        self.deleted.append(handle)
+
+    def close(self, handle: int) -> None:
+        self.closed.append(handle)
+
+
+def test_windows_remove_empty_directory_handles_missing_and_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "emptied"
+    _install_directory_context(monkeypatch, FileNotFoundError())
+    monkeypatch.setattr(safe_fs, "_windows_api", lambda: _RemoveDirectoryWindowsApi())
+    assert not safe_fs._remove_empty_directory_windows(path)
+
+    context = _DirectoryContext()
+    _install_directory_context(monkeypatch, context)
+    missing_api = _RemoveDirectoryWindowsApi(_windows_error(safe_fs._WIN_ERROR_PATH_NOT_FOUND))
+    monkeypatch.setattr(safe_fs, "_windows_api", lambda: missing_api)
+    assert not safe_fs._remove_empty_directory_windows(path)
+    assert context.close_calls == 1
+
+    directory_api = _RemoveDirectoryWindowsApi()
+    monkeypatch.setattr(safe_fs, "_windows_api", lambda: directory_api)
+    assert safe_fs._remove_empty_directory_windows(path)
+    assert directory_api.required == [77]
+    assert directory_api.deleted == [77]
+    assert directory_api.closed == [77]
+
+    failing_api = _RemoveDirectoryWindowsApi(_windows_error(5))
+    monkeypatch.setattr(safe_fs, "_windows_api", lambda: failing_api)
+    with pytest.raises(OSError) as raised:
+        safe_fs._remove_empty_directory_windows(path)
+    assert cast(Any, raised.value).winerror == 5
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-descriptor behavior")
+def test_remove_empty_directory_branches_on_missing_nondirectory_and_populated(
+    tmp_path: Path,
+) -> None:
+    assert not safe_fs.remove_empty_directory(tmp_path / "absent-parent" / "child")
+    assert not safe_fs.remove_empty_directory(tmp_path / "missing")
+
+    regular = tmp_path / "regular"
+    regular.write_bytes(b"data")
+    with pytest.raises(safe_fs.UnsafeFilesystemPathError, match="non-directory"):
+        safe_fs.remove_empty_directory(regular)
+    assert regular.read_bytes() == b"data"
+
+    populated = tmp_path / "populated"
+    populated.mkdir()
+    (populated / "entry.txt").write_bytes(b"entry")
+    with pytest.raises(OSError):
+        safe_fs.remove_empty_directory(populated)
+    assert (populated / "entry.txt").read_bytes() == b"entry"
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert safe_fs.remove_empty_directory(empty)
+    assert not empty.exists()
 
 
 def test_windows_require_regular_or_missing_closes_observation_handle(

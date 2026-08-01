@@ -283,7 +283,7 @@ def test_inspect_fresh_triggers_reverification_after_input_change() -> None:
 
     fresh = db.inspect_fresh(double)
     assert fresh.last_decision == "executed"
-    assert fresh.verified_at == 2
+    assert fresh.verified_at > stale.verified_at
     assert db.get(double) == 10
 
 
@@ -408,6 +408,142 @@ def test_strict_query_call_exposes_safe_cyclic_view() -> None:
         True,
         False,
     )
+
+
+def test_strict_get_exposes_cyclic_result_as_safe_view() -> None:
+    @query
+    def make_cycle(db: Database) -> list[Any]:
+        value: list[Any] = []
+        value.append(value)
+        return value
+
+    result = Database(mode="strict").get(make_cycle)
+
+    assert isinstance(result, FrozenList)
+    assert len(result) == 1
+    (element,) = result
+    assert element is result
+    assert not hasattr(result, "append")
+
+
+def test_strict_get_exposes_shared_acyclic_result_as_usable_containers() -> None:
+    @query
+    def make_diamond(db: Database) -> list[list[int]]:
+        inner = [1, 2]
+        return [inner, inner]
+
+    result = Database(mode="strict").get(make_diamond)
+
+    assert isinstance(result, FrozenList)
+    assert len(result) == 2
+    left, right = result
+    assert isinstance(left, FrozenList)
+    assert left is right
+    assert list(left) == [1, 2]
+
+
+def test_strict_dependent_query_computes_over_cyclic_result_from_db_get() -> None:
+    @query
+    def make_cycle(db: Database) -> list[Any]:
+        value: list[Any] = []
+        value.append(value)
+        return value
+
+    @query
+    def measure_cycle(db: Database) -> tuple[int, bool]:
+        value = db.get(make_cycle)
+        return (len(value), value[0] is value)
+
+    assert Database(mode="strict").get(measure_cycle) == (1, True)
+
+
+def test_strict_read_input_exposes_cyclic_value_as_safe_view() -> None:
+    payload = Input[Any]("payload")
+    cyclic: list[Any] = []
+    cyclic.append(cyclic)
+
+    db = Database(mode="strict")
+    db.set(payload, cyclic)
+    value = payload.read(db)
+
+    assert isinstance(value, FrozenList)
+    assert len(value) == 1
+    assert value[0] is value
+
+
+def test_strict_set_round_trips_cyclic_view_from_db_get() -> None:
+    payload = Input[Any]("payload")
+
+    @query
+    def make_cycle(db: Database) -> list[Any]:
+        value: list[Any] = []
+        value.append(value)
+        return value
+
+    @query
+    def measure_payload(db: Database) -> tuple[int, bool]:
+        value = payload.read(db)
+        return (len(value), value[0] is value)
+
+    db = Database(mode="strict")
+    view = db.get(make_cycle)
+
+    db.set(payload, view)
+
+    assert db.get(measure_payload) == (1, True)
+    # From-scratch consistency: re-freezing the view lands the exact snapshot
+    # the raw cyclic structure produces.
+    expected: list[Any] = []
+    expected.append(expected)
+    assert fingerprint_snapshot(freeze(view)) == fingerprint_snapshot(freeze(expected))
+
+
+def test_strict_query_argument_accepts_cyclic_view_from_db_get() -> None:
+    @query
+    def make_cycle(db: Database) -> list[Any]:
+        value: list[Any] = []
+        value.append(value)
+        return value
+
+    @query
+    def inspect_value(db: Database, value: list[Any]) -> tuple[bool, int, bool]:
+        return (isinstance(value, FrozenList), len(value), value[0] is value)
+
+    db = Database(mode="strict")
+    view = db.get(make_cycle)
+
+    assert db.get(inspect_value, view) == (True, 1, True)
+
+    # The view addresses the same cache node as the raw cyclic structure.
+    cyclic: list[Any] = []
+    cyclic.append(cyclic)
+    key_from_view, _ = db._query_key(inspect_value, (view,), {})
+    key_from_raw, _ = db._query_key(inspect_value, (cyclic,), {})
+    assert key_from_view.args_digest == key_from_raw.args_digest
+
+
+def test_strict_set_round_trips_shared_diamond_view_preserving_sharing() -> None:
+    payload = Input[Any]("payload")
+
+    @query
+    def make_diamond(db: Database) -> list[list[int]]:
+        inner = [1, 2]
+        return [inner, inner]
+
+    db = Database(mode="strict")
+    view = db.get(make_diamond)
+
+    db.set(payload, view)
+    value = payload.read(db)
+
+    assert isinstance(value, FrozenList)
+    left, right = value
+    assert left is right
+    assert list(left) == [1, 2]
+    # From-scratch consistency: re-freezing the view lands the exact snapshot
+    # the raw shared structure produces.
+    inner = [1, 2]
+    assert fingerprint_snapshot(freeze(view)) == fingerprint_snapshot(freeze([inner, inner]))
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked"])
@@ -912,6 +1048,7 @@ def test_handled_unrecordable_failure_propagates_more_than_one_hop(
     db = Database(mode=mode)
     assert db.get(top, str(path)) == "T:M:text"
     executions = db.statistics().query_executions
+    verified = db.revision
 
     path.unlink()
     path.mkdir()
@@ -923,9 +1060,8 @@ def test_handled_unrecordable_failure_propagates_more_than_one_hop(
     # All three hops re-executed in that one request: the invalidation reached
     # past `middle`, which is the hop a direct-reader-only fix leaves behind.
     assert db.statistics().query_executions == executions + 3
-    revision = db.revision
     for node in (leaf, middle, top):
-        assert _query_record(db, node, str(path)).changed_at == revision
+        assert _query_record(db, node, str(path)).changed_at > verified
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -955,9 +1091,10 @@ def test_permanently_unrecordable_failure_settles_the_revision(
     path.unlink()
     path.mkdir()
     assert db.get(parent, str(path)) == "P:<isdir>"
-    # One bump for the transition into "unconfirmed" -- not one per observation.
+    # The transition into "unconfirmed" moves the revision (once per node that
+    # actually changed) -- not once per observation.
     transitioned = db.revision
-    assert transitioned == before + 1
+    assert transitioned > before
 
     for _ in range(5):
         assert db.get(parent, str(path)) == "P:<isdir>"
@@ -1078,7 +1215,7 @@ def test_file_resource_detects_content_changes_even_when_stat_signature_is_stabl
     assert db.get(read_file, str(path)) == "bravo"
     record = _inspect_node(db, read_file, str(path))
     assert record.last_decision == "executed"
-    assert record.changed_at == 1
+    assert record.changed_at == db.revision
 
 
 def test_file_stat_resource_tracks_metadata_changes(tmp_path: Path) -> None:
@@ -1815,6 +1952,79 @@ def test_impure_child_prevents_parent_backdating_unless_result_unchanged() -> No
 
     consumer_node = _inspect_node(db, consumer)
     assert consumer_node.last_decision == "backdated"
+
+
+def test_untracked_leaf_value_change_two_levels_up_matches_a_fresh_database(
+    tmp_path: Path,
+) -> None:
+    counter = tmp_path / "counter.txt"
+    counter.write_text("1", encoding="utf-8")
+
+    @query
+    def unstable(db: Database) -> int:
+        db.report_untracked_read("counter file read via os.open")
+        fd = os.open(str(counter), os.O_RDONLY)
+        try:
+            data = os.read(fd, 64)
+        finally:
+            os.close(fd)
+        return int(data.decode("utf-8"))
+
+    @query
+    def middle(db: Database) -> int:
+        return unstable(db) * 10
+
+    @query
+    def top(db: Database) -> int:
+        return middle(db) + 1
+
+    db = Database()
+    assert db.get(top) == 11
+
+    # The external state moves between requests. Being untracked keeps the
+    # leaf's *direct* parent honest; the new value must also reach the
+    # grandparent, which only re-verifies through the middle hop's changed_at.
+    counter.write_text("2", encoding="utf-8")
+    assert db.get(middle) == Database().get(middle) == 20
+    assert db.get(top) == Database().get(top) == 21
+
+
+def test_stable_untracked_leaf_keeps_the_revision_settled_across_warm_requests(
+    tmp_path: Path,
+) -> None:
+    counter = tmp_path / "counter.txt"
+    counter.write_text("1", encoding="utf-8")
+
+    @query
+    def stable(db: Database) -> int:
+        db.report_untracked_read("counter file read via os.open")
+        fd = os.open(str(counter), os.O_RDONLY)
+        try:
+            data = os.read(fd, 64)
+        finally:
+            os.close(fd)
+        return int(data.decode("utf-8"))
+
+    @query
+    def parent(db: Database) -> int:
+        return stable(db) * 10
+
+    db = Database()
+    assert db.get(parent) == 10
+    settled = db.revision
+
+    # The untracked leaf re-executes on every request -- its result is never
+    # trusted -- but it keeps landing the identical value, so nothing in the
+    # graph has changed and the revision must not move.
+    for _ in range(5):
+        assert db.get(parent) == 10
+    assert db.revision == settled
+
+    # A real change in the external state is still a change in the graph and
+    # still moves the counter.
+    counter.write_text("2", encoding="utf-8")
+    assert db.get(parent) == 20
+    assert db.revision > settled
 
 
 def test_cycle_error_does_not_corrupt_database_for_subsequent_queries() -> None:

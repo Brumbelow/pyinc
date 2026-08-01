@@ -479,6 +479,144 @@ def test_desired_set_rejects_file_directory_conflict(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+LAYOUT_KIND = Input[str]("layout_kind")
+
+
+@action(tool="layout-migration/1")
+def _emit_layout(db: Database) -> list[Output]:
+    if LAYOUT_KIND.read(db) == "file":
+        return [Output.text("pkg", "file layout")]
+    return [Output.text("pkg/model.py", "directory layout")]
+
+
+def test_file_to_directory_output_migration_converges_like_a_fresh_root(tmp_path: Path) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "file")
+    _emit_layout.reconcile(db, root=inc_root)
+
+    db.set(LAYOUT_KIND, "directory")
+    result = _emit_layout.reconcile(db, root=inc_root)
+
+    assert result.created == ("pkg/model.py",)
+    assert result.deleted == ("pkg",)
+    assert result.updated == result.repaired == result.unchanged == ()
+
+    fresh_root = tmp_path / "fresh"
+    fresh_db = Database(mode="strict")
+    fresh_db.set(LAYOUT_KIND, "directory")
+    _emit_layout.reconcile(fresh_db, root=fresh_root)
+    assert _tree(inc_root) == _tree(fresh_root)
+    assert (inc_root / "pkg").is_dir()
+
+
+def test_directory_to_file_output_migration_converges_like_a_fresh_root(tmp_path: Path) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "directory")
+    _emit_layout.reconcile(db, root=inc_root)
+
+    db.set(LAYOUT_KIND, "file")
+    result = _emit_layout.reconcile(db, root=inc_root)
+
+    assert result.created == ("pkg",)
+    assert result.deleted == ("pkg/model.py",)
+    assert result.updated == result.repaired == result.unchanged == ()
+
+    fresh_root = tmp_path / "fresh"
+    fresh_db = Database(mode="strict")
+    fresh_db.set(LAYOUT_KIND, "file")
+    _emit_layout.reconcile(fresh_db, root=fresh_root)
+    assert _tree(inc_root) == _tree(fresh_root)
+    assert (inc_root / "pkg").is_file()
+
+
+def test_plan_reports_layout_migration_deletion_without_mutating(tmp_path: Path) -> None:
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "file")
+    _emit_layout.reconcile(db, root=tmp_path)
+    manifest = _manifest_path(tmp_path, _emit_layout.tool)
+    manifest_before = manifest.read_bytes()
+
+    db.set(LAYOUT_KIND, "directory")
+    plan = _emit_layout.plan(db, root=tmp_path)
+
+    assert plan.dry_run is True
+    assert plan.created == ("pkg/model.py",)
+    assert plan.deleted == ("pkg",)
+    assert (tmp_path / "pkg").read_text(encoding="utf-8") == "file layout"
+    assert not (tmp_path / "pkg").is_dir()
+    assert manifest.read_bytes() == manifest_before
+
+
+def test_directory_to_file_migration_refuses_to_prune_unowned_entries(tmp_path: Path) -> None:
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "directory")
+    _emit_layout.reconcile(db, root=tmp_path)
+    unowned = tmp_path / "pkg" / "unowned.txt"
+    unowned.write_text("keep", encoding="utf-8")
+
+    db.set(LAYOUT_KIND, "file")
+    with pytest.raises(ActionPathError, match="prune"):
+        _emit_layout.reconcile(db, root=tmp_path)
+    assert unowned.read_text(encoding="utf-8") == "keep"
+
+    unowned.unlink()
+    result = _emit_layout.reconcile(db, root=tmp_path)
+    assert result.created == ("pkg",)
+    assert (tmp_path / "pkg").read_text(encoding="utf-8") == "file layout"
+
+
+def test_migration_orphan_replaced_by_a_directory_follows_tamper_policy(tmp_path: Path) -> None:
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "file")
+    _emit_layout.reconcile(db, root=tmp_path)
+    (tmp_path / "pkg").unlink()
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "user.txt").write_text("user data", encoding="utf-8")
+
+    db.set(LAYOUT_KIND, "directory")
+    with pytest.raises(ActionPathError, match="not a regular file"):
+        _emit_layout.reconcile(db, root=tmp_path)
+    assert (tmp_path / "pkg" / "user.txt").read_text(encoding="utf-8") == "user data"
+    assert not (tmp_path / "pkg" / "model.py").exists()
+
+
+CASE_LAYOUT_KIND = Input[str]("case_layout_kind")
+
+
+@action(tool="layout-migration-case/1")
+def _emit_case_layout(db: Database) -> list[Output]:
+    if CASE_LAYOUT_KIND.read(db) == "upper-file":
+        return [Output.text("PKG", "upper file layout")]
+    return [Output.text("pkg/model.py", "directory layout")]
+
+
+def test_casefold_twin_of_an_orphan_does_not_bypass_desired_target_validation(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "case_probe").write_text("probe", encoding="utf-8")
+    if (tmp_path / "CASE_PROBE").exists():
+        pytest.skip("requires a case-sensitive filesystem")
+    (tmp_path / "case_probe").unlink()
+
+    db = Database(mode="strict")
+    db.set(CASE_LAYOUT_KIND, "upper-file")
+    _emit_case_layout.reconcile(db, root=tmp_path)
+    # Deleting the orphan "PKG" frees nothing at "pkg": the unowned directory
+    # there merely casefold-matches it, so the usual target validation applies.
+    (tmp_path / "pkg" / "model.py").mkdir(parents=True)
+    (tmp_path / "pkg" / "model.py" / "user.txt").write_text("user data", encoding="utf-8")
+
+    db.set(CASE_LAYOUT_KIND, "directory")
+    with pytest.raises(ActionPathError, match="not a regular file"):
+        _emit_case_layout.plan(db, root=tmp_path)
+    with pytest.raises(ActionPathError, match="not a regular file"):
+        _emit_case_layout.reconcile(db, root=tmp_path)
+    assert (tmp_path / "PKG").read_text(encoding="utf-8") == "upper file layout"
+    assert (tmp_path / "pkg" / "model.py" / "user.txt").read_text(encoding="utf-8") == "user data"
+
+
 def test_tracked_missing_output_is_repaired(tmp_path: Path) -> None:
     db, src, out = _setup(tmp_path)
     _emit.reconcile(db, str(src), root=out)

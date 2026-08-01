@@ -20,6 +20,7 @@ from ._safe_fs import (
     UnsafeFilesystemPathError,
     atomic_write,
     read_regular_file,
+    remove_empty_directory,
     unlink_regular_file,
 )
 from .errors import ActionLockTimeoutError, ActionManifestError, ActionPathError
@@ -108,6 +109,11 @@ def _normalize_rel(path: str) -> str:
 
 def _portable_path_key(path: str) -> str:
     return unicodedata.normalize("NFC", path).casefold()
+
+
+def _ancestors(relative: str) -> tuple[str, ...]:
+    parts = relative.split("/")
+    return tuple("/".join(parts[:depth]) for depth in range(1, len(parts)))
 
 
 def _validate_path_set(paths: Iterable[str], *, source: str) -> dict[str, str]:
@@ -428,7 +434,35 @@ class Action:
     ) -> ReconcileResult:
         root_identity = _manifest_root_digest(root)
         manifest_exists, previous = _read_manifest(state_dir, self.tool, root_identity)
-        _validate_path_set(set(desired) | set(previous), source="owned output")
+        _validate_path_set(desired, source="owned output")
+
+        # A ledger entry that conflicts with the new desired layout is just an
+        # orphan of the previous layout; it is released below rather than
+        # rejected, so an output can migrate between file and directory forms.
+        previous_only = sorted(set(previous) - set(desired))
+        desired_by_key = {_portable_path_key(path): path for path in desired}
+        for relative in previous_only:
+            twin = desired_by_key.get(_portable_path_key(relative))
+            if twin is not None:
+                # On a case-insensitive filesystem the orphan and the desired
+                # output are one file; deleting the orphan would destroy the
+                # reconciled output, so a spelling change stays rejected.
+                raise ActionPathError(
+                    f"Portable-path collision in owned output: {relative!r} and {twin!r}"
+                )
+
+        # Directories that stand where a desired file must go exist only
+        # because the previous layout nested owned outputs there. Record them
+        # so they can be pruned once their orphans are deleted.
+        prune_map: dict[str, str] = {}
+        for relative in previous_only:
+            for ancestor in _ancestors(relative):
+                ancestor_key = _portable_path_key(ancestor)
+                if any(
+                    ancestor_key == desired_key or ancestor_key.startswith(f"{desired_key}/")
+                    for desired_key in desired_by_key
+                ):
+                    prune_map.setdefault(ancestor_key, ancestor)
 
         manifest = _manifest_path(state_dir, self.tool)
         try:
@@ -449,8 +483,36 @@ class Action:
                     )
 
         targets: dict[str, tuple[Path, os.stat_result | None]] = {}
-        for relative in sorted(set(desired) | set(previous)):
+        for relative in previous_only:
             target, metadata = _safe_target(root, relative)
+            if metadata is not None and not stat.S_ISREG(metadata.st_mode):
+                raise ActionPathError(f"Owned output target is not a regular file: {relative!r}")
+            targets[relative] = (target, metadata)
+
+        orphan_file_paths = {
+            relative for relative in previous_only if targets[relative][1] is not None
+        }
+
+        for relative in sorted(desired):
+            if any(ancestor in orphan_file_paths for ancestor in _ancestors(relative)):
+                # An orphan file from the previous layout occupies exactly this
+                # parent path; a mere casefold twin of a parent frees nothing
+                # when it is deleted, so it does not lift validation. The
+                # orphan's components were validated when it was inspected, it
+                # is deleted before this path is written, and the write
+                # revalidates the target, so classify the target as absent
+                # here.
+                targets[relative] = (root.joinpath(*relative.split("/")), None)
+                continue
+            target, metadata = _safe_target(root, relative)
+            if (
+                metadata is not None
+                and stat.S_ISDIR(metadata.st_mode)
+                and _portable_path_key(relative) in prune_map
+            ):
+                # The previous layout nested owned outputs where this file now
+                # belongs; the directory is pruned before the write.
+                metadata = None
             if metadata is not None and not stat.S_ISREG(metadata.st_mode):
                 raise ActionPathError(f"Owned output target is not a regular file: {relative!r}")
             targets[relative] = (target, metadata)
@@ -482,21 +544,17 @@ class Action:
 
         deleted: list[str] = []
         delete_paths: list[str] = []
-        for relative in sorted(set(previous) - set(desired)):
+        for relative in previous_only:
             _, metadata = targets[relative]
             if metadata is not None:
                 deleted.append(relative)
                 delete_paths.append(relative)
 
         if not dry_run:
-            for relative in write_paths:
-                target, metadata = _safe_target(root, relative)
-                if metadata is not None and not stat.S_ISREG(metadata.st_mode):
-                    raise ActionPathError(
-                        f"Owned output target is not a regular file: {relative!r}"
-                    )
-                _atomic_write(target, desired[relative])
-
+            # Orphans are deleted and their emptied directories pruned before
+            # any write so a path can change between file and directory forms.
+            # Each step is individually atomic; if the run stops early, the
+            # prior ledger lets the next locked reconcile finish the set.
             for relative in delete_paths:
                 target, metadata = _safe_target(root, relative)
                 if metadata is None:
@@ -509,6 +567,29 @@ class Action:
                     unlink_regular_file(target)
                 except UnsafeFilesystemPathError as error:
                     raise ActionPathError(str(error)) from error
+
+            for relative in sorted(
+                prune_map.values(), key=lambda path: path.count("/"), reverse=True
+            ):
+                target, metadata = _safe_target(root, relative)
+                if metadata is None or not stat.S_ISDIR(metadata.st_mode):
+                    continue
+                try:
+                    remove_empty_directory(target)
+                except UnsafeFilesystemPathError as error:
+                    raise ActionPathError(str(error)) from error
+                except OSError as error:
+                    raise ActionPathError(
+                        f"Cannot prune directory {relative!r} left by the previous layout: {error}"
+                    ) from error
+
+            for relative in write_paths:
+                target, metadata = _safe_target(root, relative)
+                if metadata is not None and not stat.S_ISREG(metadata.st_mode):
+                    raise ActionPathError(
+                        f"Owned output target is not a regular file: {relative!r}"
+                    )
+                _atomic_write(target, desired[relative])
 
             if desired_hashes != previous or (desired_hashes and not manifest_exists):
                 _write_manifest(state_dir, self.tool, root_identity, desired_hashes)

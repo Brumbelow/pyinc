@@ -215,6 +215,13 @@ def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snap
             )
         return cast(Snapshot, value)
     if type(value) in _FROZEN_TYPES:
+        if _wrapper_aliases_structure(value):
+            # A strict-mode boundary view rebuilds a FrozenGraph snapshot into
+            # wrapper objects that genuinely share or cycle through each other.
+            # Feeding one back across a boundary must restore the graph
+            # encoding it came from; inlining the aliased wrappers as a tree
+            # would either drop the sharing or recurse forever on a cycle.
+            return _refreeze_wrapper(value, state)
         return cast(Snapshot, value)
     adapter_match = registry.for_value(value)
     if adapter_match is not None:
@@ -315,6 +322,109 @@ def _freeze_dataclass(value: Any, registry: _AdapterRegistry, state: _FreezeStat
         ),
     )
     return FrozenRecord(type(value).__qualname__, frozen_items)
+
+
+def _wrapper_aliases_structure(value: Any) -> bool:
+    """Report whether an already-frozen wrapper aliases any of its own parts.
+
+    A plain tree wrapper passes through `freeze` untouched with identity
+    intact, but a wrapper whose object graph revisits one of the four
+    graph-capable container types (shared or cyclic) has to be re-encoded.
+    Hash positions (mapping keys, set members) are frozen in isolated states
+    and can never carry references, so they stay unvisited here exactly as
+    they stay ref-free in `_freeze`.
+    """
+
+    seen_nodes: set[int] = set()
+    active: set[int] = set()
+
+    def walk(current: Any) -> bool:
+        current_type = type(current)
+        if current_type in (FrozenList, FrozenDict, FrozenRecord) or (
+            current_type is FrozenSet and current.kind == "set"
+        ):
+            if id(current) in seen_nodes:
+                return True
+            seen_nodes.add(id(current))
+            if current_type is FrozenList:
+                return any(walk(item) for item in current.items)
+            if current_type is FrozenDict:
+                return any(walk(item) for _key, item in current.entries)
+            if current_type is FrozenRecord:
+                return any(walk(item) for _name, item in current.entries)
+            return False
+        if current_type is FrozenAdapterValue:
+            if id(current) in active:
+                return True
+            active.add(id(current))
+            try:
+                return walk(current.payload)
+            finally:
+                active.discard(id(current))
+        if current_type is tuple:
+            if id(current) in active:
+                return True
+            active.add(id(current))
+            try:
+                return any(walk(item) for item in current)
+            finally:
+                active.discard(id(current))
+        return False
+
+    return walk(value)
+
+
+def _refreeze_wrapper(value: Any, state: _FreezeState) -> Snapshot:
+    """Re-encode an aliased wrapper graph through the raw-mutable memo machinery.
+
+    Every graph-capable wrapper registers in `state` exactly as its raw
+    counterpart would, so revisits become `FrozenRef` back-edges and
+    `_finalize_snapshot` restores the canonical `FrozenGraph` -- the
+    round-tripped snapshot fingerprints identically to the snapshot the view
+    was built from.
+    """
+
+    value_type = type(value)
+    if value_type in IMMUTABLE_SCALARS:
+        return cast(Snapshot, value)
+    if value_type is FrozenList:
+        return _freeze_via_memo(
+            value,
+            state,
+            lambda: FrozenList(tuple(_refreeze_wrapper(item, state) for item in value.items)),
+        )
+    if value_type is FrozenDict:
+        # Keys were frozen in isolated states and carry no references; keep
+        # them byte-identical so the canonical entry order is preserved.
+        return _freeze_via_memo(
+            value,
+            state,
+            lambda: FrozenDict(
+                tuple((key, _refreeze_wrapper(item, state)) for key, item in value.entries)
+            ),
+        )
+    if value_type is FrozenSet:
+        if value.kind == "set":
+            return _freeze_via_memo(value, state, lambda: FrozenSet("set", value.items))
+        return cast(Snapshot, value)
+    if value_type is FrozenRecord:
+        return _freeze_via_memo(
+            value,
+            state,
+            lambda: FrozenRecord(
+                value.type_name,
+                tuple((name, _refreeze_wrapper(item, state)) for name, item in value.entries),
+            ),
+        )
+    if value_type is FrozenAdapterValue:
+        with _active_guard(value, state):
+            return FrozenAdapterValue(value.adapter_key, _refreeze_wrapper(value.payload, state))
+    if value_type is tuple:
+        with _active_guard(value, state):
+            return tuple(_refreeze_wrapper(item, state) for item in value)
+    if value_type in (FrozenGraph, FrozenRef):
+        return cast(Snapshot, value)
+    raise UnsupportedValueError(f"Unsupported snapshot value {value_type.__qualname__}.")
 
 
 def _inline_refs(value: Snapshot, nodes: list[Any]) -> Snapshot:
