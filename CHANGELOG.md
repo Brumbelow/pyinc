@@ -8,6 +8,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `Database.request_span()`, a public context manager holding one kernel
+  request open across several `get`/`inspect`/`inspect_fresh`/`read_resource`
+  calls, and `Database.request_inputs_changed()` to declare mid-span input
+  changes. Entering a span declares that the world the database reads from
+  is stable until the span closes; `set`/`set_many` declare their own
+  changes, a change committed by any thread rolls the span, buffered
+  observer events are delivered when the outermost span closes even if the
+  span body raises, and a failing load's exception lives to span end.
+  `pyinc.integrations.request_inputs_changed()` rolls a held span, and
+  `WorkspaceSession` holds a span for each public method.
+
 - `pyinc-tools analyze` can report diagnostics and gate a CI job: `--format
   text` prints one `path:line:col: severity code message` line per diagnostic,
   `--diagnostics-only` emits just the diagnostics array instead of the full
@@ -77,6 +88,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The default backdate decision in `checked` and `fast` now matches `strict`
+  in three corners it previously diverged on: a recomputed dataclass whose
+  type changed while its fields stayed equal, and a dataclass replaced by a
+  dict of the same shape, both count as changes in every mode (previously
+  backdated in `checked`/`fast` because thawing dropped the type identity),
+  and default comparisons no longer invoke `ValueAdapter` `thaw`/`freeze`
+  hooks in any mode. Queries with an `eq=` or `cutoff=` policy are
+  unaffected.
 - `pyinc-tools analyze --fail-on` combined with `--watch` is rejected as a
   usage error (exit status `2`), because watch mode never terminates normally.
   The default remains `--fail-on none`, so existing invocations keep their
@@ -162,6 +181,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `getmtime`), the byte-oriented environment (`os.getenvb`, `os.environb`), and
   the working directory (`os.getcwd`, `Path.cwd`). These are not intercepted;
   route them through `FileStatResource` or `db.report_untracked_read`.
+
+### Performance
+
+- The default backdate comparison runs on the canonical stored snapshots
+  themselves instead of exposing both values and re-freezing them, so the
+  warm recompute path no longer pays a deep thaw, validation walk, or
+  re-freeze per comparison. Queries with an `eq=` or `cutoff=` policy keep
+  the previous path and continue to receive mode-exposed values.
+- Warm resource validation answers an unchanged-probe check from `probe()`
+  alone and runs `probe_and_load` only on a probe miss, so unchanged file
+  reads no longer decode their contents and no longer allocate the decoded
+  value they would have discarded. Stored probe/value pairs still originate
+  from a single atomic observation, and a content change under a stable stat
+  signature is still detected.
+- `WorkspaceSession` holds one kernel request span per public method, so a
+  warm `analyze_workspace` validates each resource once per call instead of
+  once per internal request.
 
 ### Removed
 

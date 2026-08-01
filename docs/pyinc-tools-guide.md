@@ -238,6 +238,13 @@ Use the position-resolved `SymbolId` returned by `symbol_at` for references,
 rename, and hierarchy operations. Passing a bare name would lose the lexical
 scope and shadowing information those operations need.
 
+`WorkspaceSession` holds one kernel request span per public method: the
+several kernel gets a method such as `analyze_workspace` fans out to share
+one request, so every resource the analysis walks is validated at most once
+per call. Session methods that rewrite the mirror mid-call already declare it
+via `request_inputs_changed()`, which rolls the held span onto a fresh
+request so later reads in the same call see the edit.
+
 ## Troubleshooting
 
 ### The command is not found
