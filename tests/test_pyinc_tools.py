@@ -8741,3 +8741,57 @@ def test_cli_text_output_omits_position_for_rangeless_diagnostic(
     # line is identical across runs. "pyinc-tools-" is the mirror tempdir prefix.
     assert decode_errors[0].count(str(root / "bad.py")) == 2
     assert "pyinc-tools-" not in decode_errors[0]
+
+
+# ---------------------------------------------------------------------------
+# Session request spans
+# ---------------------------------------------------------------------------
+
+
+def test_warm_workspace_analysis_validates_each_resource_once(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "alpha.py", "import beta\n\n\ndef top() -> int:\n    return beta.helper()\n")
+    _write(root / "beta.py", "def helper() -> int:\n    return 1\n")
+    _write(root / "gamma.py", "VALUE = 3\n")
+
+    with WorkspaceSession(str(root)) as session:
+        session.analyze_workspace()
+        settled = session.analyze_workspace()
+
+        stats_before = session.db.statistics()
+        warm = session.analyze_workspace()
+        stats_after = session.db.statistics()
+
+        assert warm.python == settled.python
+        # One public method holds one kernel request span, so every resource
+        # the analysis walks is validated at most once for the whole call --
+        # not once per entrypoint the method fans out to.
+        assert stats_after.total_requests == stats_before.total_requests + 1
+        assert stats_after.resource_loads == stats_before.resource_loads
+        probes = stats_after.resource_probe_hits - stats_before.resource_probe_hits
+        assert 0 < probes <= stats_after.resource_count
+
+
+def test_mirror_mutation_inside_one_session_request_is_visible(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "mod.py", "def one() -> int:\n    return 1\n")
+
+    with WorkspaceSession(str(root)) as session:
+        session.analyze_workspace()
+
+        # Hold the session lock -- and with it one request span -- across an
+        # analysis, an overlay edit, and a second analysis. The edit calls
+        # request_inputs_changed() under the same held span, which must make
+        # the later analysis re-validate and see the new content.
+        with session._state_lock:
+            warm = session.analyze_workspace()
+            session.set_overlay(
+                root / "mod.py",
+                "def one() -> int:\n    return 1\n\n\ndef extra() -> int:\n    return 2\n",
+            )
+            edited = session.analyze_workspace()
+
+        warm_module = next(m for m in warm.python.modules if m.path.endswith("mod.py"))
+        assert [d.name for d in warm_module.definitions] == ["one"]
+        edited_module = next(m for m in edited.python.modules if m.path.endswith("mod.py"))
+        assert any(d.name == "extra" for d in edited_module.definitions)

@@ -270,20 +270,35 @@ class _RequestLock:
     same both times. Tying the integrations' per-request memo to the lock is
     what keeps it from outliving that guarantee: outside a session it does not
     exist, so a caller driving the integrations directly still sees its edits.
+
+    The lock holds a kernel request span for the same reason it holds the
+    memo: the stability it guarantees is exactly what ``Database.request_span``
+    asks a caller to declare, so the several gets a public method fans out to
+    share one request and validate each resource once. The methods that do
+    rewrite the mirror mid-hold already call ``request_inputs_changed()``,
+    which rolls the held span onto a fresh request.
     """
 
     def __init__(self, db: Database) -> None:
         self._lock = threading.RLock()
         self._db = db
         self._depth = 0
+        self._span: AbstractContextManager[None] | None = None
         self._scope: AbstractContextManager[None] | None = None
 
     def __enter__(self) -> None:
         self._lock.acquire()
         try:
             if self._depth == 0:
-                scope = request_scope(self._db)
-                scope.__enter__()
+                span = self._db.request_span()
+                span.__enter__()
+                try:
+                    scope = request_scope(self._db)
+                    scope.__enter__()
+                except BaseException:
+                    span.__exit__(None, None, None)
+                    raise
+                self._span = span
                 self._scope = scope
             self._depth += 1
         except BaseException:
@@ -293,9 +308,13 @@ class _RequestLock:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self._depth -= 1
         scope = self._scope
+        span = self._span
         if self._depth == 0 and scope is not None:
             self._scope = None
             scope.__exit__(None, None, None)
+        if self._depth == 0 and span is not None:
+            self._span = None
+            span.__exit__(None, None, None)
         self._lock.release()
 
 
