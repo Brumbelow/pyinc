@@ -87,7 +87,7 @@ this contract.
 | Purpose | Parse requirements files and optionally follow their requirement-file includes. |
 | Entrypoints | `requirements_analysis`, `deep_requirements_analysis`, `workspace_requirements_analysis` |
 | Result types | `FileReference`, `IndexDirective`, `RequirementRef`, `RequirementsAnalysis` |
-| Supported shapes | Names, extras, version text, markers, editable/direct URL lines, continuations, index/find-links directives, `-r` requirement references, and `-c` constraint references. Deep analysis follows in-root `-r` files with cycle and missing-file diagnostics. |
+| Supported shapes | Names, extras, version text, markers, editable/direct URL lines, continuations, index/find-links directives, `-r` requirement references, and `-c` constraint references. Per-requirement options (for example the `--hash=...` lines `pip-compile --generate-hashes` emits) are split off the requirement rather than folded into its version text; the options themselves are ignored, not verified. Deep analysis follows in-root `-r` files with cycle and missing-file diagnostics. |
 | Key limits | Marker evaluation is separate. No URL/VCS fetch, version solving, or recursive constraint application occurs; constraint references are recorded but not followed. Project-root escapes are diagnosed. |
 
 ## Requirement evaluation
@@ -98,7 +98,7 @@ this contract.
 | Entrypoints | `evaluate_version_specifier`, `evaluate_markers`, `applicable_requirements`, `workspace_applicable_requirements` |
 | Result types | `ApplicableRequirement`, `ApplicableRequirementsAnalysis`, `MarkerEvaluation`, `PythonEnvironmentSnapshot`, `VersionSpecifierEvaluation` |
 | Supported shapes | PEP 440 epochs, prerelease/post/dev/local labels, wildcards, compatible releases, and arbitrary equality (`===`); PEP 508 boolean marker expressions against the running Python environment. |
-| Key limits | Evaluation targets the current process environment only. Extras are not modeled, noisy or unknown marker variables produce diagnostics, and this API does not resolve or install dependencies. `===` compares the version exactly as written — no normalization, padding, or case folding — so it is decided without parsing and is not subject to pre-release exclusion. |
+| Key limits | Evaluation targets the current process environment only. Extras are not modeled, noisy or unknown marker variables produce diagnostics, and this API does not resolve or install dependencies. Unsupported or unparseable constraints are ambiguous rather than guessed. `===` compares the version exactly as written — no normalization, padding, or case folding — so it is decided without parsing and is not subject to pre-release exclusion. |
 
 ## Environment files
 

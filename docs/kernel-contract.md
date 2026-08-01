@@ -162,10 +162,11 @@ Two boundaries apply:
   the end of the story: it would return at the revision its own dependents had
   already verified, so nothing above it would ever learn that the world moved,
   and a transitive dependent would keep a pre-failure value permanently. The
-  bump is per *transition*, not per request — one on the way in, one on the way
-  out — so `revision` settles while a resource stays unprobeable instead of
-  churning on every `get()`, and a resource that heals and breaks again bumps
-  again. That stays consistent with a fresh `Database` throughout, and it
+  bump is per *transition* — one on the way in, one on the way out — plus one
+  for each re-executed query whose recomputed value actually changed, never one
+  per observation or request, so `revision` settles while a resource stays
+  unprobeable instead of churning on every `get()`, and a resource that heals
+  and breaks again bumps again. That stays consistent with a fresh `Database` throughout, and it
   settles as soon as a load succeeds again; while the probe keeps raising, the
   queries that read it directly re-run every request, and *their* dependents
   re-run only when the handled value actually differs. A file replaced by a

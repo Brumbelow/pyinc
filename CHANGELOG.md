@@ -165,6 +165,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A value change two levels above an untracked query invalidates its
+  transitive dependents. A recomputation that lands a changed value now moves
+  the revision the way input and resource changes always did; before, the
+  parent of a `report_untracked_read` query re-executed and stored its new
+  value at exactly the revision its own dependents had already verified, so a
+  grandparent kept reporting `dependencies unchanged` and `db.get()` diverged
+  from a fresh `Database`. An untracked query that re-executes to a
+  byte-identical value does not move the revision, so warm requests over a
+  stable graph still settle.
+- Strict mode exposes cyclic and shared query results — and `read_input`
+  values — through the same immutable container views it already used for
+  query arguments, instead of leaking the raw graph envelope, which crashed
+  `len()` and iteration with `TypeError`. Those views also freeze back:
+  passing one into `db.set` or as a query argument re-encodes it to the
+  identical canonical snapshot (same fingerprint, same cache node) where it
+  previously hit `RecursionError`.
+- The environment guard installed by `Database` matches `os._Environ` again:
+  both `|` union directions and `|=` work (previously `TypeError` for any
+  code in the process once a `Database` had ever been constructed), and the
+  `encodekey`/`decodekey`/`encodevalue`/`decodevalue` helpers are reachable.
+  Every other attribute — including the raw backing mapping — raises
+  `AttributeError`, and union reads inside a query still require a `Resource`
+  scope.
+- An `@action` whose output layout migrates between a file and a directory
+  (`pkg` ↔ `pkg/model.py`) reconciles instead of wedging permanently on its
+  own ledger. Manifest entries that conflict with the new layout are deleted
+  as orphans of the previous layout — before publication, under the usual
+  tamper policy, pruning only directories the deletion left empty — and
+  `plan()` reports those deletions without mutating. Previously every
+  reconcile and every `plan()` raised `ActionPathError` until the manifest was
+  edited by hand.
+- Requirement lines carrying pip per-requirement options parse correctly:
+  `pip-compile --generate-hashes` output no longer folds `--hash=...`
+  continuation lines into the version text, which corrupted the specifier and
+  misreported every requirement in a hashed lockfile. An undecidable
+  specifier is reported `ambiguous` by `applicable_requirements`, matching
+  dependency checking, instead of `version_mismatch`.
+- The LSP server serializes writes to its output stream, so a watcher-thread
+  diagnostics notification can no longer interleave with a main-loop response
+  and corrupt `Content-Length` framing. The published-diagnostics bookkeeping
+  is guarded by the same lock.
+- The session lookups behind `textDocument/declaration` and the rename
+  preflight take the session lock like every other entry point, so they no
+  longer read the workspace mirror mid-refresh, and they raise `RuntimeError`
+  after `close()` like the rest of the session surface.
 - `WorkspaceSession` diagnostics no longer leak the temporary workspace-mirror
   path through their message text. A kernel `Diagnostic` has no path field, so an
   integration that needs to name a file interpolates it into the message; under a
