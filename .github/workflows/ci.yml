@@ -14,37 +14,12 @@ jobs:
   test:
     name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ['3.11', '3.12', '3.13', '3.14']
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
-
-      - name: Run test suite
-        run: pytest -q
-
-  test-macos:
-    name: Test (macos-latest, Python ${{ matrix.python-version }}, ${{ matrix.shard }})
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 5
-      matrix:
-        python-version: ['3.11', '3.12', '3.13', '3.14']
-        shard: [core, properties, tools]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -60,7 +35,7 @@ jobs:
           python -m pip install -e '.[dev]'
 
       - name: Probe artifact-store process contention
-        if: matrix.shard == 'core'
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           for attempt in {1..8}; do
@@ -68,26 +43,8 @@ jobs:
             python -m pytest -q --tb=long tests/test_store.py::test_filesystem_store_refuses_cross_process_conflicting_bytes
           done
 
-      - name: Run core test shard
-        if: matrix.shard == 'core'
-        run: >-
-          python -m pytest -q --tb=long
-          --ignore=tests/test_properties.py
-          --ignore=tests/test_pyinc_tools.py
-          --ignore=tests/test_pyinc_tools_workspace_helpers.py
-          --ignore=tests/test_v3_tools.py
-
-      - name: Run property test shard
-        if: matrix.shard == 'properties'
-        run: pytest -q tests/test_properties.py
-
-      - name: Run tools test shard
-        if: matrix.shard == 'tools'
-        run: >-
-          pytest -q
-          tests/test_pyinc_tools.py
-          tests/test_pyinc_tools_workspace_helpers.py
-          tests/test_v3_tools.py
+      - name: Run test suite
+        run: pytest -q
 
   quality:
     name: Static analysis and coverage
