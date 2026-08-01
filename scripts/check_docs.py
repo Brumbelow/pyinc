@@ -324,6 +324,33 @@ def check_documented_integration_api(root: Path) -> tuple[str, ...]:
     return tuple(errors)
 
 
+def check_documented_kernel_api(root: Path) -> tuple[str, ...]:
+    """Compare the kernel contract's public-surface tables with package exports."""
+    contract_path = root / "docs/kernel-contract.md"
+    documented: set[str] = set()
+    in_section = False
+    for line in contract_path.read_text(encoding="utf-8").splitlines():
+        heading = _HEADING.match(line)
+        if heading is not None:
+            in_section = heading.group("title") == "Public Surface"
+            continue
+        if not in_section or not line.strip().startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) != 2 or cells[0] in {"Name", ""} or set(cells[0]) <= {"-"}:
+            continue
+        documented.update(_INLINE_CODE.findall(cells[0]))
+    exported = _read_exports(root, "pyinc")
+    errors: list[str] = []
+    missing = sorted(exported - documented)
+    extra = sorted(documented - exported)
+    if missing:
+        errors.append("docs/kernel-contract.md: undocumented exports: " + ", ".join(missing))
+    if extra:
+        errors.append("docs/kernel-contract.md: names absent from __all__: " + ", ".join(extra))
+    return tuple(errors)
+
+
 def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
     """Run every offline documentation check."""
     files = markdown_files(root)
@@ -335,6 +362,7 @@ def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
         *check_python_fences(root, files),
         *check_cli_examples(root),
         *check_documented_integration_api(root),
+        *check_documented_kernel_api(root),
     )
 
 
