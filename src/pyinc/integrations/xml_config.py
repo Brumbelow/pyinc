@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TypeAlias, cast
 
 from pyinc.core import query
+from pyinc.errors import UnsupportedValueError
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
@@ -218,7 +219,12 @@ def _xml_cutoff_token(text: str) -> tuple[str, str]:
         elements = _walk_elements(root, "")
         snapshot = freeze(elements)
         return ("parsed", repr(snapshot))
-    except (ET.ParseError, RecursionError):
+    except (ET.ParseError, RecursionError, UnsupportedValueError):
+        # `freeze` refuses a value outside the snapshot grammar with
+        # `UnsupportedValueError`, which is a `PyIncError` and not a
+        # `ValueError`: a document the parser accepts but `freeze` will not
+        # snapshot must degrade to the raw text, not escape the cutoff and fail
+        # a recomputation a fresh database completes.
         return ("raw", text)
 
 

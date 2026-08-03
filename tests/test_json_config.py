@@ -527,6 +527,66 @@ def test_the_nesting_cap_keeps_every_accepted_document_snapshot_safe(tmp_path: P
 
 
 # ---------------------------------------------------------------------------
+# Lone surrogates
+# ---------------------------------------------------------------------------
+#
+# RFC 8259 permits `\uD800`-style escapes and `json.loads` decodes them, but a
+# lone surrogate is not a Unicode scalar value and so cannot cross a cached
+# boundary. Whatever the integration reports for such a document, it has to
+# report it identically on a first read, after an edit, and from a database
+# that never saw the file.
+
+
+_SURROGATE_DOCUMENTS: tuple[tuple[str, str], ...] = (
+    ("value", '{"a": "\\ud800"}'),
+    ("nested value", '{"a": {"b": ["\\udfff"]}}'),
+    ("key", '{"\\ud800": 1}'),
+    ("nested key", '{"a": {"\\udfff": 1}}'),
+)
+
+
+@pytest.mark.parametrize(("label", "document"), _SURROGATE_DOCUMENTS)
+def test_lone_surrogate_documents_analyze_identically_warm_and_fresh(
+    label: str, document: str, tmp_path: Path
+) -> None:
+    assert json.loads(document) is not None
+
+    path = tmp_path / "config.json"
+    path.write_text(document, encoding="utf-8")
+    first = json_analysis(Database(), str(path))
+
+    incremental = Database()
+    path.write_text('{"a": 1}', encoding="utf-8")
+    json_analysis(incremental, str(path))
+    # The cutoff runs only on recomputation, so the edit is what reaches it.
+    path.write_text(document, encoding="utf-8")
+
+    assert json_analysis(incremental, str(path)) == first
+    assert json_analysis(Database(), str(path)) == first
+
+
+def test_lone_surrogate_object_key_is_reported_as_a_decode_error(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text('{"\\ud800": 1}', encoding="utf-8")
+
+    analysis = json_analysis(Database(), str(path))
+    assert analysis.sections == ()
+    assert [code for code, _message in analysis.diagnostics] == ["json-decode-error"]
+    assert "surrogate" in analysis.diagnostics[0][1]
+
+
+def test_lone_surrogate_value_is_analyzed_through_its_escaped_repr(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text('{"a": "\\ud800"}', encoding="utf-8")
+
+    analysis = json_analysis(Database(), str(path))
+    assert analysis.diagnostics == ()
+    assert [(key.key, key.string_value) for key in analysis.sections[0].keys] == [
+        ("a", "'\\ud800'")
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Amplification budget
 # ---------------------------------------------------------------------------
 

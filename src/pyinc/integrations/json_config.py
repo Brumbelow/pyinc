@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 
 from pyinc.core import query
+from pyinc.errors import UnsupportedValueError
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
@@ -92,6 +93,10 @@ class _JsonNestingLimitError(ValueError):
     pass
 
 
+class _JsonSurrogateKeyError(ValueError):
+    pass
+
+
 # Object and array nesting is capped before parsing because every section re-emits
 # the dot path of all its ancestors: `json_sections_payload` grows with the square
 # of the nesting depth, so this cap is what bounds the *cache*, not just the parse.
@@ -161,8 +166,29 @@ def _json_object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     for key, value in pairs:
         if key in result:
             raise _DuplicateJsonKeyError(f"duplicate JSON object key {key!r}")
+        if not _is_unicode_text(key):
+            # An object key reaches the cached payload verbatim, as its own
+            # section name and inside every descendant's dot path, where a lone
+            # surrogate is not a value `freeze` can snapshot. Values are safe
+            # because they reach the payload through `repr`, which escapes one.
+            raise _JsonSurrogateKeyError(f"JSON object key {key!r} contains an unpaired surrogate")
         result[key] = value
     return result
+
+
+def _is_unicode_text(value: str) -> bool:
+    """Report whether `value` is made only of Unicode scalar values.
+
+    The ASCII test is the fast path an overwhelming majority of keys take; only
+    a key that leaves it pays for an encode.
+    """
+    if value.isascii():
+        return True
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _load_json(text: str) -> Any:
@@ -269,7 +295,13 @@ def _json_cutoff_token(text: str) -> tuple[str, str]:
         parsed = _load_json(text)
         snapshot = freeze(parsed)
         return ("parsed", repr(snapshot))
-    except (ValueError, RecursionError, OverflowError):
+    except (ValueError, RecursionError, OverflowError, UnsupportedValueError):
+        # `freeze` rejects a value outside the snapshot grammar with
+        # `UnsupportedValueError`, which is a `PyIncError` and not a
+        # `ValueError`: a document `json.loads` accepts but `freeze` refuses --
+        # a lone surrogate escape in a string value, say -- must degrade to the
+        # raw text here, not escape the cutoff and fail the recomputation a
+        # fresh database completes.
         return ("raw", text)
 
 
@@ -279,7 +311,7 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
         if isinstance(result, dict):
             return result
         return None
-    except (ValueError, RecursionError, OverflowError):
+    except (ValueError, RecursionError, OverflowError, UnsupportedValueError):
         return None
 
 

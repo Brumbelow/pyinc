@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 
 from pyinc.core import query
+from pyinc.errors import UnsupportedValueError
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
@@ -269,11 +270,14 @@ def _config_cutoff_token(text: str) -> tuple[str, str]:
         parsed = _load_toml(text)
         snapshot = freeze(_toml_cutoff_value(parsed))
         return ("parsed", repr(snapshot))
-    except (ValueError, RecursionError, OverflowError):
+    except (ValueError, RecursionError, OverflowError, UnsupportedValueError):
         # `_load_toml` bounds `_toml_cutoff_value`'s recursion and `freeze`'s walk
         # at the cap, so neither can raise for a document that got this far. The
         # clause stays defensive anyway: an unforeseen path degrades to the raw
         # text, which only misses a cutoff, rather than escaping `config_analysis`.
+        # `freeze` refuses a value outside the snapshot grammar with
+        # `UnsupportedValueError`, which is a `PyIncError` and not a `ValueError`,
+        # so it has to be named for the clause to cover the `freeze` call at all.
         return ("raw", text)
 
 

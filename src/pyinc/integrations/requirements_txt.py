@@ -154,7 +154,12 @@ def _valid_file_reference_path(path: str) -> bool:
 
 
 def _normalize_name(name: str) -> str:
-    """PEP 503 package name normalization."""
+    """Fold a package name to the underscore form `RequirementRef.name` carries.
+
+    Runs of `-`, `_`, and `.` collapse to a single underscore and the result is
+    lowercased. That is PEP 503 normalization with underscores where PEP 503
+    specifies hyphens; the evaluation surfaces re-normalize to the hyphen form.
+    """
     return re.sub(r"[-_.]+", "_", name).lower()
 
 
