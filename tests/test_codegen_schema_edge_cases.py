@@ -646,9 +646,9 @@ def test_build_enum_reports_invalid_values_duplicates_mismatches_and_types() -> 
     assert {
         "duplicate-enum-value",
         "unsupported-enum-value",
-        "enum-type-mismatch",
         "unsupported-enum-type",
     } <= _codes(malformed[7])
+    assert "enum-type-mismatch" not in _codes(malformed[7])
     assert malformed[5] == "docs"
 
 
@@ -969,3 +969,17 @@ def test_definition_queries_return_safe_fallbacks_for_malformed_and_missing_data
     assert definition_pointer(db, str(schema_path), "Missing") == ""
     missing = definition_model(db, str(schema_path), "Missing")
     assert _codes(missing[7]) == {"missing-definition"}
+
+
+def test_enum_under_an_unusable_declared_type_signals_the_type_once() -> None:
+    enum_result = _build_enum(
+        "Level",
+        {"type": "object", "enum": ["low", "high"]},
+        "",
+        "/Level",
+        (),
+    )
+    diagnostics = enum_result[7]
+    codes = [d[0] for d in diagnostics]
+    assert codes.count("unsupported-enum-type") == 1
+    assert "enum-type-mismatch" not in codes

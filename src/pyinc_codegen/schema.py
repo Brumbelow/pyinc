@@ -967,6 +967,18 @@ def _build_enum(
     initial_diagnostics: tuple[DiagnosticPayload, ...],
 ) -> ModelPayload:
     diagnostics = list(initial_diagnostics)
+    base_map = {
+        "string": "str",
+        "integer": "int",
+        "number": "float",
+        "boolean": "bool",
+        "null": "None",
+    }
+    declared_type = fragment.get("type")
+    effective_declared = _effective_type(declared_type)
+    declared_is_usable = effective_declared is None or (
+        isinstance(effective_declared, str) and effective_declared in base_map
+    )
     values = fragment.get("enum")
     if not isinstance(values, list):
         diagnostics.append(
@@ -991,7 +1003,6 @@ def _build_enum(
                     _pointer(json_pointer, "enum"),
                 )
             )
-        declared_type = fragment.get("type")
         for index, value in enumerate(values):
             value_pointer = _pointer(json_pointer, "enum", str(index))
             literal = _enum_value(value)
@@ -1004,7 +1015,7 @@ def _build_enum(
                     )
                 )
                 continue
-            if not _enum_type_matches(value, declared_type):
+            if declared_is_usable and not _enum_type_matches(value, declared_type):
                 diagnostics.append(
                     _diagnostic(
                         "enum-type-mismatch",
@@ -1015,16 +1026,9 @@ def _build_enum(
             rendered_values.append(literal)
         rendered = tuple(rendered_values)
 
-    base_map = {
-        "string": "str",
-        "integer": "int",
-        "number": "float",
-        "boolean": "bool",
-        "null": "None",
-    }
     # The supported nullable union names the type the members are drawn from;
     # the enum already carries the null, so the union adds no base type.
-    declared = _effective_type(fragment.get("type"))
+    declared = effective_declared
     if declared is not None and (not isinstance(declared, str) or declared not in base_map):
         diagnostics.append(
             _diagnostic(
