@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or usage help
+    url: https://github.com/Brumbelow/pyinc/blob/main/docs/README.md
+    about: Start from the documentation index — guides, contracts, and the tooling reference.
+  - name: Security or soundness disclosure
+    url: https://github.com/Brumbelow/pyinc/security/advisories/new
+    about: Report a vulnerability or a from-scratch consistency violation privately.
