@@ -9,6 +9,7 @@ before the first ``get()``.
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -325,7 +326,14 @@ def test_filestat_probe_and_load_classify_failures_identically(tmp_path: Path) -
             return type(error)
         return "no error"
 
-    assert outcome(lambda: resource.probe(through_file)) == outcome(
-        lambda: resource.load(db, through_file)
-    )
-    assert outcome(lambda: resource.probe(through_file)) != "no error"
+    through_file_outcome = outcome(lambda: resource.probe(through_file))
+    assert through_file_outcome == outcome(lambda: resource.load(db, through_file))
+    if os.name == "nt":
+        # Windows reports a child under a regular file as WinError 3 (path not
+        # found), which the snapshot classifies as missing — for probe and load
+        # alike.
+        assert resource.probe(through_file) == (False, None, None)
+        loaded = resource.load(db, through_file)
+        assert (loaded.exists, loaded.size, loaded.mtime_ns) == (False, None, None)
+    else:
+        assert through_file_outcome != "no error"
