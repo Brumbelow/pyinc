@@ -20,7 +20,6 @@ from pyinc import (
     CheckpointManifestError,
     CheckpointVersionError,
     Database,
-    DirectoryResource,
     FileResource,
     InMemoryArtifactStore,
     Input,
@@ -298,6 +297,35 @@ class _AllocatingFailingResource(Resource[str, str, str]):
 
 
 @dataclass(frozen=True)
+class _DeniableFileResource(Resource[str, str, tuple[str, ...]]):
+    """A file resource whose probe and load both raise while a marker exists.
+
+    Models the failure neither the probe nor the load survives. The marker lives
+    beside the key on disk because a query's capture set may not hold mutable
+    state.
+    """
+
+    def _denied(self, path: str) -> bool:
+        return Path(path + ".denied").exists()
+
+    def label(self, path: str) -> str:
+        return f"deniable[{path}]"
+
+    def probe(self, path: str) -> tuple[str, ...]:
+        if self._denied(path):
+            raise PermissionError(path)
+        try:
+            return ("present", hashlib.sha256(Path(path).read_bytes()).hexdigest())
+        except FileNotFoundError:
+            return ("missing",)
+
+    def load(self, db: Database, path: str) -> str:
+        if self._denied(path):
+            raise PermissionError(path)
+        return Path(path).read_text(encoding="utf-8")
+
+
+@dataclass(frozen=True)
 class _UnprobeableResource(Resource[str, str, str]):
     def probe(self, key: str) -> str:
         raise RuntimeError(f"cannot probe {key}")
@@ -565,45 +593,41 @@ def test_checkpoints_omit_failed_resource_records_and_their_readers(tmp_path: Pa
 
 
 def test_checkpoints_omit_readers_of_an_unrecordable_failure(tmp_path: Path) -> None:
-    directories = DirectoryResource()
-    path = tmp_path / "listing"
-    path.mkdir()
-    (path / "a.txt").write_text("a", encoding="utf-8")
+    deniable = _DeniableFileResource()
+    path = tmp_path / "thing.txt"
+    path.write_text("text", encoding="utf-8")
+    denial = Path(str(path) + ".denied")
 
-    @query(key="checkpoint-optional-listing")
-    def names(db: Database, dirname: str) -> tuple[str, ...]:
+    @query(key="checkpoint-optional-denial")
+    def contents(db: Database, filename: str) -> str:
         try:
-            return directories.read(db, dirname)
-        except NotADirectoryError:
-            return ("<caught>",)
+            return deniable.read(db, filename)
+        except PermissionError:
+            return "<caught>"
 
     store = InMemoryArtifactStore()
     db = Database(store=store)
-    assert db.get(names, str(path)) == ("a.txt",)
+    assert db.get(contents, str(path)) == "text"
 
-    # Neither the load nor the probe survives a directory replaced by a file, so
-    # the resource record keeps the listing it last saw while the reader is
-    # correctly re-executed and caches the handled failure. Persisting that pair
-    # would warm a value the record cannot re-derive.
-    (path / "a.txt").unlink()
-    path.rmdir()
-    path.write_text("not a directory", encoding="utf-8")
-    assert db.get(names, str(path)) == ("<caught>",)
+    # Neither the load nor the probe survives a denial, so the resource record
+    # keeps the bytes it last saw while the reader is correctly re-executed and
+    # caches the handled failure. Persisting that pair would warm a value the
+    # record cannot re-derive.
+    denial.write_text("", encoding="utf-8")
+    assert db.get(contents, str(path)) == "<caught>"
 
     checkpoint = db.save_checkpoint()
     manifest = json.loads(cast(bytes, store.get(checkpoint)).decode("utf-8"))
     saved = {(entry["identity"], entry["args_digest"]) for entry in manifest["records"]}
-    reader_key, _ = db._query_key(names, (str(path),), {})
+    reader_key, _ = db._query_key(contents, (str(path),), {})
     assert (reader_key.identity, reader_key.args_digest) not in saved
     assert not any(entry["kind"] == "resource" for entry in manifest["records"])
 
-    path.unlink()
-    path.mkdir()
-    (path / "a.txt").write_text("a", encoding="utf-8")
+    denial.unlink()
 
     warmed = Database(store=store)
     warmed.load_checkpoint(checkpoint)
-    assert warmed.get(names, str(path)) == Database().get(names, str(path)) == ("a.txt",)
+    assert warmed.get(contents, str(path)) == Database().get(contents, str(path)) == "text"
     assert warmed.statistics().query_executions == 1
 
 

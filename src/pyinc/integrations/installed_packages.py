@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import email.policy
-import hashlib
 import os
 import re
 import site
@@ -10,7 +9,6 @@ import sys
 from dataclasses import dataclass
 from email.message import Message
 from email.parser import Parser
-from pathlib import Path
 from typing import TypeAlias, cast
 
 from pyinc.core import query
@@ -18,7 +16,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
-from ._resources import file_read_snapshot
+from ._resources import file_probe, file_read_snapshot, file_text
 
 # ---------------------------------------------------------------------------
 # Payload type aliases
@@ -87,16 +85,11 @@ class _DistInfoMetadataResource:
         return f"dist-info-metadata[{path}]"
 
     def probe(self, path: str) -> tuple[str, str] | tuple[str]:
-        file_path = Path(path)
-        if not file_path.exists():
-            return ("missing",)
-        return ("present", hashlib.sha256(file_path.read_bytes()).hexdigest())
+        return file_probe(path)
 
     def load(self, db: Database, path: str) -> str:
-        file_path = Path(path)
-        if not file_path.exists():
-            return ""
-        return file_path.read_text(encoding="utf-8")
+        text = file_text(path, "utf-8")
+        return text if text is not None else ""
 
     def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
         probe, text = file_read_snapshot(path, "utf-8")

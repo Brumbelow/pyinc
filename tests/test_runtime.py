@@ -13,6 +13,7 @@ from typing import Any, ClassVar, cast
 import pytest
 
 from pyinc import (
+    BinaryFileResource,
     CycleError,
     Database,
     DatabaseStatistics,
@@ -75,14 +76,44 @@ def _outcome(call: Callable[[], Any]) -> tuple[Any, ...]:
         return (type(exc).__name__, str(exc))
 
 
-# Opening a directory as a file raises IsADirectoryError on POSIX, and
-# PermissionError (Win32 ERROR_ACCESS_DENIED) on Windows. Listing a file as a
-# directory raises NotADirectoryError on both, so only this direction needs the
-# split. The kernel treats any raise from a resource the same way; the tests
-# name the exact type so a scenario that stops failing cannot pass silently.
-DIRECTORY_AS_FILE_ERROR: type[OSError] = (
-    PermissionError if os.name == "nt" else IsADirectoryError
-)
+@dataclass(frozen=True)
+class _DeniableFileResource(Resource[str, str, tuple[str, ...]]):
+    """A file resource whose probe and load both raise while a marker exists.
+
+    A file swapped for a directory used to be the vehicle for a failure neither
+    the probe nor the load survives. A directory reads as a missing file now --
+    a state, and so recordable -- so a scenario about an *unrecordable* failure
+    needs a denial the boundary genuinely cannot absorb, which is what a
+    permission error is. The marker lives beside the key on disk because a
+    query's capture set may not hold mutable state.
+    """
+
+    def _denied(self, path: str) -> bool:
+        return Path(path + ".denied").exists()
+
+    def label(self, path: str) -> str:
+        return f"deniable[{path}]"
+
+    def probe(self, path: str) -> tuple[str, ...]:
+        if self._denied(path):
+            raise PermissionError(path)
+        try:
+            return ("present", hashlib.sha256(Path(path).read_bytes()).hexdigest())
+        except FileNotFoundError:
+            return ("missing",)
+
+    def load(self, db: Database, path: str) -> str:
+        if self._denied(path):
+            raise PermissionError(path)
+        return Path(path).read_text(encoding="utf-8")
+
+
+def _deny(path: Path) -> None:
+    Path(str(path) + ".denied").write_text("", encoding="utf-8")
+
+
+def _allow(path: Path) -> None:
+    Path(str(path) + ".denied").unlink()
 
 
 @pytest.mark.parametrize("limit", [0, -1, 1.5, float("nan"), True, "1"])
@@ -748,24 +779,25 @@ def test_query_nested_inside_resource_hook_cannot_read_raw_environment(
 def test_failed_resource_reads_do_not_leave_dangling_dependencies(
     tmp_path: Path,
 ) -> None:
-    directories = DirectoryResource()
+    deniable = _DeniableFileResource()
     path = tmp_path / "sample.py"
     path.write_text("value = 1\n", encoding="utf-8")
+    _deny(path)
 
     @query
     def classify(db: Database, candidate: str) -> str:
         try:
-            directories.read(db, candidate)
-        except NotADirectoryError:
-            return "file"
-        return "directory"
+            deniable.read(db, candidate)
+        except PermissionError:
+            return "denied"
+        return "readable"
 
     db = Database()
-    assert db.get(classify, str(path)) == "file"
+    assert db.get(classify, str(path)) == "denied"
     inspection = _inspect_node(db, classify, str(path))
     assert inspection.last_decision == "executed"
-    # A directory probe of a non-directory raises rather than reporting a state,
-    # so the failure cannot be recorded and no edge is published.
+    # The probe raises rather than reporting a state, so the failure cannot be
+    # recorded and no edge is published.
     assert inspection.dependencies == ()
 
 
@@ -891,11 +923,12 @@ def test_file_replaced_by_a_directory_matches_a_fresh_database(mode: str, tmp_pa
 
     path.unlink()
     path.mkdir()
-    # Both the load and the probe raise here, so no failure record can be
-    # written; the record describing the file that used to be there must not be
-    # allowed to report "unchanged" and hand back a value fresh cannot produce.
+    # A directory is not a readable regular file and never becomes one by being
+    # read again, so the probe reports it as absent rather than raising: a probe
+    # that raises retires the record and hands the caller an error a fresh
+    # database, which sees the same directory, would have to raise too.
     fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
-    assert fresh[0] == DIRECTORY_AS_FILE_ERROR.__name__
+    assert fresh == ("value", "<default>")
     assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
 
 
@@ -916,13 +949,16 @@ def test_directory_replaced_by_a_file_matches_a_fresh_database(mode: str, tmp_pa
     (path / "a.txt").unlink()
     path.rmdir()
     path.write_text("not a directory", encoding="utf-8")
+    # The read still tells the caller a file is not a directory; the probe
+    # behind it reports the absent listing instead of raising, so the failure
+    # is recorded rather than retiring the node it was checking.
     fresh = _outcome(lambda: Database(mode=mode).get(names, str(path)))
     assert fresh[0] == "NotADirectoryError"
     assert _outcome(lambda: db.get(names, str(path))) == fresh
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_directory_restored_after_an_unprobeable_failure_matches_a_fresh_database(
+def test_directory_restored_after_a_kind_swap_matches_a_fresh_database(
     mode: str,
     tmp_path: Path,
 ) -> None:
@@ -946,10 +982,9 @@ def test_directory_restored_after_an_unprobeable_failure_matches_a_fresh_databas
     path.write_text("not a directory", encoding="utf-8")
     assert db.get(names, str(path)) == ("<caught>",)
 
-    # The world returns to exactly the state the resource record still describes
-    # (a branch switch, an undo). Its probe matches again, but an observation it
-    # never recorded happened in between, and the reader's cached value came from
-    # that observation -- the probe may not be allowed to certify the interval.
+    # The world returns to exactly the state the resource record described
+    # before the swap (a branch switch, an undo), so the round trip has to land
+    # the original answer and not the one the intervening kind held.
     path.unlink()
     path.mkdir()
     (path / "a.txt").write_text("a", encoding="utf-8")
@@ -974,12 +1009,141 @@ def test_missing_file_replaced_by_a_directory_matches_a_fresh_database(
     db = Database(mode=mode)
     assert db.get(read_optional, str(path)) == "<default>"
 
-    # The failure record left by the absent file goes stale the same way a value
-    # record does: once the path is a directory, neither load nor probe survives.
+    # The failure record left by the absent file still describes the world: a
+    # directory reads as a missing file, so nothing about the answer moves.
     path.mkdir()
     fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
-    assert fresh[0] == DIRECTORY_AS_FILE_ERROR.__name__
+    assert fresh == ("value", "<default>")
     assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
+
+
+# A probe has to be total: it answers for every path it is handed, so that a
+# warm database re-probing a path it already knows lands where a fresh one
+# reading the same world lands. The three ways a path stops naming a readable
+# regular file -- absent, a directory, a file somewhere in its parent chain --
+# are one answer. A permission denial is not among them; that is a genuine
+# failure, and it keeps raising.
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("kind", ["directory", "parent-is-a-file"])
+def test_file_resource_reads_an_unreadable_kind_as_a_missing_file(
+    mode: str, kind: str, tmp_path: Path
+) -> None:
+    files = FileResource()
+    binaries = BinaryFileResource()
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    path = holder / "thing.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    @query
+    def read_optional_bytes(db: Database, filename: str) -> str:
+        try:
+            return binaries.read(db, filename).decode("utf-8")
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database(mode=mode)
+    assert db.get(read_optional, str(path)) == "hello"
+    assert db.get(read_optional_bytes, str(path)) == "hello"
+
+    path.unlink()
+    if kind == "directory":
+        path.mkdir()
+    else:
+        holder.rmdir()
+        holder.write_text("now a file", encoding="utf-8")
+
+    def read_with(target: Database, node: Any) -> tuple[Any, ...]:
+        return _outcome(lambda: target.get(node, str(path)))
+
+    for reader in (read_optional, read_optional_bytes):
+        fresh = read_with(Database(mode=mode), reader)
+        assert fresh == ("value", "<default>")
+        assert read_with(db, reader) == fresh
+
+    assert files.probe(str(path)) == ("missing",)
+    assert binaries.probe(str(path)) == ("missing",)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_file_resource_still_raises_a_permission_denial(mode: str, tmp_path: Path) -> None:
+    # Only the kinds that mean "no readable regular file here" are absorbed; a
+    # denial is a genuine failure and stays one, warm and fresh alike.
+    files = FileResource()
+    path = tmp_path / "thing.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    @query
+    def read_optional(db: Database, filename: str) -> str:
+        try:
+            return files.read(db, filename)
+        except FileNotFoundError:
+            return "<default>"
+
+    db = Database(mode=mode)
+    assert db.get(read_optional, str(path)) == "hello"
+
+    path.chmod(0o000)
+    try:
+        fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
+        if fresh[0] == "value":  # running as a user that ignores the mode bits
+            pytest.skip("the filesystem does not enforce the permission bits here")
+        assert fresh[0] == "PermissionError"
+        assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
+    finally:
+        path.chmod(0o644)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_directory_resource_probes_a_file_path_as_an_absent_listing(
+    mode: str, tmp_path: Path
+) -> None:
+    # The probe has to answer for a path whose kind changed; the read behind it
+    # still reports that a file is not a directory, which is how a workspace
+    # walk tells a module from a package.
+    directories = DirectoryResource()
+    listing = tmp_path / "listing"
+    listing.mkdir()
+    (listing / "a.txt").write_text("a", encoding="utf-8")
+
+    @query
+    def names(db: Database, dirname: str) -> tuple[str, ...]:
+        try:
+            return directories.read(db, dirname)
+        except NotADirectoryError:
+            return ("<caught>",)
+
+    db = Database(mode=mode)
+    assert db.get(names, str(listing)) == ("a.txt",)
+
+    (listing / "a.txt").unlink()
+    listing.rmdir()
+    listing.write_text("not a directory", encoding="utf-8")
+
+    # A path that is not a directory must not probe the way an absent one does:
+    # reading them differs, so one probe for both would hide the transition
+    # between them.
+    not_a_directory = directories.probe(str(listing))
+    assert not_a_directory[0] is False
+    assert not_a_directory != (False, ())
+    # A listing reached through a file in its parent chain answers the same.
+    assert directories.probe(str(listing / "child")) == not_a_directory
+    assert directories.probe(str(tmp_path / "never-existed")) == (False, ())
+
+    fresh = Database(mode=mode)
+    assert db.get(names, str(listing)) == fresh.get(names, str(listing)) == ("<caught>",)
+    # The failure is now recorded against the probe that observed it, so the
+    # reader keeps its edge instead of losing the node it depends on.
+    assert _find_node(_inspect_node(db, names, str(listing)), "dir[").last_decision == "failed"
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -987,16 +1151,16 @@ def test_handled_unrecordable_failure_invalidates_a_transitive_reader(
     mode: str,
     tmp_path: Path,
 ) -> None:
-    files = FileResource()
+    deniable = _DeniableFileResource()
     path = tmp_path / "thing.txt"
     path.write_text("text", encoding="utf-8")
 
     @query
     def reader(db: Database, filename: str) -> str:
         try:
-            return files.read(db, filename)
-        except DIRECTORY_AS_FILE_ERROR:
-            return "<isdir>"
+            return deniable.read(db, filename)
+        except PermissionError:
+            return "<denied>"
 
     @query
     def parent(db: Database, filename: str) -> str:
@@ -1005,26 +1169,23 @@ def test_handled_unrecordable_failure_invalidates_a_transitive_reader(
     db = Database(mode=mode)
     assert db.get(parent, str(path)) == "P:text"
 
-    # Neither the load nor the probe survives a file replaced by a directory, so
-    # nothing about the failure can be recorded. Reporting the resource changed
-    # is enough for `reader`, which re-executes and catches; it is *not* enough
-    # for `parent` unless the transition also moves the revision, because
-    # otherwise `reader` re-executes at the revision `parent` already verified.
-    path.unlink()
-    path.mkdir()
-    assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:<isdir>"
+    # Neither the load nor the probe survives a denial, so nothing about the
+    # failure can be recorded. Reporting the resource changed is enough for
+    # `reader`, which re-executes and catches; it is *not* enough for `parent`
+    # unless the transition also moves the revision, because otherwise `reader`
+    # re-executes at the revision `parent` already verified.
+    _deny(path)
+    assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:<denied>"
     # Still right when the transitive reader is asked repeatedly, not just once.
-    assert db.get(parent, str(path)) == "P:<isdir>"
+    assert db.get(parent, str(path)) == "P:<denied>"
 
     # ... and it settles: once the world heals, the parent follows the value back.
-    path.rmdir()
-    path.write_text("text", encoding="utf-8")
+    _allow(path)
     assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:text"
 
     # A second break is a second transition and must invalidate again.
-    path.unlink()
-    path.mkdir()
-    assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:<isdir>"
+    _deny(path)
+    assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:<denied>"
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -1032,16 +1193,16 @@ def test_handled_unrecordable_failure_propagates_more_than_one_hop(
     mode: str,
     tmp_path: Path,
 ) -> None:
-    files = FileResource()
+    deniable = _DeniableFileResource()
     path = tmp_path / "thing.txt"
     path.write_text("text", encoding="utf-8")
 
     @query
     def leaf(db: Database, filename: str) -> str:
         try:
-            return files.read(db, filename)
-        except DIRECTORY_AS_FILE_ERROR:
-            return "<isdir>"
+            return deniable.read(db, filename)
+        except PermissionError:
+            return "<denied>"
 
     @query
     def middle(db: Database, filename: str) -> str:
@@ -1056,12 +1217,11 @@ def test_handled_unrecordable_failure_propagates_more_than_one_hop(
     executions = db.statistics().query_executions
     verified = db.revision
 
-    path.unlink()
-    path.mkdir()
-    assert db.get(top, str(path)) == Database(mode=mode).get(top, str(path)) == "T:M:<isdir>"
+    _deny(path)
+    assert db.get(top, str(path)) == Database(mode=mode).get(top, str(path)) == "T:M:<denied>"
     # Every hop of the chain agrees, not only the root that was asked for.
-    assert db.get(middle, str(path)) == "M:<isdir>"
-    assert db.get(leaf, str(path)) == "<isdir>"
+    assert db.get(middle, str(path)) == "M:<denied>"
+    assert db.get(leaf, str(path)) == "<denied>"
 
     # All three hops re-executed in that one request: the invalidation reached
     # past `middle`, which is the hop a direct-reader-only fix leaves behind.
@@ -1075,16 +1235,16 @@ def test_permanently_unrecordable_failure_settles_the_revision(
     mode: str,
     tmp_path: Path,
 ) -> None:
-    files = FileResource()
+    deniable = _DeniableFileResource()
     path = tmp_path / "thing.txt"
     path.write_text("text", encoding="utf-8")
 
     @query
     def reader(db: Database, filename: str) -> str:
         try:
-            return files.read(db, filename)
-        except DIRECTORY_AS_FILE_ERROR:
-            return "<isdir>"
+            return deniable.read(db, filename)
+        except PermissionError:
+            return "<denied>"
 
     @query
     def parent(db: Database, filename: str) -> str:
@@ -1094,22 +1254,20 @@ def test_permanently_unrecordable_failure_settles_the_revision(
     assert db.get(parent, str(path)) == "P:text"
     before = db.revision
 
-    path.unlink()
-    path.mkdir()
-    assert db.get(parent, str(path)) == "P:<isdir>"
+    _deny(path)
+    assert db.get(parent, str(path)) == "P:<denied>"
     # The transition into "unconfirmed" moves the revision (once per node that
     # actually changed) -- not once per observation.
     transitioned = db.revision
     assert transitioned > before
 
     for _ in range(5):
-        assert db.get(parent, str(path)) == "P:<isdir>"
+        assert db.get(parent, str(path)) == "P:<denied>"
         assert db.revision == transitioned
 
     # A read that ultimately succeeds is not a transition either: the healing
     # load moves the revision once, and the requests after it leave it alone.
-    path.rmdir()
-    path.write_text("text", encoding="utf-8")
+    _allow(path)
     assert db.get(parent, str(path)) == "P:text"
     healed = db.revision
     assert healed > transitioned
@@ -1129,12 +1287,14 @@ def test_module_replaced_by_a_package_matches_a_fresh_database(tmp_path: Path) -
     assert tuple(ref.module for ref in imports) == ("os",)
 
     # A module -> package refactor is the shipped-integration form of the same
-    # trap: _SourceTextResource probes with exists() then read_bytes().
+    # transition, and lands on the same answer: the path no longer names a
+    # source file, so it analyzes as an empty one in both databases.
     path.unlink()
     path.mkdir()
     (path / "__init__.py").write_text("import os\n", encoding="utf-8")
     fresh = _outcome(lambda: python_source.file_analysis(Database(), str(path)))
-    assert fresh[0] == DIRECTORY_AS_FILE_ERROR.__name__
+    assert fresh[0] == "value"
+    assert fresh[1].imports == ()
     assert _outcome(lambda: python_source.file_analysis(db, str(path))) == fresh
 
 

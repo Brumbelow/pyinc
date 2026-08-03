@@ -14,6 +14,15 @@ KeyT = TypeVar("KeyT")
 ValueT = TypeVar("ValueT")
 ProbeT = TypeVar("ProbeT")
 
+# The three ways a path stops naming the thing a file or listing resource reads.
+# A probe has to be total -- it answers for every key it is handed -- and none
+# of these is a transient failure a later read could survive: the path is
+# absent, it is a directory, or something in its parent chain is a file. They
+# answer the way an absent path does. Every other OSError, a permission denial
+# above all, is a genuine failure and keeps propagating, where the kernel's
+# failure records handle it identically warm and fresh.
+_MISSING_FILE_ERRORS = (FileNotFoundError, IsADirectoryError, NotADirectoryError)
+
 
 class Resource(Generic[KeyT, ValueT, ProbeT]):
     """A tracked external value.
@@ -177,7 +186,7 @@ class DirectoryResource(Resource[str | os.PathLike[str], tuple[str, ...], Direct
         return f"dir[{os.fspath(path)}]"
 
     def probe(self, path: str | os.PathLike[str]) -> DirectoryProbe:
-        return _listing_snapshot(os.fspath(path))
+        return _listing_probe(os.fspath(path))
 
     def load(self, db: _runtime.Database, path: str | os.PathLike[str]) -> tuple[str, ...]:
         return _listing_snapshot(os.fspath(path))[1]
@@ -192,7 +201,7 @@ class DirectoryResource(Resource[str | os.PathLike[str], tuple[str, ...], Direct
 def _read_file(path: str) -> bytes | None:
     try:
         return Path(path).read_bytes()
-    except FileNotFoundError:
+    except _MISSING_FILE_ERRORS:
         return None
 
 
@@ -203,6 +212,30 @@ def _listing_snapshot(path: str) -> DirectoryProbe:
     except FileNotFoundError:
         return False, ()
     return True, names
+
+
+# A path that is not a directory may not share the probe an absent one gets:
+# reading them differs -- an absent path yields no entries, a non-directory
+# raises -- so one probe for both would certify an interval a change happened
+# in. "" is never a directory entry name, so it names the third state without
+# widening the probe every directory record already carries.
+_NOT_A_DIRECTORY_PROBE: DirectoryProbe = (False, ("",))
+
+
+def _listing_probe(path: str) -> DirectoryProbe:
+    """Report a path that holds no listing rather than raising for it.
+
+    The load keeps raising: a caller reading a listing is told a file is not a
+    directory, which is how a directory walk tells a module from a package. The
+    probe cannot, because a probe that raises retires the record it was
+    checking, and a warm database would then answer a path whose kind changed
+    differently from a fresh one reading the same world.
+    """
+
+    try:
+        return _listing_snapshot(path)
+    except _MISSING_FILE_ERRORS:
+        return _NOT_A_DIRECTORY_PROBE
 
 
 def _stat_snapshot(path: str) -> FileStatSnapshot:

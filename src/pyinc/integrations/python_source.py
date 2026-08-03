@@ -17,6 +17,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 
 from ._decoding import decoded, once_per_request
+from ._resources import file_bytes, file_probe
 from .source_geometry import (
     DocumentMap,
     SourcePosition,
@@ -158,24 +159,19 @@ class _SourceTextResource:
         return f"sourcefile[{path}]"
 
     def probe(self, path: str) -> tuple[str, str] | tuple[str]:
-        file_path = Path(path)
-        if not file_path.exists():
-            return ("missing",)
-        return ("present", hashlib.sha256(file_path.read_bytes()).hexdigest())
+        return file_probe(path)
 
     def load(self, db: Database, path: str) -> SourceTextPayload:
-        file_path = Path(path)
-        if not file_path.exists():
+        data = file_bytes(path)
+        if data is None:
             return "", None
-        return _decode_python_source(file_path.read_bytes(), path)
+        return _decode_python_source(data, path)
 
     def probe_and_load(
         self, db: Database, path: str
     ) -> tuple[tuple[str, str] | tuple[str], SourceTextPayload]:
-        file_path = Path(path)
-        try:
-            data = file_path.read_bytes()
-        except FileNotFoundError:
+        data = file_bytes(path)
+        if data is None:
             return ("missing",), ("", None)
         probe = ("present", hashlib.sha256(data).hexdigest())
         return probe, _decode_python_source(data, path)

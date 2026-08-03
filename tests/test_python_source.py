@@ -1167,3 +1167,65 @@ def test_import_statements_for_file_collects_tuple_handler_try_block(
     stmts = import_statements_for_file(db, str(mod))
     collected_modules = {s[0] for s in stmts}
     assert "fast_lib" in collected_modules
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_module_swapped_for_a_directory_matches_a_fresh_database(mode: str, tmp_path: Path) -> None:
+    # The workspace walk only collects regular files, so a fresh database never
+    # sees the swapped module. A warm one re-probes the path it already knows,
+    # and has to reach the same answer rather than the read error a directory
+    # would raise: a directory is not a source file, exactly as an absent one
+    # is not.
+    (tmp_path / "mod.py").write_text("import os\n", encoding="utf-8")
+    (tmp_path / "other.py").write_text("x = 1\n", encoding="utf-8")
+
+    db = Database(mode=mode)
+    warm = workspace_analysis(db, str(tmp_path))
+    assert sorted(module.path for module in warm.modules) == [
+        str(tmp_path / "mod.py"),
+        str(tmp_path / "other.py"),
+    ]
+
+    (tmp_path / "mod.py").unlink()
+    (tmp_path / "mod.py").mkdir()
+
+    after = workspace_analysis(db, str(tmp_path))
+    assert after == workspace_analysis(Database(mode=mode), str(tmp_path))
+    assert sorted(module.path for module in after.modules) == [str(tmp_path / "other.py")]
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_module_restored_after_a_directory_swap_matches_a_fresh_database(
+    mode: str, tmp_path: Path
+) -> None:
+    (tmp_path / "mod.py").write_text("import os\n", encoding="utf-8")
+
+    db = Database(mode=mode)
+    assert workspace_analysis(db, str(tmp_path)).modules != ()
+
+    (tmp_path / "mod.py").unlink()
+    (tmp_path / "mod.py").mkdir()
+    assert workspace_analysis(db, str(tmp_path)).modules == ()
+
+    (tmp_path / "mod.py").rmdir()
+    (tmp_path / "mod.py").write_text("import sys\n", encoding="utf-8")
+    restored = workspace_analysis(db, str(tmp_path))
+    assert restored == workspace_analysis(Database(mode=mode), str(tmp_path))
+    assert tuple(ref.module for ref in restored.modules[0].imports) == ("sys",)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_package_swapped_for_a_module_matches_a_fresh_database(mode: str, tmp_path: Path) -> None:
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("import os\n", encoding="utf-8")
+
+    db = Database(mode=mode)
+    assert len(workspace_analysis(db, str(tmp_path)).modules) == 1
+
+    (package / "__init__.py").unlink()
+    package.rmdir()
+    package.write_text("import sys\n", encoding="utf-8")
+
+    after = workspace_analysis(db, str(tmp_path))
+    assert after == workspace_analysis(Database(mode=mode), str(tmp_path))

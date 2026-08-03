@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -15,7 +14,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
 
-from ._resources import file_read_snapshot
+from ._resources import file_probe, file_read_snapshot, file_text
 
 JsonKeyPayload: TypeAlias = tuple[str, str, str, str]
 JsonSectionPayload: TypeAlias = tuple[str, tuple[JsonKeyPayload, ...], tuple[str, ...]]
@@ -65,16 +64,11 @@ class _JsonFileResource:
         return f"jsonfile[{path}]"
 
     def probe(self, path: str) -> tuple[str, str] | tuple[str]:
-        file_path = Path(path)
-        if not file_path.exists():
-            return ("missing",)
-        return ("present", hashlib.sha256(file_path.read_bytes()).hexdigest())
+        return file_probe(path)
 
     def load(self, db: Database, path: str) -> str:
-        file_path = Path(path)
-        if not file_path.exists():
-            return ""
-        return file_path.read_text(encoding=self.encoding)
+        text = file_text(path, self.encoding)
+        return text if text is not None else ""
 
     def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], str]:
         probe, text = file_read_snapshot(path, self.encoding)
