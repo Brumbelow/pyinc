@@ -1037,6 +1037,20 @@ def _build_enum(
     return (name, "enum", (), rendered, base_type, description, (), tuple(diagnostics))
 
 
+def _alias_names_itself(name: str, type_expr: str, refs: tuple[str, ...]) -> bool:
+    """Whether an alias resolves to its own name with nothing in between.
+
+    ``X: TypeAlias = 'X'`` — or ``'X | None'``, which the nullable spellings
+    render — denotes no type at all. Recursion that passes through a model or a
+    container (``list[X]``) names one and keeps compiling.
+    """
+
+    if name not in refs:
+        return False
+    python_name = _python_identifier(name)
+    return type_expr in (python_name, f"{python_name} | None")
+
+
 def _field_collision_diagnostics(
     names: Iterable[str], properties_pointer: str
 ) -> tuple[DiagnosticPayload, ...]:
@@ -1241,6 +1255,14 @@ def _build_model(
         json_pointer,
         validate_current=False,
     )
+    if _alias_names_itself(name, type_expr, alias_refs):
+        type_diagnostics += (
+            _diagnostic(
+                "self-referential-alias",
+                f"alias definition names only itself: {type_expr!r} resolves to no other type",
+                json_pointer,
+            ),
+        )
     return (
         name,
         "alias",

@@ -758,6 +758,28 @@ def test_build_model_selects_a_shape_keyword_before_the_type_driven_branch() -> 
     assert _codes(ref_model[7]) == {"ambiguous-schema-combination"}
 
 
+def test_alias_definitions_that_name_only_themselves_are_rejected() -> None:
+    for fragment in (
+        {"$ref": "#/$defs/Loop"},
+        {"allOf": [{"$ref": "#/$defs/Loop"}]},
+        {"anyOf": [{"$ref": "#/$defs/Loop"}, {"type": "null"}]},
+        {"anyOf": [{"type": "null"}, {"allOf": [{"$ref": "#/$defs/Loop"}]}]},
+    ):
+        model = _build_model("Loop", fragment, lambda name: True, "/$defs/Loop")
+        assert [(code, severity, pointer) for code, _message, severity, pointer in model[7]] == [
+            ("self-referential-alias", "error", "/$defs/Loop")
+        ]
+
+    # Recursion that passes through a container or a model names a type, so it
+    # keeps generating.
+    for resolvable in (
+        {"type": "array", "items": {"$ref": "#/$defs/Loop"}},
+        {"anyOf": [{"type": "array", "items": {"$ref": "#/$defs/Loop"}}, {"type": "null"}]},
+        {"$ref": "#/$defs/Other"},
+    ):
+        assert _build_model("Loop", resolvable, lambda name: True, "/$defs/Loop")[7] == ()
+
+
 def test_build_model_reports_invalid_required_and_properties_containers() -> None:
     invalid_required = _build_model(
         "Model",

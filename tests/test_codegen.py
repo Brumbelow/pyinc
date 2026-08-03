@@ -615,6 +615,67 @@ def test_multi_branch_combinators_remain_errors(
     assert diagnostic.json_pointer == f"/$defs/Holder/properties/value/{keyword}"
 
 
+def test_alias_definitions_naming_only_themselves_block_generation(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Loop": {"anyOf": [{"$ref": "#/$defs/Loop"}, {"type": "null"}]},
+                "Selfy": {"allOf": [{"$ref": "#/$defs/Selfy"}]},
+            }
+        },
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    # ``Loop: TypeAlias = 'Loop | None'`` names nothing a type checker can
+    # resolve, so it is reported instead of emitted.
+    assert {(d.code, d.json_pointer) for d in analysis.errors} == {
+        ("self-referential-alias", "/$defs/Loop"),
+        ("self-referential-alias", "/$defs/Selfy"),
+    }
+    with pytest.raises(SchemaGenerationError):
+        generate(db, schema_path, out)
+    assert _tree(out) == {}
+
+
+def test_recursion_through_a_container_or_a_model_keeps_generating(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Tree": {
+                    "type": "object",
+                    "properties": {
+                        "children": {
+                            "type": "array",
+                            "items": {"anyOf": [{"$ref": "#/$defs/Tree"}, {"type": "null"}]},
+                        }
+                    },
+                },
+                "Forest": {"type": "array", "items": {"$ref": "#/$defs/Forest"}},
+            }
+        },
+    )
+    db = Database(mode="strict")
+    assert schema_analysis(db, schema_path).errors == ()
+
+    generate(db, schema_path, out)
+    assert (out / "forest.py").read_text(encoding="utf-8") == (
+        "from __future__ import annotations\n"
+        "\n"
+        "from typing import TypeAlias\n"
+        "\n"
+        "Forest: TypeAlias = 'list[Forest]'\n"
+    )
+    assert "    children: list[Tree | None] | None = None\n" in (out / "tree.py").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_schema_valued_additional_properties_compile_to_mappings(tmp_path: Path) -> None:
     schema_path = tmp_path / "schema.json"
     out = tmp_path / "generated"
