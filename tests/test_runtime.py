@@ -1103,6 +1103,76 @@ def test_file_resource_still_raises_a_permission_denial(mode: str, tmp_path: Pat
         path.chmod(0o644)
 
 
+def test_listing_probe_follows_the_read_where_a_path_under_a_file_reads_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Windows reports a path reached through a regular file as absent
+    # (ERROR_PATH_NOT_FOUND) where POSIX raises NotADirectoryError from the
+    # listing. Drive that shape here: whichever the platform picks, the probe
+    # must agree with what a read of the path does, and must not raise.
+    directories = DirectoryResource()
+    holder = tmp_path / "holder.txt"
+    holder.write_text("not a directory", encoding="utf-8")
+    nested = str(holder / "child")
+    real_iterdir = Path.iterdir
+
+    def iterdir(self: Path) -> Any:
+        if str(self) == nested:
+            raise FileNotFoundError(2, "The system cannot find the path specified", nested)
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+
+    assert directories.probe(nested) == (False, ())
+    assert directories.load(Database(), nested) == ()
+    # ... which is exactly how an absent path reads, so they share a probe.
+    absent = str(tmp_path / "never-existed")
+    assert directories.probe(absent) == (False, ())
+    assert directories.load(Database(), absent) == ()
+
+
+def _denied(self: Path, *args: Any, **kwargs: Any) -> Any:
+    raise PermissionError(13, "Permission denied", str(self))
+
+
+def test_file_resources_read_a_denied_directory_as_a_missing_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Windows refuses to open a directory as a file with EACCES where POSIX
+    # raises IsADirectoryError, and that is the very error an ACL denial on a
+    # regular file gives, so the type alone cannot classify it. This drives the
+    # Windows shape on any platform: same raise, two kinds of path, and only
+    # the kind decides.
+    directory = tmp_path / "holder"
+    directory.mkdir()
+    regular = tmp_path / "thing.txt"
+    regular.write_text("hello", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "read_bytes", _denied)
+    monkeypatch.setattr(Path, "read_text", _denied)
+
+    files = FileResource()
+    binaries = BinaryFileResource()
+
+    assert files.probe(str(directory)) == ("missing",)
+    assert binaries.probe(str(directory)) == ("missing",)
+    with pytest.raises(FileNotFoundError):
+        files.load(Database(), str(directory))
+    with pytest.raises(FileNotFoundError):
+        binaries.load(Database(), str(directory))
+
+    # A denial on a regular file is a genuine failure and keeps propagating.
+    for call in (
+        lambda: files.probe(str(regular)),
+        lambda: binaries.probe(str(regular)),
+        lambda: files.load(Database(), str(regular)),
+        lambda: binaries.load(Database(), str(regular)),
+        lambda: files.probe_and_load(Database(), str(regular)),
+    ):
+        with pytest.raises(PermissionError):
+            call()
+
+
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_directory_resource_probes_a_file_path_as_an_absent_listing(
     mode: str, tmp_path: Path
@@ -1129,15 +1199,37 @@ def test_directory_resource_probes_a_file_path_as_an_absent_listing(
     listing.rmdir()
     listing.write_text("not a directory", encoding="utf-8")
 
-    # A path that is not a directory must not probe the way an absent one does:
-    # reading them differs, so one probe for both would hide the transition
-    # between them.
-    not_a_directory = directories.probe(str(listing))
-    assert not_a_directory[0] is False
-    assert not_a_directory != (False, ())
-    # A listing reached through a file in its parent chain answers the same.
-    assert directories.probe(str(listing / "child")) == not_a_directory
-    assert directories.probe(str(tmp_path / "never-existed")) == (False, ())
+    # The invariant a probe keeps: two paths may share one only when reading
+    # them agrees. Which non-directory answer a path *under* a file lands on is
+    # the platform's to decide -- POSIX raises NotADirectoryError from the
+    # listing where Windows reports the path absent -- so the probe is pinned
+    # against the read rather than against either platform's choice.
+    kinds = ("directory", "file", "under a file", "absent")
+    paths = (
+        str(tmp_path),
+        str(listing),
+        str(listing / "child"),
+        str(tmp_path / "never-existed"),
+    )
+
+    def read_kind(target: str) -> tuple[str, object]:
+        try:
+            return ("names", directories.load(Database(), target))
+        except OSError as exc:
+            return ("raised", type(exc).__name__)
+
+    probes = [directories.probe(target) for target in paths]
+    reads = [read_kind(target) for target in paths]
+    for left in range(len(kinds)):
+        for right in range(left + 1, len(kinds)):
+            if probes[left] == probes[right]:
+                assert reads[left] == reads[right], (kinds[left], kinds[right])
+
+    # A file and an absent path read differently on every platform, so they may
+    # never share a probe -- which is the state the listing probe had to grow.
+    assert reads[1] != reads[3]
+    assert probes[1] != probes[3]
+    assert probes[3] == (False, ())
 
     fresh = Database(mode=mode)
     assert db.get(names, str(listing)) == fresh.get(names, str(listing)) == ("<caught>",)

@@ -21,6 +21,7 @@ env_file: Any = importlib.import_module("pyinc.integrations.env_file")
 installed_packages: Any = importlib.import_module("pyinc.integrations.installed_packages")
 json_config: Any = importlib.import_module("pyinc.integrations.json_config")
 notebook: Any = importlib.import_module("pyinc.integrations.notebook")
+python_source: Any = importlib.import_module("pyinc.integrations.python_source")
 requirements_txt: Any = importlib.import_module("pyinc.integrations.requirements_txt")
 toml_config: Any = importlib.import_module("pyinc.integrations.toml_config")
 xml_config: Any = importlib.import_module("pyinc.integrations.xml_config")
@@ -551,3 +552,87 @@ def test_deep_requirements_reports_cycles_duplicates_and_escape(
     }
     assert any(code == "cycle" for code, _message in analysis.diagnostics)
     assert any("outside project" in message for _code, message in analysis.diagnostics)
+
+
+def _denied(self: Path, *args: Any, **kwargs: Any) -> Any:
+    raise PermissionError(13, "Permission denied", str(self))
+
+
+def test_shared_file_helpers_read_a_denied_directory_as_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Windows refuses to open a directory as a file with EACCES where POSIX
+    # raises IsADirectoryError, and an ACL denial on a regular file raises the
+    # same thing, so only the kind of the path separates them. This drives that
+    # shape on any platform.
+    resources: Any = importlib.import_module("pyinc.integrations._resources")
+    directory = tmp_path / "holder"
+    directory.mkdir()
+    regular = tmp_path / "thing.txt"
+    regular.write_text("hello", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "read_bytes", _denied)
+    monkeypatch.setattr(Path, "read_text", _denied)
+
+    assert resources.file_bytes(str(directory)) is None
+    assert resources.file_probe(str(directory)) == ("missing",)
+    assert resources.file_text(str(directory), "utf-8") is None
+    assert resources.file_read_snapshot(str(directory), "utf-8") == (("missing",), None)
+
+    with pytest.raises(PermissionError):
+        resources.file_bytes(str(regular))
+    with pytest.raises(PermissionError):
+        resources.file_probe(str(regular))
+    with pytest.raises(PermissionError):
+        resources.file_text(str(regular), "utf-8")
+    with pytest.raises(PermissionError):
+        resources.file_read_snapshot(str(regular), "utf-8")
+
+
+@pytest.mark.parametrize(
+    "resource",
+    (
+        csv_data._CsvFileResource(),
+        deep_resolution._PthFileResource(),
+        env_file._EnvFileResource(),
+        installed_packages._DistInfoMetadataResource(),
+        json_config._JsonFileResource(),
+        notebook._NotebookFileResource(),
+        requirements_txt._RequirementsFileResource(),
+        toml_config._ConfigFileResource(),
+        xml_config._XmlFileResource(),
+        python_source._SourceTextResource(),
+    ),
+    ids=(
+        "csv",
+        "pth",
+        "env",
+        "metadata",
+        "json",
+        "notebook",
+        "requirements",
+        "toml",
+        "xml",
+        "source",
+    ),
+)
+def test_shipped_file_resources_read_a_denied_directory_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resource: Any,
+) -> None:
+    directory = tmp_path / "holder"
+    directory.mkdir()
+    regular = tmp_path / "thing.txt"
+    regular.write_text("hello", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "read_bytes", _denied)
+    monkeypatch.setattr(Path, "read_text", _denied)
+
+    assert resource.probe(str(directory)) == ("missing",)
+    assert resource.probe_and_load(Database(), str(directory))[0] == ("missing",)
+
+    with pytest.raises(PermissionError):
+        resource.probe(str(regular))
+    with pytest.raises(PermissionError):
+        resource.load(Database(), str(regular))

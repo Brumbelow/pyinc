@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from pyinc.resources import _MISSING_FILE_ERRORS
+from pyinc.resources import _read_file, _reads_as_missing
 
 FileProbe = tuple[str, str] | tuple[str]
 
@@ -14,13 +14,12 @@ def file_bytes(path: str) -> bytes | None:
     A path that is a directory, or that has a file somewhere in its parent
     chain, names no readable regular file and never will by being read again,
     so it answers the way an absent path does -- which is what keeps the probe
-    built on it total. Any other OSError propagates.
+    built on it total. Any other OSError propagates. Shares the kernel file
+    resources' read so the two classify a failed read the same way, which the
+    platforms make less obvious than it sounds.
     """
 
-    try:
-        return Path(path).read_bytes()
-    except _MISSING_FILE_ERRORS:
-        return None
+    return _read_file(path)
 
 
 def file_probe(path: str) -> FileProbe:
@@ -41,8 +40,10 @@ def file_text(path: str, encoding: str) -> str | None:
 
     try:
         return Path(path).read_text(encoding=encoding)
-    except _MISSING_FILE_ERRORS:
-        return None
+    except OSError as exc:
+        if _reads_as_missing(path, exc):
+            return None
+        raise
 
 
 def file_read_snapshot(path: str, encoding: str) -> tuple[FileProbe, str | None]:

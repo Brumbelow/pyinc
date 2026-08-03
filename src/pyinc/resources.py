@@ -14,14 +14,40 @@ KeyT = TypeVar("KeyT")
 ValueT = TypeVar("ValueT")
 ProbeT = TypeVar("ProbeT")
 
-# The three ways a path stops naming the thing a file or listing resource reads.
-# A probe has to be total -- it answers for every key it is handed -- and none
-# of these is a transient failure a later read could survive: the path is
-# absent, it is a directory, or something in its parent chain is a file. They
-# answer the way an absent path does. Every other OSError, a permission denial
-# above all, is a genuine failure and keeps propagating, where the kernel's
-# failure records handle it identically warm and fresh.
+# The ways a path stops naming the thing a file or listing resource reads. A
+# probe has to be total -- it answers for every key it is handed -- and none of
+# these is a transient failure a later read could survive: the path is absent,
+# it is a directory, or something in its parent chain is a file. They answer the
+# way an absent path does. Every other OSError is a genuine failure and keeps
+# propagating, where the kernel's failure records handle it identically warm and
+# fresh.
+#
+# Which error carries which of those is the platform's business, and the two
+# disagree. POSIX raises IsADirectoryError for a directory opened as a file and
+# NotADirectoryError for a path reached through one; Windows raises
+# PermissionError for the directory and FileNotFoundError for the path under a
+# file. So this tuple does not decide a permission denial on its own -- see
+# `_reads_as_missing`.
 _MISSING_FILE_ERRORS = (FileNotFoundError, IsADirectoryError, NotADirectoryError)
+
+
+def _reads_as_missing(path: str, exc: OSError) -> bool:
+    """Report whether a failed file read means the path names no readable file.
+
+    A permission denial cannot be decided by its type. Windows raises it for a
+    directory opened as a file, where POSIX raises IsADirectoryError, and it is
+    also what an ACL denial on a perfectly ordinary file raises -- which must
+    keep propagating into a failure record. Only the kind of the path separates
+    them, so that is what is asked.
+
+    The question races the read it is explaining. Either answer was true at some
+    instant inside this call, and the probe the caller goes on to record
+    observed one of them, so a race costs a re-read and never a wrong answer.
+    """
+
+    if isinstance(exc, _MISSING_FILE_ERRORS):
+        return True
+    return isinstance(exc, PermissionError) and os.path.isdir(path)
 
 
 class Resource(Generic[KeyT, ValueT, ProbeT]):
@@ -201,8 +227,10 @@ class DirectoryResource(Resource[str | os.PathLike[str], tuple[str, ...], Direct
 def _read_file(path: str) -> bytes | None:
     try:
         return Path(path).read_bytes()
-    except _MISSING_FILE_ERRORS:
-        return None
+    except OSError as exc:
+        if _reads_as_missing(path, exc):
+            return None
+        raise
 
 
 def _listing_snapshot(path: str) -> DirectoryProbe:
@@ -230,6 +258,12 @@ def _listing_probe(path: str) -> DirectoryProbe:
     probe cannot, because a probe that raises retires the record it was
     checking, and a warm database would then answer a path whose kind changed
     differently from a fresh one reading the same world.
+
+    A path reached *through* a file is where the platforms part: POSIX raises
+    NotADirectoryError and lands here, Windows reports the path absent and never
+    gets this far. Both are sound, because on each the probe still matches what
+    a read of that path does -- Windows reads it exactly as it reads an absent
+    path, so the two may share a probe there.
     """
 
     try:
