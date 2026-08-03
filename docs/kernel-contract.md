@@ -154,35 +154,43 @@ Two boundaries apply:
 - **The probe must be total.** This rests on `probe()` modelling failure instead
   of raising — `FileResource.probe` returns `("missing",)` for an absent file. A
   resource whose `probe` *also* raises is outside the contract, and what the
-  kernel does then depends on what it already knows about that node. With **no
-  record** (the read is the node's first), nothing is recorded, the exception
-  propagates unchanged, and a query that catches it is cached as if it had no
-  dependency at all — a later `get()` in that same process does not re-check it,
-  and neither does anything that depends on it (it is still refused a
-  checkpoint, see below). With a **record already there**
-  — an earlier success, or an earlier recorded failure — that record describes a
-  world the kernel can no longer confirm, so the node is reported as *changed*:
-  the queries that read it directly re-execute and the exception surfaces inside
-  their query bodies again. The record is also marked unconfirmed, which retires
-  its stored probe until a real observation rewrites the record: a world that
-  returns to exactly the state that probe describes — an undo, a branch switch
-  back — re-loads instead of reusing, and the readers that consumed the raise
-  re-execute rather than staying green on a value only the failure explains.
-  Entering that unconfirmed state also **moves the revision**, exactly as a
-  recorded failure does. A direct reader that handles the exception is otherwise
-  the end of the story: it would return at the revision its own dependents had
-  already verified, so nothing above it would ever learn that the world moved,
-  and a transitive dependent would keep a pre-failure value permanently. The
-  bump is per *transition* — one on the way in, one on the way out — plus one
-  for each re-executed query whose recomputed value actually changed, never one
-  per observation or request, so `revision` settles while a resource stays
-  unprobeable instead of churning on every `get()`, and a resource that heals
-  and breaks again bumps again. That stays consistent with a fresh `Database` throughout, and it
-  settles as soon as a load succeeds again; while the probe keeps raising, the
-  queries that read it directly re-run every request, and *their* dependents
-  re-run only when the handled value actually differs. A file replaced by a
-  directory (`FileResource`, `DirectoryResource`, and the `python_source`
-  module → package refactor) is the ordinary way to reach this state.
+  kernel does then depends on what it already knows about that node.
+
+  - **No record yet:** the read is the node's first, nothing is recorded, the
+    exception propagates unchanged, and a query that catches it is cached as if
+    it had no dependency at all — a later `get()` in that same process does not
+    re-check it, and neither does anything that depends on it (it is still
+    refused a checkpoint, see below).
+  - **Record present:** an earlier success, or an earlier recorded failure,
+    describes a world the kernel can no longer confirm, so the node is reported
+    as *changed*: the queries that read it directly re-execute and the exception
+    surfaces inside their query bodies again. The record is also marked
+    unconfirmed, which retires its stored probe until a real observation
+    rewrites the record: a world that returns to exactly the state that probe
+    describes — an undo, a branch switch back — re-loads instead of reusing, and
+    the readers that consumed the raise re-execute rather than staying green on
+    a value only the failure explains. A file replaced by a directory
+    (`FileResource`, `DirectoryResource`, and the `python_source`
+    module → package refactor) is the ordinary way to reach this state.
+  - **Revision accounting:** entering that unconfirmed state **moves the
+    revision**, exactly as a recorded failure does. A direct reader that handles
+    the exception is otherwise the end of the story: it would return at the
+    revision its own dependents had already verified, so nothing above it would
+    ever learn that the world moved, and a transitive dependent would keep a
+    pre-failure value permanently. The bump is per *transition* — one on the way
+    in, one on the way out — plus one for each re-executed query whose
+    recomputed value actually changed, never one per observation or request, so
+    `revision` settles while a resource stays unprobeable instead of churning on
+    every `get()`, and a resource that heals and breaks again bumps again. That
+    stays consistent with a fresh `Database` throughout, and it settles as soon
+    as a load succeeds again; while the probe keeps raising, the queries that
+    read it directly re-run every request, and *their* dependents re-run only
+    when the handled value actually differs.
+
+  The probe contract extends to failures for the same reason it covers values: a
+  resource whose `load` can raise *different* exceptions for one probe value must
+  fold that distinction into the probe. Invalidation compares probes only, never
+  exception messages, which are frequently nondeterministic.
   (See: `test_failed_resource_loads_are_recorded_only_when_the_probe_is_total`,
   `test_file_replaced_by_a_directory_matches_a_fresh_database`,
   `test_directory_replaced_by_a_file_matches_a_fresh_database`,
@@ -192,11 +200,6 @@ Two boundaries apply:
   `test_handled_unrecordable_failure_invalidates_a_transitive_reader`,
   `test_handled_unrecordable_failure_propagates_more_than_one_hop`,
   `test_permanently_unrecordable_failure_settles_the_revision`)
-
-  The probe contract extends to failures for the same reason it covers values: a
-  resource whose `load` can raise *different* exceptions for one probe value must
-  fold that distinction into the probe. Invalidation compares probes only, never
-  exception messages, which are frequently nondeterministic.
 - **Failures are not checkpointed.** A failure record holds no value, and a
   reader that handled a failure is only reproducible while the load keeps
   failing. The failure record and every record that transitively depends on it

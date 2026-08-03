@@ -168,9 +168,8 @@ dataclass — one cause, one diagnostic:
 - a definition that carries `properties` at all is silent, even when the map is
   empty. `{"type": "object", "properties": {}}` emits the same fieldless
   dataclass with no diagnostic, because declaring the empty set says the model
-  has no fields where omitting the keyword leaves that unsaid. Presence of the
-  keyword, not the emitted dataclass, is what the warning tests — so the
-  type-less spelling `{"properties": {}}` is silent too.
+  has no fields where omitting the keyword leaves that unsaid. The type-less
+  spelling `{"properties": {}}` is silent too.
 - a definition with a schema-valued `additionalProperties` does constrain its
   instances, and is rejected on that keyword alone; the warning would misname
   the cause and is not also reported
