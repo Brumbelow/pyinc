@@ -1317,6 +1317,34 @@ def test_property_names_shadowing_generated_module_bindings_block_generation(
     assert _tree(out) == before
 
 
+def test_reordering_property_keys_keeps_incremental_diagnostics_identical_to_fresh(
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    incremental_db = Database()
+    for order in (("dict", "str", "Literal"), ("Literal", "str", "dict")):
+        _write_schema(
+            schema_path,
+            {
+                "$defs": {
+                    "Thing": {
+                        "type": "object",
+                        "properties": {name: {"type": "string"} for name in order},
+                    },
+                    "Loop": {"anyOf": [{"$ref": "#/$defs/Loop"}, {"type": "null"}]},
+                }
+            },
+        )
+        incremental = schema_analysis(incremental_db, schema_path).diagnostics
+        assert incremental == schema_analysis(Database(), schema_path).diagnostics
+        assert [(d.code, d.json_pointer) for d in incremental] == [
+            ("self-referential-alias", "/$defs/Loop"),
+            ("reserved-field-name", "/$defs/Thing/properties/Literal"),
+            ("reserved-field-name", "/$defs/Thing/properties/dict"),
+            ("reserved-field-name", "/$defs/Thing/properties/str"),
+        ]
+
+
 def test_property_name_near_a_reserved_binding_still_generates(tmp_path: Path) -> None:
     schema_path = tmp_path / "schema.json"
     out = tmp_path / "generated"
