@@ -607,6 +607,55 @@ def test_freeze_reencodes_shared_wrapper_structure_as_the_raw_frozen_graph() -> 
     assert fingerprint_snapshot(snapshot) == fingerprint_snapshot(original)
 
 
+def test_freeze_reencodes_wrappers_shared_through_a_tuple_spine() -> None:
+    # Sibling wrappers whose lowest common ancestor is a raw tuple alias each
+    # other exactly as they would under a list spine, and must land the same
+    # graph encoding: a tuple carries no memo slot of its own to notice it.
+    inner_raw = [1]
+    original = freeze((inner_raw, inner_raw))
+    assert isinstance(original, FrozenGraph)
+
+    inner = FrozenList((1,))
+    snapshot = freeze((inner, inner))
+
+    assert isinstance(snapshot, FrozenGraph)
+    assert snapshot == original
+    assert fingerprint_snapshot(snapshot) == fingerprint_snapshot(original)
+
+
+def test_freeze_reencodes_wrappers_shared_through_nested_tuple_spines() -> None:
+    inner_raw = [1]
+    original = freeze(((inner_raw,), ("tag", (inner_raw,))))
+
+    inner = FrozenList((1,))
+    snapshot = freeze(((inner,), ("tag", (inner,))))
+
+    assert isinstance(snapshot, FrozenGraph)
+    assert snapshot == original
+    assert fingerprint_snapshot(snapshot) == fingerprint_snapshot(original)
+
+
+def test_freeze_reencodes_wrappers_shared_through_mixed_list_and_tuple_spines() -> None:
+    inner_raw = [1]
+    original = freeze([(inner_raw,), {"key": inner_raw}])
+
+    inner = FrozenList((1,))
+    snapshot = freeze([(inner,), {"key": inner}])
+
+    assert isinstance(snapshot, FrozenGraph)
+    assert snapshot == original
+    assert fingerprint_snapshot(snapshot) == fingerprint_snapshot(original)
+
+
+def test_freeze_tuple_of_unshared_wrappers_stays_a_plain_tuple() -> None:
+    items = (FrozenList((1,)), FrozenList((2,)))
+    snapshot = freeze(items)
+
+    assert type(snapshot) is tuple
+    assert snapshot == items
+    assert snapshot[0] is items[0]
+
+
 def test_freeze_reencodes_cyclic_wrapper_structure_as_the_raw_frozen_graph() -> None:
     raw: list[Any] = []
     raw.append(raw)
@@ -750,6 +799,50 @@ def test_adapted_hash_positions_are_isolated_from_graph_node_order() -> None:
     cyclic_payload.append(cyclic_payload)
     with pytest.raises(UnsupportedValueError, match="remain hashable"):
         freeze({AdaptedKey("cyclic", cyclic_payload)}, adapters=adapters)
+
+
+def test_strict_view_of_tuple_shared_list_refreezes_to_the_stored_snapshot() -> None:
+    @query
+    def shared_pair(db: Database) -> object:
+        items = [1]
+        return (items, items)
+
+    raw = [1]
+    expected = freeze((raw, raw))
+
+    db = Database(mode="strict")
+    view = cast(Any, db.get(shared_pair))
+    assert view[0] is view[1]
+    assert freeze(view) == expected
+    assert fingerprint(view) == fingerprint_snapshot(expected)
+
+
+def test_strict_view_of_tuple_shared_list_round_trips_through_set_and_arguments() -> None:
+    @query
+    def shared_pair(db: Database) -> object:
+        items = [1]
+        return (items, items)
+
+    @query
+    def width(db: Database, payload: object) -> int:
+        return len(cast(Any, payload))
+
+    raw = [1]
+    db = Database(mode="strict")
+    view = db.get(shared_pair)
+
+    # As a query argument: the view keys the very node the raw value keyed.
+    db.get(width, (raw, raw))
+    executions = db.statistics().query_executions
+    assert db.get(width, view) == 2
+    assert db.statistics().query_executions == executions
+
+    # Through db.set: re-encoding the view is an equal update, not a change.
+    stored = Input[object]("shared-pair")
+    db.set(stored, (raw, raw))
+    ignores = db.statistics().input_equal_ignores
+    db.set(stored, view)
+    assert db.statistics().input_equal_ignores == ignores + 1
 
 
 # ---------------------------------------------------------------------------
@@ -908,6 +1001,19 @@ def test_scalar_subclasses_require_an_adapter_at_boundaries() -> None:
 
     with pytest.raises(UnsupportedValueError, match="Scalar subclass"):
         freeze(StatefulInt(2, 3))
+
+
+def test_integers_past_the_int_to_str_limit_are_rejected_as_boundary_values() -> None:
+    # freeze accepts the value -- the K2 grammar has no width limit -- but the
+    # encoder cannot render it, so the rejection is typed like every other one.
+    huge = 10**5000
+
+    with pytest.raises(UnsupportedValueError, match="digit"):
+        fingerprint_snapshot(freeze(huge))
+    with pytest.raises(UnsupportedValueError, match="digit"):
+        fingerprint(huge)
+    with pytest.raises(UnsupportedValueError, match="digit"):
+        serialize_snapshot(freeze(huge))
 
 
 def test_nan_payloads_are_canonicalized_and_prefrozen_payloads_are_validated() -> None:

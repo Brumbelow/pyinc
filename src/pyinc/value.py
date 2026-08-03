@@ -4,6 +4,7 @@ import hashlib
 import math
 import os
 import struct
+import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -179,15 +180,42 @@ class _FreezeState:
     # Strong refs to every memoized value. Without this, a value freed mid-freeze
     # can have its id() reused by a later allocation, causing a spurious memo hit.
     live_refs: list[Any] = field(default_factory=list)
+    # Graph-capable wrappers already passed through, and whether one of them was
+    # reached a second time. Set on the optimistic pass, consumed by _freeze_root.
+    wrapper_ids: set[int] = field(default_factory=set)
+    saw_aliased_wrapper: bool = False
+    # Route every graph-capable wrapper through the memo instead of passing it
+    # through. Only the re-encoding pass sets this.
+    refreeze_wrappers: bool = False
 
 
 def freeze(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> Snapshot:
     registry = _coerce_registry(adapters)
-    state = _FreezeState()
-    snapshot = _freeze(value, registry, state)
-    result = _finalize_snapshot(snapshot, state)
+    result = _freeze_root(value, registry)
     _validate_snapshot(result)
     return result
+
+
+def _freeze_root(value: Any, registry: _AdapterRegistry) -> Snapshot:
+    """Freeze one boundary value, re-encoding once if sibling wrappers alias.
+
+    A wrapper reached twice is a back-edge only once every wrapper on the way
+    registers in the memo, and the first pass deliberately does not register
+    them: a tree wrapper has to keep passing through with its identity intact.
+    Sharing whose lowest common ancestor is a raw tuple therefore cannot be
+    seen until the aliased wrapper is met, by which point the first occurrence
+    is already inlined. So the walk that finds it is the freeze itself, and the
+    answer it produces is thrown away in favour of a second pass that routes
+    wrappers through the graph machinery -- landing the snapshot the equivalent
+    raw structure produces.
+    """
+
+    state = _FreezeState()
+    snapshot = _freeze(value, registry, state)
+    if state.saw_aliased_wrapper:
+        retry = _FreezeState(refreeze_wrappers=True)
+        return _finalize_snapshot(_freeze(value, registry, retry), retry)
+    return _finalize_snapshot(snapshot, state)
 
 
 def _finalize_snapshot(snapshot: Snapshot, state: _FreezeState) -> Snapshot:
@@ -215,13 +243,26 @@ def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snap
             )
         return cast(Snapshot, value)
     if type(value) in _FROZEN_TYPES:
-        if _wrapper_aliases_structure(value):
+        if state.refreeze_wrappers or _wrapper_aliases_structure(value):
             # A strict-mode boundary view rebuilds a FrozenGraph snapshot into
             # wrapper objects that genuinely share or cycle through each other.
             # Feeding one back across a boundary must restore the graph
             # encoding it came from; inlining the aliased wrappers as a tree
             # would either drop the sharing or recurse forever on a cycle.
             return _refreeze_wrapper(value, state)
+        if type(value) in (FrozenList, FrozenDict, FrozenRecord) or (
+            type(value) is FrozenSet and value.kind == "set"
+        ):
+            # Sibling wrappers can alias through a raw spine that carries no
+            # memo slot of its own: a tuple holds none, and a memoized
+            # container's slot sits one level above the wrappers it holds.
+            # Only the four types a FrozenGraph node table can hold are worth
+            # tracking; nothing else can be the target of a back-edge.
+            if id(value) in state.wrapper_ids:
+                state.saw_aliased_wrapper = True
+            else:
+                state.wrapper_ids.add(id(value))
+                state.live_refs.append(value)
         return cast(Snapshot, value)
     adapter_match = registry.for_value(value)
     if adapter_match is not None:
@@ -897,7 +938,16 @@ def _encode_snapshot(value: Any, buf: bytearray) -> None:
         buf += b"F;"
         return
     if isinstance(value, int):
-        body = str(value).encode("ascii")
+        try:
+            body = str(value).encode("ascii")
+        except ValueError as exc:
+            # The grammar has no width limit; CPython's int-to-str conversion
+            # does. Type the refusal like every other boundary rejection.
+            raise UnsupportedValueError(
+                f"Integer exceeds the {sys.get_int_max_str_digits()}-digit int-to-str "
+                "conversion limit and cannot be encoded; raise the limit with "
+                "sys.set_int_max_str_digits() or keep the value off the boundary."
+            ) from exc
         buf += b"i"
         buf += str(len(body)).encode("ascii")
         buf += b":"
@@ -1195,8 +1245,7 @@ def _freeze_hash_position(value: Any, registry: _AdapterRegistry, _state: _Freez
     # safely participate in a mutable graph, and isolating them prevents memo
     # node numbers allocated during mapping/set iteration from entering the
     # canonical ordering key.
-    local_state = _FreezeState()
-    snapshot = _finalize_snapshot(_freeze(value, registry, local_state), local_state)
+    snapshot = _freeze_root(value, registry)
     _validate_snapshot(snapshot)
     if not _snapshot_thaws_hashably(snapshot, [], set()):
         raise UnsupportedValueError(
