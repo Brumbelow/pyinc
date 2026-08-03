@@ -27,43 +27,32 @@ reusable CI, CodeQL, and five-run benchmark gates. It then builds the sdist and
 wheel, validates the exact wheel in a clean environment, publishes to PyPI via
 trusted publishing (OIDC, no stored token), and creates or repairs a GitHub
 Release containing those exact distributions and `SHA256SUMS`. The tag name must
-equal the `pyproject.toml` `version` (e.g. `version = "3.0.0rc1"` →
-`git tag -s v3.0.0rc1`), and the version bump must land together with its
+equal the `pyproject.toml` `version` (e.g. `version = "3.1.0"` →
+`git tag -s v3.1.0`), and the version bump must land together with its
 `CHANGELOG.md` section cut in the same PR. The release workflow verifies the
 annotated tag, configured signing-key fingerprint, every commit since the
 trusted baseline, and the exact project version before publishing.
 
-The 3.0 release is promoted in two stages:
+Releases from 3.1.0 on are cut in one stage:
 
-1. Commit `3.0.0rc1` and its changelog, verify the signed commit, create and
-   verify the signed annotated `v3.0.0rc1` tag, then push the commit and tag.
-2. After the RC is published, install its artifacts in clean environments and
-   review the benchmark/correctness report. Do not prepare the final release
-   until every pyinc result matches a fresh run.
-3. Make one direct child commit of `v3.0.0rc1` that changes only
-   `pyproject.toml` and `CHANGELOG.md`. The `3.0.0` changelog section must contain
-   this validation record, substituting the RC tag's full commit SHA:
+1. Land the version bump and the changelog cut (`## [X.Y.Z] - YYYY-MM-DD` plus
+   the release link reference) in one PR. Move `TRUSTED_BASELINE` in
+   `release.yml` forward in the same PR if any commit since the current
+   baseline is not signed by the release key — the workflow verifies every
+   commit in `TRUSTED_BASELINE..tag`, so everything in that range must land on
+   `main` as a fast-forward push of locally signed commits, never through the
+   GitHub merge button.
+2. Verify the signed release commit at the tip of `main`
+   (`git verify-commit HEAD`), create and verify the signed annotated tag
+   (`git tag -s vX.Y.Z` / `git verify-tag vX.Y.Z`), then push the commit and
+   the tag.
+3. After publication, dispatch the manual `published-artifacts` workflow with
+   the bare version to validate the published artifacts across the OS/Python
+   matrix.
 
-   ```markdown
-   ### Release validation
-
-   - RC candidate: `v3.0.0rc1` at `<40-character RC commit SHA>`
-   - [x] Clean installations from the published RC artifacts passed.
-   - [x] The benchmark/correctness report was reviewed; every pyinc result matched a fresh run.
-   - [x] Final promotion approved.
-   ```
-
-   Append the matching release reference after the existing changelog links:
-
-   ```markdown
-   [3.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0
-   ```
-
-4. Verify the final signed commit, create and verify the signed annotated
-   `v3.0.0` tag, then push the commit and tag. The release workflow rejects the
-   final tag unless the RC tag is signed by the configured key, the final commit
-   is the RC's direct child, only the two metadata files changed, and the
-   validation record is complete and names the exact RC commit.
+The 3.0.0 release was promoted through a two-stage RC flow; that policy stays
+hardcoded in `scripts/verify_release_metadata.py` and applies only to the
+`v3.0.0` / `v3.0.0rc1` tags.
 
 ## Packages in this repo — and the boundaries between them
 

@@ -6,6 +6,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-08-03
+
+### Highlights
+
+- `Database.request_span()` holds one kernel request open across several
+  reads, with `Database.request_inputs_changed()` to declare mid-span input
+  changes; `WorkspaceSession` holds a span per public method, so a warm
+  `analyze_workspace` validates each resource once per call.
+- A resource whose `load` raises gets a failure record: readers keep their
+  dependency edges, `inspect()` and `explain()` show the node as `failed`, an
+  unchanged failing probe stays green, and a failing load costs one load per
+  request instead of one per reader.
+- The warm path got cheaper: default backdating compares stored snapshots
+  without a thaw or re-freeze, and unchanged file reads answer from the probe
+  alone without decoding contents.
+- `pyinc-tools analyze` can gate a CI job: `--format text`, `--diagnostics-only`,
+  and `--fail-on` with exit status `3`.
+- PEP 440 conformance: `===` evaluates, `~=` uses a true prefix-match upper
+  bound, wildcard matching compares epochs, and `pip-compile --generate-hashes`
+  output parses correctly.
+- Code generation compiles `const`, inline `enum`, schema-valued
+  `additionalProperties`, and the single-branch combinator spellings, and
+  annotation-only keywords warn instead of failing the document.
+- Notebook cells with IPython syntax are neutralized width-for-width and
+  analyzed instead of reported as syntax errors.
+- Structured-configuration nesting is capped — XML at 256 element levels, JSON
+  at 200, TOML at 100 — with a diagnostic instead of stack exhaustion.
+- Checkpoints from 3.0.0 are refused loudly (manifest v5) instead of warming
+  records the current kernel would not produce.
+- The workspace demo returned: recordings of `pyinc-tools` watching a pinned
+  checkout of pytest.
+
 ### Added
 
 - `Database.request_span()`, a public context manager holding one kernel
@@ -1885,3 +1917,4 @@ The first stable v1 release.
 [2.6.0]: https://github.com/Brumbelow/pyinc/releases/tag/v2.6.0
 [3.0.0rc1]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0rc1
 [3.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0
+[3.1.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.1.0
