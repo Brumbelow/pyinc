@@ -69,6 +69,7 @@ def markdown_files(root: Path) -> tuple[Path, ...]:
     return (
         root / "README.md",
         root / "CONTRIBUTING.md",
+        root / "SECURITY.md",
         root / "bench/README.md",
         *sorted((root / "docs").glob("*.md")),
     )

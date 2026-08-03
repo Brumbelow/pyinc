@@ -107,9 +107,9 @@ through the GitHub merge button. This does not affect ordinary pull requests.
 
 ## Reporting a security issue
 
-Please do not open a public issue for a vulnerability. Report it privately
-through
-[GitHub's private vulnerability reporting](https://github.com/Brumbelow/pyinc/security/advisories/new).
+See [SECURITY.md](SECURITY.md). Please do not open a public issue for a
+vulnerability. A from-scratch consistency violation is handled with the same
+seriousness, and that document says what to include.
 
 ---
 
