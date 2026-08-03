@@ -85,10 +85,12 @@ ResourceKeyT = TypeVar("ResourceKeyT")
 ResourceValueT = TypeVar("ResourceValueT")
 ResourceProbeT = TypeVar("ResourceProbeT")
 
-# Durable checkpoint manifest schema version. Bumped whenever the identity or
-# record layout changes so stale manifests are rejected loudly rather than
-# silently reused.
-_CHECKPOINT_MANIFEST_VERSION = 4
+# Durable checkpoint manifest schema version. Bumped whenever the identity, the
+# record layout, or the meaning of a recorded field changes, so stale manifests
+# are rejected loudly rather than silently reused. Version 5 carries the
+# dependency semantics a caught resource-read failure now records: a version-4
+# record can claim no dependencies for a reader a fresh database re-derives.
+_CHECKPOINT_MANIFEST_VERSION = 5
 # Version of the snapshot/fingerprint encoding this kernel emits, mirrored from
 # value._KERNEL_FINGERPRINT_PREFIX (b"K2;"). Recorded in the manifest and checked
 # at load so a checkpoint from a differently-encoded kernel is never trusted.
@@ -723,11 +725,8 @@ class Database:
             snapshot = self._freeze_value(value)
             digest = fingerprint_snapshot(snapshot)
             record = self._records.get(node_key)
-            if record is not None and self._compare_values(
-                eq=input_key.eq,
-                cutoff=input_key.cutoff,
-                left=self._thaw_value(record.snapshot),
-                right=self._thaw_value(snapshot),
+            if record is not None and self._compare_input_snapshots(
+                input_key, record.snapshot, snapshot
             ):
                 record.snapshot = snapshot
                 record.digest = digest
@@ -807,11 +806,8 @@ class Database:
             request_id = self._current_request_id()
             for input_key, node_key, snapshot, digest in pending:
                 record = self._records.get(node_key)
-                equal = record is not None and self._compare_values(
-                    eq=input_key.eq,
-                    cutoff=input_key.cutoff,
-                    left=self._thaw_value(record.snapshot),
-                    right=self._thaw_value(snapshot),
+                equal = record is not None and self._compare_input_snapshots(
+                    input_key, record.snapshot, snapshot
                 )
                 decisions.append((equal, input_key, node_key, snapshot, digest))
 
@@ -2271,7 +2267,19 @@ class Database:
                     # comparison of the exposed values reduces to comparing
                     # the stored snapshots directly -- the same decision in
                     # every mode, with no thaw or re-freeze on the warm path.
-                    equal = False if impure else snapshots_equal(previous.snapshot, snapshot)
+                    # Snapshot equality is the primary answer; the digests
+                    # settle the one shape it under-reports, a NaN payload,
+                    # which never equals itself but does normalize to a single
+                    # canonical encoding. The digests are already computed, so
+                    # the fallback costs a string compare.
+                    equal = (
+                        False
+                        if impure
+                        else (
+                            snapshots_equal(previous.snapshot, snapshot)
+                            or digest == previous_digest
+                        )
+                    )
                 else:
                     old_value = self._expose_snapshot(previous.snapshot)
                     new_value = self._expose_snapshot(snapshot)
@@ -5833,6 +5841,26 @@ class Database:
 
     def _semantic_equal(self, left: Any, right: Any) -> bool:
         return semantic_equal(left, right, adapters=self._adapters)
+
+    def _compare_input_snapshots(
+        self, input_key: Any, previous: Snapshot, snapshot: Snapshot
+    ) -> bool:
+        if input_key.eq is None and input_key.cutoff is None:
+            # Both operands are canonical freeze outputs, so the default
+            # comparison reduces to comparing the stored snapshots directly --
+            # the same decision _execute_query makes for a recomputed result,
+            # with no thaw and no ValueAdapter hook on the default input path.
+            # Thawing would drop FrozenRecord type identity and call a dict of
+            # matching shape an equal update the caller never sees.
+            return snapshots_equal(previous, snapshot)
+        # An explicit policy is defined over the values the caller wrote, not
+        # over their encodings, so it keeps the thawed operands.
+        return self._compare_values(
+            eq=input_key.eq,
+            cutoff=input_key.cutoff,
+            left=self._thaw_value(previous),
+            right=self._thaw_value(snapshot),
+        )
 
     def _compare_values(
         self,

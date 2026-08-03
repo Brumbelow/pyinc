@@ -3448,10 +3448,12 @@ class Boxed:
 
 
 class BoxedAdapter(ValueAdapter):
+    freeze_calls: ClassVar[int] = 0
     thaw_calls: ClassVar[int] = 0
 
     def freeze(self, value: Boxed, freeze: Any) -> object:
         assert callable(freeze)
+        type(self).freeze_calls += 1
         return {"payload": freeze(value.payload)}
 
     def thaw(self, snapshot: Any, thaw: Any) -> Boxed:
@@ -3510,6 +3512,76 @@ def test_dataclass_to_dict_with_equal_shape_executes(mode: str) -> None:
     assert db.revision == revision_after_set + 1
 
 
+# The default (no eq=, no cutoff=) input comparison is the same decision as the
+# recomputation one, on the same operands: the stored canonical snapshots. The
+# tests below drive the shapes where thawing would erase the distinction the
+# comparison exists to make, through both input entry points and in every mode.
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("replacement", [MapPoint(1, 2), {"x": 1, "y": 2}])
+def test_input_set_type_change_with_equal_fields_matches_fresh(
+    mode: str, replacement: object
+) -> None:
+    point = Input[object]("point")
+
+    @query
+    def describe(db: Database) -> str:
+        value = point.read(db)
+        return f"{type(value).__name__}:{value!r}"
+
+    db = Database(mode=mode)
+    db.set(point, GridPoint(1, 2))
+    db.get(describe)
+    db.set(point, replacement)
+
+    fresh = Database(mode=mode)
+    fresh.set(point, replacement)
+    assert db.get(describe) == fresh.get(describe)
+    assert db.statistics().input_equal_ignores == 0
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("replacement", [MapPoint(1, 2), {"x": 1, "y": 2}])
+def test_input_set_many_type_change_with_equal_fields_matches_fresh(
+    mode: str, replacement: object
+) -> None:
+    point = Input[object]("point")
+
+    @query
+    def describe(db: Database) -> str:
+        value = point.read(db)
+        return f"{type(value).__name__}:{value!r}"
+
+    db = Database(mode=mode)
+    db.set_many([(point, GridPoint(1, 2))])
+    db.get(describe)
+    db.set_many([(point, replacement)])
+
+    fresh = Database(mode=mode)
+    fresh.set_many([(point, replacement)])
+    assert db.get(describe) == fresh.get(describe)
+    assert db.statistics().input_equal_ignores == 0
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_equal_input_set_does_not_run_adapter_hooks(mode: str) -> None:
+    boxed = Input[Boxed]("boxed")
+
+    db = Database(mode=mode, adapters={Boxed: BoxedAdapter()})
+    db.set(boxed, Boxed(7))
+
+    BoxedAdapter.freeze_calls = 0
+    BoxedAdapter.thaw_calls = 0
+    db.set(boxed, Boxed(7))
+
+    # The one freeze is the incoming value's own snapshot; the comparison that
+    # follows reads the stored snapshots and runs no hook of its own.
+    assert BoxedAdapter.freeze_calls == 1
+    assert BoxedAdapter.thaw_calls == 0
+    assert db.statistics().input_equal_ignores == 1
+
+
 @pytest.mark.parametrize("mode", ["checked", "fast"])
 def test_backdate_compare_does_not_thaw_adapted_values(mode: str) -> None:
     stage = Input[int]("stage")
@@ -3562,6 +3634,36 @@ def test_prefrozen_nan_wrapper_result_backdates(mode: str) -> None:
     fresh_value = fresh.get(constant_items)
     assert math.isnan(list(cast(Any, second))[0])
     assert math.isnan(list(cast(Any, fresh_value))[0])
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_freshly_built_nan_result_backdates_and_holds_dependents(mode: str) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def measurement(db: Database) -> object:
+        stage.read(db)
+        return (1.0, float("nan"))
+
+    @query
+    def arity(db: Database) -> int:
+        return len(cast(Any, measurement(db)))
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(arity)
+    changed_at = _inspect_node(db, measurement).changed_at
+    backdates = db.statistics().query_backdates
+
+    db.set(stage, 1)
+    revision_after_set = db.revision
+    assert db.get(arity) == 2
+    record = _inspect_node(db, measurement)
+    assert record.last_decision == "backdated"
+    assert record.changed_at == changed_at
+    assert db.revision == revision_after_set
+    assert db.statistics().query_backdates == backdates + 1
+    assert _inspect_node(db, arity).last_decision == "reused"
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -3663,7 +3765,11 @@ def test_numeric_dict_key_recompute_decisions(mode: str) -> None:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("shape", ["bare", "tuple", "dict_value", "set_member", "dict_key"])
-def test_nan_result_executes_on_every_recompute(mode: str, shape: str) -> None:
+def test_nan_result_backdates_on_every_recompute(mode: str, shape: str) -> None:
+    # A NaN never equals itself, so comparing the snapshots alone would call
+    # every one of these an unequal result forever. The canonical encoding
+    # normalizes NaN to a single bit pattern, and the digests decide it, in
+    # every position a NaN can hold and in every mode.
     stage = Input[int]("stage")
 
     @query
@@ -3683,15 +3789,16 @@ def test_nan_result_executes_on_every_recompute(mode: str, shape: str) -> None:
     db = Database(mode=mode)
     db.set(stage, 0)
     db.get(produce)
+    changed_at = _inspect_node(db, produce).changed_at
 
     for step in (1, 2):
         db.set(stage, step)
         revision_after_set = db.revision
         db.get(produce)
         record = _inspect_node(db, produce)
-        assert record.last_decision == "executed"
-        assert db.revision == revision_after_set + 1
-        assert record.changed_at == db.revision
+        assert record.last_decision == "backdated"
+        assert db.revision == revision_after_set
+        assert record.changed_at == changed_at
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

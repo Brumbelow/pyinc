@@ -211,7 +211,7 @@ def test_manifest_missing_required_field_raises_value_error() -> None:
     db = Database(store=store)
 
     manifest = {
-        "pyinc_ckpt_version": 4,
+        "pyinc_ckpt_version": 5,
         "kernel_fingerprint_version": 2,
         "records": [{"kind": "query"}],
     }
@@ -725,6 +725,31 @@ def test_v2_manifest_rejected_loudly() -> None:
 
     manifest = {
         "pyinc_ckpt_version": 2,
+        "kernel_fingerprint_version": 2,
+        "records": [],
+    }
+    manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    key = "ck" + hashlib.sha256(manifest_bytes).hexdigest()
+    store.put(key, manifest_bytes)
+
+    with pytest.raises(ValueError, match="Unsupported checkpoint version"):
+        db.load_checkpoint(key)
+
+
+def test_v4_manifest_rejected_loudly() -> None:
+    """A 3.0.0 manifest records dependency sets this kernel no longer means.
+
+    3.0.0 recorded no dependencies for a reader whose resource read raised a
+    caught exception, so warming such a record here would report "dependencies
+    unchanged" for a node a fresh database re-derives. The record layout is
+    unchanged, which is exactly why the manifest version has to carry the
+    difference.
+    """
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+
+    manifest = {
+        "pyinc_ckpt_version": 4,
         "kernel_fingerprint_version": 2,
         "records": [],
     }

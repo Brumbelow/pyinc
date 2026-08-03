@@ -365,7 +365,7 @@ def _manifest(
     adapters: dict[object, object] | None = None,
 ) -> dict[str, Any]:
     return {
-        "pyinc_ckpt_version": 4,
+        "pyinc_ckpt_version": 5,
         "kernel_fingerprint_version": 2,
         "adapters": adapters or {},
         "records": records or [],
