@@ -2,9 +2,9 @@
 
 ## Supported versions
 
-Security fixes are released for the latest published minor version. `pyinc`
-follows semantic versioning; everything the `pyinc` package exports, and nothing
-else, carries that contract.
+Fixes land on the latest published minor version; the previous minor receives
+security fixes only. `pyinc` follows semantic versioning; everything the `pyinc`
+package exports, and nothing else, carries that contract.
 
 | Version | Supported |
 |---|---|

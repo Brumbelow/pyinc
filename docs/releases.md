@@ -36,10 +36,10 @@ Windows — plus static analysis, branch coverage, the documentation check,
 CodeQL, and a five-repetition run of the correctness and work-count benchmark
 must all pass before anything is built.
 
-**The artifacts.** The sdist and wheel are built once, installed into a clean
-virtual environment, and exercised there by running the shipped examples against
-the installed package. Those exact files, not a later rebuild, are what gets
-published.
+**The artifacts.** The sdist and wheel are built once. The wheel is installed
+into a clean virtual environment and exercised there by running the shipped
+examples against the installed package; the sdist is checked for completeness.
+Those exact files, not a later rebuild, are what gets published.
 
 **Publication.** Upload to PyPI uses trusted publishing over OIDC. No API token
 is stored in the repository or in Actions secrets.
