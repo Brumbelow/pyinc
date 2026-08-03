@@ -68,6 +68,7 @@ def markdown_files(root: Path) -> tuple[Path, ...]:
     """Return the checked Markdown files in deterministic order."""
     return (
         root / "README.md",
+        root / "CONTRIBUTING.md",
         root / "bench/README.md",
         *sorted((root / "docs").glob("*.md")),
     )
