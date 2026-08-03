@@ -330,6 +330,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on an `anyOf` null branch are validated like annotations anywhere else, and an
   `anyOf` whose branches are both `{"type": "null"}` is rejected rather than
   compiling to a bare `None` type.
+- A workspace path that swaps kind — a tracked file replaced on disk by a
+  same-named directory, or the reverse — no longer wedges mirror sync. The
+  conflicting mirror entry, and any conflicting entry between it and the
+  mirror root, is cleared before the new one is materialized, so the refresh
+  succeeds instead of raising and leaving its paths pending for every later
+  watcher tick to retry. A mirrored child whose parent is a file again is
+  dropped: the traversal reports that as absence rather than an unsafe path
+  component, while a symlinked parent — which reports the same errno under
+  `O_NOFOLLOW` — is still rejected. An overlay write lands over a mirror
+  directory the swap left behind.
+- The polling watcher stops for a closed session, not for any `RuntimeError`.
+  A `RecursionError` — a `RuntimeError` subclass — or a `RuntimeError` raised
+  while collecting the snapshot or refreshing now reaches the watcher's error
+  handler and the loop keeps polling, instead of silently retiring the watcher
+  thread as though the session had closed.
+- `WorkspaceSession`'s request lock is released even when tearing down its
+  integrations request scope or its kernel request span raises, and the span
+  closes even when the scope exit raises. A failure below the session can no
+  longer leave the lock held — which would have deadlocked every later call on
+  that session, `close()` included — or leave a kernel request open past the
+  stability it declares.
 
 ## [3.0.0] - 2026-07-12
 
