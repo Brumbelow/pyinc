@@ -1187,7 +1187,7 @@ class Database:
         }
         # A manifest is closed over its persisted query/resource dependencies.
         # If a stale child is omitted, every parent that references it is omitted
-        # too, so schema-v4 manifests never contain dangling dependency records.
+        # too, so schema-v5 manifests never contain dangling dependency records.
         changed = True
         while changed:
             changed = False

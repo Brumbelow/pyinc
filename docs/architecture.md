@@ -81,7 +81,7 @@ instead of manufacturing kernel store keys.
 `Database.save_checkpoint(store=None) -> str` serializes current node records,
 snapshot addresses, and dependency edges to a content-addressed key prefixed
 with `"ck"`. `Database.load_checkpoint(key, store=None)` accepts manifest
-schema v4 only and validates the entire manifest before staging any record:
+schema v5 only and validates the entire manifest before staging any record:
 kernel version, identities, input keys, dependency references, duplicates,
 types, and content addresses. Records whose live code/resources no longer
 match miss safely; structurally malformed or foreign manifests raise a typed

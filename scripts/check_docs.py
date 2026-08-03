@@ -21,6 +21,24 @@ _IMAGE_LINK = re.compile(r"!\[[^]]*\]\((?P<target>[^)\s]+)")
 _INLINE_CODE = re.compile(r"`([^`]+)`")
 _GITHUB_LOCAL_PREFIX = "/Brumbelow/pyinc/blob/main/"
 _PUBLIC_ROW_NAMES = frozenset({"Entrypoints", "Result types", "Shared types"})
+_CHECKPOINT_VERSION_NAME = "_CHECKPOINT_MANIFEST_VERSION"
+_CHECKPOINT_VERSION_SOURCE = Path("src/pyinc/runtime.py")
+# Prose that states the durable checkpoint manifest schema version. Each pattern
+# matches the surrounding sentence so a stale number cannot survive unnoticed.
+_CHECKPOINT_VERSION_PROSE = (
+    (
+        Path("docs/kernel-contract.md"),
+        re.compile(r"content-addressed manifest \(schema v(?P<version>\d+)\)"),
+    ),
+    (
+        Path("docs/architecture.md"),
+        re.compile(r"accepts manifest schema v(?P<version>\d+) only"),
+    ),
+    (
+        Path("docs/migration-v3.md"),
+        re.compile(r"Manifest schema v(?P<version>\d+) rejects"),
+    ),
+)
 _API_FILES = {
     "pyinc": Path("src/pyinc/__init__.py"),
     "pyinc.integrations": Path("src/pyinc/integrations/__init__.py"),
@@ -357,6 +375,46 @@ def check_documented_kernel_api(root: Path) -> tuple[str, ...]:
     return tuple(errors)
 
 
+def _read_checkpoint_manifest_version(root: Path) -> int:
+    path = root / _CHECKPOINT_VERSION_SOURCE
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == _CHECKPOINT_VERSION_NAME
+            for target in statement.targets
+        ):
+            continue
+        value = ast.literal_eval(statement.value)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        break
+    raise ValueError(f"{path} does not assign an integer {_CHECKPOINT_VERSION_NAME}")
+
+
+def check_checkpoint_manifest_version(root: Path) -> tuple[str, ...]:
+    """Pin the documented manifest schema version to the kernel's own constant."""
+    expected = _read_checkpoint_manifest_version(root)
+    errors: list[str] = []
+    for relative, pattern in _CHECKPOINT_VERSION_PROSE:
+        prose = re.sub(r"\s+", " ", " ".join(_prose_lines(root / relative)))
+        match = pattern.search(prose)
+        if match is None:
+            errors.append(
+                f"{relative}: no checkpoint manifest version statement "
+                f"matching {pattern.pattern!r}"
+            )
+            continue
+        documented = int(match.group("version"))
+        if documented != expected:
+            errors.append(
+                f"{relative}: documents checkpoint manifest schema v{documented}, "
+                f"but {_CHECKPOINT_VERSION_NAME} is {expected}"
+            )
+    return tuple(errors)
+
+
 def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
     """Run every offline documentation check."""
     files = markdown_files(root)
@@ -369,6 +427,7 @@ def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
         *check_cli_examples(root),
         *check_documented_integration_api(root),
         *check_documented_kernel_api(root),
+        *check_checkpoint_manifest_version(root),
     )
 
 
