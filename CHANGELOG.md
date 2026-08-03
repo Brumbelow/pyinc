@@ -371,6 +371,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `self-referential-alias` instead of emitting `Loop: TypeAlias = 'Loop | None'`,
   which no type checker can resolve. Recursion through a model or a container
   (`Tree` → `list[Tree | None]`) names a type and still generates.
+- An `@action` run that stops between publishing its outputs and publishing
+  its ledger no longer wedges every later run. A recorded output whose parent
+  path is now a file cannot exist, and a recorded output whose path is now a
+  directory holding nothing but files of the desired layout was already
+  released by the stopped run: both are recognized in preflight, so the next
+  locked `reconcile()` — and `plan()` — converge the set instead of raising
+  `ActionPathError` for every desired set until the manifest was edited by
+  hand. Recovery never deletes to repair, so a directory holding any other
+  entry still refuses under the tamper policy, and files a stopped run
+  published but never recorded stay unowned: a rollback or teardown that
+  would have to remove them is still refused until a reconcile of the
+  published layout records them.
+- `plan()` reports the prune refusal `reconcile()` enforces. A directory that
+  the previous layout must leave empty is checked for unowned entries during
+  preflight and the refusal names the blocking entry, so a dry run no longer
+  reports a clean migration that the next reconcile abandons after deleting
+  its orphans — and that reconcile now refuses before deleting anything.
 
 ## [3.0.0] - 2026-07-12
 
