@@ -605,6 +605,17 @@ def test_render_type_handles_valid_refs_nullable_unions_and_nested_arrays() -> N
         (False, "number", False),
         ("x", "string", True),
         ("x", "object", False),
+        # The supported nullable union admits the type it names and the null it
+        # adds, in either branch order.
+        ("x", ["string", "null"], True),
+        (None, ["string", "null"], True),
+        (None, ["null", "string"], True),
+        (1, ["integer", "null"], True),
+        (1, ["string", "null"], False),
+        ("x", ["object", "null"], False),
+        # Unions the compiler cannot render name no single type to check against.
+        ("x", ["string", "integer"], False),
+        ("x", ["string"], False),
     ],
 )
 def test_enum_type_matching_covers_all_supported_primitive_types(
@@ -639,6 +650,17 @@ def test_build_enum_reports_invalid_values_duplicates_mismatches_and_types() -> 
         "unsupported-enum-type",
     } <= _codes(malformed[7])
     assert malformed[5] == "docs"
+
+
+def test_build_enum_accepts_a_nullable_union_and_still_checks_its_members() -> None:
+    nullable = _build_enum("E", {"type": ["string", "null"], "enum": ["red", None]}, "", "/E", ())
+    assert nullable[7] == ()
+    assert (nullable[3], nullable[4]) == (("'red'", "None"), "str")
+
+    mismatched = _build_enum("E", {"type": ["string", "null"], "enum": ["red", 7]}, "", "/E", ())
+    assert [(code, pointer) for code, _message, _severity, pointer in mismatched[7]] == [
+        ("enum-type-mismatch", "/E/enum/1")
+    ]
 
 
 def test_field_collision_diagnostics_are_emitted_for_each_normalized_name() -> None:

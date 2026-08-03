@@ -381,6 +381,79 @@ def test_const_value_must_agree_with_the_declared_type(tmp_path: Path) -> None:
     assert diagnostic.json_pointer == "/$defs/Thing/properties/flag/const"
 
 
+def test_enum_and_const_members_agree_with_a_nullable_union_type(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Colour": {"type": ["string", "null"], "enum": ["red", None]},
+                "Thing": {
+                    "type": "object",
+                    "properties": {
+                        "shade": {"type": ["string", "null"], "enum": ["dark", None]},
+                        "tag": {"type": ["string", "null"], "const": None},
+                    },
+                },
+            }
+        },
+    )
+    db = Database(mode="strict")
+    # The union names one type plus null, so a member matching either agrees
+    # with it; the enum still selects the shape and renders the closed set.
+    assert schema_analysis(db, schema_path).errors == ()
+
+    generate(db, schema_path, out)
+    assert (out / "colour.py").read_text(encoding="utf-8") == (
+        "from __future__ import annotations\n"
+        "\n"
+        "from typing import Literal, TypeAlias\n"
+        "\n"
+        "Colour: TypeAlias = Literal['red', None]\n"
+    )
+    assert (out / "thing.py").read_text(encoding="utf-8") == (
+        "from __future__ import annotations\n"
+        "\n"
+        "from dataclasses import dataclass\n"
+        "from typing import Literal\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Thing:\n"
+        "    shade: Literal['dark', None] = None\n"
+        "    tag: Literal[None] = None\n"
+    )
+
+
+def test_members_that_match_no_arm_of_a_nullable_union_are_still_flagged(
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Colour": {"type": ["string", "null"], "enum": ["red", 7]},
+                "Thing": {
+                    "type": "object",
+                    "properties": {"tag": {"type": ["integer", "null"], "const": "x"}},
+                },
+            }
+        },
+    )
+    db = Database(mode="strict")
+    analysis = schema_analysis(db, schema_path)
+    assert {(d.code, d.json_pointer) for d in analysis.errors} == {
+        ("enum-type-mismatch", "/$defs/Colour/enum/1"),
+        ("const-type-mismatch", "/$defs/Thing/properties/tag/const"),
+    }
+    with pytest.raises(SchemaGenerationError):
+        generate(db, schema_path, out)
+    assert _tree(out) == {}
+
+
 @pytest.mark.parametrize(
     ("value", "code"),
     [

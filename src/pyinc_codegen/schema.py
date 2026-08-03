@@ -929,6 +929,14 @@ def _enum_value(value: object) -> str | None:
 def _enum_type_matches(value: object, declared_type: object) -> bool:
     if declared_type is None:
         return True
+    if isinstance(declared_type, list):
+        # The one union the compiler renders names a type plus null, so a member
+        # agrees with it when it matches that type or is the null it adds. Any
+        # other list names no single type to check a member against.
+        effective = _effective_type(declared_type)
+        if not isinstance(effective, str):
+            return False
+        return value is None or _enum_type_matches(value, effective)
     if declared_type == "null":
         return value is None
     if declared_type == "boolean":
@@ -1014,7 +1022,9 @@ def _build_enum(
         "boolean": "bool",
         "null": "None",
     }
-    declared = fragment.get("type")
+    # The supported nullable union names the type the members are drawn from;
+    # the enum already carries the null, so the union adds no base type.
+    declared = _effective_type(fragment.get("type"))
     if declared is not None and (not isinstance(declared, str) or declared not in base_map):
         diagnostics.append(
             _diagnostic(
