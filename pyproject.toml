@@ -17,12 +17,14 @@ classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
 ]
 dependencies = []
 
@@ -34,6 +36,7 @@ Homepage = "https://github.com/Brumbelow/pyinc"
 Documentation = "https://github.com/Brumbelow/pyinc/blob/main/docs/README.md"
 Repository = "https://github.com/Brumbelow/pyinc"
 Issues = "https://github.com/Brumbelow/pyinc/issues"
+Changelog = "https://github.com/Brumbelow/pyinc/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
