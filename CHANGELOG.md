@@ -68,8 +68,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still does not become a dataclass default.
 - New code-generation diagnostic codes: `ignored-constraint` (warning),
   `invalid-constraint` (error), `unconstrained-object-model` (warning),
-  `unsupported-const-value` (error), `const-type-mismatch` (error), and
-  `unsupported-tuple-items` (error).
+  `unsupported-const-value` (error), `const-type-mismatch` (error),
+  `unsupported-tuple-items` (error), and `self-referential-alias` (error).
 - Notebook code cells that fail to parse as Python are re-parsed after
   neutralizing IPython syntax: line magics, shell escapes, help forms, and
   capture assignments are replaced by equal-width placeholders, so the rest of
@@ -351,6 +351,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer leave the lock held — which would have deadlocked every later call on
   that session, `close()` included — or leave a kernel request open past the
   stability it declares.
+- A property named after a binding the generated module itself uses (`str`,
+  `dict`, `Literal`, and the rest of the emitter's closed set) is rejected with
+  the blocking `reserved-field-name` diagnostic at the property. The field bound
+  that name for the rest of its own class body, so the annotations after it
+  silently stopped naming the builtin or the `TYPE_CHECKING` import they spell —
+  `zone: str` read the model's own `str` field — and the emitted module failed
+  type checking with nothing reported by analysis.
+- `enum` and `const` members are checked against the nullable union declared
+  beside them instead of being reported as disagreeing with it. Only a string
+  `type` was understood, so every member of
+  `{"type": ["string", "null"], "enum": ["red", null]}` — including the ones
+  that matched — produced an `enum-type-mismatch` or `const-type-mismatch`
+  error, and a definition-level enum additionally rejected the union as an
+  `unsupported-enum-type`. A member matching neither the type the union names
+  nor the null it adds is still an error.
+- A definition whose alias resolves straight back to its own name — through a
+  bare `$ref`, a single-branch `allOf`, or a nullable `anyOf` — is reported as
+  `self-referential-alias` instead of emitting `Loop: TypeAlias = 'Loop | None'`,
+  which no type checker can resolve. Recursion through a model or a container
+  (`Tree` → `list[Tree | None]`) names a type and still generates.
 
 ## [3.0.0] - 2026-07-12
 
