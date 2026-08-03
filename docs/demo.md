@@ -8,6 +8,13 @@ no configuration added.
 ![Editing pytest under pyinc's watcher](assets/demo.gif)
 
 The watcher analyzes the tree once, then re-analyzes when edited files settle.
+The stats pane shows both halves of that split: 109.08 s to analyze all 270
+files from cold, then 632 ms to bring the graph back up to date after one edit
+to `src/_pytest/warning_types.py` — 73 queries executed, 9,767 reused, and 47
+backdated because recomputing them produced a semantically equal result. The
+1300 diagnostics are findings about pytest rather than tool noise: those visible
+in the clip are `undeclared-import`, reporting imports of installed
+distributions that pytest's own dependency metadata does not declare.
 
 ![Two edits under pyinc's watcher](assets/demo-beats.gif)
 

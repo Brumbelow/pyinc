@@ -56,9 +56,10 @@ action.
 ![Editing pytest under pyinc's watcher](https://raw.githubusercontent.com/Brumbelow/pyinc/main/docs/assets/demo.gif)
 
 `pyinc-tools` was pointed at a pinned checkout of pytest — nothing in it adapted
-for `pyinc` — and watched while single files were edited;
-[the demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) has
-the clips.
+for `pyinc` — and watched while single files were edited: 109.08 s to analyze
+all 270 files from cold, then 632 ms to catch up after an edit.
+[The demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) has
+the clips and reads the rest of the numbers.
 
 ## Correctness contract
 
