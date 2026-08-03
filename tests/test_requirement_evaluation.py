@@ -916,3 +916,30 @@ def test_version_specifier_evaluation_decode_shape() -> None:
     assert result.specifier == ">=1.0"
     assert result.version == "1.5"
     assert result.satisfied is True
+
+
+@pytest.mark.parametrize(
+    "spec_text",
+    [
+        "==1.0.*",
+        "!=1.0.*",
+        "==1.0.post1.*",
+        "!=1.0.post1.*",
+        "==1.0a1.*",
+        "==1.0.dev1.*",
+        "==1.0+local.*",
+        ">=1.0.*",
+        "<1.0.*",
+        "~=1.0.*",
+    ],
+)
+def test_wildcard_specifier_validity_matches_packaging(spec_text: str) -> None:
+    from pyinc.integrations._pep440 import parse_specifier_set
+
+    try:
+        SpecifierSet(spec_text)
+    except Exception:
+        packaging_accepts = False
+    else:
+        packaging_accepts = True
+    assert (parse_specifier_set(spec_text) is not None) == packaging_accepts

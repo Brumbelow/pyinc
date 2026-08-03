@@ -195,7 +195,16 @@ def parse_specifier_set(text: str) -> SpecifierSet | None:
         match = re.match(_SPEC_PAT, clause)
         if match is None:
             return None
-        specs.append((match.group(1), match.group(2).strip()))
+        operator, spec_version = match.group(1), match.group(2).strip()
+        if spec_version.endswith(".*") and operator != "===":
+            if operator not in ("==", "!="):
+                return None
+            base = parse_version(spec_version[:-2])
+            if base is None or base.pre is not None or base.post is not None:
+                return None
+            if base.dev is not None or base.local:
+                return None
+        specs.append((operator, spec_version))
     return tuple(specs)
 
 
@@ -217,6 +226,13 @@ def _satisfies_single(
         if spec_version is None:
             return None
         if operator not in ("==", "!="):
+            return None
+        if (
+            spec_version.pre is not None
+            or spec_version.post is not None
+            or spec_version.dev is not None
+            or spec_version.local
+        ):
             return None
         matches = _release_prefix_matches(spec_version, version)
         return matches if operator == "==" else not matches
