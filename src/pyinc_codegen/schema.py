@@ -84,8 +84,9 @@ _WINDOWS_RESERVED_MODULE_STEMS = frozenset(
 # The closed set of names every generated module binds: the fixed imports
 # ``_render_python`` emits plus the builtins ``_render_type`` spells in type
 # expressions. A model class with one of these names would shadow the binding
-# in every module that imports it under ``TYPE_CHECKING``, silently changing
-# what the other annotations mean. Keep this in sync with the emitter.
+# in every module that imports it under ``TYPE_CHECKING``, and a field with one
+# shadows it for the rest of its own class body, silently changing what the
+# other annotations mean. Keep this in sync with the emitter.
 _EMITTER_BOUND_NAMES = frozenset(
     {
         # Fixed imports.
@@ -262,9 +263,13 @@ def _is_reserved_field_name(name: str) -> bool:
     return normalized.startswith("__") and normalized.endswith("__")
 
 
+def _shadows_emitter_binding(name: str) -> bool:
+    return _python_identifier(name) in _EMITTER_BOUND_NAMES
+
+
 def _definition_name_diagnostics(name: str, json_pointer: str) -> tuple[DiagnosticPayload, ...]:
     normalized = _python_identifier(name)
-    if normalized in _EMITTER_BOUND_NAMES:
+    if _shadows_emitter_binding(name):
         return (
             _diagnostic(
                 "reserved-definition-name",
@@ -1173,6 +1178,20 @@ def _build_model(
                     _diagnostic(
                         "reserved-field-name",
                         f"property name is reserved by the Python data model: {property_name!r}",
+                        property_pointer,
+                    ),
+                )
+                continue
+            if _shadows_emitter_binding(property_name):
+                # A field binds its name in the class body, so every later
+                # annotation there reads the field instead of the import or
+                # builtin it names. Rejected like the definition name that
+                # shadows the same binding at module scope.
+                diagnostics += (
+                    _diagnostic(
+                        "reserved-field-name",
+                        "property name shadows a binding the generated module relies on: "
+                        f"{_python_identifier(property_name)!r}",
                         property_pointer,
                     ),
                 )

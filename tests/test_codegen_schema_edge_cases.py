@@ -139,6 +139,42 @@ def test_definition_name_diagnostics_cover_every_emitter_binding() -> None:
     assert _definition_name_diagnostics("STR", "/$defs/STR") == ()
 
 
+def test_property_names_shadowing_every_emitter_binding_are_rejected() -> None:
+    for reserved in sorted(_EMITTER_BOUND_NAMES):
+        model = _build_model(
+            "Thing",
+            {"type": "object", "properties": {reserved: {"type": "string"}}},
+            lambda name: False,
+            "/$defs/Thing",
+        )
+        assert [(code, severity, pointer) for code, _message, severity, pointer in model[7]] == [
+            ("reserved-field-name", "error", f"/$defs/Thing/properties/{reserved}")
+        ]
+        assert model[2] == ()
+
+    # The comparison runs on the NFKC-normalized name, like the emitted field.
+    fullwidth = "\N{FULLWIDTH LATIN SMALL LETTER S}tr"
+    normalized = _build_model(
+        "Thing",
+        {"type": "object", "properties": {fullwidth: {"type": "string"}}},
+        lambda name: False,
+        "/$defs/Thing",
+    )
+    assert _codes(normalized[7]) == {"reserved-field-name"}
+
+    unaffected = _build_model(
+        "Thing",
+        {
+            "type": "object",
+            "properties": {"str2": {"type": "string"}, "STR": {"type": "string"}},
+        },
+        lambda name: False,
+        "/$defs/Thing",
+    )
+    assert unaffected[7] == ()
+    assert [field[0] for field in unaffected[2]] == ["STR", "str2"]
+
+
 def test_pointer_decoders_cover_valid_escapes_and_malformed_sequences() -> None:
     assert _decode_pointer_segment("a~0b~1c") == "a~b/c"
     assert _decode_pointer_segment("trailing~") is None

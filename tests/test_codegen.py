@@ -1141,6 +1141,80 @@ def test_reserved_dunder_property_names_block_generation(tmp_path: Path) -> None
     assert _tree(out) == before
 
 
+def test_property_names_shadowing_generated_module_bindings_block_generation(
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(schema_path, {"$defs": {"Thing": {"type": "object"}}})
+    db = Database(mode="strict")
+    generate(db, schema_path, out)
+    before = _tree(out)
+
+    shadowing_names = ("Literal", "dict", "str")
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Thing": {
+                    "type": "object",
+                    "properties": {
+                        **{name: {"type": "string"} for name in shadowing_names},
+                        "zone": {"type": "string"},
+                    },
+                }
+            }
+        },
+    )
+    analysis = schema_analysis(db, schema_path)
+    # A field named after one of those bindings shadows it for every annotation
+    # in the same class body, so ``zone: str`` would stop naming the builtin.
+    diagnostics = [
+        diagnostic for diagnostic in analysis.errors if diagnostic.code == "reserved-field-name"
+    ]
+    assert {diagnostic.json_pointer for diagnostic in diagnostics} == {
+        f"/$defs/Thing/properties/{name}" for name in shadowing_names
+    }
+
+    with pytest.raises(SchemaGenerationError):
+        generate(db, schema_path, out)
+    with pytest.raises(SchemaGenerationError):
+        pyinc_codegen.generate_outputs.reconcile(db, str(schema_path), root=out)
+    assert _tree(out) == before
+
+
+def test_property_name_near_a_reserved_binding_still_generates(tmp_path: Path) -> None:
+    schema_path = tmp_path / "schema.json"
+    out = tmp_path / "generated"
+    _write_schema(
+        schema_path,
+        {
+            "$defs": {
+                "Thing": {
+                    "type": "object",
+                    "properties": {"str2": {"type": "string"}, "listing": {"type": "string"}},
+                    "required": ["str2", "listing"],
+                }
+            }
+        },
+    )
+    db = Database(mode="strict")
+    assert schema_analysis(db, schema_path).errors == ()
+
+    generate(db, schema_path, out)
+    assert (out / "thing.py").read_text(encoding="utf-8") == (
+        "from __future__ import annotations\n"
+        "\n"
+        "from dataclasses import dataclass\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Thing:\n"
+        "    listing: str\n"
+        "    str2: str\n"
+    )
+
+
 def test_non_identifier_definition_name_blocks_generation(tmp_path: Path) -> None:
     p = tmp_path / "s.json"
     out = tmp_path / "gen"
