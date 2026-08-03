@@ -17,6 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _FENCE_OPEN = re.compile(r"^(?P<marker>`{3,}|~{3,})\s*(?P<info>.*)$")
 _HEADING = re.compile(r"^(?P<level>#{1,6})\s+(?P<title>.+?)\s*#*\s*$")
 _INLINE_LINK = re.compile(r"(?<!!)\[[^]]*\]\((?P<target>[^)\s]+)")
+_IMAGE_LINK = re.compile(r"!\[[^]]*\]\((?P<target>[^)\s]+)")
 _INLINE_CODE = re.compile(r"`([^`]+)`")
 _GITHUB_LOCAL_PREFIX = "/Brumbelow/pyinc/blob/main/"
 _PUBLIC_ROW_NAMES = frozenset({"Entrypoints", "Result types", "Shared types"})
@@ -141,32 +142,37 @@ def _local_target(root: Path, source: Path, raw_target: str) -> tuple[Path, str]
 
 
 def check_local_links(root: Path, files: tuple[Path, ...]) -> tuple[str, ...]:
-    """Check local Markdown targets and fragments without requesting external URLs."""
+    """Check local Markdown and image targets without requesting external URLs.
+
+    Images are checked for existence only; an external image URL is left alone,
+    exactly as an external link is.
+    """
     errors: list[str] = []
     anchors: dict[Path, frozenset[str]] = {}
     resolved_root = root.resolve()
     for path in files:
         prose = "\n".join(_prose_lines(path))
         prose = _INLINE_CODE.sub("", prose)
-        for match in _INLINE_LINK.finditer(prose):
-            raw_target = match.group("target")
-            local = _local_target(root, path, raw_target)
-            if local is None:
-                continue
-            destination, fragment = local
-            resolved = destination.resolve()
-            try:
-                resolved.relative_to(resolved_root)
-            except ValueError:
-                errors.append(f"{path}: local link escapes the repository: {raw_target}")
-                continue
-            if not resolved.is_file():
-                errors.append(f"{path}: missing local link target: {raw_target}")
-                continue
-            if fragment:
-                destination_anchors = anchors.setdefault(resolved, heading_anchors(resolved))
-                if fragment.casefold() not in destination_anchors:
-                    errors.append(f"{path}: missing anchor #{fragment} in {resolved}")
+        for kind, pattern in (("link", _INLINE_LINK), ("image", _IMAGE_LINK)):
+            for match in pattern.finditer(prose):
+                raw_target = match.group("target")
+                local = _local_target(root, path, raw_target)
+                if local is None:
+                    continue
+                destination, fragment = local
+                resolved = destination.resolve()
+                try:
+                    resolved.relative_to(resolved_root)
+                except ValueError:
+                    errors.append(f"{path}: local {kind} escapes the repository: {raw_target}")
+                    continue
+                if not resolved.is_file():
+                    errors.append(f"{path}: missing local {kind} target: {raw_target}")
+                    continue
+                if fragment and kind == "link":
+                    destination_anchors = anchors.setdefault(resolved, heading_anchors(resolved))
+                    if fragment.casefold() not in destination_anchors:
+                        errors.append(f"{path}: missing anchor #{fragment} in {resolved}")
     return tuple(errors)
 
 
