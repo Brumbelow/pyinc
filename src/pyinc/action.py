@@ -10,7 +10,7 @@ import stat
 import tempfile
 import time
 import unicodedata
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, overload
@@ -307,6 +307,63 @@ def _safe_target(root: Path, relative: str) -> tuple[Path, os.stat_result | None
     return target, target_metadata
 
 
+def _orphan_cannot_exist(root: Path, relative: str) -> bool:
+    """Report whether a non-directory component makes a recorded path unreachable."""
+    current = root
+    for part in relative.split("/")[:-1]:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except OSError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            return False
+        if not stat.S_ISDIR(metadata.st_mode):
+            return True
+    return False
+
+
+def _holds_only_desired_outputs(target: Path, relative: str, desired: Collection[str]) -> bool:
+    """Report whether a directory holds nothing but regular files of the desired set."""
+    pending = [(target, relative)]
+    while pending:
+        directory, prefix = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                listing = list(entries)
+        except OSError:
+            return False
+        for entry in listing:
+            path = f"{prefix}/{entry.name}"
+            if entry.is_dir(follow_symlinks=False):
+                pending.append((Path(entry.path), path))
+            elif not entry.is_file(follow_symlinks=False) or path not in desired:
+                return False
+    return True
+
+
+def _unprunable_entry(
+    target: Path,
+    relative: str,
+    released: Collection[str],
+    prune_map: Mapping[str, str],
+) -> str | None:
+    """Return the first entry that stops a previous layout's directory from being pruned."""
+    try:
+        with os.scandir(target) as entries:
+            listing = sorted(entries, key=lambda entry: entry.name)
+    except OSError:
+        return None
+    for entry in listing:
+        path = f"{relative}/{entry.name}"
+        if path in released:
+            continue
+        if _portable_path_key(path) in prune_map and entry.is_dir(follow_symlinks=False):
+            continue
+        return path
+    return None
+
+
 class Action:
     """Reconcile a pure desired-output function against a filesystem root."""
 
@@ -484,7 +541,25 @@ class Action:
 
         targets: dict[str, tuple[Path, os.stat_result | None]] = {}
         for relative in previous_only:
+            if _orphan_cannot_exist(root, relative):
+                # A run that stopped before publishing its ledger left a file
+                # where this orphan's parent directory stood. No file can exist
+                # at the recorded path, so it is already released.
+                targets[relative] = (root.joinpath(*relative.split("/")), None)
+                continue
             target, metadata = _safe_target(root, relative)
+            if (
+                metadata is not None
+                and stat.S_ISDIR(metadata.st_mode)
+                and any(path.startswith(f"{relative}/") for path in desired)
+                and _holds_only_desired_outputs(target, relative, desired)
+            ):
+                # The desired layout nests outputs strictly beneath this path
+                # and the directory holds nothing else, so a run that stopped
+                # before publishing its ledger already released the orphan.
+                # Nothing here is deleted; the nested outputs are reconciled
+                # exactly as they would be under an unrecorded directory.
+                metadata = None
             if metadata is not None and not stat.S_ISREG(metadata.st_mode):
                 raise ActionPathError(f"Owned output target is not a regular file: {relative!r}")
             targets[relative] = (target, metadata)
@@ -516,6 +591,20 @@ class Action:
             if metadata is not None and not stat.S_ISREG(metadata.st_mode):
                 raise ActionPathError(f"Owned output target is not a regular file: {relative!r}")
             targets[relative] = (target, metadata)
+
+        # Pruning is refused for a directory that still holds an unowned entry.
+        # The refusal is decided here so a dry run reports it instead of a
+        # reconcile discovering it after its deletions.
+        for relative in sorted(prune_map.values()):
+            target, metadata = _safe_target(root, relative)
+            if metadata is None or not stat.S_ISDIR(metadata.st_mode):
+                continue
+            blocking = _unprunable_entry(target, relative, orphan_file_paths, prune_map)
+            if blocking is not None:
+                raise ActionPathError(
+                    f"Cannot prune directory {relative!r} left by the previous layout: "
+                    f"it still holds {blocking!r}"
+                )
 
         created: list[str] = []
         updated: list[str] = []

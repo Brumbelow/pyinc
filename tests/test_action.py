@@ -484,9 +484,37 @@ LAYOUT_KIND = Input[str]("layout_kind")
 
 @action(tool="layout-migration/1")
 def _emit_layout(db: Database) -> list[Output]:
-    if LAYOUT_KIND.read(db) == "file":
+    kind = LAYOUT_KIND.read(db)
+    if kind == "none":
+        return []
+    if kind == "file":
         return [Output.text("pkg", "file layout")]
     return [Output.text("pkg/model.py", "directory layout")]
+
+
+class _StoppedRun(RuntimeError):
+    """Marks the simulated stop between publication and the ledger write."""
+
+
+def _stop_before_the_ledger(*_args: object, **_kwargs: object) -> None:
+    raise _StoppedRun("stopped before the ledger was published")
+
+
+def _stop_layout_migration(root: Path, db: Database, kind: str) -> None:
+    """Publish the outputs of ``kind`` but stop before the ledger is written."""
+    action_module = importlib.import_module("pyinc.action")
+    db.set(LAYOUT_KIND, kind)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(action_module, "_write_manifest", _stop_before_the_ledger)
+        with pytest.raises(_StoppedRun):
+            _emit_layout.reconcile(db, root=root)
+
+
+def _ledger_outputs(root: Path) -> dict[str, str]:
+    manifest = _manifest_path(root, _emit_layout.tool)
+    outputs = json.loads(manifest.read_text(encoding="utf-8"))["outputs"]
+    assert isinstance(outputs, dict)
+    return outputs
 
 
 def test_file_to_directory_output_migration_converges_like_a_fresh_root(tmp_path: Path) -> None:
@@ -615,6 +643,286 @@ def test_casefold_twin_of_an_orphan_does_not_bypass_desired_target_validation(
         _emit_case_layout.reconcile(db, root=tmp_path)
     assert (tmp_path / "PKG").read_text(encoding="utf-8") == "upper file layout"
     assert (tmp_path / "pkg" / "model.py" / "user.txt").read_text(encoding="utf-8") == "user data"
+
+
+def test_file_to_directory_crash_before_the_ledger_write_converges(tmp_path: Path) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "file")
+    _emit_layout.reconcile(db, root=inc_root)
+    stale_ledger = {"pkg": _content_hash(b"file layout")}
+
+    _stop_layout_migration(inc_root, db, "directory")
+    assert (inc_root / "pkg" / "model.py").read_text(encoding="utf-8") == "directory layout"
+    assert _ledger_outputs(inc_root) == stale_ledger
+
+    plan = _emit_layout.plan(db, root=inc_root)
+    assert plan.dry_run is True
+    assert plan.unchanged == ("pkg/model.py",)
+    assert plan.deleted == plan.created == plan.updated == plan.repaired == ()
+    assert _ledger_outputs(inc_root) == stale_ledger
+
+    result = _emit_layout.reconcile(db, root=inc_root)
+    assert result.unchanged == ("pkg/model.py",)
+    assert result.deleted == result.created == result.updated == result.repaired == ()
+    assert _ledger_outputs(inc_root) == {"pkg/model.py": _content_hash(b"directory layout")}
+
+    fresh_root = tmp_path / "fresh"
+    fresh_db = Database(mode="strict")
+    fresh_db.set(LAYOUT_KIND, "directory")
+    _emit_layout.reconcile(fresh_db, root=fresh_root)
+    assert _tree(inc_root) == _tree(fresh_root)
+
+
+def test_directory_to_file_crash_before_the_ledger_write_converges(tmp_path: Path) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "directory")
+    _emit_layout.reconcile(db, root=inc_root)
+    stale_ledger = {"pkg/model.py": _content_hash(b"directory layout")}
+
+    _stop_layout_migration(inc_root, db, "file")
+    assert (inc_root / "pkg").read_text(encoding="utf-8") == "file layout"
+    assert _ledger_outputs(inc_root) == stale_ledger
+
+    plan = _emit_layout.plan(db, root=inc_root)
+    assert plan.dry_run is True
+    assert plan.unchanged == ("pkg",)
+    assert plan.deleted == plan.created == plan.updated == plan.repaired == ()
+    assert _ledger_outputs(inc_root) == stale_ledger
+
+    result = _emit_layout.reconcile(db, root=inc_root)
+    assert result.unchanged == ("pkg",)
+    assert result.deleted == result.created == result.updated == result.repaired == ()
+    assert _ledger_outputs(inc_root) == {"pkg": _content_hash(b"file layout")}
+
+    fresh_root = tmp_path / "fresh"
+    fresh_db = Database(mode="strict")
+    fresh_db.set(LAYOUT_KIND, "file")
+    _emit_layout.reconcile(fresh_db, root=fresh_root)
+    assert _tree(inc_root) == _tree(fresh_root)
+
+
+def test_partially_published_migration_converges(tmp_path: Path) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "file")
+    _emit_layout.reconcile(db, root=inc_root)
+    (inc_root / "pkg").unlink()
+    (inc_root / "pkg").mkdir()
+
+    db.set(LAYOUT_KIND, "directory")
+    result = _emit_layout.reconcile(db, root=inc_root)
+
+    assert result.created == ("pkg/model.py",)
+    assert result.deleted == ()
+    assert (inc_root / "pkg" / "model.py").read_text(encoding="utf-8") == "directory layout"
+
+
+@pytest.mark.parametrize(
+    ("stopped", "rolled_back"),
+    (("directory", "file"), ("file", "directory")),
+)
+def test_rollback_after_a_crash_window_converges(
+    tmp_path: Path, stopped: str, rolled_back: str
+) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, rolled_back)
+    _emit_layout.reconcile(db, root=inc_root)
+    _stop_layout_migration(inc_root, db, stopped)
+    _emit_layout.reconcile(db, root=inc_root)
+
+    db.set(LAYOUT_KIND, rolled_back)
+    result = _emit_layout.reconcile(db, root=inc_root)
+
+    assert result.deleted != ()
+    fresh_root = tmp_path / "fresh"
+    fresh_db = Database(mode="strict")
+    fresh_db.set(LAYOUT_KIND, rolled_back)
+    _emit_layout.reconcile(fresh_db, root=fresh_root)
+    assert _tree(inc_root) == _tree(fresh_root)
+
+
+def test_teardown_after_a_directory_to_file_crash_releases_the_recorded_layout(
+    tmp_path: Path,
+) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "directory")
+    _emit_layout.reconcile(db, root=inc_root)
+    _stop_layout_migration(inc_root, db, "file")
+
+    db.set(LAYOUT_KIND, "none")
+    result = _emit_layout.reconcile(db, root=inc_root)
+
+    assert result.deleted == ()
+    assert _ledger_outputs(inc_root) == {}
+    # The stopped run published this file without recording it; it is unowned
+    # now and must survive the teardown.
+    assert (inc_root / "pkg").read_text(encoding="utf-8") == "file layout"
+
+
+def test_teardown_after_a_file_to_directory_crash_follows_tamper_policy(tmp_path: Path) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "file")
+    _emit_layout.reconcile(db, root=inc_root)
+    _stop_layout_migration(inc_root, db, "directory")
+
+    db.set(LAYOUT_KIND, "none")
+    with pytest.raises(ActionPathError, match="not a regular file"):
+        _emit_layout.reconcile(db, root=inc_root)
+    assert (inc_root / "pkg" / "model.py").read_text(encoding="utf-8") == "directory layout"
+
+    # Converging the layout the stopped run published records it, after which
+    # the teardown owns the file it must delete.
+    db.set(LAYOUT_KIND, "directory")
+    _emit_layout.reconcile(db, root=inc_root)
+    db.set(LAYOUT_KIND, "none")
+    result = _emit_layout.reconcile(db, root=inc_root)
+
+    assert result.deleted == ("pkg/model.py",)
+    assert not (inc_root / "pkg" / "model.py").exists()
+
+
+def test_rollback_before_the_ledger_is_repaired_keeps_unrecorded_files(tmp_path: Path) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "file")
+    _emit_layout.reconcile(db, root=inc_root)
+    _stop_layout_migration(inc_root, db, "directory")
+
+    db.set(LAYOUT_KIND, "file")
+    with pytest.raises(ActionPathError, match="not a regular file"):
+        _emit_layout.reconcile(db, root=inc_root)
+    assert (inc_root / "pkg" / "model.py").read_text(encoding="utf-8") == "directory layout"
+    assert _ledger_outputs(inc_root) == {"pkg": _content_hash(b"file layout")}
+
+
+def test_crash_recovery_does_not_release_a_directory_holding_unowned_files(
+    tmp_path: Path,
+) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "file")
+    _emit_layout.reconcile(db, root=inc_root)
+    _stop_layout_migration(inc_root, db, "directory")
+    (inc_root / "pkg" / "user.txt").write_text("user data", encoding="utf-8")
+
+    with pytest.raises(ActionPathError, match="not a regular file"):
+        _emit_layout.plan(db, root=inc_root)
+    with pytest.raises(ActionPathError, match="not a regular file"):
+        _emit_layout.reconcile(db, root=inc_root)
+    assert (inc_root / "pkg" / "user.txt").read_text(encoding="utf-8") == "user data"
+
+
+def test_orphan_whose_directory_was_already_pruned_converges(tmp_path: Path) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "directory")
+    _emit_layout.reconcile(db, root=inc_root)
+    # A run that stopped after its deletions and prune but before publication.
+    (inc_root / "pkg" / "model.py").unlink()
+    (inc_root / "pkg").rmdir()
+
+    db.set(LAYOUT_KIND, "file")
+    result = _emit_layout.reconcile(db, root=inc_root)
+
+    assert result.created == ("pkg",)
+    assert result.deleted == ()
+    assert (inc_root / "pkg").read_text(encoding="utf-8") == "file layout"
+
+
+def test_orphan_under_a_symbolic_link_is_never_released(tmp_path: Path) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "directory")
+    _emit_layout.reconcile(db, root=inc_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "model.py").write_text("outside data", encoding="utf-8")
+    (inc_root / "pkg" / "model.py").unlink()
+    (inc_root / "pkg").rmdir()
+    try:
+        (inc_root / "pkg").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink support is unavailable")
+
+    db.set(LAYOUT_KIND, "file")
+    with pytest.raises(ActionPathError, match="symbolic link"):
+        _emit_layout.reconcile(db, root=inc_root)
+    assert (outside / "model.py").read_text(encoding="utf-8") == "outside data"
+
+
+NESTED_LAYOUT_KIND = Input[str]("nested_layout_kind")
+
+
+@action(tool="layout-migration-nested/1")
+def _emit_nested_layout(db: Database) -> list[Output]:
+    if NESTED_LAYOUT_KIND.read(db) == "file":
+        return [Output.text("pkg", "file layout")]
+    return [Output.text("pkg/inner/model.py", "nested layout")]
+
+
+def test_nested_layout_crash_before_the_ledger_write_converges(tmp_path: Path) -> None:
+    inc_root = tmp_path / "inc"
+    db = Database(mode="strict")
+    db.set(NESTED_LAYOUT_KIND, "file")
+    _emit_nested_layout.reconcile(db, root=inc_root)
+
+    db.set(NESTED_LAYOUT_KIND, "nested")
+    action_module = importlib.import_module("pyinc.action")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(action_module, "_write_manifest", _stop_before_the_ledger)
+        with pytest.raises(_StoppedRun):
+            _emit_nested_layout.reconcile(db, root=inc_root)
+
+    result = _emit_nested_layout.reconcile(db, root=inc_root)
+
+    assert result.unchanged == ("pkg/inner/model.py",)
+    assert result.deleted == ()
+
+    db.set(NESTED_LAYOUT_KIND, "file")
+    rolled_back = _emit_nested_layout.reconcile(db, root=inc_root)
+    assert rolled_back.created == ("pkg",)
+    assert rolled_back.deleted == ("pkg/inner/model.py",)
+    assert (inc_root / "pkg").read_text(encoding="utf-8") == "file layout"
+
+
+def test_nested_prune_refusal_names_the_directory_that_still_holds_an_entry(
+    tmp_path: Path,
+) -> None:
+    db = Database(mode="strict")
+    db.set(NESTED_LAYOUT_KIND, "nested")
+    _emit_nested_layout.reconcile(db, root=tmp_path)
+    unowned = tmp_path / "pkg" / "inner" / "unowned.txt"
+    unowned.write_text("keep", encoding="utf-8")
+
+    db.set(NESTED_LAYOUT_KIND, "file")
+    with pytest.raises(ActionPathError, match="'pkg/inner'"):
+        _emit_nested_layout.plan(db, root=tmp_path)
+    assert unowned.read_text(encoding="utf-8") == "keep"
+    assert (tmp_path / "pkg" / "inner" / "model.py").exists()
+
+
+def test_plan_surfaces_the_prune_refusal_reconcile_enforces(tmp_path: Path) -> None:
+    db = Database(mode="strict")
+    db.set(LAYOUT_KIND, "directory")
+    _emit_layout.reconcile(db, root=tmp_path)
+    unowned = tmp_path / "pkg" / "unowned.txt"
+    unowned.write_text("keep", encoding="utf-8")
+
+    db.set(LAYOUT_KIND, "file")
+    with pytest.raises(ActionPathError, match="prune"):
+        _emit_layout.plan(db, root=tmp_path)
+    with pytest.raises(ActionPathError, match="prune"):
+        _emit_layout.reconcile(db, root=tmp_path)
+
+    assert unowned.read_text(encoding="utf-8") == "keep"
+    # The refusal is preflight, so the orphan is still there to delete once the
+    # unowned entry is gone.
+    assert (tmp_path / "pkg" / "model.py").read_text(encoding="utf-8") == "directory layout"
 
 
 def test_tracked_missing_output_is_repaired(tmp_path: Path) -> None:

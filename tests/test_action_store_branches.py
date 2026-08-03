@@ -15,7 +15,9 @@ from pyinc.action import (
     Action,
     Output,
     _action_lock_directory,
+    _holds_only_desired_outputs,
     _safe_target,
+    _unprunable_entry,
     _validate_path_set,
     action,
 )
@@ -492,6 +494,15 @@ def test_action_rechecks_orphan_before_deleting(
         with pytest.raises(ActionPathError, match="non-regular owned target"):
             declared._reconcile_locked({}, root=root, state_dir=root, dry_run=False)
         assert directory.is_dir()
+
+
+def test_unreadable_migration_directories_are_left_to_the_write_and_prune_steps(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+
+    assert _holds_only_desired_outputs(missing, "missing", {"missing/model.py"}) is False
+    assert _unprunable_entry(missing, "missing", set(), {}) is None
 
 
 def test_action_supports_direct_decorator_form() -> None:
