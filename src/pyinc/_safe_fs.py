@@ -44,6 +44,8 @@ _WIN_ERROR_FILE_NOT_FOUND = 2
 _WIN_ERROR_PATH_NOT_FOUND = 3
 _WIN_ERROR_FILE_EXISTS = 80
 _WIN_ERROR_ALREADY_EXISTS = 183
+_WIN_ERROR_ACCESS_DENIED = 5
+_WIN_ERROR_SHARING_VIOLATION = 32
 _WIN_MISSING_ERRORS = frozenset({_WIN_ERROR_FILE_NOT_FOUND, _WIN_ERROR_PATH_NOT_FOUND})
 _WIN_EXISTS_ERRORS = frozenset({_WIN_ERROR_FILE_EXISTS, _WIN_ERROR_ALREADY_EXISTS})
 _WIN_INVALID_HANDLE = ctypes.c_void_p(-1).value
@@ -530,6 +532,38 @@ def open_lock_file(path: Path) -> BinaryIO:
         if descriptor >= 0:
             os.close(descriptor)
         os.close(parent_fd)
+
+
+def transient_lock_open_failure(error: OSError, path: Path) -> bool:
+    """Whether a failed lock-file open may be retried within the caller's deadline.
+
+    A concurrent lock holder (or a scanner holding the file) surfaces as a
+    sharing violation, or as access-denied while the file is briefly held.
+    Access-denied is retryable only while the lock path itself is still a
+    regular file or missing; a directory or other special file at the path is a
+    real misconfiguration and stays fatal, as does every other failure.
+    """
+    if isinstance(error, UnsafeFilesystemPathError):
+        cause = error.__cause__
+        if not isinstance(cause, OSError):
+            return False
+        error = cause
+    winerror = getattr(error, "winerror", None)
+    if winerror == _WIN_ERROR_SHARING_VIOLATION:
+        return True
+    if winerror == _WIN_ERROR_ACCESS_DENIED:
+        return _lock_path_regular_or_missing(path)
+    return False
+
+
+def _lock_path_regular_or_missing(path: Path) -> bool:
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return stat.S_ISREG(mode)
 
 
 def ensure_directory(path: Path) -> None:

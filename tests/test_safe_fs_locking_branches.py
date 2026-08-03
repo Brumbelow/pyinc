@@ -1269,3 +1269,47 @@ def test_windows_lock_file_closes_partial_resources_on_failure(
 
     assert context.close_calls == 1
     assert api.closed == ([] if failure_stage == "open" else [81])
+
+
+def test_sharing_violation_classifies_as_transient_lock_open_failure(
+    tmp_path: Path,
+) -> None:
+    error = _windows_error(32, "sharing violation")
+    assert safe_fs.transient_lock_open_failure(error, tmp_path / "store.lock")
+
+
+def test_access_denied_is_transient_only_while_the_lock_path_stays_regular_or_missing(
+    tmp_path: Path,
+) -> None:
+    denied = _windows_error(5, "access denied")
+    missing = tmp_path / "store.lock"
+    assert safe_fs.transient_lock_open_failure(denied, missing)
+
+    regular = tmp_path / "present.lock"
+    regular.write_bytes(b"\0")
+    assert safe_fs.transient_lock_open_failure(denied, regular)
+
+    directory = tmp_path / "dir.lock"
+    directory.mkdir()
+    assert not safe_fs.transient_lock_open_failure(denied, directory)
+
+
+def test_wrapped_posix_open_failures_classify_through_their_cause(tmp_path: Path) -> None:
+    cause = _windows_error(32)
+    wrapped = safe_fs.UnsafeFilesystemPathError("Cannot safely open lock file")
+    wrapped.__cause__ = cause
+    assert safe_fs.transient_lock_open_failure(wrapped, tmp_path / "store.lock")
+
+    unwrapped_cause = safe_fs.UnsafeFilesystemPathError("no cause attached")
+    assert not safe_fs.transient_lock_open_failure(
+        unwrapped_cause, tmp_path / "store.lock"
+    )
+
+
+def test_ordinary_open_failures_stay_fatal(tmp_path: Path) -> None:
+    assert not safe_fs.transient_lock_open_failure(
+        OSError(13, "plain errno"), tmp_path / "x"
+    )
+    assert not safe_fs.transient_lock_open_failure(
+        _windows_error(2, "file not found"), tmp_path / "x"
+    )
