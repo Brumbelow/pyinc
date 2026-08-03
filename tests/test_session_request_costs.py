@@ -9,7 +9,9 @@ it on every increment (see `tests/test_source_ranges_caching.py`).
 
 from __future__ import annotations
 
+import gc
 import sys
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from types import FrameType
@@ -273,12 +275,14 @@ def test_decode_memo_is_skipped_when_payload_identity_is_unstable(tmp_path: Path
     """Off `strict`, `db.get` thaws a fresh object per call, so every entry would miss."""
 
     _write_workspace(tmp_path)
-    _decoding._CACHE.clear()
+    _decoding._CACHES.clear()
     for mode in ("fast", "checked"):
-        workspace_analysis(Database(mode=mode), tmp_path)
-        assert _decoding._CACHE == {}, mode
-    workspace_analysis(Database(mode="strict"), tmp_path)
-    assert _decoding._CACHE
+        db = Database(mode=mode)
+        workspace_analysis(db, tmp_path)
+        assert _decoding._CACHES.get(db) is None, mode
+    strict_db = Database(mode="strict")
+    workspace_analysis(strict_db, tmp_path)
+    assert _decoding._CACHES.get(strict_db)
 
 
 def test_a_mid_request_mirror_rewrite_drops_the_memo(tmp_path: Path) -> None:
@@ -305,3 +309,37 @@ def test_a_mid_request_mirror_rewrite_drops_the_memo(tmp_path: Path) -> None:
         result = session.analyze_file("delta.py")
         assert result.symbols is not None
         assert [symbol.qualified_name for symbol in result.symbols.symbols] == ["one", "five"]
+
+
+class _WeakrefablePayload(list[str]):
+    """Plain tuples and lists take no weak references; a list subclass does."""
+
+
+def test_decode_memo_entries_die_with_their_database() -> None:
+    db = Database(mode="strict")
+    payload = _WeakrefablePayload(["payload"])
+    decoded_value = _decoding.decoded(
+        db, "kind", (payload,), lambda: _WeakrefablePayload(["decoded"])
+    )
+    assert decoded_value == ["decoded"]
+    payload_ref = weakref.ref(payload)
+    decoded_ref = weakref.ref(decoded_value)
+    del payload, decoded_value, db
+    gc.collect()
+    assert payload_ref() is None
+    assert decoded_ref() is None
+
+
+def test_decode_memo_still_hits_within_a_live_database() -> None:
+    db = Database(mode="strict")
+    payload = _WeakrefablePayload(["payload"])
+    calls = {"count": 0}
+
+    def decode() -> str:
+        calls["count"] += 1
+        return "value"
+
+    first = _decoding.decoded(db, "kind", (payload,), decode)
+    second = _decoding.decoded(db, "kind", (payload,), decode)
+    assert first == second == "value"
+    assert calls["count"] == 1

@@ -18,6 +18,10 @@ call, so every lookup would miss and every miss would pin one more payload tree
 and decoded tree until the bound reset the whole cache. Off `strict` the memo is
 skipped outright.
 
+The memo is keyed per database through a weak reference, so a dropped database
+releases every payload and decoded value it pinned; the entry bound applies
+per database.
+
 `once_per_request` keys on the call itself, and lives only for the span a caller
 declares with `request_scope`. A `WorkspaceSession` holds its lock for the whole of
 each public method and its inputs cannot change while it is held, so an
@@ -30,6 +34,7 @@ does rewrite the mirror inside one of its own methods calls
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -48,7 +53,9 @@ _T = TypeVar("_T")
 # time, which keeps lookups a single dict hit.
 _MAX_ENTRIES = 8192
 
-_CACHE: dict[tuple[Any, ...], tuple[tuple[Any, ...], Any]] = {}
+_CACHES: weakref.WeakKeyDictionary[
+    Database, dict[tuple[Any, ...], tuple[tuple[Any, ...], Any]]
+] = weakref.WeakKeyDictionary()
 
 _REQUEST: ContextVar[tuple[Database, dict[Any, Any]] | None] = ContextVar(
     "pyinc_integration_request", default=None
@@ -66,16 +73,20 @@ def decoded(
 
     if db.mode != "strict":
         return decode()
+    cache = _CACHES.get(db)
+    if cache is None:
+        cache = {}
+        _CACHES[db] = cache
     key = (kind, *(id(source) for source in sources))
-    entry = _CACHE.get(key)
+    entry = cache.get(key)
     if entry is not None:
         held, value = entry
         if all(left is right for left, right in zip(held, sources, strict=True)):
             return value  # type: ignore[no-any-return]
     value = decode()
-    if len(_CACHE) >= _MAX_ENTRIES:
-        _CACHE.clear()
-    _CACHE[key] = (sources, value)
+    if len(cache) >= _MAX_ENTRIES:
+        cache.clear()
+    cache[key] = (sources, value)
     return value
 
 
