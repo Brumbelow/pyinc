@@ -9,11 +9,12 @@ before the first ``get()``.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from pyinc import Database, query
-from pyinc.resources import Resource
+from pyinc.resources import FileStatResource, Resource
 
 
 def _tally(key: str, event: str) -> None:
@@ -302,3 +303,29 @@ def test_warm_probe_hit_counts_as_probe_hit_not_load(tmp_path: Path) -> None:
     stats = db.statistics()
     assert stats.resource_loads == 2
     assert _tallied(target) == "pl" + "p" + "ppl"
+
+
+def test_filestat_probe_and_load_classify_failures_identically(tmp_path: Path) -> None:
+    resource = FileStatResource()
+    db = Database(mode="strict")
+
+    missing = tmp_path / "absent.txt"
+    probe_result = resource.probe(missing)
+    load_result = resource.load(db, missing)
+    assert probe_result == (False, None, None)
+    assert (load_result.exists, load_result.size, load_result.mtime_ns) == (False, None, None)
+
+    through_file = tmp_path / "plain.txt" / "child"
+    (tmp_path / "plain.txt").write_text("x", encoding="utf-8")
+
+    def outcome(call: Callable[[], object]) -> type[BaseException] | object:
+        try:
+            call()
+        except OSError as error:
+            return type(error)
+        return "no error"
+
+    assert outcome(lambda: resource.probe(through_file)) == outcome(
+        lambda: resource.load(db, through_file)
+    )
+    assert outcome(lambda: resource.probe(through_file)) != "no error"
