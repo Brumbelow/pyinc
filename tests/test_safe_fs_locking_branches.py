@@ -1313,3 +1313,55 @@ def test_ordinary_open_failures_stay_fatal(tmp_path: Path) -> None:
     assert not safe_fs.transient_lock_open_failure(
         _windows_error(2, "file not found"), tmp_path / "x"
     )
+
+
+def test_acquire_retries_transient_open_failures_until_the_open_succeeds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = {"count": 0}
+    stream = _TrackingStream()
+
+    def flaky_open(path: Path) -> _TrackingStream:
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise _windows_error(32, "sharing violation")
+        return stream
+
+    monkeypatch.setattr(locking, "open_lock_file", flaky_open)
+    monkeypatch.setattr(locking, "_try_lock", lambda handle: None)
+    lock = locking.FileLock(tmp_path / "store.lock", timeout=5.0)
+    lock.acquire()
+    try:
+        assert calls["count"] == 3
+        assert lock._handle is stream
+    finally:
+        monkeypatch.setattr(locking, "_unlock", lambda handle: None)
+        lock.release()
+
+
+def test_acquire_raises_timeout_when_transient_open_failures_outlast_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def always_contended(path: Path) -> _TrackingStream:
+        raise _windows_error(32, "sharing violation")
+
+    monkeypatch.setattr(locking, "open_lock_file", always_contended)
+    lock = locking.FileLock(tmp_path / "store.lock", timeout=0)
+    with pytest.raises(TimeoutError, match="waiting for lock"):
+        lock.acquire()
+
+
+def test_acquire_propagates_nontransient_open_failures_immediately(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = {"count": 0}
+
+    def broken_open(path: Path) -> _TrackingStream:
+        calls["count"] += 1
+        raise _windows_error(2, "file not found")
+
+    monkeypatch.setattr(locking, "open_lock_file", broken_open)
+    lock = locking.FileLock(tmp_path / "store.lock", timeout=5.0)
+    with pytest.raises(OSError):
+        lock.acquire()
+    assert calls["count"] == 1

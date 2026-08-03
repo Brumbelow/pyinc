@@ -12,7 +12,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, Protocol, cast
 
-from ._safe_fs import open_lock_file
+from ._safe_fs import open_lock_file, transient_lock_open_failure
 
 
 class _MsvcrtModule(Protocol):
@@ -40,14 +40,8 @@ class FileLock:
         self._handle: BinaryIO | None = None
 
     def acquire(self) -> None:
-        handle = open_lock_file(self.path)
-        if os.name == "nt":
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-
         deadline = time.monotonic() + self.timeout
+        handle = self._open_within(deadline)
         while True:
             try:
                 _try_lock(handle)
@@ -64,6 +58,26 @@ class FileLock:
             else:
                 self._handle = handle
                 return
+
+    def _open_within(self, deadline: float) -> BinaryIO:
+        while True:
+            try:
+                handle = open_lock_file(self.path)
+            except OSError as error:
+                if not transient_lock_open_failure(error, self.path):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out after {self.timeout:g}s waiting for lock {self.path}."
+                    ) from error
+                time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+            else:
+                if os.name == "nt":
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b"\0")
+                        handle.flush()
+                return handle
 
     def release(self) -> None:
         handle = self._handle

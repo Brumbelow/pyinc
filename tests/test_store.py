@@ -964,3 +964,17 @@ def test_checkpoint_store_passed_to_save_and_load_directly() -> None:
     db2.load_checkpoint(ck_key, store=store)
     assert db2.get(ckp_sq) == 36
     assert db2.inspect(ckp_sq).last_recompute == "reused"
+
+
+def test_filesystem_store_reports_exhausted_open_retries_as_lock_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def always_contended(path: Path) -> object:
+        error = OSError(13, "transient contention")
+        error.winerror = 32  # type: ignore[attr-defined]
+        raise error
+
+    monkeypatch.setattr("pyinc._locking.open_lock_file", always_contended)
+    store = FileSystemArtifactStore(tmp_path, lock_timeout=0)
+    with pytest.raises(ArtifactStoreLockError):
+        store.put("f" * 64, b"payload")
