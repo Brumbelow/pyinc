@@ -152,9 +152,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every accepted document within the snapshot depth the value layer supports;
   TOML's is half of JSON's because its cutoff encoding spends two snapshot
   levels per table.
-- The JSON integration's pre-parse depth scan moves its query fingerprints, so
-  checkpoints saved by an earlier release miss for JSON analysis and safely
-  re-execute.
+- The JSON integration's pre-parse depth scan moves its query fingerprints.
 - Code generation selects a schema node's shape by one precedence everywhere —
   `$ref`, then `allOf`/`anyOf`, then `enum`, then `const`, then `type`.
 - Root-schema violations are reported as one `unsupported-root-schema` error at
@@ -182,6 +180,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `getmtime`), the byte-oriented environment (`os.getenvb`, `os.environb`), and
   the working directory (`os.getcwd`, `Path.cwd`). These are not intercepted;
   route them through `FileStatResource` or `db.report_untracked_read`.
+- The durable checkpoint manifest version is `5`. A manifest written by 3.0.0
+  records version `4` and `load_checkpoint` now rejects it loudly. The record
+  layout is identical either way, so nothing else would have caught the
+  difference: 3.0.0 recorded no dependencies for a query whose resource read
+  raised a caught exception, and such a record warms under this release
+  reporting "dependencies unchanged" while a fresh database re-derives it from
+  the resource. Re-save affected checkpoints.
+- `db.set` and `db.set_many` decide default (no `eq=`, no `cutoff=`) input
+  equality on the stored canonical snapshots — the same operands and the same
+  decision recomputation uses. They previously compared thawed values, which
+  drops `FrozenRecord` type identity: setting `GridPoint(1, 2)` and then
+  `{"x": 1, "y": 2}`, or a same-shaped different dataclass, counted as an
+  equal update and was ignored, while the stored snapshot was replaced anyway,
+  so a warm `strict`-mode dependent kept a dataclass-derived result no fresh
+  database produces. This completes the "default comparisons no longer invoke
+  `ValueAdapter` `thaw`/`freeze` hooks in any mode" change: the default input
+  path now runs no adapter hook beyond freezing the incoming value. Inputs
+  declared with `eq=` or `cutoff=` are unaffected and keep comparing the
+  values as written.
+- A recomputation producing an equal NaN-bearing value backdates like every
+  other unchanged value. The default decision compares stored snapshots and a
+  NaN never equals itself, so a query returning `float("nan")` re-ran its
+  dependents on every request even though its canonical digest was unchanged;
+  the decision now falls back to the record digests, which normalize NaN to
+  one bit pattern. Because the fallback only adds equality, the shapes where
+  the two disagree the other way — `True` against `1`, `1` against `1.0` —
+  decide as before.
+- A JSON object key containing a lone surrogate is a `json-decode-error`
+  diagnostic rather than an exception out of `json_analysis`, because such a
+  key reaches the cached payload verbatim as its own section name and again in
+  every descendant's dot path. Values are unaffected: they reach the payload
+  through `repr`, which escapes a surrogate. Payloads and cutoff tokens for
+  every document without a lone surrogate are byte-identical.
 
 ### Performance
 
@@ -388,6 +419,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   preflight and the refusal names the blocking entry, so a dry run no longer
   reports a clean migration that the next reconcile abandons after deleting
   its orphans — and that reconcile now refuses before deleting anything.
+- `freeze` detects sharing across the whole boundary value instead of one
+  wrapper at a time. A `strict`-mode result like `(items, items)` — one list
+  reached twice through a raw tuple — stores a `FrozenGraph`, but re-freezing
+  the exposed view returned the tree `(FrozenList, FrozenList)`, so the view
+  did not round-trip to its own snapshot or fingerprint, through `db.set` or
+  as a query argument. Only the `[items, items]` spelling worked, because a
+  list spine keeps the aliasing inside one wrapper. Fingerprints for every
+  shape that already round-tripped are unchanged, and a tuple carrying no
+  `Frozen*` wrapper pays nothing.
+- A JSON document carrying a lone-surrogate escape (`"\ud800"`) no longer
+  fails an incremental recomputation a fresh database completes. `json.loads`
+  accepts the escape and the snapshot grammar refuses it, but the cutoff's
+  defensive clause named only `ValueError` and `freeze` raises
+  `UnsupportedValueError`, a `PyIncError`. The clause now names it and
+  degrades to the raw text as intended. The TOML and XML cutoffs gained the
+  same name defensively; neither parser can produce a lone surrogate.
+- `fingerprint_snapshot` and `serialize_snapshot` reject an integer wider than
+  CPython's int-to-str conversion limit with `UnsupportedValueError` naming
+  the digit limit, instead of letting a raw `ValueError` out of the encoder.
+  The `K2` grammar is unchanged.
 
 ## [3.0.0] - 2026-07-12
 
