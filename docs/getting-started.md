@@ -191,8 +191,8 @@ with TemporaryDirectory() as directory:
     assert Path(directory, "greeting.txt").read_text() == "Hello, Ada!\n"
 ```
 
-`plan()` performs the same validation and locking as `reconcile()` without
-changing outputs or the ownership ledger. The action owns only paths recorded
+`plan()` runs the same preflight and locking as `reconcile()` without changing
+outputs or the ownership ledger. The action owns only paths recorded
 in its validated ledger. Review the [action contract](action-contract.md)
 before sharing an output root between tools.
 

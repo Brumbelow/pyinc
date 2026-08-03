@@ -23,8 +23,10 @@ from pyinc import (
 - `@action(tool="stable identity", lock_timeout=30.0)` wraps a pure desired-set
   function.
 - `reconcile(..., root=..., state_dir=None, lock_timeout=None)` converges the
-  filesystem. `plan(...)` performs the same validation under the same lock but
-  does not mutate the output root or ledger.
+  filesystem. `plan(...)` runs the same preflight under the same lock but does
+  not mutate the output root or ledger. One refusal is therefore invisible to
+  it: a directory the previous layout left non-empty is refused when the prune
+  runs, so that failure surfaces only in a real reconcile.
 - `ReconcileResult` reports `created`, `updated`, `repaired`, `deleted`, and
   `unchanged` path tuples plus `dry_run`. There is no aggregate `written` field
   in v3.
@@ -50,6 +52,16 @@ with the new desired layout — a file where the layout now needs a directory, o
 the reverse — is not an error: it is an orphan of the previous layout, deleted
 before the new set is published, so a reconcile converges across a layout
 migration instead of wedging on its own ledger.
+
+A case-only spelling change is the exception. A ledger entry whose portable key
+matches a desired output is a collision rather than an orphan, because on a
+case-insensitive filesystem deleting it would destroy the reconciled output. The
+one shape that check does not see — an owned file replaced by outputs nested
+under a case variant of its own name (`PKG` becoming `pkg/model.py`) — is
+refused on a case-insensitive filesystem at target validation instead, since the
+orphan still occupies the desired parent and a casefold twin does not lift that
+validation. Both refusals apply to `plan` too; remove the stale path by hand to
+converge.
 
 The root is resolved once. Every owned target is checked during preflight and
 again immediately before a write or deletion; a desired target still sitting

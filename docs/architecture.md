@@ -10,7 +10,8 @@ memos, inputs, and resources as revisioned node records with:
 - a semantic digest
 - dependency edges captured dynamically at runtime
 - `changed_at` and `verified_at` revisions
-- the last decision: `executed`, `reused`, or `backdated`
+- the last decision: `executed`, `reused`, `backdated`, or `failed` (a resource
+  whose `load` raised)
 
 `Database.inspect(...)` returns the last recorded provenance tree for a query
 key, and `Database.explain(...)` formats that tree; inspection never changes a

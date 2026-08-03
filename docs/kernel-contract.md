@@ -386,6 +386,15 @@ a dependent is still active, the dependent will re-execute the intermediate from
 scratch on its next request. This is correct but may degrade performance.
 (See: `test_rewiring_with_lru_eviction`)
 
+**7. Catching an exception raised by a child query.**
+The edge a failing *resource* read publishes before its exception propagates has
+no query-side equivalent: a query's record and dependency edges publish only
+after it returns, so a query that catches an exception raised by a sub-query is
+cached with no edge to it and is not re-executed when a later change would make
+that sub-query succeed. Model a failure the caller means to handle as a returned
+value, or route it through a `Resource`.
+(See: `test_caught_query_failure_does_not_publish_a_dependency_edge`)
+
 ## Escape Hatches
 
 - **`db.report_untracked_read(reason)`** — marks the current query as impure;
@@ -641,7 +650,7 @@ Actions and stores:
 | `action` | Decorator declaring a filesystem-reconciling action over declared outputs. |
 | `Action` | The declared-action object: `reconcile` and `plan`. |
 | `Output` | One declared file output: relative path plus content. |
-| `ReconcileResult` | What a reconcile did: written, deleted, repaired, unchanged. |
+| `ReconcileResult` | What a reconcile did: created, updated, repaired, deleted, unchanged, plus `dry_run`. |
 | `ArtifactStore` | Interface for durable content-addressed artifact storage. |
 | `InMemoryArtifactStore` | Process-local store for tests and ephemeral use. |
 | `FileSystemArtifactStore` | Durable on-disk store with advisory locking. |
