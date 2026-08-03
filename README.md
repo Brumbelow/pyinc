@@ -19,6 +19,22 @@ It is pure Python, stdlib-only, and has zero runtime dependencies. Python
 python -m pip install pyinc
 ```
 
+## Why pyinc exists
+
+Python has had no standard, native engine for this. Without that piece, authors
+of Python tools have usually had to choose between two painful options:
+
+- Build a caching layer from scratch, and inherit the cache-invalidation bugs
+  that come with it — the editor still underlining an error you fixed a minute
+  ago.
+- Leave Python for Rust or C++ to get the performance. That is broadly what
+  happened to linting: `ruff`, written in Rust, displaced the established
+  Python-implemented linters rather than any of them being made fast enough in
+  place.
+
+That is, until pyinc. [The FAQ](https://github.com/Brumbelow/pyinc/blob/main/docs/faq.md)
+covers how it compares with Salsa and with `functools.lru_cache`.
+
 ## Quick start
 
 ```python docs-check
