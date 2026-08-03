@@ -19,6 +19,7 @@ from .models import (
 )
 from .schema import (
     _snake,
+    alias_cycle_diagnostics,
     definition_model,
     definition_names,
     document_diagnostics,
@@ -66,7 +67,9 @@ def schema_analysis(db: Database, schema_path: str | os.PathLike[str]) -> Schema
     models = tuple(
         _decode_model(definition_model(db, path, name)) for name in definition_names(db, path)
     )
-    diagnostics = tuple(
-        _decode_diagnostic(item) for item in document_diagnostics(db, path)
-    ) + tuple(diagnostic for model in models for diagnostic in model.diagnostics)
+    diagnostics = (
+        tuple(_decode_diagnostic(item) for item in document_diagnostics(db, path))
+        + tuple(_decode_diagnostic(item) for item in alias_cycle_diagnostics(db, path))
+        + tuple(diagnostic for model in models for diagnostic in model.diagnostics)
+    )
     return SchemaAnalysis(path=path, models=models, diagnostics=diagnostics)

@@ -47,8 +47,12 @@ A definition rendered as an `object` becomes a frozen `@dataclass`; an `enum`
 becomes a `typing.Literal` alias; a top-level `$ref`/primitive, `const`, or
 combinator becomes a type alias. Model references use deferred annotations and
 imports guarded by `TYPE_CHECKING`; aliases store their type expression as a
-forward-reference string. Mutually recursive models and aliases therefore
-compile and import on every supported Python version.
+forward-reference string. Mutually recursive models therefore compile and
+import on every supported Python version, and an alias that names a model
+caught in such a cycle imports fine too. A cycle formed entirely of aliases
+(alias to alias and back, with no model or container type between) resolves to
+no type and is rejected — see [Nullable and single-branch
+references](#nullable-and-single-branch-references).
 
 A schema node's shape is selected in one order everywhere the compiler reads
 one — `$ref`, then a combinator, then `enum`, then `const`, and only then
@@ -222,6 +226,12 @@ that reaches it, a bare self `$ref`, a single-branch `allOf`, and a nullable
 type and keeps compiling: `{"Forest": {"type": "array", "items": {"$ref":
 "#/$defs/Forest"}}}` renders `list[Forest]`, and a dataclass field may refer
 back to its own model.
+
+The same problem reappears across definitions: `{"A": {"$ref": "#/$defs/B"},
+"B": {"$ref": "#/$defs/A"}}` closes a loop of aliases with no type in between,
+so each member is an `alias-cycle` error naming the cycle in definition order
+(`A -> B -> A`). As with the single-definition case, a container or object
+field between the aliases breaks the loop and keeps them compiling.
 
 ### Ignored keywords
 

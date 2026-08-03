@@ -7,6 +7,13 @@ from typing import Any
 import pytest
 
 from pyinc import Database
+from pyinc_codegen import (
+    DiagnosticSeverity,
+    SchemaAnalysis,
+    SchemaGenerationError,
+    generate,
+    schema_analysis,
+)
 from pyinc_codegen.models import DiagnosticPayload, ModelPayload
 from pyinc_codegen.schema import (
     _EMITTER_BOUND_NAMES,
@@ -57,6 +64,18 @@ def _codes(diagnostics: tuple[DiagnosticPayload, ...]) -> set[str]:
 
 def _write_schema(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _analyze(tmp_path: Path, schema: object) -> SchemaAnalysis:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(schema_path, schema)
+    return schema_analysis(Database(), str(schema_path))
+
+
+def _generate(tmp_path: Path, schema: object) -> None:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(schema_path, schema)
+    generate(Database(), str(schema_path), tmp_path / "generated")
 
 
 def test_json_object_hook_and_loader_reject_duplicate_keys() -> None:
@@ -983,3 +1002,53 @@ def test_enum_under_an_unusable_declared_type_signals_the_type_once() -> None:
     codes = [d[0] for d in diagnostics]
     assert codes.count("unsupported-enum-type") == 1
     assert "enum-type-mismatch" not in codes
+
+
+def test_two_definition_pure_alias_cycle_is_diagnosed_on_each_member(tmp_path: Path) -> None:
+    schema = {
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"$ref": "#/$defs/A"},
+        }
+    }
+    analysis = _analyze(tmp_path, schema)
+    cycle_diags = [d for d in analysis.diagnostics if d.code == "alias-cycle"]
+    assert len(cycle_diags) == 2
+    assert all(d.severity is DiagnosticSeverity.ERROR for d in cycle_diags)
+    assert all("A -> B -> A" in d.message for d in cycle_diags)
+
+
+def test_alias_cycle_blocks_generation(tmp_path: Path) -> None:
+    schema = {
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"$ref": "#/$defs/A"},
+        }
+    }
+    with pytest.raises(SchemaGenerationError):
+        _generate(tmp_path, schema)
+
+
+def test_recursion_through_a_container_is_not_a_cycle(tmp_path: Path) -> None:
+    schema = {
+        "$defs": {
+            "Tree": {
+                "type": "object",
+                "properties": {"children": {"type": "array", "items": {"$ref": "#/$defs/Node"}}},
+            },
+            "Node": {"$ref": "#/$defs/Tree"},
+        }
+    }
+    analysis = _analyze(tmp_path, schema)
+    assert not any(d.code == "alias-cycle" for d in analysis.diagnostics)
+
+
+def test_nullable_alias_edges_still_form_a_cycle(tmp_path: Path) -> None:
+    schema = {
+        "$defs": {
+            "A": {"anyOf": [{"$ref": "#/$defs/B"}, {"type": "null"}]},
+            "B": {"$ref": "#/$defs/A"},
+        }
+    }
+    analysis = _analyze(tmp_path, schema)
+    assert sum(d.code == "alias-cycle" for d in analysis.diagnostics) == 2

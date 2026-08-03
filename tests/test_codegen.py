@@ -1917,7 +1917,7 @@ def test_empty_and_invalid_enums_are_errors_but_render_valid_python(tmp_path: Pa
         generate(db, schema_path, tmp_path / "generated")
 
 
-def test_mutually_recursive_models_and_aliases_import_on_python_311_plus(
+def test_mutually_recursive_models_import_on_python_311_plus(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     schema_path = tmp_path / "schema.json"
@@ -1934,8 +1934,6 @@ def test_mutually_recursive_models_and_aliases_import_on_python_311_plus(
                     "type": "object",
                     "properties": {"left": {"$ref": "#/$defs/Left"}},
                 },
-                "FirstAlias": {"$ref": "#/$defs/SecondAlias"},
-                "SecondAlias": {"$ref": "#/$defs/FirstAlias"},
                 "LeftList": {
                     "type": "array",
                     "items": {"$ref": "#/$defs/Left"},
@@ -1948,8 +1946,6 @@ def test_mutually_recursive_models_and_aliases_import_on_python_311_plus(
     left_source = (package / "left.py").read_text(encoding="utf-8")
     assert "if TYPE_CHECKING:" in left_source
     assert "from .right import Right" in left_source
-    alias_source = (package / "first_alias.py").read_text(encoding="utf-8")
-    assert "FirstAlias: TypeAlias = 'SecondAlias'" in alias_source
 
     monkeypatch.syspath_prepend(str(tmp_path))
     importlib.invalidate_caches()
@@ -1957,8 +1953,6 @@ def test_mutually_recursive_models_and_aliases_import_on_python_311_plus(
         generated = importlib.import_module("cycle_models")
         assert generated.Left.__name__ == "Left"
         assert generated.Right.__name__ == "Right"
-        assert generated.FirstAlias == "SecondAlias"
-        assert generated.SecondAlias == "FirstAlias"
         assert generated.LeftList == "list[Left]"
     finally:
         for module_name in tuple(sys.modules):

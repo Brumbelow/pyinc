@@ -1560,6 +1560,70 @@ def definition_structure(db: Database, path: str, name: str) -> ModelPayload:
     return (model[0], model[1], fields, model[3], model[4], "", model[6], model[7])
 
 
+def _pure_alias_target(payload: ModelPayload, names: frozenset[str]) -> str | None:
+    """The single definition this alias renames, or None.
+
+    Only an alias whose whole expression is another definition's name (bare, or
+    with the rendered `| None` nullable spelling) forms an edge: recursion that
+    passes through a container or object field names a real type and compiles.
+    """
+    if payload[1] != "alias":
+        return None
+    expression = payload[4]
+    for ref in payload[6]:
+        if ref not in names or ref == payload[0]:
+            continue
+        python_name = _python_identifier(ref)
+        if expression in (python_name, f"{python_name} | None"):
+            return ref
+    return None
+
+
+@query
+def alias_cycle_diagnostics(db: Database, path: str) -> tuple[DiagnosticPayload, ...]:
+    """Error diagnostics for pure alias cycles that span definitions.
+
+    Each member of such a cycle would render as a module whose alias imports
+    the next member, closing an import loop with no type in between; the
+    single-definition case is already caught as `self-referential-alias`.
+    """
+    names = frozenset(definition_names(db, path))
+    edges: dict[str, str] = {}
+    for name in sorted(names):
+        target = _pure_alias_target(definition_structure(db, path, name), names)
+        if target is not None:
+            edges[name] = target
+
+    diagnostics: list[DiagnosticPayload] = []
+    resolved: set[str] = set()
+    for start in sorted(edges):
+        if start in resolved:
+            continue
+        trail: list[str] = []
+        seen_at: dict[str, int] = {}
+        current = start
+        while current in edges and current not in resolved and current not in seen_at:
+            seen_at[current] = len(trail)
+            trail.append(current)
+            current = edges[current]
+        if current in seen_at:
+            cycle = trail[seen_at[current] :]
+            anchor = min(cycle)
+            rotation = cycle.index(anchor)
+            ordered = cycle[rotation:] + cycle[:rotation]
+            rendered = " -> ".join([*ordered, ordered[0]])
+            for member in ordered:
+                diagnostics.append(
+                    _diagnostic(
+                        "alias-cycle",
+                        f"alias cycle resolves to no type: {rendered}",
+                        definition_pointer(db, path, member),
+                    )
+                )
+        resolved.update(trail)
+    return tuple(diagnostics)
+
+
 @query
 def model_python(db: Database, path: str, name: str) -> str:
     payload = definition_structure(db, path, name)
