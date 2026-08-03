@@ -12,6 +12,7 @@ each have one job.
 | [`pyinc-tools` Guide](pyinc-tools-guide.md) | Install or operate the CLI/LSP, configure an editor, understand overlays, or troubleshoot. |
 | [LSP Reference](lsp-reference.md) | Check an advertised method or its user-visible limitations. |
 | [Demo](demo.md) | See the watcher running on a real workspace. |
+| [FAQ](faq.md) | Compare pyinc with Salsa or `lru_cache`, or decide whether it fits your workload. |
 | [Codegen Guide](codegen-guide.md) | Generate typed Python models from JSON Schema through the action layer. |
 | [Migrating from 2.x](migration-v3.md) | Discard incompatible state and update code for 3.0. |
 | [Releases and Verification](releases.md) | Check a published artifact, or see what the release pipeline enforces. |

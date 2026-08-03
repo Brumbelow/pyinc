@@ -105,6 +105,7 @@ tamper repair, orphan cleanup, and dry-run planning. See the
 
 - [Getting started](https://github.com/Brumbelow/pyinc/blob/main/docs/getting-started.md) — build a small graph, add a tracked file, choose a mode, inspect work, and write a first action.
 - [Demo](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) — the watcher running on a real workspace.
+- [FAQ](https://github.com/Brumbelow/pyinc/blob/main/docs/faq.md) — how this relates to Salsa, why not `lru_cache`, threading, and when not to use it.
 - [Architecture](https://github.com/Brumbelow/pyinc/blob/main/docs/architecture.md) — package boundaries and how the kernel, integrations, tools, and codegen fit together.
 - [Kernel contract](https://github.com/Brumbelow/pyinc/blob/main/docs/kernel-contract.md) — the normative soundness envelope.
 - [Action contract](https://github.com/Brumbelow/pyinc/blob/main/docs/action-contract.md) — declared-output reconciliation.
