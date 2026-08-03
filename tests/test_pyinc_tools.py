@@ -11,7 +11,9 @@ from typing import Any, BinaryIO, cast
 import pytest
 
 import pyinc_tools.cli as cli
-from pyinc.integrations import SourcePosition, SourceRange, SymbolId
+import pyinc_tools.session as session_module
+from pyinc import Database
+from pyinc.integrations import SourcePosition, SourceRange, SymbolId, request_scope
 from pyinc_tools._jsonrpc import ParseError, read_message
 from pyinc_tools.lsp import LanguageServer, _package_version, _RequestFailed
 from pyinc_tools.session import (
@@ -37,6 +39,7 @@ from pyinc_tools.session import (
     TypeDefinitionLocation,
     TypeHierarchyItem,
     WorkspaceSession,
+    _RequestLock,
 )
 
 _LSP_SYMBOL_KIND_FUNCTION = 12
@@ -8889,3 +8892,85 @@ def test_mirror_mutation_inside_one_session_request_is_visible(tmp_path: Path) -
         assert [d.name for d in warm_module.definitions] == ["one"]
         edited_module = next(m for m in edited.python.modules if m.path.endswith("mod.py"))
         assert any(d.name == "extra" for d in edited_module.definitions)
+
+
+def _lock_is_free(request_lock: _RequestLock) -> bool:
+    """Whether a second thread can take the session lock.
+
+    An RLock its owner leaked is still re-entrant for that owner, so only
+    another thread can tell a held lock from a released one.
+    """
+
+    taken: list[bool] = []
+
+    def attempt() -> None:
+        acquired = request_lock._lock.acquire(timeout=1.0)
+        taken.append(acquired)
+        if acquired:
+            request_lock._lock.release()
+
+    thread = threading.Thread(target=attempt)
+    thread.start()
+    thread.join(timeout=2.0)
+    return taken == [True]
+
+
+def test_request_lock_releases_and_closes_its_span_when_a_context_exit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = Database()
+    events: list[str] = []
+
+    @contextlib.contextmanager
+    def recording_span() -> Iterator[None]:
+        events.append("span-enter")
+        try:
+            yield
+        finally:
+            events.append("span-exit")
+
+    @contextlib.contextmanager
+    def failing_scope(_db: Database) -> Iterator[None]:
+        events.append("scope-enter")
+        yield
+        events.append("scope-exit")
+        raise RuntimeError("request scope exit failed")
+
+    monkeypatch.setattr(db, "request_span", recording_span)
+    monkeypatch.setattr(session_module, "request_scope", failing_scope)
+    request_lock = _RequestLock(db)
+
+    with pytest.raises(RuntimeError, match="request scope exit failed"), request_lock:
+        pass
+
+    assert events == ["span-enter", "scope-enter", "scope-exit", "span-exit"]
+    assert request_lock._span is None
+    assert request_lock._scope is None
+    assert _lock_is_free(request_lock)
+
+
+def test_session_stays_usable_when_a_request_scope_exit_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    _write(root / "mod.py", "def one() -> int:\n    return 1\n")
+
+    @contextlib.contextmanager
+    def failing_scope(db: Database) -> Iterator[None]:
+        with request_scope(db):
+            yield
+        raise RuntimeError("request scope exit failed")
+
+    session = WorkspaceSession(str(root))
+    try:
+        monkeypatch.setattr(session_module, "request_scope", failing_scope)
+        with pytest.raises(RuntimeError, match="request scope exit failed"):
+            session.analyze_workspace()
+
+        # A leaked lock would deadlock every later call, close() included.
+        assert _lock_is_free(session._state_lock)
+        monkeypatch.undo()
+        assert session.analyze_workspace().python.modules
+    finally:
+        monkeypatch.undo()
+        session.close()

@@ -307,16 +307,25 @@ class _RequestLock:
             raise
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        self._depth -= 1
-        scope = self._scope
-        span = self._span
-        if self._depth == 0 and scope is not None:
+        # A lock left held would wedge every later call on this session, close()
+        # included, and a span left open would outlive the stability it claims,
+        # so neither teardown may be skipped because an earlier one raised.
+        try:
+            self._depth -= 1
+            if self._depth != 0:
+                return
+            scope = self._scope
+            span = self._span
             self._scope = None
-            scope.__exit__(None, None, None)
-        if self._depth == 0 and span is not None:
             self._span = None
-            span.__exit__(None, None, None)
-        self._lock.release()
+            try:
+                if scope is not None:
+                    scope.__exit__(None, None, None)
+            finally:
+                if span is not None:
+                    span.__exit__(None, None, None)
+        finally:
+            self._lock.release()
 
 
 class WorkspaceSession:
