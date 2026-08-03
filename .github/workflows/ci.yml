@@ -43,7 +43,7 @@ jobs:
           done
 
       - name: Run test suite
-        run: pytest -q
+        run: pytest -q -n auto --dist load
 
   quality:
     name: Static analysis and coverage
@@ -71,7 +71,7 @@ jobs:
         run: python scripts/check_docs.py
 
       - name: Measure branch coverage
-        run: pytest --cov=pyinc --cov=pyinc_codegen --cov=pyinc_tools --cov-branch --cov-report=term-missing --cov-fail-under=90
+        run: pytest -n auto --dist load --cov=pyinc --cov=pyinc_codegen --cov=pyinc_tools --cov-branch --cov-report=term-missing --cov-fail-under=90
 
   distribution:
     name: Build and validate installed artifacts
