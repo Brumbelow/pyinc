@@ -77,15 +77,25 @@ covered by the ambiguity rules in [Ignored keywords](#ignored-keywords).
   `ignored-constraint` warning (see [Ignored keywords](#ignored-keywords))
 - deterministic error diagnostics for malformed schema shapes, remote or
   unresolved `$ref`, unsupported combinators and conditionals, unsupported
-  unions, invalid `enum`/`const` members, and names that cannot be emitted
-  safely
+  unions, invalid `enum`/`const` members, aliases that name only themselves,
+  and names that cannot be emitted safely
 - portable module collision checks after Unicode normalization, snake-case
   conversion, and case folding
 
 **Identifier safety.** Invalid definition and property names are error
 diagnostics rather than lossy substitutions. Generation stops before touching
 the output tree. Property names reserved by Python's data model, such as
-`__dict__`, `__slots__`, and `__weakref__`, are rejected as well. Definition
+`__dict__`, `__slots__`, and `__weakref__`, are rejected as well. Names that
+shadow a binding the generated modules rely on are rejected too: the emitter's
+fixed imports (`dataclass`, `Literal`, `TypeAlias`, `TYPE_CHECKING`, `Never`)
+and the builtins its type expressions spell (`str`, `int`, `float`, `bool`,
+`list`, `dict`, `object`). A definition with one of those names is a
+`reserved-definition-name` error, because every module that imports it under
+`TYPE_CHECKING` would rebind the name; a property with one is a
+`reserved-field-name` error, because the field binds the name for the rest of
+its own class body, so a later `zone: str` in the same model would stop naming
+the builtin. Both comparisons run after NFKC normalization, so the fullwidth
+spellings are rejected with them. Definition
 names that would produce the same portable module name (for example
 `HTTPServer` and `http_server`) are rejected together, as is a definition that
 would occupy the generated `__init__.py` path. The snake-cased module stem must
@@ -140,7 +150,11 @@ Members must be strings, integers, booleans, or `null`. PEP 586 does not allow
 a `float` in a `Literal`, so `{"const": 1.5}` is an `unsupported-const-value`
 error and a float `enum` member is an `unsupported-enum-value` error. A member
 that contradicts a declared `type` is a `const-type-mismatch` or
-`enum-type-mismatch` error. `Literal` is imported into a generated module only
+`enum-type-mismatch` error. A declared nullable union is read as the type it
+names plus the null it adds, so both members of
+`{"type": ["string", "null"], "enum": ["red", null]}` agree with it, in either
+branch order; `{"type": ["string", "null"], "enum": ["red", 7]}` still reports
+the `7`. `Literal` is imported into a generated module only
 when that module's rendered types actually use it.
 
 ### Mappings and object models
@@ -198,6 +212,16 @@ keyword: a multi-branch `allOf`, an `anyOf` that is not one schema plus
 *both* `{"type": "null"}` is rejected for the same reason a one- or three-branch
 `anyOf` is: it names no type to make optional. General unions are out of
 scope — the compiler has no rule for choosing one Python type for them.
+
+An alias that names only itself denotes no type:
+`{"Loop": {"anyOf": [{"$ref": "#/$defs/Loop"}, {"type": "null"}]}}` would emit
+`Loop: TypeAlias = 'Loop | None'`, which resolves to nothing, so it is a
+`self-referential-alias` error reported at the definition — in every spelling
+that reaches it, a bare self `$ref`, a single-branch `allOf`, and a nullable
+`anyOf`. Recursion that passes through a model or a container still names a
+type and keeps compiling: `{"Forest": {"type": "array", "items": {"$ref":
+"#/$defs/Forest"}}}` renders `list[Forest]`, and a dataclass field may refer
+back to its own model.
 
 ### Ignored keywords
 

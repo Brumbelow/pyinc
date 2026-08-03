@@ -169,9 +169,10 @@ Two boundaries apply:
     rewrites the record: a world that returns to exactly the state that probe
     describes — an undo, a branch switch back — re-loads instead of reusing, and
     the readers that consumed the raise re-execute rather than staying green on
-    a value only the failure explains. A file replaced by a directory
-    (`FileResource`, `DirectoryResource`, and the `python_source`
-    module → package refactor) is the ordinary way to reach this state.
+    a value only the failure explains. A permission denial that neither the
+    probe nor the load survives is the ordinary way to reach this state; the
+    shipped file and listing resources read a path whose kind changed as a
+    missing file or an absent listing rather than raising.
   - **Revision accounting:** entering that unconfirmed state **moves the
     revision**, exactly as a recorded failure does. A direct reader that handles
     the exception is otherwise the end of the story: it would return at the
@@ -196,7 +197,7 @@ Two boundaries apply:
   `test_directory_replaced_by_a_file_matches_a_fresh_database`,
   `test_missing_file_replaced_by_a_directory_matches_a_fresh_database`,
   `test_module_replaced_by_a_package_matches_a_fresh_database`,
-  `test_directory_restored_after_an_unprobeable_failure_matches_a_fresh_database`,
+  `test_directory_restored_after_a_kind_swap_matches_a_fresh_database`,
   `test_handled_unrecordable_failure_invalidates_a_transitive_reader`,
   `test_handled_unrecordable_failure_propagates_more_than_one_hop`,
   `test_permanently_unrecordable_failure_settles_the_revision`)

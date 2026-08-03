@@ -181,7 +181,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the working directory (`os.getcwd`, `Path.cwd`). These are not intercepted;
   route them through `FileStatResource` or `db.report_untracked_read`.
 - The durable checkpoint manifest version is `5`. A manifest written by 3.0.0
-  records version `4` and `load_checkpoint` now rejects it loudly. The record
+  records version `4` and `load_checkpoint` now refuses it with
+  `CheckpointVersionError`. The record
   layout is identical either way, so nothing else would have caught the
   difference: 3.0.0 recorded no dependencies for a query whose resource read
   raised a caught exception, and such a record warms under this release
@@ -213,6 +214,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every descendant's dot path. Values are unaffected: they reach the payload
   through `repr`, which escapes a surrogate. Payloads and cutoff tokens for
   every document without a lone surrogate are byte-identical.
+- A path that is a directory, or that has a file somewhere in its parent
+  chain, reads as a missing file in every shipped file resource. The probes
+  caught only `FileNotFoundError`, so a directory raised `IsADirectoryError`
+  and a path reached through a file raised `NotADirectoryError` — and a probe
+  that raises retires the record it was checking. Replacing a tracked `mod.py`
+  with a same-named directory therefore raised out of a warm
+  `workspace_analysis` while a fresh database returned the analysis without
+  that module, because the workspace walk only collects regular files.
+  `FileResource.load` still raises `FileNotFoundError`; a permission denial,
+  and every other `OSError`, is a genuine failure and still propagates into
+  the failure records that landed this cycle.
+- `DirectoryResource.probe` answers for a path that holds no listing instead
+  of raising, so a listing whose kind changed is a recorded failure rather
+  than an unrecordable one and its reader keeps the dependency edge. The read
+  still raises `NotADirectoryError` for a path that is a file — that is how a
+  workspace walk tells a module from a package — and the probe distinguishes
+  "absent" from "not a directory", which reads differently and so may not
+  share a probe with it.
+- A notebook carrying a lone-surrogate escape is reported as one
+  `notebook-decode-error` naming the field that holds it, with no cells and no
+  kernel metadata. Cell sources, cell types and the kernel metadata reach the
+  cached payload and the cutoff token verbatim, where a lone surrogate is not
+  a value `freeze` can snapshot. Outputs and per-execution metadata reach
+  neither, so a notebook that only stores a surrogate keeps its analysis.
+  Payloads and cutoff tokens for every surrogate-free notebook are unchanged.
 
 ### Performance
 
@@ -439,6 +465,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   CPython's int-to-str conversion limit with `UnsupportedValueError` naming
   the digit limit, instead of letting a raw `ValueError` out of the encoder.
   The `K2` grammar is unchanged.
+- A notebook with a lone-surrogate escape no longer fails analysis two
+  different ways. A fresh read raised `UnsupportedValueError` out of the
+  payload and an incremental one raised it out of the cutoff with a different
+  message; a first read, a post-edit incremental read, and a database that
+  never saw the file now agree, and none of them raises.
 
 ## [3.0.0] - 2026-07-12
 

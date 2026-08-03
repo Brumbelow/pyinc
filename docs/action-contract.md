@@ -24,9 +24,7 @@ from pyinc import (
   function.
 - `reconcile(..., root=..., state_dir=None, lock_timeout=None)` converges the
   filesystem. `plan(...)` runs the same preflight under the same lock but does
-  not mutate the output root or ledger. One refusal is therefore invisible to
-  it: a directory the previous layout left non-empty is refused when the prune
-  runs, so that failure surfaces only in a real reconcile.
+  not mutate the output root or ledger.
 - `ReconcileResult` reports `created`, `updated`, `repaired`, `deleted`, and
   `unchanged` path tuples plus `dry_run`. There is no aggregate `written` field
   in v3.
@@ -71,6 +69,14 @@ be symbolic links, all resolved parents must remain under the root, and an
 owned target must be a regular file. An orphan that has become a directory,
 device, or symbolic link is never deleted.
 
+A recorded output that is now a directory is treated as already released —
+never deleted, and not an error — only when the desired layout nests outputs
+strictly beneath it and that directory holds nothing but regular files of the
+desired set; any other entry, or any symbolic link, keeps the refusal. A
+recorded output whose parent path is now a regular file is likewise already
+released, because no file can exist there. These are the states a run leaves
+when it stops between publication and the ledger write.
+
 ## Locking, publication, and recovery
 
 The full preflight/write/delete/manifest sequence is protected by advisory
@@ -97,14 +103,21 @@ action roots must therefore not be concurrently renamed by non-cooperating
 processes. Validated orphans are deleted first, directories that the previous
 layout's outputs left empty are pruned second, desired files are published
 third, and the new ledger is published last. Each file is atomic, but the set
-is deliberately not transactional. If a process stops mid-run — including
-after deletions but before publication — the prior ledger remains sufficient
-for the next locked reconcile to repair and converge the set.
+is deliberately not transactional. If a process stops mid-run — after
+deletions, after a prune, or after publication but before the ledger is
+written — the next locked reconcile of the desired set that run was publishing
+converges it, recognizing the recorded outputs the stopped run released.
+Recovery never deletes to repair: files the stopped run published but did not
+record are unowned, so a desired set that would have to remove them — a
+rollback to the recorded layout, or a teardown — is refused under the tamper
+policy until a reconcile of the published layout records them.
 
 Rollback of already-published files and transactional directory swaps remain
 out of scope. Directory pruning is limited to layout migration: only
 directories that orphan deletion left empty are removed, and a directory still
 holding an unowned entry is refused with `ActionPathError` rather than pruned.
+That refusal is decided during preflight, so `plan()` reports it and a
+reconcile refuses before deleting anything.
 
 ## Ownership manifest
 
