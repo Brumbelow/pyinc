@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import shutil
 import tokenize
 from pathlib import Path
 from types import SimpleNamespace
@@ -197,6 +198,12 @@ def test_read_workspace_file_rejects_outside_unnormalized_directories_and_specia
         os.mkfifo(fifo)
         with pytest.raises(ValueError, match="not a regular file"):
             workspace._read_workspace_file(fifo, root)
+
+    # A parent that is a file means the path is gone, not that it is unsafe.
+    plain = root / "mod.py"
+    plain.write_bytes(b"pass\n")
+    with pytest.raises(NotADirectoryError):
+        workspace._read_workspace_file(plain / "inner.py", root)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory-descriptor behavior")
@@ -586,6 +593,69 @@ def test_workspace_mirror_syncs_regular_directory_deleted_and_irrelevant_paths(
     mirror.sync_path_from_disk(str(missing_irrelevant))
     assert not stale.exists()
     mirror.sync_path_from_disk(str(missing_irrelevant))
+
+
+def test_workspace_mirror_syncs_a_tracked_file_swapped_for_a_directory_and_back(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    mirror_root = tmp_path / "mirror"
+    root.mkdir()
+    mirror_root.mkdir()
+    mirror = workspace.WorkspaceMirror(str(root), str(mirror_root), frozenset(), ())
+
+    target = root / "mod.py"
+    target.write_bytes(b"first")
+    mirror.sync_path_from_disk(str(target))
+    assert (mirror_root / "mod.py").read_bytes() == b"first"
+
+    # The mirror still holds a file where the directory now belongs.
+    target.unlink()
+    target.mkdir()
+    child = target / "inner.py"
+    child.write_bytes(b"inner")
+    mirror.sync_path_from_disk(str(target))
+    mirror.sync_path_from_disk(str(child))
+
+    assert (mirror_root / "mod.py").is_dir()
+    assert (mirror_root / "mod.py" / "inner.py").read_bytes() == b"inner"
+    assert str(target) not in mirror.content_hashes()
+
+    # ...and the reverse: a populated mirror directory where a file now belongs.
+    shutil.rmtree(target)
+    target.write_bytes(b"second")
+    mirror.sync_path_from_disk(str(target))
+
+    assert (mirror_root / "mod.py").read_bytes() == b"second"
+    assert mirror.content_hashes()[str(target)] == hashlib.sha256(b"second").hexdigest()
+
+    # The child the directory used to hold is now unreachable, not unsafe.
+    mirror.sync_path_from_disk(str(child))
+    assert (mirror_root / "mod.py").read_bytes() == b"second"
+    assert str(child) not in mirror.content_hashes()
+
+
+def test_workspace_mirror_syncs_a_child_whose_mirrored_parent_is_still_a_file(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    mirror_root = tmp_path / "mirror"
+    root.mkdir()
+    mirror_root.mkdir()
+    mirror = workspace.WorkspaceMirror(str(root), str(mirror_root), frozenset(), ())
+
+    target = root / "mod.py"
+    target.write_bytes(b"first")
+    mirror.sync_path_from_disk(str(target))
+
+    target.unlink()
+    target.mkdir()
+    child = target / "inner.py"
+    child.write_bytes(b"inner")
+    # Only the child is refreshed, so the stale mirror file is the parent.
+    mirror.sync_path_from_disk(str(child))
+
+    assert (mirror_root / "mod.py" / "inner.py").read_bytes() == b"inner"
 
 
 def test_workspace_mirror_tracks_added_and_removed_requirement_references(tmp_path: Path) -> None:

@@ -173,6 +173,14 @@ def _require_workspace_parent_identity(
             os.close(comparison)
 
 
+def _is_link_entry(component: str, dir_fd: int) -> bool:
+    try:
+        metadata = os.lstat(component, dir_fd=dir_fd)
+    except OSError:
+        return False
+    return stat.S_ISLNK(metadata.st_mode)
+
+
 def _read_workspace_file(path: Path, root: Path) -> bytes:
     """Read one in-root regular file without following a path component."""
 
@@ -193,6 +201,15 @@ def _read_workspace_file(path: Path, root: Path) -> bytes:
             try:
                 next_descriptor = os.open(component, directory_flags, dir_fd=descriptor)
             except FileNotFoundError:
+                raise
+            except NotADirectoryError as exc:
+                # A parent that became a plain file means the path is gone, but
+                # a symlinked parent reports the same errno under O_NOFOLLOW and
+                # is the escape this walk exists to reject.
+                if _is_link_entry(component, descriptor):
+                    raise ValueError(
+                        f"workspace file contains an unsafe path component: {path!s}"
+                    ) from exc
                 raise
             except OSError as exc:
                 raise ValueError(
@@ -504,14 +521,16 @@ class WorkspaceMirror:
         if relevant:
             try:
                 content = _read_workspace_file(source_path, self.root_path)
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 pass
             except IsADirectoryError:
                 self._content_hashes.pop(key, None)
-                mirror_path.mkdir(parents=True, exist_ok=True)
+                self._materialize_mirror_directory(mirror_path)
                 return
             else:
-                mirror_path.parent.mkdir(parents=True, exist_ok=True)
+                self._materialize_mirror_directory(mirror_path.parent)
+                if mirror_path.is_dir():
+                    shutil.rmtree(mirror_path)
                 mirror_path.write_bytes(content)
                 self._content_hashes[key] = hashlib.sha256(content).hexdigest()
                 return
@@ -523,9 +542,27 @@ class WorkspaceMirror:
             mirror_path.unlink()
         self._prune_empty_parents(mirror_path.parent)
 
+    def _materialize_mirror_directory(self, directory: Path) -> None:
+        """Make `directory` exist in the mirror as a directory.
+
+        A workspace path that swapped kind -- a tracked file replaced by a
+        same-named directory -- leaves the mirror holding the other kind, and
+        every entry between the mirror root and `directory` has to give way
+        before it can be created.
+        """
+
+        current = self.mirror_root_path
+        for part in directory.relative_to(self.mirror_root_path).parts:
+            current = current / part
+            if current.exists() and not current.is_dir():
+                current.unlink()
+        directory.mkdir(parents=True, exist_ok=True)
+
     def _prune_empty_parents(self, directory: Path) -> None:
         while directory != self.mirror_root_path:
-            if not directory.exists():
+            # A parent the mirror now holds as a file belongs to the swap that
+            # replaced it, so only directories are candidates for pruning.
+            if not directory.is_dir():
                 directory = directory.parent
                 continue
             try:

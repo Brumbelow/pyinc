@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import shutil
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -256,6 +257,99 @@ def test_polling_workspace_watcher_first_poll_detects_edits_made_before_watcher_
 
         mirror_copy = Path(session.mirror_root) / "a.py"
         assert mirror_copy.read_text(encoding="utf-8") == "def a() -> int:\n    return 2\n"
+
+
+def test_refresh_paths_converges_when_a_tracked_file_is_swapped_for_a_directory(
+    tmp_path: Path,
+) -> None:
+    """Refreshing a swapped path must leave the mirror matching disk.
+
+    An analysis taken while the swap is settling still fails inside the kernel's
+    file resource -- it does so without a session too -- so what the session owes
+    is convergence: the refresh itself succeeds and analysis recovers once the
+    workspace stops moving.
+    """
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def a() -> int:\n    return 1\n")
+    other = root / "other.py"
+    _write(other, "import definitely_missing_module\n")
+
+    with WorkspaceSession(root) as session:
+        assert {module.path for module in session.analyze_workspace().python.modules} == {
+            str(target),
+            str(other),
+        }
+
+        # The mirror holds a file at the path the package now occupies.
+        target.unlink()
+        child = target / "inner.py"
+        _write(child, "def b() -> int:\n    return 2\n")
+        assert session.refresh_paths([target, child]) == (str(target), str(child))
+
+        mirrored = Path(session.mirror_root) / "mod.py"
+        assert mirrored.is_dir()
+        assert (mirrored / "inner.py").read_text(encoding="utf-8") == (
+            "def b() -> int:\n    return 2\n"
+        )
+
+        shutil.rmtree(target)
+        _write(target, "def a() -> int:\n    return 3\n")
+        assert session.refresh_paths([target, child]) == (str(target), str(child))
+
+        assert mirrored.read_text(encoding="utf-8") == "def a() -> int:\n    return 3\n"
+        restored = session.analyze_workspace()
+        assert {module.path for module in restored.python.modules} == {
+            str(target),
+            str(other),
+        }
+        assert [diagnostic.code for diagnostic in restored.diagnostics] == ["missing-import"]
+
+
+def test_polling_workspace_watcher_converges_when_a_tracked_file_becomes_a_directory(
+    tmp_path: Path,
+) -> None:
+    """A file replaced by a same-named directory must not wedge the poll loop.
+
+    A refresh that raises leaves its paths pending, so a failure here is retried
+    on every tick for as long as the session lives.
+    """
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def a() -> int:\n    return 1\n")
+
+    clock_state = {"now": 0.0}
+
+    def fake_clock() -> float:
+        return clock_state["now"]
+
+    with WorkspaceSession(root) as session:
+        watcher = PollingWorkspaceWatcher(session, debounce_ms=100, clock=fake_clock)
+
+        target.unlink()
+        child = target / "inner.py"
+        _write(child, "def b() -> int:\n    return 2\n")
+        assert watcher.poll() == ()  # detected, still debouncing
+        clock_state["now"] = 0.11
+        assert watcher.poll() == (str(target), str(child))
+        assert watcher._pending == {}
+        assert (Path(session.mirror_root) / "mod.py" / "inner.py").exists()
+
+        shutil.rmtree(target)
+        _write(target, "def a() -> int:\n    return 3\n")
+        clock_state["now"] = 0.22
+        assert watcher.poll() == ()  # detected, still debouncing
+        clock_state["now"] = 0.33
+        assert watcher.poll() == (str(target), str(child))
+        assert watcher._pending == {}
+
+        assert {module.path for module in session.analyze_workspace().python.modules} == {
+            str(target)
+        }
 
 
 def test_polling_workspace_watcher_retries_paths_whose_refresh_failed_transiently(
