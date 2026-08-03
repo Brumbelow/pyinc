@@ -424,9 +424,7 @@ class WorkspaceSession:
         with self._state_lock:
             self._check_open()
             real_path = self._normalize_real_path(path)
-            mirror_path = self._mirror_path_for_real(real_path)
-            mirror_path.parent.mkdir(parents=True, exist_ok=True)
-            mirror_path.write_bytes(_encode_python_text(text))
+            self._mirror.write_overlay(real_path, _encode_python_text(text))
             request_inputs_changed()
             self._overlays[real_path] = text
             self._scheduled_paths.add(real_path)

@@ -491,6 +491,15 @@ class WorkspaceMirror:
     def mirror_path_for_real(self, real_path: str) -> Path:
         return self.mirror_root_path / Path(real_path).relative_to(self.root_path)
 
+    def write_overlay(self, real_path: str, content: bytes) -> None:
+        """Put an editor buffer in the mirror in place of the file on disk."""
+
+        mirror_path = self.mirror_path_for_real(real_path)
+        self._materialize_mirror_directory(mirror_path.parent)
+        if mirror_path.is_dir():
+            shutil.rmtree(mirror_path)
+        mirror_path.write_bytes(content)
+
     def sync_path_from_disk(self, real_path: str) -> None:
         source_path = Path(real_path)
         referenced = _requirements_reference_paths(

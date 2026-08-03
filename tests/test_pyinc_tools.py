@@ -311,6 +311,27 @@ def test_refresh_paths_converges_when_a_tracked_file_is_swapped_for_a_directory(
         assert [diagnostic.code for diagnostic in restored.diagnostics] == ["missing-import"]
 
 
+def test_set_overlay_replaces_a_mirror_directory_a_swap_left_behind(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    _write(target, "def a() -> int:\n    return 1\n")
+
+    with WorkspaceSession(root) as session:
+        target.unlink()
+        _write(target / "inner.py", "def b() -> int:\n    return 2\n")
+        session.refresh_paths([target])
+        assert (Path(session.mirror_root) / "mod.py").is_dir()
+
+        # The editor still holds the document the directory replaced.
+        session.set_overlay(target, "def a() -> int:\n    return 3\n")
+
+        assert (Path(session.mirror_root) / "mod.py").read_text(encoding="utf-8") == (
+            "def a() -> int:\n    return 3\n"
+        )
+        assert session.source_text(target) == "def a() -> int:\n    return 3\n"
+
+
 def test_polling_workspace_watcher_converges_when_a_tracked_file_becomes_a_directory(
     tmp_path: Path,
 ) -> None:
