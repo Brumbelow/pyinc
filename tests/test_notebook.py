@@ -671,3 +671,82 @@ def test_notebook_markdown_heading_strips_hashes(tmp_path: Path) -> None:
     assert result.cells[0].heading == "Sub-heading text"
     assert result.cells[1].heading is None
     assert result.cells[2].heading == "indented heading"
+
+
+# ---------------------------------------------------------------------------
+# Lone surrogates
+# ---------------------------------------------------------------------------
+#
+# RFC 8259 permits `\uD800`-style escapes and `json.loads` decodes them, but a
+# lone surrogate is not a Unicode scalar value and so cannot cross a cached
+# boundary. Cell sources and the kernel metadata reach the cached payload
+# verbatim -- and the cutoff token too -- so whatever the integration reports
+# for such a notebook, it has to report it identically on a first read, after an
+# edit, and from a database that never saw the file.
+
+
+_SURROGATE_NOTEBOOKS: tuple[tuple[str, str], ...] = (
+    ("markdown source", '{"cells": [{"cell_type": "markdown", "source": ["\\ud800"]}]}'),
+    ("code source", '{"cells": [{"cell_type": "code", "source": ["x = \\"\\udfff\\"\\n"]}]}'),
+    ("raw source", '{"cells": [{"cell_type": "raw", "source": "\\ud800"}]}'),
+    (
+        "kernel name",
+        '{"cells": [], "metadata": {"kernelspec": {"name": "\\ud800", "language": "python"}}}',
+    ),
+    (
+        "language info",
+        '{"cells": [], "metadata": {"language_info": {"name": "\\udfff"}}}',
+    ),
+)
+
+
+@pytest.mark.parametrize(("label", "document"), _SURROGATE_NOTEBOOKS)
+def test_lone_surrogate_notebooks_analyze_identically_warm_and_fresh(
+    label: str, document: str, tmp_path: Path
+) -> None:
+    assert json.loads(document) is not None
+
+    path = tmp_path / "nb.ipynb"
+    path.write_text(document, encoding="utf-8")
+    first = notebook_analysis(Database(), str(path))
+
+    incremental = Database()
+    _write_notebook(path, _notebook([]))
+    notebook_analysis(incremental, str(path))
+    # The cutoff runs only on recomputation, so the edit is what reaches it.
+    path.write_text(document, encoding="utf-8")
+
+    assert notebook_analysis(incremental, str(path)) == first
+    assert notebook_analysis(Database(), str(path)) == first
+
+
+@pytest.mark.parametrize(("label", "document"), _SURROGATE_NOTEBOOKS)
+def test_lone_surrogate_notebooks_are_reported_as_a_decode_error(
+    label: str, document: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "nb.ipynb"
+    path.write_text(document, encoding="utf-8")
+
+    analysis = notebook_analysis(Database(), str(path))
+    assert analysis.cells == ()
+    assert analysis.kernel_name is None
+    assert analysis.language is None
+    assert [diagnostic.code for diagnostic in analysis.diagnostics] == ["notebook-decode-error"]
+    assert "surrogate" in analysis.diagnostics[0].message
+
+
+def test_surrogate_outside_the_payload_leaves_a_notebook_analyzable(tmp_path: Path) -> None:
+    # Outputs and execution metadata never reach the payload, so a surrogate
+    # there is not the integration's problem and must not cost the notebook its
+    # analysis.
+    path = tmp_path / "nb.ipynb"
+    path.write_text(
+        '{"cells": [{"cell_type": "code", "source": ["import os\\n"],'
+        ' "outputs": [{"text": "\\ud800"}], "execution_count": 1}],'
+        ' "metadata": {"kernelspec": {"name": "python3", "language": "python"}}}',
+        encoding="utf-8",
+    )
+
+    analysis = notebook_analysis(Database(), str(path))
+    assert analysis.diagnostics == ()
+    assert tuple(imported.module for imported in analysis.cells[0].imports) == ("os",)

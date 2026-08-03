@@ -324,6 +324,62 @@ def _extract_code_imports_and_defs(
     return tuple(imports), tuple(defs), _cell_parse_diagnostic(parse_error)
 
 
+def _is_unicode_text(value: str) -> bool:
+    """Report whether `value` is made only of Unicode scalar values.
+
+    The ASCII test is the fast path an overwhelming majority of notebook text
+    takes; only a string that leaves it pays for an encode.
+    """
+    if value.isascii():
+        return True
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _source_is_unicode_text(raw: Any) -> bool:
+    """Apply `_is_unicode_text` to a cell's source in either shape it takes."""
+    if isinstance(raw, str):
+        return _is_unicode_text(raw)
+    if isinstance(raw, list):
+        return all(_is_unicode_text(item) for item in raw if isinstance(item, str))
+    return True
+
+
+def _surrogate_bearing_field(parsed: dict[str, Any]) -> str | None:
+    """Name the first payload-bound string that is not valid Unicode.
+
+    Cell sources, cell types and the kernel metadata reach the cached payload --
+    and the cutoff token -- verbatim, where a lone surrogate is not a value
+    `freeze` can snapshot. Outputs and per-execution metadata reach neither, so
+    they are not walked: a notebook that only stores a surrogate loses no
+    analysis over it.
+    """
+    metadata = parsed.get("metadata")
+    if isinstance(metadata, dict):
+        for holder_name in ("kernelspec", "language_info"):
+            holder = metadata.get(holder_name)
+            if not isinstance(holder, dict):
+                continue
+            for field_name in ("name", "language"):
+                value = holder.get(field_name)
+                if isinstance(value, str) and not _is_unicode_text(value):
+                    return f"metadata.{holder_name}.{field_name}"
+    cells_raw = parsed.get("cells")
+    if isinstance(cells_raw, list):
+        for index, raw_cell in enumerate(cells_raw):
+            if not isinstance(raw_cell, dict):
+                continue
+            cell_type = raw_cell.get("cell_type")
+            if isinstance(cell_type, str) and not _is_unicode_text(cell_type):
+                return f"cells[{index}].cell_type"
+            if not _source_is_unicode_text(raw_cell.get("source")):
+                return f"cells[{index}].source"
+    return None
+
+
 def _try_parse_notebook(text: str) -> dict[str, Any] | None:
     if not text:
         return None
@@ -332,6 +388,8 @@ def _try_parse_notebook(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     if not isinstance(parsed, dict):
+        return None
+    if _surrogate_bearing_field(parsed) is not None:
         return None
     return parsed
 
@@ -431,6 +489,17 @@ def notebook_diagnostics_payload(db: Database, path: str) -> tuple[NotebookDiagn
         return (("notebook-decode-error", str(exc), None),)
     if not isinstance(parsed, dict):
         return (("notebook-shape-error", "top-level value is not an object", None),)
+    surrogate_field = _surrogate_bearing_field(parsed)
+    if surrogate_field is not None:
+        # Decided before the shape checks so this agrees with
+        # `_try_parse_notebook`, which refuses the document either way.
+        return (
+            (
+                "notebook-decode-error",
+                f"{surrogate_field} contains an unpaired surrogate",
+                None,
+            ),
+        )
     cells_raw = parsed.get("cells")
     if cells_raw is None:
         return (("notebook-shape-error", "missing 'cells' field", None),)
