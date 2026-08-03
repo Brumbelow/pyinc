@@ -565,6 +565,38 @@ def test_workspace_remaps_out_of_project_requirements_reference(tmp_path: Path) 
     assert "pyinc-tools-" not in matching[0].message
 
 
+def test_workspace_keeps_a_two_level_out_of_project_reference_deterministic(
+    tmp_path: Path,
+) -> None:
+    """A `-r` target that escapes two levels resolves above the mirror's parent.
+
+    The remap re-anchors the mirror root and its parent, so this message still
+    names the path the mirror layout resolved to rather than the workspace one.
+    What it must never do is vary between runs or leak the mirror's random
+    component.
+    """
+
+    root = tmp_path / "nested" / "workspace"
+    root.mkdir(parents=True)
+    (root / "requirements.txt").write_text("-r ../../twoup.txt\n", encoding="utf-8")
+
+    messages: list[tuple[str, ...]] = []
+    for _ in range(2):
+        with WorkspaceSession(root) as session:
+            messages.append(
+                tuple(
+                    diagnostic.message
+                    for diagnostic in session.analyze_workspace().diagnostics
+                    if diagnostic.code == "error"
+                )
+            )
+            assert session.mirror_root not in messages[-1][0]
+
+    assert len(messages[0]) == 1
+    assert messages[0] == messages[1]
+    assert "pyinc-tools-" not in messages[0][0]
+
+
 def test_workspace_mirror_rejects_referenced_file_symlink(tmp_path: Path) -> None:
     outside = tmp_path.parent / f"{tmp_path.name}-requirements.in"
     outside.write_text("outside-package==1\n", encoding="utf-8")
