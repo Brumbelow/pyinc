@@ -729,6 +729,7 @@ class _Driver:
         self._ignored_dir_names = frozenset[str]()
         self._exclude_globs: tuple[str, ...] = ()
         self.refreshed: list[tuple[str, ...]] = []
+        self._closed = False
 
     def refresh_paths(self, paths: Any) -> tuple[str, ...]:
         result = tuple(paths)
@@ -737,15 +738,67 @@ class _Driver:
 
 
 def test_watcher_run_exits_when_its_session_closes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    watcher = workspace.PollingWorkspaceWatcher(_Driver(tmp_path))
+    driver = _Driver(tmp_path)
+    watcher = workspace.PollingWorkspaceWatcher(driver)
+    observed: list[Exception] = []
+    watcher._on_error = observed.append
 
     def closed() -> tuple[str, ...]:
-        raise RuntimeError("closed")
+        driver._closed = True
+        raise RuntimeError("WorkspaceSession is closed.")
 
     monkeypatch.setattr(watcher, "_poll_once", closed)
     watcher._run(0.0)
+
+    assert observed == []
+    assert capsys.readouterr().err == ""
+
+
+def test_watcher_run_reports_a_runtime_error_that_is_not_a_closed_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RuntimeError also covers RecursionError and plain bugs in the poll path.
+
+    Only the closed-session contract may retire the watcher thread; anything
+    else has to reach the error handler instead of disappearing.
+    """
+
+    watcher = workspace.PollingWorkspaceWatcher(_Driver(tmp_path))
+    observed: list[Exception] = []
+    watcher._on_error = observed.append
+    failures = iter((RecursionError("too deep"), RuntimeError("snapshot bug")))
+
+    def failing() -> tuple[str, ...]:
+        error = next(failures, None)
+        if error is None:
+            watcher._stop_event.set()
+            return ()
+        raise error
+
+    monkeypatch.setattr(watcher, "_poll_once", failing)
+    watcher._run(0.0)
+
+    assert [type(error).__name__ for error in observed] == ["RecursionError", "RuntimeError"]
+
+
+def test_watcher_run_exits_when_a_driver_without_closed_state_signals_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _Driver(tmp_path)
+    del driver._closed
+    watcher = workspace.PollingWorkspaceWatcher(driver)
+    observed: list[Exception] = []
+    watcher._on_error = observed.append
+
+    def closed() -> tuple[str, ...]:
+        raise RuntimeError("WorkspaceSession is closed.")
+
+    monkeypatch.setattr(watcher, "_poll_once", closed)
+    watcher._run(0.0)
+
+    assert observed == []
 
 
 def test_watcher_run_returns_immediately_when_already_stopped(tmp_path: Path) -> None:

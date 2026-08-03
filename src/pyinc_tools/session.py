@@ -230,11 +230,12 @@ from ._workspace import (
     DEFAULT_IGNORED_DIR_NAMES as DEFAULT_IGNORED_DIR_NAMES,
 )
 from ._workspace import (
-    PollingWorkspaceWatcher as PollingWorkspaceWatcher,
-)
-from ._workspace import (
+    SESSION_CLOSED_MESSAGE,
     WorkspaceMirror,
     _encode_python_text,
+)
+from ._workspace import (
+    PollingWorkspaceWatcher as PollingWorkspaceWatcher,
 )
 
 # Diagnostic codes that `code_actions_for_range` can offer a quick fix for.
@@ -402,7 +403,7 @@ class WorkspaceSession:
 
     def _check_open(self) -> None:
         if self._closed:
-            raise RuntimeError("WorkspaceSession is closed.")
+            raise RuntimeError(SESSION_CLOSED_MESSAGE)
 
     def __enter__(self) -> WorkspaceSession:
         return self

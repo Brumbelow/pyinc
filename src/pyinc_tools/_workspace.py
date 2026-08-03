@@ -36,6 +36,9 @@ _RELEVANT_SUFFIXES = frozenset(
     {".py", ".pyi", ".toml", ".json", ".xml", ".csv", ".ipynb", ".txt", ".cfg", ".ini"}
 )
 _RELEVANT_NAMES = frozenset({".env", "Pipfile", "pyproject.toml"})
+# The signal a closed session raises to its watcher; a driver that reports no
+# closed state is recognized by this message alone.
+SESSION_CLOSED_MESSAGE = "WorkspaceSession is closed."
 _REQUIREMENTS_REFERENCE = re.compile(r"^(?:-r|--requirement|-c|--constraint)\s+(.+)$")
 
 
@@ -742,9 +745,12 @@ class PollingWorkspaceWatcher:
             while not self._stop_event.is_set():
                 try:
                     ready = self._poll_once()
-                except RuntimeError:
-                    # Session was closed out from under us; exit cleanly.
-                    return
+                except RuntimeError as exc:
+                    if self._session_closed(exc):
+                        # Session was closed out from under us; exit cleanly.
+                        return
+                    self._handle_error(exc)
+                    ready = ()
                 except Exception as exc:  # pragma: no cover - defensive
                     self._handle_error(exc)
                     ready = ()
@@ -762,6 +768,19 @@ class PollingWorkspaceWatcher:
         finally:
             self._finish_current_thread()
 
+    def _session_closed(self, exc: RuntimeError) -> bool:
+        """Whether `exc` is the session reporting that it closed.
+
+        Only that contract may retire the watcher thread: RuntimeError also
+        covers RecursionError and any bug in the poll path, and those have to
+        be reported rather than mistaken for a shutdown.
+        """
+
+        closed = getattr(self._session, "_closed", None)
+        if closed is not None:
+            return bool(closed)
+        return str(exc) == SESSION_CLOSED_MESSAGE
+
     def _handle_error(self, exc: Exception) -> None:
         if self._on_error is not None:
             with contextlib.suppress(Exception):  # pragma: no cover - defensive
@@ -777,6 +796,7 @@ PollingWorkspaceWatcher.__module__ = "pyinc_tools.session"
 
 __all__ = [
     "DEFAULT_IGNORED_DIR_NAMES",
+    "SESSION_CLOSED_MESSAGE",
     "PollingWorkspaceWatcher",
     "WorkspaceMirror",
 ]
