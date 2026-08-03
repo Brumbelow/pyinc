@@ -90,7 +90,7 @@ def test_workspace_link_detection_handles_windows_reparse_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class Probe:
-        def __init__(self, attributes: int | None) -> None:
+        def __init__(self, attributes: int | type[OSError] | None) -> None:
             self.attributes = attributes
 
         def is_symlink(self) -> bool:
@@ -99,6 +99,8 @@ def test_workspace_link_detection_handles_windows_reparse_metadata(
         def lstat(self) -> SimpleNamespace:
             if self.attributes is None:
                 raise FileNotFoundError
+            if isinstance(self.attributes, type):
+                raise self.attributes
             return SimpleNamespace(st_file_attributes=self.attributes)
 
     monkeypatch.setattr(workspace, "os", SimpleNamespace(name="nt"))
@@ -106,6 +108,9 @@ def test_workspace_link_detection_handles_windows_reparse_metadata(
     assert workspace._is_workspace_link(Probe(0x400))  # type: ignore[arg-type]
     assert not workspace._is_workspace_link(Probe(0))  # type: ignore[arg-type]
     assert not workspace._is_workspace_link(Probe(None))  # type: ignore[arg-type]
+    # Windows reports ERROR_DIRECTORY for a component under a file parent; an
+    # entry the probe cannot reach is absent, not a link.
+    assert not workspace._is_workspace_link(Probe(NotADirectoryError))  # type: ignore[arg-type]
 
     symlink = tmp_path / "link"
     _symlink_or_skip(symlink, tmp_path / "target")
@@ -200,8 +205,22 @@ def test_read_workspace_file_rejects_outside_unnormalized_directories_and_specia
             workspace._read_workspace_file(fifo, root)
 
     # A parent that is a file means the path is gone, not that it is unsafe.
+    # POSIX reports ENOTDIR for that shape, Windows ERROR_PATH_NOT_FOUND.
     plain = root / "mod.py"
     plain.write_bytes(b"pass\n")
+    with pytest.raises(workspace._MISSING_PATH_ERRORS):
+        workspace._read_workspace_file(plain / "inner.py", root)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ENOTDIR traversal")
+def test_read_workspace_file_reports_a_posix_file_parent_as_not_a_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    plain = root / "mod.py"
+    plain.write_bytes(b"pass\n")
+
     with pytest.raises(NotADirectoryError):
         workspace._read_workspace_file(plain / "inner.py", root)
 
@@ -356,6 +375,17 @@ def test_windows_workspace_reader_rejects_links_open_errors_and_identity_changes
     with pytest.raises(FileNotFoundError):
         workspace._read_workspace_file_windows(target, root)
 
+    def parent_became_a_file(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if path == target:
+            raise NotADirectoryError(errno.ENOTDIR, "The directory name is invalid", path)
+        return original_open(path, flags, *args, **kwargs)
+
+    # ERROR_DIRECTORY between the stat and the open says the path is gone, so
+    # it must not be reported as an unsafe read the mirror would keep retrying.
+    monkeypatch.setattr(os, "open", parent_became_a_file)
+    with pytest.raises(NotADirectoryError):
+        workspace._read_workspace_file_windows(target, root)
+
     monkeypatch.setattr(os, "open", original_open)
     replaced = False
 
@@ -370,6 +400,62 @@ def test_windows_workspace_reader_rejects_links_open_errors_and_identity_changes
     monkeypatch.setattr(os, "open", replace_before_open)
     with pytest.raises(ValueError, match="changed identity"):
         workspace._read_workspace_file_windows(target, root)
+
+
+def test_windows_shaped_missing_child_is_absence_for_the_reader_and_the_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows reports ERROR_PATH_NOT_FOUND where POSIX reports ENOTDIR.
+
+    The child of a path that is a regular file again reaches the stat as a
+    FileNotFoundError there, and both signals have to mean the same thing: the
+    entry is gone, and its mirror copy goes with it.
+    """
+
+    root = tmp_path / "root"
+    mirror_root = tmp_path / "mirror"
+    root.mkdir()
+    mirror_root.mkdir()
+    mirror = workspace.WorkspaceMirror(str(root), str(mirror_root), frozenset(), ())
+
+    parent = root / "mod.py"
+    parent.mkdir()
+    child = parent / "inner.py"
+    child.write_bytes(b"inner")
+    mirror.sync_path_from_disk(str(child))
+    assert (mirror_root / "mod.py" / "inner.py").read_bytes() == b"inner"
+
+    shutil.rmtree(parent)
+    parent.write_bytes(b"pass\n")
+    real_lstat = Path.lstat
+
+    def windows_lstat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == child:
+            raise FileNotFoundError(errno.ENOENT, "The system cannot find the path specified")
+        return real_lstat(self, *args, **kwargs)
+
+    class WindowsOs:
+        """The real os module, reporting the name that picks the Windows reader.
+
+        Patching `os.name` itself is not an option: pathlib reads it when it
+        builds a path and would refuse to instantiate a WindowsPath here.
+        """
+
+        name = "nt"
+
+        def __getattr__(self, attribute: str) -> Any:
+            return getattr(os, attribute)
+
+    monkeypatch.setattr(workspace, "os", WindowsOs())
+    monkeypatch.setattr(Path, "lstat", windows_lstat)
+
+    with pytest.raises(FileNotFoundError):
+        workspace._read_workspace_file(child, root)
+
+    mirror.sync_path_from_disk(str(child))
+
+    assert not (mirror_root / "mod.py").exists()
+    assert str(child) not in mirror.content_hashes()
 
 
 def test_requirements_reference_paths_follows_allowed_recursive_closure(tmp_path: Path) -> None:
@@ -490,12 +576,15 @@ def test_collect_filesystem_snapshot_hashes_contents_and_tolerates_a_disappearin
     }
 
     monkeypatch.setattr(workspace, "_workspace_files", lambda *_args: ({target}, set()))
-    monkeypatch.setattr(
-        workspace,
-        "_read_workspace_file",
-        lambda *_args: (_ for _ in ()).throw(FileNotFoundError(target)),
-    )
-    assert workspace._collect_filesystem_snapshot(str(root), frozenset()) == {}
+    # A path can also swap kind between the walk and the read, which POSIX and
+    # Windows report differently and the snapshot has to survive either way.
+    for error in workspace._MISSING_PATH_ERRORS:
+        monkeypatch.setattr(
+            workspace,
+            "_read_workspace_file",
+            lambda *_args, _error=error: (_ for _ in ()).throw(_error(target)),
+        )
+        assert workspace._collect_filesystem_snapshot(str(root), frozenset()) == {}
 
 
 def test_workspace_mirror_copies_and_normalizes_paths(tmp_path: Path) -> None:
@@ -540,15 +629,17 @@ def test_workspace_mirror_copy_tolerates_a_file_disappearing(
     target = root / "gone.py"
     mirror = workspace.WorkspaceMirror(str(root), str(mirror_root), frozenset(), ())
     monkeypatch.setattr(workspace, "_workspace_files", lambda *_args: ({target}, set()))
-    monkeypatch.setattr(
-        workspace,
-        "_read_workspace_file",
-        lambda *_args: (_ for _ in ()).throw(FileNotFoundError(target)),
-    )
 
-    mirror.copy_workspace()
+    for error in workspace._MISSING_PATH_ERRORS:
+        monkeypatch.setattr(
+            workspace,
+            "_read_workspace_file",
+            lambda *_args, _error=error: (_ for _ in ()).throw(_error(target)),
+        )
 
-    assert not (mirror_root / "gone.py").exists()
+        mirror.copy_workspace()
+
+        assert not (mirror_root / "gone.py").exists()
 
 
 def test_workspace_mirror_syncs_regular_directory_deleted_and_irrelevant_paths(

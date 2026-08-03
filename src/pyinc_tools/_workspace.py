@@ -39,6 +39,12 @@ _RELEVANT_NAMES = frozenset({".env", "Pipfile", "pyproject.toml"})
 # The signal a closed session raises to its watcher; a driver that reports no
 # closed state is recognized by this message alone.
 SESSION_CLOSED_MESSAGE = "WorkspaceSession is closed."
+# What traversing to a path reports once it is no longer there. A parent that
+# became a regular file raises ENOTDIR on POSIX; Windows answers the same shape
+# with ERROR_PATH_NOT_FOUND or ERROR_DIRECTORY, which arrive as
+# FileNotFoundError and NotADirectoryError. Both mean absence on both
+# platforms, and neither may be reported as an unsafe path.
+_MISSING_PATH_ERRORS = (FileNotFoundError, NotADirectoryError)
 _REQUIREMENTS_REFERENCE = re.compile(r"^(?:-r|--requirement|-c|--constraint)\s+(.+)$")
 
 
@@ -120,7 +126,8 @@ def _is_workspace_link(path: Path) -> bool:
         return False
     try:
         attributes = int(getattr(path.lstat(), "st_file_attributes", 0))
-    except FileNotFoundError:
+    except _MISSING_PATH_ERRORS:
+        # An entry the probe cannot reach is absent, and absent is not a link.
         return False
     reparse_point = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
     return bool(attributes & reparse_point)
@@ -259,7 +266,7 @@ def _read_workspace_file_windows(path: Path, root: Path) -> bytes:
     _reject_symlink_components(path, root)
     try:
         before = path.lstat()
-    except FileNotFoundError:
+    except _MISSING_PATH_ERRORS:
         raise
     if stat.S_ISLNK(before.st_mode):
         raise ValueError(f"workspace file symlinks are not supported: {path!s}")
@@ -271,7 +278,10 @@ def _read_workspace_file_windows(path: Path, root: Path) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     try:
         descriptor = os.open(path, flags)
-    except FileNotFoundError:
+    except _MISSING_PATH_ERRORS:
+        # The path went away between the stat and the open, which the mirror
+        # settles by dropping its copy -- an unsafe-read report would instead
+        # fail the refresh and be retried on every later tick.
         raise
     except OSError as exc:
         raise ValueError(f"workspace file is not safe to read: {path!s}") from exc
@@ -398,7 +408,7 @@ def _collect_filesystem_snapshot(
     for source_path in files:
         try:
             content = _read_workspace_file(source_path, Path(root).resolve(strict=False))
-        except FileNotFoundError:
+        except _MISSING_PATH_ERRORS:
             continue
         snapshot[str(source_path)] = hashlib.sha256(content).hexdigest()
     return snapshot
@@ -460,7 +470,7 @@ class WorkspaceMirror:
             target_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 content = _read_workspace_file(source_path, self.root_path)
-            except FileNotFoundError:
+            except _MISSING_PATH_ERRORS:
                 continue
             target_path.write_bytes(content)
             hashes[str(source_path)] = hashlib.sha256(content).hexdigest()
@@ -533,7 +543,7 @@ class WorkspaceMirror:
         if relevant:
             try:
                 content = _read_workspace_file(source_path, self.root_path)
-            except (FileNotFoundError, NotADirectoryError):
+            except _MISSING_PATH_ERRORS:
                 pass
             except IsADirectoryError:
                 self._content_hashes.pop(key, None)
