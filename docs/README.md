@@ -14,6 +14,7 @@ each have one job.
 | [Demo](demo.md) | See the watcher running on a real workspace. |
 | [Codegen Guide](codegen-guide.md) | Generate typed Python models from JSON Schema through the action layer. |
 | [Migrating from 2.x](migration-v3.md) | Discard incompatible state and update code for 3.0. |
+| [Releases and Verification](releases.md) | Check a published artifact, or see what the release pipeline enforces. |
 
 ## Depend on a contract
 

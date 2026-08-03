@@ -103,6 +103,7 @@ Releases are cut by the maintainer. The tag name must equal the
 commit in the released range against the release signing key, so those commits
 reach `main` as a fast-forward push of locally signed commits rather than
 through the GitHub merge button. This does not affect ordinary pull requests.
+[`docs/releases.md`](docs/releases.md) describes the rest of the pipeline.
 
 ## Reporting a security issue
 

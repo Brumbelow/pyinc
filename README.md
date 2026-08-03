@@ -79,6 +79,11 @@ The [kernel contract](https://github.com/Brumbelow/pyinc/blob/main/docs/kernel-c
 defines the exact value rules, intercepted operations, execution modes, durable
 checkpoint trust boundary, and documented limitations.
 
+Releases are cut from a signed tag whose whole commit range is signature-checked
+and published through PyPI trusted publishing;
+[releases and verification](https://github.com/Brumbelow/pyinc/blob/main/docs/releases.md)
+shows how to verify a download.
+
 ## Packages
 
 One distribution ships three top-level typed packages; the stable integration
@@ -107,6 +112,7 @@ tamper repair, orphan cleanup, and dry-run planning. See the
 - [`pyinc-tools` guide](https://github.com/Brumbelow/pyinc/blob/main/docs/pyinc-tools-guide.md) and [LSP reference](https://github.com/Brumbelow/pyinc/blob/main/docs/lsp-reference.md) — CLI, editor setup, overlays, protocol methods, and user-visible limitations.
 - [Integration authoring](https://github.com/Brumbelow/pyinc/blob/main/docs/integration-authoring.md) — the three-layer integration pattern.
 - [Migrating from 2.x](https://github.com/Brumbelow/pyinc/blob/main/docs/migration-v3.md) — state cleanup and 3.0 API changes.
+- [Releases and verification](https://github.com/Brumbelow/pyinc/blob/main/docs/releases.md) — signed tags, trusted publishing, and checking a download.
 
 ## Development
 
