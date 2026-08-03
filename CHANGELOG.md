@@ -47,7 +47,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `ClassModel.truncated_bases` names every base that resolved to a workspace
   class but sat past the `MAX_BASE_DEPTH` cap and so was not walked, reported
   as written at the stopped edge and deduplicated in first-encounter order.
-  Members inherited more than eight levels above a class are still omitted, but
+  Members inherited eight or more levels above a class are still omitted, but
   no longer silently.
 - Code generation compiles four constructs that were previously
   `unsupported-construct` errors: `const` and inline `enum` render as
@@ -85,13 +85,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reported as an ordinary diagnostic rather than an exception: XML at 256
   element levels, JSON at 200 object/array levels, and TOML at 100 container
   levels.
+- A workspace demo page, `docs/demo.md`: recordings of `pyinc-tools` watching
+  a pinned checkout of pytest, linked from the README. The clips ship as
+  1.8 MB of media in the sdist, and neither the page nor the README carries
+  measured timings — the recordings stand on their own.
 
 ### Changed
 
 - The default backdate decision in `checked` and `fast` now matches `strict`
   in three corners it previously diverged on: a recomputed dataclass whose
-  type changed while its fields stayed equal, and a dataclass replaced by a
-  dict of the same shape, both count as changes in every mode (previously
+  type name (its qualified name) changed while its fields stayed equal, and a
+  dataclass replaced by a dict of the same shape, both count as changes in
+  every mode (previously
   backdated in `checked`/`fast` because thawing dropped the type identity),
   and default comparisons no longer invoke `ValueAdapter` `thaw`/`freeze`
   hooks in any mode. Queries with an `eq=` or `cutoff=` policy are
@@ -140,20 +145,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   iterative. Payloads and their order are unchanged.
 - Configuration nesting past a cap is rejected rather than analyzed. XML at
   257 element levels, JSON at 201 container levels, and TOML at 101 container
-  levels (array-of-tables costs two containers per header, so `[[a.b.c…]]`
-  crosses at 51 headers) now yield an empty payload and one diagnostic naming
-  the limit. Below each cap, payloads and cutoff tokens are byte-identical to
-  the previous release, verified across 871 constructed plus 16,000 fuzzed
-  JSON documents and 16,840 TOML documents with zero differences. The JSON cap
-  is set by two measured constraints: a document at the cap with 20-character
-  keys caches 823 KiB of section payload, and `pyinc.value._MAX_SNAPSHOT_DEPTH`
-  is 200, so nothing the integration accepts can fail to `freeze`. The TOML cap
-  is half that because `_toml_cutoff_value` rewrites each table as a tuple of
-  pairs, costing two snapshot levels per table.
-- The JSON integration's pre-parse depth scan moves the query fingerprints of
-  `json_file_text`, `json_sections_payload`, `json_diagnostics_payload`, and
-  `json_analysis_payload`, so checkpoints saved by an earlier release miss for
-  these queries and safely re-execute.
+  levels (the implicit root table is the first level and each array-of-tables
+  header costs two, so 50 nested `[[…]]` headers cross the cap) now yield an
+  empty payload and one diagnostic naming the limit. Below each cap, payloads
+  and cutoff tokens are byte-identical to the previous release. The caps keep
+  every accepted document within the snapshot depth the value layer supports;
+  TOML's is half of JSON's because its cutoff encoding spends two snapshot
+  levels per table.
+- The JSON integration's pre-parse depth scan moves its query fingerprints, so
+  checkpoints saved by an earlier release miss for JSON analysis and safely
+  re-execute.
 - Code generation selects a schema node's shape by one precedence everywhere —
   `$ref`, then `allOf`/`anyOf`, then `enum`, then `const`, then `type`.
 - Root-schema violations are reported as one `unsupported-root-schema` error at
@@ -198,13 +199,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `WorkspaceSession` holds one kernel request span per public method, so a
   warm `analyze_workspace` validates each resource once per call instead of
   once per internal request.
-
-### Removed
-
-- The demo page, its recordings, and the measured-timing claims in the README.
-  The workspace demo will be re-recorded and republished with the next
-  release; until then the repository makes no wall-clock claims. Dropping the
-  recordings also removes 7.3 MB of media from the sdist.
 
 ### Fixed
 
