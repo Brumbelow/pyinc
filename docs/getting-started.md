@@ -148,6 +148,11 @@ print(db.statistics())
 print(db.query_profile())
 ```
 
+Hold a batch of reads inside `db.request_span()` when they should all see one
+world: the batch shares a single resource-validation pass, and a `db.set` inside
+it rolls the span so later reads re-derive. See
+[Request Spans](kernel-contract.md#request-spans) for a worked example.
+
 Use `dependency_graph()` for a machine-readable graph. `statistics()` reports
 work counts and cache decisions; `query_profile()` reports timing aggregates.
 Those APIs are better correctness and performance signals than inferring work

@@ -254,6 +254,51 @@ call already opens its own request. Spans are reentrant: an inner span, or
 one opened inside a `get`, joins the enclosing request, and only the
 outermost close ends it.
 
+```python docs-check
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from pyinc import Database, FileResource, Input, query
+
+NOTES = FileResource()
+SUFFIX = Input[str]("span.suffix")
+
+
+@query
+def line_count(db: Database, path: str) -> int:
+    return len(NOTES.read(db, path).splitlines())
+
+
+@query
+def summary(db: Database, path: str) -> str:
+    return f"{line_count(db, path)}{SUFFIX.read(db)}"
+
+
+with TemporaryDirectory() as directory:
+    path = str(Path(directory, "notes.txt"))
+    Path(path).write_text("first\nsecond\n", encoding="utf-8")
+
+    db = Database()
+    db.set(SUFFIX, " lines")
+    assert db.get(summary, path) == "2 lines"
+
+    before = db.statistics()
+    with db.request_span():
+        assert db.get(line_count, path) == 2       # validates the file once
+        assert db.get(summary, path) == "2 lines"  # answers from that pass
+        assert db.inspect(summary, path).last_decision == "reused"
+        db.set(SUFFIX, " rows")                    # a real change rolls the span
+        assert db.get(summary, path) == "2 rows"   # re-validates against it
+    after = db.statistics()
+
+    # Four calls, two requests: one per declared world, not one per call.
+    assert after.total_requests - before.total_requests == 2
+    assert after.resource_probe_hits - before.resource_probe_hits == 2
+```
+
+Without the span those same four calls open four requests and re-probe the
+file on three of them.
+
 ## Explicit Limitations
 
 These fall **outside** the soundness envelope. The kernel does not guarantee
