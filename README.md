@@ -55,20 +55,10 @@ action.
 
 ![Editing pytest under pyinc's watcher](https://raw.githubusercontent.com/Brumbelow/pyinc/main/docs/assets/demo.gif)
 
-`pyinc-tools` was pointed at a pinned checkout of pytest — 270 Python files,
-nothing adapted for `pyinc` — and watched while single files were edited.
-Measured against an earlier build of the same engine, the initial analysis went
-from 232.99 s to 104.43 s (~2.2x), re-analyzing the workspace after a one-file
-edit from 160.311 s to 0.597 s (~268x), and a warm single-file re-analysis from
-10.010 s to 0.209 s (~48x). Those timings are from one machine and will differ
-on yours; the clip above is a separate run of the same engine, so its on-screen
-readings differ again. The work counts behind that one-file edit — 73 queries
-executed, 9,744 results reused, 47 backdated — depend on the engine and the edit
-rather than on the machine: the executed and backdated counts reproduce exactly,
-and the reused count varies slightly from run to run.
-[The demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md)
-names the commit every figure was measured at, and walks through the pipeline,
-the measurements, and a trace of which queries one update actually re-ran.
+`pyinc-tools` was pointed at a pinned checkout of pytest — nothing in it adapted
+for `pyinc` — and watched while single files were edited;
+[the demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) has
+the clips.
 
 ## Correctness contract
 
@@ -108,7 +98,7 @@ tamper repair, orphan cleanup, and dry-run planning. See the
 ## Documentation
 
 - [Getting started](https://github.com/Brumbelow/pyinc/blob/main/docs/getting-started.md) — build a small graph, add a tracked file, choose a mode, inspect work, and write a first action.
-- [Demo](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) — the watcher, work counts, and an update trace on a real workspace.
+- [Demo](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) — the watcher running on a real workspace.
 - [Architecture](https://github.com/Brumbelow/pyinc/blob/main/docs/architecture.md) — package boundaries and how the kernel, integrations, tools, and codegen fit together.
 - [Kernel contract](https://github.com/Brumbelow/pyinc/blob/main/docs/kernel-contract.md) — the normative soundness envelope.
 - [Action contract](https://github.com/Brumbelow/pyinc/blob/main/docs/action-contract.md) — declared-output reconciliation.
