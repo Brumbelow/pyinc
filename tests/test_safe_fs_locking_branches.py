@@ -1329,13 +1329,13 @@ def test_acquire_retries_transient_open_failures_until_the_open_succeeds(
 
     monkeypatch.setattr(locking, "open_lock_file", flaky_open)
     monkeypatch.setattr(locking, "_try_lock", lambda handle: None)
+    monkeypatch.setattr(locking, "_unlock", lambda handle: None)
     lock = locking.FileLock(tmp_path / "store.lock", timeout=5.0)
     lock.acquire()
     try:
         assert calls["count"] == 3
         assert lock._handle is stream
     finally:
-        monkeypatch.setattr(locking, "_unlock", lambda handle: None)
         lock.release()
 
 
