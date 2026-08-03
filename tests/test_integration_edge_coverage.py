@@ -168,10 +168,14 @@ def test_marker_comparison_edges() -> None:
     assert diagnostics[0][0] == "unknown-marker-variable"
     assert requirement_evaluation._env_lookup("unknown", env) == ""
 
+    # Neither side is a marker variable here, so none of these reach the
+    # version-specifier path -- they land on packaging's own fixed fallback
+    # table, where "<" and ">" are unconditionally False (not string
+    # ordering) and "<=" / ">=" are string equality (not "or equal to").
     cases = (
-        ("<", "a", "b", True),
+        ("<", "a", "b", False),
         ("<=", "a", "a", True),
-        (">", "b", "a", True),
+        (">", "b", "a", False),
         (">=", "b", "b", True),
         ("==", "a", "a", True),
         ("!=", "a", "b", True),
@@ -197,10 +201,13 @@ def test_marker_comparison_edges() -> None:
         )
         assert evaluate(node, env, []) is expected
 
+    # "bad" is not version-shaped, so "~=bad" forms no valid specifier clause
+    # at all (unlike an ordinary comparison, ~= has no string fallback), and
+    # packaging itself raises UndefinedComparison for exactly this shape.
     invalid_compatible = requirement_evaluation._CompareNode("string", "bad", "~=", "string", "1.0")
     invalid_diagnostics: list[tuple[str, str]] = []
     assert evaluate(invalid_compatible, env, invalid_diagnostics) is False
-    assert invalid_diagnostics[0][0] == "unparseable-version"
+    assert invalid_diagnostics[0][0] == "undefined-marker-comparison"
 
     compatible = requirement_evaluation._CompareNode(
         "name", "python_version", "~=", "string", "3.1"

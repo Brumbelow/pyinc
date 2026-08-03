@@ -441,16 +441,21 @@ def test_marker_version_variable_wildcard_equality_is_prefix_matching(
     assert evaluate_markers(db, 'python_version != "3.*"').value is False
     assert evaluate_markers(db, 'python_full_version == "3.12.*"').value is True
 
-    # A wildcard base that is not itself a version stays undecidable.
+    # A wildcard base that is not itself a version forms no valid specifier
+    # clause, exactly as packaging's Specifier construction would reject it,
+    # so evaluation falls back to packaging's fixed operator table rather
+    # than reporting an unparseable environment value.
     bad = evaluate_markers(db, 'python_version == "bad.*"')
     assert bad.value is False
-    assert [code for code, _ in bad.diagnostics] == ["unparseable-version"]
+    assert bad.diagnostics == ()
 
-    # Wildcards are only defined for ==/!= in PEP 440; ordered operators keep
-    # the undecidable diagnostic.
+    # Wildcards are only defined for ==/!= in PEP 440; an ordered operator
+    # against a wildcard literal is also not a valid specifier clause, so it
+    # falls back to the table too -- ">=" maps to string equality there, not
+    # string ordering, exactly as packaging's own fallback does.
     ordered = evaluate_markers(db, 'python_version >= "3.*"')
     assert ordered.value is False
-    assert [code for code, _ in ordered.diagnostics] == ["unparseable-version"]
+    assert ordered.diagnostics == ()
 
 
 def test_marker_wildcard_equality_matches_packaging_on_running_interpreter() -> None:
@@ -943,3 +948,93 @@ def test_wildcard_specifier_validity_matches_packaging(spec_text: str) -> None:
     else:
         packaging_accepts = True
     assert (parse_specifier_set(spec_text) is not None) == packaging_accepts
+
+
+# ---------------------------------------------------------------------------
+# Marker comparisons follow packaging's algorithm, not a variable list
+# ---------------------------------------------------------------------------
+
+_PARITY_ENV_MAPPING = {
+    "python_version": "3.12",
+    "python_full_version": "3.12.3",
+    "implementation_name": "cpython",
+    "implementation_version": "3.12.3",
+    "os_name": "posix",
+    "sys_platform": "linux",
+    "platform_system": "Linux",
+    "platform_release": "6.5.0-28-generic",
+    "platform_machine": "x86_64",
+    "platform_python_implementation": "CPython",
+    "platform_version": "#28-Ubuntu SMP",
+}
+
+# PythonEnvironmentPayload field order per requirement_evaluation._env_lookup.
+_PARITY_ENV_PAYLOAD = (
+    _PARITY_ENV_MAPPING["python_version"],
+    _PARITY_ENV_MAPPING["python_full_version"],
+    _PARITY_ENV_MAPPING["implementation_name"],
+    _PARITY_ENV_MAPPING["implementation_version"],
+    _PARITY_ENV_MAPPING["os_name"],
+    _PARITY_ENV_MAPPING["sys_platform"],
+    _PARITY_ENV_MAPPING["platform_system"],
+    _PARITY_ENV_MAPPING["platform_release"],
+    _PARITY_ENV_MAPPING["platform_machine"],
+    _PARITY_ENV_MAPPING["platform_python_implementation"],
+    _PARITY_ENV_MAPPING["platform_version"],
+)
+
+
+@pytest.mark.parametrize(
+    "marker_text",
+    [
+        'platform_release >= "6"',
+        'platform_release < "7"',
+        'platform_release == "6.5.0-28-generic"',
+        'platform_release == "6.5.*"',
+        'platform_release != "6.5.*"',
+        'platform_release == "6.5.0.post1.*"',
+        'platform_release != "6.5.0.post1.*"',
+        '"linux" == sys_platform',
+        '"6" <= platform_release',
+        '"7" > platform_release',
+        'os_name == sys_platform',
+        'python_version == "3.*"',
+        'python_version == "3.14.0.post1.*"',
+        'python_version >= "3.10"',
+        'python_full_version < "3.13"',
+        '"generic" in platform_release',
+        '"win" not in sys_platform',
+        'implementation_version ~= "3.12"',
+        'platform_machine >= "x86"',
+        'sys_platform < "zzz"',
+        'sys_platform <= "linux"',
+        'python_version >= "3.*"',
+        '"posix" == os_name',
+        '"3.11" < python_version',
+        'platform_system > "A"',
+    ],
+)
+def test_marker_evaluation_matches_packaging(marker_text: str) -> None:
+    expected = Marker(marker_text).evaluate(dict(_PARITY_ENV_MAPPING))
+    node = requirement_evaluation._parse_marker(marker_text)
+    assert node is not None, marker_text
+    value, _diags = requirement_evaluation._evaluate_marker(node, _PARITY_ENV_PAYLOAD)
+    assert value == expected, marker_text
+
+
+def test_unparseable_environment_version_under_a_valid_specifier_diagnoses() -> None:
+    node = requirement_evaluation._parse_marker('platform_release >= "6"')
+    assert node is not None
+    value, diags = requirement_evaluation._evaluate_marker(node, _PARITY_ENV_PAYLOAD)
+    assert value is False
+    assert any(code == "unparseable-version" for code, _message in diags)
+
+
+def test_compatible_release_against_non_version_variable_diagnoses() -> None:
+    """packaging raises UndefinedComparison for a ~= key it doesn't version-match;
+    pyinc's non-raising contract reports the divergence and evaluates False."""
+    node = requirement_evaluation._parse_marker('sys_platform ~= "linux"')
+    assert node is not None
+    value, diags = requirement_evaluation._evaluate_marker(node, _PARITY_ENV_PAYLOAD)
+    assert value is False
+    assert any(code == "undefined-marker-comparison" for code, _message in diags)

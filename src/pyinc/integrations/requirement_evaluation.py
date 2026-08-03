@@ -10,7 +10,6 @@ from typing import Literal, TypeAlias, cast
 
 from pyinc.core import query
 from pyinc.integrations._pep440 import (
-    compare_versions,
     parse_specifier_set,
     parse_version,
     satisfies,
@@ -382,8 +381,6 @@ _MARKER_VARIABLES = frozenset(
     }
 )
 
-_VERSION_VARIABLES = frozenset({"python_version", "python_full_version", "implementation_version"})
-
 
 def _env_lookup(name: str, env: PythonEnvironmentPayload) -> str:
     idx = {
@@ -426,126 +423,108 @@ def _eval_node(
     return _eval_compare(node, env, diagnostics)
 
 
+_VERSION_MARKER_VARIABLES = frozenset(
+    {"python_version", "python_full_version", "implementation_version", "platform_release"}
+)
+
+
+def _literal_is_version_shaped(literal: str) -> bool:
+    """Whether ``literal`` could plausibly form a PEP 440 specifier clause.
+
+    ``parse_specifier_set`` intentionally defers non-wildcard version-format
+    validation to ``satisfies`` (see Task 3) so that ``evaluate_version_specifier``
+    can report a specific "cannot evaluate" detail instead of an upfront parse
+    failure. Marker evaluation needs the sharper distinction that packaging's
+    ``Specifier`` constructor makes: a clause whose text is not version-shaped
+    at all (e.g. ``==6.5.0-28-generic``) is invalid and must fall back to the
+    string table, as opposed to a clause that is well-formed but simply
+    doesn't match the environment's value.
+    """
+    base = literal[:-2] if literal.endswith(".*") else literal
+    return parse_version(base) is not None
+
+
 def _eval_compare(
     node: _CompareNode,
     env: PythonEnvironmentPayload,
     diagnostics: list[tuple[str, str]],
 ) -> bool:
-    def resolve(kind: str, text: str) -> tuple[str, bool]:
-        if kind == "name":
-            if text not in _MARKER_VARIABLES:
-                diagnostics.append(("unknown-marker-variable", f"unknown marker variable: {text}"))
-                return "", False
-            if text == "extra":
-                diagnostics.append(
-                    (
-                        "extras-not-modeled",
-                        "marker references 'extra'; extras are not modeled — "
-                        "treating as empty string",
-                    )
+    def env_value(text: str) -> str:
+        if text not in _MARKER_VARIABLES:
+            diagnostics.append(("unknown-marker-variable", f"unknown marker variable: {text}"))
+            return ""
+        if text == "extra":
+            diagnostics.append(
+                (
+                    "extras-not-modeled",
+                    "marker references 'extra'; extras are not modeled — "
+                    "treating as empty string",
                 )
-            if text == "platform_version":
-                diagnostics.append(
-                    (
-                        "platform-version-unstable",
-                        "marker references 'platform_version', which is noisy "
-                        "across kernel patch versions",
-                    )
+            )
+        if text == "platform_version":
+            diagnostics.append(
+                (
+                    "platform-version-unstable",
+                    "marker references 'platform_version', which is noisy "
+                    "across kernel patch versions",
                 )
-            return _env_lookup(text, env), text in _VERSION_VARIABLES
-        return text, False
+            )
+        return _env_lookup(text, env)
 
-    left_val, left_is_ver = resolve(node.left_kind, node.left)
-    right_val, right_is_ver = resolve(node.right_kind, node.right)
     op = node.op
-
-    use_version_compare = op in ("<", "<=", ">", ">=", "==", "!=") and (
-        (node.left_kind == "name" and left_is_ver) or (node.right_kind == "name" and right_is_ver)
-    )
+    # packaging's evaluation triple, with no side normalization and no
+    # operator inversion: the comparison text always comes from the right
+    # node -- a right-side variable contributes its NAME when the left side
+    # is also a variable, and its environment value when the left side is a
+    # literal (or when neither side is a variable, in which case there is no
+    # key to look up and the comparison falls straight to the string table).
+    if node.left_kind == "name":
+        lhs = env_value(node.left)
+        key = node.left
+        rhs = node.right
+    else:
+        lhs = node.left
+        key = node.right if node.right_kind == "name" else ""
+        rhs = env_value(node.right) if node.right_kind == "name" else node.right
 
     if op == "in":
-        return left_val in right_val
+        return lhs in rhs
     if op == "not in":
-        return left_val not in right_val
+        return lhs not in rhs
     if op == "===":
-        return left_val == right_val
-    if op == "~=":
-        left_v = parse_version(left_val)
-        right_v = parse_version(right_val)
-        if left_v is None or right_v is None:
-            diagnostics.append(
-                (
-                    "unparseable-version",
-                    f"cannot parse version in marker: {left_val} ~= {right_val}",
-                )
-            )
-            return False
-        spec_set = (("~=", right_val),)
-        ok, _ = satisfies(spec_set, left_val, include_prerelease=True)
-        return ok
+        return lhs == rhs
 
-    if (
-        use_version_compare
-        and op in ("==", "!=")
-        and node.right_kind == "string"
-        and right_val.endswith(".*")
-    ):
-        # PEP 440 prefix matching: ==/!= against a wildcard literal compares
-        # the release prefix, exactly as a specifier built from the clause
-        # would. Wildcards with ordered operators are not valid clauses and
-        # fall through to the unparseable-version diagnostic below.
-        left_v = parse_version(left_val)
-        right_v = parse_version(right_val[:-2])
-        if left_v is None or right_v is None:
-            diagnostics.append(
-                (
-                    "unparseable-version",
-                    f"cannot parse version in marker: {left_val} {op} {right_val}",
+    if key in _VERSION_MARKER_VARIABLES:
+        spec_set = parse_specifier_set(f"{op}{rhs}")
+        if spec_set and _literal_is_version_shaped(rhs):
+            ok, detail = satisfies(spec_set, lhs, include_prerelease=True)
+            if not ok and detail.startswith("unparseable version"):
+                diagnostics.append(
+                    (
+                        "unparseable-version",
+                        f"cannot parse version in marker: {lhs} {op} {rhs}",
+                    )
                 )
-            )
-            return False
-        spec_set = ((op, right_val),)
-        ok, _ = satisfies(spec_set, left_val, include_prerelease=True)
-        return ok
+            return ok
 
-    if use_version_compare:
-        left_v = parse_version(left_val)
-        right_v = parse_version(right_val)
-        if left_v is None or right_v is None:
-            diagnostics.append(
-                (
-                    "unparseable-version",
-                    f"cannot parse version in marker: {left_val} {op} {right_val}",
-                )
-            )
-            return False
-        cmp = compare_versions(left_v, right_v)
-        if op == "<":
-            return cmp < 0
-        if op == "<=":
-            return cmp <= 0
-        if op == ">":
-            return cmp > 0
-        if op == ">=":
-            return cmp >= 0
-        if op == "==":
-            return cmp == 0
-        if op == "!=":
-            return cmp != 0
+    # packaging's fixed fallback table for a non-version key, or a version
+    # key whose clause didn't parse: "<" and ">" are always False, "<=",
+    # ">=", and "==" are string equality, and "!=" is string inequality.
+    # "~=" has no entry -- it has no meaning outside a version comparison.
+    if op in ("<", ">"):
         return False
-
-    if op == "<":
-        return left_val < right_val
-    if op == "<=":
-        return left_val <= right_val
-    if op == ">":
-        return left_val > right_val
-    if op == ">=":
-        return left_val >= right_val
-    if op == "==":
-        return left_val == right_val
+    if op in ("<=", ">=", "=="):
+        return lhs == rhs
     if op == "!=":
-        return left_val != right_val
+        return lhs != rhs
+
+    diagnostics.append(
+        (
+            "undefined-marker-comparison",
+            f"marker comparison {op!r} against {rhs!r} has no version "
+            "interpretation here and no string fallback",
+        )
+    )
     return False
 
 
