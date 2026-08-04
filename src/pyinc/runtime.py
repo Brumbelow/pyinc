@@ -19,7 +19,6 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMappin
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
-from functools import lru_cache
 from pathlib import Path
 from types import (
     BuiltinFunctionType,
@@ -97,13 +96,6 @@ _CHECKPOINT_MANIFEST_VERSION = 5
 _KERNEL_FINGERPRINT_VERSION = 2
 _DEFAULT_SEMANTIC_EQUALITY_VERSION = 1
 _MISSING_SNAPSHOT = object()
-
-
-@lru_cache(maxsize=1024)
-def _module_file_digest(file_path: str, _change_identity: tuple[int, int, int, int, int]) -> str:
-    """Hash module bytes once per OS-maintained file-change identity."""
-
-    return hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
 
 
 def _build_runtime_build_payload() -> tuple[Any, ...]:
@@ -5014,27 +5006,16 @@ class Database:
                 f"Captured module {module_name!r} file does not match its import spec."
             )
 
+        # The identity is the bytes, hashed on every derivation. Stat-shaped
+        # shortcuts (size, mtime, ctime, device, inode) are not collision-free:
+        # a same-size rewrite inside one timestamp granule preserves all five.
         with self._allow_raw_reads_scope():
             try:
-                stat_result = os.stat(file_path)
-                change_identity = (
-                    stat_result.st_size,
-                    stat_result.st_mtime_ns,
-                    stat_result.st_ctime_ns,
-                    stat_result.st_dev,
-                    stat_result.st_ino,
-                )
-                digest = (
-                    hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
-                    if os.name == "nt"
-                    else _module_file_digest(file_path, change_identity)
-                )
+                digest = hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
             except OSError as exc:
                 raise UnsupportedValueError(
                     f"Captured module {module_name!r} file cannot be read safely."
                 ) from exc
-        # ctime/inode/device join size and mtime in the cache key, so a
-        # same-size write with a restored mtime still forces a fresh byte hash.
         file_identity = ("file-sha256", import_identity, digest)
         return (version_digest, file_identity, all_tuple, constants_payload)
 
@@ -5066,21 +5047,14 @@ class Database:
             if not isinstance(file_path, str):
                 source_observation = ("missing-file",)
             else:
+                # Observed by content, never by stat identity: the stamp gates
+                # reuse of a memoized fingerprint, so it carries the same
+                # collision risk the identity payload does.
                 with self._allow_raw_reads_scope():
                     try:
-                        stat_result = os.stat(file_path)
-                        change_identity = (
-                            stat_result.st_size,
-                            stat_result.st_mtime_ns,
-                            stat_result.st_ctime_ns,
-                            stat_result.st_dev,
-                            stat_result.st_ino,
-                        )
                         source_observation = (
-                            change_identity,
-                            hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
-                            if os.name == "nt"
-                            else None,
+                            "file-sha256",
+                            hashlib.sha256(Path(file_path).read_bytes()).hexdigest(),
                         )
                     except OSError:
                         source_observation = ("unreadable-file",)

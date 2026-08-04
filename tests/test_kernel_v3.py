@@ -848,6 +848,48 @@ def test_module_identity_hashes_compiled_file_bytes_even_when_stat_is_stable(
     assert first != second
 
 
+def test_module_identity_observes_rewritten_bytes_when_stat_identity_collides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A same-size rewrite can land inside one timestamp granule, leaving size,
+    # mtime, ctime, device, and inode all unchanged. Freeze the stat answer for
+    # this path to make that collision deterministic; the identity must come
+    # from the bytes.
+    path = tmp_path / "extension.bin"
+    path.write_bytes(b"first-payload")
+    frozen_stat = os.stat(path)
+    real_stat = os.stat
+
+    def stat_with_frozen_target(
+        target: Any, *args: Any, **kwargs: Any
+    ) -> os.stat_result:
+        if isinstance(target, (str, os.PathLike)) and os.fspath(target) == str(path):
+            return frozen_stat
+        return real_stat(target, *args, **kwargs)
+
+    module = ModuleType("pyinc_stat_collision_identity_test")
+    module.__file__ = str(path)
+    specification = importlib.machinery.ModuleSpec(
+        module.__name__,
+        importlib.machinery.SourceFileLoader(module.__name__, str(path)),
+        origin=str(path),
+    )
+    specification.has_location = True
+    module.__spec__ = specification
+    module.__loader__ = specification.loader
+    module.__package__ = specification.parent
+    vars(module)["__cached__"] = specification.cached
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(os, "stat", stat_with_frozen_target)
+    db = Database()
+
+    first = db._module_identity_payload(module)
+    path.write_bytes(b"other-payload")
+    second = db._module_identity_payload(module)
+
+    assert first != second
+
+
 def test_frozen_local_dataclass_capture_is_rejected_instead_of_erasing_behavior() -> None:
     def make_query(multiplier: int) -> Query[[], int]:
         @dataclass(frozen=True)
