@@ -75,5 +75,10 @@ gpg --import .github/release-signing-key.asc
 git verify-tag v3.1.0
 ```
 
-`git verify-tag` reports a good signature from the fingerprint above. `git
-verify-commit v3.1.0^{commit}` checks the commit the tag names in the same way.
+`git verify-tag` reports a good signature from the fingerprint above, followed
+by `WARNING: This key is not certified with a trusted signature!`. That warning
+is expected after a bare `gpg --import`: GPG is saying you have not personally
+certified the key, not that the signature failed to verify. Comparing the
+fingerprint it reports against the one above is what establishes trust here.
+`git verify-commit v3.1.0^{commit}` checks the commit the tag names in the same
+way.

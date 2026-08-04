@@ -229,9 +229,10 @@ back to its own model.
 
 The same problem reappears across definitions: `{"A": {"$ref": "#/$defs/B"},
 "B": {"$ref": "#/$defs/A"}}` closes a loop of aliases with no type in between,
-so each member is an `alias-cycle` error naming the cycle in definition order
-(`A -> B -> A`). As with the single-definition case, a container or object
-field between the aliases breaks the loop and keeps them compiling.
+so each member is an `alias-cycle` error naming the cycle anchored at its
+alphabetically first member (`A -> B -> A`). As with the single-definition
+case, a container or object field between the aliases breaks the loop and keeps
+them compiling.
 
 ### Ignored keywords
 

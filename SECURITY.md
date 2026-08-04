@@ -65,6 +65,6 @@ publishing, with no stored API token. The release workflow verifies the
 annotated tag and every commit in the released range against the key in
 `.github/release-signing-key.asc`, each GitHub Release carries a `SHA256SUMS`
 file covering the exact distributions published to PyPI, and a separate workflow
-re-verifies that the two match after publication.
+is dispatched after publication to re-verify that the two match.
 [`docs/releases.md`](docs/releases.md) describes the pipeline and how to check a
 download.
