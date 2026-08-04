@@ -80,8 +80,20 @@ caller's remaining stack, not of the file.
 | Purpose | Inspect TOML sections and summarize Python project dependencies and tool tables. |
 | Entrypoints | `config_analysis`, `workspace_config_analysis` |
 | Result types | `ConfigAnalysis`, `ConfigKey`, `ConfigSection` |
-| Supported shapes | Any single TOML file; workspace discovery of `pyproject.toml`; nested sections; project dependencies, optional dependency groups, tool names, parse and project-shape diagnostics. |
-| Key limits | Values are summarized as stable strings, with date/time values rendered in ISO form. No build-backend execution, schema validation, dependency resolution, or file mutation occurs. Table or array nesting deeper than 100 levels is rejected with a `toml-decode-error` diagnostic that names the limit; depth is measured on the parsed document and counts its implicit top-level table as the first level, so `[a.b]` is three and `[[a]]` is three as well, an array wrapping a table. On stack exhaustion that diagnostic carries the fixed text `TOML parsing exhausted the interpreter stack`; a spent stack can cost a cutoff, never make one wrong. |
+
+**Semantics.** Any single TOML file; workspace discovery of `pyproject.toml`;
+nested sections; project dependencies, optional dependency groups, tool names,
+parse and project-shape diagnostics. Values are summarized as stable strings,
+with date/time values rendered in ISO form.
+
+**Limits.** No build-backend execution, schema validation, dependency
+resolution, or file mutation occurs. Table or array nesting deeper than 100
+levels is rejected with a `toml-decode-error` diagnostic that names the limit;
+depth is measured on the parsed document and counts its implicit top-level
+table as the first level, so `[a.b]` is three and `[[a]]` is three as well, an
+array wrapping a table. On stack exhaustion that diagnostic carries the fixed
+text `TOML parsing exhausted the interpreter stack`; a spent stack can cost a
+cutoff, never make one wrong.
 
 ## JSON configuration
 
@@ -90,8 +102,20 @@ caller's remaining stack, not of the file.
 | Purpose | Inspect keys and nested sections in a JSON object. |
 | Entrypoints | `json_analysis`, `workspace_json_analysis` |
 | Result types | `JsonAnalysis`, `JsonKey`, `JsonSection` |
-| Supported shapes | Standard JSON; workspace discovery defaults to `package.json`; objects become sections and nested subsections; scalar, array, object, boolean, and null value kinds are reported. |
-| Key limits | A non-object top level has no sections. JSONC, JSON5, schema validation, JSON Pointer/Path, and `$ref` resolution are out of scope. Duplicate keys and non-finite numeric constants are rejected rather than silently normalized, as is object or array nesting deeper than 200 levels — the `json-decode-error` diagnostic names that limit, and depth is counted from the file text before parsing, so the rejection is the same from every call site. On stack exhaustion that diagnostic carries the fixed text `JSON parsing exhausted the interpreter stack`; a spent stack can cost a cutoff, never make one wrong. |
+
+**Semantics.** Standard JSON; workspace discovery defaults to `package.json`;
+objects become sections and nested subsections; scalar, array, object,
+boolean, and null value kinds are reported.
+
+**Limits.** A non-object top level has no sections. JSONC, JSON5, schema
+validation, JSON Pointer/Path, and `$ref` resolution are out of scope.
+Duplicate keys and non-finite numeric constants are rejected rather than
+silently normalized, as is object or array nesting deeper than 200 levels —
+the `json-decode-error` diagnostic names that limit, and depth is counted from
+the file text before parsing, so the rejection is the same from every call
+site. On stack exhaustion that diagnostic carries the fixed text `JSON parsing
+exhausted the interpreter stack`; a spent stack can cost a cutoff, never make
+one wrong.
 
 ## Requirements files
 
@@ -100,8 +124,18 @@ caller's remaining stack, not of the file.
 | Purpose | Parse requirements files and optionally follow their requirement-file includes. |
 | Entrypoints | `requirements_analysis`, `deep_requirements_analysis`, `workspace_requirements_analysis` |
 | Result types | `FileReference`, `IndexDirective`, `RequirementRef`, `RequirementsAnalysis` |
-| Supported shapes | Names, extras, version text, markers, editable/direct URL lines, continuations, index/find-links directives, `-r` requirement references, and `-c` constraint references. Per-requirement options (for example the `--hash=...` lines `pip-compile --generate-hashes` emits) are split off the requirement rather than folded into its version text; the options themselves are ignored, not verified. Deep analysis follows in-root `-r` files with cycle and missing-file diagnostics. |
-| Key limits | Marker evaluation is separate. No URL/VCS fetch, version solving, or recursive constraint application occurs; constraint references are recorded but not followed. Project-root escapes are diagnosed. |
+
+**Semantics.** Names, extras, version text, markers, editable/direct URL
+lines, continuations, index/find-links directives, `-r` requirement
+references, and `-c` constraint references. Per-requirement options (for
+example the `--hash=...` lines `pip-compile --generate-hashes` emits) are
+split off the requirement rather than folded into its version text; the
+options themselves are ignored, not verified. Deep analysis follows in-root
+`-r` files with cycle and missing-file diagnostics.
+
+**Limits.** Marker evaluation is separate. No URL/VCS fetch, version solving,
+or recursive constraint application occurs; constraint references are recorded
+but not followed. Project-root escapes are diagnosed.
 
 ## Requirement evaluation
 
@@ -110,8 +144,20 @@ caller's remaining stack, not of the file.
 | Purpose | Evaluate version specifiers and environment markers, then combine requirements with the installed environment. |
 | Entrypoints | `evaluate_version_specifier`, `evaluate_markers`, `applicable_requirements`, `workspace_applicable_requirements` |
 | Result types | `ApplicableRequirement`, `ApplicableRequirementsAnalysis`, `MarkerEvaluation`, `PythonEnvironmentSnapshot`, `VersionSpecifierEvaluation` |
-| Supported shapes | PEP 440 epochs, prerelease/post/dev/local labels, wildcards, compatible releases, and arbitrary equality (`===`); PEP 508 boolean marker expressions against the running Python environment. |
-| Key limits | Evaluation targets the current process environment only. Extras are not modeled, noisy or unknown marker variables produce diagnostics, and this API does not resolve or install dependencies. Unsupported or unparseable constraints are ambiguous rather than guessed. An installed version is checked with pre-releases allowed, matching dependency checking; `evaluate_version_specifier` keeps resolver-style pre-release exclusion unless the specifier opts in. `===` compares the version exactly as written — no normalization, padding, or case folding — so it is decided without parsing and is not subject to pre-release exclusion. |
+
+**Semantics.** PEP 440 epochs, prerelease/post/dev/local labels, wildcards,
+compatible releases, and arbitrary equality (`===`); PEP 508 boolean marker
+expressions against the running Python environment. An installed version is
+checked with pre-releases allowed, matching dependency checking;
+`evaluate_version_specifier` keeps resolver-style pre-release exclusion unless
+the specifier opts in. `===` compares the version exactly as written — no
+normalization, padding, or case folding — so it is decided without parsing and
+is not subject to pre-release exclusion.
+
+**Limits.** Evaluation targets the current process environment only. Extras
+are not modeled, noisy or unknown marker variables produce diagnostics, and
+this API does not resolve or install dependencies. Unsupported or unparseable
+constraints are ambiguous rather than guessed.
 
 ## Environment files
 
@@ -130,8 +176,19 @@ caller's remaining stack, not of the file.
 | Purpose | Inspect XML elements, attributes, text, child tags, and dot-separated element paths. |
 | Entrypoints | `xml_analysis`, `workspace_xml_analysis` |
 | Result types | `XmlAnalysis`, `XmlAttribute`, `XmlElement` |
-| Supported shapes | Well-formed XML documents; namespace-qualified element and attribute names are exposed by local name; workspace discovery defaults to `pom.xml`. Formatting-only changes can backdate parsed results. |
-| Key limits | Every XML `DOCTYPE` and entity declaration is rejected with an `xml-parse-error` diagnostic, as is element nesting deeper than 256 levels — the diagnostic names that limit, and depth counts the document's root element as the first level. On stack exhaustion it carries the fixed text `XML parsing exhausted the interpreter stack`; a spent stack can cost a cutoff, never make one wrong. DTD/XSD validation, external entities, XInclude, streaming APIs, and general XPath are not supported. Dot paths identify hierarchy but do not index repeated siblings. |
+
+**Semantics.** Well-formed XML documents; namespace-qualified element and
+attribute names are exposed by local name; workspace discovery defaults to
+`pom.xml`. Formatting-only changes can backdate parsed results.
+
+**Limits.** Every XML `DOCTYPE` and entity declaration is rejected with an
+`xml-parse-error` diagnostic, as is element nesting deeper than 256 levels —
+the diagnostic names that limit, and depth counts the document's root element
+as the first level. On stack exhaustion it carries the fixed text `XML parsing
+exhausted the interpreter stack`; a spent stack can cost a cutoff, never make
+one wrong. DTD/XSD validation, external entities, XInclude, streaming APIs,
+and general XPath are not supported. Dot paths identify hierarchy but do not
+index repeated siblings.
 
 ## CSV data
 
@@ -160,8 +217,38 @@ caller's remaining stack, not of the file.
 | Purpose | Build module/workspace symbol indexes, follow static re-exports, find identity-based references, and model workspace classes. |
 | Entrypoints | `module_symbol_table`, `workspace_symbol_index`, `find_references`, `class_model` |
 | Result types | `ClassMember`, `ClassModel`, `ModuleSymbolTable`, `Parameter`, `Reference`, `ReferenceQueryResult`, `Signature`, `Symbol`, `WorkspaceSymbolEntry`, `WorkspaceSymbolIndex` |
-| Supported shapes | Functions, methods, classes, variables, imports/re-exports, annotations as source text, lexical references, workspace inheritance, and `self` attributes assigned directly in methods. Inheritance is flattened depth-first, left-to-right, nearest-definition-wins: a member name is claimed by the definition at the shortest inheritance distance from the starting class, ties at equal distance going to the earlier depth-first left-to-right arrival. A class reached again at a strictly shallower distance is walked again and its members reclaimed, so every flattened `ClassMember` — its `defining_path`, `defining_class`, `range`, `annotation` and `signature`, not only its name — is fixed by the inheritance graph, its base declaration order, and the depth cap below, never by the order in which the walk happens to reach a class. |
-| Key limits | No runtime attribute inference, type evaluation/checking, decorator semantics, installed-source navigation, or complete Python method-resolution-order model — the nearest-definition rule above is not C3, so it can pick a different winner than the interpreter for a name defined at several points in a diamond. Re-export and inheritance cycles or ambiguous chains produce conservative results. Both walks stop at depth 8: re-export following reports an `ambiguous` result observable through `follow_depth`/`trail`, and base-class following names every base the cap stopped it from walking in `ClassModel.truncated_bases`, so members inherited eight or more levels above a class are omitted but never silently. Both base tuples hold base source text as written at the stopped edge — an aliased base is reported under its alias — deduplicated in first-encounter order, and report different facts: `truncated_bases` is a base that resolved to a workspace class but sat past the cap, `unresolved_bases` a base that never resolved to a workspace class at all. A base under neither was followed. |
+
+**Semantics.** Functions, methods, classes, variables, imports/re-exports,
+annotations as source text, lexical references, workspace inheritance, and
+`self` attributes assigned directly in methods.
+
+Inheritance is flattened depth-first, left-to-right,
+nearest-definition-wins: a member name is claimed by the definition at the
+shortest inheritance distance from the starting class, ties at equal distance
+going to the earlier depth-first left-to-right arrival. A class reached again
+at a strictly shallower distance is walked again and its members reclaimed, so
+every flattened `ClassMember` — its `defining_path`, `defining_class`,
+`range`, `annotation` and `signature`, not only its name — is fixed by the
+inheritance graph, its base declaration order, and the depth cap below, never
+by the order in which the walk happens to reach a class.
+
+**Limits.** No runtime attribute inference, type evaluation/checking,
+decorator semantics, installed-source navigation, or complete Python
+method-resolution-order model — the nearest-definition rule above is not C3,
+so it can pick a different winner than the interpreter for a name defined at
+several points in a diamond. Re-export and inheritance cycles or ambiguous
+chains produce conservative results.
+
+Both walks stop at depth 8: re-export following reports an `ambiguous` result
+observable through `follow_depth`/`trail`, and base-class following names
+every base the cap stopped it from walking in `ClassModel.truncated_bases`,
+so members inherited eight or more levels above a class are omitted but never
+silently. Both base tuples hold base source text as written at the stopped
+edge — an aliased base is reported under its alias — deduplicated in
+first-encounter order, and report different facts: `truncated_bases` is a
+base that resolved to a workspace class but sat past the cap,
+`unresolved_bases` a base that never resolved to a workspace class at all. A
+base under neither was followed.
 
 ## Notebooks
 
@@ -170,8 +257,41 @@ caller's remaining stack, not of the file.
 | Purpose | Inspect Jupyter notebook metadata and source-bearing cells without executing them. |
 | Entrypoints | `notebook_analysis`, `workspace_notebook_analysis` |
 | Result types | `NotebookAnalysis`, `NotebookCell`, `NotebookDefinition`, `NotebookDiagnostic`, `NotebookImport` |
-| Supported shapes | JSON `.ipynb` files; code, markdown, raw, and unknown cells; markdown headings; top-level imports/definitions and syntax diagnostics per code cell; kernel/language metadata. A code cell that does not parse as Python is neutralized first: line magics (`%matplotlib inline`), shell escapes (`!pip install pandas`), help forms (`?obj`, `obj?`, `obj??`), and capture assignments (`files = !ls`) are replaced by equal-width Python placeholders, so the rest of the cell is still analyzed and every reported range still names its real notebook line and column. A cell magic on the first line claims the whole cell and its body is dropped, unless the magic runs that body as Python (`%%capture`, `%%debug`, `%%prun`, `%%python`, `%%python2`, `%%python3`, `%%time`, `%%timeit`). Workspace discovery scans `.ipynb` files directly in the requested root. |
-| Key limits | Workspace discovery is not recursive. Outputs and execution counts are ignored for cutoff purposes. Neutralization is lexical, is skipped for a cell that already parses as Python, and only recognizes those constructs where IPython does — at the start of a logical line. A neutralized cell that still does not parse reports `notebook-non-python-cell` instead of `syntax-error`, so a cell mixing notebook syntax with genuinely broken Python is reported under that code and not as a plain syntax error. String and bracket context is tracked so that a magic-shaped line inside a literal or a bracketed continuation is left alone, but a cell whose own string literals are unterminated can still be misread, and backslash continuations inside a magic are not modeled. Cells are analyzed independently; there is no execution, magic expansion, cross-cell binding resolution, MIME rendering, attachment extraction, or nbformat schema dependency. Surrogate scanning covers what reaches the cached payload: cell sources, cell types, and the kernel metadata. Cell outputs and per-execution metadata never reach the payload or the cutoff token, so they are not scanned — a notebook whose outputs contain a lone surrogate stays fully analyzable, and one whose sources do is reported as a decode error rather than analyzed partially. |
+
+**Semantics.** JSON `.ipynb` files; code, markdown, raw, and unknown cells;
+markdown headings; top-level imports/definitions and syntax diagnostics per
+code cell; kernel/language metadata. Workspace discovery scans `.ipynb` files
+directly in the requested root.
+
+A code cell that does not parse as Python is neutralized first: line magics
+(`%matplotlib inline`), shell escapes (`!pip install pandas`), help forms
+(`?obj`, `obj?`, `obj??`), and capture assignments (`files = !ls`) are
+replaced by equal-width Python placeholders, so the rest of the cell is still
+analyzed and every reported range still names its real notebook line and
+column. A cell magic on the first line claims the whole cell and its body is
+dropped, unless the magic runs that body as Python (`%%capture`, `%%debug`,
+`%%prun`, `%%python`, `%%python2`, `%%python3`, `%%time`, `%%timeit`).
+
+**Limits.** Workspace discovery is not recursive. Outputs and execution
+counts are ignored for cutoff purposes. Neutralization is lexical, is skipped
+for a cell that already parses as Python, and only recognizes those
+constructs where IPython does — at the start of a logical line. A neutralized
+cell that still does not parse reports `notebook-non-python-cell` instead of
+`syntax-error`, so a cell mixing notebook syntax with genuinely broken Python
+is reported under that code and not as a plain syntax error. String and
+bracket context is tracked so that a magic-shaped line inside a literal or a
+bracketed continuation is left alone, but a cell whose own string literals
+are unterminated can still be misread, and backslash continuations inside a
+magic are not modeled.
+
+Cells are analyzed independently; there is no execution, magic expansion,
+cross-cell binding resolution, MIME rendering, attachment extraction, or
+nbformat schema dependency. Surrogate scanning covers what reaches the cached
+payload: cell sources, cell types, and the kernel metadata. Cell outputs and
+per-execution metadata never reach the payload or the cutoff token, so they
+are not scanned — a notebook whose outputs contain a lone surrogate stays
+fully analyzable, and one whose sources do is reported as a decode error
+rather than analyzed partially.
 
 ## Request scoping
 
@@ -179,8 +299,31 @@ caller's remaining stack, not of the file.
 |---|---|
 | Purpose | Let a caller declare a span during which the state the entrypoints read does not change, so repeated entrypoint calls inside it answer from the first one. |
 | Entrypoints | `request_scope`, `request_inputs_changed`, `once_per_request` |
-| Supported shapes | `request_scope(db)` is a context manager bound to one `Database` and to the calling context. `once_per_request(db, kind, args, compute)` returns `compute()`, answering from the open scope when the same `kind` and `args` already ran against that same `Database`. `request_inputs_changed()` drops what the open scope has memoized, and also reaches the kernel: when the caller holds a `Database.request_span`, the declaration rolls that span onto a fresh request, so kernel-level once-per-request work re-runs against the moved inputs. |
-| Key limits | The span is the caller's declaration, not a checked fact: a caller that changes what the integrations read part-way through its own scope must call `request_inputs_changed()`, and nothing detects the omission. Calls made with no scope open, or against a `Database` other than the one the scope was opened for, compute normally. The memo lives only for the span and is never durable. It answers a repeated question inside one request; it does not participate in the kernel's invalidation and is not a cache across requests. `request_inputs_changed()` clears the innermost open scope only, so under scopes nested for different `Database` objects it forgets nothing an outer scope memoized: mutate inputs only for the innermost scope's database, or re-enter the scopes that must forget. `once_per_request` keys its memo on `kind` and `args`, so `args` must be hashable; unhashable arguments raise `TypeError`, and only while a scope for that `Database` is open, so the failure shows up under scoping rather than without it. |
+
+**Semantics.** `request_scope(db)` is a context manager bound to one
+`Database` and to the calling context. `once_per_request(db, kind, args,
+compute)` returns `compute()`, answering from the open scope when the same
+`kind` and `args` already ran against that same `Database`.
+`request_inputs_changed()` drops what the open scope has memoized, and also
+reaches the kernel: when the caller holds a `Database.request_span`, the
+declaration rolls that span onto a fresh request, so kernel-level
+once-per-request work re-runs against the moved inputs.
+
+**Limits.** The span is the caller's declaration, not a checked fact: a
+caller that changes what the integrations read part-way through its own scope
+must call `request_inputs_changed()`, and nothing detects the omission. Calls
+made with no scope open, or against a `Database` other than the one the scope
+was opened for, compute normally. The memo lives only for the span and is
+never durable. It answers a repeated question inside one request; it does not
+participate in the kernel's invalidation and is not a cache across requests.
+
+`request_inputs_changed()` clears the innermost open scope only, so under
+scopes nested for different `Database` objects it forgets nothing an outer
+scope memoized: mutate inputs only for the innermost scope's database, or
+re-enter the scopes that must forget. `once_per_request` keys its memo on
+`kind` and `args`, so `args` must be hashable; unhashable arguments raise
+`TypeError`, and only while a scope for that `Database` is open, so the
+failure shows up under scoping rather than without it.
 
 ## Composition and experimental helpers
 

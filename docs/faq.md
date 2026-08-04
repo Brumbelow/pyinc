@@ -16,9 +16,11 @@ The differences that matter are not in the graph algorithm, which is the
 familiar one. They are in what a Python implementation has to enforce at
 runtime:
 
-- **Ownership of cached values.** In Rust, a value handed out of a cache cannot
-  be mutated by a holder that no longer owns it; the compiler prevents it.
-  Python offers no such guarantee, so pyinc converts every value crossing a
+- **Ownership of cached values.** Safe Rust APIs can encode much of this
+  discipline in the type system — a value handed out of a cache is not
+  mutable by a holder that no longer owns it, though interior mutability
+  means even Rust expresses that as API design rather than an absolute.
+  Python offers none of it, so pyinc converts every value crossing a
   cached boundary into an owned snapshot — `freeze` maps `list` →
   `FrozenList`, `dict` → `FrozenDict`, `set` → `FrozenSet`, and dataclasses →
   `FrozenRecord`, with registered `ValueAdapter`s for everything else. That is
@@ -60,10 +62,13 @@ something the arguments do not name:
   that changed.
 - **Early cutoff.** When an input changes but the recomputed result is
   semantically equal to the stored one, pyinc **backdates** the record: its
-  revision does not advance, so dependents stay valid and are never
-  recomputed. An argument-keyed cache cannot express this, because the new
-  argument is simply a different key and everything downstream of it misses.
-  The 47 backdated nodes in the [demo](demo.md) are that effect.
+  revision does not advance, so dependents stay valid and are never even
+  re-verified. A downstream `lru_cache` can still hit when it happens to
+  receive an equal argument — what it lacks is the dynamic dependency graph
+  and revision metadata, so nothing decides *without recomputing the chain*
+  that dependents are still current, and nothing ever tells it to drop the
+  entries that are not. The 47 backdated nodes in the [demo](demo.md) are
+  that effect.
 - **Ownership.** `lru_cache` hands every caller the same object; mutating a
   cached list corrupts every later hit. pyinc snapshots values at the boundary,
   so a caller cannot reach back into cached state.
@@ -84,7 +89,8 @@ What is published:
 
 - The [demo](demo.md) numbers — a 270-file pytest checkout analyzed in 109.08 s
   from cold, then re-analyzed in 632 ms after a single-file edit, executing 73
-  queries and reusing 9,767.
+  queries and reusing 9,767. One recorded run on one machine; the demo page
+  states the full provenance.
 - The [benchmark and correctness harness](../bench/README.md), which runs a
   fixed 67-row matrix comparing pyinc against fresh recomputation, an
   intentionally incomplete naive cache, and `joblib.Memory`.

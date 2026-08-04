@@ -53,7 +53,8 @@ same hashes.
 ## After publication
 
 [`.github/workflows/published-artifacts.yml`](../.github/workflows/published-artifacts.yml)
-is dispatched with the published version. It downloads the distributions from
+is manually dispatched (`workflow_dispatch`) with the published version — it
+does not trigger automatically. It downloads the distributions from
 both PyPI and the GitHub Release, checks each against `SHA256SUMS` and against
 the hashes the two services report, and then installs that exact version from
 PyPI across all twelve supported operating-system and Python combinations.
@@ -64,7 +65,7 @@ PyPI across all twelve supported operating-system and Python combinations.
 published to PyPI:
 
 ```console
-gh release download v3.1.0 --repo Brumbelow/pyinc
+gh release download v3.2.0 --repo Brumbelow/pyinc
 sha256sum --check SHA256SUMS
 ```
 
@@ -72,13 +73,16 @@ To check the tag from a clone of the repository:
 
 ```console
 gpg --import .github/release-signing-key.asc
-git verify-tag v3.1.0
+git verify-tag v3.2.0
 ```
 
 `git verify-tag` reports a good signature from the fingerprint above, followed
 by `WARNING: This key is not certified with a trusted signature!`. That warning
 is expected after a bare `gpg --import`: GPG is saying you have not personally
-certified the key, not that the signature failed to verify. Comparing the
-fingerprint it reports against the one above is what establishes trust here.
-`git verify-commit v3.1.0^{commit}` checks the commit the tag names in the same
-way.
+certified the key, not that the signature failed to verify. Be precise about
+what a matching fingerprint establishes: continuity with the key pinned in
+this repository — every release signed by the same key that signed the ones
+before it — not an independently certified maintainer identity. GPG's warning
+is correct that nothing outside this repository vouches for the key.
+`git verify-commit v3.2.0^{commit}` checks the commit the tag names in the
+same way.

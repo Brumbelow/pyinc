@@ -780,9 +780,12 @@ Errors:
 
 ## Verification
 
-The from-scratch consistency guarantee is mechanically verified by property tests
-that compare incremental results against fresh-database recomputation for the same
-declared state, across all three modes and with/without LRU eviction:
+The from-scratch consistency guarantee is exercised by property-based
+differential tests that compare incremental results against fresh-database
+recomputation for the same declared state, across all three modes and
+with/without LRU eviction. Finite tests are evidence, not a formal proof —
+which is one reason the guarantee is stated with explicit conditions and
+limitations:
 
 - `test_incremental_results_match_fresh_recomputation` (basic query graph)
 - `test_resource_backed_queries_match_fresh_recomputation` (file resources)
@@ -801,8 +804,8 @@ The mutation adversarial suite (`test_external_alias_mutation_after_boundary_cro
 value membrane protects cached state from external mutation, deep mutation, and
 cross-query aliasing.
 
-The durable cross-run guarantee (limitation 4) is mechanically verified by the
-same fresh-recomputation equivalence, extended to the checkpoint path:
+The durable cross-run guarantee (limitation 4) is checked by the same
+fresh-recomputation equivalence, extended to the checkpoint path:
 
 - `test_checkpoint_reload_matches_fresh_recomputation` (property test in
   `tests/test_properties.py`) — reloads a checkpoint across all three modes and
@@ -810,8 +813,8 @@ same fresh-recomputation equivalence, extended to the checkpoint path:
   fresh, cache-free run over the same edit sequence, and exercises the
   dirty-graph save path directly.
 - `tests/test_checkpoint_cross_process.py` — a subprocess matrix that saves in
-  one interpreter and reloads in another, proving identities and digests line up
-  across processes.
+  one interpreter and reloads in another, checking that identities and digests
+  line up across processes.
 - `tests/test_checkpoint_trust.py` — the adversarial store and trust suite:
   bit-flipped and truncated snapshot bytes, tampered and wrong-version
   manifests, changed query/adapter/resource implementations, and

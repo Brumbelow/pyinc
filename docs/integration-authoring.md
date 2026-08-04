@@ -117,10 +117,13 @@ Optimistic reuse risks from-scratch inconsistency. Reference:
 `_resolve_workspace_module` returns `"ambiguous"` when multiple paths match a module
 prefix.
 
-**Mark unsupported cases as untracked.** When static analysis hits a pattern it cannot
-handle deterministically, call `db.report_untracked_read(reason)`. This forces
-re-execution on every request but preserves correctness. Reference:
-`module_export_surface` marks dynamic `__all__` as untracked.
+**Mark unsupported cases as untracked.** When a query depends on state the
+guard cannot intercept — dynamic behavior, time, randomness, network state,
+subprocess output — call `db.report_untracked_read(reason)`. Be clear about
+what that buys: it does not make the read deterministic or tracked, it
+prevents reuse. The node re-executes on every request and never backdates, so
+stale reuse cannot happen; the read itself stays as nondeterministic as it
+was. Reference: `module_export_surface` marks dynamic `__all__` as untracked.
 
 **Why?** From-scratch consistency is the kernel's primary guarantee. Re-execution is
 always safe; stale reuse is never safe. An integration that guesses wrong about reuse

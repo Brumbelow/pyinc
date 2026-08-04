@@ -67,7 +67,7 @@ Releases are published to PyPI from a tagged, signed commit through trusted
 publishing, with no stored API token. The release workflow verifies the
 annotated tag and every commit in the released range against the key in
 `.github/release-signing-key.asc`, each GitHub Release carries a `SHA256SUMS`
-file covering the exact distributions published to PyPI, and a separate workflow
-is dispatched after publication to re-verify that the two match.
+file covering the exact distributions published to PyPI, and a separate
+manually dispatched workflow re-verifies after publication that the two match.
 [`docs/releases.md`](docs/releases.md) describes the pipeline and how to check a
 download.
