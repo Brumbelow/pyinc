@@ -40,6 +40,7 @@ from pyinc import (
     serialize_snapshot,
 )
 from pyinc.core import Query  # internal: introspecting query identities
+from pyinc.runtime import _CHECKPOINT_MANIFEST_VERSION  # internal: manifest schema
 from pyinc.value import fingerprint_snapshot  # not re-exported from pyinc
 
 
@@ -211,7 +212,7 @@ def test_manifest_missing_required_field_raises_value_error() -> None:
     db = Database(store=store)
 
     manifest = {
-        "pyinc_ckpt_version": 5,
+        "pyinc_ckpt_version": _CHECKPOINT_MANIFEST_VERSION,
         "kernel_fingerprint_version": 2,
         "records": [{"kind": "query"}],
     }
@@ -750,6 +751,31 @@ def test_v4_manifest_rejected_loudly() -> None:
 
     manifest = {
         "pyinc_ckpt_version": 4,
+        "kernel_fingerprint_version": 2,
+        "records": [],
+    }
+    manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    key = "ck" + hashlib.sha256(manifest_bytes).hexdigest()
+    store.put(key, manifest_bytes)
+
+    with pytest.raises(ValueError, match="Unsupported checkpoint version"):
+        db.load_checkpoint(key)
+
+
+def test_v5_manifest_rejected_loudly() -> None:
+    """A 3.1.x manifest can carry records this kernel would trust unsoundly.
+
+    Version-5 records may have been written by a kernel that derived captured-
+    module identity from a stat tuple a same-size rewrite can preserve, and
+    that dropped the resource edge for a stat probe raising NotADirectoryError.
+    Both leave records a warm database would reuse while a fresh one
+    re-derives, so the manifest version has to carry the difference.
+    """
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+
+    manifest = {
+        "pyinc_ckpt_version": 5,
         "kernel_fingerprint_version": 2,
         "records": [],
     }

@@ -31,7 +31,13 @@ from pyinc import (
     serialize_snapshot,
 )
 from pyinc.resources import Resource
-from pyinc.runtime import _MISSING_SNAPSHOT, ExecutionFrame, NodeKey, NodeRecord
+from pyinc.runtime import (
+    _CHECKPOINT_MANIFEST_VERSION,
+    _MISSING_SNAPSHOT,
+    ExecutionFrame,
+    NodeKey,
+    NodeRecord,
+)
 from pyinc.value import (
     FrozenAdapterValue,
     FrozenDict,
@@ -393,7 +399,7 @@ def _manifest(
     adapters: dict[object, object] | None = None,
 ) -> dict[str, Any]:
     return {
-        "pyinc_ckpt_version": 5,
+        "pyinc_ckpt_version": _CHECKPOINT_MANIFEST_VERSION,
         "kernel_fingerprint_version": 2,
         "adapters": adapters or {},
         "records": records or [],

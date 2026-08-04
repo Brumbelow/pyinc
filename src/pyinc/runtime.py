@@ -86,10 +86,13 @@ ResourceProbeT = TypeVar("ResourceProbeT")
 
 # Durable checkpoint manifest schema version. Bumped whenever the identity, the
 # record layout, or the meaning of a recorded field changes, so stale manifests
-# are rejected loudly rather than silently reused. Version 5 carries the
-# dependency semantics a caught resource-read failure now records: a version-4
-# record can claim no dependencies for a reader a fresh database re-derives.
-_CHECKPOINT_MANIFEST_VERSION = 5
+# are rejected loudly rather than silently reused. Version 6 marks two
+# soundness repairs a version-5 record can predate: captured-module identity
+# was derived from a stat tuple a same-size rewrite can preserve, and a stat
+# probe raising NotADirectoryError published no resource edge, so a version-5
+# record can carry a stale identity or claim no dependencies for a reader a
+# fresh database re-derives.
+_CHECKPOINT_MANIFEST_VERSION = 6
 # Version of the snapshot/fingerprint encoding this kernel emits, mirrored from
 # value._KERNEL_FINGERPRINT_PREFIX (b"K2;"). Recorded in the manifest and checked
 # at load so a checkpoint from a differently-encoded kernel is never trusted.
