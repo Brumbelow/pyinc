@@ -68,7 +68,7 @@ decomposed by the adapter into one.
 **2. Tracked ambient reads.**
 All reads of external state within a query must go through the Resource API
 (`FileResource`, `BinaryFileResource`, `FileStatResource`, `EnvResource`,
-`DirectoryResource`) or a user-defined `Resource`. The public hooks are `read`,
+`DirectoryResource`, `ResolvedPathResource`) or a user-defined `Resource`. The public hooks are `read`,
 `probe`, `load`, `probe_and_load`, `identity`, and `label`; built-ins derive
 probe/value pairs from one observed state. On a warm request the kernel may
 first check for an unchanged world with `probe` alone and calls
@@ -326,12 +326,14 @@ Three of those gaps sit close enough to the guarded set to be named individually
   edge is recorded, so the query is reused unchanged after that file appears,
   disappears, or is rewritten, while a fresh `Database` reports the new state.
   Route the observation through `FileStatResource`, whose probe covers
-  existence, size, and mtime, or declare it with
+  existence, size, and mtime, through `ResolvedPathResource` when the
+  observation is where a path canonicalizes to, or declare it with
   `db.report_untracked_read(reason)`.
   (See: `test_file_metadata_reads_bypass_untracked_read_guard`,
   `test_stat_only_query_is_never_invalidated_by_the_file_it_stats`,
   `test_report_untracked_read_restores_consistency_for_a_stat_only_query`,
-  `test_file_stat_resource_tracks_metadata_changes`)
+  `test_file_stat_resource_tracks_metadata_changes`,
+  `test_resolved_path_resource_tracks_symlink_retargeting`)
 - **The byte-oriented environment.** `os.getenv` and `os.environ` are
   intercepted; `os.getenvb` and `os.environb` — the same process environment
   under a second name where `os.supports_bytes_environ` holds — are not.
@@ -493,8 +495,8 @@ a fresh `Database` into an empty directory.
   Resource identity includes the resource's configuration, the implementations
   of every state-observation hook (`probe`, `load`, `probe_and_load`, and
   `identity`), and the interpreter/build identity. The built-in resources
-  (condition 2) cover text, binary, environment, stat, and directory
-  observation.
+  (condition 2) cover text, binary, environment, stat, directory, and
+  path-resolution observation.
 - `Database.inspect(...)` exposes the last recorded provenance tree as structured
   data. `Database.explain(...)` formats it for humans. Inspection is
   observational and does not force an extra verification pass;
@@ -564,7 +566,7 @@ Snapshot bytes use the encoding described in
 On top of this, `Database.save_checkpoint(store=None) -> str` serialises the
 current query and resource records — their snapshot bytes, call snapshots,
 resource parameters, dependency edges, and per-adapter implementation digests —
-into a content-addressed manifest (schema v5), returning a key prefixed with
+into a content-addressed manifest (schema v6), returning a key prefixed with
 `"ck"`. Adapter digests include `freeze`/`thaw` code, snapshot-safe instance
 configuration, and the interpreter/build identity. Saving rejects an adapter
 whose captures or state cannot be pinned; loading under such an adapter safely
@@ -673,6 +675,7 @@ Core:
 | `FileStatSnapshot` | The frozen stat observation `FileStatResource` produces. |
 | `EnvResource` | Environment-variable resource. |
 | `DirectoryResource` | Directory-listing resource. |
+| `ResolvedPathResource` | Symlink-aware path canonicalization as a tracked value. |
 
 Values and snapshots:
 

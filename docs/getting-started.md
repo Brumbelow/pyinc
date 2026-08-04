@@ -56,7 +56,8 @@ snapshot-safe comparison token, never both.
 
 Inputs are pushed into a database. Resources are pulled from external state and
 re-probed when a request needs them. Built-in resources cover text and binary
-files, file metadata, environment variables, and directory listings.
+files, file metadata, environment variables, directory listings, and symlink-
+aware path resolution.
 
 ```python docs-check
 from pathlib import Path

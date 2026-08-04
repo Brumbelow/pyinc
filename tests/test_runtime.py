@@ -31,6 +31,7 @@ from pyinc import (
     MutationError,
     QueryChangeEvent,
     QueryProfile,
+    ResolvedPathResource,
     Resource,
     Subscription,
     UnsupportedValueError,
@@ -1538,6 +1539,47 @@ def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) ->
     child.write_text("beta", encoding="utf-8")
     assert db.get(entries, str(path)) == ("a.txt",)
     assert _inspect_node(db, entries, str(path)).last_decision == "reused"
+
+
+def test_resolved_path_resource_tracks_symlink_retargeting(tmp_path: Path) -> None:
+    resolver = ResolvedPathResource()
+    first_target = tmp_path / "first"
+    second_target = tmp_path / "second"
+    first_target.mkdir()
+    second_target.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(first_target, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink support is unavailable in this environment")
+
+    @query
+    def resolved(db: Database, path: str) -> str | None:
+        return resolver.read(db, path)
+
+    db = Database(mode="checked")
+    assert db.get(resolved, str(link)) == str(first_target)
+
+    link.unlink()
+    link.symlink_to(second_target, target_is_directory=True)
+    assert db.get(resolved, str(link)) == str(second_target)
+    assert _inspect_node(db, resolved, str(link)).last_decision == "executed"
+
+
+def test_resolved_path_resource_probe_is_total_for_a_symlink_loop(tmp_path: Path) -> None:
+    resolver = ResolvedPathResource()
+    try:
+        (tmp_path / "a").symlink_to(tmp_path / "b")
+        (tmp_path / "b").symlink_to(tmp_path / "a")
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink support is unavailable in this environment")
+
+    looped = str(tmp_path / "a" / "child")
+    first_probe = resolver.probe(looped)
+    assert first_probe == resolver.probe(looped)
+    value = resolver.load(Database(), looped)
+    assert value is None or isinstance(value, str)
+    assert first_probe == (value,)
 
 
 def test_file_resource_atomic_probe_and_load_keeps_digest_and_text_coherent(

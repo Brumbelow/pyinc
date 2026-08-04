@@ -355,6 +355,37 @@ def test_resolve_module_location_matches_fresh_recomputation(
     assert resolve_module_path(incremental, "pkg.leaf") == resolve_module_path(fresh3, "pkg.leaf")
 
 
+def test_namespace_resolution_tracks_symlink_retargeting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_site = tmp_path / "first_site"
+    second_site = tmp_path / "second_site"
+    third_site = tmp_path / "third_site"
+    for site in (first_site, second_site, third_site):
+        site.mkdir()
+    (second_site / "nspkg").mkdir()
+    (third_site / "nspkg").mkdir()
+
+    link = first_site / "nspkg"
+    try:
+        link.symlink_to(second_site / "nspkg", target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink support is unavailable in this environment")
+    _install_search_paths(monkeypatch, (str(first_site), str(second_site)))
+
+    db = Database(mode="checked")
+    first = resolve_module_path(db, "nspkg")
+    assert first.kind == "namespace-package"
+
+    # Retargeting the link splits the two contributions that canonicalized
+    # onto one directory, so the visited set no longer collapses them.
+    link.unlink()
+    link.symlink_to(third_site / "nspkg", target_is_directory=True)
+
+    fresh = Database(mode="checked")
+    assert resolve_module_path(db, "nspkg") == resolve_module_path(fresh, "nspkg")
+
+
 # ---------------------------------------------------------------------------
 # Cross-integration query visibility
 # ---------------------------------------------------------------------------

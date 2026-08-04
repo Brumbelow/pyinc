@@ -200,6 +200,46 @@ class EnvResource(Resource[str, str | None, tuple[str | None]]):
         return (value,), value
 
 
+def _resolved_path(path: str) -> str | None:
+    # `strict=False` still raises for a symlink loop -- OSError on current
+    # interpreters, RuntimeError historically -- and a probe has to be total.
+    # A path that cannot resolve is answered as None, the way an unset
+    # environment variable is.
+    try:
+        return str(Path(path).resolve(strict=False))
+    except (OSError, RuntimeError):
+        return None
+
+
+@dataclass(frozen=True)
+class ResolvedPathResource(Resource[str | os.PathLike[str], str | None, tuple[str | None]]):
+    """Symlink-aware canonicalization of one path, tracked as a dependency.
+
+    The semantic value is the fully resolved path string, so retargeting any
+    link along the chain invalidates readers. `Path.resolve` reaches the live
+    filesystem untracked (kernel contract, limitation 1); containment and
+    visited-set decisions inside queries route through this resource instead.
+    """
+
+    def read(self, db: _runtime.Database, key: str | os.PathLike[str]) -> str | None:
+        return db.read_resource(self, os.fspath(key))
+
+    def label(self, path: str | os.PathLike[str]) -> str:
+        return f"resolvedpath[{os.fspath(path)}]"
+
+    def probe(self, path: str | os.PathLike[str]) -> tuple[str | None]:
+        return (_resolved_path(os.fspath(path)),)
+
+    def load(self, db: _runtime.Database, path: str | os.PathLike[str]) -> str | None:
+        return _resolved_path(os.fspath(path))
+
+    def probe_and_load(
+        self, db: _runtime.Database, path: str | os.PathLike[str]
+    ) -> tuple[tuple[str | None], str | None]:
+        value = _resolved_path(os.fspath(path))
+        return (value,), value
+
+
 DirectoryProbe = tuple[bool, tuple[str, ...]]
 
 

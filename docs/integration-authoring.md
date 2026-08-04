@@ -81,7 +81,7 @@ intercepts `open()`, `os.getenv`, `os.listdir`, `os.scandir`, and `Path.iterdir`
 query execution and raises `UntrackedReadError` otherwise.
 
 **Built-in resources:** `FileResource`, `BinaryFileResource`, `FileStatResource`,
-`EnvResource`, and `DirectoryResource` cover common cases.
+`EnvResource`, `DirectoryResource`, and `ResolvedPathResource` cover common cases.
 
 **Custom resources:** When built-in resources do not fit, define a custom resource as a
 frozen dataclass implementing the public `Resource[KeyT, ValueT, ProbeT]` hooks:
@@ -152,10 +152,14 @@ result.
 When your integration traverses directory trees or recursive structures:
 
 - Track a `visited` set of canonical (resolved) paths.
-- Use `Path.resolve()` to canonicalize before comparing.
+- Canonicalize through `ResolvedPathResource`, never through a raw
+  `Path.resolve()`: resolution is an ambient read the guard cannot intercept
+  (kernel contract, limitation 1), so an untracked call records no dependency
+  edge and a retargeted symlink leaves warm containment and visited-set
+  decisions stale while a fresh database recomputes them.
 - Check root containment before recursing to prevent escaping the workspace.
-- Reference: `_collect_python_files` uses `visited_directories`, `_canonical_path`,
-  and `_is_within_root` for safe traversal.
+- Reference: `_collect_python_files` uses `visited_directories`, a tracked
+  resolution read, and `_is_within_root` for safe traversal.
 
 ## Stable API Surface
 
