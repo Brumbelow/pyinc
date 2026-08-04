@@ -273,9 +273,12 @@ def _listing_probe(path: str) -> DirectoryProbe:
 
 
 def _stat_snapshot(path: str) -> FileStatSnapshot:
+    # A stat answers for directories, so of _MISSING_FILE_ERRORS only the
+    # absent-path members can fire here; a PermissionError means a parent ACL
+    # denial and keeps propagating into a failure record like any other OSError.
     try:
         metadata = Path(path).stat()
-    except FileNotFoundError:
+    except _MISSING_FILE_ERRORS:
         return FileStatSnapshot(exists=False, size=None, mtime_ns=None)
     return FileStatSnapshot(
         exists=True,

@@ -1497,6 +1497,30 @@ def test_file_stat_resource_tracks_metadata_changes(tmp_path: Path) -> None:
     assert _inspect_node(db, read_stat, str(path)).last_decision == "executed"
 
 
+def test_file_stat_resource_is_total_when_a_parent_path_component_is_a_file(
+    tmp_path: Path,
+) -> None:
+    stats = FileStatResource()
+    parent = tmp_path / "parent"
+    parent.write_text("plain file", encoding="utf-8")
+    child = parent / "child"
+
+    @query
+    def child_exists(db: Database, filename: str) -> bool:
+        snapshot = cast(dict[str, object], stats.read(db, filename))
+        return snapshot["exists"] is True
+
+    db = Database(mode="checked")
+    assert db.get(child_exists, str(child)) is False
+
+    parent.unlink()
+    parent.mkdir()
+    child.write_text("now a real child", encoding="utf-8")
+    assert db.get(child_exists, str(child)) is True
+    fresh = Database(mode="checked")
+    assert fresh.get(child_exists, str(child)) is True
+
+
 def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) -> None:
     directories = DirectoryResource()
     path = tmp_path / "workspace"
