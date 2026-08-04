@@ -193,6 +193,19 @@ def test_malformed_manifest_json_raises_value_error() -> None:
     assert not isinstance(exc_info.value, json.JSONDecodeError)
 
 
+def test_deeply_nested_manifest_json_raises_typed_checkpoint_error() -> None:
+    """A malformed manifest must never escape as a raw RecursionError."""
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+
+    bogus = (b'{"a":' * 200_000) + b"1" + (b"}" * 200_000)
+    key = "ck" + hashlib.sha256(bogus).hexdigest()
+    store.put(key, bogus)
+
+    with pytest.raises(CheckpointManifestError, match="could not be decoded"):
+        db.load_checkpoint(key)
+
+
 def test_unsupported_manifest_version_raises_value_error() -> None:
     store = InMemoryArtifactStore()
     db = Database(store=store)

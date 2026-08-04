@@ -28,7 +28,7 @@ from .errors import ActionLockTimeoutError, ActionManifestError, ActionPathError
 if TYPE_CHECKING:
     from .runtime import Database
 
-_MANIFEST_VERSION = 2
+_MANIFEST_VERSION = 3
 _DEFAULT_LOCK_TIMEOUT = 30.0
 _WINDOWS_RESERVED_NAMES = {
     "aux",
@@ -157,6 +157,20 @@ def _manifest_root_digest(root: Path) -> str:
     return hashlib.sha256(os.fsencode(exact_root)).hexdigest()
 
 
+def _root_incarnation(root: Path) -> list[int] | None:
+    """Identify the directory the root path currently names, not the path text.
+
+    A root deleted and recreated at the same path is a different directory:
+    the ledger's claims name files in the old one, and deleting same-named
+    files in the new one would destroy outputs this action never owned.
+    """
+    try:
+        metadata = root.stat()
+    except OSError:
+        return None
+    return [metadata.st_dev, metadata.st_ino]
+
+
 def _manifest_path(state_dir: Path, tool: str) -> Path:
     return state_dir / f".pyinc-action.{_tool_digest(tool)}.json"
 
@@ -170,7 +184,9 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _read_manifest(state_dir: Path, tool: str, root_digest: str) -> tuple[bool, dict[str, str]]:
+def _read_manifest(
+    state_dir: Path, tool: str, root_digest: str, root: Path
+) -> tuple[bool, dict[str, str]]:
     path = _manifest_path(state_dir, tool)
     try:
         raw = read_regular_file(path)
@@ -182,8 +198,11 @@ def _read_manifest(state_dir: Path, tool: str, root_digest: str) -> tuple[bool, 
     except (OSError, ValueError, RecursionError, OverflowError) as error:
         raise ActionManifestError(f"Cannot read action manifest {path}: {error}") from error
 
-    if not isinstance(data, dict) or set(data) != {"root", "tool", "version", "outputs"}:
-        raise ActionManifestError("Action manifest must contain root, tool, version, and outputs.")
+    expected_fields = {"root", "root_incarnation", "tool", "version", "outputs"}
+    if not isinstance(data, dict) or set(data) != expected_fields:
+        raise ActionManifestError(
+            "Action manifest must contain root, root_incarnation, tool, version, and outputs."
+        )
     if data["version"] != _MANIFEST_VERSION or type(data["version"]) is not int:
         raise ActionManifestError(
             f"Unsupported action manifest version; expected {_MANIFEST_VERSION}."
@@ -192,6 +211,25 @@ def _read_manifest(state_dir: Path, tool: str, root_digest: str) -> tuple[bool, 
         raise ActionManifestError("Action manifest tool identity does not match this action.")
     if data["root"] != root_digest or not isinstance(data["root"], str):
         raise ActionManifestError("Action manifest root identity does not match this action.")
+    recorded_incarnation = data["root_incarnation"]
+    if recorded_incarnation is not None and (
+        not isinstance(recorded_incarnation, list)
+        or len(recorded_incarnation) != 2
+        or any(type(item) is not int for item in recorded_incarnation)
+    ):
+        raise ActionManifestError("Action manifest root incarnation is malformed.")
+    current_incarnation = _root_incarnation(root)
+    if (
+        recorded_incarnation is not None
+        and current_incarnation is not None
+        and recorded_incarnation != current_incarnation
+    ):
+        raise ActionManifestError(
+            "Action manifest was recorded against a different incarnation of "
+            f"{root}: the root was deleted and recreated since, so its claims "
+            f"no longer name files this action owns. Delete {path} to adopt "
+            "the current directory."
+        )
     raw_outputs = data["outputs"]
     if not isinstance(raw_outputs, dict):
         raise ActionManifestError("Action manifest outputs must be an object.")
@@ -221,10 +259,12 @@ def _write_manifest(
     state_dir: Path,
     tool: str,
     root_digest: str,
+    root: Path,
     outputs: Mapping[str, str],
 ) -> None:
     payload = {
         "root": root_digest,
+        "root_incarnation": _root_incarnation(root),
         "tool": tool,
         "version": _MANIFEST_VERSION,
         "outputs": dict(sorted(outputs.items())),
@@ -490,7 +530,7 @@ class Action:
         dry_run: bool,
     ) -> ReconcileResult:
         root_identity = _manifest_root_digest(root)
-        manifest_exists, previous = _read_manifest(state_dir, self.tool, root_identity)
+        manifest_exists, previous = _read_manifest(state_dir, self.tool, root_identity, root)
         _validate_path_set(desired, source="owned output")
 
         # A ledger entry that conflicts with the new desired layout is just an
@@ -681,7 +721,7 @@ class Action:
                 _atomic_write(target, desired[relative])
 
             if desired_hashes != previous or (desired_hashes and not manifest_exists):
-                _write_manifest(state_dir, self.tool, root_identity, desired_hashes)
+                _write_manifest(state_dir, self.tool, root_identity, root, desired_hashes)
 
         return ReconcileResult(
             created=tuple(created),

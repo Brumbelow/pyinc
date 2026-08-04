@@ -373,7 +373,13 @@ following hold:
   probe changes whenever its `load` result changes, and probe values are
   snapshot-safe and process-independent;
 - **(iii)** adapters for any adapted snapshot type are registered in the
-  loading process with unchanged `freeze`/`thaw` implementations.
+  loading process with unchanged `freeze`/`thaw` implementations;
+- **(iv)** the checkpoint key and the store it loads from come from a trusted
+  channel. Content addressing proves that bytes match the key they were asked
+  for by — it does not authenticate where the key came from. A coherent
+  attacker-selected key names a coherent attacker-selected manifest, so keys
+  and store contents must be produced by a prior trusted `save_checkpoint`,
+  not accepted from an untrusted input (see `SECURITY.md`).
 
 Under these conditions `load_checkpoint(key)` followed by `db.get(query)`
 returns the value a fresh recomputation on the same declared state would, in all

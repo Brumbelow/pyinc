@@ -127,13 +127,24 @@ Each tool owns one manifest under `state_dir` (the root by default):
 .pyinc-action.<sha256-of-full-tool-identity>.json
 ```
 
-Schema v2 records exactly `root`, `tool`, `version`, and `outputs`. The root
-digest prevents one external state directory from being reused across output
-roots, and the full tool string is verified on every read. Every output digest must be 64 lowercase
+Schema v3 records exactly `root`, `root_incarnation`, `tool`, `version`, and
+`outputs`. The root digest prevents one external state directory from being
+reused across output roots, and the full tool string is verified on every
+read. The root incarnation — the device and inode of the root directory at
+write time — prevents a stale external ledger from acting on a root that was
+deleted and recreated at the same path: the claims name files in the old
+directory, so reconciliation refuses with `ActionManifestError` until the
+stale manifest is removed. Every output digest must be 64 lowercase
 hexadecimal characters. Unknown fields, duplicate JSON keys, wrong types,
 foreign identities, old schema versions, malformed paths, and malformed hashes
-raise `ActionManifestError` before mutation. v1 manifests are intentionally not
-compatible with v3 and may be discarded.
+raise `ActionManifestError` before mutation. v1 and v2 manifests are
+intentionally not compatible with v3's ledger semantics and may be discarded.
+
+The ledger is validated, not authenticated: nothing in it proves who wrote
+it. A forged manifest under a writable `state_dir` can claim any regular
+root-relative file and cause its deletion on the next reconcile, so an
+external `state_dir` must be trusted at least as strongly as the output root
+itself.
 
 An action deletes only files recorded by its own validated ledger, subject to
 the regular-file-only constraint described in [Preflight and portable

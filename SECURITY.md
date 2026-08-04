@@ -46,11 +46,14 @@ security-relevant boundaries are:
 
 - **The durable checkpoint trust boundary.** Checkpoint manifests and
   artifact-store bytes are validated before use, and the trust envelope is
-  documented in the kernel contract. Loading a checkpoint from an untrusted
-  source is outside the supported envelope.
+  documented in the kernel contract. Validation is integrity relative to the
+  checkpoint key, not provenance: loading a checkpoint key or store from an
+  untrusted source is outside the supported envelope.
 - **The action layer's ownership ledger.** Actions reconcile files on disk under
-  a validated ledger. Sharing an output root with a non-cooperating process is
-  outside the envelope.
+  a validated ledger. The ledger is not authenticated, so an external
+  `state_dir` must be trusted at least as strongly as the output root, and
+  sharing an output root with a non-cooperating process is outside the
+  envelope.
 - **`fast` mode**, which by documented design does not check in-query mutation.
 
 Behavior documented as a limitation in

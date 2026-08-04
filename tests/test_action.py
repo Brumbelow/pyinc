@@ -1447,6 +1447,30 @@ def test_shared_state_directory_rejects_a_different_output_root(tmp_path: Path) 
     assert not second_root.exists()
 
 
+def test_stale_external_ledger_refuses_a_recreated_output_root(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    root = tmp_path / "root"
+
+    @action(tool="incarnation-bound-manifest")
+    def incarnation_action(db: Database) -> list[Output]:
+        return [Output.text("owned.txt", "content")]
+
+    incarnation_action.reconcile(Database(), root=root, state_dir=state)
+    assert (root / "owned.txt").read_text() == "content"
+
+    # The root is deleted and recreated at the same path: the ledger's claims
+    # name a directory that no longer exists, so they must not delete files
+    # somebody else placed in the new one.
+    shutil.rmtree(root)
+    root.mkdir()
+    somebody_else = root / "owned.txt"
+    somebody_else.write_text("not the ledger's file", encoding="utf-8")
+
+    with pytest.raises(ActionManifestError, match="incarnation"):
+        incarnation_action.reconcile(Database(), root=root, state_dir=state)
+    assert somebody_else.read_text() == "not the ledger's file"
+
+
 @pytest.mark.parametrize("timeout", (float("nan"), float("inf"), -float("inf")))
 def test_action_rejects_nonfinite_lock_timeout(timeout: float) -> None:
     with pytest.raises(ValueError, match="finite"):

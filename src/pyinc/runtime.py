@@ -1343,7 +1343,13 @@ class Database:
 
         try:
             manifest = json.loads(manifest_bytes.decode("utf-8"), object_pairs_hook=unique_object)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+            OverflowError,
+        ) as exc:
             raise CheckpointManifestError(
                 f"Checkpoint {key!r} manifest could not be decoded as JSON: {exc}"
             ) from exc
