@@ -412,7 +412,7 @@ def test_action_dry_run_ignores_already_missing_orphan(
     root = tmp_path / "root"
     root.mkdir()
     (root / "present").write_bytes(b"owned")
-    digest = "0" * 64
+    digest = action_module._content_hash(b"owned")
     declared = Action(lambda _db: (), tool="missing-orphan")
     monkeypatch.setattr(
         action_module,
@@ -482,7 +482,7 @@ def test_action_rechecks_orphan_before_deleting(
     monkeypatch.setattr(
         action_module,
         "_read_manifest",
-        lambda *_args: (True, {"owned": "0" * 64}),
+        lambda *_args: (True, {"owned": action_module._content_hash(b"owned")}),
     )
     monkeypatch.setattr(action_module, "_safe_target", target_state)
 

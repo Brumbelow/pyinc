@@ -224,12 +224,13 @@ def _read_manifest(
         and current_incarnation is not None
         and recorded_incarnation != current_incarnation
     ):
-        raise ActionManifestError(
-            "Action manifest was recorded against a different incarnation of "
-            f"{root}: the root was deleted and recreated since, so its claims "
-            f"no longer name files this action owns. Delete {path} to adopt "
-            "the current directory."
-        )
+        # The root was deleted and recreated at this path. The recorded claims
+        # name files in a directory that no longer exists, so they are void
+        # and the current directory is adopted fresh, deleting nothing.
+        # Detection is best-effort -- a filesystem can hand the recreated
+        # directory its old inode straight back -- which is why deletion is
+        # additionally digest-verified where the claims are consumed.
+        return True, {}
     raw_outputs = data["outputs"]
     if not isinstance(raw_outputs, dict):
         raise ActionManifestError("Action manifest outputs must be an object.")
@@ -580,6 +581,7 @@ class Action:
                     )
 
         targets: dict[str, tuple[Path, os.stat_result | None]] = {}
+        orphan_owned: dict[str, bool] = {}
         for relative in previous_only:
             if _orphan_cannot_exist(root, relative):
                 # A run that stopped before publishing its ledger left a file
@@ -603,13 +605,43 @@ class Action:
             if metadata is not None and not stat.S_ISREG(metadata.st_mode):
                 raise ActionPathError(f"Owned output target is not a regular file: {relative!r}")
             targets[relative] = (target, metadata)
+            if metadata is not None:
+                # An orphan is this action's to delete only while it still
+                # carries the exact bytes the ledger recorded. Byte comparison
+                # decides ownership because nothing stat-shaped can: a
+                # recreated directory can reuse its inode, and a drifted file
+                # is the user's now either way.
+                try:
+                    current = read_regular_file(target)
+                except UnsafeFilesystemPathError as error:
+                    raise ActionPathError(str(error)) from error
+                orphan_owned[relative] = (
+                    current is not None and _content_hash(current) == previous[relative]
+                )
 
         orphan_file_paths = {
             relative for relative in previous_only if targets[relative][1] is not None
         }
+        deletable_orphans = {
+            relative for relative in orphan_file_paths if orphan_owned.get(relative, False)
+        }
 
         for relative in sorted(desired):
-            if any(ancestor in orphan_file_paths for ancestor in _ancestors(relative)):
+            blocking_orphans = [
+                ancestor for ancestor in _ancestors(relative) if ancestor in orphan_file_paths
+            ]
+            if blocking_orphans:
+                drifted = [
+                    ancestor for ancestor in blocking_orphans if ancestor not in deletable_orphans
+                ]
+                if drifted:
+                    # The parent path is an orphan whose bytes drifted from the
+                    # ledger: it is not this action's to delete, and the write
+                    # beneath it cannot proceed without destroying it.
+                    raise ActionPathError(
+                        f"Cannot publish {relative!r}: its parent {drifted[0]!r} no longer "
+                        "carries the bytes this action's ledger recorded."
+                    )
                 # An orphan file from the previous layout occupies exactly this
                 # parent path; a mere casefold twin of a parent frees nothing
                 # when it is deleted, so it does not lift validation. The
@@ -639,7 +671,7 @@ class Action:
             target, metadata = _safe_target(root, relative)
             if metadata is None or not stat.S_ISDIR(metadata.st_mode):
                 continue
-            blocking = _unprunable_entry(target, relative, orphan_file_paths, prune_map)
+            blocking = _unprunable_entry(target, relative, deletable_orphans, prune_map)
             if blocking is not None:
                 raise ActionPathError(
                     f"Cannot prune directory {relative!r} left by the previous layout: "
@@ -675,7 +707,7 @@ class Action:
         delete_paths: list[str] = []
         for relative in previous_only:
             _, metadata = targets[relative]
-            if metadata is not None:
+            if metadata is not None and relative in deletable_orphans:
                 deleted.append(relative)
                 delete_paths.append(relative)
 
@@ -693,6 +725,12 @@ class Action:
                         f"Refusing to delete a non-regular owned target: {relative!r}"
                     )
                 try:
+                    # Ownership is re-verified against the recorded bytes at
+                    # the last moment, the same way the stat is: a file that
+                    # changed since preflight is not this action's anymore.
+                    current = read_regular_file(target)
+                    if current is None or _content_hash(current) != previous[relative]:
+                        continue
                     unlink_regular_file(target)
                 except UnsafeFilesystemPathError as error:
                     raise ActionPathError(str(error)) from error

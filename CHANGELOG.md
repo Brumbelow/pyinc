@@ -50,9 +50,13 @@ decided at release time.
 - The checkpoint manifest schema is v6; v5 manifests are rejected loudly
   because their records can predate the module-identity and stat-probe
   repairs above.
-- The action ledger schema is v3 and records the root directory's incarnation
-  (device and inode). A stale external ledger refuses a root that was deleted
-  and recreated at the same path instead of deleting same-named files there.
+- The action ledger schema is v3, and orphan deletion is verified against the
+  recorded bytes: an orphan that no longer carries the digest the ledger
+  recorded is released, never deleted. The manifest also records the root
+  directory's incarnation (device and inode), so a detectably recreated root
+  voids the stale claims outright — and on filesystems that hand a recreated
+  directory its old inode back, the byte check alone still keeps a stale
+  external ledger from deleting files it never wrote.
 - The kernel contract states the guarantee as conditional ("provided the
   conditions hold") rather than "when and only when", adds the
   substitutivity law for custom `eq=`/`cutoff=` policies — a coarser policy

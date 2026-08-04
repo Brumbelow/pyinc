@@ -131,26 +131,32 @@ Schema v3 records exactly `root`, `root_incarnation`, `tool`, `version`, and
 `outputs`. The root digest prevents one external state directory from being
 reused across output roots, and the full tool string is verified on every
 read. The root incarnation — the device and inode of the root directory at
-write time — prevents a stale external ledger from acting on a root that was
-deleted and recreated at the same path: the claims name files in the old
-directory, so reconciliation refuses with `ActionManifestError` until the
-stale manifest is removed. Every output digest must be 64 lowercase
+write time — detects a root that was deleted and recreated at the same path:
+the recorded claims name files in a directory that no longer exists, so they
+are treated as void and the current directory is adopted fresh, deleting
+nothing. Detection is best-effort — a filesystem can hand the recreated
+directory its old inode straight back — which is why deletion is additionally
+verified byte-for-byte below. Every output digest must be 64 lowercase
 hexadecimal characters. Unknown fields, duplicate JSON keys, wrong types,
 foreign identities, old schema versions, malformed paths, and malformed hashes
 raise `ActionManifestError` before mutation. v1 and v2 manifests are
 intentionally not compatible with v3's ledger semantics and may be discarded.
 
 The ledger is validated, not authenticated: nothing in it proves who wrote
-it. A forged manifest under a writable `state_dir` can claim any regular
-root-relative file and cause its deletion on the next reconcile, so an
-external `state_dir` must be trusted at least as strongly as the output root
-itself.
+it. A forged manifest under a writable `state_dir` can claim a regular
+root-relative file and — when the file's bytes match the digest the forgery
+records — cause its deletion on the next reconcile, so an external
+`state_dir` must be trusted at least as strongly as the output root itself.
 
-An action deletes only files recorded by its own validated ledger, subject to
-the regular-file-only constraint described in [Preflight and portable
-paths](#preflight-and-portable-paths). The manifest is left byte-identical on
-a no-op reconcile, so no-op operation does not rewrite user-visible outputs or
-state.
+An action deletes only files recorded by its own validated ledger, only while
+they still carry the exact bytes the ledger recorded, and subject to the
+regular-file-only constraint described in [Preflight and portable
+paths](#preflight-and-portable-paths). An orphan whose content drifted from
+its recorded digest is the user's file now: the claim is released and the
+file survives. A drifted orphan standing where the desired layout needs a
+parent directory is a refusal (`ActionPathError`) rather than a deletion. The
+manifest is left byte-identical on a no-op reconcile, so no-op operation does
+not rewrite user-visible outputs or state.
 
 ## Soundness boundary
 
