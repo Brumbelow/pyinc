@@ -65,7 +65,7 @@ PyPI across all twelve supported operating-system and Python combinations.
 published to PyPI:
 
 ```console
-gh release download v3.2.0 --repo Brumbelow/pyinc
+gh release download v3.1.0 --repo Brumbelow/pyinc
 sha256sum --check SHA256SUMS
 ```
 
@@ -73,7 +73,7 @@ To check the tag from a clone of the repository:
 
 ```console
 gpg --import .github/release-signing-key.asc
-git verify-tag v3.2.0
+git verify-tag v3.1.0
 ```
 
 `git verify-tag` reports a good signature from the fingerprint above, followed
@@ -84,5 +84,5 @@ what a matching fingerprint establishes: continuity with the key pinned in
 this repository — every release signed by the same key that signed the ones
 before it — not an independently certified maintainer identity. GPG's warning
 is correct that nothing outside this repository vouches for the key.
-`git verify-commit v3.2.0^{commit}` checks the commit the tag names in the
+`git verify-commit v3.1.0^{commit}` checks the commit the tag names in the
 same way.

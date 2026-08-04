@@ -6,6 +6,72 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+v3.1.1 was tagged but never published; its release run was cancelled after an
+external audit surfaced the consistency issues fixed below. The v3.1.1 tag
+remains in history and should not be used; the next published version will be
+decided at release time.
+
+### Fixed
+
+- Captured-module identity is derived from the file's bytes on every
+  observation. The POSIX path cached the digest under a stat tuple (size,
+  mtime, ctime, device, inode) that a same-size rewrite inside one timestamp
+  granule can preserve, so a warm database could keep trusting a stale
+  digest. Windows already hashed unconditionally; now every platform does.
+- `FileStatResource` answers a path reached through a file parent (ENOTDIR)
+  as missing instead of raising out of the probe. The escaping exception left
+  the reading query dependency-free, so it was reused after the path came to
+  exist.
+- The memoized query-fingerprint fast path observes definitions per entry
+  instead of per container: mutating `__kwdefaults__` in place, rebinding a
+  closure cell, or rebinding a captured global now invalidates the memo
+  rather than reusing the stale fingerprint.
+- The ambient-read guard covers the whole query boundary. Adapter `thaw`
+  during argument materialization and adapter `freeze` on the result ran
+  outside it, so an adapter reading ambient state could smuggle untracked
+  bytes into the stored snapshot without a dependency edge.
+- Strict mode rebuilds every boundary view, not only graph snapshots.
+  Non-graph `Frozen*` values were exposed by reference, and
+  `object.__setattr__` on such a view corrupted the stored record.
+- `workspace_python_files` and `resolve_module_location` canonicalize paths
+  through the new tracked `ResolvedPathResource` instead of a raw
+  `Path.resolve()`, so retargeting a symlink invalidates containment and
+  visited-set decisions instead of leaving warm traversals stale.
+- A deeply nested checkpoint manifest raises `CheckpointManifestError`
+  instead of escaping as a raw `RecursionError`.
+
+### Added
+
+- `ResolvedPathResource`: symlink-aware path canonicalization as a tracked
+  resource value, total over unresolvable paths.
+
+### Changed
+
+- The checkpoint manifest schema is v6; v5 manifests are rejected loudly
+  because their records can predate the module-identity and stat-probe
+  repairs above.
+- The action ledger schema is v3 and records the root directory's incarnation
+  (device and inode). A stale external ledger refuses a root that was deleted
+  and recreated at the same path instead of deleting same-named files there.
+- The kernel contract states the guarantee as conditional ("provided the
+  conditions hold") rather than "when and only when", adds the
+  substitutivity law for custom `eq=`/`cutoff=` policies — a coarser policy
+  narrows the guarantee to consistency modulo its declared equivalence — and
+  states the `ValueAdapter` boundary laws the guard now enforces.
+- The checkpoint trust conditions gain (iv): keys and store bytes must come
+  from a trusted channel; content addressing authenticates bytes against a
+  key, not the key's provenance. The action contract and security policy
+  state that an external `state_dir` must be trusted as strongly as the
+  output root.
+- The README positions pyinc as an application of the established Salsa-style
+  red-green model with prior art named, not as the first incremental engine
+  for Python. Verification language, the `lru_cache` comparison, the Rust
+  ownership analogy, and the `report_untracked_read` guidance now say
+  exactly what is true; the demo page carries full provenance for its
+  numbers.
+- The development-status classifier is `4 - Beta` until the hardened release
+  has soaked and an external audit of the fixes closes.
+
 ## [3.1.1] - 2026-08-03
 
 ### Highlights
