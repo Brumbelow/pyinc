@@ -451,7 +451,7 @@ def test_effective_search_paths_deduplicate_and_ignore_missing_pth_entries(
     )
     monkeypatch.setattr(deep_resolution, "_directory_exists", lambda *_args: False)
 
-    assert query.fn(cast(Database, object())) == ((os.fspath(site), "sys.path"),)
+    assert query.fn(Database()) == ((os.fspath(site), "sys.path"),)
 
 
 def test_deep_resolution_skips_an_already_visited_candidate(tmp_path: Path) -> None:
@@ -459,10 +459,11 @@ def test_deep_resolution_skips_an_already_visited_candidate(tmp_path: Path) -> N
     site.mkdir()
     module_path = site / "module.py"
     module_path.write_text("", encoding="utf-8")
-    visited = {deep_resolution._canonical_path(os.fspath(module_path))}
+    db = Database()
+    visited = {deep_resolution._canonical_path(db, os.fspath(module_path))}
 
     assert deep_resolution._descend(
-        Database(),
+        db,
         (os.fspath(site),),
         "module",
         visited=visited,
