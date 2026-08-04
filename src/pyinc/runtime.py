@@ -2218,21 +2218,25 @@ class Database:
         token = self._execution_stack.set(stack + (frame,))
         raw_reads_token = self._allow_raw_reads.set(False)
         try:
-            query_args, query_kwargs = self._materialize_call(
-                call_snapshot,
-                record_boundaries=self.mode == "checked",
-                frame=frame,
-            )
+            # The guard covers the whole query boundary, not just the body:
+            # materializing arguments runs adapter thaws and freezing the
+            # result runs adapter freezes, and an ambient read in either
+            # smuggles untracked state into the stored snapshot.
             with self._guard_untracked_reads():
+                query_args, query_kwargs = self._materialize_call(
+                    call_snapshot,
+                    record_boundaries=self.mode == "checked",
+                    frame=frame,
+                )
                 t0 = time.perf_counter_ns()
                 result = query.fn(self, *query_args, **query_kwargs)
                 elapsed = time.perf_counter_ns() - t0
-            if self.mode == "checked":
-                for before, value in zip(
-                    frame.boundary_fingerprints, frame.boundary_values, strict=True
-                ):
-                    assert_not_mutated(before, self._fingerprint_value(value))
-            snapshot = self._freeze_value(result)
+                if self.mode == "checked":
+                    for before, value in zip(
+                        frame.boundary_fingerprints, frame.boundary_values, strict=True
+                    ):
+                        assert_not_mutated(before, self._fingerprint_value(value))
+                snapshot = self._freeze_value(result)
             digest = fingerprint_snapshot(snapshot)
             impure = bool(frame.untracked_reasons)
 

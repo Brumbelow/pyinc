@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -227,3 +228,68 @@ def test_environ_raw_data_mapping_stays_hidden_inside_queries() -> None:
 
     with pytest.raises(AttributeError, match="_data"):
         Database().get(peek)
+
+
+class _AdaptedPayload:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _FreezeReadsFileAdapter:
+    def __init__(self, side_file: str) -> None:
+        self.side_file = side_file
+
+    def freeze(self, value: _AdaptedPayload, freeze_value: Any) -> object:
+        return freeze_value(Path(self.side_file).read_text(encoding="utf-8"))
+
+    def thaw(self, snapshot: object, thaw_value: Any) -> _AdaptedPayload:
+        return _AdaptedPayload(str(thaw_value(snapshot)))
+
+
+class _ThawReadsFileAdapter:
+    def __init__(self, side_file: str) -> None:
+        self.side_file = side_file
+
+    def freeze(self, value: _AdaptedPayload, freeze_value: Any) -> object:
+        return freeze_value(value.text)
+
+    def thaw(self, snapshot: object, thaw_value: Any) -> _AdaptedPayload:
+        return _AdaptedPayload(Path(self.side_file).read_text(encoding="utf-8"))
+
+
+def test_adapter_freeze_of_a_query_result_runs_under_the_guard(tmp_path: Path) -> None:
+    """Freezing a result is part of the query boundary: an adapter that reads
+    ambient state there smuggles it into the stored snapshot, so the condition 2
+    guard has to see the read."""
+
+    side = tmp_path / "side.txt"
+    side.write_text("one", encoding="utf-8")
+
+    @query
+    def boxed(db: Database) -> _AdaptedPayload:
+        return _AdaptedPayload("payload")
+
+    db = Database(
+        mode="checked",
+        adapters={_AdaptedPayload: _FreezeReadsFileAdapter(str(side))},
+    )
+    with pytest.raises(UntrackedReadError, match="untracked"):
+        db.get(boxed)
+
+
+def test_adapter_thaw_of_query_arguments_runs_under_the_guard(tmp_path: Path) -> None:
+    """Materializing call arguments is the thaw half of the same boundary."""
+
+    side = tmp_path / "side.txt"
+    side.write_text("one", encoding="utf-8")
+
+    @query
+    def consume(db: Database, payload: _AdaptedPayload) -> str:
+        return payload.text
+
+    db = Database(
+        mode="checked",
+        adapters={_AdaptedPayload: _ThawReadsFileAdapter(str(side))},
+    )
+    with pytest.raises(UntrackedReadError, match="untracked"):
+        db.get(consume, _AdaptedPayload("payload"))
