@@ -391,13 +391,15 @@ def test_live_kwdefault_mutation_changes_query_identity_between_requests() -> No
     db = Database()
     assert db.get(answer) == 1
 
-    answer.fn.__kwdefaults__["value"] = 2
+    kwdefaults = answer.fn.__kwdefaults__
+    assert kwdefaults is not None
+    kwdefaults["value"] = 2
     try:
         fresh = Database()
         assert fresh.get(answer) == 2
         assert db.get(answer) == 2
     finally:
-        answer.fn.__kwdefaults__["value"] = 1
+        kwdefaults["value"] = 1
 
 
 def test_live_closure_cell_rebinding_changes_query_identity_between_requests() -> None:
@@ -424,20 +426,23 @@ def test_live_closure_cell_rebinding_changes_query_identity_between_requests() -
     assert db.get(read_value) == 2
 
 
+_LIVE_GLOBAL_CAPTURE = 1
+
+
 def test_live_captured_global_rebinding_changes_query_identity_between_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = sys.modules[__name__]
-    monkeypatch.setattr(module, "_LIVE_GLOBAL_CAPTURE", 1, raising=False)
+    monkeypatch.setattr(module, "_LIVE_GLOBAL_CAPTURE", 1)
 
     @query(key="live-global-rebinding")
     def read_global(db: Database) -> int:
-        return _LIVE_GLOBAL_CAPTURE  # type: ignore[name-defined]  # noqa: F821
+        return _LIVE_GLOBAL_CAPTURE
 
     db = Database()
     assert db.get(read_global) == 1
 
-    monkeypatch.setattr(module, "_LIVE_GLOBAL_CAPTURE", 2, raising=False)
+    monkeypatch.setattr(module, "_LIVE_GLOBAL_CAPTURE", 2)
     fresh = Database()
     assert fresh.get(read_global) == 2
     assert db.get(read_global) == 2

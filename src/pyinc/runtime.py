@@ -3020,7 +3020,7 @@ class Database:
             return cls._strict_snapshot_view(value)
         if type(value) is tuple:
             detached = tuple(detach(item) for item in value)
-            if all(item is original for item, original in zip(detached, value)):
+            if all(item is original for item, original in zip(detached, value, strict=True)):
                 return value
             return detached
         return value
@@ -3239,7 +3239,7 @@ class Database:
         if type(expected) is tuple and type(current) is tuple:
             return len(expected) == len(current) and all(
                 cls._definition_observation_matches(old, new)
-                for old, new in zip(expected, current)
+                for old, new in zip(expected, current, strict=True)
             )
         return False
 

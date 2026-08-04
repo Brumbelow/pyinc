@@ -2115,10 +2115,12 @@ def test_strict_boundary_views_are_detached_from_the_stored_snapshot() -> None:
     # bypasses them; a view aliasing the stored snapshot would then corrupt it.
     object.__setattr__(view, "items", (99,))
 
-    assert tuple(db.get(listed)) == (1, 2)
+    warm_view = db.get(listed)
+    assert tuple(warm_view) == (1, 2)
     fresh = Database(mode="strict")
     fresh.set(numbers, (1, 2))
-    assert tuple(db.get(listed)) == tuple(fresh.get(listed))
+    fresh_view = fresh.get(listed)
+    assert tuple(warm_view) == tuple(fresh_view)
 
 
 def test_strict_boundary_views_detach_nested_shells_too() -> None:

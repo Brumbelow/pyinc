@@ -9,7 +9,6 @@ before the first ``get()``.
 from __future__ import annotations
 
 import hashlib
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
