@@ -37,6 +37,8 @@ from pyinc.action import (
     action,
 )
 
+action_module: Any = importlib.import_module("pyinc.action")
+
 _PROCESS_ACTION_TOOL = "cross-process-action"
 
 
@@ -1445,6 +1447,83 @@ def test_shared_state_directory_rejects_a_different_output_root(tmp_path: Path) 
 
     assert (first_root / "owned.txt").read_text() == "content"
     assert not second_root.exists()
+
+
+@pytest.mark.parametrize("recreation", ["detected", "undetected"])
+def test_stale_external_ledger_never_deletes_in_a_recreated_output_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recreation: str
+) -> None:
+    state = tmp_path / "state"
+    root = tmp_path / "root"
+    wanted = {"owned.txt": "content"}
+
+    @action(tool="incarnation-bound-manifest")
+    def incarnation_action(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    if recreation == "undetected":
+        # A filesystem can hand the recreated directory its old inode straight
+        # back (ext4 does), so stat identity never observes the recreation and
+        # only the byte-level ownership check stands between the stale claims
+        # and the new directory's files.
+        monkeypatch.setattr(action_module, "_root_incarnation", lambda _root: [1, 1])
+
+    incarnation_action.reconcile(Database(), root=root, state_dir=state)
+    assert (root / "owned.txt").read_text() == "content"
+
+    # The root is deleted and recreated at the same path: the ledger's claims
+    # name files in a directory that no longer exists, so they must not delete
+    # files somebody else placed in the new one.
+    shutil.rmtree(root)
+    root.mkdir()
+    somebody_else = root / "owned.txt"
+    somebody_else.write_text("not the ledger's file", encoding="utf-8")
+    if recreation == "detected":
+        monkeypatch.setattr(action_module, "_root_incarnation", lambda _root: [2, 2])
+
+    wanted.clear()
+    wanted["other.txt"] = "new output"
+    result = incarnation_action.reconcile(Database(), root=root, state_dir=state)
+
+    assert somebody_else.read_text() == "not the ledger's file"
+    assert "owned.txt" not in result.deleted
+    assert (root / "other.txt").read_text() == "new output"
+
+    # The released claim is gone: reconciling the somebody-else file into a
+    # desired output later must not treat it as an orphan of this ledger.
+    manifest_text = _manifest_path(state, "incarnation-bound-manifest").read_text(
+        encoding="utf-8"
+    )
+    assert "owned.txt" not in manifest_text
+
+
+def test_a_drifted_orphan_is_released_but_never_deleted(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    wanted = {"kept.txt": "kept", "dropped.txt": "generated"}
+
+    @action(tool="digest-verified-deletion")
+    def drift_action(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    drift_action.reconcile(Database(), root=root)
+    edited = root / "dropped.txt"
+    edited.write_text("hand-edited after generation", encoding="utf-8")
+
+    del wanted["dropped.txt"]
+    result = drift_action.reconcile(Database(), root=root)
+
+    # The file no longer carries the bytes the ledger recorded, so it is the
+    # user's file now: the claim is released, the file survives.
+    assert edited.read_text() == "hand-edited after generation"
+    assert "dropped.txt" not in result.deleted
+
+    # An unmodified orphan is still deleted normally.
+    wanted["transient.txt"] = "generated"
+    drift_action.reconcile(Database(), root=root)
+    del wanted["transient.txt"]
+    result = drift_action.reconcile(Database(), root=root)
+    assert result.deleted == ("transient.txt",)
+    assert not (root / "transient.txt").exists()
 
 
 @pytest.mark.parametrize("timeout", (float("nan"), float("inf"), -float("inf")))

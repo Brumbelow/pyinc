@@ -27,6 +27,7 @@ from pyinc.integrations.python_source import (
     source_text,
     workspace_analysis,
     workspace_analysis_payload,
+    workspace_python_files,
 )
 
 Operation = tuple[Literal["write", "delete"], str, str | None]
@@ -427,6 +428,38 @@ def test_workspace_analysis_ignores_symlink_cycles_and_outside_workspace(
     )
     assert all("external_link" not in item.path for item in analysis.modules)
     assert all(".loop." not in item.module for item in analysis.modules)
+
+
+def test_workspace_python_files_tracks_symlink_retargeting(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    inside = root / "z_inside"
+    inside.mkdir()
+    (inside / "same.py").write_text("value = 1\n", encoding="utf-8")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "same.py").write_text("value = 1\n", encoding="utf-8")
+
+    link = root / "a_link"
+    _symlink_or_skip(link, inside)
+
+    db = Database(mode="checked")
+    first = db.get(workspace_python_files, str(root))
+    assert first
+
+    # Retargeting the link flips which listing is in-root: the link now leaves
+    # the workspace and z_inside stops being a traversal duplicate.
+    link.unlink()
+    _symlink_or_skip(link, outside)
+
+    fresh = Database(mode="checked")
+    assert db.get(workspace_python_files, str(root)) == fresh.get(
+        workspace_python_files, str(root)
+    )
+    assert workspace_analysis(db, root) == workspace_analysis(
+        Database(mode="checked"), root
+    )
 
 
 def test_workspace_analysis_reuses_when_only_outside_symlink_target_changes(

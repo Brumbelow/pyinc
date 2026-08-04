@@ -9,7 +9,7 @@ from typing import TypeAlias, cast
 
 from pyinc.core import query
 from pyinc.integrations.installed_packages import environment_index
-from pyinc.resources import DirectoryResource, FileStatResource
+from pyinc.resources import DirectoryResource, FileStatResource, ResolvedPathResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
@@ -124,6 +124,7 @@ class _PthFileResource:
 _DIRECTORIES = DirectoryResource()
 _FILES = _PthFileResource()
 _FILESTAT = FileStatResource()
+_RESOLVED = ResolvedPathResource()
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +132,14 @@ _FILESTAT = FileStatResource()
 # ---------------------------------------------------------------------------
 
 
-def _canonical_path(path: str) -> str:
-    return str(Path(path).resolve(strict=False))
+def _canonical_path(db: Database, path: str) -> str:
+    """Resolve ``path`` as a tracked read; an unresolvable path is its own key.
+
+    Canonical paths dedupe search-path entries and suppress traversal cycles,
+    so a symlink retarget has to invalidate the queries that used them.
+    """
+    resolved = _RESOLVED.read(db, path)
+    return resolved if resolved is not None else path
 
 
 def _parse_pth_content(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -247,7 +254,7 @@ def _effective_search_paths_payload(db: Database) -> tuple[ModulePathEntryPayloa
     seen: set[str] = set()
     results: list[ModulePathEntryPayload] = []
     for entry in base:
-        canonical = _canonical_path(entry)
+        canonical = _canonical_path(db, entry)
         if canonical in seen:
             continue
         seen.add(canonical)
@@ -259,7 +266,7 @@ def _effective_search_paths_payload(db: Database) -> tuple[ModulePathEntryPayloa
             pth_path = os.path.join(entry, pth_name)
             extras, _ = _pth_directives_payload(db, pth_path)
             for extra in extras:
-                canonical = _canonical_path(extra)
+                canonical = _canonical_path(db, extra)
                 if canonical in seen:
                     continue
                 if not _directory_exists(db, canonical):
@@ -327,7 +334,7 @@ def _descend(
         if candidate is None:
             continue
         path, kind = candidate
-        canonical = _canonical_path(path)
+        canonical = _canonical_path(db, path)
         if canonical in visited:
             continue
         visited.add(canonical)

@@ -19,7 +19,6 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMappin
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
-from functools import lru_cache
 from pathlib import Path
 from types import (
     BuiltinFunctionType,
@@ -87,23 +86,21 @@ ResourceProbeT = TypeVar("ResourceProbeT")
 
 # Durable checkpoint manifest schema version. Bumped whenever the identity, the
 # record layout, or the meaning of a recorded field changes, so stale manifests
-# are rejected loudly rather than silently reused. Version 5 carries the
-# dependency semantics a caught resource-read failure now records: a version-4
-# record can claim no dependencies for a reader a fresh database re-derives.
-_CHECKPOINT_MANIFEST_VERSION = 5
+# are rejected loudly rather than silently reused. Version 6 marks two
+# soundness repairs a version-5 record can predate: captured-module identity
+# was derived from a stat tuple a same-size rewrite can preserve, and a stat
+# probe raising NotADirectoryError published no resource edge, so a version-5
+# record can carry a stale identity or claim no dependencies for a reader a
+# fresh database re-derives.
+_CHECKPOINT_MANIFEST_VERSION = 6
 # Version of the snapshot/fingerprint encoding this kernel emits, mirrored from
 # value._KERNEL_FINGERPRINT_PREFIX (b"K2;"). Recorded in the manifest and checked
 # at load so a checkpoint from a differently-encoded kernel is never trusted.
 _KERNEL_FINGERPRINT_VERSION = 2
 _DEFAULT_SEMANTIC_EQUALITY_VERSION = 1
 _MISSING_SNAPSHOT = object()
-
-
-@lru_cache(maxsize=1024)
-def _module_file_digest(file_path: str, _change_identity: tuple[int, int, int, int, int]) -> str:
-    """Hash module bytes once per OS-maintained file-change identity."""
-
-    return hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
+_EMPTY_CELL_OBSERVATION = object()
+_UNBOUND_GLOBAL_OBSERVATION = object()
 
 
 def _build_runtime_build_payload() -> tuple[Any, ...]:
@@ -1346,7 +1343,13 @@ class Database:
 
         try:
             manifest = json.loads(manifest_bytes.decode("utf-8"), object_pairs_hook=unique_object)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+            OverflowError,
+        ) as exc:
             raise CheckpointManifestError(
                 f"Checkpoint {key!r} manifest could not be decoded as JSON: {exc}"
             ) from exc
@@ -2224,21 +2227,25 @@ class Database:
         token = self._execution_stack.set(stack + (frame,))
         raw_reads_token = self._allow_raw_reads.set(False)
         try:
-            query_args, query_kwargs = self._materialize_call(
-                call_snapshot,
-                record_boundaries=self.mode == "checked",
-                frame=frame,
-            )
+            # The guard covers the whole query boundary, not just the body:
+            # materializing arguments runs adapter thaws and freezing the
+            # result runs adapter freezes, and an ambient read in either
+            # smuggles untracked state into the stored snapshot.
             with self._guard_untracked_reads():
+                query_args, query_kwargs = self._materialize_call(
+                    call_snapshot,
+                    record_boundaries=self.mode == "checked",
+                    frame=frame,
+                )
                 t0 = time.perf_counter_ns()
                 result = query.fn(self, *query_args, **query_kwargs)
                 elapsed = time.perf_counter_ns() - t0
-            if self.mode == "checked":
-                for before, value in zip(
-                    frame.boundary_fingerprints, frame.boundary_values, strict=True
-                ):
-                    assert_not_mutated(before, self._fingerprint_value(value))
-            snapshot = self._freeze_value(result)
+                if self.mode == "checked":
+                    for before, value in zip(
+                        frame.boundary_fingerprints, frame.boundary_values, strict=True
+                    ):
+                        assert_not_mutated(before, self._fingerprint_value(value))
+                snapshot = self._freeze_value(result)
             digest = fingerprint_snapshot(snapshot)
             impure = bool(frame.untracked_reasons)
 
@@ -2923,12 +2930,19 @@ class Database:
             return all(type(key) is str for key, _value in envelope[1].entries)
         return all(type(key) is str for key in envelope[1])
 
-    @staticmethod
-    def _strict_snapshot_view(snapshot: Any) -> Any:
-        """Expose a graph snapshot through immutable container interfaces."""
+    @classmethod
+    def _strict_snapshot_view(cls, snapshot: Any) -> Any:
+        """Expose a snapshot through rebuilt immutable container interfaces.
+
+        Every `Frozen*` shell is rebuilt, graph or not: frozen dataclass
+        setters refuse plain writes, but `object.__setattr__` bypasses them,
+        so a view aliasing the stored snapshot would let a caller corrupt the
+        record it came from. Leaf values and all-leaf tuples are shared —
+        nothing reflective can rebind their contents.
+        """
 
         if type(snapshot) is not FrozenGraph:
-            return snapshot
+            return cls._detached_snapshot_view(snapshot)
 
         shells: list[Any] = []
         for node in snapshot.nodes:
@@ -2983,6 +2997,33 @@ class Database:
                     tuple((key, resolve(item)) for key, item in node.entries),
                 )
         return resolve(snapshot.root)
+
+    @classmethod
+    def _detached_snapshot_view(cls, value: Any) -> Any:
+        detach = cls._detached_snapshot_view
+        if type(value) is FrozenList:
+            return FrozenList(tuple(detach(item) for item in value.items))
+        if type(value) is FrozenDict:
+            return FrozenDict(
+                tuple((detach(key), detach(item)) for key, item in value.entries)
+            )
+        if type(value) is FrozenSet:
+            return FrozenSet(value.kind, tuple(detach(item) for item in value.items))
+        if type(value) is FrozenRecord:
+            return FrozenRecord(
+                value.type_name,
+                tuple((key, detach(item)) for key, item in value.entries),
+            )
+        if type(value) is FrozenAdapterValue:
+            return FrozenAdapterValue(value.adapter_key, detach(value.payload))
+        if type(value) is FrozenGraph:
+            return cls._strict_snapshot_view(value)
+        if type(value) is tuple:
+            detached = tuple(detach(item) for item in value)
+            if all(item is original for item, original in zip(detached, value, strict=True)):
+                return value
+            return detached
+        return value
 
     def _expose_snapshot(
         self,
@@ -3081,7 +3122,7 @@ class Database:
         if (
             cached is not None
             and cached[0] == runtime_build
-            and cached[1] == definition_observation
+            and self._definition_observation_matches(cached[1], definition_observation)
             and all(
                 self._module_observation_stamp(module) == expected for module, expected in cached[3]
             )
@@ -3121,17 +3162,86 @@ class Database:
 
     @staticmethod
     def _query_definition_observation(query: Any) -> Any:
-        function = query.fn
+        """Observe the live query definition for memoized-fingerprint reuse.
+
+        The observation records object *references* — per entry, not per
+        container, because a `__kwdefaults__` dict or a closure cell mutated in
+        place keeps its identity while changing the definition. Storing the
+        references in the memo pins their addresses, so identity comparison is
+        collision-free: any rebinding introduces an object that cannot be
+        identical to a still-pinned one, and a spurious mismatch only costs a
+        fingerprint recompute. The traversal mirrors what
+        `_function_definition_payload` folds into the fingerprint; modules stay
+        leaves because `_module_observation_stamp` covers their content.
+        """
+        from .core import Input, Query
+
+        seen: builtins.set[int] = set()
+
+        def observe_value(value: Any) -> Any:
+            if isinstance(value, Query):
+                return (value.key, observe_value(value.eq), observe_value(value.cutoff),
+                        observe_value(value.fn))
+            if isinstance(value, Input):
+                return (value.key, observe_value(value.eq), observe_value(value.cutoff))
+            if isinstance(value, FunctionType):
+                return observe_function(value)
+            return value
+
+        def observe_function(fn: FunctionType) -> Any:
+            if id(fn) in seen:
+                return fn
+            seen.add(id(fn))
+            code = fn.__code__
+            fn_globals = fn.__globals__
+            return (
+                fn,
+                code,
+                fn.__defaults__,
+                tuple(observe_value(value) for value in fn.__defaults__ or ()),
+                fn.__kwdefaults__,
+                tuple(
+                    (name, observe_value(value))
+                    for name, value in sorted((fn.__kwdefaults__ or {}).items())
+                ),
+                tuple(
+                    (cell, observe_cell(cell)) for cell in fn.__closure__ or ()
+                ),
+                tuple(
+                    (name, observe_value(fn_globals[name]))
+                    if name in fn_globals
+                    else (name, _UNBOUND_GLOBAL_OBSERVATION)
+                    for name in sorted(set(code.co_names))
+                ),
+                tuple((name, observe_value(value)) for name, value in sorted(vars(fn).items())),
+            )
+
+        def observe_cell(cell: Any) -> Any:
+            try:
+                contents = cell.cell_contents
+            except ValueError:
+                return _EMPTY_CELL_OBSERVATION
+            return observe_value(contents)
+
         return (
             query.key,
-            id(function),
-            id(function.__code__),
-            id(function.__defaults__),
-            id(function.__kwdefaults__),
-            tuple((name, id(value)) for name, value in sorted(vars(function).items())),
-            id(query.eq),
-            id(query.cutoff),
+            observe_value(query.eq),
+            observe_value(query.cutoff),
+            observe_function(query.fn),
         )
+
+    @classmethod
+    def _definition_observation_matches(cls, expected: Any, current: Any) -> bool:
+        """Compare observations by identity at the leaves, never by equality."""
+
+        if expected is current:
+            return True
+        if type(expected) is tuple and type(current) is tuple:
+            return len(expected) == len(current) and all(
+                cls._definition_observation_matches(old, new)
+                for old, new in zip(expected, current, strict=True)
+            )
+        return False
 
     def _code_fingerprint(self, fn: FunctionType) -> str:
         payload = (
@@ -5014,27 +5124,16 @@ class Database:
                 f"Captured module {module_name!r} file does not match its import spec."
             )
 
+        # The identity is the bytes, hashed on every derivation. Stat-shaped
+        # shortcuts (size, mtime, ctime, device, inode) are not collision-free:
+        # a same-size rewrite inside one timestamp granule preserves all five.
         with self._allow_raw_reads_scope():
             try:
-                stat_result = os.stat(file_path)
-                change_identity = (
-                    stat_result.st_size,
-                    stat_result.st_mtime_ns,
-                    stat_result.st_ctime_ns,
-                    stat_result.st_dev,
-                    stat_result.st_ino,
-                )
-                digest = (
-                    hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
-                    if os.name == "nt"
-                    else _module_file_digest(file_path, change_identity)
-                )
+                digest = hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
             except OSError as exc:
                 raise UnsupportedValueError(
                     f"Captured module {module_name!r} file cannot be read safely."
                 ) from exc
-        # ctime/inode/device join size and mtime in the cache key, so a
-        # same-size write with a restored mtime still forces a fresh byte hash.
         file_identity = ("file-sha256", import_identity, digest)
         return (version_digest, file_identity, all_tuple, constants_payload)
 
@@ -5066,21 +5165,14 @@ class Database:
             if not isinstance(file_path, str):
                 source_observation = ("missing-file",)
             else:
+                # Observed by content, never by stat identity: the stamp gates
+                # reuse of a memoized fingerprint, so it carries the same
+                # collision risk the identity payload does.
                 with self._allow_raw_reads_scope():
                     try:
-                        stat_result = os.stat(file_path)
-                        change_identity = (
-                            stat_result.st_size,
-                            stat_result.st_mtime_ns,
-                            stat_result.st_ctime_ns,
-                            stat_result.st_dev,
-                            stat_result.st_ino,
-                        )
                         source_observation = (
-                            change_identity,
-                            hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
-                            if os.name == "nt"
-                            else None,
+                            "file-sha256",
+                            hashlib.sha256(Path(file_path).read_bytes()).hexdigest(),
                         )
                     except OSError:
                         source_observation = ("unreadable-file",)

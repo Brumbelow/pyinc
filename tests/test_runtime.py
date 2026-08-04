@@ -31,6 +31,7 @@ from pyinc import (
     MutationError,
     QueryChangeEvent,
     QueryProfile,
+    ResolvedPathResource,
     Resource,
     Subscription,
     UnsupportedValueError,
@@ -1497,6 +1498,30 @@ def test_file_stat_resource_tracks_metadata_changes(tmp_path: Path) -> None:
     assert _inspect_node(db, read_stat, str(path)).last_decision == "executed"
 
 
+def test_file_stat_resource_is_total_when_a_parent_path_component_is_a_file(
+    tmp_path: Path,
+) -> None:
+    stats = FileStatResource()
+    parent = tmp_path / "parent"
+    parent.write_text("plain file", encoding="utf-8")
+    child = parent / "child"
+
+    @query
+    def child_exists(db: Database, filename: str) -> bool:
+        snapshot = cast(dict[str, object], stats.read(db, filename))
+        return snapshot["exists"] is True
+
+    db = Database(mode="checked")
+    assert db.get(child_exists, str(child)) is False
+
+    parent.unlink()
+    parent.mkdir()
+    child.write_text("now a real child", encoding="utf-8")
+    assert db.get(child_exists, str(child)) is True
+    fresh = Database(mode="checked")
+    assert fresh.get(child_exists, str(child)) is True
+
+
 def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) -> None:
     directories = DirectoryResource()
     path = tmp_path / "workspace"
@@ -1514,6 +1539,47 @@ def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) ->
     child.write_text("beta", encoding="utf-8")
     assert db.get(entries, str(path)) == ("a.txt",)
     assert _inspect_node(db, entries, str(path)).last_decision == "reused"
+
+
+def test_resolved_path_resource_tracks_symlink_retargeting(tmp_path: Path) -> None:
+    resolver = ResolvedPathResource()
+    first_target = tmp_path / "first"
+    second_target = tmp_path / "second"
+    first_target.mkdir()
+    second_target.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(first_target, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink support is unavailable in this environment")
+
+    @query
+    def resolved(db: Database, path: str) -> str | None:
+        return resolver.read(db, path)
+
+    db = Database(mode="checked")
+    assert db.get(resolved, str(link)) == str(first_target)
+
+    link.unlink()
+    link.symlink_to(second_target, target_is_directory=True)
+    assert db.get(resolved, str(link)) == str(second_target)
+    assert _inspect_node(db, resolved, str(link)).last_decision == "executed"
+
+
+def test_resolved_path_resource_probe_is_total_for_a_symlink_loop(tmp_path: Path) -> None:
+    resolver = ResolvedPathResource()
+    try:
+        (tmp_path / "a").symlink_to(tmp_path / "b")
+        (tmp_path / "b").symlink_to(tmp_path / "a")
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink support is unavailable in this environment")
+
+    looped = str(tmp_path / "a" / "child")
+    first_probe = resolver.probe(looped)
+    assert first_probe == resolver.probe(looped)
+    value = resolver.load(Database(), looped)
+    assert value is None or isinstance(value, str)
+    assert first_probe == (value,)
 
 
 def test_file_resource_atomic_probe_and_load_keeps_digest_and_text_coherent(
@@ -2032,6 +2098,46 @@ def test_external_alias_mutation_after_boundary_crossing() -> None:
     data["new_key"] = [99]
 
     assert db.get(echo) == {"key": [1, 2, 3]}
+
+
+def test_strict_boundary_views_are_detached_from_the_stored_snapshot() -> None:
+    numbers = Input[tuple[int, ...]]("strict-detach.numbers")
+
+    @query
+    def listed(db: Database) -> list[int]:
+        return list(numbers.read(db))
+
+    db = Database(mode="strict")
+    db.set(numbers, (1, 2))
+    view = db.get(listed)
+
+    # Frozen dataclass setters refuse plain writes, but object.__setattr__
+    # bypasses them; a view aliasing the stored snapshot would then corrupt it.
+    object.__setattr__(view, "items", (99,))
+
+    warm_view = db.get(listed)
+    assert tuple(warm_view) == (1, 2)
+    fresh = Database(mode="strict")
+    fresh.set(numbers, (1, 2))
+    fresh_view = fresh.get(listed)
+    assert tuple(warm_view) == tuple(fresh_view)
+
+
+def test_strict_boundary_views_detach_nested_shells_too() -> None:
+    payload = Input[list[Any]]("strict-detach.nested")
+
+    @query
+    def echoed(db: Database) -> list[Any]:
+        return list(payload.read(db))
+
+    db = Database(mode="strict")
+    db.set(payload, [{"key": 1}])
+    view = db.get(echoed)
+
+    inner = view[0]
+    object.__setattr__(inner, "entries", (("key", 99),))
+
+    assert dict(db.get(echoed)[0]) == {"key": 1}
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked"])

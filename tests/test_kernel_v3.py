@@ -357,6 +357,97 @@ def test_query_identity_includes_defaults_and_keyword_defaults() -> None:
     assert db._query_key(first, (), {})[0].identity != db._query_key(second, (), {})[0].identity
 
 
+def test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative() -> None:
+    """Pins the documented shape of consistency under a coarse policy.
+
+    A cutoff that declares two values unchanged makes dependents consistent
+    modulo that equivalence: they legitimately stay at results computed from
+    the earlier representative, while a fresh database starts from the later
+    one. Exact-value agreement requires a substitutive policy (condition 3).
+    """
+    coarse = Input[int]("congruence.value", cutoff=lambda _value: 0)
+
+    @query
+    def doubled(db: Database) -> int:
+        return coarse.read(db) * 2
+
+    db = Database(mode="checked")
+    db.set(coarse, 1)
+    assert db.get(doubled) == 2
+
+    db.set(coarse, 2)
+    assert db.get(doubled) == 2
+
+    fresh = Database(mode="checked")
+    fresh.set(coarse, 2)
+    assert fresh.get(doubled) == 4
+
+
+def test_live_kwdefault_mutation_changes_query_identity_between_requests() -> None:
+    @query(key="live-kwdefault-mutation")
+    def answer(db: Database, *, value: int = 1) -> int:
+        return value
+
+    db = Database()
+    assert db.get(answer) == 1
+
+    kwdefaults = answer.fn.__kwdefaults__
+    assert kwdefaults is not None
+    kwdefaults["value"] = 2
+    try:
+        fresh = Database()
+        assert fresh.get(answer) == 2
+        assert db.get(answer) == 2
+    finally:
+        kwdefaults["value"] = 1
+
+
+def test_live_closure_cell_rebinding_changes_query_identity_between_requests() -> None:
+    def make_query() -> tuple[Query[[], int], Any]:
+        value = 1
+
+        def rebind(new: int) -> None:
+            nonlocal value
+            value = new
+
+        @query(key="live-closure-rebinding")
+        def read_value(db: Database) -> int:
+            return value
+
+        return read_value, rebind
+
+    read_value, rebind = make_query()
+    db = Database()
+    assert db.get(read_value) == 1
+
+    rebind(2)
+    fresh = Database()
+    assert fresh.get(read_value) == 2
+    assert db.get(read_value) == 2
+
+
+_LIVE_GLOBAL_CAPTURE = 1
+
+
+def test_live_captured_global_rebinding_changes_query_identity_between_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "_LIVE_GLOBAL_CAPTURE", 1)
+
+    @query(key="live-global-rebinding")
+    def read_global(db: Database) -> int:
+        return _LIVE_GLOBAL_CAPTURE
+
+    db = Database()
+    assert db.get(read_global) == 1
+
+    monkeypatch.setattr(module, "_LIVE_GLOBAL_CAPTURE", 2)
+    fresh = Database()
+    assert fresh.get(read_global) == 2
+    assert db.get(read_global) == 2
+
+
 def test_query_identity_includes_transitively_captured_functions() -> None:
     def make_helper(offset: int) -> Any:
         def helper() -> int:
@@ -845,6 +936,48 @@ def test_module_identity_hashes_compiled_file_bytes_even_when_stat_is_stable(
 
     assert path.stat().st_size == original_stat.st_size
     assert path.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert first != second
+
+
+def test_module_identity_observes_rewritten_bytes_when_stat_identity_collides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A same-size rewrite can land inside one timestamp granule, leaving size,
+    # mtime, ctime, device, and inode all unchanged. Freeze the stat answer for
+    # this path to make that collision deterministic; the identity must come
+    # from the bytes.
+    path = tmp_path / "extension.bin"
+    path.write_bytes(b"first-payload")
+    frozen_stat = os.stat(path)
+    real_stat = os.stat
+
+    def stat_with_frozen_target(
+        target: Any, *args: Any, **kwargs: Any
+    ) -> os.stat_result:
+        if isinstance(target, (str, os.PathLike)) and os.fspath(target) == str(path):
+            return frozen_stat
+        return real_stat(target, *args, **kwargs)
+
+    module = ModuleType("pyinc_stat_collision_identity_test")
+    module.__file__ = str(path)
+    specification = importlib.machinery.ModuleSpec(
+        module.__name__,
+        importlib.machinery.SourceFileLoader(module.__name__, str(path)),
+        origin=str(path),
+    )
+    specification.has_location = True
+    module.__spec__ = specification
+    module.__loader__ = specification.loader
+    module.__package__ = specification.parent
+    vars(module)["__cached__"] = specification.cached
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(os, "stat", stat_with_frozen_target)
+    db = Database()
+
+    first = db._module_identity_payload(module)
+    path.write_bytes(b"other-payload")
+    second = db._module_identity_payload(module)
+
     assert first != second
 
 

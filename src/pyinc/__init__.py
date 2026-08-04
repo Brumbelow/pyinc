@@ -27,6 +27,7 @@ from .resources import (
     FileResource,
     FileStatResource,
     FileStatSnapshot,
+    ResolvedPathResource,
     Resource,
 )
 from .runtime import (
@@ -106,6 +107,7 @@ __all__ = [
     "Query",
     "QueryProfile",
     "ReconcileResult",
+    "ResolvedPathResource",
     "Resource",
     "Subscription",
     "UnsupportedValueError",

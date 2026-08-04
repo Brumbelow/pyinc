@@ -7,8 +7,8 @@ v3 process.
 
 ## Discard persisted state
 
-- Delete saved checkpoint keys and create new checkpoints. Manifest schema v5
-  rejects v1-v4 manifests with `CheckpointVersionError`. Snapshot objects using
+- Delete saved checkpoint keys and create new checkpoints. Manifest schema v6
+  rejects v1-v5 manifests with `CheckpointVersionError`. Snapshot objects using
   the `K2` value encoding remain valid, but no v2 checkpoint ledger is trusted.
 - Delete `.pyinc-action.*.json` v1 ledgers after confirming their owned output
   directories. v3 writes schema v2 manifests named with the SHA-256 digest of

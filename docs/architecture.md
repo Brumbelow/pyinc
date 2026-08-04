@@ -81,7 +81,7 @@ instead of manufacturing kernel store keys.
 `Database.save_checkpoint(store=None) -> str` serializes current node records,
 snapshot addresses, and dependency edges to a content-addressed key prefixed
 with `"ck"`. `Database.load_checkpoint(key, store=None)` accepts manifest
-schema v5 only and validates the entire manifest before staging any record:
+schema v6 only and validates the entire manifest before staging any record:
 kernel version, identities, input keys, dependency references, duplicates,
 types, and content addresses. Records whose live code/resources no longer
 match miss safely; structurally malformed or foreign manifests raise a typed
@@ -100,8 +100,8 @@ The top-level package exposes a stable kernel surface:
 - `Database`, stable keyed `Input`, public `Query`, and `@query` for the
   query runtime
 - public generic `Resource`, `Database.read_resource`, `FileResource`,
-  `BinaryFileResource`, `FileStatResource`, `EnvResource`, and
-  `DirectoryResource` for tracked external reads
+  `BinaryFileResource`, `FileStatResource`, `EnvResource`,
+  `DirectoryResource`, and `ResolvedPathResource` for tracked external reads
 - value-boundary helpers such as `freeze`, `thaw`, `semantic_equal`, and
   `ValueAdapter`
 - structured inspection via `InspectionNode`, `Database.inspect(...)`,

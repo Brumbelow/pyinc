@@ -8,7 +8,8 @@ guarantee holds; it is the stable semver contract for `src/pyinc`.
 
 pyinc guarantees **from-scratch consistency** — the result of incremental
 evaluation matches a fresh evaluation on the same declared inputs and resources —
-when and only when the three conditions below hold.
+provided the three conditions below hold. Outside those conditions no
+guarantee is made.
 
 When a recomputed value is semantically equal to the previously stored value,
 the record is **backdated** (also called **early cutoff**): its `changed_at`
@@ -68,7 +69,7 @@ decomposed by the adapter into one.
 **2. Tracked ambient reads.**
 All reads of external state within a query must go through the Resource API
 (`FileResource`, `BinaryFileResource`, `FileStatResource`, `EnvResource`,
-`DirectoryResource`) or a user-defined `Resource`. The public hooks are `read`,
+`DirectoryResource`, `ResolvedPathResource`) or a user-defined `Resource`. The public hooks are `read`,
 `probe`, `load`, `probe_and_load`, `identity`, and `label`; built-ins derive
 probe/value pairs from one observed state. On a warm request the kernel may
 first check for an unchanged world with `probe` alone and calls
@@ -95,6 +96,15 @@ numbers, process state) must either be routed through a Resource or declared via
 `report_untracked_read()`. Query bodies and equality/cutoff policies must have
 fingerprintable implementations and snapshot-safe captures. Dynamically scoped
 local classes are rejected; define stable implementation types at module scope.
+
+Custom `eq=`/`cutoff=` policies must also be **substitutive** for every
+dependent computation: when a policy reports two values unchanged, each
+dependent must produce a semantically equal result from either value. A
+coarser policy is permitted, but the guarantee it buys is correspondingly
+coarser — backdating keeps dependents at results computed from the earlier
+representative, so from-scratch consistency then holds *modulo the declared
+equivalence* rather than on exact values.
+(See: `test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative`)
 
 ## Mode-Specific Enforcement
 
@@ -326,12 +336,14 @@ Three of those gaps sit close enough to the guarded set to be named individually
   edge is recorded, so the query is reused unchanged after that file appears,
   disappears, or is rewritten, while a fresh `Database` reports the new state.
   Route the observation through `FileStatResource`, whose probe covers
-  existence, size, and mtime, or declare it with
+  existence, size, and mtime, through `ResolvedPathResource` when the
+  observation is where a path canonicalizes to, or declare it with
   `db.report_untracked_read(reason)`.
   (See: `test_file_metadata_reads_bypass_untracked_read_guard`,
   `test_stat_only_query_is_never_invalidated_by_the_file_it_stats`,
   `test_report_untracked_read_restores_consistency_for_a_stat_only_query`,
-  `test_file_stat_resource_tracks_metadata_changes`)
+  `test_file_stat_resource_tracks_metadata_changes`,
+  `test_resolved_path_resource_tracks_symlink_retargeting`)
 - **The byte-oriented environment.** `os.getenv` and `os.environ` are
   intercepted; `os.getenvb` and `os.environb` — the same process environment
   under a second name where `os.supports_bytes_environ` holds — are not.
@@ -371,7 +383,13 @@ following hold:
   probe changes whenever its `load` result changes, and probe values are
   snapshot-safe and process-independent;
 - **(iii)** adapters for any adapted snapshot type are registered in the
-  loading process with unchanged `freeze`/`thaw` implementations.
+  loading process with unchanged `freeze`/`thaw` implementations;
+- **(iv)** the checkpoint key and the store it loads from come from a trusted
+  channel. Content addressing proves that bytes match the key they were asked
+  for by — it does not authenticate where the key came from. A coherent
+  attacker-selected key names a coherent attacker-selected manifest, so keys
+  and store contents must be produced by a prior trusted `save_checkpoint`,
+  not accepted from an untrusted input (see `SECURITY.md`).
 
 Under these conditions `load_checkpoint(key)` followed by `db.get(query)`
 returns the value a fresh recomputation on the same declared state would, in all
@@ -454,11 +472,29 @@ value, or route it through a `Resource`.
   `test_impure_child_prevents_parent_backdating_unless_result_unchanged`)
 
 - **`ValueAdapter`** — allows custom types to participate in freeze/thaw by
-  implementing `freeze` and `thaw`.
+  implementing `freeze` and `thaw`. Adapters extend the condition 1 value
+  boundary, so the boundary's obligations extend to them as laws:
+
+  - **Deterministic, side-effect-free hooks.** `freeze` and `thaw` are pure
+    functions of their arguments; neither reads ambient state. Adapter work
+    at query boundaries runs under the condition 2 guard, so an intercepted
+    read raises `UntrackedReadError` there.
+  - **Owned results.** `freeze` returns a payload sharing no mutable state
+    with the live value; `thaw` returns a value the caller owns outright.
+  - **Semantic round-trip.** For any accepted value, `thaw(freeze(x))` is
+    semantically equal to `x` wherever the adapted type is consumed.
+  - **Pinned adapter state.** Adapter instance configuration is immutable for
+    the registered lifetime; implementations and configuration participate in
+    query and checkpoint identity.
+
+  (See: `test_adapter_freeze_of_a_query_result_runs_under_the_guard`,
+  `test_adapter_thaw_of_query_arguments_runs_under_the_guard`)
 
 - **`eq=` / `cutoff=`** on `Input` and `@query` — allows custom equivalence.
   `eq=` compares thawed values directly; `cutoff=` compares snapshot-safe tokens.
-  These are mutually exclusive. Cutoff tokens must be snapshot-safe.
+  These are mutually exclusive. Cutoff tokens must be snapshot-safe, and the
+  declared equivalence must be substitutive for dependents (condition 3) for
+  the guarantee to hold on exact values.
   (See: `test_input_cutoff_suppresses_equal_updates`,
   `test_query_cutoff_backdates_and_skips_downstream`)
 
@@ -493,8 +529,8 @@ a fresh `Database` into an empty directory.
   Resource identity includes the resource's configuration, the implementations
   of every state-observation hook (`probe`, `load`, `probe_and_load`, and
   `identity`), and the interpreter/build identity. The built-in resources
-  (condition 2) cover text, binary, environment, stat, and directory
-  observation.
+  (condition 2) cover text, binary, environment, stat, directory, and
+  path-resolution observation.
 - `Database.inspect(...)` exposes the last recorded provenance tree as structured
   data. `Database.explain(...)` formats it for humans. Inspection is
   observational and does not force an extra verification pass;
@@ -564,7 +600,7 @@ Snapshot bytes use the encoding described in
 On top of this, `Database.save_checkpoint(store=None) -> str` serialises the
 current query and resource records — their snapshot bytes, call snapshots,
 resource parameters, dependency edges, and per-adapter implementation digests —
-into a content-addressed manifest (schema v5), returning a key prefixed with
+into a content-addressed manifest (schema v6), returning a key prefixed with
 `"ck"`. Adapter digests include `freeze`/`thaw` code, snapshot-safe instance
 configuration, and the interpreter/build identity. Saving rejects an adapter
 whose captures or state cannot be pinned; loading under such an adapter safely
@@ -673,6 +709,7 @@ Core:
 | `FileStatSnapshot` | The frozen stat observation `FileStatResource` produces. |
 | `EnvResource` | Environment-variable resource. |
 | `DirectoryResource` | Directory-listing resource. |
+| `ResolvedPathResource` | Symlink-aware path canonicalization as a tracked value. |
 
 Values and snapshots:
 
@@ -743,9 +780,12 @@ Errors:
 
 ## Verification
 
-The from-scratch consistency guarantee is mechanically verified by property tests
-that compare incremental results against fresh-database recomputation for the same
-declared state, across all three modes and with/without LRU eviction:
+The from-scratch consistency guarantee is exercised by property-based
+differential tests that compare incremental results against fresh-database
+recomputation for the same declared state, across all three modes and
+with/without LRU eviction. Finite tests are evidence, not a formal proof —
+which is one reason the guarantee is stated with explicit conditions and
+limitations:
 
 - `test_incremental_results_match_fresh_recomputation` (basic query graph)
 - `test_resource_backed_queries_match_fresh_recomputation` (file resources)
@@ -764,8 +804,8 @@ The mutation adversarial suite (`test_external_alias_mutation_after_boundary_cro
 value membrane protects cached state from external mutation, deep mutation, and
 cross-query aliasing.
 
-The durable cross-run guarantee (limitation 4) is mechanically verified by the
-same fresh-recomputation equivalence, extended to the checkpoint path:
+The durable cross-run guarantee (limitation 4) is checked by the same
+fresh-recomputation equivalence, extended to the checkpoint path:
 
 - `test_checkpoint_reload_matches_fresh_recomputation` (property test in
   `tests/test_properties.py`) — reloads a checkpoint across all three modes and
@@ -773,8 +813,8 @@ same fresh-recomputation equivalence, extended to the checkpoint path:
   fresh, cache-free run over the same edit sequence, and exercises the
   dirty-graph save path directly.
 - `tests/test_checkpoint_cross_process.py` — a subprocess matrix that saves in
-  one interpreter and reloads in another, proving identities and digests line up
-  across processes.
+  one interpreter and reloads in another, checking that identities and digests
+  line up across processes.
 - `tests/test_checkpoint_trust.py` — the adversarial store and trust suite:
   bit-flipped and truncated snapshot bytes, tampered and wrong-version
   manifests, changed query/adapter/resource implementations, and

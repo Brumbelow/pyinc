@@ -28,7 +28,7 @@ from .errors import ActionLockTimeoutError, ActionManifestError, ActionPathError
 if TYPE_CHECKING:
     from .runtime import Database
 
-_MANIFEST_VERSION = 2
+_MANIFEST_VERSION = 3
 _DEFAULT_LOCK_TIMEOUT = 30.0
 _WINDOWS_RESERVED_NAMES = {
     "aux",
@@ -157,6 +157,20 @@ def _manifest_root_digest(root: Path) -> str:
     return hashlib.sha256(os.fsencode(exact_root)).hexdigest()
 
 
+def _root_incarnation(root: Path) -> list[int] | None:
+    """Identify the directory the root path currently names, not the path text.
+
+    A root deleted and recreated at the same path is a different directory:
+    the ledger's claims name files in the old one, and deleting same-named
+    files in the new one would destroy outputs this action never owned.
+    """
+    try:
+        metadata = root.stat()
+    except OSError:
+        return None
+    return [metadata.st_dev, metadata.st_ino]
+
+
 def _manifest_path(state_dir: Path, tool: str) -> Path:
     return state_dir / f".pyinc-action.{_tool_digest(tool)}.json"
 
@@ -170,7 +184,9 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _read_manifest(state_dir: Path, tool: str, root_digest: str) -> tuple[bool, dict[str, str]]:
+def _read_manifest(
+    state_dir: Path, tool: str, root_digest: str, root: Path
+) -> tuple[bool, dict[str, str]]:
     path = _manifest_path(state_dir, tool)
     try:
         raw = read_regular_file(path)
@@ -182,8 +198,11 @@ def _read_manifest(state_dir: Path, tool: str, root_digest: str) -> tuple[bool, 
     except (OSError, ValueError, RecursionError, OverflowError) as error:
         raise ActionManifestError(f"Cannot read action manifest {path}: {error}") from error
 
-    if not isinstance(data, dict) or set(data) != {"root", "tool", "version", "outputs"}:
-        raise ActionManifestError("Action manifest must contain root, tool, version, and outputs.")
+    expected_fields = {"root", "root_incarnation", "tool", "version", "outputs"}
+    if not isinstance(data, dict) or set(data) != expected_fields:
+        raise ActionManifestError(
+            "Action manifest must contain root, root_incarnation, tool, version, and outputs."
+        )
     if data["version"] != _MANIFEST_VERSION or type(data["version"]) is not int:
         raise ActionManifestError(
             f"Unsupported action manifest version; expected {_MANIFEST_VERSION}."
@@ -192,6 +211,26 @@ def _read_manifest(state_dir: Path, tool: str, root_digest: str) -> tuple[bool, 
         raise ActionManifestError("Action manifest tool identity does not match this action.")
     if data["root"] != root_digest or not isinstance(data["root"], str):
         raise ActionManifestError("Action manifest root identity does not match this action.")
+    recorded_incarnation = data["root_incarnation"]
+    if recorded_incarnation is not None and (
+        not isinstance(recorded_incarnation, list)
+        or len(recorded_incarnation) != 2
+        or any(type(item) is not int for item in recorded_incarnation)
+    ):
+        raise ActionManifestError("Action manifest root incarnation is malformed.")
+    current_incarnation = _root_incarnation(root)
+    if (
+        recorded_incarnation is not None
+        and current_incarnation is not None
+        and recorded_incarnation != current_incarnation
+    ):
+        # The root was deleted and recreated at this path. The recorded claims
+        # name files in a directory that no longer exists, so they are void
+        # and the current directory is adopted fresh, deleting nothing.
+        # Detection is best-effort -- a filesystem can hand the recreated
+        # directory its old inode straight back -- which is why deletion is
+        # additionally digest-verified where the claims are consumed.
+        return True, {}
     raw_outputs = data["outputs"]
     if not isinstance(raw_outputs, dict):
         raise ActionManifestError("Action manifest outputs must be an object.")
@@ -221,10 +260,12 @@ def _write_manifest(
     state_dir: Path,
     tool: str,
     root_digest: str,
+    root: Path,
     outputs: Mapping[str, str],
 ) -> None:
     payload = {
         "root": root_digest,
+        "root_incarnation": _root_incarnation(root),
         "tool": tool,
         "version": _MANIFEST_VERSION,
         "outputs": dict(sorted(outputs.items())),
@@ -490,7 +531,7 @@ class Action:
         dry_run: bool,
     ) -> ReconcileResult:
         root_identity = _manifest_root_digest(root)
-        manifest_exists, previous = _read_manifest(state_dir, self.tool, root_identity)
+        manifest_exists, previous = _read_manifest(state_dir, self.tool, root_identity, root)
         _validate_path_set(desired, source="owned output")
 
         # A ledger entry that conflicts with the new desired layout is just an
@@ -540,6 +581,7 @@ class Action:
                     )
 
         targets: dict[str, tuple[Path, os.stat_result | None]] = {}
+        orphan_owned: dict[str, bool] = {}
         for relative in previous_only:
             if _orphan_cannot_exist(root, relative):
                 # A run that stopped before publishing its ledger left a file
@@ -563,13 +605,43 @@ class Action:
             if metadata is not None and not stat.S_ISREG(metadata.st_mode):
                 raise ActionPathError(f"Owned output target is not a regular file: {relative!r}")
             targets[relative] = (target, metadata)
+            if metadata is not None:
+                # An orphan is this action's to delete only while it still
+                # carries the exact bytes the ledger recorded. Byte comparison
+                # decides ownership because nothing stat-shaped can: a
+                # recreated directory can reuse its inode, and a drifted file
+                # is the user's now either way.
+                try:
+                    current = read_regular_file(target)
+                except UnsafeFilesystemPathError as error:
+                    raise ActionPathError(str(error)) from error
+                orphan_owned[relative] = (
+                    current is not None and _content_hash(current) == previous[relative]
+                )
 
         orphan_file_paths = {
             relative for relative in previous_only if targets[relative][1] is not None
         }
+        deletable_orphans = {
+            relative for relative in orphan_file_paths if orphan_owned.get(relative, False)
+        }
 
         for relative in sorted(desired):
-            if any(ancestor in orphan_file_paths for ancestor in _ancestors(relative)):
+            blocking_orphans = [
+                ancestor for ancestor in _ancestors(relative) if ancestor in orphan_file_paths
+            ]
+            if blocking_orphans:
+                drifted = [
+                    ancestor for ancestor in blocking_orphans if ancestor not in deletable_orphans
+                ]
+                if drifted:
+                    # The parent path is an orphan whose bytes drifted from the
+                    # ledger: it is not this action's to delete, and the write
+                    # beneath it cannot proceed without destroying it.
+                    raise ActionPathError(
+                        f"Cannot publish {relative!r}: its parent {drifted[0]!r} no longer "
+                        "carries the bytes this action's ledger recorded."
+                    )
                 # An orphan file from the previous layout occupies exactly this
                 # parent path; a mere casefold twin of a parent frees nothing
                 # when it is deleted, so it does not lift validation. The
@@ -599,7 +671,7 @@ class Action:
             target, metadata = _safe_target(root, relative)
             if metadata is None or not stat.S_ISDIR(metadata.st_mode):
                 continue
-            blocking = _unprunable_entry(target, relative, orphan_file_paths, prune_map)
+            blocking = _unprunable_entry(target, relative, deletable_orphans, prune_map)
             if blocking is not None:
                 raise ActionPathError(
                     f"Cannot prune directory {relative!r} left by the previous layout: "
@@ -635,7 +707,7 @@ class Action:
         delete_paths: list[str] = []
         for relative in previous_only:
             _, metadata = targets[relative]
-            if metadata is not None:
+            if metadata is not None and relative in deletable_orphans:
                 deleted.append(relative)
                 delete_paths.append(relative)
 
@@ -653,6 +725,12 @@ class Action:
                         f"Refusing to delete a non-regular owned target: {relative!r}"
                     )
                 try:
+                    # Ownership is re-verified against the recorded bytes at
+                    # the last moment, the same way the stat is: a file that
+                    # changed since preflight is not this action's anymore.
+                    current = read_regular_file(target)
+                    if current is None or _content_hash(current) != previous[relative]:
+                        continue
                     unlink_regular_file(target)
                 except UnsafeFilesystemPathError as error:
                     raise ActionPathError(str(error)) from error
@@ -681,7 +759,7 @@ class Action:
                 _atomic_write(target, desired[relative])
 
             if desired_hashes != previous or (desired_hashes and not manifest_exists):
-                _write_manifest(state_dir, self.tool, root_identity, desired_hashes)
+                _write_manifest(state_dir, self.tool, root_identity, root, desired_hashes)
 
         return ReconcileResult(
             created=tuple(created),

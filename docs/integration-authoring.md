@@ -81,7 +81,7 @@ intercepts `open()`, `os.getenv`, `os.listdir`, `os.scandir`, and `Path.iterdir`
 query execution and raises `UntrackedReadError` otherwise.
 
 **Built-in resources:** `FileResource`, `BinaryFileResource`, `FileStatResource`,
-`EnvResource`, and `DirectoryResource` cover common cases.
+`EnvResource`, `DirectoryResource`, and `ResolvedPathResource` cover common cases.
 
 **Custom resources:** When built-in resources do not fit, define a custom resource as a
 frozen dataclass implementing the public `Resource[KeyT, ValueT, ProbeT]` hooks:
@@ -117,10 +117,13 @@ Optimistic reuse risks from-scratch inconsistency. Reference:
 `_resolve_workspace_module` returns `"ambiguous"` when multiple paths match a module
 prefix.
 
-**Mark unsupported cases as untracked.** When static analysis hits a pattern it cannot
-handle deterministically, call `db.report_untracked_read(reason)`. This forces
-re-execution on every request but preserves correctness. Reference:
-`module_export_surface` marks dynamic `__all__` as untracked.
+**Mark unsupported cases as untracked.** When a query depends on state the
+guard cannot intercept — dynamic behavior, time, randomness, network state,
+subprocess output — call `db.report_untracked_read(reason)`. Be clear about
+what that buys: it does not make the read deterministic or tracked, it
+prevents reuse. The node re-executes on every request and never backdates, so
+stale reuse cannot happen; the read itself stays as nondeterministic as it
+was. Reference: `module_export_surface` marks dynamic `__all__` as untracked.
 
 **Why?** From-scratch consistency is the kernel's primary guarantee. Re-execution is
 always safe; stale reuse is never safe. An integration that guesses wrong about reuse
@@ -152,10 +155,14 @@ result.
 When your integration traverses directory trees or recursive structures:
 
 - Track a `visited` set of canonical (resolved) paths.
-- Use `Path.resolve()` to canonicalize before comparing.
+- Canonicalize through `ResolvedPathResource`, never through a raw
+  `Path.resolve()`: resolution is an ambient read the guard cannot intercept
+  (kernel contract, limitation 1), so an untracked call records no dependency
+  edge and a retargeted symlink leaves warm containment and visited-set
+  decisions stale while a fresh database recomputes them.
 - Check root containment before recursing to prevent escaping the workspace.
-- Reference: `_collect_python_files` uses `visited_directories`, `_canonical_path`,
-  and `_is_within_root` for safe traversal.
+- Reference: `_collect_python_files` uses `visited_directories`, a tracked
+  resolution read, and `_is_within_root` for safe traversal.
 
 ## Stable API Surface
 

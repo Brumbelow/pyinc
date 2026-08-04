@@ -13,7 +13,7 @@ from pyinc._python_lexing import identifier_tokens
 from pyinc.core import query
 from pyinc.integrations.deep_module_resolution import resolve_module_location
 from pyinc.integrations.installed_packages import environment_index
-from pyinc.resources import DirectoryResource
+from pyinc.resources import DirectoryResource, ResolvedPathResource
 from pyinc.runtime import Database
 
 from ._decoding import decoded, once_per_request
@@ -195,6 +195,7 @@ def _decode_python_source(data: bytes, path: str) -> SourceTextPayload:
 
 _FILES = _SourceTextResource()
 _DIRECTORIES = DirectoryResource()
+_RESOLVED = ResolvedPathResource()
 _AST_TYPE_ALIAS = getattr(ast, "TypeAlias", None)
 
 
@@ -204,10 +205,6 @@ def _is_type_alias(node: ast.AST) -> bool:
 
 def _normalize_path(path: str | os.PathLike[str]) -> str:
     return os.fspath(path)
-
-
-def _canonical_path(path: str) -> str:
-    return str(Path(path).resolve(strict=False))
 
 
 def _is_within_root(path: str, root: str) -> bool:
@@ -611,8 +608,10 @@ def _collect_python_files(
     base = Path(directory)
     for name in entries:
         child = str(base / name)
-        canonical_child = _canonical_path(child)
-        if not _is_within_root(canonical_child, canonical_root):
+        # Resolution is a tracked read: retargeting a symlink changes which
+        # listing is in-root, so it has to invalidate this walk.
+        canonical_child = _RESOLVED.read(db, child)
+        if canonical_child is None or not _is_within_root(canonical_child, canonical_root):
             continue
         try:
             child_entries = _DIRECTORIES.read(db, child)
@@ -832,7 +831,9 @@ def workspace_python_files(db: Database, root: str) -> tuple[str, ...]:
         entries = _DIRECTORIES.read(db, root)
     except NotADirectoryError:
         return tuple()
-    canonical_root = _canonical_path(root)
+    canonical_root = _RESOLVED.read(db, root)
+    if canonical_root is None:
+        return tuple()
     files = _collect_python_files(
         db,
         root,

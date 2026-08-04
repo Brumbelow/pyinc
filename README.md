@@ -6,6 +6,8 @@
 [![PyPI license](https://img.shields.io/pypi/l/pyinc)](https://pypi.org/project/pyinc/)
 [![Lint: Ruff](https://img.shields.io/badge/lint-Ruff-D7FF64.svg)](https://docs.astral.sh/ruff/)
 
+*Salsa-style red-green queries, hardened for Python's mutable runtime.*
+
 `pyinc` is a correctness-first incremental query engine for Python. Declare
 keyed inputs and pure queries, and it records the dependency graph while your
 code runs. On the next request it reuses unaffected work, recomputes affected
@@ -21,18 +23,26 @@ python -m pip install pyinc
 
 ## Why pyinc exists
 
-Python has had no standard, native engine for this. Without that piece, authors
-of Python tools have usually had to choose between two painful options:
+`pyinc` applies the established red-green incremental query model — the
+[Salsa](https://salsa-rs.github.io/salsa/) lineage that rust-analyzer is built
+on — to Python. The model is not new, and incremental recomputation for Python
+has a history of its own:
+[IncPy](https://www.usenix.org/conference/tapp-10/towards-practical-incremental-recomputation-scientists-implementation-python)
+explored it in 2010, [Adapton](https://matthewhammer.org/adapton/) listed a
+Python implementation, and libraries such as
+[Loman](https://pypi.org/project/loman/), [Darl](https://pypi.org/project/darl/),
+and [Cascade Query](https://github.com/hmatt1/cascade-query) each cover parts
+of this ground.
 
-- Build a caching layer from scratch, and inherit the cache-invalidation bugs
-  that come with it — the editor still underlining an error you fixed a minute
-  ago.
-- Leave Python for Rust or C++ to get the performance. That is broadly what
-  happened to linting: `ruff`, written in Rust, displaced the established
-  Python-implemented linters rather than any of them being made fast enough in
-  place.
-
-That is, until pyinc. [The FAQ](https://github.com/Brumbelow/pyinc/blob/main/docs/faq.md)
+What `pyinc` adds is a soundness envelope for Python's mutable runtime, built
+so the cache-invalidation bugs that usually come with a hand-rolled caching
+layer — the editor still underlining an error you fixed a minute ago — have
+somewhere to be caught: deep owned snapshots including shared and cyclic
+graphs, guarded ambient reads with explicit resources, implementation-aware
+query and resource identities, integrity-checked durable checkpoints,
+declared-output reconciliation, and warm-versus-fresh differential testing
+behind a documented consistency contract.
+[The FAQ](https://github.com/Brumbelow/pyinc/blob/main/docs/faq.md)
 covers how it compares with Salsa and with `functools.lru_cache`.
 
 ## Quick start
@@ -72,16 +82,17 @@ action.
 ![Editing pytest under pyinc's watcher](https://raw.githubusercontent.com/Brumbelow/pyinc/main/docs/assets/demo.gif)
 
 `pyinc-tools` was pointed at a pinned checkout of pytest — nothing in it adapted
-for `pyinc` — and watched while single files were edited: 109.08 s to analyze
-all 270 files from cold, then 632 ms to catch up after an edit.
-[The demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) has
-the clips and reads the rest of the numbers.
+for `pyinc` — and watched while single files were edited: in a single recorded
+run, 109.08 s to analyze all 270 files from cold, then 632 ms to catch up after
+an edit. Timings are machine-specific;
+[the demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) has
+the clips, the full provenance, and the deterministic work counts.
 
 ## Correctness contract
 
 `pyinc` guarantees **from-scratch consistency**: incremental evaluation matches
-a fresh evaluation on the same declared inputs and resources. That guarantee
-holds only when all three conditions hold:
+a fresh evaluation on the same declared inputs and resources. The guarantee is
+made provided three conditions hold; outside them, no guarantee is made:
 
 1. **Owned value boundaries.** Query arguments, query results, and `Input`
    values are snapshot-safe or handled by a registered `ValueAdapter`.
@@ -89,7 +100,9 @@ holds only when all three conditions hold:
    `Resource`; reads the guard cannot intercept are declared with
    `db.report_untracked_read(reason)`.
 3. **Deterministic queries.** The same tracked dependencies produce a
-   semantically equal result.
+   semantically equal result, and custom `eq=`/`cutoff=` policies are
+   substitutive for dependents — a coarser policy narrows the guarantee to
+   consistency modulo the equivalence it declares.
 
 The [kernel contract](https://github.com/Brumbelow/pyinc/blob/main/docs/kernel-contract.md)
 defines the exact value rules, intercepted operations, execution modes, durable
