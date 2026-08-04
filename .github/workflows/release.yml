@@ -31,7 +31,7 @@ jobs:
       contents: read
     env:
       EXPECTED_FINGERPRINT: 2B6DF408BD973740052925DC894C75E1B1D05EA2
-      TRUSTED_BASELINE: 0372825d689ef4c3fda98f3c86c1c20d417360be
+      TRUSTED_BASELINE: 8db85ec7a647bd7b74bf04f07e94a9bd78675193
     steps:
       - name: Check out the tagged revision
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

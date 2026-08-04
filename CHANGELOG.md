@@ -6,6 +6,112 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.1.1] - 2026-08-03
+
+### Highlights
+
+- Marker comparisons evaluate the way `packaging` does, clause for clause: a
+  version comparison only where packaging makes one, its fallback table
+  everywhere else. Comparing a non-version variable by Python string ordering
+  is gone.
+- Lock acquisition retries a transient lock-file open within the caller's
+  deadline, so a concurrent holder on Windows no longer fails the acquire
+  outright.
+- A cycle of aliases spanning definitions is an `alias-cycle` error that
+  blocks generation, instead of modules whose aliases resolve to no type.
+- The integrations decode memo is keyed per `Database`, so a dropped database
+  releases the payloads it pinned.
+- Contributor, security, and release-verification documentation, a comparison
+  FAQ, and issue templates.
+
+### Changed
+
+- An `enum` beside a declared `type` the generator cannot use reports
+  `unsupported-enum-type` once, instead of that error plus one
+  `enum-type-mismatch` per member for a type no member could ever match.
+  Members are still checked against a usable declared type.
+- The test suite runs in parallel on CI (`pytest -n auto --dist load`, for the
+  suite and the coverage run), with `pytest-xdist>=3.6` added to the `dev`
+  extra. A serial `pytest` is unchanged and stays the local release gate.
+- The `dev` extra requires `packaging>=26.2`, the release the specifier and
+  marker parity tests compare against.
+- Project metadata declares `Operating System :: OS Independent`,
+  `Typing :: Typed`, and a `Changelog` URL.
+
+### Fixed
+
+- Marker comparisons match `packaging`'s evaluation exactly. A version
+  comparison is made only for `python_version`, `python_full_version`,
+  `implementation_version`, and `platform_release`; the specifier is always
+  built from the operator and the right-hand side, and the left-hand side is
+  the version tested against it, so a literal on the left is no longer
+  compensated for by inverting the operator. When the clause is not a valid
+  specifier, packaging's fallback table decides: `<` and `>` are false, `<=`,
+  `>=`, and `==` are string equality, `!=` is string inequality, and `~=` has
+  no entry — it evaluates false under the new `undefined-marker-comparison`
+  diagnostic. Every other variable therefore falls to that table rather than
+  to Python string ordering, so `platform_machine > "arm"` is false instead of
+  an ordering test, and `platform_release == "6.5.0-28-generic"` is string
+  equality instead of a failed version parse. An environment value that does
+  not parse under an otherwise valid specifier evaluates false and reports
+  `unparseable-version`.
+- A wildcard specifier whose base carries a pre-release, post-release, dev, or
+  local segment (`==1.0rc1.*`, `==1.0.post1.*`, `==1.0.dev1.*`, `==1.0+abc.*`)
+  is rejected as invalid, as is a wildcard under an ordered operator
+  (`>=1.0.*`), matching packaging's specifier grammar. Such clauses previously
+  parsed and prefix-matched, so a requirement carrying one is now reported as
+  unevaluatable rather than quietly satisfied.
+- Lock acquisition retries a lock-file open that fails transiently, until the
+  same deadline the contention loop uses: a sharing violation, or
+  access-denied while the lock path is still a regular file or missing — the
+  shapes a concurrent holder or a file scanner produces on Windows. The open
+  previously happened once, before the deadline was even computed, so that
+  contention raised out of the acquire. Every other open failure still raises
+  unchanged, including access-denied at a path that is a directory or other
+  special file, and an exhausted deadline surfaces as the same typed lock
+  error contention already produced — `ArtifactStoreLockError` from the store,
+  `ActionLockTimeoutError` from an action.
+- A cycle of pure aliases spanning definitions — `{"A": {"$ref": "#/$defs/B"},
+  "B": {"$ref": "#/$defs/A"}}` — reports the blocking `alias-cycle` error on
+  every member, naming the cycle in definition order (`A -> B -> A`). It
+  previously generated one module per member, each aliasing the next, closing
+  an import loop that resolved to no type at all. A container or object field
+  anywhere in the loop still breaks it and keeps compiling; the
+  single-definition case remains `self-referential-alias`.
+- The integrations decode memo is keyed per `Database` through a weak
+  reference, so a dropped database releases every payload and decoded value it
+  pinned instead of holding them in one process-wide cache until the entry
+  bound cleared the whole thing. The bound now applies per database.
+
+### Documentation
+
+- `CONTRIBUTING.md` covers development setup, what CI checks, the
+  architectural boundaries, adding an integration, benchmarks, and the commit
+  and release rules — moved out of `AGENTS.md`, which is no longer the only
+  place they were written down.
+- `SECURITY.md` states the supported versions, how to report a vulnerability
+  or a soundness violation, what is in scope, and how release integrity is
+  established.
+- `docs/releases.md` documents what the release workflow verifies, what
+  happens after publication, and how to verify a downloaded artifact yourself.
+- `docs/faq.md` compares pyinc with Salsa and Adapton and with
+  `functools.lru_cache`, states the overhead, covers the GIL and
+  free-threaded builds, and says when not to use it. The README gains a
+  section on why pyinc exists that points at it.
+- The README and demo page state the demo's numbers in prose: 109.08 s to
+  analyze all 270 files of a pinned pytest checkout from cold, then 632 ms to
+  catch up after one edit.
+- Issue templates for bug reports, feature requests, and soundness reports.
+- The integration contract states the notebook surrogate-scanning boundary:
+  cell sources, cell types, and kernel metadata are scanned because they reach
+  the cached payload, while outputs and per-execution metadata never do — so a
+  notebook whose outputs hold a lone surrogate stays fully analyzable, and one
+  whose sources do is a decode error rather than a partial analysis.
+- The architecture, kernel-contract, and migration documents say checkpoint
+  manifest v5 where three of them still said v4, and `scripts/check_docs.py`
+  now pins every manifest-version statement in the contracts to the value the
+  runtime writes.
+
 ## [3.1.0] - 2026-08-03
 
 ### Highlights
@@ -1918,3 +2024,4 @@ The first stable v1 release.
 [3.0.0rc1]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0rc1
 [3.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0
 [3.1.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.1.0
+[3.1.1]: https://github.com/Brumbelow/pyinc/releases/tag/v3.1.1
