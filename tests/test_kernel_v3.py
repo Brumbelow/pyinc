@@ -357,6 +357,66 @@ def test_query_identity_includes_defaults_and_keyword_defaults() -> None:
     assert db._query_key(first, (), {})[0].identity != db._query_key(second, (), {})[0].identity
 
 
+def test_live_kwdefault_mutation_changes_query_identity_between_requests() -> None:
+    @query(key="live-kwdefault-mutation")
+    def answer(db: Database, *, value: int = 1) -> int:
+        return value
+
+    db = Database()
+    assert db.get(answer) == 1
+
+    answer.fn.__kwdefaults__["value"] = 2
+    try:
+        fresh = Database()
+        assert fresh.get(answer) == 2
+        assert db.get(answer) == 2
+    finally:
+        answer.fn.__kwdefaults__["value"] = 1
+
+
+def test_live_closure_cell_rebinding_changes_query_identity_between_requests() -> None:
+    def make_query() -> tuple[Query[[], int], Any]:
+        value = 1
+
+        def rebind(new: int) -> None:
+            nonlocal value
+            value = new
+
+        @query(key="live-closure-rebinding")
+        def read_value(db: Database) -> int:
+            return value
+
+        return read_value, rebind
+
+    read_value, rebind = make_query()
+    db = Database()
+    assert db.get(read_value) == 1
+
+    rebind(2)
+    fresh = Database()
+    assert fresh.get(read_value) == 2
+    assert db.get(read_value) == 2
+
+
+def test_live_captured_global_rebinding_changes_query_identity_between_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "_LIVE_GLOBAL_CAPTURE", 1, raising=False)
+
+    @query(key="live-global-rebinding")
+    def read_global(db: Database) -> int:
+        return _LIVE_GLOBAL_CAPTURE  # type: ignore[name-defined]  # noqa: F821
+
+    db = Database()
+    assert db.get(read_global) == 1
+
+    monkeypatch.setattr(module, "_LIVE_GLOBAL_CAPTURE", 2, raising=False)
+    fresh = Database()
+    assert fresh.get(read_global) == 2
+    assert db.get(read_global) == 2
+
+
 def test_query_identity_includes_transitively_captured_functions() -> None:
     def make_helper(offset: int) -> Any:
         def helper() -> int:

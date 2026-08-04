@@ -96,6 +96,8 @@ _CHECKPOINT_MANIFEST_VERSION = 5
 _KERNEL_FINGERPRINT_VERSION = 2
 _DEFAULT_SEMANTIC_EQUALITY_VERSION = 1
 _MISSING_SNAPSHOT = object()
+_EMPTY_CELL_OBSERVATION = object()
+_UNBOUND_GLOBAL_OBSERVATION = object()
 
 
 def _build_runtime_build_payload() -> tuple[Any, ...]:
@@ -3073,7 +3075,7 @@ class Database:
         if (
             cached is not None
             and cached[0] == runtime_build
-            and cached[1] == definition_observation
+            and self._definition_observation_matches(cached[1], definition_observation)
             and all(
                 self._module_observation_stamp(module) == expected for module, expected in cached[3]
             )
@@ -3113,17 +3115,86 @@ class Database:
 
     @staticmethod
     def _query_definition_observation(query: Any) -> Any:
-        function = query.fn
+        """Observe the live query definition for memoized-fingerprint reuse.
+
+        The observation records object *references* — per entry, not per
+        container, because a `__kwdefaults__` dict or a closure cell mutated in
+        place keeps its identity while changing the definition. Storing the
+        references in the memo pins their addresses, so identity comparison is
+        collision-free: any rebinding introduces an object that cannot be
+        identical to a still-pinned one, and a spurious mismatch only costs a
+        fingerprint recompute. The traversal mirrors what
+        `_function_definition_payload` folds into the fingerprint; modules stay
+        leaves because `_module_observation_stamp` covers their content.
+        """
+        from .core import Input, Query
+
+        seen: builtins.set[int] = set()
+
+        def observe_value(value: Any) -> Any:
+            if isinstance(value, Query):
+                return (value.key, observe_value(value.eq), observe_value(value.cutoff),
+                        observe_value(value.fn))
+            if isinstance(value, Input):
+                return (value.key, observe_value(value.eq), observe_value(value.cutoff))
+            if isinstance(value, FunctionType):
+                return observe_function(value)
+            return value
+
+        def observe_function(fn: FunctionType) -> Any:
+            if id(fn) in seen:
+                return fn
+            seen.add(id(fn))
+            code = fn.__code__
+            fn_globals = fn.__globals__
+            return (
+                fn,
+                code,
+                fn.__defaults__,
+                tuple(observe_value(value) for value in fn.__defaults__ or ()),
+                fn.__kwdefaults__,
+                tuple(
+                    (name, observe_value(value))
+                    for name, value in sorted((fn.__kwdefaults__ or {}).items())
+                ),
+                tuple(
+                    (cell, observe_cell(cell)) for cell in fn.__closure__ or ()
+                ),
+                tuple(
+                    (name, observe_value(fn_globals[name]))
+                    if name in fn_globals
+                    else (name, _UNBOUND_GLOBAL_OBSERVATION)
+                    for name in sorted(set(code.co_names))
+                ),
+                tuple((name, observe_value(value)) for name, value in sorted(vars(fn).items())),
+            )
+
+        def observe_cell(cell: Any) -> Any:
+            try:
+                contents = cell.cell_contents
+            except ValueError:
+                return _EMPTY_CELL_OBSERVATION
+            return observe_value(contents)
+
         return (
             query.key,
-            id(function),
-            id(function.__code__),
-            id(function.__defaults__),
-            id(function.__kwdefaults__),
-            tuple((name, id(value)) for name, value in sorted(vars(function).items())),
-            id(query.eq),
-            id(query.cutoff),
+            observe_value(query.eq),
+            observe_value(query.cutoff),
+            observe_function(query.fn),
         )
+
+    @classmethod
+    def _definition_observation_matches(cls, expected: Any, current: Any) -> bool:
+        """Compare observations by identity at the leaves, never by equality."""
+
+        if expected is current:
+            return True
+        if type(expected) is tuple and type(current) is tuple:
+            return len(expected) == len(current) and all(
+                cls._definition_observation_matches(old, new)
+                for old, new in zip(expected, current)
+            )
+        return False
 
     def _code_fingerprint(self, fn: FunctionType) -> str:
         payload = (
