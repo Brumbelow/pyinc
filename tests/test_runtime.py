@@ -2058,6 +2058,44 @@ def test_external_alias_mutation_after_boundary_crossing() -> None:
     assert db.get(echo) == {"key": [1, 2, 3]}
 
 
+def test_strict_boundary_views_are_detached_from_the_stored_snapshot() -> None:
+    numbers = Input[tuple[int, ...]]("strict-detach.numbers")
+
+    @query
+    def listed(db: Database) -> list[int]:
+        return list(numbers.read(db))
+
+    db = Database(mode="strict")
+    db.set(numbers, (1, 2))
+    view = db.get(listed)
+
+    # Frozen dataclass setters refuse plain writes, but object.__setattr__
+    # bypasses them; a view aliasing the stored snapshot would then corrupt it.
+    object.__setattr__(view, "items", (99,))
+
+    assert tuple(db.get(listed)) == (1, 2)
+    fresh = Database(mode="strict")
+    fresh.set(numbers, (1, 2))
+    assert tuple(db.get(listed)) == tuple(fresh.get(listed))
+
+
+def test_strict_boundary_views_detach_nested_shells_too() -> None:
+    payload = Input[list[Any]]("strict-detach.nested")
+
+    @query
+    def echoed(db: Database) -> list[Any]:
+        return list(payload.read(db))
+
+    db = Database(mode="strict")
+    db.set(payload, [{"key": 1}])
+    view = db.get(echoed)
+
+    inner = view[0]
+    object.__setattr__(inner, "entries", (("key", 99),))
+
+    assert dict(db.get(echoed)[0]) == {"key": 1}
+
+
 @pytest.mark.parametrize("mode", ["strict", "checked"])
 def test_deeply_nested_mutation_detection(mode: str) -> None:
     payload = Input[dict[str, Any]]("nested")

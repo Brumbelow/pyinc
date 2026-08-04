@@ -2921,12 +2921,19 @@ class Database:
             return all(type(key) is str for key, _value in envelope[1].entries)
         return all(type(key) is str for key in envelope[1])
 
-    @staticmethod
-    def _strict_snapshot_view(snapshot: Any) -> Any:
-        """Expose a graph snapshot through immutable container interfaces."""
+    @classmethod
+    def _strict_snapshot_view(cls, snapshot: Any) -> Any:
+        """Expose a snapshot through rebuilt immutable container interfaces.
+
+        Every `Frozen*` shell is rebuilt, graph or not: frozen dataclass
+        setters refuse plain writes, but `object.__setattr__` bypasses them,
+        so a view aliasing the stored snapshot would let a caller corrupt the
+        record it came from. Leaf values and all-leaf tuples are shared —
+        nothing reflective can rebind their contents.
+        """
 
         if type(snapshot) is not FrozenGraph:
-            return snapshot
+            return cls._detached_snapshot_view(snapshot)
 
         shells: list[Any] = []
         for node in snapshot.nodes:
@@ -2981,6 +2988,33 @@ class Database:
                     tuple((key, resolve(item)) for key, item in node.entries),
                 )
         return resolve(snapshot.root)
+
+    @classmethod
+    def _detached_snapshot_view(cls, value: Any) -> Any:
+        detach = cls._detached_snapshot_view
+        if type(value) is FrozenList:
+            return FrozenList(tuple(detach(item) for item in value.items))
+        if type(value) is FrozenDict:
+            return FrozenDict(
+                tuple((detach(key), detach(item)) for key, item in value.entries)
+            )
+        if type(value) is FrozenSet:
+            return FrozenSet(value.kind, tuple(detach(item) for item in value.items))
+        if type(value) is FrozenRecord:
+            return FrozenRecord(
+                value.type_name,
+                tuple((key, detach(item)) for key, item in value.entries),
+            )
+        if type(value) is FrozenAdapterValue:
+            return FrozenAdapterValue(value.adapter_key, detach(value.payload))
+        if type(value) is FrozenGraph:
+            return cls._strict_snapshot_view(value)
+        if type(value) is tuple:
+            detached = tuple(detach(item) for item in value)
+            if all(item is original for item, original in zip(detached, value)):
+                return value
+            return detached
+        return value
 
     def _expose_snapshot(
         self,
