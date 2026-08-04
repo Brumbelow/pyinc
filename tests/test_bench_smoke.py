@@ -200,5 +200,5 @@ def test_authoritative_work_gate_checks_removal_backdates_and_resource_loads() -
         and row.engine == "pyinc"
     )
     results[index] = replace(results[index], query_backdates=0, resource_loads=2)
-    with pytest.raises(AssertionError, match="query_backdates expected 6"):
+    with pytest.raises(AssertionError, match="query_backdates expected 7"):
         harness.validate_repetition(results)
