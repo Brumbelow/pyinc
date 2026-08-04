@@ -357,6 +357,32 @@ def test_query_identity_includes_defaults_and_keyword_defaults() -> None:
     assert db._query_key(first, (), {})[0].identity != db._query_key(second, (), {})[0].identity
 
 
+def test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative() -> None:
+    """Pins the documented shape of consistency under a coarse policy.
+
+    A cutoff that declares two values unchanged makes dependents consistent
+    modulo that equivalence: they legitimately stay at results computed from
+    the earlier representative, while a fresh database starts from the later
+    one. Exact-value agreement requires a substitutive policy (condition 3).
+    """
+    coarse = Input[int]("congruence.value", cutoff=lambda _value: 0)
+
+    @query
+    def doubled(db: Database) -> int:
+        return coarse.read(db) * 2
+
+    db = Database(mode="checked")
+    db.set(coarse, 1)
+    assert db.get(doubled) == 2
+
+    db.set(coarse, 2)
+    assert db.get(doubled) == 2
+
+    fresh = Database(mode="checked")
+    fresh.set(coarse, 2)
+    assert fresh.get(doubled) == 4
+
+
 def test_live_kwdefault_mutation_changes_query_identity_between_requests() -> None:
     @query(key="live-kwdefault-mutation")
     def answer(db: Database, *, value: int = 1) -> int:

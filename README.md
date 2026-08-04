@@ -80,8 +80,8 @@ the clips and reads the rest of the numbers.
 ## Correctness contract
 
 `pyinc` guarantees **from-scratch consistency**: incremental evaluation matches
-a fresh evaluation on the same declared inputs and resources. That guarantee
-holds only when all three conditions hold:
+a fresh evaluation on the same declared inputs and resources. The guarantee is
+made provided three conditions hold; outside them, no guarantee is made:
 
 1. **Owned value boundaries.** Query arguments, query results, and `Input`
    values are snapshot-safe or handled by a registered `ValueAdapter`.
@@ -89,7 +89,9 @@ holds only when all three conditions hold:
    `Resource`; reads the guard cannot intercept are declared with
    `db.report_untracked_read(reason)`.
 3. **Deterministic queries.** The same tracked dependencies produce a
-   semantically equal result.
+   semantically equal result, and custom `eq=`/`cutoff=` policies are
+   substitutive for dependents — a coarser policy narrows the guarantee to
+   consistency modulo the equivalence it declares.
 
 The [kernel contract](https://github.com/Brumbelow/pyinc/blob/main/docs/kernel-contract.md)
 defines the exact value rules, intercepted operations, execution modes, durable

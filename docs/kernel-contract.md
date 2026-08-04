@@ -8,7 +8,8 @@ guarantee holds; it is the stable semver contract for `src/pyinc`.
 
 pyinc guarantees **from-scratch consistency** — the result of incremental
 evaluation matches a fresh evaluation on the same declared inputs and resources —
-when and only when the three conditions below hold.
+provided the three conditions below hold. Outside those conditions no
+guarantee is made.
 
 When a recomputed value is semantically equal to the previously stored value,
 the record is **backdated** (also called **early cutoff**): its `changed_at`
@@ -95,6 +96,15 @@ numbers, process state) must either be routed through a Resource or declared via
 `report_untracked_read()`. Query bodies and equality/cutoff policies must have
 fingerprintable implementations and snapshot-safe captures. Dynamically scoped
 local classes are rejected; define stable implementation types at module scope.
+
+Custom `eq=`/`cutoff=` policies must also be **substitutive** for every
+dependent computation: when a policy reports two values unchanged, each
+dependent must produce a semantically equal result from either value. A
+coarser policy is permitted, but the guarantee it buys is correspondingly
+coarser — backdating keeps dependents at results computed from the earlier
+representative, so from-scratch consistency then holds *modulo the declared
+equivalence* rather than on exact values.
+(See: `test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative`)
 
 ## Mode-Specific Enforcement
 
@@ -462,11 +472,29 @@ value, or route it through a `Resource`.
   `test_impure_child_prevents_parent_backdating_unless_result_unchanged`)
 
 - **`ValueAdapter`** — allows custom types to participate in freeze/thaw by
-  implementing `freeze` and `thaw`.
+  implementing `freeze` and `thaw`. Adapters extend the condition 1 value
+  boundary, so the boundary's obligations extend to them as laws:
+
+  - **Deterministic, side-effect-free hooks.** `freeze` and `thaw` are pure
+    functions of their arguments; neither reads ambient state. Adapter work
+    at query boundaries runs under the condition 2 guard, so an intercepted
+    read raises `UntrackedReadError` there.
+  - **Owned results.** `freeze` returns a payload sharing no mutable state
+    with the live value; `thaw` returns a value the caller owns outright.
+  - **Semantic round-trip.** For any accepted value, `thaw(freeze(x))` is
+    semantically equal to `x` wherever the adapted type is consumed.
+  - **Pinned adapter state.** Adapter instance configuration is immutable for
+    the registered lifetime; implementations and configuration participate in
+    query and checkpoint identity.
+
+  (See: `test_adapter_freeze_of_a_query_result_runs_under_the_guard`,
+  `test_adapter_thaw_of_query_arguments_runs_under_the_guard`)
 
 - **`eq=` / `cutoff=`** on `Input` and `@query` — allows custom equivalence.
   `eq=` compares thawed values directly; `cutoff=` compares snapshot-safe tokens.
-  These are mutually exclusive. Cutoff tokens must be snapshot-safe.
+  These are mutually exclusive. Cutoff tokens must be snapshot-safe, and the
+  declared equivalence must be substitutive for dependents (condition 3) for
+  the guarantee to hold on exact values.
   (See: `test_input_cutoff_suppresses_equal_updates`,
   `test_query_cutoff_backdates_and_skips_downstream`)
 

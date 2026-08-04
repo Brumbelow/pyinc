@@ -22,6 +22,16 @@ _MAX_SNAPSHOT_DEPTH = 200
 
 
 class ValueAdapter(Protocol):
+    """Makes a foreign type snapshot-safe at the value boundary.
+
+    Adapters extend the kernel's condition 1 boundary and inherit its laws:
+    `freeze` and `thaw` are deterministic, side-effect-free, and read no
+    ambient state (at query boundaries they run under the ambient-read
+    guard); results are owned by the receiver; the round trip preserves
+    semantics; and adapter instance configuration stays immutable for the
+    registered lifetime. See the kernel contract's `ValueAdapter` entry.
+    """
+
     def freeze(self, value: Any, freeze: FreezeFn) -> Any:
         """Convert a live value into a snapshot-safe payload."""
 
