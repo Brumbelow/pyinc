@@ -16,6 +16,7 @@ from typing import (
     overload,
 )
 
+from ._runtime_types import register_core_types
 from .errors import InputKeyError
 from .value import semantic_equal
 
@@ -192,3 +193,6 @@ def query(
     if fn is None:
         return decorate
     return decorate(fn)
+
+
+register_core_types(Input, Query)

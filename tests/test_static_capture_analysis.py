@@ -6,8 +6,6 @@ from pyinc import Database, InMemoryArtifactStore, explain_query_captures, query
 
 Mode = str
 
-_DYNAMIC_NAMESPACE_STATE: dict[str, int] = {"value": 0}
-
 
 @query(key="contract.dynamic-namespace-read")
 def _dynamic_namespace_read(db: Database) -> int:

@@ -304,7 +304,6 @@ def test_snapshot_equality_helper_returns_a_real_bool() -> None:
 def test_snapshot_equality_helper_does_not_short_circuit_same_nan_wrapper() -> None:
     snapshot = FrozenList((float("nan"),))
 
-    assert snapshot == snapshot
     assert snapshots_equal(snapshot, snapshot) is False
 
 

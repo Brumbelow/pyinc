@@ -762,6 +762,22 @@ def test_static_capture_covers_supported_scalar_typing_and_container_shapes() ->
     assert capture(_FrozenRuntimeConfig((1, 2)), set())[0] == "frozen-dataclass"
 
 
+@pytest.mark.parametrize(
+    ("value", "expected_kind"),
+    (
+        (float("nan"), "process-local-incarnation"),
+        (complex(float("nan"), 0.0), "process-local-incarnation"),
+        (complex(0.0, float("nan")), "process-local-incarnation"),
+        (1.5, "structural-incarnation"),
+        (1 + 2j, "structural-incarnation"),
+    ),
+)
+def test_definition_object_incarnation_recognizes_real_and_complex_nan(
+    value: float | complex, expected_kind: str
+) -> None:
+    assert Database._definition_object_incarnation(value)[0] == expected_kind
+
+
 def test_static_capture_rejects_mutable_slotted_cyclic_and_invalid_state() -> None:
     db = Database()
     with pytest.raises(UnsupportedValueError, match="Mutable dataclass"):

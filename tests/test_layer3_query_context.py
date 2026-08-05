@@ -8,6 +8,7 @@ from typing import Any, NoReturn, cast
 import pytest
 
 import pyinc.integrations as integration_api
+import pyinc.integrations._decoding as _decoding
 import pyinc.integrations.csv_data as csv_data
 import pyinc.integrations.deep_module_resolution as deep_module_resolution
 import pyinc.integrations.dependency_check as dependency_check
@@ -23,7 +24,6 @@ import pyinc.integrations.symbol_resolution as symbol_resolution
 import pyinc.integrations.toml_config as toml_config
 import pyinc.integrations.xml_config as xml_config
 from pyinc import Database, InMemoryArtifactStore, Input, QueryContextError, query
-from pyinc.integrations import _decoding
 
 Mode = str
 Entrypoint = Callable[..., Any]
@@ -203,9 +203,6 @@ class _Hostile:
         return self._fail()
 
 
-_SELECTED_ENTRYPOINT = ""
-_SELECTED_IMPORT_STYLE = ""
-_SELECTED_HOSTILE: _Hostile | None = None
 _CAUGHT_INPUT = Input[int]("layer3-query-context-caught-input")
 
 

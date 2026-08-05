@@ -509,9 +509,9 @@ def _write_markdown(summaries: Sequence[BenchmarkSummary], path: Path) -> None:
             "",
             "Work is `executions/reuses/backdates/resource loads`; graph is `nodes/edges`.",
             "`reuses` is a call-level diagnostic that must repeat exactly across the five "
-            "same-path runs but has no absolute cross-path envelope: absolute path arguments "
-            "can change verification order and repeated already-checked calls without changing "
-            "executions or graph work.",
+            + "same-path runs but has no absolute cross-path envelope: absolute path arguments "
+            + "can change verification order and repeated already-checked calls without changing "
+            + "executions or graph work.",
             "",
             "| target | scenario | engine | median ms | min-max ms | work | graph | fresh |",
             "|---|---|---|---:|---:|---:|---:|:---:|",

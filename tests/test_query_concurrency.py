@@ -27,9 +27,6 @@ from pyinc import (
 )
 
 _THREAD_INPUT = Input[bool]("query-concurrency-enabled")
-_ACTIVE_EXECUTOR_SUBMIT: Callable[..., Any] | None = None
-_ACTIVE_POOL_CALL: Callable[[], Any] | None = None
-_ACTIVE_PROCESS: multiprocessing.process.BaseProcess | None = None
 
 
 def _write_marker(path: str) -> str:
@@ -132,14 +129,12 @@ def test_prewarmed_executor_submit_is_rejected_in_every_mode(
     executor_type: Callable[..., concurrent.futures.Executor],
     tmp_path: Path,
 ) -> None:
-    global _ACTIVE_EXECUTOR_SUBMIT
-
     executor_kwargs: dict[str, Any] = {"max_workers": 1}
     if executor_type is concurrent.futures.ProcessPoolExecutor:
         executor_kwargs["mp_context"] = _process_context()
     with executor_type(**executor_kwargs) as executor:
         assert executor.submit(abs, -1).result(timeout=10) == 1
-        _ACTIVE_EXECUTOR_SUBMIT = executor.submit
+        globals()["_ACTIVE_EXECUTOR_SUBMIT"] = executor.submit
         try:
             for mode in ("strict", "checked", "fast"):
                 marker = tmp_path / f"{executor_type.__name__}-{mode}"
@@ -151,7 +146,7 @@ def test_prewarmed_executor_submit_is_rejected_in_every_mode(
                 assert "Executor.submit" in message
                 assert not marker.exists()
         finally:
-            _ACTIVE_EXECUTOR_SUBMIT = None
+            globals()["_ACTIVE_EXECUTOR_SUBMIT"] = None
 
 
 def _pool_call(pool: multiprocessing.pool.Pool, method_name: str, marker: str) -> Any:
@@ -199,22 +194,22 @@ def test_preexisting_pool_submission_apis_are_rejected(
     method_name: str,
     tmp_path: Path,
 ) -> None:
-    global _ACTIVE_POOL_CALL
-
     context = _process_context()
     pool = context.Pool(1)
     try:
         assert pool.apply(abs, (-1,)) == 1
         for mode in ("strict", "checked", "fast"):
             marker = tmp_path / f"pool-{method_name}-{mode}"
-            _ACTIVE_POOL_CALL = functools.partial(_pool_call, pool, method_name, str(marker))
+            globals()["_ACTIVE_POOL_CALL"] = functools.partial(
+                _pool_call, pool, method_name, str(marker)
+            )
             database = Database(mode=mode)
             error_type, message = _error(functools.partial(database.get, _preexisting_pool_query))
             assert error_type is QueryConcurrencyError
             assert "Pool" in message
             assert not marker.exists()
     finally:
-        _ACTIVE_POOL_CALL = None
+        globals()["_ACTIVE_POOL_CALL"] = None
         pool.close()
         pool.join()
 
@@ -235,14 +230,12 @@ def test_preexisting_multiprocessing_process_cannot_start(
     mode: str,
     tmp_path: Path,
 ) -> None:
-    global _ACTIVE_PROCESS
-
     marker = tmp_path / f"process-{mode}"
     process = cast(Any, _process_context()).Process(
         target=_write_marker,
         args=(str(marker),),
     )
-    _ACTIVE_PROCESS = process
+    globals()["_ACTIVE_PROCESS"] = process
     try:
         error_type, message = _error(lambda: Database(mode=mode).get(_preexisting_process_query))
         assert error_type is QueryConcurrencyError
@@ -250,7 +243,7 @@ def test_preexisting_multiprocessing_process_cannot_start(
         assert process.pid is None
         assert not marker.exists()
     finally:
-        _ACTIVE_PROCESS = None
+        globals()["_ACTIVE_PROCESS"] = None
         process.close()
 
 

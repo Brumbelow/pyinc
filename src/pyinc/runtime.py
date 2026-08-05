@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import _thread
 import builtins
+import cmath
 import concurrent.futures
 import concurrent.futures.process
 import concurrent.futures.thread
@@ -47,6 +48,11 @@ from types import (
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast, overload
 
 from ._path_identity import is_stdlib_path
+from ._runtime_types import (
+    file_stat_public_value,
+    is_exact_input,
+    is_exact_query,
+)
 from .errors import (
     CheckpointIntegrityError,
     CheckpointManifestError,
@@ -89,7 +95,6 @@ from .value import (
 if TYPE_CHECKING:
     import pyinc.core as _core
     import pyinc.resources as _resources
-
 
 Mode = str
 DefaultT = TypeVar("DefaultT")
@@ -1154,9 +1159,7 @@ class Database:
     def set(self, input_key: Any, value: Any) -> None:
         self._reject_resource_hook_read("Database.set()")
         _reject_query_context("Database.set()")
-        from .core import Input
-
-        if type(input_key) is not Input:
+        if not is_exact_input(input_key):
             raise TypeError("db.set() expects an Input instance.")
         with self._state_lock:
             # Registration is part of the commit. A value that cannot cross the
@@ -1214,8 +1217,6 @@ class Database:
     def set_many(self, updates: Iterable[tuple[Any, Any]]) -> None:
         self._reject_resource_hook_read("Database.set_many()")
         _reject_query_context("Database.set_many()")
-        from .core import Input
-
         with self._state_lock:
             # Materialization is part of the transaction boundary: an iterator
             # that fails halfway through cannot leave registrations or counters
@@ -1230,7 +1231,7 @@ class Database:
                     raise TypeError(
                         "db.set_many() expects an iterable of (Input, value) pairs."
                     ) from exc
-                if type(input_key) is not Input:
+                if not is_exact_input(input_key):
                     raise TypeError("db.set_many() expects (Input, value) pairs.")
                 if input_key.key in seen_keys:
                     raise InputKeyError(
@@ -1320,9 +1321,7 @@ class Database:
     def get(self, query: _core.Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
         self._reject_resource_hook_read("Database.get()")
         _reject_cross_database_query_read(self, "Database.get()")
-        from .core import Query
-
-        if type(query) is not Query:
+        if not is_exact_query(query):
             raise TypeError("db.get() expects a @query-decorated callable.")
         with self._state_lock, self._request_scope() as pending:
             key: NodeKey | None = None
@@ -1347,9 +1346,7 @@ class Database:
     def explain(self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> str:
         self._reject_resource_hook_read("Database.explain()")
         _reject_query_context("Database.explain()")
-        from .core import Query
-
-        if type(query) is not Query:
+        if not is_exact_query(query):
             raise TypeError("db.explain() expects a @query-decorated callable.")
         return format_explanation(self.inspect(query, *args, **kwargs))
 
@@ -1358,9 +1355,7 @@ class Database:
     ) -> InspectionNode:
         self._reject_resource_hook_read("Database.inspect()")
         _reject_query_context("Database.inspect()")
-        from .core import Query
-
-        if type(query) is not Query:
+        if not is_exact_query(query):
             raise TypeError("db.inspect() expects a @query-decorated callable.")
         with self._state_lock, self._request_scope() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
@@ -1381,9 +1376,7 @@ class Database:
     ) -> InspectionNode:
         self._reject_resource_hook_read("Database.inspect_fresh()")
         _reject_query_context("Database.inspect_fresh()")
-        from .core import Query
-
-        if type(query) is not Query:
+        if not is_exact_query(query):
             raise TypeError("db.inspect_fresh() expects a @query-decorated callable.")
         with self._state_lock, self._request_scope() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
@@ -1525,9 +1518,7 @@ class Database:
         """
         self._reject_resource_hook_read("Database.observe()")
         _reject_query_context("Database.observe()")
-        from .core import Query
-
-        if type(query) is not Query:
+        if not is_exact_query(query):
             raise TypeError("db.observe() expects a @query-decorated callable.")
         if not callable(callback):
             raise TypeError("db.observe() expects a callable as its first argument.")
@@ -2708,9 +2699,7 @@ class Database:
     def read_input(self, input_key: _core.Input[T]) -> T:
         self._reject_resource_hook_read("Database.read_input()")
         _reject_cross_database_query_read(self, "Database.read_input()")
-        from .core import Input
-
-        if type(input_key) is not Input:
+        if not is_exact_input(input_key):
             raise TypeError("db.read_input() expects an Input instance.")
         with self._state_lock:
             key = self._input_key(input_key)
@@ -2740,10 +2729,7 @@ class Database:
                 self._refresh_resource(resource, parameter, key, outcome)
                 self._record_dependency(key)
                 result = self._expose_boundary_snapshot(self._records[key].snapshot)
-                from .resources import FileStatResource, _file_stat_public_value
-
-                if isinstance(resource, FileStatResource):
-                    result = _file_stat_public_value(result)
+                result = file_stat_public_value(resource, result)
             except (ResourceDependencyError, QueryConcurrencyError):
                 if key not in self._records:
                     self._resource_objects().pop(key, None)
@@ -5118,8 +5104,6 @@ class Database:
         *,
         owner: FunctionType,
     ) -> Any:
-        from .core import Input, Query
-
         if value is Database:
             # Query bodies may name the public constructor only to receive the
             # query-context contract error. Fingerprint the exact runtime module
@@ -5130,7 +5114,7 @@ class Database:
                 self._module_identity_payload(sys.modules[__name__]),
                 value.__qualname__,
             )
-        if isinstance(value, Query):
+        if is_exact_query(value):
             # Fold the captured query's full definition into the parent's
             # identity so a change to a dependency query's body moves the parent.
             return (
@@ -5141,7 +5125,7 @@ class Database:
                 self._policy_definition_payload(value.eq),
                 self._policy_definition_payload(value.cutoff),
             )
-        if isinstance(value, Input):
+        if is_exact_input(value):
             return (
                 "input",
                 self._state_site_incarnation(value, "input.key", value.key),
@@ -5261,21 +5245,22 @@ class Database:
     ) -> Any:
         """Encode one already-incarnated value and recurse through public state."""
 
-        from .core import Input, Query
-
         if isinstance(value, type):
             return ("captured-type", self._type_definition_payload(value))
-        if isinstance(
-            value,
-            (
-                Query,
-                Input,
-                ModuleType,
-                FunctionType,
-                MethodType,
-                BuiltinFunctionType,
-            ),
-        ) or self._is_resource_handle(value):
+        if (
+            is_exact_query(value)
+            or is_exact_input(value)
+            or isinstance(
+                value,
+                (
+                    ModuleType,
+                    FunctionType,
+                    MethodType,
+                    BuiltinFunctionType,
+                ),
+            )
+            or self._is_resource_handle(value)
+        ):
             if not isinstance(owner, FunctionType):
                 raise UnsupportedValueError(
                     "Managed handles and behavior objects are not supported inside "
@@ -6259,8 +6244,6 @@ class Database:
         let the warm path re-run a pinned leaf (execute-to-verify) and re-probe a
         pinned resource (probe-hint) by their manifest identities.
         """
-        from .core import Input, Query
-
         query_objects: dict[str, Any] = {}
         resource_objects: dict[str, Any] = {}
         seen_functions: set[int] = set()
@@ -6281,10 +6264,10 @@ class Database:
                 walk_value(value)
 
         def walk_value(value: Any) -> None:
-            if isinstance(value, Query):
+            if is_exact_query(value):
                 query_objects.setdefault(value.key, value)
                 walk_function(cast(FunctionType, value.fn))
-            elif isinstance(value, Input):
+            elif is_exact_input(value):
                 return
             elif self._is_resource_handle(value):
                 identity = self._fingerprint_identity_payload(
@@ -6462,9 +6445,7 @@ class Database:
         )
 
     def _module_attribute_payload(self, value: Any, seen_functions: builtins.set[int]) -> Any:
-        from .core import Input, Query
-
-        if isinstance(value, Query):
+        if is_exact_query(value):
             return (
                 "query-v2",
                 self._query_handle_payload(value),
@@ -6473,7 +6454,7 @@ class Database:
                 self._policy_definition_payload(value.eq),
                 self._policy_definition_payload(value.cutoff),
             )
-        if isinstance(value, Input):
+        if is_exact_input(value):
             return (
                 "input",
                 self._state_site_incarnation(value, "input.key", value.key),
@@ -7543,7 +7524,7 @@ class Database:
         """Pin process-local identity only when structural state is not substitutive."""
 
         value_type = type(value)
-        non_reflexive = type(value) in {float, complex} and value != value
+        non_reflexive = value_type in {float, complex} and cmath.isnan(value)
         equality_implementation: object = value_type.__eq__
         hash_implementation: object = value_type.__hash__
         identity_based = (

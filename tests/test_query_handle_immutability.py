@@ -12,14 +12,10 @@ _MODES = ("strict", "checked", "fast")
 @pytest.mark.parametrize("mode", _MODES)
 def test_public_handles_cannot_gain_subclass_state(mode: str) -> None:
     with pytest.raises(TypeError, match="Input handles cannot be subclassed"):
-
-        class MutableInput(Input[int]):  # type: ignore[misc]
-            __slots__ = ("marker",)
+        type("MutableInput", (Input,), {"__slots__": ("marker",)})
 
     with pytest.raises(TypeError, match="Query handles cannot be subclassed"):
-
-        class MutableQuery(Query[[], int]):  # type: ignore[misc]
-            __slots__ = ("marker",)
+        type("MutableQuery", (Query,), {"__slots__": ("marker",)})
 
     source = Input[int](f"exact-handle-input-{mode}")
 

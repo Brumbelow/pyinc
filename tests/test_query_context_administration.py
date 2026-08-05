@@ -78,6 +78,9 @@ class _Hostile:
     def __hash__(self) -> int:
         return self._fail()
 
+    def __eq__(self, _other: object) -> bool:
+        return self._fail()
+
     def __repr__(self) -> str:
         return self._fail()
 
@@ -92,13 +95,6 @@ class _Hostile:
 
     def contains(self, _key: str) -> bool:
         return self._fail()
-
-
-_QUERY_CONTEXT_TARGET: Database | None = None
-_QUERY_CONTEXT_SUBSCRIPTION: Subscription | None = None
-_QUERY_CONTEXT_HOSTILE: _Hostile | None = None
-_QUERY_CONTEXT_ACTION: Action | None = None
-_QUERY_CONTEXT_ACTION_ROOT: Path | None = None
 
 
 def _dynamic(name: str) -> Any:

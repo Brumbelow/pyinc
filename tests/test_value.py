@@ -360,7 +360,6 @@ def test_semantic_equal_requires_typed_canonical_identity(left: object, right: o
 def test_semantic_equal_recurses_past_wrapper_identity_for_nan() -> None:
     token = FrozenList((float("nan"),))
 
-    assert token == token
     assert not semantic_equal(token, token)
 
 

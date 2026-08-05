@@ -61,6 +61,8 @@ def test_annotation_mapping_subclasses_are_rejected_before_cache_or_checkpoint(
 ) -> None:
     marker = tuple([1])
     annotations = _SneakyAnnotations(marker)
+    Holder = _RuntimeAnnotated
+    original_annotations = Holder.__annotations__
 
     if surface == "function":
 
@@ -76,8 +78,6 @@ def test_annotation_mapping_subclasses_are_rejected_before_cache_or_checkpoint(
             return id(child.__annotations__["marker"])
 
     else:
-        Holder = _RuntimeAnnotated
-        original_annotations = Holder.__annotations__
         Holder.__annotations__ = annotations
 
         @query(key=f"subclassed-class-annotations-{mode}")

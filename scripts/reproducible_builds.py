@@ -129,7 +129,7 @@ def _run(
             capture_output=True,
         )
     except OSError as exc:
-        _reject(f"could not execute {argv[0]!r}: {type(exc).__name__}: {exc}")
+        return _reject(f"could not execute {argv[0]!r}: {type(exc).__name__}: {exc}")
 
 
 def _git(project_root: Path, arguments: Sequence[str]) -> bytes:

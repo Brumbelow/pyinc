@@ -295,9 +295,13 @@ def test_failed_request_discards_query_fingerprint_memo(
 
     monkeypatch.setattr(db, "_code_fingerprint", counting_fingerprint)
 
-    with pytest.raises(RuntimeError, match="request failed"), db.request_span():
-        assert db.get(value) == 1
-        raise RuntimeError("request failed")
+    def fail_request() -> None:
+        with db.request_span():
+            assert db.get(value) == 1
+            raise RuntimeError("request failed")
+
+    with pytest.raises(RuntimeError, match="request failed"):
+        fail_request()
 
     assert calls == 1
     assert db._request_query_fingerprints.get() is None

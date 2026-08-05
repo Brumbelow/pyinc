@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from ._runtime_types import register_file_stat_boundary
+
 if TYPE_CHECKING:
     import pyinc.runtime as _runtime
 
@@ -228,6 +230,9 @@ def _file_stat_public_value(value: object) -> FileStatSnapshot:
     return FileStatSnapshot(exists=exists, size=size, mtime_ns=mtime_ns)
 
 
+register_file_stat_boundary(FileStatResource, _file_stat_public_value)
+
+
 @dataclass(frozen=True)
 class EnvResource(Resource[str, str | None, tuple[str | None]]):
     def label(self, name: str) -> str:
@@ -257,6 +262,7 @@ def _resolved_path(path: str) -> str | None:
         try:
             candidate.stat()
         except (FileNotFoundError, NotADirectoryError):
+            # Missing paths keep the canonical spelling from resolve(strict=False).
             pass
         except OSError as error:
             if _is_symlink_loop_error(error):

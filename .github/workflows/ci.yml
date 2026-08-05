@@ -103,7 +103,7 @@ jobs:
             --verify-existing \
             --dist-output dist \
             --metadata-output build-metadata \
-            --version "$(python -c 'import pyinc; print(pyinc.__version__)')" \
+            --version "$(python -c 'from importlib.metadata import version; print(version("pyinc"))')" \
             --runner-label ubuntu-24.04
           python -m twine check dist/*
 
