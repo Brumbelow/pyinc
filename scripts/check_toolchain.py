@@ -27,6 +27,7 @@ _EXPECTED_TOOLS = frozenset(
     {
         "build",
         "coverage",
+        "editables",
         "hatchling",
         "hypothesis",
         "joblib",

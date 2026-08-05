@@ -8,6 +8,7 @@ uv==0.11.21
 
 # Build and release tools.
 build==1.5.0
+editables==0.5
 hatchling==1.31.0
 twine==6.2.0
 

@@ -15,11 +15,13 @@ def test_repository_toolchain_manifest_matches_project() -> None:
     tools = check_toolchain.validate(PROJECT_ROOT, verify_installed=False)
     locked = check_toolchain.parse_lock(PROJECT_ROOT / "requirements/toolchain.lock", tools)
 
+    assert tools["editables"] == "0.5"
     assert tools["hatchling"] == "1.31.0"
     assert tools["pytest"] == "9.1.1"
     assert tools["twine"] == "6.2.0"
     assert tools["uv"] == "0.11.21"
-    assert len(locked) == 56
+    assert len(locked) == 57
+    assert locked["editables"] == {"0.5"}
     assert locked["pytest"] == {"9.1.1"}
     lock_text = (PROJECT_ROOT / "requirements/toolchain.lock").read_text(encoding="utf-8")
     assert "sys_platform == 'linux'" in lock_text
