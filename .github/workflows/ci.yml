@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025, macos-15]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ['3.11', '3.12', '3.13', '3.14']
         hash_seed: ['0', '4294967295']
 
@@ -51,7 +51,7 @@ jobs:
 
   quality:
     name: Static analysis and coverage
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -80,7 +80,7 @@ jobs:
 
   distribution:
     name: Build and validate installed artifacts
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -98,13 +98,13 @@ jobs:
             --project-root . \
             --dist-output dist \
             --metadata-output build-metadata \
-            --runner-label ubuntu-24.04
+            --runner-label ubuntu-latest
           python -m scripts.reproducible_builds \
             --verify-existing \
             --dist-output dist \
             --metadata-output build-metadata \
             --version "$(python -c 'from importlib.metadata import version; print(version("pyinc"))')" \
-            --runner-label ubuntu-24.04
+            --runner-label ubuntu-latest
           python -m twine check dist/*
 
       - name: Create clean artifact environment

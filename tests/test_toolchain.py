@@ -52,7 +52,7 @@ def test_tool_invoking_workflows_use_the_hash_lock_and_release_prepares_assets_f
 
     ci = (workflow_root / "ci.yml").read_text(encoding="utf-8")
     release = (workflow_root / "release.yml").read_text(encoding="utf-8")
-    assert ci.count("--runner-label ubuntu-24.04") == ci.count(
+    assert ci.count("--runner-label ubuntu-latest") == ci.count(
         "python -m scripts.reproducible_builds"
     )
     assert release.count("--runner-label ubuntu-24.04") == release.count(
