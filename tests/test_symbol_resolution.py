@@ -536,7 +536,7 @@ def test_resolve_symbol_stops_at_installed_boundary(
 # ---------------------------------------------------------------------------
 
 
-def test_comment_only_edit_backdates_symbol_table(tmp_path: Path) -> None:
+def test_trailing_comment_backdates_equal_symbol_table(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "a.py"
@@ -549,7 +549,7 @@ def test_comment_only_edit_backdates_symbol_table(tmp_path: Path) -> None:
     second = module_symbol_table(db, root, path)
 
     assert first == second
-    assert db.inspect(module_symbol_table_payload, str(path)).last_decision == "reused"
+    assert db.inspect(module_symbol_table_payload, str(path)).last_recompute == "backdated"
 
 
 def test_signature_change_triggers_downstream_reresolution(tmp_path: Path) -> None:
@@ -1976,7 +1976,7 @@ def test_class_model_matches_fresh_recomputation_over_edits(mode: str, tmp_path:
         )
 
 
-def test_comment_only_edit_backdates_class_models(tmp_path: Path) -> None:
+def test_trailing_comment_backdates_equal_class_models(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "widget.py"
@@ -1989,7 +1989,7 @@ def test_comment_only_edit_backdates_class_models(tmp_path: Path) -> None:
     second = class_model(db, root, path, "Widget")
 
     assert first == second
-    assert db.inspect(class_models_for_file, str(path)).last_decision == "reused"
+    assert db.inspect(class_models_for_file, str(path)).last_recompute == "backdated"
 
 
 def test_class_model_member_carries_no_class_kind(tmp_path: Path) -> None:
@@ -2220,7 +2220,7 @@ def test_class_model_diamond_first_definition_wins(tmp_path: Path) -> None:
     assert hits[0].defining_class == "B"
 
 
-def test_class_model_base_file_comment_edit_reused(tmp_path: Path) -> None:
+def test_base_file_trailing_comment_backdates_equal_class_models(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     base = root / "base.py"
     base_src = "class Base:\n    def shared(self) -> None:\n        pass\n"
@@ -2234,15 +2234,15 @@ def test_class_model_base_file_comment_edit_reused(tmp_path: Path) -> None:
     db = Database(mode="strict")
     first = class_model(db, root, derived, "Derived")
 
-    # A trailing-comment edit to the BASE file leaves the AST attributes
-    # untouched, so class_models_for_file(base) backdates and the derived
-    # flattened model is reused unchanged.
+    # A trailing-comment edit to the base file leaves the complete class-model
+    # payload equal, so that parsed boundary backdates and the derived model is
+    # unchanged.
     base.write_text(base_src + "# trailing comment\n", encoding="utf-8")
     second = class_model(db, root, derived, "Derived")
 
     assert first == second
     assert {m.name for m in second.members} == {"shared"}
-    assert db.inspect(class_models_for_file, str(base)).last_decision == "reused"
+    assert db.inspect(class_models_for_file, str(base)).last_recompute == "backdated"
 
 
 def test_class_model_unrelated_edit_leaves_model_green(tmp_path: Path) -> None:

@@ -20,7 +20,7 @@ configuration are in the [`pyinc-tools` guide](pyinc-tools-guide.md).
 | Method | Result | User-visible limits |
 |---|---|---|
 | `initialize`, `initialized`, `shutdown`, `exit` | Ordered server lifecycle and negotiated capabilities. | One workspace per server process. Requests before initialization or after shutdown fail. |
-| `textDocument/didOpen`, `didChange`, `didSave`, `didClose` | Maintains editor overlays and republishes diagnostics. | `didChange` expects full document text; `didSave` reads the saved file rather than accepting text. |
+| `textDocument/didOpen`, `textDocument/didChange`, `textDocument/didSave`, `textDocument/didClose` | Maintains editor overlays and republishes diagnostics. | `didChange` expects full document text; `didSave` reads the saved file rather than accepting text. |
 | `workspace/didChangeWatchedFiles` | Refreshes changed, created, or deleted files from disk. | Paths outside the workspace are rejected. The built-in polling watcher can provide the same refresh path. |
 | `textDocument/documentSymbol` | Functions, classes, variables, and imports in one file. | Python files only; malformed source may produce an empty or partial result. |
 | `workspace/symbol` | Case-insensitive name filtering across workspace symbols. | Workspace declarations only; installed and stdlib symbols are not indexed. |

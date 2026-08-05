@@ -1370,9 +1370,9 @@ def _render_doc(payload: ModelPayload) -> str:
     return "\n".join(lines)
 
 
-@query(cutoff=_canonical_json_token)
+@query
 def schema_text(db: Database, path: str) -> str:
-    """Raw schema text with a semantic JSON cutoff."""
+    """Exact raw schema text, or a deterministic invalid-UTF-8 marker."""
 
     raw = _FILES.read(db, path)
     try:
@@ -1474,11 +1474,10 @@ def document_diagnostics(db: Database, path: str) -> tuple[DiagnosticPayload, ..
                 )
             )
 
-    # Canonical order, like every other diagnostic group here: the schema_text
-    # cutoff canonicalizes with sorted keys, so a key-reorder edit backdates and
-    # this query is not recomputed. Emitting in document key order would let an
-    # incremental database keep the pre-reorder ordering while a fresh database
-    # reads the new one.
+    # Canonical order, like every other diagnostic group here: parsed payloads
+    # backdate only when their complete values are equal. Emitting in document
+    # key order would make a key reorder observably different even when the
+    # diagnostics themselves are otherwise unchanged.
     for name in sorted(unique_names):
         location = locations_by_name[name][0]
         diagnostics.extend(_definition_name_diagnostics(name, location))

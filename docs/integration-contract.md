@@ -8,8 +8,18 @@ limits.
 All public result records are frozen dataclasses whose collection fields are
 tuples. Public source positions use zero-based, end-exclusive `SourceRange`
 values. High-level entrypoints decode cached tuple payloads into those records;
-the payload queries and decoding helpers in individual modules are not part of
-this contract.
+they are Layer-3, top-level call boundaries. Individual modules additionally
+list stable Layer-2 payload/composition queries in their own `__all__` for query
+authors. Those query handles are deliberately not re-exported from the aggregate
+`pyinc.integrations` namespace. Private decoding helpers remain outside this
+contract.
+
+File-backed integration resources classify embedded-NUL paths and symbolic-link
+loops as conservative missing states, and re-probe those states after warm or
+checkpoint reuse. The scope and requirements Layer-3 APIs therefore do not
+expose the platform's raw `ValueError`, `OSError`, or Python-version-dependent
+`RuntimeError` for those shapes. Their specific public results are documented
+in the relevant sections below.
 
 ## Shared source geometry
 
@@ -30,6 +40,16 @@ this contract.
 | Supported shapes | `.py` files under a workspace; absolute and relative imports; static exports; guarded imports used for type checking or import fallbacks; workspace, stdlib, installed, missing, and ambiguous resolution. |
 | Key limits | It does not execute imports or infer dynamic exports. Conditional or dynamically constructed bindings are reported conservatively, and ambiguous module names remain ambiguous. |
 
+Python source is observed exactly after PEP 263 decoding: comments, whitespace,
+line endings, and final-newline changes invalidate raw-text consumers. Parsed
+payloads backdate only when their complete returned value is equal. Public
+source ranges and the module scope's document range are part of that value, so
+an edit that moves or resizes them is not semantically interchangeable.
+Workspace and directory discovery include a `.py` path only when a nonblocking
+open followed by `fstat` identifies the opened target as a regular file. FIFOs,
+sockets, devices, and symlinks retargeted to those kinds are tracked but not
+reported as Python sources.
+
 ## Installed packages
 
 | Contract item | Stable surface |
@@ -39,6 +59,14 @@ this contract.
 | Result types | `ImportNameResolution`, `InstalledPackageRef`, `InstalledPackagesAnalysis` |
 | Supported shapes | `.dist-info` metadata, `top_level.txt`, distribution name fallback, `Requires-Dist`, and the running interpreter's stdlib module names. |
 | Key limits | Legacy egg formats, package installation, marker evaluation, and import-loader execution are out of scope. Namespace layout is handled by deep module resolution, not distribution metadata. |
+
+`Name` and `Version` are mandatory after surrounding whitespace is removed. A
+missing, empty, or whitespace-only mandatory field rejects that distribution
+and emits `metadata-parse-failed`; it never publishes an empty package name or
+version. Missing, empty, and whitespace-only `Summary` fields all map to the
+public empty string. Repeated `Requires-Dist` fields retain their source order,
+including duplicates. Raw `METADATA` text remains exact, while equal semantic
+projections imply equal metadata-derived package payloads.
 
 ## Deep module resolution
 
@@ -64,14 +92,14 @@ this contract.
 
 `toml_config`, `json_config`, and `xml_config` each cap how deeply a document
 may nest, and each names its cap in the diagnostic that rejects it. The cap
-bounds the *cache* rather than the parser: every section re-emits its ancestors'
-dot path, so cached payloads grow with the square of the nesting depth. Each cap
-keeps a document at the cap inside the same ~1 MiB payload budget and inside
-what `freeze` will snapshot, so nothing these integrations accept can fail to
-cache. None of the three raises `RecursionError`: when the interpreter's stack
-is exhausted the diagnostic carries that integration's fixed text and the cutoff
-token falls back to the raw file text. Stack exhaustion is a property of the
-caller's remaining stack, not of the file.
+limits one source of cache growth rather than imposing a byte or memory bound:
+every section re-emits its ancestors' dot path, so cached payloads grow with the
+square of nesting depth, while document width, string lengths, and collection
+cardinality remain independently unbounded. The caps therefore do not promise
+a universal 1 MiB payload or that every accepted input fits available memory.
+None of the three lets `RecursionError` escape: when the interpreter's stack is
+exhausted the diagnostic carries that integration's fixed text. Stack
+exhaustion is a property of the caller's remaining stack, not of the file.
 
 ## TOML configuration
 
@@ -84,7 +112,10 @@ caller's remaining stack, not of the file.
 **Semantics.** Any single TOML file; workspace discovery of `pyproject.toml`;
 nested sections; project dependencies, optional dependency groups, tool names,
 parse and project-shape diagnostics. Values are summarized as stable strings,
-with date/time values rendered in ISO form.
+with date/time values rendered in ISO form. Arrays retain item order; table keys
+are sorted recursively before rendering, including inline tables nested inside
+arrays. Signed zero and non-finite floats also have stable, sign-preserving
+renderings.
 
 **Limits.** No build-backend execution, schema validation, dependency
 resolution, or file mutation occurs. Table or array nesting deeper than 100
@@ -92,8 +123,9 @@ levels is rejected with a `toml-decode-error` diagnostic that names the limit;
 depth is measured on the parsed document and counts its implicit top-level
 table as the first level, so `[a.b]` is three and `[[a]]` is three as well, an
 array wrapping a table. On stack exhaustion that diagnostic carries the fixed
-text `TOML parsing exhausted the interpreter stack`; a spent stack can cost a
-cutoff, never make one wrong.
+text `TOML parsing exhausted the interpreter stack`. Raw TOML text remains an
+exact query value; parsed payloads may backdate only when their complete public
+values are equal.
 
 ## JSON configuration
 
@@ -105,7 +137,9 @@ cutoff, never make one wrong.
 
 **Semantics.** Standard JSON; workspace discovery defaults to `package.json`;
 objects become sections and nested subsections; scalar, array, object,
-boolean, and null value kinds are reported.
+boolean, and null value kinds are reported. Public value strings canonicalize
+object keys recursively, including objects nested inside arrays, so insertion
+order never changes one rendering while the parsed semantic tree is equal.
 
 **Limits.** A non-object top level has no sections. JSONC, JSON5, schema
 validation, JSON Pointer/Path, and `$ref` resolution are out of scope.
@@ -114,8 +148,8 @@ silently normalized, as is object or array nesting deeper than 200 levels —
 the `json-decode-error` diagnostic names that limit, and depth is counted from
 the file text before parsing, so the rejection is the same from every call
 site. On stack exhaustion that diagnostic carries the fixed text `JSON parsing
-exhausted the interpreter stack`; a spent stack can cost a cutoff, never make
-one wrong.
+exhausted the interpreter stack`; a spent stack can cost semantic reuse, never
+make it stale.
 
 ## Requirements files
 
@@ -130,8 +164,20 @@ lines, continuations, index/find-links directives, `-r` requirement
 references, and `-c` constraint references. Per-requirement options (for
 example the `--hash=...` lines `pip-compile --generate-hashes` emits) are
 split off the requirement rather than folded into its version text; the
-options themselves are ignored, not verified. Deep analysis follows in-root
-`-r` files with cycle and missing-file diagnostics.
+options themselves are ignored semantically, not verified. A
+`RequirementRef.raw_line` retains the exact logical-line spelling, including
+indentation, inline comments, continuation backslashes and their internal line
+endings, options, and trailing spaces; source ranges retain the corresponding
+start/end geometry. Deep analysis follows in-root `-r` files with cycle and
+missing-file diagnostics.
+
+An embedded-NUL or unresolvable requirements file produces an
+`invalid-requirements-path` diagnostic from `requirements_analysis` and
+`deep_requirements_analysis`. An invalid workspace root is treated as absent,
+so `workspace_requirements_analysis` returns `None`. An unresolvable nested
+`-r` path is skipped with the same diagnostic code; an embedded NUL in the
+reference text is rejected earlier as an `unparseable-line`. If the path later
+becomes resolvable, the next call observes it and agrees with a fresh database.
 
 **Limits.** Marker evaluation is separate. No URL/VCS fetch, version solving,
 or recursive constraint application occurs; constraint references are recorded
@@ -185,8 +231,8 @@ attribute names are exposed by local name; workspace discovery defaults to
 `xml-parse-error` diagnostic, as is element nesting deeper than 256 levels —
 the diagnostic names that limit, and depth counts the document's root element
 as the first level. On stack exhaustion it carries the fixed text `XML parsing
-exhausted the interpreter stack`; a spent stack can cost a cutoff, never make
-one wrong. DTD/XSD validation, external entities, XInclude, streaming APIs,
+exhausted the interpreter stack`; a spent stack can cost semantic reuse, never
+make it stale. DTD/XSD validation, external entities, XInclude, streaming APIs,
 and general XPath are not supported. Dot paths identify hierarchy but do not
 index repeated siblings.
 
@@ -209,6 +255,12 @@ index repeated siblings.
 | Result types | `Binding`, `Scope`, `ScopeTree`, `SymbolId` |
 | Supported shapes | Module, class, function, lambda, and comprehension scopes; parameters and ordinary Python binding forms; `global`, `nonlocal`, and assignment-expression behavior. |
 | Key limits | Resolution is static and conservative. A position that is ambiguous, dynamic, or outside a resolvable workspace binding returns no symbol instead of a speculative target. |
+
+An embedded-NUL path or symbolic-link loop produces a zero-length module scope
+with no bindings or occurrences, and `symbol_at` consequently returns `None`.
+The Layer-2 scope payload observes the underlying source resource's tracked
+missing state, so a loop repaired into a regular source file invalidates warm
+and checkpoint-loaded results.
 
 ## Symbol resolution
 
@@ -272,8 +324,9 @@ column. A cell magic on the first line claims the whole cell and its body is
 dropped, unless the magic runs that body as Python (`%%capture`, `%%debug`,
 `%%prun`, `%%python`, `%%python2`, `%%python3`, `%%time`, `%%timeit`).
 
-**Limits.** Workspace discovery is not recursive. Outputs and execution
-counts are ignored for cutoff purposes. Neutralization is lexical, is skipped
+**Limits.** Workspace discovery is not recursive. Exact notebook text retains
+outputs and execution counts; parsed analysis payloads omit them and may
+backdate when their complete results are equal. Neutralization is lexical, is skipped
 for a cell that already parses as Python, and only recognizes those
 constructs where IPython does — at the start of a logical line. A neutralized
 cell that still does not parse reports `notebook-non-python-cell` instead of
@@ -287,8 +340,8 @@ magic are not modeled.
 Cells are analyzed independently; there is no execution, magic expansion,
 cross-cell binding resolution, MIME rendering, attachment extraction, or
 nbformat schema dependency. Surrogate scanning covers what reaches the cached
-payload: cell sources, cell types, and the kernel metadata. Cell outputs and
-per-execution metadata never reach the payload or the cutoff token, so they
+analysis payload: cell sources, cell types, and the kernel metadata. Cell outputs and
+per-execution metadata never reach that parsed payload, so they
 are not scanned — a notebook whose outputs contain a lone surrogate stays
 fully analyzable, and one whose sources do is reported as a decode error
 rather than analyzed partially.
@@ -317,6 +370,12 @@ was opened for, compute normally. The memo lives only for the span and is
 never durable. It answers a repeated question inside one request; it does not
 participate in the kernel's invalidation and is not a cache across requests.
 
+Request-scoping functions are Layer-3 helpers and may be used only outside
+query execution. Calling `request_scope`, `request_inputs_changed`, or
+`once_per_request` from a query raises `QueryContextError` before opening,
+clearing, or populating a request memo. The internal `decoded` helper has the
+same boundary and rejects before touching its decode cache.
+
 `request_inputs_changed()` clears the innermost open scope only, so under
 scopes nested for different `Database` objects it forgets nothing an outer
 scope memoized: mutate inputs only for the innermost scope's database, or
@@ -334,11 +393,21 @@ requirement evaluation combines parsed requirements, environment markers, and
 installed versions; scope and symbol analysis build on shared Python source.
 Those calls become ordinary dependency edges and require no user wiring.
 
-Individual integration modules also expose payload queries and helper names for
-in-repository composition. They are intentionally absent from
-`pyinc.integrations.__all__` and are not covered by this stable contract. Import
-only the names listed in the `Entrypoints`, `Result types`, and `Shared types`
-rows above when relying on semver compatibility.
+Every function named in an `Entrypoints` row above is a Layer-3 function. It may
+be called at top level, but it may not execute from a query, whether reached by
+a direct submodule import, the aggregate namespace, or a runtime import. Such a
+call raises the public `QueryContextError` before argument/path resolution,
+resource access, request memoization, or decoded-result caching. The rule is the
+same in `strict`, `checked`, and `fast` modes.
+
+Query authors instead import a stable Layer-2 `@query` payload/composition handle
+listed in the defining integration module's `__all__`, then call that handle
+directly or through `db.get()` on the active database. Layer-2 results are the
+snapshot-safe payload shapes documented by their module, rather than the
+decoded Layer-3 dataclasses. Other payload queries and decoding helpers remain
+implementation details. Stable Layer-2 query handles are intentionally absent
+from the aggregate `pyinc.integrations.__all__`; the aggregate namespace is the
+typed Layer-3 consumer surface.
 
 LSP protocol behavior, filesystem watchers, scheduling, and code generation
 belong to consumer packages and do not widen this integration surface.

@@ -6,10 +6,12 @@ timings are environment-specific diagnostics and are never release thresholds.
 
 ## Run it
 
-Install the benchmark comparator with the project:
+Install the locked benchmark toolchain and the project:
 
 ```console
-python -m pip install -e '.[bench]'
+python -m pip install --require-hashes --only-binary=:all: -r requirements/toolchain.lock
+python -m pip install --no-build-isolation --no-deps -e .
+python scripts/check_toolchain.py --verify-installed
 ```
 
 Run the release configuration from the repository root:
@@ -23,7 +25,9 @@ The command launches five isolated Python processes with `PYTHONHASHSEED=0`. It 
 counts differ between repetitions, or a correctness/work gate fails.
 
 The benchmark workflow is manual and reusable; it is not run for ordinary pushes or pull
-requests. Its uploaded artifacts are the authoritative record for a particular run.
+requests. Its 90-day workflow artifact supports CI investigation. For a release, automation
+also packages these exact results with the command and layered SHA-256 manifests and attaches
+that evidence bundle to the GitHub Release, where it is not tied to workflow-artifact expiry.
 
 ## Methodology
 
@@ -61,10 +65,14 @@ The following conditions are enforced:
 - formatting-only edits backdate and perform zero downstream query executions;
 - localized edits perform targeted work, while removals and tampering delete or repair the
   expected files;
-- every pyinc row stays within its reviewed execution, reuse, backdate, resource-load, node,
-  and edge envelope, so a deterministic regression to full-graph recomputation still fails;
+- every pyinc row stays within its reviewed execution, backdate, resource-load, node, and edge
+  envelope, so a deterministic regression to full-graph recomputation still fails;
 - memo-node ceilings are 16 for synthetic, 24 for calc, 40 for codegen, and 8 for action;
-- deterministic work counts match across all five isolated repetitions.
+- deterministic work counts match across all five isolated repetitions. The report also records
+  the call-level `query_reuses` statistic and requires it to match across those same-path runs,
+  but does not impose an absolute cross-path envelope: absolute path arguments can change
+  dependency verification order and therefore the number of repeated already-checked calls
+  without changing executions or graph work.
 
 The release suite separately retains the 1,000-argument LRU and 1,000-module workspace
 scalability tests.

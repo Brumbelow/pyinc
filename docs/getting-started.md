@@ -16,7 +16,8 @@ The wheel has no runtime dependencies and includes `pyinc`, `pyinc_tools`, and
 ## 1. Declare keyed inputs and queries
 
 An `Input` is a base value supplied by your application. Give it a stable,
-non-empty key: the key is its identity in a `Database` and in checkpoints.
+non-empty exact `str` key (subclasses are rejected): the key is its identity in
+a `Database` and in checkpoints.
 
 ```python docs-check
 from pyinc import Database, Input, query
@@ -51,6 +52,13 @@ Use an explicit `@query(key="...")` only when the default
 `module:qualified_name` identity is not stable enough for your deployment. An
 `Input` or query accepts either `eq=` for custom equality or `cutoff=` for a
 snapshot-safe comparison token, never both.
+
+Query identity performs static capture analysis of directly named globals,
+nonlocals, and supported transitively captured definitions. It rejects mutable
+state it discovers, but it does not trace dynamic namespace/reflection reads
+such as `globals()[name]`, dynamic `getattr`, `vars`, `eval`/`exec`, or runtime
+imports. Put behavior-bearing state behind an `Input` or `Resource`; if it
+cannot be tracked, declare the read with `report_untracked_read()`.
 
 ## 2. Track files and other resources
 
@@ -88,14 +96,27 @@ with TemporaryDirectory() as directory:
 Inside a query, raw `open()`, `io.open()`, environment access, directory
 listing, and `Path.iterdir()` are intercepted outside resource scope and raise
 `UntrackedReadError`. For ambient reads the guard cannot intercept—such as
-`os.open()`, subprocess output, time, random values, network calls, or C
-extensions—call `db.report_untracked_read(reason)`. That node then executes on
-every request and cannot backdate.
+`os.open()`, time, random values, network calls, or C extensions—call
+`db.report_untracked_read(reason)`. That node then executes on every request and
+cannot backdate. This prevents stale memo reuse for the node; it does not make
+the observation tracked or guarantee equality with a separately timed fresh
+evaluation. Covered thread, executor, multiprocessing, fork, and command
+launches instead raise `QueryConcurrencyError` inside queries. Observe external
+command output through a Resource hook; start independent work outside
+`db.get()`.
 
-Custom resources implement the public `read`, `probe`, `load`, optional
-`probe_and_load`, `identity`, and `label` hooks. Read the
+Custom resources must implement `label`, `probe`, and `load`. `Resource`
+supplies defaults for `read`, `probe_and_load`, and `identity`; override those
+only for key normalization, one-observation probe/load, or custom configuration
+identity. A probe runs when a requested resource node needs verification, not
+on every unrelated database request. Read the
 [kernel contract](kernel-contract.md#conditions-for-from-scratch-consistency)
-before relying on a custom probe across checkpoints.
+before relying on a custom probe across checkpoints. Hooks may perform direct
+external I/O, but they may not call a `Database` observation or read an
+`Input`, query, or another resource. Compose those managed reads in the calling
+query; a hook violation raises `ResourceDependencyError` in every mode. Hooks
+may run external commands, but worker threads/processes and raw fork/exec are
+rejected with `QueryConcurrencyError`.
 
 ## 3. Choose a mode
 
@@ -104,7 +125,7 @@ ambient-read tracking.
 
 | Mode | Values seen by queries and callers | In-query mutation |
 |---|---|---|
-| `strict` | Immutable snapshots such as `FrozenList`, `FrozenDict`, `FrozenSet`, and `FrozenRecord` | A write fails immediately. |
+| `strict` | Read-only snapshots such as `FrozenList`, `FrozenDict`, `FrozenSet`, and `FrozenRecord` | An ordinary write fails immediately; this is not a capability sandbox against reflection. |
 | `checked` | Owned thawed copies | A before/after fingerprint detects mutation. |
 | `fast` | Owned thawed copies | Not checked; deterministic, non-mutating queries are the caller's responsibility. |
 
@@ -117,6 +138,12 @@ records; tuples stay tuples. Shared or cyclic mutable graphs use
 `FrozenGraph`/`FrozenRef`. `thaw()` reconstructs ordinary containers and graph
 identity, but a dataclass becomes a dictionary unless a matching
 `ValueAdapter` explicitly reconstructs its type.
+
+Mapping insertion order is deliberately canonicalized at the boundary. Both a
+strict `FrozenDict` and a checked/fast thawed `dict` iterate by canonical
+frozen-key fingerprint, not by insertion and not necessarily by ordinary
+key sorting. Represent an order-bearing mapping as a tuple of pairs or with a
+dedicated adapter.
 
 ## 4. Inspect what happened
 

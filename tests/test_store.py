@@ -251,14 +251,23 @@ def test_filesystem_store_persists_across_instances(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_database_writes_input_snapshot_to_store() -> None:
+def test_database_persists_input_snapshot_when_checkpoint_is_saved() -> None:
     payload = Input[dict[str, int]]("p")
     store = InMemoryArtifactStore()
+
+    @query
+    def read_x(db: Database) -> int:
+        return payload.read(db)["x"]
+
     db = Database(store=store)
 
     db.set(payload, {"x": 1})
 
     digest = fingerprint_snapshot(freeze({"x": 1}))
+    assert not store.contains(digest)
+    assert db.get(read_x) == 1
+    assert not store.contains(digest)
+    db.save_checkpoint()
     assert store.contains(digest)
     assert deserialize_snapshot(store.get(digest)) == freeze({"x": 1})  # type: ignore[arg-type]
 
@@ -276,8 +285,9 @@ def test_database_writes_query_result_snapshot_to_store() -> None:
 
     assert db.get(double) == 42
 
-    # Both the input snapshot (21) and the result snapshot (42) are persisted.
-    assert store.contains(fingerprint_snapshot(freeze(21)))
+    # Input transactions do not write a non-transactional external store.
+    # Query results remain write-through objects for cache eviction/reuse.
+    assert not store.contains(fingerprint_snapshot(freeze(21)))
     assert store.contains(fingerprint_snapshot(freeze(42)))
 
 
@@ -323,9 +333,15 @@ def test_database_filesystem_store_writes_through_raw_open_guard(
 ) -> None:
     payload = Input[str]("p")
     store = FileSystemArtifactStore(tmp_path / "store")
+
+    @query
+    def echo(db: Database) -> str:
+        return payload.read(db)
+
     db = Database(store=store)
 
     db.set(payload, "hello")
+    assert db.get(echo) == "hello"
 
     digest = fingerprint_snapshot(freeze("hello"))
     assert store.get(digest) is not None
@@ -351,15 +367,25 @@ def test_filesystem_store_round_trips_cyclic_graph(tmp_path: Path) -> None:
     assert deserialize_snapshot(retrieved) == snapshot
 
 
-def test_database_persists_shared_identity_input_to_store() -> None:
+def test_database_persists_shared_identity_input_on_checkpoint() -> None:
     payload = Input[tuple[dict[str, int], dict[str, int]]]("p")
     store = InMemoryArtifactStore()
+
+    @query
+    def read_x(db: Database) -> int:
+        left, right = payload.read(db)
+        return left["x"] + right["x"]
+
     db = Database(store=store)
 
     shared = {"x": 1}
     db.set(payload, (shared, shared))
 
     digest = fingerprint_snapshot(freeze((shared, shared)))
+    assert not store.contains(digest)
+    assert db.get(read_x) == 2
+    assert not store.contains(digest)
+    db.save_checkpoint()
     assert store.contains(digest)
 
 
@@ -375,6 +401,7 @@ def test_database_with_store_under_each_mode_round_trips(mode: str, tmp_path: Pa
     db = Database(mode=mode, store=store)
     db.set(payload, {"x": 7})
     assert db.get(echo_x) == 7
+    db.save_checkpoint()
 
     digest = fingerprint_snapshot(freeze({"x": 7}))
     retrieved = store.get(digest)

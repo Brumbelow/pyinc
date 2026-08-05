@@ -17,7 +17,7 @@ def main() -> None:
     events: list[QueryChangeEvent] = []
     subscription = db.observe(events.append, doubled)
 
-    db.get(doubled)  # cold execute → fires
+    db.get(doubled)  # cold execute, no prior value to change
     db.get(doubled)  # reused, no event
     db.set(COUNT, 1)  # equal input, no revision bump
     db.get(doubled)  # reused, no event

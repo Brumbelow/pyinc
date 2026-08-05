@@ -114,7 +114,7 @@ def test_toml_helpers_cover_value_kinds_and_shape_edges() -> None:
     assert toml_config._toml_value_type(1.5) == "float"
     assert toml_config._toml_value_type({"key": "value"}) == "table"
     assert toml_config._toml_value_type(object()) == "unknown"
-    assert toml_config._toml_value_to_string({"b": 2, "a": 1}) == "[('a', 1), ('b', 2)]"
+    assert toml_config._toml_value_to_string({"b": 2, "a": 1}) == "{'a': 1, 'b': 2}"
     assert toml_config._config_cutoff_token("invalid = [") == ("raw", "invalid = [")
     assert toml_config._toml_cutoff_value(timestamp) == ("datetime", timestamp.isoformat())
     assert toml_config._toml_cutoff_value(calendar_date) == ("date", calendar_date.isoformat())
@@ -262,10 +262,10 @@ def test_notebook_cutoff_handles_malformed_shapes_and_metadata() -> None:
 
     invalid_metadata = json.dumps({"cells": [None], "metadata": "invalid"})
     assert notebook._notebook_cutoff_token(invalid_metadata) == (
-        "nb",
-        "None",
-        "None",
-        "invalid-cell",
+        "notebook-v2",
+        ("kernel-name", None),
+        ("language", None),
+        ("cells", "present", (("invalid-cell",),)),
     )
 
     kernelspec_language = json.dumps(
@@ -275,9 +275,9 @@ def test_notebook_cutoff_handles_malformed_shapes_and_metadata() -> None:
         }
     )
     assert notebook._notebook_cutoff_token(kernelspec_language)[:3] == (
-        "nb",
-        "None",
-        "'R'",
+        "notebook-v2",
+        ("kernel-name", None),
+        ("language", "R"),
     )
 
     language_info = json.dumps(
@@ -290,9 +290,9 @@ def test_notebook_cutoff_handles_malformed_shapes_and_metadata() -> None:
         }
     )
     assert notebook._notebook_cutoff_token(language_info)[:3] == (
-        "nb",
-        "None",
-        "'python'",
+        "notebook-v2",
+        ("kernel-name", None),
+        ("language", "python"),
     )
 
     nonstring_language_info = json.dumps(
@@ -305,9 +305,9 @@ def test_notebook_cutoff_handles_malformed_shapes_and_metadata() -> None:
         }
     )
     assert notebook._notebook_cutoff_token(nonstring_language_info)[:3] == (
-        "nb",
-        "None",
-        "None",
+        "notebook-v2",
+        ("kernel-name", None),
+        ("language", None),
     )
 
 
@@ -513,7 +513,10 @@ def test_namespace_discovery_ignores_unsafe_candidates_and_regular_shadows(
 def test_requirements_parser_defensive_branches() -> None:
     assert requirements_txt._parse_requirement_line("   ", 1) is None
     assert requirements_txt._parse_file_references("-c bad\0path") == ()
-    assert requirements_txt._requirements_cutoff_token(" \n# comment\n") == ("", "#")
+    assert requirements_txt._requirements_cutoff_token(" \n# comment\n") == (
+        "raw",
+        " \n# comment\n",
+    )
 
     source_range = requirements_txt._range_for_line({}, 0)
     assert source_range.start.line == 0
@@ -555,8 +558,35 @@ def test_deep_requirements_reports_cycles_duplicates_and_escape(
     assert any("outside project" in message for _code, message in analysis.diagnostics)
 
 
-def _denied(self: Path, *args: Any, **kwargs: Any) -> Any:
-    raise PermissionError(13, "Permission denied", str(self))
+def _denied_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+    del flags, args, kwargs
+    raise PermissionError(13, "Permission denied", os.fspath(path))
+
+
+_SHIPPED_FILE_RESOURCES = (
+    csv_data._CsvFileResource(),
+    deep_resolution._PthFileResource(),
+    env_file._EnvFileResource(),
+    installed_packages._DistInfoMetadataResource(),
+    json_config._JsonFileResource(),
+    notebook._NotebookFileResource(),
+    requirements_txt._RequirementsFileResource(),
+    toml_config._ConfigFileResource(),
+    xml_config._XmlFileResource(),
+    python_source._SourceTextResource(),
+)
+_SHIPPED_FILE_RESOURCE_IDS = (
+    "csv",
+    "pth",
+    "env",
+    "metadata",
+    "json",
+    "notebook",
+    "requirements",
+    "toml",
+    "xml",
+    "source",
+)
 
 
 def test_shared_file_helpers_read_a_denied_directory_as_missing(
@@ -572,8 +602,7 @@ def test_shared_file_helpers_read_a_denied_directory_as_missing(
     regular = tmp_path / "thing.txt"
     regular.write_text("hello", encoding="utf-8")
 
-    monkeypatch.setattr(Path, "read_bytes", _denied)
-    monkeypatch.setattr(Path, "read_text", _denied)
+    monkeypatch.setattr(os, "open", _denied_open)
 
     assert resources.file_bytes(str(directory)) is None
     assert resources.file_probe(str(directory)) == ("missing",)
@@ -592,30 +621,8 @@ def test_shared_file_helpers_read_a_denied_directory_as_missing(
 
 @pytest.mark.parametrize(
     "resource",
-    (
-        csv_data._CsvFileResource(),
-        deep_resolution._PthFileResource(),
-        env_file._EnvFileResource(),
-        installed_packages._DistInfoMetadataResource(),
-        json_config._JsonFileResource(),
-        notebook._NotebookFileResource(),
-        requirements_txt._RequirementsFileResource(),
-        toml_config._ConfigFileResource(),
-        xml_config._XmlFileResource(),
-        python_source._SourceTextResource(),
-    ),
-    ids=(
-        "csv",
-        "pth",
-        "env",
-        "metadata",
-        "json",
-        "notebook",
-        "requirements",
-        "toml",
-        "xml",
-        "source",
-    ),
+    _SHIPPED_FILE_RESOURCES,
+    ids=_SHIPPED_FILE_RESOURCE_IDS,
 )
 def test_shipped_file_resources_read_a_denied_directory_as_missing(
     monkeypatch: pytest.MonkeyPatch,
@@ -627,8 +634,7 @@ def test_shipped_file_resources_read_a_denied_directory_as_missing(
     regular = tmp_path / "thing.txt"
     regular.write_text("hello", encoding="utf-8")
 
-    monkeypatch.setattr(Path, "read_bytes", _denied)
-    monkeypatch.setattr(Path, "read_text", _denied)
+    monkeypatch.setattr(os, "open", _denied_open)
 
     assert resource.probe(str(directory)) == ("missing",)
     assert resource.probe_and_load(Database(), str(directory))[0] == ("missing",)
@@ -637,3 +643,23 @@ def test_shipped_file_resources_read_a_denied_directory_as_missing(
         resource.probe(str(regular))
     with pytest.raises(PermissionError):
         resource.load(Database(), str(regular))
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
+@pytest.mark.parametrize("mode", ("strict", "checked", "fast"))
+@pytest.mark.parametrize(
+    "resource",
+    _SHIPPED_FILE_RESOURCES,
+    ids=_SHIPPED_FILE_RESOURCE_IDS,
+)
+def test_every_shipped_file_resource_refuses_a_fifo_without_blocking(
+    mode: str,
+    resource: Any,
+    tmp_path: Path,
+) -> None:
+    fifo = tmp_path / "resource"
+    os.mkfifo(fifo)
+
+    assert resource.probe(str(fifo)) == ("missing",)
+    probe, _value = resource.probe_and_load(Database(mode=mode), str(fifo))
+    assert probe == ("missing",)

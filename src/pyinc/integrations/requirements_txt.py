@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.resources import DirectoryResource
+from pyinc.resources import DirectoryResource, _resolved_path
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _layer3_entrypoint
 from ._resources import file_probe, file_read_snapshot, file_text
 from .source_geometry import SourcePosition, SourceRange
 
@@ -36,6 +37,11 @@ RequirementsAnalysisPayload: TypeAlias = tuple[
     tuple[FileReferencePayload, ...],
     tuple[IndexDirectivePayload, ...],
     tuple[DiagnosticPayload, ...],
+]
+RequirementsGeometryPayload: TypeAlias = tuple[tuple[int, int, int, int, int], ...]
+RequirementsPublicPayload: TypeAlias = tuple[
+    RequirementsAnalysisPayload,
+    RequirementsGeometryPayload,
 ]
 
 
@@ -182,13 +188,34 @@ def _logical_line_ranges(text: str) -> dict[int, SourceRange]:
         first = physical[start_line - 1]
         last = physical[end_line - 1]
         start_character = len(first) - len(first.lstrip())
-        end_character = len(last.rstrip())
+        end_character = len(last)
         start = SourcePosition(start_line - 1, start_character)
         end = SourcePosition(end_line - 1, end_character)
         if end < start:
             end = start
         ranges[start_line] = SourceRange(start, end)
     return ranges
+
+
+def _raw_logical_lines(text: str) -> dict[int, str]:
+    """Return each logical line's exact source spelling without its final EOL.
+
+    Continuation backslashes, the line endings inside a continuation, leading
+    indentation, inline comments, options, and trailing spaces remain present.
+    Only the terminator of the final physical line is removed because
+    ``RequirementRef.raw_line`` describes the line rather than its separator.
+    """
+
+    physical = text.splitlines(keepends=True)
+    result: dict[int, str] = {}
+    for start_line, end_line, _logical in _logical_lines(text):
+        raw = "".join(physical[start_line - 1 : end_line])
+        if raw.endswith("\r\n"):
+            raw = raw[:-2]
+        elif raw.endswith(("\r", "\n")):
+            raw = raw[:-1]
+        result[start_line] = raw
+    return result
 
 
 def _strip_inline_comment(line: str) -> str:
@@ -228,7 +255,12 @@ def _strip_requirement_options(line: str) -> str:
     return line[: match.start()].rstrip()
 
 
-def _parse_requirement_line(line: str, lineno: int) -> RequirementPayload | None:
+def _parse_requirement_line(
+    line: str,
+    lineno: int,
+    *,
+    raw_line: str | None = None,
+) -> RequirementPayload | None:
     """Parse a single PEP 508 specifier line into a RequirementPayload."""
     stripped = _strip_requirement_options(_strip_inline_comment(line.strip()))
     if not stripped:
@@ -242,7 +274,15 @@ def _parse_requirement_line(line: str, lineno: int) -> RequirementPayload | None
         extras = tuple(e.strip() for e in extras_str.split(",") if e.strip()) if extras_str else ()
         markers = (url_match.group("markers") or "").strip()
         url = url_match.group("url").strip()
-        return (name, line.strip(), lineno, extras, f"@ {url}", markers, False)
+        return (
+            name,
+            line if raw_line is None else raw_line,
+            lineno,
+            extras,
+            f"@ {url}",
+            markers,
+            False,
+        )
 
     match = re.match(_REQ_PAT, stripped)
     if match is None:
@@ -254,12 +294,21 @@ def _parse_requirement_line(line: str, lineno: int) -> RequirementPayload | None
     version_spec = match.group("version").strip()
     markers = (match.group("markers") or "").strip()
 
-    return (name, line.strip(), lineno, extras, version_spec, markers, False)
+    return (
+        name,
+        line if raw_line is None else raw_line,
+        lineno,
+        extras,
+        version_spec,
+        markers,
+        False,
+    )
 
 
 def _parse_requirements(text: str) -> tuple[RequirementPayload, ...]:
     """Extract all requirement payloads from text."""
     results: list[RequirementPayload] = []
+    raw_lines = _raw_logical_lines(text)
     for lineno, _end_lineno, line in _logical_lines(text):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -278,7 +327,7 @@ def _parse_requirements(text: str) -> tuple[RequirementPayload, ...]:
                             if not target.startswith((".", "/", "git+", "hg+", "svn+", "bzr+"))
                             else target
                         ),
-                        stripped,
+                        raw_lines[lineno],
                         lineno,
                         (),
                         "",
@@ -287,7 +336,11 @@ def _parse_requirements(text: str) -> tuple[RequirementPayload, ...]:
                     )
                 )
             continue
-        payload = _parse_requirement_line(stripped, lineno)
+        payload = _parse_requirement_line(
+            stripped,
+            lineno,
+            raw_line=raw_lines[lineno],
+        )
         if payload is not None:
             results.append(payload)
     return tuple(results)
@@ -384,28 +437,18 @@ def _parse_diagnostics(text: str) -> tuple[DiagnosticPayload, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Cutoff
+# Legacy projection helper (not attached to the exact raw boundary)
 # ---------------------------------------------------------------------------
 
 
-def _requirements_cutoff_token(text: str) -> tuple[str, ...]:
-    """Normalize requirements text for semantic comparison.
+def _requirements_cutoff_token(text: str) -> tuple[str, str]:
+    """Retain an exact legacy projection for cutoff-congruence tests.
 
-    Preserves line structure (blank lines and comment lines keep their
-    positions) because downstream results include line numbers.  Only
-    comment *text* and trailing whitespace are normalized so that edits
-    to comment wording — without changing line count — are backdated.
+    Requirements expose source spelling and geometry. There is therefore no
+    coarser token that is substitutive for every raw and parsed consumer.
     """
-    lines: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            lines.append("")
-        elif stripped.startswith("#"):
-            lines.append("#")
-        else:
-            lines.append(_strip_inline_comment(stripped).rstrip())
-    return tuple(lines)
+
+    return ("raw", text)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +456,7 @@ def _requirements_cutoff_token(text: str) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_requirements_cutoff_token)
+@query
 def requirements_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 
@@ -456,6 +499,32 @@ def requirements_analysis_payload(db: Database, path: str) -> RequirementsAnalys
     return (path, reqs, refs, indices, diagnostics)
 
 
+@query
+def requirements_geometry_payload(
+    db: Database,
+    path: str,
+) -> RequirementsGeometryPayload:
+    ranges = _logical_line_ranges(requirements_file_text(db, path))
+    return tuple(
+        (
+            lineno,
+            source_range.start.line,
+            source_range.start.character,
+            source_range.end.line,
+            source_range.end.character,
+        )
+        for lineno, source_range in sorted(ranges.items())
+    )
+
+
+@query
+def requirements_public_payload(db: Database, path: str) -> RequirementsPublicPayload:
+    return (
+        requirements_analysis_payload(db, path),
+        requirements_geometry_payload(db, path),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Layer 3 — Entrypoints
 # ---------------------------------------------------------------------------
@@ -467,6 +536,16 @@ def _range_for_line(ranges: dict[int, SourceRange], lineno: int) -> SourceRange:
         return source_range
     position = SourcePosition(max(lineno - 1, 0), 0)
     return SourceRange(position, position)
+
+
+def _decode_geometry(payload: RequirementsGeometryPayload) -> dict[int, SourceRange]:
+    return {
+        lineno: SourceRange(
+            SourcePosition(start_line, start_character),
+            SourcePosition(end_line, end_character),
+        )
+        for lineno, start_line, start_character, end_line, end_character in payload
+    }
 
 
 def _decode_requirement(
@@ -498,14 +577,28 @@ def _decode_index_directive(
     return IndexDirective(kind=kind, url=url, range=_range_for_line(ranges, lineno))
 
 
+def _invalid_path_analysis(path: str) -> RequirementsAnalysis:
+    return RequirementsAnalysis(
+        path=path,
+        requirements=(),
+        file_references=(),
+        index_directives=(),
+        diagnostics=(("invalid-requirements-path", f"requirements path cannot resolve: {path!r}"),),
+    )
+
+
+@_layer3_entrypoint
 def requirements_analysis(db: Database, path: str | os.PathLike[str]) -> RequirementsAnalysis:
     normalized = os.fspath(path)
-    payload = cast(
-        RequirementsAnalysisPayload,
-        thaw(db.get(requirements_analysis_payload, normalized)),
+    invalid_path = _resolved_path(normalized) is None
+    payload, geometry = cast(
+        RequirementsPublicPayload,
+        thaw(db.get(requirements_public_payload, normalized)),
     )
+    if invalid_path:
+        return _invalid_path_analysis(normalized)
     path_str, reqs, refs, indices, diagnostics = payload
-    ranges = _logical_line_ranges(requirements_file_text(db, normalized))
+    ranges = _decode_geometry(geometry)
     return RequirementsAnalysis(
         path=path_str,
         requirements=tuple(_decode_requirement(r, ranges) for r in reqs),
@@ -515,6 +608,7 @@ def requirements_analysis(db: Database, path: str | os.PathLike[str]) -> Require
     )
 
 
+@_layer3_entrypoint
 def workspace_requirements_analysis(
     db: Database, root: str | os.PathLike[str]
 ) -> RequirementsAnalysis | None:
@@ -526,6 +620,7 @@ def workspace_requirements_analysis(
     return None
 
 
+@_layer3_entrypoint
 def deep_requirements_analysis(db: Database, path: str | os.PathLike[str]) -> RequirementsAnalysis:
     """Follow -r/--requirement references recursively, merging all requirements.
 
@@ -533,7 +628,11 @@ def deep_requirements_analysis(db: Database, path: str | os.PathLike[str]) -> Re
     file in the chain, merges results.  Cycle detection via canonical path set.
     Constraint files (-c) are noted as file references but not followed.
     """
-    root = Path(os.fspath(path)).resolve()
+    raw_root = os.fspath(path)
+    resolved_root = _resolved_path(raw_root)
+    if resolved_root is None:
+        return _invalid_path_analysis(raw_root)
+    root = Path(resolved_root)
     project_root = root.parent
     all_requirements: dict[str, RequirementRef] = {}
     all_file_references: list[FileReference] = []
@@ -543,7 +642,15 @@ def deep_requirements_analysis(db: Database, path: str | os.PathLike[str]) -> Re
     active: set[str] = set()
 
     def _walk(file_path: Path) -> None:
-        canonical = str(file_path.resolve())
+        canonical = _resolved_path(str(file_path))
+        if canonical is None:
+            all_diagnostics.append(
+                (
+                    "invalid-requirements-path",
+                    f"requirements path cannot resolve: {str(file_path)!r}",
+                )
+            )
+            return
         if canonical in visited:
             return
         if canonical in active:
@@ -573,7 +680,16 @@ def deep_requirements_analysis(db: Database, path: str | os.PathLike[str]) -> Re
                 ref_path = Path(ref.path)
                 if not ref_path.is_absolute():
                     ref_path = file_path.parent / ref_path
-                ref_path = ref_path.resolve()
+                resolved_reference = _resolved_path(str(ref_path))
+                if resolved_reference is None:
+                    all_diagnostics.append(
+                        (
+                            "invalid-requirements-path",
+                            f"-r path cannot resolve: {ref.path!r}",
+                        )
+                    )
+                    continue
+                ref_path = Path(resolved_reference)
                 try:
                     ref_path.relative_to(project_root)
                 except ValueError:

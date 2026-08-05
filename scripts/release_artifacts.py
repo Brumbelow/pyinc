@@ -8,18 +8,43 @@ import json
 import os
 import re
 import sys
+import zipfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, NoReturn
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any, NoReturn
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+if TYPE_CHECKING:
+    from scripts import reproducible_builds
+else:
+    try:
+        from scripts import reproducible_builds
+    except ModuleNotFoundError:
+        import reproducible_builds
 
 _PROJECT_NAME = "pyinc"
 _VERSION_PATTERN = re.compile(r"[0-9]+(?:\.[0-9]+){2}(?:(?:a|b|rc)[0-9]+)?")
 _REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _CHECKSUM_LINE_PATTERN = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+-]*)")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_BENCHMARK_CHECKSUM_NAME = "BENCHMARK-SHA256SUMS"
+_DEMO_CHECKSUM_NAME = "DEMO-SHA256SUMS"
+_BENCHMARK_MEMBER_NAMES = frozenset(
+    {
+        "samples.csv",
+        "benchmark.csv",
+        "benchmark.md",
+        "metadata.json",
+        "command.txt",
+        "SHA256SUMS",
+    }
+)
+_MAX_BENCHMARK_MEMBER_BYTES = 128 * 1024 * 1024
+_MAX_BENCHMARK_TOTAL_BYTES = 256 * 1024 * 1024
+_MAX_DEMO_MEMBER_BYTES = 64 * 1024 * 1024
+_MAX_DEMO_TOTAL_BYTES = 256 * 1024 * 1024
 
 
 class ReleaseArtifactError(ValueError):
@@ -50,6 +75,23 @@ def distribution_names(version: str) -> tuple[str, str]:
 
     version = _validated_version(version)
     return (f"pyinc-{version}.tar.gz", f"pyinc-{version}-py3-none-any.whl")
+
+
+def benchmark_evidence_names(version: str) -> tuple[str, str]:
+    """Return the canonical benchmark bundle and checksum asset names."""
+    version = _validated_version(version)
+    return (f"pyinc-{version}-benchmark-evidence.zip", _BENCHMARK_CHECKSUM_NAME)
+
+
+def demo_evidence_names(version: str) -> tuple[str, str]:
+    """Return the canonical demo bundle and checksum asset names."""
+    version = _validated_version(version)
+    return (f"pyinc-{version}-demo-evidence.zip", _DEMO_CHECKSUM_NAME)
+
+
+def build_metadata_names(version: str) -> tuple[str, str, str]:
+    """Return the provenance, SBOM, and build-metadata checksum asset names."""
+    return reproducible_builds.metadata_names(_validated_version(version))
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -139,7 +181,10 @@ def extract_release_notes(changelog: str, version: str) -> str:
     if len(starts) != 1:
         _reject(f"CHANGELOG.md must contain exactly one {version} release section")
     start = starts[0]
-    if re.fullmatch(rf"## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}", lines[start]) is None:
+    if (
+        re.fullmatch(rf"## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}", lines[start])
+        is None
+    ):
         _reject(f"the {version} release heading must include an ISO date")
     end = next(
         (index for index in range(start + 1, len(lines)) if lines[index].startswith("## [")),
@@ -247,7 +292,7 @@ def _pypi_artifacts(document: Mapping[str, object], version: str) -> dict[str, P
 
 def _github_assets(
     document: Mapping[str, object], version: str
-) -> tuple[dict[str, PublishedArtifact], PublishedArtifact]:
+) -> tuple[dict[str, PublishedArtifact], PublishedArtifact, dict[str, PublishedArtifact]]:
     tag = f"v{version}"
     if _string(document, "tag_name", "GitHub Release") != tag:
         _reject("GitHub Release tag does not match the requested version")
@@ -259,7 +304,14 @@ def _github_assets(
     raw_assets = document.get("assets")
     if not isinstance(raw_assets, list):
         _reject("GitHub Release assets must be a JSON array")
-    expected_names = frozenset((*distribution_names(version), "SHA256SUMS"))
+    evidence_names = frozenset(
+        (
+            *benchmark_evidence_names(version),
+            *demo_evidence_names(version),
+            *build_metadata_names(version),
+        )
+    )
+    expected_names = frozenset((*distribution_names(version), "SHA256SUMS", *evidence_names))
     assets: dict[str, PublishedArtifact] = {}
     for raw_asset in raw_assets:
         asset = _object(raw_asset, "GitHub Release asset")
@@ -284,9 +336,164 @@ def _github_assets(
             sha256=digest,
         )
     if frozenset(assets) != expected_names:
-        _reject("GitHub Release must contain exactly the sdist, wheel, and SHA256SUMS")
+        _reject(
+            "GitHub Release must contain exactly the distributions, distribution "
+            "checksums, demo evidence, benchmark evidence, and build metadata"
+        )
     checksum_asset = assets.pop("SHA256SUMS")
-    return assets, checksum_asset
+    evidence = {name: assets.pop(name) for name in evidence_names}
+    return assets, checksum_asset, evidence
+
+
+def verify_benchmark_evidence(version: str, bundle_path: Path, checksum_path: Path) -> None:
+    """Verify the external bundle hash and every member's internal hash."""
+    bundle_name, checksum_name = benchmark_evidence_names(version)
+    if bundle_path.name != bundle_name or checksum_path.name != checksum_name:
+        _reject("benchmark evidence assets do not use their canonical names")
+    checksums = parse_checksums(checksum_path.read_bytes())
+    if checksums != {bundle_name: _sha256_file(bundle_path)}:
+        _reject("benchmark evidence bundle does not match BENCHMARK-SHA256SUMS")
+
+    try:
+        with zipfile.ZipFile(bundle_path) as archive:
+            infos = archive.infolist()
+            names = [info.filename for info in infos]
+            if len(names) != len(set(names)) or frozenset(names) != _BENCHMARK_MEMBER_NAMES:
+                _reject("benchmark evidence bundle has missing, duplicate, or extra members")
+            if any(
+                info.is_dir()
+                or "/" in info.filename
+                or "\\" in info.filename
+                or info.file_size > _MAX_BENCHMARK_MEMBER_BYTES
+                for info in infos
+            ):
+                _reject("benchmark evidence bundle contains an unsafe member")
+            if sum(info.file_size for info in infos) > _MAX_BENCHMARK_TOTAL_BYTES:
+                _reject("benchmark evidence bundle exceeds its total size limit")
+            internal = parse_checksums(archive.read("SHA256SUMS"))
+            expected_internal = _BENCHMARK_MEMBER_NAMES - {"SHA256SUMS"}
+            if frozenset(internal) != expected_internal:
+                _reject("benchmark evidence internal SHA256SUMS is incomplete")
+            for name, digest in internal.items():
+                if _sha256_bytes(archive.read(name)) != digest:
+                    _reject(f"benchmark evidence member hash mismatch: {name}")
+    except zipfile.BadZipFile as exc:
+        _reject(f"benchmark evidence bundle is not a valid zip file: {exc}")
+
+
+def _parse_evidence_checksums(document: bytes) -> dict[str, str]:
+    try:
+        lines = document.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        _reject("evidence SHA256SUMS must be ASCII")
+    checksums: dict[str, str] = {}
+    for line in lines:
+        if "  " not in line:
+            _reject(f"malformed evidence SHA256SUMS line: {line!r}")
+        digest, name = line.split("  ", 1)
+        path = PurePosixPath(name)
+        if (
+            _SHA256_PATTERN.fullmatch(digest) is None
+            or not name
+            or path.is_absolute()
+            or ".." in path.parts
+            or "\\" in name
+            or name in checksums
+        ):
+            _reject(f"malformed evidence SHA256SUMS line: {line!r}")
+        checksums[name] = digest
+    if not checksums:
+        _reject("evidence SHA256SUMS must not be empty")
+    return checksums
+
+
+def verify_demo_evidence(version: str, bundle_path: Path, checksum_path: Path) -> None:
+    """Verify the demo bundle, metadata, raw runs, and both checksum layers."""
+    bundle_name, checksum_name = demo_evidence_names(version)
+    if bundle_path.name != bundle_name or checksum_path.name != checksum_name:
+        _reject("demo evidence assets do not use their canonical names")
+    checksums = parse_checksums(checksum_path.read_bytes())
+    if checksums != {bundle_name: _sha256_file(bundle_path)}:
+        _reject("demo evidence bundle does not match DEMO-SHA256SUMS")
+
+    try:
+        with zipfile.ZipFile(bundle_path) as archive:
+            infos = archive.infolist()
+            names = [info.filename for info in infos]
+            required = {"metadata.json", "runs.json", "SHA256SUMS"}
+            if len(names) != len(set(names)) or not required <= set(names):
+                _reject("demo evidence bundle has missing or duplicate members")
+            if any(
+                info.is_dir()
+                or PurePosixPath(info.filename).is_absolute()
+                or ".." in PurePosixPath(info.filename).parts
+                or "\\" in info.filename
+                or info.file_size > _MAX_DEMO_MEMBER_BYTES
+                for info in infos
+            ):
+                _reject("demo evidence bundle contains an unsafe member")
+            if sum(info.file_size for info in infos) > _MAX_DEMO_TOTAL_BYTES:
+                _reject("demo evidence bundle exceeds its total size limit")
+            internal = _parse_evidence_checksums(archive.read("SHA256SUMS"))
+            expected_internal = set(names) - {"SHA256SUMS"}
+            if set(internal) != expected_internal:
+                _reject("demo evidence internal SHA256SUMS is incomplete")
+            for name, digest in internal.items():
+                if _sha256_bytes(archive.read(name)) != digest:
+                    _reject(f"demo evidence member hash mismatch: {name}")
+
+            metadata = _object(json.loads(archive.read("metadata.json")), "demo metadata")
+            if metadata.get("schema_version") != 1 or metadata.get("evidence_kind") != "pyinc-demo":
+                _reject("demo evidence metadata schema or kind is invalid")
+            if metadata.get("release_version") != version:
+                _reject("demo evidence version does not match the release")
+            commit = metadata.get("commit_sha")
+            if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+                _reject("demo evidence commit_sha is invalid")
+            if metadata.get("working_tree_dirty") is not False:
+                _reject("release demo evidence must record a clean working tree")
+            if not isinstance(metadata.get("generated_at_utc"), str):
+                _reject("demo evidence generated_at_utc is missing")
+            distributions = metadata.get("distribution_snapshot")
+            if not isinstance(distributions, list) or not any(
+                isinstance(item, dict)
+                and item.get("normalized_name") == "pyinc"
+                and item.get("version") == version
+                for item in distributions
+            ):
+                _reject("demo evidence does not identify the release distribution")
+
+            runs = json.loads(archive.read("runs.json"))
+            if not isinstance(runs, list) or metadata.get("example_count") != len(runs):
+                _reject("demo evidence run count does not match metadata")
+            examples: set[str] = set()
+            for index, raw_run in enumerate(runs):
+                run = _object(raw_run, f"demo run {index}")
+                example = run.get("example")
+                if (
+                    not isinstance(example, str)
+                    or not example.startswith("examples/")
+                    or "/" in example.removeprefix("examples/")
+                    or not example.endswith(".py")
+                    or example in examples
+                ):
+                    _reject(f"demo run {index} has an invalid example path")
+                examples.add(example)
+                if run.get("exit_code") != 0:
+                    _reject(f"demo run {example} did not succeed")
+                for stream_name in ("stdout", "stderr"):
+                    stream = _object(run.get(stream_name), f"demo run {index} {stream_name}")
+                    stream_path = stream.get("path")
+                    if not isinstance(stream_path, str) or stream_path not in expected_internal:
+                        _reject(f"demo run {index} has an invalid {stream_name} path")
+    except (
+        KeyError,
+        RuntimeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+    ) as exc:
+        _reject(f"demo evidence bundle is corrupt: {type(exc).__name__}: {exc}")
 
 
 def verify_pypi_artifacts(version: str, directory: Path) -> None:
@@ -314,11 +521,10 @@ def verify_published_artifacts(
         _reject(f"invalid GitHub repository: {repository!r}")
     pypi_url = f"https://pypi.org/pypi/{_PROJECT_NAME}/{quote(version, safe='')}/json"
     github_url = (
-        f"https://api.github.com/repos/{repository}/releases/tags/"
-        f"{quote(f'v{version}', safe='')}"
+        f"https://api.github.com/repos/{repository}/releases/tags/{quote(f'v{version}', safe='')}"
     )
     pypi = _pypi_artifacts(_request_json(pypi_url), version)
-    github, checksum_asset = _github_assets(
+    github, checksum_asset, evidence_assets = _github_assets(
         _request_json(github_url, token=github_token), version
     )
 
@@ -346,25 +552,107 @@ def verify_published_artifacts(
         if digest != checksums[artifact.name]:
             _reject(f"SHA256SUMS does not match {artifact.name}")
 
+    downloaded_evidence: dict[str, Path] = {}
+    for artifact in evidence_assets.values():
+        path = output_directory / "github" / artifact.name
+        digest = _download(artifact.url, path)
+        if artifact.sha256 is not None and digest != artifact.sha256:
+            _reject(f"downloaded GitHub sha256 does not match metadata for {artifact.name}")
+        downloaded_evidence[artifact.name] = path
+    benchmark_bundle, benchmark_checksums = benchmark_evidence_names(version)
+    verify_benchmark_evidence(
+        version,
+        downloaded_evidence[benchmark_bundle],
+        downloaded_evidence[benchmark_checksums],
+    )
+    demo_bundle, demo_checksums = demo_evidence_names(version)
+    verify_demo_evidence(
+        version,
+        downloaded_evidence[demo_bundle],
+        downloaded_evidence[demo_checksums],
+    )
+    reproducible_builds.verify_metadata_outputs(
+        output_directory / "github",
+        output_directory / "github",
+        version,
+        exact_directories=False,
+    )
+
+
+def verify_prepared_assets(
+    version: str,
+    local_directory: Path,
+    checksum_path: Path,
+    benchmark_directory: Path,
+    demo_directory: Path,
+    build_metadata_directory: Path,
+) -> None:
+    """Verify every local asset that must exist before publication starts."""
+    _local_distributions(local_directory, version)
+    verify_checksums(local_directory, version, checksum_path)
+    benchmark_names = benchmark_evidence_names(version)
+    if not benchmark_directory.is_dir() or frozenset(
+        path.name for path in benchmark_directory.iterdir() if path.is_file()
+    ) != frozenset(benchmark_names):
+        _reject("local benchmark evidence assets are incomplete or contain extras")
+    verify_benchmark_evidence(
+        version,
+        benchmark_directory / benchmark_names[0],
+        benchmark_directory / benchmark_names[1],
+    )
+    demo_names = demo_evidence_names(version)
+    if not demo_directory.is_dir() or frozenset(
+        path.name for path in demo_directory.iterdir() if path.is_file()
+    ) != frozenset(demo_names):
+        _reject("local demo evidence assets are incomplete or contain extras")
+    verify_demo_evidence(
+        version,
+        demo_directory / demo_names[0],
+        demo_directory / demo_names[1],
+    )
+    reproducible_builds.verify_metadata_outputs(local_directory, build_metadata_directory, version)
+
 
 def verify_remote_assets(
     version: str,
     local_directory: Path,
     checksum_path: Path,
+    benchmark_directory: Path,
+    demo_directory: Path,
+    build_metadata_directory: Path,
     remote_directory: Path,
 ) -> None:
     """Verify a downloaded GitHub Release asset set against the local release files."""
 
+    verify_prepared_assets(
+        version,
+        local_directory,
+        checksum_path,
+        benchmark_directory,
+        demo_directory,
+        build_metadata_directory,
+    )
     local_artifacts = _local_distributions(local_directory, version)
-    verify_checksums(local_directory, version, checksum_path)
-    expected_names = frozenset((*distribution_names(version), "SHA256SUMS"))
+    benchmark_names = benchmark_evidence_names(version)
+    benchmark_paths = tuple(benchmark_directory / name for name in benchmark_names)
+    demo_names = demo_evidence_names(version)
+    demo_paths = tuple(demo_directory / name for name in demo_names)
+    metadata_names = build_metadata_names(version)
+    metadata_paths = tuple(build_metadata_directory / name for name in metadata_names)
+    expected_names = frozenset(
+        (
+            *distribution_names(version),
+            "SHA256SUMS",
+            *benchmark_names,
+            *demo_names,
+            *metadata_names,
+        )
+    )
     if not remote_directory.is_dir():
         _reject(f"remote asset directory does not exist: {remote_directory}")
-    observed_names = frozenset(
-        path.name for path in remote_directory.iterdir() if path.is_file()
-    )
+    observed_names = frozenset(path.name for path in remote_directory.iterdir() if path.is_file())
     if observed_names != expected_names:
-        _reject("GitHub Release must contain exactly the sdist, wheel, and SHA256SUMS")
+        _reject("GitHub Release does not contain the exact release asset set")
 
     remote_checksum_path = remote_directory / "SHA256SUMS"
     if remote_checksum_path.read_bytes() != checksum_path.read_bytes():
@@ -380,6 +668,35 @@ def verify_remote_assets(
             _reject(f"GitHub Release asset differs from the verified build: {local_path.name}")
         if remote_checksums[local_path.name] != local_digest:
             _reject(f"GitHub Release SHA256SUMS does not match {local_path.name}")
+
+    for local_path in benchmark_paths:
+        remote_path = remote_directory / local_path.name
+        if _sha256_file(remote_path) != _sha256_file(local_path):
+            _reject(f"GitHub Release asset differs from benchmark evidence: {local_path.name}")
+    verify_benchmark_evidence(
+        version,
+        remote_directory / benchmark_names[0],
+        remote_directory / benchmark_names[1],
+    )
+    for local_path in demo_paths:
+        remote_path = remote_directory / local_path.name
+        if _sha256_file(remote_path) != _sha256_file(local_path):
+            _reject(f"GitHub Release asset differs from demo evidence: {local_path.name}")
+    verify_demo_evidence(
+        version,
+        remote_directory / demo_names[0],
+        remote_directory / demo_names[1],
+    )
+    for local_path in metadata_paths:
+        remote_path = remote_directory / local_path.name
+        if _sha256_file(remote_path) != _sha256_file(local_path):
+            _reject(f"GitHub Release asset differs from build metadata: {local_path.name}")
+    reproducible_builds.verify_metadata_outputs(
+        remote_directory,
+        remote_directory,
+        version,
+        exact_directories=False,
+    )
 
 
 def verify_release_state(
@@ -462,7 +779,20 @@ def _parser() -> argparse.ArgumentParser:
     remote.add_argument("--version", required=True)
     remote.add_argument("--directory", type=Path, required=True)
     remote.add_argument("--checksums", type=Path, required=True)
+    remote.add_argument("--benchmark-directory", type=Path, required=True)
+    remote.add_argument("--demo-directory", type=Path, required=True)
+    remote.add_argument("--build-metadata-directory", type=Path, required=True)
     remote.add_argument("--remote-directory", type=Path, required=True)
+
+    prepared = subparsers.add_parser(
+        "verify-prepared-assets", help="verify every asset before publication"
+    )
+    prepared.add_argument("--version", required=True)
+    prepared.add_argument("--directory", type=Path, required=True)
+    prepared.add_argument("--checksums", type=Path, required=True)
+    prepared.add_argument("--benchmark-directory", type=Path, required=True)
+    prepared.add_argument("--demo-directory", type=Path, required=True)
+    prepared.add_argument("--build-metadata-directory", type=Path, required=True)
 
     state = subparsers.add_parser(
         "verify-release-state", help="verify published GitHub Release metadata"
@@ -497,7 +827,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.version,
                 arguments.directory,
                 arguments.checksums,
+                arguments.benchmark_directory,
+                arguments.demo_directory,
+                arguments.build_metadata_directory,
                 arguments.remote_directory,
+            )
+        elif arguments.command == "verify-prepared-assets":
+            verify_prepared_assets(
+                arguments.version,
+                arguments.directory,
+                arguments.checksums,
+                arguments.benchmark_directory,
+                arguments.demo_directory,
+                arguments.build_metadata_directory,
             )
         elif arguments.command == "verify-release-state":
             verify_release_state(

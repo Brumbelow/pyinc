@@ -32,14 +32,13 @@ _sys_trace = _SysTrace()
 
 def _install_counter(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     # Swapping in a counting replacement for identifier_tokens won't work:
-    # pyinc's query layer fingerprints every callable a query transitively
-    # reaches, including a monkeypatched one, and folds in any mutable state
-    # it closes over so a changed source module can't hide behind it (see
-    # "Mutable closure/global rejection" in docs/kernel-contract.md). That
-    # means the counter's own value would become part of source_ranges_for_file's
-    # identity and change it on every increment, defeating the very caching
-    # this test verifies. A trace hook counts real calls to the original,
-    # untouched function without pyinc ever seeing it.
+    # pyinc's static capture analysis fingerprints each statically reachable
+    # callable, including a monkeypatched one, and folds in directly discovered
+    # mutable state it closes over (see "Static capture analysis" in
+    # docs/kernel-contract.md). That makes the counter's value part of
+    # source_ranges_for_file's identity and changes it on every increment,
+    # defeating the caching this test verifies. A trace hook counts real calls
+    # to the original, untouched function without pyinc ever seeing it.
     counter = {"n": 0}
     target_code = identifier_tokens.__code__
 

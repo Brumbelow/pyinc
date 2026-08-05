@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
+import io
 
-from pyinc.resources import _read_file, _reads_as_missing
+from pyinc.resources import _read_file
 
 FileProbe = tuple[str, str] | tuple[str]
 
@@ -34,16 +34,17 @@ def file_probe(path: str) -> FileProbe:
 def file_text(path: str, encoding: str) -> str | None:
     """Read a text resource, reporting an unreadable kind as absent.
 
-    Decoding is left to ``Path.read_text`` so a load keeps the newline handling
-    it has always had; ``file_read_snapshot`` decodes the bytes it hashed.
+    The shared byte reader performs the nonblocking-open and descriptor-kind
+    check. ``TextIOWrapper`` preserves ``Path.read_text``'s universal-newline
+    behavior for direct ``load`` calls; ``file_read_snapshot`` decodes the
+    exact bytes it hashed, as before.
     """
 
-    try:
-        return Path(path).read_text(encoding=encoding)
-    except OSError as exc:
-        if _reads_as_missing(path, exc):
-            return None
-        raise
+    raw = file_bytes(path)
+    if raw is None:
+        return None
+    with io.TextIOWrapper(io.BytesIO(raw), encoding=encoding) as handle:
+        return handle.read()
 
 
 def file_read_snapshot(path: str, encoding: str) -> tuple[FileProbe, str | None]:

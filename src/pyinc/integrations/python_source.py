@@ -13,10 +13,10 @@ from pyinc._python_lexing import identifier_tokens
 from pyinc.core import query
 from pyinc.integrations.deep_module_resolution import resolve_module_location
 from pyinc.integrations.installed_packages import environment_index
-from pyinc.resources import DirectoryResource, ResolvedPathResource
+from pyinc.resources import DirectoryResource, ResolvedPathResource, _open_regular_file
 from pyinc.runtime import Database
 
-from ._decoding import decoded, once_per_request
+from ._decoding import _layer3_entrypoint, decoded, once_per_request
 from ._resources import file_bytes, file_probe
 from .source_geometry import (
     DocumentMap,
@@ -197,6 +197,41 @@ _FILES = _SourceTextResource()
 _DIRECTORIES = DirectoryResource()
 _RESOLVED = ResolvedPathResource()
 _AST_TYPE_ALIAS = getattr(ast, "TypeAlias", None)
+
+
+@dataclass(frozen=True)
+class _RegularSourceFileResource:
+    """Track whether a discovered source path opens as a regular file."""
+
+    def read(self, db: Database, path: str | os.PathLike[str]) -> bool:
+        return cast(bool, db.read_resource(self, os.fspath(path)))
+
+    def label(self, path: str) -> str:
+        return f"regular-source-file[{path}]"
+
+    def probe(self, path: str) -> tuple[bool]:
+        return (_is_regular_source_file(path),)
+
+    def load(self, db: Database, path: str) -> bool:
+        return _is_regular_source_file(path)
+
+    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[bool], bool]:
+        value = _is_regular_source_file(path)
+        return (value,), value
+
+    def identity(self) -> str:
+        return "regular-source-file-v1"
+
+
+def _is_regular_source_file(path: str) -> bool:
+    descriptor = _open_regular_file(path)
+    if descriptor is None:
+        return False
+    os.close(descriptor)
+    return True
+
+
+_REGULAR_SOURCE_FILES = _RegularSourceFileResource()
 
 
 def _is_type_alias(node: ast.AST) -> bool:
@@ -616,7 +651,7 @@ def _collect_python_files(
         try:
             child_entries = _DIRECTORIES.read(db, child)
         except NotADirectoryError:
-            if name.endswith(".py"):
+            if name.endswith(".py") and _REGULAR_SOURCE_FILES.read(db, child):
                 python_files.append(child)
             continue
         if canonical_child in visited_directories:
@@ -634,7 +669,7 @@ def _collect_python_files(
     return tuple(python_files)
 
 
-@query(cutoff=_source_cutoff_token)
+@query
 def source_text(db: Database, path: str) -> str:
     # Deliberately not memoized per request: query bodies read the source
     # through here, and answering one from an earlier call would rob the second
@@ -685,10 +720,7 @@ def source_ranges_for_file(db: Database, path: str) -> FileSourceRangesPayload:
             )
     return (
         tuple(sorted(import_ranges.items())),
-        tuple(
-            (line, name, payload)
-            for (line, name), payload in sorted(definition_ranges.items())
-        ),
+        tuple((line, name, payload) for (line, name), payload in sorted(definition_ranges.items())),
         None,
     )
 
@@ -1026,7 +1058,13 @@ def workspace_analysis_payload(db: Database, root: str) -> WorkspaceAnalysisPayl
 def directory_analysis_payload(db: Database, root: str) -> DirectoryAnalysisPayload:
     entries = _DIRECTORIES.read(db, root)
     base = Path(root)
-    python_files = tuple(str(base / name) for name in entries if name.endswith(".py"))
+    python_files = tuple(
+        path
+        for name in entries
+        if name.endswith(".py")
+        for path in (str(base / name),)
+        if _REGULAR_SOURCE_FILES.read(db, path)
+    )
     return tuple(file_analysis_payload(db, path) for path in python_files)
 
 
@@ -1140,9 +1178,7 @@ def _apply_file_source_ranges(
         definitions=tuple(
             replace(
                 item,
-                range=definition_ranges.get(
-                    (item.range.start.line + 1, item.name), item.range
-                ),
+                range=definition_ranges.get((item.range.start.line + 1, item.name), item.range),
             )
             for item in analysis.definitions
         ),
@@ -1200,23 +1236,25 @@ def _decoded_module_analysis(
 # leaves such a value as plain tuples, so what `db.get` hands back in any mode is
 # already the payload. Thawing it again only walks and copies the whole tree --
 # on a workspace-sized request that copy dominated the cost of decoding.
+@_layer3_entrypoint
 def file_analysis(db: Database, path: str | os.PathLike[str]) -> PythonFileAnalysis:
     normalized_path = _normalize_path(path)
     payload = db.get(file_analysis_payload, normalized_path)
     return _decoded_file_analysis(db, payload, source_ranges_for_file(db, normalized_path))
 
 
+@_layer3_entrypoint
 def directory_analysis(
     db: Database, root: str | os.PathLike[str]
 ) -> tuple[PythonFileAnalysis, ...]:
     normalized_root = _normalize_path(root)
     payload = db.get(directory_analysis_payload, normalized_root)
     return tuple(
-        _decoded_file_analysis(db, item, source_ranges_for_file(db, item[0]))
-        for item in payload
+        _decoded_file_analysis(db, item, source_ranges_for_file(db, item[0])) for item in payload
     )
 
 
+@_layer3_entrypoint
 def module_analysis(
     db: Database, root: str | os.PathLike[str], path: str | os.PathLike[str]
 ) -> PythonModuleAnalysis:
@@ -1230,7 +1268,9 @@ def module_analysis(
     )
 
 
-def _module_analysis(db: Database, normalized_root: str, normalized_path: str) -> PythonModuleAnalysis:
+def _module_analysis(
+    db: Database, normalized_root: str, normalized_path: str
+) -> PythonModuleAnalysis:
     workspace_files = db.get(workspace_python_files, normalized_root)
     if normalized_path not in workspace_files:
         raise ValueError(
@@ -1240,6 +1280,7 @@ def _module_analysis(db: Database, normalized_root: str, normalized_path: str) -
     return _decoded_module_analysis(db, payload, source_ranges_for_file(db, normalized_path))
 
 
+@_layer3_entrypoint
 def workspace_analysis(db: Database, root: str | os.PathLike[str]) -> PythonWorkspaceAnalysis:
     normalized_root = _normalize_path(root)
     return once_per_request(

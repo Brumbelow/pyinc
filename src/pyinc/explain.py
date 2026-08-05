@@ -36,6 +36,8 @@ class InspectionNode:
 
 @dataclass(frozen=True)
 class CaptureInfo:
+    """Classification of one statically discoverable function capture."""
+
     name: str
     origin: str
     type_name: str
@@ -233,10 +235,10 @@ def _classify_capture(name: str, value: Any, origin: str) -> CaptureInfo:
         elif origin == "annotation_evaluator" and isinstance(value, FunctionType):
             kind = "annotation"
             database._annotation_evaluator_payload(value, set())
-        elif isinstance(value, Query):
+        elif type(value) is Query:
             kind = "query"
             database._query_fingerprint(value)
-        elif isinstance(value, Input):
+        elif type(value) is Input:
             kind = "input"
             database._input_policy_digest(value)
         elif _is_resource_handle(value):
@@ -278,9 +280,15 @@ def _classify_capture(name: str, value: Any, origin: str) -> CaptureInfo:
 
 
 def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
+    """Classify captures discoverable through static function inspection.
+
+    Dynamic namespace and reflection paths such as ``globals()[name]`` are not
+    resolved by this preflight and therefore do not appear in its result.
+    """
+
     from .core import Query
 
-    target = fn_or_query.fn if isinstance(fn_or_query, Query) else fn_or_query
+    target = fn_or_query.fn if type(fn_or_query) is Query else fn_or_query
     if not isinstance(target, FunctionType):
         raise TypeError("explain_query_captures() expects a function or @query-decorated callable.")
 

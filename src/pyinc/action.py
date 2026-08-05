@@ -67,6 +67,7 @@ class ReconcileResult:
     deleted: tuple[str, ...]
     unchanged: tuple[str, ...]
     dry_run: bool
+    would_delete: tuple[str, ...] = ()
 
 
 def _content_hash(data: bytes) -> str:
@@ -166,8 +167,10 @@ def _root_incarnation(root: Path) -> list[int] | None:
     """
     try:
         metadata = root.stat()
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as error:
+        raise ActionPathError(f"Cannot inspect action root incarnation {root}: {error}") from error
     return [metadata.st_dev, metadata.st_ino]
 
 
@@ -186,12 +189,12 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _read_manifest(
     state_dir: Path, tool: str, root_digest: str, root: Path
-) -> tuple[bool, dict[str, str]]:
+) -> tuple[bool, dict[str, str], bool]:
     path = _manifest_path(state_dir, tool)
     try:
         raw = read_regular_file(path)
         if raw is None:
-            return False, {}
+            return False, {}, False
         data = json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
     except ActionManifestError:
         raise
@@ -218,19 +221,6 @@ def _read_manifest(
         or any(type(item) is not int for item in recorded_incarnation)
     ):
         raise ActionManifestError("Action manifest root incarnation is malformed.")
-    current_incarnation = _root_incarnation(root)
-    if (
-        recorded_incarnation is not None
-        and current_incarnation is not None
-        and recorded_incarnation != current_incarnation
-    ):
-        # The root was deleted and recreated at this path. The recorded claims
-        # name files in a directory that no longer exists, so they are void
-        # and the current directory is adopted fresh, deleting nothing.
-        # Detection is best-effort -- a filesystem can hand the recreated
-        # directory its old inode straight back -- which is why deletion is
-        # additionally digest-verified where the claims are consumed.
-        return True, {}
     raw_outputs = data["outputs"]
     if not isinstance(raw_outputs, dict):
         raise ActionManifestError("Action manifest outputs must be an object.")
@@ -253,7 +243,16 @@ def _read_manifest(
                 f"Action manifest contains an invalid SHA-256 digest for {path_key!r}."
             )
         outputs[path_key] = raw_digest
-    return True, outputs
+    current_incarnation = _root_incarnation(root)
+    if (
+        recorded_incarnation is not None
+        and current_incarnation is not None
+        and recorded_incarnation != current_incarnation
+    ):
+        # Validation precedes adoption: a root change voids only an otherwise
+        # valid ledger.  Malformed paths or digests remain typed failures.
+        return True, {}, True
+    return True, outputs, False
 
 
 def _write_manifest(
@@ -281,6 +280,8 @@ def _atomic_write(target: Path, data: bytes) -> None:
         atomic_write(target, data)
     except UnsafeFilesystemPathError as error:
         raise ActionPathError(str(error)) from error
+    except OSError as error:
+        raise ActionPathError(f"Cannot atomically publish action file {target}: {error}") from error
 
 
 def _lock_path(root: Path, tool: str) -> Path:
@@ -296,17 +297,28 @@ def _action_lock_directory() -> Path:
         user_identity = hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
     else:
         user_identity = str(uid)
-    temp_directory = Path(tempfile.gettempdir()).resolve(strict=True)
+    try:
+        temp_directory = Path(tempfile.gettempdir()).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ActionPathError(f"Action lock directory is invalid: {error}") from error
     directory = temp_directory / f"pyinc-action-locks-{user_identity}"
-    with contextlib.suppress(FileExistsError):
-        directory.mkdir(mode=0o700)
-    metadata = directory.lstat()
+    try:
+        with contextlib.suppress(FileExistsError):
+            directory.mkdir(mode=0o700)
+        metadata = directory.lstat()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ActionPathError(f"Cannot safely inspect action lock directory: {error}") from error
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise ActionPathError(f"Action lock path is not a directory: {directory}")
     if uid is not None and metadata.st_uid != uid:
         raise ActionPathError(f"Action lock path is owned by another user: {directory}")
     if uid is not None and stat.S_IMODE(metadata.st_mode) & 0o077:
-        directory.chmod(0o700)
+        try:
+            directory.chmod(0o700)
+        except OSError as error:
+            raise ActionPathError(
+                f"Cannot safely set action lock directory permissions: {error}"
+            ) from error
     return directory
 
 
@@ -338,7 +350,12 @@ def _safe_target(root: Path, relative: str) -> tuple[Path, os.stat_result | None
         elif not stat.S_ISDIR(metadata.st_mode):
             raise ActionPathError(f"Owned output parent is not a directory: {relative!r}")
 
-    resolved_parent = target.parent.resolve(strict=False)
+    try:
+        resolved_parent = target.parent.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ActionPathError(
+            f"Cannot safely resolve owned output path {relative!r}: {error}"
+        ) from error
     try:
         resolved_common = os.path.commonpath((os.fspath(root), os.fspath(resolved_parent)))
     except ValueError as error:
@@ -355,13 +372,45 @@ def _orphan_cannot_exist(root: Path, relative: str) -> bool:
         current = current / part
         try:
             metadata = current.lstat()
-        except OSError:
+        except FileNotFoundError:
             return False
+        except OSError as error:
+            raise ActionPathError(
+                f"Cannot inspect parent of owned output {relative!r}: {error}"
+            ) from error
         if stat.S_ISLNK(metadata.st_mode):
             return False
         if not stat.S_ISDIR(metadata.st_mode):
             return True
     return False
+
+
+def _reject_interrupted_deletion_quarantine(target: Path, relative: str) -> None:
+    """Fail closed when a prior process died with an orphan quarantined.
+
+    An in-process failure restores the leaf in ``_safe_fs``. A process death can
+    leave the private directory behind, and the random quarantine name carries
+    too little authenticated metadata to decide automatically whether its
+    payload should be restored or deleted. Preserve it and the old ledger for
+    operator review instead of silently adopting the missing live path.
+    """
+
+    try:
+        with os.scandir(target.parent) as entries:
+            candidates = [entry for entry in entries if entry.name.startswith(".pyinc-delete-")]
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ActionPathError(
+            f"Cannot inspect deletion recovery state for {relative!r}: {error}"
+        ) from error
+    if not candidates:
+        return
+    names = ", ".join(sorted(entry.name for entry in candidates))
+    raise ActionPathError(
+        f"Interrupted deletion quarantine blocks {relative!r}: {names}. "
+        "Inspect the preserved payload and restore or remove it before reconciling."
+    )
 
 
 def _holds_only_desired_outputs(target: Path, relative: str, desired: Collection[str]) -> bool:
@@ -372,14 +421,21 @@ def _holds_only_desired_outputs(target: Path, relative: str, desired: Collection
         try:
             with os.scandir(directory) as entries:
                 listing = list(entries)
-        except OSError:
-            return False
-        for entry in listing:
-            path = f"{prefix}/{entry.name}"
-            if entry.is_dir(follow_symlinks=False):
-                pending.append((Path(entry.path), path))
-            elif not entry.is_file(follow_symlinks=False) or path not in desired:
-                return False
+        except OSError as error:
+            raise ActionPathError(
+                f"Cannot inspect migration directory {relative!r}: {error}"
+            ) from error
+        try:
+            for entry in listing:
+                path = f"{prefix}/{entry.name}"
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append((Path(entry.path), path))
+                elif not entry.is_file(follow_symlinks=False) or path not in desired:
+                    return False
+        except OSError as error:
+            raise ActionPathError(
+                f"Cannot inspect entry in migration directory {relative!r}: {error}"
+            ) from error
     return True
 
 
@@ -393,15 +449,20 @@ def _unprunable_entry(
     try:
         with os.scandir(target) as entries:
             listing = sorted(entries, key=lambda entry: entry.name)
-    except OSError:
-        return None
-    for entry in listing:
-        path = f"{relative}/{entry.name}"
-        if path in released:
-            continue
-        if _portable_path_key(path) in prune_map and entry.is_dir(follow_symlinks=False):
-            continue
-        return path
+    except OSError as error:
+        raise ActionPathError(f"Cannot inspect prunable directory {relative!r}: {error}") from error
+    try:
+        for entry in listing:
+            path = f"{relative}/{entry.name}"
+            if path in released:
+                continue
+            if _portable_path_key(path) in prune_map and entry.is_dir(follow_symlinks=False):
+                continue
+            return path
+    except OSError as error:
+        raise ActionPathError(
+            f"Cannot inspect entry in prunable directory {relative!r}: {error}"
+        ) from error
     return None
 
 
@@ -433,6 +494,9 @@ class Action:
         self.__wrapped__ = fn
 
     def outputs(self, db: Database, *args: object, **kwargs: object) -> tuple[Output, ...]:
+        from .runtime import _reject_query_context
+
+        _reject_query_context("Action.outputs()")
         return tuple(self.fn(db, *args, **kwargs))
 
     def reconcile(
@@ -446,6 +510,9 @@ class Action:
         **kwargs: object,
     ) -> ReconcileResult:
         """Validate, lock, and converge all owned outputs under ``root``."""
+        from .runtime import _reject_query_context
+
+        _reject_query_context("Action.reconcile()")
         try:
             root_text = os.fspath(root)
             state_text = os.fspath(state_dir) if state_dir is not None else root_text
@@ -455,7 +522,7 @@ class Action:
             state_path = (
                 Path(state_text).resolve(strict=False) if state_dir is not None else root_path
             )
-        except (OSError, TypeError, ValueError) as error:
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
             raise ActionPathError(f"Action root or state directory is invalid: {error}") from error
 
         for path, label in ((root_path, "owned output path"), (state_path, "action state path")):
@@ -463,7 +530,7 @@ class Action:
                 metadata = path.lstat()
             except FileNotFoundError:
                 continue
-            except (OSError, ValueError) as error:
+            except (OSError, RuntimeError, ValueError) as error:
                 raise ActionPathError(f"Cannot safely inspect {label}: {error}") from error
             if not stat.S_ISDIR(metadata.st_mode):
                 raise ActionPathError(f"Cannot safely inspect {label}: not a directory: {path}")
@@ -531,7 +598,9 @@ class Action:
         dry_run: bool,
     ) -> ReconcileResult:
         root_identity = _manifest_root_digest(root)
-        manifest_exists, previous = _read_manifest(state_dir, self.tool, root_identity, root)
+        manifest_exists, previous, adopted_root = _read_manifest(
+            state_dir, self.tool, root_identity, root
+        )
         _validate_path_set(desired, source="owned output")
 
         # A ledger entry that conflicts with the new desired layout is just an
@@ -583,13 +652,15 @@ class Action:
         targets: dict[str, tuple[Path, os.stat_result | None]] = {}
         orphan_owned: dict[str, bool] = {}
         for relative in previous_only:
+            candidate_target = root.joinpath(*relative.split("/"))
             if _orphan_cannot_exist(root, relative):
                 # A run that stopped before publishing its ledger left a file
                 # where this orphan's parent directory stood. No file can exist
                 # at the recorded path, so it is already released.
-                targets[relative] = (root.joinpath(*relative.split("/")), None)
+                targets[relative] = (candidate_target, None)
                 continue
             target, metadata = _safe_target(root, relative)
+            _reject_interrupted_deletion_quarantine(target, relative)
             if (
                 metadata is not None
                 and stat.S_ISDIR(metadata.st_mode)
@@ -615,6 +686,10 @@ class Action:
                     current = read_regular_file(target)
                 except UnsafeFilesystemPathError as error:
                     raise ActionPathError(str(error)) from error
+                except OSError as error:
+                    raise ActionPathError(
+                        f"Cannot read owned output {relative!r} during preflight: {error}"
+                    ) from error
                 orphan_owned[relative] = (
                     current is not None and _content_hash(current) == previous[relative]
                 )
@@ -691,6 +766,10 @@ class Action:
                 current = read_regular_file(target) if metadata is not None else None
             except UnsafeFilesystemPathError as error:
                 raise ActionPathError(str(error)) from error
+            except OSError as error:
+                raise ActionPathError(
+                    f"Cannot read desired output {relative!r} during preflight: {error}"
+                ) from error
             if current is not None and _content_hash(current) == desired_hashes[relative]:
                 unchanged.append(relative)
                 continue
@@ -703,14 +782,13 @@ class Action:
             else:
                 updated.append(relative)
 
-        deleted: list[str] = []
         delete_paths: list[str] = []
         for relative in previous_only:
             _, metadata = targets[relative]
             if metadata is not None and relative in deletable_orphans:
-                deleted.append(relative)
                 delete_paths.append(relative)
 
+        deleted: list[str] = []
         if not dry_run:
             # Orphans are deleted and their emptied directories pruned before
             # any write so a path can change between file and directory forms.
@@ -725,15 +803,17 @@ class Action:
                         f"Refusing to delete a non-regular owned target: {relative!r}"
                     )
                 try:
-                    # Ownership is re-verified against the recorded bytes at
-                    # the last moment, the same way the stat is: a file that
-                    # changed since preflight is not this action's anymore.
-                    current = read_regular_file(target)
-                    if current is None or _content_hash(current) != previous[relative]:
-                        continue
-                    unlink_regular_file(target)
+                    # The current directory entry is moved out of the live path
+                    # before verification.  Only that quarantined identity is
+                    # deleted, so a replacement cannot win a check/unlink race.
+                    if unlink_regular_file(target, expected_digest=previous[relative]):
+                        deleted.append(relative)
                 except UnsafeFilesystemPathError as error:
                     raise ActionPathError(str(error)) from error
+                except OSError as error:
+                    raise ActionPathError(
+                        f"Cannot safely delete owned output {relative!r}: {error}"
+                    ) from error
 
             for relative in sorted(
                 prune_map.values(), key=lambda path: path.count("/"), reverse=True
@@ -758,7 +838,11 @@ class Action:
                     )
                 _atomic_write(target, desired[relative])
 
-            if desired_hashes != previous or (desired_hashes and not manifest_exists):
+            if (
+                desired_hashes != previous
+                or (desired_hashes and not manifest_exists)
+                or adopted_root
+            ):
                 _write_manifest(state_dir, self.tool, root_identity, root, desired_hashes)
 
         return ReconcileResult(
@@ -768,6 +852,7 @@ class Action:
             deleted=tuple(deleted),
             unchanged=tuple(unchanged),
             dry_run=dry_run,
+            would_delete=tuple(delete_paths) if dry_run else (),
         )
 
     def plan(
@@ -779,6 +864,9 @@ class Action:
         lock_timeout: float | None = None,
         **kwargs: object,
     ) -> ReconcileResult:
+        from .runtime import _reject_query_context
+
+        _reject_query_context("Action.plan()")
         return self.reconcile(
             db,
             *args,

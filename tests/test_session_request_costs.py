@@ -22,12 +22,12 @@ import pytest
 import pyinc_tools.session as session_module
 from pyinc import Database
 from pyinc.integrations import _decoding
-from pyinc.integrations.python_source import workspace_analysis
+from pyinc.integrations.python_source import _workspace_analysis, workspace_analysis
 from pyinc.integrations.scope_resolution import _decode_scope_tree, scope_tree
 from pyinc.integrations.symbol_resolution import (
+    _find_references_for_symbol,
     _module_symbol_table,
     _placed_module_symbol_table,
-    find_references,
     module_symbol_table,
 )
 from pyinc_tools import WorkspaceSession
@@ -131,7 +131,7 @@ def test_overlay_edit_decodes_only_that_file(
         assert counter["n"] == 2
 
 
-def _count_workspace_analysis_fetches(
+def _count_workspace_analysis_walks(
     root: Path, importers: int, monkeypatch: pytest.MonkeyPatch
 ) -> int:
     root.mkdir(parents=True, exist_ok=True)
@@ -145,19 +145,19 @@ def _count_workspace_analysis_fetches(
         )
     with WorkspaceSession(root) as session:
         session.analyze_workspace()
-        counter = _count_calls(monkeypatch, workspace_analysis)
+        counter = _count_calls(monkeypatch, _workspace_analysis)
         session.analyze_workspace()
         return counter["n"]
 
 
-def test_workspace_analysis_fetches_do_not_scale_with_the_file_count(
+def test_workspace_analysis_walks_do_not_scale_with_the_file_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Every file that imports a workspace name has to know which of its own
     # names other modules re-export. That used to walk the workspace analysis
     # once per file; now the request walks it once for all of them.
-    small = _count_workspace_analysis_fetches(tmp_path / "small", 2, monkeypatch)
-    large = _count_workspace_analysis_fetches(tmp_path / "large", 12, monkeypatch)
+    small = _count_workspace_analysis_walks(tmp_path / "small", 2, monkeypatch)
+    large = _count_workspace_analysis_walks(tmp_path / "large", 12, monkeypatch)
     assert small == large
 
 
@@ -169,7 +169,7 @@ def test_unused_import_check_does_not_scan_the_workspace(
         # beta imports `one` and stops using it: the unused-import walk runs.
         session.set_overlay("beta.py", "from alpha import one\n\n\ndef three():\n    return 3\n")
         session.analyze_workspace()
-        counter = _count_calls(monkeypatch, find_references)
+        counter = _count_calls(monkeypatch, _find_references_for_symbol)
         assert _codes(session, "beta.py") == ["unused-import"]
         # The answer only ever depended on beta's own occurrences.
         assert counter["n"] == 0

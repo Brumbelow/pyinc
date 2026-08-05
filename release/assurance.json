@@ -1,0 +1,32 @@
+{
+  "schema_version": 3,
+  "version": "3.1.2",
+  "candidate_commit": null,
+  "status": "blocked",
+  "open_p0_p1": null,
+  "reviews": [
+    {
+      "discipline": "incremental-computation",
+      "candidate_commit": null,
+      "reviewer": null,
+      "scope": null,
+      "report": null,
+      "counterexample_corpus": null
+    },
+    {
+      "discipline": "filesystem-security",
+      "candidate_commit": null,
+      "reviewer": null,
+      "scope": null,
+      "report": null,
+      "counterexample_corpus": null
+    }
+  ],
+  "soak": {
+    "candidate_commit": null,
+    "started_utc": null,
+    "completed_utc": null,
+    "external_projects": [],
+    "p0_p1_failures": null
+  }
+}

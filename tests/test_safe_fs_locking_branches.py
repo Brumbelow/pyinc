@@ -812,7 +812,8 @@ def test_public_safe_fs_functions_dispatch_to_windows_boundaries(
     def write_windows(candidate: Path, data: bytes) -> None:
         calls.append(("write", (candidate, data)))
 
-    def unlink_windows(candidate: Path) -> bool:
+    def unlink_windows(candidate: Path, *, expected_digest: str | None = None) -> bool:
+        assert expected_digest is None
         calls.append(("unlink", candidate))
         return True
 

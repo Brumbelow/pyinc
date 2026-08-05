@@ -22,11 +22,12 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import pytest
 
 from pyinc import (
+    CheckpointIntegrityError,
     CheckpointManifestError,
     Database,
     FileResource,
@@ -49,9 +50,108 @@ class _BehavioralList(list[int]):
         return self[0] * 2
 
 
+class _HostileBytes(bytes):
+    decoded: str
+
+    def __new__(cls, raw: bytes, decoded: str) -> _HostileBytes:
+        value = super().__new__(cls, raw)
+        value.decoded = decoded
+        return value
+
+    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+        del encoding, errors
+        return self.decoded
+
+
+class _OverridingStore:
+    def __init__(self, wrapped: InMemoryArtifactStore, replacements: dict[str, bytes]) -> None:
+        self.wrapped = wrapped
+        self.replacements = replacements
+
+    def get(self, digest: str) -> bytes | None:
+        return self.replacements.get(digest, self.wrapped.get(digest))
+
+    def put(self, digest: str, payload: bytes) -> None:
+        self.wrapped.put(digest, payload)
+
+    def contains(self, digest: str) -> bool:
+        return digest in self.replacements or self.wrapped.contains(digest)
+
+
+class _HostileCheckpointKey(str):
+    def startswith(
+        self,
+        prefix: str | tuple[str, ...],
+        start: SupportsIndex | None = 0,
+        end: SupportsIndex | None = None,
+    ) -> bool:
+        del prefix, start, end
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Snapshot-level corruption: skipped and re-executed, never surfaced.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ("strict", "checked", "fast"))
+def test_checkpoint_rejects_bytes_subclass_manifest_payload(mode: str) -> None:
+    @query(key=f"hostile-manifest-bytes-{mode}")
+    def value(db: Database) -> int:
+        return 1
+
+    store = InMemoryArtifactStore()
+    writer = Database(mode=cast(Any, mode), store=store)
+    assert writer.get(value) == 1
+    checkpoint = writer.save_checkpoint()
+    raw = store.get(checkpoint)
+    assert raw is not None
+    tampered = json.loads(raw.decode("utf-8"))
+    replacement = serialize_snapshot(freeze(999))
+    replacement_digest = fingerprint_snapshot(freeze(999))
+    store.put(replacement_digest, replacement)
+    query_record = next(record for record in tampered["records"] if record["kind"] == "query")
+    query_record["snapshot_digest"] = replacement_digest
+    hostile = _HostileBytes(raw, json.dumps(tampered, separators=(",", ":")))
+    reader = Database(
+        mode=cast(Any, mode),
+        store=_OverridingStore(store, {checkpoint: hostile}),
+    )
+
+    with pytest.raises(CheckpointIntegrityError, match="manifest payload is not bytes"):
+        reader.load_checkpoint(checkpoint)
+
+
+@pytest.mark.parametrize("mode", ("strict", "checked", "fast"))
+def test_checkpoint_skips_bytes_subclass_snapshot_payload(mode: str) -> None:
+    @query(key=f"hostile-snapshot-bytes-{mode}")
+    def value(db: Database) -> int:
+        return 1
+
+    store = InMemoryArtifactStore()
+    writer = Database(mode=cast(Any, mode), store=store)
+    assert writer.get(value) == 1
+    checkpoint = writer.save_checkpoint()
+    digest = fingerprint_snapshot(freeze(1))
+    raw = store.get(digest)
+    assert raw is not None
+    hostile = _HostileBytes(raw, "not the authenticated snapshot stream")
+    reader = Database(
+        mode=cast(Any, mode),
+        store=_OverridingStore(store, {digest: hostile}),
+    )
+    reader.load_checkpoint(checkpoint)
+
+    assert reader.get(value) == 1
+    assert reader.inspect(value).last_recompute == "executed"
+
+
+def test_checkpoint_rejects_str_subclass_key_before_store_lookup() -> None:
+    store = InMemoryArtifactStore()
+    reader = Database(store=store)
+
+    with pytest.raises(CheckpointIntegrityError, match="Checkpoint keys must be"):
+        reader.load_checkpoint(_HostileCheckpointKey("ck" + "0" * 64))
 
 
 def test_bitflipped_snapshot_bytes_are_skipped_and_reexecuted() -> None:
@@ -576,20 +676,14 @@ def test_code_fingerprint_stable_across_processes(tmp_path: Path) -> None:
     script.write_text(
         textwrap.dedent(
             """
-            from pyinc import Database, Input, query
-
-            gauge = Input[int]("gauge")
+            from pyinc import Database, query
 
             @query
-            def fp_child(db: Database) -> int:
-                return 7
-
-            @query
-            def fp_parent(db: Database) -> int:
-                return gauge.read(db) + fp_child(db)
+            def fp_parent(db: Database, left: int, right: int) -> int:
+                return left + right
 
             db = Database()
-            key, _ = db._query_key(fp_parent, (), {})
+            key, _ = db._query_key(fp_parent, (1, 2), {})
             print(key.identity)
             """
         )
@@ -599,20 +693,21 @@ def test_code_fingerprint_stable_across_processes(tmp_path: Path) -> None:
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
-        env=env,
+        env={**env, "PYTHONHASHSEED": "1"},
         check=True,
     ).stdout
     second = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
-        env=env,
+        env={**env, "PYTHONHASHSEED": "4294967295"},
         check=True,
     ).stdout
 
     assert first.strip() != ""
-    # Two independent processes (each with its own randomized hash seed and
-    # object addresses) must compute byte-identical identities.
+    # A capture-free definition computes a byte-identical identity across two
+    # independent processes with different hash seeds and object addresses.
+    # Direct global/nonlocal captures are process-incarnated instead.
     assert first == second
 
 
@@ -790,6 +885,25 @@ def test_v5_manifest_rejected_loudly() -> None:
     manifest = {
         "pyinc_ckpt_version": 5,
         "kernel_fingerprint_version": 2,
+        "records": [],
+    }
+    manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    key = "ck" + hashlib.sha256(manifest_bytes).hexdigest()
+    store.put(key, manifest_bytes)
+
+    with pytest.raises(ValueError, match="Unsupported checkpoint version"):
+        db.load_checkpoint(key)
+
+
+def test_v6_manifest_rejected_after_soundness_changes() -> None:
+    """Version 6 can carry numeric backdates, stale hints, and caught failures."""
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+
+    manifest = {
+        "pyinc_ckpt_version": 6,
+        "kernel_fingerprint_version": 2,
+        "adapters": {},
         "records": [],
     }
     manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
@@ -1458,26 +1572,16 @@ def test_modified_input_adapter_skips_dependent_warm() -> None:
     assert loaded.inspect(read_input).last_recompute == "executed"
 
 
-def test_checkpoint_save_rejects_adapter_with_unpinnable_capture() -> None:
-    temp_in = Input[float]("adapter_unpinnable_save")
-
-    @query
-    def read_temp(db: Database) -> _Temperature:
-        return _Temperature(temp_in.read(db))
-
-    db = Database(
-        "checked",
-        store=InMemoryArtifactStore(),
-        adapters={_Temperature: _MutableCaptureTempAdapter()},
-    )
-    db.set(temp_in, 5.0)
-    assert db.get(read_temp) == _Temperature(5.0)
-
+def test_database_rejects_adapter_with_unpinnable_capture() -> None:
     with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted"):
-        db.save_checkpoint()
+        Database(
+            "checked",
+            store=InMemoryArtifactStore(),
+            adapters={_Temperature: _MutableCaptureTempAdapter()},
+        )
 
 
-def test_checkpoint_save_rejects_adapter_with_mixed_slot_state() -> None:
+def test_database_rejects_adapter_with_mixed_slot_state() -> None:
     class MixedSlotAdapter:
         __slots__ = ("offset", "__dict__")
 
@@ -1490,25 +1594,15 @@ def test_checkpoint_save_rejects_adapter_with_mixed_slot_state() -> None:
         def thaw(self, snapshot: Any, thaw_value: Any) -> _Temperature:
             return _Temperature(float(thaw_value(snapshot)) - self.offset)
 
-    temp_in = Input[float]("adapter_mixed_slots")
-
-    @query
-    def read_temp(db: Database) -> _Temperature:
-        return _Temperature(temp_in.read(db))
-
-    db = Database(
-        "checked",
-        store=InMemoryArtifactStore(),
-        adapters={_Temperature: MixedSlotAdapter(1.0)},
-    )
-    db.set(temp_in, 5.0)
-    assert db.get(read_temp) == _Temperature(5.0)
-
     with pytest.raises(UnsupportedValueError, match="slot state"):
-        db.save_checkpoint()
+        Database(
+            "checked",
+            store=InMemoryArtifactStore(),
+            adapters={_Temperature: MixedSlotAdapter(1.0)},
+        )
 
 
-def test_unpinnable_live_adapter_safely_misses_checkpoint() -> None:
+def test_unpinnable_live_adapter_is_rejected_before_checkpoint_load() -> None:
     temp_in = Input[float]("adapter_unpinnable_warm")
 
     @query
@@ -1519,18 +1613,14 @@ def test_unpinnable_live_adapter_safely_misses_checkpoint() -> None:
     saved = Database("checked", store=store, adapters={_Temperature: _IdentityTempAdapter()})
     saved.set(temp_in, 5.0)
     assert saved.get(read_temp) == _Temperature(5.0)
-    checkpoint = saved.save_checkpoint()
+    saved.save_checkpoint()
 
-    loaded = Database(
-        "checked",
-        store=store,
-        adapters={_Temperature: _MutableCaptureTempAdapter()},
-    )
-    loaded.set(temp_in, 5.0)
-    loaded.load_checkpoint(checkpoint)
-
-    assert loaded.get(read_temp) == _Temperature(5.0)
-    assert loaded.inspect(read_temp).last_recompute == "executed"
+    with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted"):
+        Database(
+            "checked",
+            store=store,
+            adapters={_Temperature: _MutableCaptureTempAdapter()},
+        )
 
 
 def test_changed_adapter_instance_configuration_skips_warm() -> None:

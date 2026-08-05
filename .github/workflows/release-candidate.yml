@@ -1,0 +1,170 @@
+name: Pre-tag release candidate
+
+run-name: Pre-tag v${{ inputs.version }} at ${{ inputs.release_commit }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact version in pyproject.toml and CHANGELOG.md
+        required: true
+        type: string
+      release_commit:
+        description: Full SHA of the signed release-closure commit at the tip of main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve exact candidate
+    runs-on: ubuntu-24.04
+    outputs:
+      release_commit: ${{ steps.candidate.outputs.release_commit }}
+      version: ${{ steps.candidate.outputs.version }}
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Require the selected main revision to match the request
+        id: candidate
+        env:
+          REQUESTED_RELEASE_COMMIT: ${{ inputs.release_commit }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          if [[ ! "$REQUESTED_RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release_commit must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$REQUESTED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+            echo "version must be an exact supported release version" >&2
+            exit 1
+          fi
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$REQUESTED_RELEASE_COMMIT" = "$GITHUB_SHA"
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$REQUESTED_RELEASE_COMMIT"
+          echo "release_commit=$REQUESTED_RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "version=$REQUESTED_VERSION" >> "$GITHUB_OUTPUT"
+
+  gates:
+    needs: resolve
+    uses: ./.github/workflows/ci.yml
+
+  codeql:
+    needs: resolve
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    uses: ./.github/workflows/codeql.yml
+
+  benchmark:
+    needs: resolve
+    uses: ./.github/workflows/benchmark.yml
+
+  mutation:
+    needs: resolve
+    uses: ./.github/workflows/mutation-testing.yml
+
+  verify-candidate:
+    name: Verify pre-tag release candidate
+    needs: [resolve, gates, codeql, benchmark, mutation]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: read
+    env:
+      EXPECTED_FINGERPRINT: 2B6DF408BD973740052925DC894C75E1B1D05EA2
+      TRUSTED_BASELINE_TAG: v3.1.0
+      TRUSTED_BASELINE: 8db85ec7a647bd7b74bf04f07e94a9bd78675193
+      RELEASE_COMMIT: ${{ needs.resolve.outputs.release_commit }}
+      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Check out the exact release commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.release_commit }}
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14'
+
+      - name: Install locked release toolchain
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements/toolchain.lock
+          python -m pip install --no-build-isolation --no-deps -e .
+          python scripts/check_toolchain.py --verify-installed
+
+      - name: Import the release signing key
+        env:
+          GNUPGHOME: ${{ runner.temp }}/pyinc-release-gnupg
+        run: |
+          install -d -m 700 "$GNUPGHOME"
+          gpg --batch --import .github/release-signing-key.asc
+          primary_count="$(gpg --batch --with-colons --list-keys | awk -F: '$1 == "pub" { count++ } END { print count + 0 }')"
+          test "$primary_count" = 1
+          actual_fingerprint="$(gpg --batch --with-colons --fingerprint | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test "$actual_fingerprint" = "$EXPECTED_FINGERPRINT"
+
+      - name: Verify release-commit identity and signatures
+        env:
+          GNUPGHOME: ${{ runner.temp }}/pyinc-release-gnupg
+        run: |
+          verify_expected_signature() {
+            kind="$1"
+            reference="$2"
+            status="$(git "verify-$kind" --raw "$reference" 2>&1)"
+            printf '%s\n' "$status"
+            signer="$(printf '%s\n' "$status" | awk -v expected="$EXPECTED_FINGERPRINT" '$2 == "VALIDSIG" && ($3 == expected || $NF == expected) { print expected; exit }')"
+            test "$signer" = "$EXPECTED_FINGERPRINT"
+          }
+
+          test "$RELEASE_COMMIT" = "$GITHUB_SHA"
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$RELEASE_COMMIT"
+          test "$(git cat-file -t "$TRUSTED_BASELINE_TAG")" = tag
+          verify_expected_signature tag "$TRUSTED_BASELINE_TAG"
+          test "$(git rev-parse "$TRUSTED_BASELINE_TAG^{commit}")" = "$TRUSTED_BASELINE"
+          verify_expected_signature commit "$TRUSTED_BASELINE"
+          git merge-base --is-ancestor "$TRUSTED_BASELINE" "$RELEASE_COMMIT"
+          test -z "$(git rev-list --min-parents=2 "$TRUSTED_BASELINE..$RELEASE_COMMIT")"
+          git rev-list --reverse "$TRUSTED_BASELINE..$RELEASE_COMMIT" > "$RUNNER_TEMP/release-commits"
+          while IFS= read -r commit; do
+            verify_expected_signature commit "$commit"
+          done < "$RUNNER_TEMP/release-commits"
+
+      - name: Verify release metadata
+        run: |
+          python scripts/verify_release_metadata.py \
+            --tag "v$RELEASE_VERSION" \
+            --commit "$RELEASE_COMMIT"
+
+      - name: Verify independent assurance and priority closure
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          candidate_commit="$(git rev-parse "$RELEASE_COMMIT^")"
+          candidate_created_epoch="$(git show -s --format=%ct "$candidate_commit")"
+          test "$(git show -s --format=%P "$RELEASE_COMMIT")" = "$candidate_commit"
+          test "$(git diff --name-only "$candidate_commit" "$RELEASE_COMMIT")" = \
+            "release/assurance.json"
+          python scripts/check_release_assurance.py \
+            --version "$RELEASE_VERSION" \
+            --candidate-commit "$candidate_commit" \
+            --candidate-created-epoch "$candidate_created_epoch"
+          for priority in P0 P1; do
+            count="$(gh issue list --state open --label "$priority" --limit 1000 --json number --jq length)"
+            test "$count" = 0
+          done

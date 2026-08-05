@@ -21,8 +21,8 @@ Semantics:
 
 Query graph (each layer is a kernel-cached node):
 
-    calc_source (cutoff=semantic token)  -> raw text; comment/whitespace edits backdate
-    parse_calc                           -> (includes, bindings, emits, diagnostics)
+    calc_source                          -> exact raw text
+    parse_calc                           -> complete semantic payload; equal edits backdate
     binding_table                        -> merged name->expr over referenced includes
     binding_expr                         -> one name's expression (backdates when unchanged)
     binding_cycles                       -> names participating in a reference cycle
@@ -31,8 +31,9 @@ Query graph (each layer is a kernel-cached node):
     calc_emit  (@action)                 -> one ``<name>.out`` per emit
 
 Regexes are inlined as string literals (not module-level ``re.Pattern``
-singletons) because the kernel walks query-reachable functions' captures and
-rejects ``Pattern`` values; the ``re`` module itself is a supported capture.
+singletons) because the kernel's static capture analysis walks statically
+query-reachable functions and rejects directly captured ``Pattern`` values;
+the ``re`` module itself is a supported capture.
 """
 
 from __future__ import annotations
@@ -109,8 +110,9 @@ def _parse_expr(rhs: str) -> tuple[_Expr | None, str | None]:
 def _semantic_token(source: str) -> _ParsePayload:
     """Parse to the canonical (includes, bindings, emits, diagnostics) payload.
 
-    Used both as the parse layer and as ``calc_source``'s cutoff token, so
-    comment-only and whitespace-only edits map to an equal token and backdate.
+    This is the complete public value of ``parse_calc``. Comment-only and
+    whitespace-only edits map to an equal payload there, never at the raw text
+    boundary.
     """
     includes: list[str] = []
     bindings: list[_Binding] = []
@@ -162,9 +164,9 @@ def _resolve_include(current_file: str, target: str) -> str:
     return os.path.normpath(os.path.join(os.path.dirname(current_file), target))
 
 
-@query(cutoff=_semantic_token)
+@query
 def calc_source(db: Database, path: str) -> str:
-    """Raw text of a ``.calc`` file. Comment/whitespace-only edits backdate."""
+    """Exact raw text of a ``.calc`` file."""
     return _FILES.read(db, path)
 
 

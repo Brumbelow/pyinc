@@ -343,6 +343,27 @@ def test_semantic_equal_different_container_types() -> None:
     assert not semantic_equal({1, 2}, frozenset({1, 2}))
 
 
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        pytest.param(1, 1.0, id="int-float"),
+        pytest.param(True, 1, id="bool-int"),
+        pytest.param(0.0, -0.0, id="signed-zero"),
+        pytest.param(complex(0.0, -0.0), complex(-0.0, 0.0), id="complex-signed-zero"),
+    ],
+)
+def test_semantic_equal_requires_typed_canonical_identity(left: object, right: object) -> None:
+    assert left == right
+    assert not semantic_equal(left, right)
+
+
+def test_semantic_equal_recurses_past_wrapper_identity_for_nan() -> None:
+    token = FrozenList((float("nan"),))
+
+    assert token == token
+    assert not semantic_equal(token, token)
+
+
 def test_fingerprint_determinism() -> None:
     # Same value → same digest.
     assert fingerprint({"a": [1, 2], "b": 3}) == fingerprint({"a": [1, 2], "b": 3})
@@ -1029,13 +1050,11 @@ def test_nan_payloads_are_canonicalized_and_prefrozen_payloads_are_validated() -
         freeze(FrozenList((first,)))
 
 
-def test_semantic_equality_of_canonical_snapshots_matches_snapshot_equality() -> None:
-    """freeze is ==-preserving on its own outputs.
+def test_semantic_equality_of_canonical_snapshots_matches_typed_snapshot_relation() -> None:
+    """The public helper and runtime relation agree on canonical snapshots.
 
-    The runtime's default backdate decision relies on this reduction: for
-    canonical snapshots ``a`` and ``b`` (outputs of ``freeze``), re-freezing
-    never changes the encoding and ``semantic_equal(a, b)`` coincides with
-    comparing the snapshots directly.
+    The runtime's default backdate decision relies on this reduction without
+    delegating to Python's coercive container equality.
     """
 
     @dataclass(frozen=True)

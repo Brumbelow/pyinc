@@ -10,7 +10,8 @@ pyinc borrows its vocabulary — demand-driven queries, red-green verification,
 early cutoff — from Salsa, the Rust incremental-computation framework that
 rust-analyzer is built on. It is not a port of Salsa, shares no code with it,
 and does not implement Adapton's algorithm. The lineage is in the idea, not the
-implementation.
+implementation. The [dated related-work matrix](related-work.md) pins the
+primary sources and releases used for the broader Python comparison.
 
 The differences that matter are not in the graph algorithm, which is the
 familiar one. They are in what a Python implementation has to enforce at
@@ -25,7 +26,9 @@ runtime:
   `FrozenList`, `dict` → `FrozenDict`, `set` → `FrozenSet`, and dataclasses →
   `FrozenRecord`, with registered `ValueAdapter`s for everything else. That is
   condition 1 of the guarantee, and it exists because the language does not
-  provide it.
+  provide it. Mapping insertion order is not retained: every mode iterates
+  mappings in canonical frozen-key fingerprint order, so an order-bearing value
+  must use a tuple of pairs or an explicit adapter.
 - **Ambient reads.** Reading a file or an environment variable directly inside
   a query, rather than through a declared input, silently breaks any
   incremental engine in any language. pyinc does not only document the rule:
@@ -90,7 +93,7 @@ What is published:
 - The [demo](demo.md) numbers — a 270-file pytest checkout analyzed in 109.08 s
   from cold, then re-analyzed in 632 ms after a single-file edit, executing 73
   queries and reusing 9,767. One recorded run on one machine; the demo page
-  states the full provenance.
+  states the recorded evidence and its limits.
 - The [benchmark and correctness harness](../bench/README.md), which runs a
   fixed 67-row matrix comparing pyinc against fresh recomputation, an
   intentionally incomplete naive cache, and `joblib.Memory`.
@@ -102,7 +105,9 @@ on one CI runner would not tell you much about your machine. Measure on your
 own hardware:
 
 ```console
-python -m pip install -e '.[bench]'
+python -m pip install --require-hashes --only-binary=:all: -r requirements/toolchain.lock
+python -m pip install --no-build-isolation --no-deps -e .
+python scripts/check_toolchain.py --verify-installed
 python -m bench.run --output bench/results --repetitions 5
 ```
 
@@ -115,15 +120,21 @@ actually changed.
 **Threads.** `Database` is thread-safe both across independent instances and on
 a single shared instance. Each instance holds a `threading.RLock` that
 serializes every public read and mutation, so threads sharing one `Database`
-serialize on that lock while threads holding separate instances run in
-parallel. The ambient-read guard is installed globally exactly once and
+serialize on that lock while threads holding separate instances may execute
+concurrently. The ambient-read guard is installed globally exactly once and
 dispatches per context through a `ContextVar` stack, so a query on one
 `Database` does not disturb enforcement on another, and raw I/O from a thread
 that is not inside a query is unaffected. See
 [Thread Safety](kernel-contract.md#thread-safety).
 
 pyinc is pure Python and does nothing special with the GIL. Sharing one
-`Database` across threads buys correctness, not parallel speedup.
+`Database` across threads buys correctness, not parallel speedup; on ordinary
+GIL-enabled CPython, separate instances do not make CPU-bound Python bytecode
+run in parallel either. I/O and code that releases the GIL may still overlap.
+Queries themselves are synchronous: covered thread, executor,
+multiprocessing, fork, and command-launch APIs raise `QueryConcurrencyError`
+when invoked during query execution. Start independent work at top level, and
+route an external command whose output is a dependency through a Resource.
 
 **Free-threaded builds.** The test matrix covers CPython 3.11–3.14 on the
 default build; it does not currently include a free-threaded build, so pyinc
@@ -139,7 +150,11 @@ execution; that is [out of scope](architecture.md#scope) by design. Separate
 processes hold separate databases and run fully in parallel, and they can share
 completed work through checkpoints and a `FileSystemArtifactStore`: save in one
 interpreter, load in another. That path is exercised by a cross-process test
-matrix.
+matrix. Python makes the identity of every direct global/nonlocal capture
+observable, so captured definition sites carry a process incarnation and
+conservatively execute after a cross-process load. Capture-free queries whose
+data arrives as explicit query arguments can reuse directly; captured
+Input/Resource readers still reload against live state and remain correct.
 
 ## When should I not use pyinc?
 

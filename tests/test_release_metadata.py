@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,7 @@ VALIDATION_RECORD = f"""### Release validation
 - [x] Final promotion approved."""
 RC_CHANGELOG_REFERENCE = "[3.0.0rc1]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0rc1"
 FINAL_CHANGELOG_REFERENCE = "[3.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _project(
@@ -172,12 +174,29 @@ def test_accepts_matching_non_promotion_tags(tag: str, version: str) -> None:
     )
 
 
+def test_repository_release_metadata_is_self_consistent() -> None:
+    project_document = (PROJECT_ROOT / "pyproject.toml").read_bytes()
+    project_version = tomllib.loads(project_document.decode("utf-8"))["project"]["version"]
+    assert isinstance(project_version, str)
+
+    verify_release_metadata(
+        ReleaseMetadata(
+            tag=f"v{project_version}",
+            project_version=project_version,
+            release_commit=FINAL_COMMIT,
+            project_document=project_document,
+            changelog=(PROJECT_ROOT / "CHANGELOG.md").read_bytes(),
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "changelog",
     [
         b"# Changelog\n",
         b"# Changelog\n\n## [3.0.0rc2] - 2026-07-09\n\n- Wrong RC.\n",
         b"# Changelog\n\n## [3.0.0rc1]\n\n- Missing date.\n",
+        b"# Changelog\n\n## [3.0.0rc1] - 2026-02-30\n\n- Impossible date.\n",
         b"# Changelog\n\n## [3.0.0rc1] - 2026-07-09\n\n",
         (
             b"# Changelog\n\n## [3.0.0rc1] - 2026-07-09\n\n- First.\n\n"
@@ -222,6 +241,19 @@ def test_rejects_tag_that_does_not_match_project_version() -> None:
                 release_commit=FINAL_COMMIT,
                 project_document=_project("3.0.2"),
                 changelog=b"",
+            )
+        )
+
+
+def test_rejects_retired_release_version() -> None:
+    with pytest.raises(ReleaseMetadataError, match="3.1.1.*retired.*must not be reused"):
+        verify_release_metadata(
+            ReleaseMetadata(
+                tag="v3.1.1",
+                project_version="3.1.1",
+                release_commit=FINAL_COMMIT,
+                project_document=_project("3.1.1"),
+                changelog=b"# Changelog\n\n## [3.1.1] - 2026-08-03\n\n- Cancelled.\n",
             )
         )
 

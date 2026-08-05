@@ -525,7 +525,7 @@ def test_toml_helper_uncommon_values_and_failures() -> None:
     assert toml_config._toml_value_type(1.5) == "float"
     assert toml_config._toml_value_type({}) == "table"
     assert toml_config._toml_value_type(object()) == "unknown"
-    assert toml_config._toml_value_to_string({"b": 1, "a": 2}) == "[('a', 2), ('b', 1)]"
+    assert toml_config._toml_value_to_string({"b": 1, "a": 2}) == "{'a': 2, 'b': 1}"
     assert toml_config._config_cutoff_token("[broken")[0] == "raw"
     assert toml_config._toml_cutoff_value(datetime.date(2026, 7, 9)) == (
         "date",
@@ -544,7 +544,12 @@ def test_notebook_cutoff_and_cell_helper_edges() -> None:
     cutoff = notebook._notebook_cutoff_token(
         '{"cells":[null],"metadata":{"kernelspec":null,"language_info":{"name":"python"}}}'
     )
-    assert cutoff == ("nb", "None", "'python'", "invalid-cell")
+    assert cutoff == (
+        "notebook-v2",
+        ("kernel-name", None),
+        ("language", "python"),
+        ("cells", "present", (("invalid-cell",),)),
+    )
 
 
 def test_deep_module_sys_path_filtering(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .baselines import required_comparators
@@ -53,6 +54,20 @@ def _cpu_model() -> str:
     return platform.processor() or platform.machine() or "unknown"
 
 
+def _distribution_snapshot() -> list[dict[str, str]]:
+    distributions: dict[tuple[str, str], dict[str, str]] = {}
+    for distribution in importlib.metadata.distributions():
+        try:
+            name = distribution.metadata["Name"]
+        except KeyError:
+            continue
+        if not name:
+            continue
+        version = distribution.version
+        distributions[(name.casefold(), version)] = {"name": name, "version": version}
+    return [distributions[key] for key in sorted(distributions)]
+
+
 def build_metadata(repetitions: int) -> dict[str, object]:
     commit_sha = _git("rev-parse", "HEAD").lower()
     if _SHA_PATTERN.fullmatch(commit_sha) is None:
@@ -60,8 +75,10 @@ def build_metadata(repetitions: int) -> dict[str, object]:
     python_build = platform.python_build()
     return {
         "schema_version": 1,
+        "generated_at_utc": datetime.now(UTC).isoformat(),
         "commit_sha": commit_sha,
         "working_tree_dirty": bool(_git("status", "--porcelain")),
+        "pyinc_version": importlib.metadata.version("pyinc"),
         "python": {
             "version": platform.python_version(),
             "implementation": platform.python_implementation(),
@@ -96,6 +113,7 @@ def build_metadata(repetitions: int) -> dict[str, object]:
         "rows_per_repetition": ROWS_PER_REPETITION,
         "repetitions": repetitions,
         "pythonhashseed": "0",
+        "distributions": _distribution_snapshot(),
     }
 
 

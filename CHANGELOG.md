@@ -6,12 +6,82 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.1.2] - 2026-08-04
+
 v3.1.1 was tagged but never published; its release run was cancelled after an
-external audit surfaced the consistency issues fixed below. The v3.1.1 tag
-remains in history and should not be used; the next published version will be
-decided at release time.
+external technical review surfaced the consistency issues fixed below. No
+standalone audit report has been published. The v3.1.1 tag
+remains in history and must not be reused; v3.1.2 is its release successor.
 
 ### Fixed
+
+- Documentation now states the precise `report_untracked_read` guarantee: it
+  forces that node to re-execute and prevents backdating, but does not turn
+  time, randomness, network state, or another nondeterministic observation into
+  a tracked dependency or promise equality with a separately timed fresh run.
+  Misleading "always safe" and "restores consistency" wording and test names
+  have been removed.
+- Value-boundary prose now distinguishes avoiding the `FrozenGraph` envelope
+  from avoiding deep-freeze work, describes strict views as resistant to
+  ordinary writes rather than capability-level immutable, and states that
+  `FrozenRecord` retains a qualified-name tag and fields rather than
+  reconstructible Python type identity.
+- Resource authoring documentation now distinguishes required `label`,
+  `probe`, and `load` hooks from inherited `read`, `probe_and_load`, and
+  `identity` defaults. It also identifies singleton resources as a convention
+  and states that probes run when a requested resource node needs verification,
+  not on every unrelated request.
+- Cutoff authoring now makes substitutivity explicit: equal tokens must imply
+  equal complete public payloads. The AST example states that comment-only
+  equivalence applies only to its position-free payload and requires positions
+  and ranges to participate whenever the public result exposes them.
+- Limits and concurrency prose no longer turns nesting caps into a universal
+  byte or memory bound. It distinguishes concurrent database execution from
+  CPU parallelism under ordinary GIL CPython and describes ambient-read and
+  worker-launch interception as enumerated same-context guards, not capability
+  sandboxes.
+- Public inspection documentation now distinguishes `last_decision` from
+  `last_recompute` and enumerates the actual `DatabaseStatistics` and
+  `QueryProfile` fields. Failing-resource prose now acknowledges that an
+  uncaught load error propagates from `get()`.
+- The semantic-versioning surface now explicitly covers `pyinc`, the aggregate
+  integrations package, each integration module's Layer-2 composition tier,
+  `pyinc_tools`, and `pyinc_codegen`. A checked public-API table enumerates
+  every module `__all__`; SECURITY no longer implies only top-level `pyinc`
+  exports are stable.
+- Public examples now describe checkpoint eligibility and three database runs,
+  state the action digest condition for deletion, measure calc's zero query
+  bodies/writes precisely, import only enumerated public surfaces, fail when
+  the undeclared-import fixture produces no finding, and replace the large
+  repository analyzer dump with a deterministic temporary two-file fixture and
+  concise output.
+- Release automation now runs every top-level installed-wheel example, checks
+  the sdist against every file in its configured include roots rather than a
+  sentinel subset, and semantically validates changelog calendar dates. Release
+  documentation names those exact gates and uses the discovered release tag in
+  verification commands instead of a hardcoded version.
+- The packaged README and project Documentation/Changelog metadata now link to
+  the matching `v3.1.2` documentation snapshot rather than moving `main`, so
+  PyPI readers stay on the API and schema generation they installed.
+- The documentation gate now checks all public Markdown and issue templates,
+  executes every shipped example, enforces action/checkpoint/release-version
+  parity, compares LSP capabilities with handlers and the method table, and
+  requires a scheduled external-link workflow.
+- Release automation now attaches a machine-readable demo-evidence bundle with
+  the exact candidate SHA, clean/dirty state, UTC timestamp, environment and
+  installed-distribution snapshot, commands, raw stdout/stderr, exit statuses,
+  source hashes, and two verified SHA-256 layers.
+- The five-repetition benchmark's raw samples, CSV/Markdown summaries,
+  environment metadata, exact command, and layered hashes are bundled and
+  attached to every GitHub Release instead of expiring with the 90-day workflow
+  artifact.
+- Direct build, test, benchmark, analysis, and release tools now have exact
+  versions in one mechanically checked source manifest and a universal,
+  transitive, hash-locked resolution, separate from the wheel's zero runtime
+  dependencies. Release artifacts are built twice from isolated clean source
+  copies and must be byte-identical; the release metadata includes an SPDX 2.3
+  SBOM, unsigned SLSA-format provenance, the complete installed-tool snapshot,
+  and hashes binding both metadata files and both distributions.
 
 - Captured-module identity is derived from the file's bytes on every
   observation. The POSIX path cached the digest under a stat tuple (size,
@@ -22,23 +92,214 @@ decided at release time.
   as missing instead of raising out of the probe. The escaping exception left
   the reading query dependency-free, so it was reused after the path came to
   exist.
-- The memoized query-fingerprint fast path observes definitions per entry
-  instead of per container: mutating `__kwdefaults__` in place, rebinding a
-  closure cell, or rebinding a captured global now invalidates the memo
-  rather than reusing the stale fingerprint.
+- Default equality now uses one deep typed, structural relation across queries,
+  inputs, resource probes, cutoff tokens, checkpoints, `semantic_equal`, and
+  `Query.compare`. It distinguishes `1` from `1.0`, `True` from `1`, and
+  positive from negative floating-point zero; NaN never backdates through a
+  digest fallback.
+- Query-definition fingerprints are recomputed from the complete supported
+  definition once per request instead of being retained behind an incomplete
+  per-`Database` observation memo. In-place changes to accepted defaults,
+  annotations, resource configuration, input policy state, frozen dataclasses,
+  and other accepted definition state therefore move query identity before a
+  warm or checkpoint record can be reused. A `request_span` shares the computed
+  digest only for its declared-stable request and clears it when inputs are
+  declared changed.
+- Direct global/nonlocal captures and directly accessible defaults, reflected
+  annotations, and function attributes carry a process-local site generation
+  in addition to their structural definition. This covers managed handles,
+  functions, modules, methods, types, and ordinary immutable values; replacing
+  one with a distinct equal object cannot hide behind allocator address reuse.
+  Cross-process checkpoint readers therefore execute definitions with direct
+  captures, while capture-free explicit-argument calls remain reusable.
+- Weakly referenced policy, adapter, and resource identity records now clean up
+  without consulting module globals that may already be cleared during
+  interpreter shutdown. The cleanup callback also avoids retaining its own
+  owner-state record, preventing ignored teardown exceptions after otherwise
+  successful runs.
+- Callable objects that expose `__wrapped__` are rejected as query captures,
+  equality/cutoff policies, and resource state-observation hooks. Their wrapped
+  function alone does not identify the object's `__call__` implementation or
+  instance state; ordinary decorated functions and bound methods remain
+  supported.
 - The ambient-read guard covers the whole query boundary. Adapter `thaw`
   during argument materialization and adapter `freeze` on the result ran
   outside it, so an adapter reading ambient state could smuggle untracked
   bytes into the stored snapshot without a dependency edge.
+- A `Database` now pins every registered `ValueAdapter`'s implementation and
+  instance-state digest at construction and verifies it around adapter
+  boundaries, including strict exposure and checkpoint save/load. Later
+  adapter mutation is rejected before stale snapshots can be reused; adapter
+  configuration is a database invariant rather than ordinary query identity.
+  Adapters whose state or statically discovered captures cannot be
+  fingerprinted are rejected at construction.
 - Strict mode rebuilds every boundary view, not only graph snapshots.
   Non-graph `Frozen*` values were exposed by reference, and
   `object.__setattr__` on such a view corrupted the stored record.
+- Every `Database` ownership boundary now recursively detaches already-frozen
+  wrappers, including nested adapter payloads, graph nodes/references, resource
+  results and probes, query arguments, and resource parameters. Public
+  `freeze()` retains its existing pass-through behavior, while cache records and
+  checkpoint hints can no longer alias a caller-owned `Frozen*` shell that can
+  be changed reflectively without a revision.
 - `workspace_python_files` and `resolve_module_location` canonicalize paths
   through the new tracked `ResolvedPathResource` instead of a raw
   `Path.resolve()`, so retargeting a symlink invalidates containment and
   visited-set decisions instead of leaving warm traversals stale.
+- Built-in and shipped integration file resources open paths nonblockingly and
+  validate the opened descriptor with `fstat` before reading. FIFOs, Unix
+  sockets, devices, directories, and other non-regular targets therefore use
+  conservative missing-file semantics without a stat/read race that can block.
+  Python workspace discovery tracks the same regular-file decision, including
+  symlinks retargeted between regular and special files.
+- Path failures no longer escape through platform- and Python-version-specific
+  exceptions. Action roots, state directories, target parents, and filesystem
+  artifact-store roots/directories normalize symlink-resolution failures to
+  `ActionPathError` or `ArtifactStoreError` before mutation. Built-in path
+  resources treat embedded NULs and symlink loops as conservative missing or
+  unresolved states; lexical scope returns the empty-source result with no
+  bindings or occurrences, requirements analysis reports
+  `invalid-requirements-path`, and all of those states revalidate after warm or
+  checkpoint reuse.
 - A deeply nested checkpoint manifest raises `CheckpointManifestError`
   instead of escaping as a raw `RecursionError`.
+- Checkpoints record their `strict`, `checked`, or `fast` execution mode and
+  reject cross-mode loads with `CheckpointModeError`, preventing a stored
+  result computed against one boundary representation from warming another.
+- Checkpoint save no longer trusts `ArtifactStore.contains()` for referenced
+  objects. It performs the required idempotent `put` for every result, call,
+  and resource-parameter snapshot, so bytes preseeded under the wrong digest
+  abort the save instead of producing a checkpoint that cannot warm.
+- `ArtifactStore.contains()` now supplies its documented `get()`-based default,
+  and `InMemoryArtifactStore.keys()` returns a detached read-only snapshot
+  instead of exposing the mutable backing dictionary.
+- `Query` handles are slotted and immutable, and captured-query identity covers
+  the handle's complete documented metadata. Descriptive attributes or
+  arbitrary attached state can no longer change a parent's result without
+  moving its identity.
+- Resource state-observation hooks cannot read database-managed state. Calls
+  from `identity`, `label`, `probe`, `load`, or `probe_and_load` into any
+  `Database`, `Input`, query, or resource read now fail with the public
+  `ResourceDependencyError` in strict, checked, and fast modes, including
+  cross-database calls and hooks that catch the first raise. Direct external
+  I/O remains allowed inside hooks; managed composition belongs in the reading
+  query so it owns the dependency edges.
+- Query execution now rejects database administration with the public
+  `QueryContextError` before any argument, callback, store, subscription, or
+  database state is touched. Only same-database query composition, `Input` and
+  `Resource` reads, and `report_untracked_read` are allowed; cross-database
+  managed reads are rejected because they cannot publish an edge into the
+  active graph. The rule also covers equality/cutoff policy execution and all
+  three modes.
+- A query that catches a child-query failure can no longer publish a permanent
+  dependency-free fallback. Failures during child keying, checkpoint warming,
+  or execution conservatively mark the successful catcher untracked and omit it
+  from checkpoints; failures found while verifying an existing child instead
+  make the parent execute so its own handler sees the exception. Cold child
+  state is rolled back, repeated failures are deduplicated in inspection, and a
+  later successful child result replaces the fallback in `strict`, `checked`,
+  and `fast`. Catching a direct same-key `CycleError` remains cacheable.
+- Query and Resource execution now reject worker launch through the enumerated
+  `threading`, `_thread`, executor, `multiprocessing`, fork, and process APIs
+  with the public `QueryConcurrencyError` before work starts. The violation is
+  sticky across nested query and Resource frames, so catching it cannot publish
+  a history-dependent result or checkpoint. External commands remain available
+  as tracked Resource I/O, and top-level concurrency is unchanged.
+- All 35 stable Layer-3 integration entrypoints now reject query-time execution
+  uniformly with `QueryContextError`, whether imported directly, through
+  `pyinc.integrations`, or at runtime. Rejection happens before argument/path
+  handling, resource access, or request/decode memo mutation in all three
+  modes; query authors compose the stable Layer-2 query payload APIs from the
+  defining integration module instead. Top-level Layer-3 calls are unchanged.
+- Raw text boundaries no longer use parser-shaped semantic cutoffs. Python,
+  JSON, TOML, XML, CSV, env, notebook, requirements, installed-metadata,
+  `.pth`, schema-codegen, and shipped-example source queries now publish every
+  exact text change; semantic backdating happens only on separate parsed
+  queries whose complete public payload is equal. This prevents an arbitrary
+  raw-text consumer or checkpoint-warmed parent from retaining the earlier
+  spelling after a comment, whitespace, ordering, or metadata-only edit.
+- Python source ranges and lexical scopes reverify against the exact decoded
+  source, including leading and trailing whitespace, line-ending and
+  final-newline changes, and trailing comments. Geometry-changing edits publish
+  updated definition ranges and the module scope's document end after warm and
+  checkpoint-loaded evaluation; equal complete parsed payloads alone backdate.
+- The TOML semantic projection is now a fully tagged recursive tree. Tables,
+  arrays, strings, booleans, integers, binary64 floats, and date/time variants
+  cannot share a token, and float tokens retain signed zero, infinities, and
+  NaN sign. Public TOML value strings recursively sort nested table keys, so an
+  inline-table reorder cannot keep one semantic token while changing a
+  `ConfigKey.string_value`.
+- JSON public value rendering now canonicalizes object key order recursively,
+  including objects nested inside arrays at arbitrary depth. Reordered objects
+  therefore produce both the same canonical token and the same complete
+  `JsonKey.string_value`, while the exact raw query still publishes the changed
+  source spelling.
+- Installed-distribution metadata now rejects empty or whitespace-only `Name`
+  and `Version` fields exactly like missing mandatory fields. Its retained
+  semantic projection explicitly separates rejected metadata from complete
+  package metadata, collapses missing/blank `Summary` only where the public
+  payload does, and preserves repeated `Requires-Dist` order and duplicates.
+- The retained notebook semantic projection distinguishes a missing `cells`
+  field from an explicitly empty list and emits one tagged token for each cell.
+  Invalid cells can no longer shift a flat token stream into the same shape as
+  valid cells at different positions; output-only edits remain equivalent
+  because outputs and execution counters are absent from every public analysis
+  payload.
+- Requirements decoding now carries exact logical-line spelling and source
+  geometry in one tracked public payload. `RequirementRef.raw_line` preserves
+  indentation, inline comments, continuation backslashes and internal line
+  endings, per-requirement options, and trailing spaces; direct, deep, and
+  workspace consumers therefore agree after warm reuse and checkpoint reload.
+- Action preflight now fails closed on every directory-scan and entry-inspection
+  error. Permission and filesystem failures raise `ActionPathError` before any
+  owned file or ledger byte changes instead of being mistaken for an empty or
+  prunable directory.
+- Orphan deletion now atomically quarantines one directory-entry identity before
+  hashing and unlinking it. A replacement between preflight and deletion is
+  restored or preserved, never deleted under the earlier file's digest.
+  `ReconcileResult.deleted` is populated only after a successful removal, while
+  `plan()` reports predictions separately in `would_delete`.
+- Root-incarnation adoption validates the complete action manifest before
+  voiding otherwise valid old claims, and immediately writes the adopted root
+  identity even when the new ownership set is empty. Malformed paths cannot hide
+  behind an incarnation mismatch, and later inode reuse cannot reactivate stale
+  claims.
+- `FileStatResource.read()` now preserves its documented `FileStatSnapshot`
+  return type in strict, checked, and fast databases, including checkpoint
+  restores. Callers can use `.exists`, `.size`, and `.mtime_ns` directly.
+- `Input` and explicit `Query` keys now require exact base `str` instances.
+  Stateful string subclasses are rejected instead of being identified only by
+  their character sequence.
+- Public `FrozenDict` keys and `FrozenSet` members are rejected when distinct
+  typed snapshots would merge under Python lookup after thaw, including
+  integer/float, boolean/integer, signed-zero, nested, and adapter-produced
+  collisions. Cardinality can no longer differ between strict and thawed modes.
+- Mapping insertion order is now an explicit boundary contract. `freeze()`
+  canonicalizes entries by frozen-key fingerprint, so strict `FrozenDict`
+  views and checked/fast thawed dictionaries share one iteration order across
+  fresh execution, warm reuse, and same-mode checkpoint reload. Callers that
+  need order-bearing mappings must use tuples of pairs or an explicit adapter.
+- Capture enforcement is now described precisely as static capture analysis.
+  Directly named mutable globals and closures are rejected, while
+  `globals()[name]`, dynamic `vars`/`getattr`, `eval`/`exec`, runtime imports,
+  and similar namespace/reflection paths remain outside the analyzed envelope.
+  The contract documents that these reads can stale warm and checkpoint state
+  unless routed through an `Input`/`Resource` or declared untracked.
+- A failed `Database.set()` no longer leaves an Input registration behind.
+  Registration, records, revision, statistics, and artifact persistence now
+  remain unchanged when freezing or a custom comparison policy fails; the same
+  precommit boundary covers `set_many()`.
+- Custom Input and Query equality/cutoff policies now receive detached operands
+  in every mode. A buggy comparator can no longer use ordinary or reflective
+  mutation to alter the stored old snapshot or the new snapshot that will be
+  published; policy purity remains a documented requirement.
+- Query observers now emit only when a prior stored value changes under the
+  query's equality policy; cold execution and unchanged untracked execution no
+  longer masquerade as value changes. Each event captures its recipients when
+  the value is published, so later subscribers cannot receive earlier buffered
+  events, while unsubscription preserves deliveries already captured.
+  Subscription removal uses registration identity rather than callback
+  equality, preventing one equal callback object from detaching another.
 
 ### Added
 
@@ -47,9 +308,11 @@ decided at release time.
 
 ### Changed
 
-- The checkpoint manifest schema is v6; v5 manifests are rejected loudly
-  because their records can predate the module-identity and stat-probe
-  repairs above.
+- The checkpoint manifest schema is v7; v1-v6 manifests are rejected loudly
+  because their records can predate the typed-equality, owned-snapshot, and
+  execution-mode and query-context repairs above, omit a database dependency
+  read from a resource hook, or retain a fallback derived from an unrecorded
+  child-query failure.
 - The action ledger schema is v3, and orphan deletion is verified against the
   recorded bytes: an orphan that no longer carries the digest the ledger
   recorded is released, never deleted. The manifest also records the root
@@ -67,14 +330,20 @@ decided at release time.
   key, not the key's provenance. The action contract and security policy
   state that an external `state_dir` must be trusted as strongly as the
   output root.
+- Checkpoint trust condition (vi) now states that query behavior must remain
+  inside the static capture-analysis envelope. Dynamically reached state is
+  trustworthy only when modeled as an `Input`/`Resource` or declared
+  untracked and therefore omitted from the checkpoint.
 - The README positions pyinc as an application of the established Salsa-style
-  red-green model with prior art named, not as the first incremental engine
-  for Python. Verification language, the `lru_cache` comparison, the Rust
-  ownership analogy, and the `report_untracked_read` guidance now say
-  exactly what is true; the demo page carries full provenance for its
-  numbers.
+  red-green model. A 2026-08-04 related-work matrix pins primary evidence for
+  IncPy, Adapton, Loman, Cascade Query, and Calyxos, separates the established
+  graph algorithm from pyinc's proposed integrated Python assurance envelope,
+  and makes no priority claim. Verification language, the `lru_cache`
+  comparison, the Rust ownership analogy, and the `report_untracked_read`
+  guidance now say exactly what is true; the demo page links its recorded
+  evidence for the published numbers.
 - The development-status classifier is `4 - Beta` until the hardened release
-  has soaked and an external audit of the fixes closes.
+  has soaked and independent technical review of the fixes closes.
 
 ## [3.1.1] - 2026-08-03
 
@@ -718,12 +987,13 @@ decided at release time.
 
 - Replaced marshal-based code identity with canonical typed code-object
   encoding, including slice and nested-code constants, definition defaults,
-  immutable and transitive captures, comparator policies, resource/adapter
-  implementations, and relevant interpreter/build flags.
-- Unpinnable equality/cutoff policy captures and local or dynamically unbound
-  class captures are rejected instead of collapsing to name- or type-only
-  identities. Input policies, resources, and adapters now independently include
-  interpreter/build identity at their checkpoint trust boundaries.
+  statically discovered immutable and transitive captures, comparator policies,
+  resource/adapter implementations, and relevant interpreter/build flags.
+- Statically discovered unpinnable equality/cutoff policy captures and local or
+  dynamically unbound class captures are rejected instead of collapsing to
+  name- or type-only identities. Input policies, resources, and adapters now
+  independently include interpreter/build identity at their checkpoint trust
+  boundaries.
 - Checkpoints now use fully prevalidated manifest schema v4. v1-v3 checkpoint
   manifests are intentionally rejected; the `K2` user-value encoding remains
   unchanged.
@@ -1000,7 +1270,7 @@ decided at release time.
   fixture (`examples/calc/`, `examples/calc_demo.py`), the canonical worked
   example for a query graph that reconciles outputs to disk.
 - **`pyinc_codegen` — JSON-Schema → typed-Python compiler.** A new consumer
-  package (`src/pyinc_codegen/`), the first useful file→file compiler built on
+  package (`src/pyinc_codegen/`), a useful file→file compiler built on
   pyinc. It reads a JSON Schema and generates one typed model and one doc file
   per definition plus an aggregate `__init__.py`, emitted through the `@action`
   layer so only changed artifacts are written.
@@ -1796,8 +2066,8 @@ resolved here, except for the still-deferred *schedulers or worker pools*.
   snapshot variants. Previously the boundary raised
   `UnsupportedValueError("Cyclic values cannot cross cached boundaries.")`
   and silently dropped shared identity. Pure-tree inputs continue to produce
-  the v1 flat snapshot shape (zero overhead in the common case); only inputs
-  with actual sharing or cycles are wrapped in `FrozenGraph`. `thaw` runs a
+  the v1 flat snapshot shape without a `FrozenGraph` envelope; only inputs with
+  actual sharing or cycles are wrapped in `FrozenGraph`. `thaw` runs a
   two-pass allocate-then-fill so a list-with-itself round-trips to an actual
   self-referential list and shared sub-objects retain identity. Resolves the
   v1 architectural non-goal "arbitrary mutable object graphs across cached
@@ -2044,8 +2314,9 @@ resolved here, except for the still-deferred *schedulers or worker pools*.
 
 - **Docs.** Reconciled the stable v1.x release story across `AGENTS.md`,
   `README.md`, `docs/architecture.md`, and `docs/integration-contract.md`.
-- **Runtime diagnostics.** Unsupported ambient-capture failures now point users
-  to `pyinc.explain_query_captures(...)` for preflight inspection.
+- **Runtime diagnostics.** Unsupported statically discovered ambient-capture
+  failures now point users to `pyinc.explain_query_captures(...)` for static
+  preflight inspection.
 
 ## [1.0.0] — 2026-04-18
 
@@ -2095,3 +2366,4 @@ The first stable v1 release.
 [3.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0
 [3.1.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.1.0
 [3.1.1]: https://github.com/Brumbelow/pyinc/releases/tag/v3.1.1
+[3.1.2]: https://github.com/Brumbelow/pyinc/releases/tag/v3.1.2

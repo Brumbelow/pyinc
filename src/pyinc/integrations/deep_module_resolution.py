@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias, cast
@@ -13,6 +12,7 @@ from pyinc.resources import DirectoryResource, FileStatResource, ResolvedPathRes
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _layer3_entrypoint
 from ._resources import file_probe, file_read_snapshot, file_text
 
 # ---------------------------------------------------------------------------
@@ -181,8 +181,7 @@ def _get_sys_path_entries() -> tuple[str, ...]:
 
 
 def _path_exists(db: Database, path: str) -> bool:
-    stat = cast(Mapping[str, object], _FILESTAT.read(db, path))
-    return bool(stat["exists"])
+    return _FILESTAT.read(db, path).exists
 
 
 def _directory_exists(db: Database, path: str) -> bool:
@@ -217,9 +216,9 @@ def _pth_listing(db: Database, directory: str) -> tuple[str, ...]:
     return tuple(sorted(entry for entry in entries if entry.endswith(".pth")))
 
 
-@query(cutoff=_pth_cutoff_token)
+@query
 def _pth_file_text(db: Database, pth_path: str) -> str:
-    """Raw text of a .pth file. Cutoff ignores comment/whitespace edits."""
+    """Exact raw text of a .pth file."""
     return _FILES.read(db, pth_path)
 
 
@@ -542,6 +541,7 @@ def _decode_location(payload: ResolvedModuleLocationPayload) -> ResolvedModuleLo
     )
 
 
+@_layer3_entrypoint
 def resolve_module_path(db: Database, dotted_name: str) -> ResolvedModuleLocation:
     """Resolve a dotted module name to its file or namespace contributions."""
     payload = cast(
@@ -551,6 +551,7 @@ def resolve_module_path(db: Database, dotted_name: str) -> ResolvedModuleLocatio
     return _decode_location(payload)
 
 
+@_layer3_entrypoint
 def deep_module_resolution_analysis(db: Database) -> DeepModuleResolutionAnalysis:
     """Snapshot of effective module search paths, .pth directives, and namespaces."""
     payload = cast(

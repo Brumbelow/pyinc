@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from functools import wraps
 from inspect import isasyncgenfunction, iscoroutinefunction, isgeneratorfunction
 from types import FunctionType
 from typing import (
@@ -12,6 +11,8 @@ from typing import (
     Generic,
     ParamSpec,
     TypeVar,
+    cast,
+    final,
     overload,
 )
 
@@ -27,15 +28,20 @@ EqFn = Callable[[Any, Any], bool]
 CutoffFn = Callable[[Any], Any]
 
 
+@final
 @dataclass(frozen=True, eq=False)
 class Input(Generic[T]):
     key: str
     eq: EqFn | None = field(default=None, kw_only=True)
     cutoff: CutoffFn | None = field(default=None, kw_only=True)
 
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        del cls, kwargs
+        raise TypeError("Input handles cannot be subclassed.")
+
     def __post_init__(self) -> None:
-        if not isinstance(self.key, str) or not self.key:
-            raise InputKeyError("Input key must be a non-empty string.")
+        if type(self.key) is not str or not self.key:
+            raise InputKeyError("Input key must be a non-empty exact str.")
         if self.eq is not None and self.cutoff is not None:
             raise ValueError("Input() accepts either eq= or cutoff=, but not both.")
         if self.eq is not None and not callable(self.eq):
@@ -47,7 +53,32 @@ class Input(Generic[T]):
         return db.read_input(self)
 
 
+@final
 class Query(Generic[P, T]):
+    """An immutable handle for one query definition.
+
+    The callable and policy objects remain observable through read-only
+    properties so the runtime can fingerprint their complete definitions on
+    each request.  The handle itself has no instance dictionary and cannot
+    acquire state that would be invisible to a capturing query.
+    """
+
+    __slots__ = (
+        "_cutoff",
+        "_doc",
+        "_eq",
+        "_fn",
+        "_key",
+        "_module",
+        "_name",
+        "_qualname",
+        "__weakref__",
+    )
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        del cls, kwargs
+        raise TypeError("Query handles cannot be subclassed.")
+
     def __init__(
         self,
         fn: Callable[Concatenate[Database, P], T],
@@ -67,15 +98,56 @@ class Query(Generic[P, T]):
         if cutoff is not None and not callable(cutoff):
             raise TypeError("@query cutoff= must be callable.")
         query_key = key if key is not None else f"{fn.__module__}:{fn.__qualname__}"
-        if not isinstance(query_key, str) or not query_key:
-            raise ValueError("Query key must be a non-empty string.")
-        self.fn = fn
-        self.eq = eq
-        self.cutoff = cutoff
-        self.key = query_key
-        # Copy descriptive callable metadata without merging the function's
-        # arbitrary attribute dictionary into the query contract.
-        wraps(fn, updated=())(self)
+        if type(query_key) is not str or not query_key:
+            raise ValueError("Query key must be a non-empty exact str.")
+        object.__setattr__(self, "_fn", fn)
+        object.__setattr__(self, "_eq", eq)
+        object.__setattr__(self, "_cutoff", cutoff)
+        object.__setattr__(self, "_key", query_key)
+        object.__setattr__(self, "_module", fn.__module__)
+        object.__setattr__(self, "_name", fn.__name__)
+        object.__setattr__(self, "_qualname", fn.__qualname__)
+        object.__setattr__(self, "_doc", fn.__doc__)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "__module__":
+            return object.__getattribute__(self, "_module")
+        if name == "__name__":
+            return object.__getattribute__(self, "_name")
+        if name == "__qualname__":
+            return object.__getattribute__(self, "_qualname")
+        if name == "__doc__":
+            return object.__getattribute__(self, "_doc")
+        if name == "__wrapped__":
+            return object.__getattribute__(self, "_fn")
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        del name, value
+        raise AttributeError("Query handles are immutable.")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise AttributeError("Query handles are immutable.")
+
+    @property
+    def fn(self) -> Callable[Concatenate[Database, P], T]:
+        return cast(
+            Callable[..., T],
+            object.__getattribute__(self, "_fn"),
+        )
+
+    @property
+    def eq(self) -> EqFn | None:
+        return cast(EqFn | None, object.__getattribute__(self, "_eq"))
+
+    @property
+    def cutoff(self) -> CutoffFn | None:
+        return cast(CutoffFn | None, object.__getattribute__(self, "_cutoff"))
+
+    @property
+    def key(self) -> str:
+        return cast(str, object.__getattribute__(self, "_key"))
 
     def __call__(self, db: Database, *args: P.args, **kwargs: P.kwargs) -> T:
         return db.get(self, *args, **kwargs)

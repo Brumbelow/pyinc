@@ -145,7 +145,7 @@ def test_stat_only_query_is_never_invalidated_by_the_file_it_stats(tmp_path: Pat
     assert Database().get(observed_size) == 12
 
 
-def test_report_untracked_read_restores_consistency_for_a_stat_only_query(
+def test_report_untracked_read_prevents_stat_query_memo_reuse(
     tmp_path: Path,
 ) -> None:
     """The declared escape hatch for the metadata gap."""
@@ -163,7 +163,9 @@ def test_report_untracked_read_restores_consistency_for_a_stat_only_query(
     path.write_text("hello, world", encoding="utf-8")
 
     assert db.get(declared_size) == 12
-    assert db.get(declared_size) == Database().get(declared_size)
+    executions = db.statistics().query_executions
+    assert db.get(declared_size) == 12
+    assert db.statistics().query_executions == executions + 1
     assert db.inspect(declared_size).is_untracked
 
 

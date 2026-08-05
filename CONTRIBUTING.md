@@ -17,13 +17,20 @@ git clone https://github.com/Brumbelow/pyinc.git
 cd pyinc
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install -e '.[dev]'
+python3 -m pip install --require-hashes --only-binary=:all: -r requirements/toolchain.lock
+python3 -m pip install --no-build-isolation --no-deps -e .
+python3 scripts/check_toolchain.py --verify-installed
 ```
 
 Python 3.11 or newer is required. `pyproject.toml` pins `target-version =
 "py311"` for Ruff and `python_version = "3.11"` for mypy. The installed console
 script is `pyinc-tools`, with `analyze` and `lsp` subcommands; `python3 -m
-pyinc_tools` is equivalent.
+pyinc_tools` is equivalent. `requirements/toolchain.txt` pins every directly
+invoked build, test, benchmark, analysis, and release tool; those tools are not
+runtime dependencies of the wheel. `requirements/toolchain.lock` is the
+universal, transitive, hash-locked resolution used by CI and releases. Regenerate
+it with the exact `uv pip compile` command recorded at the top of both files;
+the manifest pins that lock generator itself as `uv==0.11.21`.
 
 ## What CI will check
 
@@ -102,7 +109,9 @@ Releases are cut by the maintainer. The tag name must equal the
 `CHANGELOG.md` section in the same change. The release workflow verifies every
 commit in the released range against the release signing key, so those commits
 reach `main` as a fast-forward push of locally signed commits rather than
-through the GitHub merge button. This does not affect ordinary pull requests.
+through the GitHub merge button. A GitHub **Verified** merge is signed by
+GitHub's key, not the release key, and therefore remains ineligible. This does
+not affect ordinary pull requests as review vehicles.
 [`docs/releases.md`](docs/releases.md) describes the rest of the pipeline.
 
 ## Reporting a security issue

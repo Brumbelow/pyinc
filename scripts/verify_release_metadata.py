@@ -9,6 +9,7 @@ import sys
 import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import NoReturn
 
@@ -18,6 +19,7 @@ FINAL_TAG = "v3.0.0"
 FINAL_VERSION = "3.0.0"
 FINAL_CHANGELOG_REFERENCE = b"[3.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.0.0"
 FINAL_CHANGED_PATHS = frozenset({"CHANGELOG.md", "pyproject.toml"})
+RETIRED_RELEASE_VERSIONS = frozenset({"3.1.1"})
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 _PROJECT_TABLE_PATTERN = re.compile(rb"(?m)^\[project\][ \t]*(?:#[^\r\n]*)?\r?$")
 _TABLE_PATTERN = re.compile(rb"(?m)^\[\[?[^\r\n]+\]\]?[ \t]*(?:#[^\r\n]*)?\r?$")
@@ -82,8 +84,16 @@ def _release_section(changelog: str, version: str) -> tuple[str, ...]:
     if len(starts) != 1:
         _reject(f"CHANGELOG.md must contain exactly one {version} release section")
     heading = lines[starts[0]]
-    if re.fullmatch(rf"## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}", heading) is None:
+    match = re.fullmatch(
+        rf"## \[{re.escape(version)}\] - (?P<date>\d{{4}}-\d{{2}}-\d{{2}})",
+        heading,
+    )
+    if match is None:
         _reject(f"the {version} CHANGELOG.md heading must use '## [{version}] - YYYY-MM-DD'")
+    try:
+        date.fromisoformat(match.group("date"))
+    except ValueError:
+        _reject(f"the {version} CHANGELOG.md heading must contain a valid calendar date")
     start = starts[0] + 1
     end = next(
         (index for index in range(start, len(lines)) if lines[index].startswith("## [")),
@@ -176,6 +186,10 @@ def verify_release_metadata(metadata: ReleaseMetadata) -> None:
     document_version = _project_version(metadata.project_document)
     if document_version != metadata.project_version:
         _reject("project metadata does not match the recorded project version")
+    if metadata.project_version in RETIRED_RELEASE_VERSIONS:
+        _reject(
+            f"release version {metadata.project_version!r} is retired and must not be reused"
+        )
     expected_tag = f"v{metadata.project_version}"
     if metadata.tag != expected_tag:
         _reject(

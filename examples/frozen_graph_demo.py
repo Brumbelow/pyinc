@@ -4,7 +4,8 @@ from pyinc import FrozenGraph, freeze, thaw
 
 
 def main() -> None:
-    # 1. Pure tree: no shared identity, no cycles → flat snapshot shape, zero overhead.
+    # 1. Pure tree: no shared identity or cycles, so no FrozenGraph envelope.
+    # Deep freezing and snapshot allocation still occur.
     tree = {"name": "root", "items": [1, 2, 3]}
     tree_snapshot = freeze(tree)
     print(f"tree_is_FrozenGraph={isinstance(tree_snapshot, FrozenGraph)}")

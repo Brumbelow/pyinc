@@ -7,18 +7,19 @@ v3 process.
 
 ## Discard persisted state
 
-- Delete saved checkpoint keys and create new checkpoints. Manifest schema v6
-  rejects v1-v5 manifests with `CheckpointVersionError`. Snapshot objects using
+- Delete saved checkpoint keys and create new checkpoints. Manifest schema v7
+  rejects v1-v6 manifests with `CheckpointVersionError`. Snapshot objects using
   the `K2` value encoding remain valid, but no v2 checkpoint ledger is trusted.
 - Delete `.pyinc-action.*.json` v1 ledgers after confirming their owned output
-  directories. v3 writes schema v2 manifests named with the SHA-256 digest of
+  directories. Current v3 writes schema v3 manifests named with the SHA-256 digest of
   the full tool identity and binds each ledger to its resolved output root. The
   next reconcile safely claims its desired files;
   an old ledger is never used to delete files.
 
 ## Kernel API changes
 
-Inputs now require a stable, non-empty key:
+Inputs now require a stable, non-empty exact `str` key; string subclasses are
+rejected rather than reduced to their characters:
 
 ```python
 SOURCE = Input[str]("build.source", cutoff=cutoff_source)
@@ -28,19 +29,53 @@ The key replaces process-global creation ordinals. Within one `Database`, two
 different `Input` objects may share a key only when their complete definition
 is compatible. A conflict raises `InputKeyError` immediately.
 
-`Query` is public. `@query(key="build.parse")` supplies an explicit stable key;
-without it the key is `module:qualname`. Coroutine, async-generator, and
+`Query` is public. `@query(key="build.parse")` supplies an explicit stable exact
+`str` key; string subclasses are rejected. Without it, the key is
+`module:qualname`. Coroutine, async-generator, and
 generator functions are rejected when decorated. Query identity includes the
-function implementation, defaults, immutable captures, transitive query
-captures, and equality/cutoff policies. Policy captures and callable instance
-state must be snapshot-safe. Local or dynamically unbound class objects are not
-stable capture handles; define implementation types at module scope.
+supported static function implementation, defaults, statically discovered
+immutable captures, transitive query captures, and equality/cutoff policies.
+Policy captures and callable instance state found by that analysis must be
+snapshot-safe. Local or dynamically unbound class objects are not stable
+capture handles; define implementation types at module scope. Dynamic namespace
+or reflection reads such as `globals()[name]`, `vars`, dynamic `getattr`,
+`eval`/`exec`, and runtime imports are outside static capture analysis; move
+their behavior-bearing state to an `Input`/`Resource` or declare it untracked.
+Callable objects that expose `__wrapped__` are not treated as transparent
+decorators and are rejected as captures, equality/cutoff policies, or
+state-observation resource hooks. Decorators that return ordinary Python
+functions, including `functools.wraps` decorators, and decorated bound methods
+remain supported.
+
+Distinct equal objects in defaults, reflected annotations, function state, or
+any direct global/nonlocal capture are no longer interchangeable: Python can
+expose their identity through `id`, `is`, protocols, and extension callables.
+This includes captured managed handles, functions, modules, methods, and types.
+Those definition sites carry a process-local incarnation, so a cross-process
+checkpoint executes rather than reusing them. A capture-free query can still
+warm an explicit query-argument call across processes.
+
+Mappings crossing a v3 value boundary do not promise ordinary insertion order.
+`FrozenDict` and thawed dictionaries iterate in canonical frozen-key
+fingerprint order in every mode and after checkpoint reload. Code whose
+mapping order is semantic should migrate that value to a tuple of pairs or a
+dedicated adapter.
 
 `Resource[KeyT, ValueT, ProbeT]` is public and exposes `read`, `probe`, `load`,
-`probe_and_load`, `identity`, and `label`. Custom resources should use those
-hooks and callers may use `Database.read_resource`; documented calls to private
-database resource methods should be replaced. Use `BinaryFileResource` for
-bytes and `FileResource` for decoded text.
+`probe_and_load`, `identity`, and `label`. Custom resources implement the
+required `label`, `probe`, and `load` hooks; inherited defaults supply `read`,
+`probe_and_load`, and `identity`. Module-level singleton resources are a
+convention, not a semantic requirement. Callers may use
+`Database.read_resource`; documented calls to private database resource methods
+should be replaced. Use `BinaryFileResource` for bytes and `FileResource` for
+decoded text.
+
+Resource hooks now have an explicit no-managed-dependencies rule. `identity`,
+`label`, `probe`, `load`, and `probe_and_load` may observe external state but
+must not call a `Database` observation or read an `Input`, query, or another
+resource. Move that composition into the reading query. Violations raise the
+public `ResourceDependencyError` in strict, checked, and fast modes, including
+when a hook catches the initial error or targets another database.
 
 ## Source and symbol APIs
 
@@ -67,9 +102,10 @@ assume Python code-point columns on the wire.
 ## Action API changes
 
 `ReconcileResult.written` has been replaced by `created`, `updated`, and
-`repaired`; `deleted`, `unchanged`, and `dry_run` remain. Handle the categories
-explicitly or concatenate the three changed-path tuples when only a combined
-view is needed.
+`repaired`; `deleted`, `unchanged`, and `dry_run` remain. `deleted` records only
+completed removals; `plan()` leaves it empty and places predicted removals in
+`would_delete`. Handle the categories explicitly or concatenate the three
+changed-path tuples when only a combined view is needed.
 
 Action paths and manifests are now strict trust boundaries. Catch
 `ActionPathError`, `ActionManifestError`, and `ActionLockTimeoutError` where an

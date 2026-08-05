@@ -14,6 +14,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
 
+from ._decoding import _layer3_entrypoint
 from ._resources import file_probe, file_read_snapshot, file_text
 
 JsonKeyPayload: TypeAlias = tuple[str, str, str, str]
@@ -93,19 +94,11 @@ class _JsonSurrogateKeyError(ValueError):
 
 # Object and array nesting is capped before parsing because every section re-emits
 # the dot path of all its ancestors: `json_sections_payload` grows with the square
-# of the nesting depth, so this cap is what bounds the *cache*, not just the parse.
-# `xml_config` caps `_MAX_XML_DEPTH` for the same reason and against the same
-# budget — a document at the cap must not cache more than ~1 MiB.
-#
-# Two constraints meet at 200. The budget: measured with 20-character keys, a
-# document at this cap caches 832 KB of section payload text (422 KB of it section
-# names); at 256 levels, the cap `xml_config` carries, the same document would
-# cache 1.33 MiB, over budget. XML sits higher under one budget because an XML
-# element emits its path once where a JSON object emits it twice, as its own
-# section name and again in its parent's `subsections`. Independently, `freeze`
+# of nesting depth. The cap bounds that depth-amplification term, not total bytes
+# or memory; one scalar string or key may still be arbitrarily large. Independently, `freeze`
 # refuses to snapshot a value nested deeper than 200 levels, and a JSON document's
 # container depth is exactly its snapshot depth, so a document past 200 could never
-# be cached at all — it raises `UnsupportedValueError` out of the cutoff instead.
+# cross the cached value boundary at all.
 # 200 is still an order of magnitude deeper than any real configuration document.
 _MAX_JSON_DEPTH = 200
 
@@ -237,9 +230,17 @@ def _json_value_type(value: Any) -> str:
 
 
 def _json_value_to_string(value: Any) -> str:
+    return repr(_canonical_public_value(value))
+
+
+def _canonical_public_value(value: Any) -> Any:
+    """Normalize object insertion order at every public rendering depth."""
+
     if isinstance(value, dict):
-        return repr(sorted(value.items()))
-    return repr(value)
+        return [(key, _canonical_public_value(item)) for key, item in sorted(value.items())]
+    if isinstance(value, list):
+        return [_canonical_public_value(item) for item in value]
+    return value
 
 
 def _walk_sections(
@@ -294,8 +295,7 @@ def _json_cutoff_token(text: str) -> tuple[str, str]:
         # `UnsupportedValueError`, which is a `PyIncError` and not a
         # `ValueError`: a document `json.loads` accepts but `freeze` refuses --
         # a lone surrogate escape in a string value, say -- must degrade to the
-        # raw text here, not escape the cutoff and fail the recomputation a
-        # fresh database completes.
+        # raw text here, not escape a direct projection test.
         return ("raw", text)
 
 
@@ -314,7 +314,7 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_json_cutoff_token)
+@query
 def json_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 
@@ -370,6 +370,7 @@ def _decode_section(payload: JsonSectionPayload) -> JsonSection:
     )
 
 
+@_layer3_entrypoint
 def json_analysis(db: Database, path: str | os.PathLike[str]) -> JsonAnalysis:
     normalized = os.fspath(path)
     payload = cast(JsonAnalysisPayload, thaw(db.get(json_analysis_payload, normalized)))
@@ -381,6 +382,7 @@ def json_analysis(db: Database, path: str | os.PathLike[str]) -> JsonAnalysis:
     )
 
 
+@_layer3_entrypoint
 def workspace_json_analysis(
     db: Database,
     root: str | os.PathLike[str],

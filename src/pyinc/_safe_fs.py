@@ -5,11 +5,13 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import errno
+import hashlib
 import importlib
 import os
 import secrets
 import stat
 import struct
+import sys
 from pathlib import Path, PureWindowsPath
 from typing import Any, BinaryIO, cast
 
@@ -188,11 +190,12 @@ class _WindowsApi:
         access: int,
         creation: int,
         flags: int,
+        share: int = _WIN_STABLE_SHARE_MODE,
     ) -> int:
         handle = self._create_file(
             _windows_extended_path(path),
             access,
-            _WIN_STABLE_SHARE_MODE,
+            share,
             None,
             creation,
             flags,
@@ -455,10 +458,22 @@ def atomic_write(path: Path, data: bytes) -> None:
         os.close(parent_fd)
 
 
-def unlink_regular_file(path: Path) -> bool:
-    """Unlink a regular file through a no-follow parent handle and sync the directory."""
+def unlink_regular_file(path: Path, *, expected_digest: str | None = None) -> bool:
+    """Unlink one regular-file identity, optionally only at an expected SHA-256.
+
+    With ``expected_digest``, POSIX first renames the current leaf into a private
+    same-directory quarantine and verifies the renamed object.  The digest and
+    unlink therefore apply to one directory-entry identity even if another
+    process replaces the original path. POSIX callers must exclude a
+    non-cooperating process that retains and writes through an already-open file
+    descriptor; no portable unlink protocol can prevent that final mutation.
+    Windows holds a read/delete handle that excludes replacement and writers
+    while it verifies and marks that same handle for deletion.
+    """
     if os.name == "nt":
-        return _unlink_regular_file_windows(path)
+        return _unlink_regular_file_windows(path, expected_digest=expected_digest)
+    if expected_digest is not None:
+        return _unlink_regular_file_if_digest_posix(path, expected_digest)
     try:
         parent_fd = _open_directory(path.parent, create=False)
     except FileNotFoundError:
@@ -475,6 +490,214 @@ def unlink_regular_file(path: Path) -> bool:
         os.fsync(parent_fd)
         return True
     finally:
+        os.close(parent_fd)
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _rename_noreplace(
+    source: str,
+    destination: str,
+    *,
+    src_dir_fd: int,
+    dst_dir_fd: int,
+) -> None:
+    """Atomically move one entry only while the destination remains absent."""
+
+    function_name: str | None = None
+    flags = 0
+    if sys.platform.startswith("linux"):
+        function_name = "renameat2"
+        flags = 1  # RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        function_name = "renameatx_np"
+        flags = 0x00000004  # RENAME_EXCL
+    if function_name is not None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        function = getattr(libc, function_name, None)
+        if function is not None:
+            function.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            function.restype = ctypes.c_int
+            result = function(
+                src_dir_fd,
+                os.fsencode(source),
+                dst_dir_fd,
+                os.fsencode(destination),
+                flags,
+            )
+            if result == 0:
+                return
+            error_number = ctypes.get_errno()
+            if error_number not in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+                raise OSError(error_number, os.strerror(error_number), destination)
+
+    # A hard link plus unlink is the portable no-clobber move for non-directory
+    # entries. Directories deliberately fail closed when the platform lacks an
+    # atomic exclusive rename; preserving the quarantine is safer than a racy
+    # check followed by a clobbering rename.
+    os.link(
+        source,
+        destination,
+        src_dir_fd=src_dir_fd,
+        dst_dir_fd=dst_dir_fd,
+        follow_symlinks=False,
+    )
+    os.unlink(source, dir_fd=src_dir_fd)
+
+
+def _unlink_regular_file_if_digest_posix(path: Path, expected_digest: str) -> bool:
+    """Quarantine, verify, and delete one POSIX directory entry identity."""
+    try:
+        parent_fd = _open_directory(path.parent, create=False)
+    except FileNotFoundError:
+        return False
+
+    quarantine_fd = -1
+    quarantine_name: str | None = None
+    payload_present = False
+    try:
+        try:
+            metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(metadata.st_mode):
+            raise UnsafeFilesystemPathError(f"Refusing to delete non-regular file: {path}")
+
+        _require_directory_identity(parent_fd, path.parent)
+        for _attempt in range(100):
+            candidate = f".pyinc-delete-{os.getpid()}-{secrets.token_hex(16)}"
+            try:
+                os.mkdir(candidate, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            quarantine_name = candidate
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                quarantine_fd = os.open(candidate, flags, dir_fd=parent_fd)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.rmdir(candidate, dir_fd=parent_fd)
+                raise
+            break
+        else:
+            raise OSError(f"Could not allocate a deletion quarantine beside {path}.")
+
+        _require_directory_identity(parent_fd, path.parent)
+        try:
+            os.rename(
+                path.name,
+                "payload",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=quarantine_fd,
+            )
+        except FileNotFoundError:
+            return False
+        payload_present = True
+        os.fsync(parent_fd)
+
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open("payload", flags, dir_fd=quarantine_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise UnsafeFilesystemPathError(
+                    "Deletion target changed to a non-regular object."
+                )
+            current_digest = hashlib.sha256(_read_descriptor(descriptor)).hexdigest()
+        finally:
+            os.close(descriptor)
+
+        if current_digest != expected_digest:
+            try:
+                os.link(
+                    "payload",
+                    path.name,
+                    src_dir_fd=quarantine_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as error:
+                raise UnsafeFilesystemPathError(
+                    f"Deletion target changed while it was quarantined; both objects were "
+                    f"preserved, with the verified object at "
+                    f"{path.parent / quarantine_name / 'payload'}"
+                ) from error
+            except OSError as error:
+                raise UnsafeFilesystemPathError(
+                    f"Cannot restore changed deletion target; it was preserved at "
+                    f"{path.parent / quarantine_name / 'payload'}"
+                ) from error
+            os.unlink("payload", dir_fd=quarantine_fd)
+            payload_present = False
+            os.rmdir(quarantine_name, dir_fd=parent_fd)
+            quarantine_name = None
+            os.fsync(parent_fd)
+            return False
+
+        os.unlink("payload", dir_fd=quarantine_fd)
+        payload_present = False
+        os.rmdir(quarantine_name, dir_fd=parent_fd)
+        quarantine_name = None
+        os.fsync(parent_fd)
+        return True
+    except BaseException:
+        if payload_present and quarantine_fd >= 0 and quarantine_name is not None:
+            preserved_path = path.parent / quarantine_name / "payload"
+            try:
+                payload_metadata = os.stat("payload", dir_fd=quarantine_fd, follow_symlinks=False)
+                try:
+                    target_metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    target_metadata = None
+                if target_metadata is None:
+                    _rename_noreplace(
+                        "payload",
+                        path.name,
+                        src_dir_fd=quarantine_fd,
+                        dst_dir_fd=parent_fd,
+                    )
+                    payload_present = False
+                elif (target_metadata.st_dev, target_metadata.st_ino) != (
+                    payload_metadata.st_dev,
+                    payload_metadata.st_ino,
+                ):
+                    raise UnsafeFilesystemPathError(
+                        "Cannot restore interrupted deletion because the live path was "
+                        "replaced; both objects were preserved, with the quarantined "
+                        f"object at {preserved_path}"
+                    )
+                if payload_present:
+                    os.unlink("payload", dir_fd=quarantine_fd)
+                    payload_present = False
+                os.rmdir(quarantine_name, dir_fd=parent_fd)
+                quarantine_name = None
+                os.fsync(parent_fd)
+            except UnsafeFilesystemPathError:
+                raise
+            except OSError as restore_error:
+                raise UnsafeFilesystemPathError(
+                    "Cannot restore an interrupted deletion; the object was preserved "
+                    f"at {preserved_path}"
+                ) from restore_error
+        raise
+    finally:
+        if quarantine_fd >= 0:
+            os.close(quarantine_fd)
+        if quarantine_name is not None and not payload_present:
+            with contextlib.suppress(OSError):
+                os.rmdir(quarantine_name, dir_fd=parent_fd)
         os.close(parent_fd)
 
 
@@ -653,7 +876,7 @@ def _atomic_write_windows(path: Path, data: bytes) -> None:
                 api.close(handle)
 
 
-def _unlink_regular_file_windows(path: Path) -> bool:
+def _unlink_regular_file_windows(path: Path, *, expected_digest: str | None = None) -> bool:
     api = _windows_api()
     try:
         directories = _WindowsDirectoryHandles.open(api, os.fspath(path.parent), create=False)
@@ -663,19 +886,34 @@ def _unlink_regular_file_windows(path: Path) -> bool:
         try:
             handle = api.open_handle(
                 os.fspath(path),
-                access=_WIN_DELETE | _WIN_FILE_READ_ATTRIBUTES,
+                access=(
+                    _WIN_DELETE
+                    | _WIN_FILE_READ_ATTRIBUTES
+                    | (_WIN_GENERIC_READ if expected_digest is not None else 0)
+                ),
                 creation=_WIN_OPEN_EXISTING,
                 flags=_WIN_FILE_FLAG_OPEN_REPARSE_POINT,
+                share=(
+                    _WIN_FILE_SHARE_READ if expected_digest is not None else _WIN_STABLE_SHARE_MODE
+                ),
             )
         except OSError as error:
             if _windows_error_code(error) in _WIN_MISSING_ERRORS:
                 return False
             raise
+        stream: BinaryIO | None = None
         try:
             api.require_regular(handle, os.fspath(path))
+            if expected_digest is not None:
+                stream = _windows_file_from_handle(handle, os.O_RDONLY, "rb")
+                if hashlib.sha256(stream.read()).hexdigest() != expected_digest:
+                    return False
             api.delete_handle(handle, os.fspath(path))
         finally:
-            api.close(handle)
+            if stream is None:
+                api.close(handle)
+            else:
+                stream.close()
     return True
 
 

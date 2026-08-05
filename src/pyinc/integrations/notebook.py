@@ -13,6 +13,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _layer3_entrypoint
 from ._resources import file_probe, file_read_snapshot, file_text
 from .source_geometry import DocumentMap, SourcePosition, SourceRange, identifier_range
 
@@ -352,7 +353,7 @@ def _surrogate_bearing_field(parsed: dict[str, Any]) -> str | None:
     """Name the first payload-bound string that is not valid Unicode.
 
     Cell sources, cell types and the kernel metadata reach the cached payload --
-    and the cutoff token -- verbatim, where a lone surrogate is not a value
+    and this test projection -- verbatim, where a lone surrogate is not a value
     `freeze` can snapshot. Outputs and per-execution metadata reach neither, so
     they are not walked: a notebook that only stores a surrogate loses no
     analysis over it.
@@ -394,19 +395,15 @@ def _try_parse_notebook(text: str) -> dict[str, Any] | None:
     return parsed
 
 
-def _notebook_cutoff_token(text: str) -> tuple[str, ...]:
-    """Project the notebook text to the parts that affect analysis.
+def _notebook_cutoff_token(text: str) -> tuple[object, ...]:
+    """Legacy projection retained for cutoff-congruence tests.
 
-    Outputs and per-execution metadata are stripped so that running cells
-    (which only changes ``outputs`` and ``execution_count``) backdates and
-    leaves downstream consumers untouched. JSON-decode failures fall back to
-    the raw text so a malformed notebook still has a stable cutoff.
+    It is deliberately not attached to ``notebook_text``: raw notebook text is
+    exact. Outputs and per-execution metadata are stripped from this projection,
+    and JSON-decode failures fall back to the raw text.
     """
     parsed = _try_parse_notebook(text)
     if parsed is None:
-        return ("raw", text)
-    cells_raw = parsed.get("cells", [])
-    if not isinstance(cells_raw, list):
         return ("raw", text)
     metadata = parsed.get("metadata", {})
     kernel_name: str | None = None
@@ -425,16 +422,36 @@ def _notebook_cutoff_token(text: str) -> tuple[str, ...]:
             li_name = language_info.get("name")
             if isinstance(li_name, str):
                 language = li_name
-    parts: list[str] = ["nb", repr(kernel_name), repr(language)]
+    if "cells" not in parsed:
+        return (
+            "notebook-v2",
+            ("kernel-name", kernel_name),
+            ("language", language),
+            ("cells", "missing"),
+        )
+    cells_raw = parsed["cells"]
+    if not isinstance(cells_raw, list):
+        return ("raw", text)
+    cells: list[tuple[object, ...]] = []
     for raw_cell in cells_raw:
         if not isinstance(raw_cell, dict):
-            parts.append("invalid-cell")
+            cells.append(("invalid-cell",))
             continue
-        cell_type = str(raw_cell.get("cell_type", ""))
+        cell_type = _classify_cell_type(raw_cell.get("cell_type"))
         source = _coerce_source(raw_cell.get("source"))
-        parts.append(cell_type)
-        parts.append(source)
-    return tuple(parts)
+        cells.append(
+            (
+                "cell",
+                ("cell-type", cell_type),
+                ("source", source),
+            )
+        )
+    return (
+        "notebook-v2",
+        ("kernel-name", kernel_name),
+        ("language", language),
+        ("cells", "present", tuple(cells)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +459,7 @@ def _notebook_cutoff_token(text: str) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_notebook_cutoff_token)
+@query
 def notebook_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 
@@ -661,6 +678,7 @@ def _decode_diagnostic(
     )
 
 
+@_layer3_entrypoint
 def notebook_analysis(db: Database, path: str | os.PathLike[str]) -> NotebookAnalysis:
     normalized = os.fspath(path)
     payload = cast(NotebookAnalysisPayload, thaw(db.get(notebook_analysis_payload, normalized)))
@@ -676,6 +694,7 @@ def notebook_analysis(db: Database, path: str | os.PathLike[str]) -> NotebookAna
     )
 
 
+@_layer3_entrypoint
 def workspace_notebook_analysis(
     db: Database,
     root: str | os.PathLike[str],

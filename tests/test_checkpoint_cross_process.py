@@ -1,7 +1,7 @@
 """Cross-process checkpoint round-trips.
 
 The durable-cache contract only means something across a *real* process
-boundary: fresh ``id()``s, a fresh randomized hash seed, and fresh module
+boundary: fresh ``id()``s, explicitly different hash seeds, and fresh module
 state. ``runpy`` (as used in ``test_examples.py``) reuses this interpreter, so
 it cannot exercise D3 (deterministic identities across processes). These tests
 spawn genuine subprocesses via ``sys.executable``.
@@ -42,6 +42,8 @@ import pyinc
 # The base state saved by phase "save": alpha=1, beta=2, a 5-byte file
 # ("hello"), and the helper module's WEIGHT=10 -> 1 + 2 + 5 + 10 == 18.
 BASE_RESULT = 18
+SAVE_HASH_SEED = "1"
+LOAD_HASH_SEED = "4294967295"
 
 FIXTURE_SCRIPT = '''\
 """Cross-process checkpoint fixture. Everything is defined at module level so
@@ -59,6 +61,7 @@ import mg_helpers  # written next to this script; captured by the root query
 alpha = Input[int]("cxp_alpha")
 beta = Input[int]("cxp_beta")
 files = FileResource()
+identity_marker = tuple([1])
 
 store_dir = sys.argv[1]
 phase = sys.argv[2]
@@ -89,7 +92,6 @@ def build_root(alt_body):
             return (
                 alpha.read(db) * 1000
                 + beta.read(db)
-                + len(files.read(db, data_path))
                 + mg_helpers.WEIGHT
             )
 
@@ -100,11 +102,25 @@ def build_root(alt_body):
             return (
                 alpha.read(db)
                 + beta.read(db)
-                + len(files.read(db, data_path))
                 + mg_helpers.WEIGHT
             )
 
     return root
+
+
+@query
+def file_size(db, path):
+    return len(files.read(db, path))
+
+
+@query
+def identity_sensitive(db):
+    return len(identity_marker)
+
+
+@query
+def stable_sum(db, alpha_value, beta_value, weight):
+    return alpha_value + beta_value + weight
 
 
 def main():
@@ -115,7 +131,9 @@ def main():
         root = build_root(False)
         db.set(alpha, 1)
         db.set(beta, 2)
-        value = db.get(root)
+        value = db.get(root) + db.get(file_size, data_path)
+        assert db.get(identity_sensitive) == 1
+        assert db.get(stable_sum, 1, 2, mg_helpers.WEIGHT) == 13
         key = db.save_checkpoint()
         key_path.write_text(key)
         print(json.dumps({"result": value, "key": key}))
@@ -126,10 +144,25 @@ def main():
     db.set(alpha, alpha_value)
     db.set(beta, beta_value)
     db.load_checkpoint(key_path.read_text())
-    value = db.get(root)
+    value = db.get(root) + db.get(file_size, data_path)
+    assert db.get(identity_sensitive) == 1
+    stable_value = db.get(stable_sum, alpha_value, beta_value, mg_helpers.WEIGHT)
+    assert stable_value == alpha_value + beta_value + mg_helpers.WEIGHT
+    if variant == "unchanged":
+        decision = db.inspect(
+            stable_sum, alpha_value, beta_value, mg_helpers.WEIGHT
+        ).last_recompute
+    elif variant == "file_changed":
+        decision = db.inspect(file_size, data_path).last_recompute
+    else:
+        decision = db.inspect(root).last_recompute
     print(
         json.dumps(
-            {"result": value, "recompute": db.inspect(root).last_recompute}
+            {
+                "result": value,
+                "recompute": decision,
+                "identity_recompute": db.inspect(identity_sensitive).last_recompute,
+            }
         )
     )
 
@@ -187,7 +220,7 @@ def cross_process(tmp_path: Path) -> CrossProcessEnv:
     store_dir = tmp_path / "store"
     store_dir.mkdir()
 
-    env = {
+    base_env = {
         **os.environ,
         "PYTHONPATH": os.pathsep.join([_src_dir(), str(tmp_path)]),
         # Never cache bytecode: an edited helper module whose new source happens
@@ -195,7 +228,9 @@ def cross_process(tmp_path: Path) -> CrossProcessEnv:
         # .pyc and mask the module bump. It also keeps tmp_path free of debris.
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    saved = _run([sys.executable, str(script), str(store_dir), "save", "unchanged"], env)
+    save_env = {**base_env, "PYTHONHASHSEED": SAVE_HASH_SEED}
+    load_env = {**base_env, "PYTHONHASHSEED": LOAD_HASH_SEED}
+    saved = _run([sys.executable, str(script), str(store_dir), "save", "unchanged"], save_env)
     assert saved["result"] == BASE_RESULT
     return CrossProcessEnv(
         python=sys.executable,
@@ -204,7 +239,7 @@ def cross_process(tmp_path: Path) -> CrossProcessEnv:
         root=tmp_path,
         data_path=data_path,
         helper_path=helper_path,
-        env=env,
+        env=load_env,
         save_result=int(saved["result"]),
         save_key=str(saved["key"]),
     )
@@ -212,11 +247,14 @@ def cross_process(tmp_path: Path) -> CrossProcessEnv:
 
 def test_cross_process_unchanged_state_reuses(cross_process: CrossProcessEnv) -> None:
     out = cross_process.run_load("unchanged")
-    # Fresh process, identical declared state: the checkpoint verifies (input
-    # digests match, the unchanged file re-establishes its resource record from
-    # the probe hint) and the root is served without re-executing.
+    # Fresh process, identical explicit arguments, and no identity-observable
+    # ambient captures: the capture-free query is served without re-executing.
     assert out["recompute"] == "reused"
     assert out["result"] == cross_process.save_result
+    # Ordinary immutable captures carry a process-incarnation token because
+    # Python can observe object identity. Their values still match fresh, but
+    # a new process executes rather than trusting structural equality alone.
+    assert out["identity_recompute"] == "executed"
 
 
 def test_cross_process_input_change_reexecutes(cross_process: CrossProcessEnv) -> None:

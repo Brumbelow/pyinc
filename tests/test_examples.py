@@ -39,7 +39,7 @@ def test_untracked_escape_hatch_demo_runs(capsys: pytest.CaptureFixture[str]) ->
 def test_observers_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     _run_example("observers_demo.py")
     output = capsys.readouterr().out
-    assert "event_count=3" in output
+    assert "event_count=2" in output
     assert "decision=executed" in output
     assert "final_decision=executed" in output
 

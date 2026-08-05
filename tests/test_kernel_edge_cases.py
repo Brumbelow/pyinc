@@ -17,6 +17,7 @@ from pyinc import (
     FileStatResource,
     Input,
     Query,
+    freeze,
     query,
 )
 from pyinc.errors import InputKeyError
@@ -64,7 +65,7 @@ class _UnprobeableResource(Resource[str, str, str]):
 
 @pytest.mark.parametrize("key", ["", 0, None])
 def test_input_rejects_invalid_keys(key: object) -> None:
-    with pytest.raises(InputKeyError, match="non-empty string"):
+    with pytest.raises(InputKeyError, match="non-empty exact str"):
         Input[object](cast(Any, key))
 
 
@@ -118,7 +119,7 @@ def test_query_rejects_invalid_keys_and_policies() -> None:
     with pytest.raises(TypeError, match="cutoff= must be callable"):
         Query(calculate, cutoff=cast(Any, 1))
     for key in ("", 0):
-        with pytest.raises(ValueError, match="non-empty string"):
+        with pytest.raises(ValueError, match="non-empty exact str"):
             Query(calculate, key=cast(Any, key))
 
 
@@ -129,6 +130,11 @@ def test_query_comparison_supports_default_custom_and_cutoff_policies() -> None:
     default = Query(calculate)
     assert default.compare([1, 2], [1, 2])
     assert not default.compare([1, 2], [2, 1])
+    assert not default.compare(1, 1.0)
+    assert not default.compare(True, 1)
+    assert not default.compare(0.0, -0.0)
+    nan_wrapper = freeze([float("nan")])
+    assert not default.compare(nan_wrapper, nan_wrapper)
 
     custom = Query(calculate, eq=lambda left, right: len(left) == len(right))
     assert custom.compare([1], [2])
@@ -137,6 +143,7 @@ def test_query_comparison_supports_default_custom_and_cutoff_policies() -> None:
     cutoff = Query(calculate, cutoff=lambda value: value["stable"])
     assert cutoff.compare({"stable": 1, "noise": 2}, {"stable": 1, "noise": 3})
     assert not cutoff.compare({"stable": 1}, {"stable": 2})
+    assert not cutoff.compare({"stable": 1}, {"stable": 1.0})
 
 
 def test_query_decorator_forms_and_query_call_delegate_to_database() -> None:
@@ -242,7 +249,7 @@ def test_file_stat_resource_covers_present_and_missing_paths(tmp_path: Path) -> 
         (True, 4, snapshot.mtime_ns),
         snapshot,
     )
-    assert cast(Any, resource.read(db, present))["exists"] is True
+    assert resource.read(db, present).exists is True
 
     absent = resource.load(db, missing)
     assert (absent.exists, absent.size, absent.mtime_ns) == (False, None, None)

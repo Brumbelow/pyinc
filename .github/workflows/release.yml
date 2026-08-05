@@ -23,14 +23,20 @@ jobs:
   benchmark:
     uses: ./.github/workflows/benchmark.yml
 
+  mutation:
+    uses: ./.github/workflows/mutation-testing.yml
+
   verify-and-build:
     name: Verify signed tag and build
-    needs: [gates, codeql, benchmark]
-    runs-on: ubuntu-latest
+    needs: [gates, codeql, benchmark, mutation]
+    runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
+      issues: read
     env:
       EXPECTED_FINGERPRINT: 2B6DF408BD973740052925DC894C75E1B1D05EA2
+      TRUSTED_BASELINE_TAG: v3.1.0
       TRUSTED_BASELINE: 8db85ec7a647bd7b74bf04f07e94a9bd78675193
     steps:
       - name: Check out the tagged revision
@@ -42,6 +48,27 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.14'
+
+      - name: Install locked release toolchain
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements/toolchain.lock
+          python -m pip install --no-build-isolation --no-deps -e .
+          python scripts/check_toolchain.py --verify-installed
+
+      - name: Require a successful pre-tag gate for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          count="$(gh run list \
+            --workflow release-candidate.yml \
+            --commit "$GITHUB_SHA" \
+            --event workflow_dispatch \
+            --status success \
+            --limit 100 \
+            --json databaseId \
+            --jq length)"
+          test "$count" -gt 0
 
       - name: Import the release signing key
         env:
@@ -73,7 +100,12 @@ jobs:
           git fetch --no-tags origin \
             +refs/heads/main:refs/remotes/origin/main
           test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
+          test "$(git cat-file -t "$TRUSTED_BASELINE_TAG")" = tag
+          verify_expected_signature tag "$TRUSTED_BASELINE_TAG"
+          test "$(git rev-parse "$TRUSTED_BASELINE_TAG^{commit}")" = "$TRUSTED_BASELINE"
+          verify_expected_signature commit "$TRUSTED_BASELINE"
           git merge-base --is-ancestor "$TRUSTED_BASELINE" "$GITHUB_SHA"
+          test -z "$(git rev-list --min-parents=2 "$TRUSTED_BASELINE..$GITHUB_SHA")"
           git rev-list --reverse "$TRUSTED_BASELINE..$GITHUB_SHA" > "$RUNNER_TEMP/release-commits"
           while IFS= read -r commit; do
             verify_expected_signature commit "$commit"
@@ -91,22 +123,57 @@ jobs:
             --tag "$GITHUB_REF_NAME" \
             --commit "$GITHUB_SHA"
 
+      - name: Verify independent assurance and priority closure
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          candidate_commit="$(git rev-parse "$GITHUB_SHA^")"
+          candidate_created_epoch="$(git show -s --format=%ct "$candidate_commit")"
+          test "$(git diff --name-only "$candidate_commit" "$GITHUB_SHA")" = \
+            "release/assurance.json"
+          python scripts/check_release_assurance.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --candidate-commit "$candidate_commit" \
+            --candidate-created-epoch "$candidate_created_epoch"
+          for priority in P0 P1; do
+            count="$(gh issue list --state open --label "$priority" --limit 1000 --json number --jq length)"
+            test "$count" = 0
+          done
+
       - name: Build and check distribution
         run: |
-          python -m pip install --upgrade pip build twine
-          python -m build
+          python -m scripts.reproducible_builds \
+            --project-root . \
+            --dist-output dist \
+            --metadata-output build-metadata \
+            --version "${GITHUB_REF_NAME#v}" \
+            --commit "$GITHUB_SHA" \
+            --runner-label ubuntu-24.04
+          python -m scripts.reproducible_builds \
+            --verify-existing \
+            --dist-output dist \
+            --metadata-output build-metadata \
+            --version "${GITHUB_REF_NAME#v}" \
+            --commit "$GITHUB_SHA" \
+            --runner-label ubuntu-24.04
           python -m twine check dist/*
 
       - name: Validate exact release artifacts
         run: |
-          python -m venv .release-venv
-          .release-venv/bin/python -m pip install --no-deps dist/*.whl
-          .release-venv/bin/python scripts/validate_install.py --sdist dist/pyinc-*.tar.gz
-          .release-venv/bin/pyinc-tools --version
-          .release-venv/bin/python examples/correctness_demo.py
-          .release-venv/bin/python examples/action_reconcile_demo.py
-          .release-venv/bin/python examples/calc_demo.py
-          .release-venv/bin/python examples/codegen_demo.py
+          python -m venv "$RUNNER_TEMP/release-venv"
+          "$RUNNER_TEMP/release-venv/bin/python" -m pip install --no-deps dist/*.whl
+          "$RUNNER_TEMP/release-venv/bin/python" scripts/validate_install.py \
+            --sdist dist/pyinc-*.tar.gz
+          "$RUNNER_TEMP/release-venv/bin/pyinc-tools" --version
+
+      - name: Capture exact installed-wheel demo evidence
+        run: |
+          python -m scripts.demo_evidence \
+            --project-root . \
+            --output release-evidence \
+            --python "$RUNNER_TEMP/release-venv/bin/python" \
+            --version "${GITHUB_REF_NAME#v}"
 
       - name: Generate artifact checksums
         shell: bash
@@ -116,6 +183,37 @@ jobs:
             --directory dist \
             --output SHA256SUMS
 
+      - name: Download benchmark results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: benchmark-${{ github.sha }}
+          path: benchmark-results/
+
+      - name: Prepare every remaining release asset
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python scripts/benchmark_evidence.py \
+            --source benchmark-results \
+            --output release-benchmark \
+            --version "$version" \
+            --commit "$GITHUB_SHA"
+          python scripts/release_artifacts.py release-notes \
+            --version "$version" \
+            --changelog CHANGELOG.md \
+            --output release-notes.md
+
+      - name: Verify the complete pre-publication asset set
+        shell: bash
+        run: |
+          python scripts/release_artifacts.py verify-prepared-assets \
+            --version "${GITHUB_REF_NAME#v}" \
+            --directory dist \
+            --checksums SHA256SUMS \
+            --benchmark-directory release-benchmark \
+            --demo-directory release-evidence \
+            --build-metadata-directory build-metadata
+
       - name: Upload exact release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -124,13 +222,21 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
             SHA256SUMS
+            build-metadata/pyinc-*.provenance.json
+            build-metadata/pyinc-*.spdx.json
+            build-metadata/BUILD-METADATA-SHA256SUMS
+            release-evidence/pyinc-*-demo-evidence.zip
+            release-evidence/DEMO-SHA256SUMS
+            release-benchmark/pyinc-*-benchmark-evidence.zip
+            release-benchmark/BENCHMARK-SHA256SUMS
+            release-notes.md
           if-no-files-found: error
           retention-days: 7
 
   publish:
     name: Publish verified artifacts
     needs: verify-and-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: pypi
       url: https://pypi.org/project/pyinc/
@@ -153,7 +259,7 @@ jobs:
   github-release:
     name: Publish GitHub Release
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -162,13 +268,26 @@ jobs:
         with:
           path: source
 
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14'
+
+      - name: Install locked release verification toolchain
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: \
+            -r source/requirements/toolchain.lock
+          python source/scripts/check_toolchain.py \
+            --root source \
+            --verify-installed
+
       - name: Download exact release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-distributions
           path: release-artifacts/
 
-      - name: Verify published artifacts and extract release notes
+      - name: Verify published artifacts
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -188,10 +307,6 @@ jobs:
             sleep 10
           done
           test "$published" = true
-          python source/scripts/release_artifacts.py release-notes \
-            --version "$version" \
-            --changelog source/CHANGELOG.md \
-            --output release-notes.md
 
       - name: Create or repair GitHub Release
         env:
@@ -209,6 +324,9 @@ jobs:
               --version "$version" \
               --directory release-artifacts/dist \
               --checksums release-artifacts/SHA256SUMS \
+              --benchmark-directory release-artifacts/release-benchmark \
+              --demo-directory release-artifacts/release-evidence \
+              --build-metadata-directory release-artifacts/build-metadata \
               --remote-directory "$remote_directory"
           }
 
@@ -221,7 +339,7 @@ jobs:
             python source/scripts/release_artifacts.py verify-release-state \
               --version "$version" \
               --metadata "$metadata_path" \
-              --notes release-notes.md \
+              --notes release-artifacts/release-notes.md \
               --release-list "$release_list_path"
           }
 
@@ -254,7 +372,7 @@ jobs:
             gh release create "$GITHUB_REF_NAME" \
               --verify-tag \
               --title "$title" \
-              --notes-file release-notes.md \
+              --notes-file release-artifacts/release-notes.md \
               "${create_flags[@]}"
           fi
 
@@ -265,7 +383,7 @@ jobs:
           mapfile -t existing_assets < "$existing_assets_path"
           for asset_name in "${existing_assets[@]}"; do
             case "$asset_name" in
-              "pyinc-${version}.tar.gz"|"pyinc-${version}-py3-none-any.whl"|SHA256SUMS)
+              "pyinc-${version}.tar.gz"|"pyinc-${version}-py3-none-any.whl"|SHA256SUMS|"pyinc-${version}-benchmark-evidence.zip"|BENCHMARK-SHA256SUMS|"pyinc-${version}-demo-evidence.zip"|DEMO-SHA256SUMS|"pyinc-${version}.provenance.json"|"pyinc-${version}.spdx.json"|BUILD-METADATA-SHA256SUMS)
                 ;;
               *)
                 echo "Unexpected asset on draft GitHub Release: ${asset_name}" >&2
@@ -303,6 +421,13 @@ jobs:
           sync_draft_asset "release-artifacts/dist/pyinc-${version}.tar.gz"
           sync_draft_asset "release-artifacts/dist/pyinc-${version}-py3-none-any.whl"
           sync_draft_asset release-artifacts/SHA256SUMS
+          sync_draft_asset "release-artifacts/release-benchmark/pyinc-${version}-benchmark-evidence.zip"
+          sync_draft_asset release-artifacts/release-benchmark/BENCHMARK-SHA256SUMS
+          sync_draft_asset "release-artifacts/release-evidence/pyinc-${version}-demo-evidence.zip"
+          sync_draft_asset release-artifacts/release-evidence/DEMO-SHA256SUMS
+          sync_draft_asset "release-artifacts/build-metadata/pyinc-${version}.provenance.json"
+          sync_draft_asset "release-artifacts/build-metadata/pyinc-${version}.spdx.json"
+          sync_draft_asset release-artifacts/build-metadata/BUILD-METADATA-SHA256SUMS
 
           verified_assets="$RUNNER_TEMP/verified-draft-assets"
           mkdir -p "$verified_assets"
@@ -315,14 +440,14 @@ jobs:
               --prerelease \
               --latest=false \
               --title "$title" \
-              --notes-file release-notes.md
+              --notes-file release-artifacts/release-notes.md
           else
             gh release edit "$GITHUB_REF_NAME" \
               --draft=false \
               --prerelease=false \
               --latest \
               --title "$title" \
-              --notes-file release-notes.md
+              --notes-file release-artifacts/release-notes.md
           fi
 
           published_metadata="$RUNNER_TEMP/published-release.json"

@@ -1,0 +1,23 @@
+# Source-of-intent direct tool pins. Regenerate the universal transitive lock:
+# uv pip compile requirements/toolchain.txt --universal --generate-hashes --python-version 3.11 --output-file requirements/toolchain.lock
+# Install only through toolchain.lock with pip --require-hashes --only-binary=:all:.
+# Installer and lock generator. The lock-generation command above must run with
+# this exact uv version.
+pip==25.1.1
+uv==0.11.21
+
+# Build and release tools.
+build==1.5.0
+hatchling==1.31.0
+twine==6.2.0
+
+# Test, analysis, and benchmark tools.
+coverage==7.15.2
+hypothesis==6.163.0
+joblib==1.5.3
+mypy==2.3.0
+packaging==26.2
+pytest==9.1.1
+pytest-cov==7.1.0
+pytest-xdist==3.8.0
+ruff==0.16.0

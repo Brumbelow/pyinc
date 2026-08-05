@@ -3,8 +3,11 @@
 ## Supported versions
 
 Fixes land on the latest published minor version; the previous minor receives
-security fixes only. `pyinc` follows semantic versioning; everything the `pyinc`
-package exports, and nothing else, carries that contract.
+security fixes only. The wheel's semantic-versioning surface is defined by the
+[`pyinc`, integrations, tools, and codegen `__all__` tiers](docs/public-api.md),
+including stable module-level integration composition handles. Documented CLI
+and LSP behavior is also a public interface. Imports outside those enumerated
+surfaces are implementation details.
 
 | Version | Supported |
 |---|---|
@@ -41,7 +44,12 @@ impact is security-relevant, and as a public issue otherwise.
 
 ## Scope
 
-`pyinc` is a library with no network surface and no runtime dependencies. The
+`pyinc` is a library with no network surface and exactly zero runtime
+dependencies (`project.dependencies = []`). Build, test, benchmark, and release
+tools are separate from that runtime claim and have exact direct pins in
+[`requirements/toolchain.txt`](requirements/toolchain.txt). Their universal
+transitive resolution and accepted artifact hashes are locked in
+[`requirements/toolchain.lock`](requirements/toolchain.lock). The
 security-relevant boundaries are:
 
 - **The durable checkpoint trust boundary.** Checkpoint manifests and
@@ -68,6 +76,7 @@ publishing, with no stored API token. The release workflow verifies the
 annotated tag and every commit in the released range against the key in
 `.github/release-signing-key.asc`, each GitHub Release carries a `SHA256SUMS`
 file covering the exact distributions published to PyPI, and a separate
-manually dispatched workflow re-verifies after publication that the two match.
+workflow automatically re-verifies after publication that the two match. The
+same workflow can be manually rerun for an exact version.
 [`docs/releases.md`](docs/releases.md) describes the pipeline and how to check a
 download.

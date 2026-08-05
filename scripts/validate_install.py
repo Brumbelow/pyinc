@@ -40,26 +40,20 @@ def _import_package_tree(package: _Package) -> None:
 def _validate_sdist(archive_path: Path, version: str) -> None:
     assert archive_path.name == f"pyinc-{version}.tar.gz"
     prefix = f"pyinc-{version}"
-    required = {
-        f"{prefix}/bench/README.md",
-        f"{prefix}/bench/__init__.py",
-        f"{prefix}/bench/harness.py",
-        f"{prefix}/bench/run.py",
-        f"{prefix}/docs/getting-started.md",
-        f"{prefix}/docs/lsp-reference.md",
-        f"{prefix}/scripts/__init__.py",
-        f"{prefix}/scripts/check_docs.py",
-        f"{prefix}/scripts/release_artifacts.py",
-        f"{prefix}/scripts/validate_install.py",
-        f"{prefix}/scripts/verify_release_metadata.py",
-        f"{prefix}/tests/test_bench_smoke.py",
-        f"{prefix}/tests/test_docs.py",
-        f"{prefix}/tests/test_release_artifacts.py",
-        f"{prefix}/tests/test_release_metadata.py",
+    project_root = Path(__file__).resolve().parents[1]
+    included_roots = ("src", "tests", "examples", "docs", "bench", "scripts")
+    required_paths = {
+        path.relative_to(project_root).as_posix()
+        for root_name in included_roots
+        for path in (project_root / root_name).rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
     }
+    required_paths.update({"README.md", "LICENSE", "CHANGELOG.md", "pyproject.toml"})
+    required = {f"{prefix}/{path}" for path in required_paths}
     with tarfile.open(archive_path, mode="r:gz") as archive:
         names = frozenset(archive.getnames())
-    assert required <= names
+    missing = sorted(required - names)
+    assert not missing, f"sdist is missing configured source files: {missing}"
     assert not any("__pycache__" in name or name.endswith(".pyc") for name in names)
 
 

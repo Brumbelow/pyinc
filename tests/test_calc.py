@@ -136,15 +136,15 @@ def test_unrelated_file_edit_no_execution(tmp_path: Path) -> None:  # B1
     assert db.statistics().query_executions == 0
 
 
-def test_comment_only_edit_backdates(tmp_path: Path) -> None:  # B3
+def test_comment_only_edit_executes_raw_and_backdates_parse(tmp_path: Path) -> None:  # B3
     root = tmp_path / "m.calc"
     _write(root, "let a = 1 + 1\nemit a\n")
     db = Database(mode="strict")
     evaluate_name(db, str(root), "a")
     _write(root, "# note\nlet a = 1 + 1\nemit a\n")
     assert evaluate_name(db, str(root), "a") == ("value", 2, "", "")
-    assert db.inspect(calc_source, str(root)).last_recompute == "backdated"
-    assert db.inspect(parse_calc, str(root)).last_decision == "reused"
+    assert db.inspect(calc_source, str(root)).last_recompute == "executed"
+    assert db.inspect(parse_calc, str(root)).last_recompute == "backdated"
     assert db.inspect(evaluate_name, str(root), "a").last_decision == "reused"
 
 

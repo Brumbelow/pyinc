@@ -48,7 +48,7 @@ def main() -> None:
         print()
         print("Undeclared imports (installed but not declared):")
         if not analysis.undeclared_imports:
-            print("  (none — all imports accounted for)")
+            raise RuntimeError("example fixture did not produce its promised undeclared import")
         for item in analysis.undeclared_imports:
             print(f"  - {item.import_name:<20s} -> distribution: {item.distribution_name}")
 

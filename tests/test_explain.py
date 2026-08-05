@@ -186,7 +186,7 @@ def test_explain_query_captures_classifies_accepted_kinds() -> None:
     assert by_name["file_resource"].accepted
 
 
-def test_explain_query_captures_classifies_rejected_mutable_closure() -> None:
+def test_static_capture_preflight_classifies_direct_mutable_closure() -> None:
     box = {"x": 1}
 
     @query
@@ -201,7 +201,7 @@ def test_explain_query_captures_classifies_rejected_mutable_closure() -> None:
     assert box_info.rejection_reason
 
 
-def test_explain_query_captures_classifies_rejected_mutable_global() -> None:
+def test_static_capture_preflight_classifies_direct_mutable_global() -> None:
     @query
     def read_dict(db: Database) -> int:
         return _MUTABLE_DICT["x"]

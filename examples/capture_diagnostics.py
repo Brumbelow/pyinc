@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from pyinc import Database, explain_query_captures, query
-from pyinc.errors import UnsupportedValueError
+from pyinc import Database, UnsupportedValueError, explain_query_captures, query
 
 
 def main() -> None:
@@ -11,7 +10,7 @@ def main() -> None:
     def read_box(db: Database) -> int:
         return box["value"]
 
-    print("preflight capture diagnostics:")
+    print("static capture preflight diagnostics:")
     for info in explain_query_captures(read_box):
         print(
             f"- {info.name}: accepted={info.accepted} "

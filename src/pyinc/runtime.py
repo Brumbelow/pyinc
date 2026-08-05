@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import _thread
 import builtins
+import concurrent.futures
+import concurrent.futures.process
+import concurrent.futures.thread
 import dis
+import functools
 import hashlib
 import importlib.machinery
 import inspect
 import io
 import json
+import multiprocessing.pool
+import multiprocessing.process
 import os
 import struct
+import subprocess
 import sys
 import sysconfig
 import threading
@@ -19,6 +27,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMappin
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
+from dataclasses import Field as DataclassField
 from pathlib import Path
 from types import (
     BuiltinFunctionType,
@@ -26,6 +35,7 @@ from types import (
     FunctionType,
     GenericAlias,
     GetSetDescriptorType,
+    MappingProxyType,
     MemberDescriptorType,
     MethodDescriptorType,
     MethodType,
@@ -40,9 +50,13 @@ from ._path_identity import is_stdlib_path
 from .errors import (
     CheckpointIntegrityError,
     CheckpointManifestError,
+    CheckpointModeError,
     CheckpointVersionError,
     CycleError,
     InputKeyError,
+    QueryConcurrencyError,
+    QueryContextError,
+    ResourceDependencyError,
     UnsupportedValueError,
     UntrackedReadError,
 )
@@ -62,6 +76,7 @@ from .value import (
     assert_not_mutated,
     collect_adapter_keys,
     deserialize_snapshot,
+    detach_snapshot,
     fingerprint,
     fingerprint_snapshot,
     freeze,
@@ -86,21 +101,22 @@ ResourceProbeT = TypeVar("ResourceProbeT")
 
 # Durable checkpoint manifest schema version. Bumped whenever the identity, the
 # record layout, or the meaning of a recorded field changes, so stale manifests
-# are rejected loudly rather than silently reused. Version 6 marks two
-# soundness repairs a version-5 record can predate: captured-module identity
-# was derived from a stat tuple a same-size rewrite can preserve, and a stat
-# probe raising NotADirectoryError published no resource edge, so a version-5
-# record can carry a stale identity or claim no dependencies for a reader a
-# fresh database re-derives.
-_CHECKPOINT_MANIFEST_VERSION = 6
+# are rejected loudly rather than silently reused. Version 7 binds every
+# semantic change/probe decision to the deep typed snapshot relation, rejects
+# resource hooks that observe database-managed state, rejects query-time
+# administration, and refuses fallbacks derived from an unrecorded child-query
+# failure. A version-6 record may have
+# backdated Python-equal numeric types, restored a checkpoint probe hint across
+# such a transition, omitted a dependency read inside a resource hook, or cached
+# a caught child failure without any edge that could invalidate it, or a result
+# derived from an in-query database mutation or administrative operation.
+_CHECKPOINT_MANIFEST_VERSION = 7
 # Version of the snapshot/fingerprint encoding this kernel emits, mirrored from
 # value._KERNEL_FINGERPRINT_PREFIX (b"K2;"). Recorded in the manifest and checked
 # at load so a checkpoint from a differently-encoded kernel is never trusted.
 _KERNEL_FINGERPRINT_VERSION = 2
-_DEFAULT_SEMANTIC_EQUALITY_VERSION = 1
+_DEFAULT_SEMANTIC_EQUALITY_VERSION = 2
 _MISSING_SNAPSHOT = object()
-_EMPTY_CELL_OBSERVATION = object()
-_UNBOUND_GLOBAL_OBSERVATION = object()
 
 
 def _build_runtime_build_payload() -> tuple[Any, ...]:
@@ -141,6 +157,52 @@ def _build_runtime_build_payload() -> tuple[Any, ...]:
 
 
 _RUNTIME_BUILD_PAYLOAD = _build_runtime_build_payload()
+
+
+class _ProcessIdentityToken:
+    """Opaque process-incarnation state excluded from captured module constants."""
+
+    __slots__ = ("nonce",)
+
+    def __init__(self) -> None:
+        self.nonce = os.urandom(16)
+
+
+# Definition objects owned permanently by code/module objects can use this
+# process token. Directly replaceable definition sites use the stronger
+# per-Database generation registry initialized below.
+_PROCESS_IDENTITY_TOKEN = _ProcessIdentityToken()
+_DEFINITION_IDENTITY_LOCK = threading.RLock()
+_DEFINITION_IDENTITY_GENERATION = [0]
+_DEFINITION_IDENTITY_SITES: weakref.WeakKeyDictionary[FunctionType, dict[str, tuple[Any, int]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+class _StateIdentityOwner:
+    """Identity-site state tied to one policy, adapter, or resource object."""
+
+    __slots__ = ("generation", "owner_ref", "owner_strong", "sites")
+
+    def __init__(self, owner: object, generation: int) -> None:
+        self.generation = generation
+        self.owner_ref: weakref.ReferenceType[object] | None = None
+        self.owner_strong: object | None = None
+        self.sites: dict[str, tuple[Any, int]] = {}
+        try:
+            self.owner_ref = weakref.ref(owner)
+        except TypeError:
+            # Slot-only configuration owners cannot be weak-referenced. Keeping
+            # the uncommon owner alive is the only way to prevent allocator
+            # reuse from impersonating it later in this process.
+            self.owner_strong = owner
+
+    def owns(self, owner: object) -> bool:
+        current = self.owner_ref() if self.owner_ref is not None else self.owner_strong
+        return current is owner
+
+
+_STATE_IDENTITY_OWNERS: dict[int, _StateIdentityOwner] = {}
 
 
 def _canonical_record_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -232,6 +294,25 @@ class _RefreshOutcome:
     failure_recorded: bool = False
 
 
+@dataclass(frozen=True)
+class _ResourceRegistration:
+    """A resource object and the owned snapshot of the parameter that keyed it."""
+
+    resource: Any
+    parameter_snapshot: Snapshot
+    parameter_type_digest: str
+
+
+@dataclass
+class _ResourceHookContext:
+    """One active Resource hook and any database-read violation it caught."""
+
+    database: Database
+    resource_type: str
+    hook_name: str
+    violation: ResourceDependencyError | QueryConcurrencyError | None = None
+
+
 @dataclass
 class ExecutionFrame:
     key: NodeKey
@@ -240,6 +321,7 @@ class ExecutionFrame:
     boundary_values: list[Any] = field(default_factory=list)
     untracked_reasons: list[str] = field(default_factory=list)
     checkpointable: bool = True
+    concurrency_violation: QueryConcurrencyError | None = None
 
 
 @dataclass(frozen=True)
@@ -305,9 +387,9 @@ class _TimingAggregate:
 class QueryChangeEvent:
     """Delivered to observers when a subscribed query's result changes.
 
-    Fires only on the `"executed"` decision (cold execute or true recompute
-    that produced a new value). `"reused"` and `"backdated"` decisions do
-    not fire — the stored value did not move.
+    Fires only when a query with a prior stored value recomputes to a value
+    that is different under its equality policy. Cold execution, unchanged
+    untracked re-execution, `"reused"`, and `"backdated"` do not fire.
     """
 
     query_id: str
@@ -321,13 +403,37 @@ ObserverCallback = Callable[[QueryChangeEvent], None]
 ObserverErrorHook = Callable[[Exception], None]
 
 
+@dataclass(frozen=True, eq=False)
+class _ObserverRegistration:
+    """One subscription, kept distinct even when callbacks compare equal."""
+
+    callback: ObserverCallback
+
+
+@dataclass(frozen=True)
+class _PendingObserverEvent:
+    """An event and the subscriptions that existed when it occurred."""
+
+    event: QueryChangeEvent
+    callbacks: tuple[ObserverCallback, ...]
+
+
 def _default_observer_error_hook(exc: Exception) -> None:
     sys.stderr.write(f"pyinc: observer callback raised {type(exc).__qualname__}: {exc}\n")
 
 
 _ACTIVE_GUARDS: ContextVar[tuple[Database, ...]] = ContextVar("pyinc_active_guards", default=())
+_ACTIVE_QUERY_EXECUTIONS: ContextVar[tuple[Database, ...]] = ContextVar(
+    "pyinc_active_query_executions", default=()
+)
+_ACTIVE_RESOURCE_HOOKS: ContextVar[tuple[_ResourceHookContext, ...]] = ContextVar(
+    "pyinc_active_resource_hooks", default=()
+)
 _GUARD_INSTALLED = False
 _GUARD_INSTALL_LOCK = threading.Lock()
+_EXTERNAL_PROCESS_LAUNCH_DEPTH: ContextVar[int] = ContextVar(
+    "pyinc_external_process_launch_depth", default=0
+)
 
 
 def _raise_if_guarded(message: str) -> None:
@@ -337,13 +443,126 @@ def _raise_if_guarded(message: str) -> None:
             raise UntrackedReadError(message)
 
 
-def _install_guards_once() -> None:
-    """Install global wrappers around raw I/O entry points exactly once per process.
+def _reject_query_context(operation: str) -> None:
+    """Reject database administration while any query owns this context."""
+    if not _ACTIVE_QUERY_EXECUTIONS.get():
+        return
+    raise QueryContextError(
+        f"{operation} cannot be used while a query is executing. Queries may only "
+        "compose queries, read Input or Resource values, and call "
+        "Database.report_untracked_read()."
+    )
 
-    The wrappers consult `_ACTIVE_GUARDS` (a `ContextVar`) to determine whether
-    any `Database` currently has a query frame on the calling context without
-    raw-read permission. Installation is idempotent and thread-safe; once
-    installed, the wrappers stay in place for the life of the process.
+
+def _reject_layer3_query_context(operation: str) -> None:
+    """Reject a decoded integration entrypoint from live query execution."""
+    if not _ACTIVE_QUERY_EXECUTIONS.get():
+        return
+    raise QueryContextError(
+        f"{operation} is a Layer-3 integration entrypoint and cannot be used while "
+        "a query is executing. Query authors must compose stable Layer-2 @query "
+        "payload APIs from the entrypoint's integration module instead."
+    )
+
+
+def _reject_concurrent_launch(
+    operation: str,
+    *,
+    allow_in_resource_hooks: bool = False,
+) -> None:
+    """Reject an enumerated worker/process launch from live query execution.
+
+    Resource hooks may invoke the explicitly external-command APIs (for
+    example ``subprocess.Popen``) as tracked I/O. Worker launches and process
+    forks remain forbidden there because they can escape the current context
+    or inherit a live ``Database`` and its lock.
+    """
+    resource_contexts = _ACTIVE_RESOURCE_HOOKS.get()
+    if allow_in_resource_hooks and resource_contexts:
+        return
+
+    active_databases = _ACTIVE_QUERY_EXECUTIONS.get()
+    if not active_databases and not resource_contexts:
+        return
+
+    existing: QueryConcurrencyError | None = None
+    for database in active_databases:
+        for frame in database._execution_stack.get():
+            if frame.concurrency_violation is not None:
+                existing = frame.concurrency_violation
+                break
+        if existing is not None:
+            break
+    if existing is None:
+        for context in resource_contexts:
+            if isinstance(context.violation, QueryConcurrencyError):
+                existing = context.violation
+                break
+
+    if existing is None:
+        if resource_contexts:
+            message = (
+                f"{operation} cannot be used from a Resource hook. Resource hooks "
+                "may perform direct external I/O but cannot launch threads, workers, "
+                "or processes that escape the current execution context."
+            )
+        else:
+            message = (
+                f"{operation} cannot be used while a query is executing. Queries "
+                "must execute synchronously; launch concurrent work outside db.get()."
+            )
+        existing = QueryConcurrencyError(message)
+
+    reason = f"forbidden concurrent launch: {operation}"
+    seen_databases: set[int] = set()
+    for database in active_databases:
+        if id(database) in seen_databases:
+            continue
+        seen_databases.add(id(database))
+        for frame in database._execution_stack.get():
+            if frame.concurrency_violation is None:
+                frame.concurrency_violation = existing
+            if reason not in frame.untracked_reasons:
+                frame.untracked_reasons.append(reason)
+            frame.checkpointable = False
+    for context in resource_contexts:
+        if context.violation is None:
+            context.violation = existing
+    raise existing
+
+
+def _raise_sticky_concurrency_violation(frame: ExecutionFrame) -> None:
+    if frame.concurrency_violation is not None:
+        raise frame.concurrency_violation
+
+
+def _reject_cross_database_query_read(database: Database, operation: str) -> None:
+    """Require query composition and managed reads to stay on their owning database."""
+    active = _ACTIVE_QUERY_EXECUTIONS.get()
+    if not active or active[-1] is database:
+        return
+    raise QueryContextError(
+        f"{operation} cannot use a different Database while a query is executing. "
+        "Query composition and Input or Resource reads must use the Database "
+        "passed to the active query."
+    )
+
+
+def _reject_database_construction() -> None:
+    """Apply hook-specific then query-specific precedence to Database construction."""
+    hook_contexts = _ACTIVE_RESOURCE_HOOKS.get()
+    if hook_contexts:
+        hook_contexts[-1].database._reject_resource_hook_read("Database()")
+    _reject_query_context("Database()")
+
+
+def _install_guards_once() -> None:
+    """Install raw-I/O and concurrent-launch guards once per process.
+
+    The wrappers and audit hook consult per-context stacks to determine whether
+    a ``Database`` query or Resource hook is active. Installation is idempotent
+    and thread-safe; once installed, the guards stay in place for the life of
+    the process.
     """
     global _GUARD_INSTALLED
     if _GUARD_INSTALLED:
@@ -359,6 +578,33 @@ def _install_guards_once() -> None:
         original_os_scandir = os.scandir
         original_path_iterdir = Path.iterdir
         original_environ = os.environ
+
+        def guarded_launch(
+            original: Callable[..., Any],
+            operation: str,
+            *,
+            allow_in_resource_hooks: bool = False,
+            external_process_scope: bool = False,
+            allow_external_process_internal: bool = False,
+        ) -> Callable[..., Any]:
+            @functools.wraps(original)
+            def guarded(*args: Any, **kwargs: Any) -> Any:
+                if allow_external_process_internal and _EXTERNAL_PROCESS_LAUNCH_DEPTH.get() > 0:
+                    return original(*args, **kwargs)
+                _reject_concurrent_launch(
+                    operation,
+                    allow_in_resource_hooks=allow_in_resource_hooks,
+                )
+                if not external_process_scope:
+                    return original(*args, **kwargs)
+                depth = _EXTERNAL_PROCESS_LAUNCH_DEPTH.get()
+                token = _EXTERNAL_PROCESS_LAUNCH_DEPTH.set(depth + 1)
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    _EXTERNAL_PROCESS_LAUNCH_DEPTH.reset(token)
+
+            return guarded
 
         def guarded_open(*args: Any, **kwargs: Any) -> Any:
             _raise_if_guarded("Raw open() inside a query is untracked. Use FileResource.read().")
@@ -406,6 +652,172 @@ def _install_guards_once() -> None:
         os.scandir = guarded_scandir
         os.environ = guarded_environ  # type: ignore[assignment]  # noqa: B003
         Path.iterdir = guarded_path_iterdir  # type: ignore[assignment, method-assign]
+
+        threading.Thread.start = guarded_launch(  # type: ignore[method-assign]
+            threading.Thread.start,
+            "threading.Thread.start()",
+        )
+        for alias_name in ("start_new_thread", "start_new", "start_joinable_thread"):
+            original_alias = getattr(_thread, alias_name, None)
+            if callable(original_alias):
+                setattr(
+                    _thread,
+                    alias_name,
+                    guarded_launch(original_alias, f"_thread.{alias_name}()"),
+                )
+        for alias_name in ("_start_new_thread", "_start_joinable_thread"):
+            original_alias = getattr(threading, alias_name, None)
+            if callable(original_alias):
+                setattr(
+                    threading,
+                    alias_name,
+                    guarded_launch(original_alias, f"threading.{alias_name}()"),
+                )
+
+        concurrent.futures.ThreadPoolExecutor.submit = guarded_launch(  # type: ignore[method-assign]
+            concurrent.futures.ThreadPoolExecutor.submit,
+            "ThreadPoolExecutor.submit()",
+        )
+        concurrent.futures.ProcessPoolExecutor.submit = guarded_launch(  # type: ignore[method-assign]
+            concurrent.futures.ProcessPoolExecutor.submit,
+            "ProcessPoolExecutor.submit()",
+        )
+        concurrent.futures.thread._WorkItem.__init__ = guarded_launch(  # type: ignore[method-assign]
+            concurrent.futures.thread._WorkItem.__init__,
+            "ThreadPoolExecutor.submit()",
+        )
+        concurrent.futures.process._WorkItem.__init__ = guarded_launch(  # type: ignore[method-assign]
+            concurrent.futures.process._WorkItem.__init__,
+            "ProcessPoolExecutor.submit()",
+        )
+        multiprocessing.process.BaseProcess.start = guarded_launch(  # type: ignore[method-assign]
+            multiprocessing.process.BaseProcess.start,
+            "multiprocessing.Process.start()",
+        )
+        multiprocessing.pool.Pool.__init__ = guarded_launch(  # type: ignore[method-assign]
+            multiprocessing.pool.Pool.__init__,
+            "multiprocessing.Pool()",
+        )
+        for method_name in (
+            "apply",
+            "apply_async",
+            "map",
+            "map_async",
+            "starmap",
+            "starmap_async",
+            "imap",
+            "imap_unordered",
+        ):
+            original_method = getattr(multiprocessing.pool.Pool, method_name)
+            setattr(
+                multiprocessing.pool.Pool,
+                method_name,
+                guarded_launch(original_method, f"multiprocessing.Pool.{method_name}()"),
+            )
+        for result_type_name in ("ApplyResult", "MapResult", "IMapIterator"):
+            result_type = getattr(multiprocessing.pool, result_type_name)
+            result_type.__init__ = guarded_launch(
+                result_type.__init__,
+                "multiprocessing.Pool submission",
+            )
+
+        subprocess.Popen.__init__ = guarded_launch(  # type: ignore[method-assign]
+            subprocess.Popen.__init__,
+            "subprocess.Popen()",
+            allow_in_resource_hooks=True,
+            external_process_scope=True,
+        )
+
+        for function_name in ("fork", "forkpty"):
+            original_function = getattr(os, function_name, None)
+            if callable(original_function):
+                setattr(
+                    os,
+                    function_name,
+                    guarded_launch(
+                        original_function,
+                        f"os.{function_name}()",
+                        allow_external_process_internal=True,
+                    ),
+                )
+        for function_name in (
+            "execl",
+            "execle",
+            "execlp",
+            "execlpe",
+            "execv",
+            "execve",
+            "execvp",
+            "execvpe",
+        ):
+            original_function = getattr(os, function_name, None)
+            if callable(original_function):
+                setattr(
+                    os,
+                    function_name,
+                    guarded_launch(
+                        original_function,
+                        f"os.{function_name}()",
+                        allow_external_process_internal=True,
+                    ),
+                )
+        for function_name in (
+            "posix_spawn",
+            "posix_spawnp",
+            "spawnl",
+            "spawnle",
+            "spawnlp",
+            "spawnlpe",
+            "spawnv",
+            "spawnve",
+            "spawnvp",
+            "spawnvpe",
+            "system",
+            "popen",
+            "startfile",
+        ):
+            original_function = getattr(os, function_name, None)
+            if callable(original_function):
+                setattr(
+                    os,
+                    function_name,
+                    guarded_launch(
+                        original_function,
+                        f"os.{function_name}()",
+                        allow_in_resource_hooks=True,
+                        external_process_scope=function_name.startswith("spawn"),
+                    ),
+                )
+
+        concurrency_audit_events: dict[str, tuple[str, bool, bool]] = {
+            "_thread.start_joinable_thread": (
+                "_thread.start_joinable_thread()",
+                False,
+                False,
+            ),
+            "_thread.start_new_thread": ("_thread.start_new_thread()", False, False),
+            "os.exec": ("os.exec*()", False, True),
+            "os.fork": ("os.fork()", False, True),
+            "os.forkpty": ("os.forkpty()", False, True),
+            "os.posix_spawn": ("os.posix_spawn()", True, False),
+            "os.system": ("os.system()", True, False),
+            "subprocess.Popen": ("subprocess.Popen()", True, False),
+        }
+
+        def concurrency_audit_hook(event: str, args: tuple[Any, ...]) -> None:
+            del args
+            policy = concurrency_audit_events.get(event)
+            if policy is None:
+                return
+            operation, allow_in_resource_hooks, allow_external_internal = policy
+            if allow_external_internal and _EXTERNAL_PROCESS_LAUNCH_DEPTH.get() > 0:
+                return
+            _reject_concurrent_launch(
+                operation,
+                allow_in_resource_hooks=allow_in_resource_hooks,
+            )
+
+        sys.addaudithook(concurrency_audit_hook)
         _GUARD_INSTALLED = True
 
 
@@ -503,26 +915,35 @@ class _GuardedEnviron(MutableMapping[str, str]):
 class Subscription:
     """Handle returned by `Database.observe(...)`.
 
-    Calling `unsubscribe()` detaches the callback from the subscribed
-    query node. Repeated unsubscribes are no-ops. Subscriptions do not
-    keep the observed node alive under LRU eviction; if the node is
-    evicted and later re-executed, the callback fires as normal.
+    Calling `unsubscribe()` detaches this exact registration from future
+    value changes; callback equality is not consulted. An event that already
+    captured the registration is still delivered. Repeated unsubscribes are
+    no-ops. Subscriptions do not keep the observed node alive under LRU
+    eviction, and recreating an evicted node is a cold execution rather than
+    a value-change event.
     """
 
-    __slots__ = ("_database", "_key", "_callback", "_active")
+    __slots__ = ("_database", "_key", "_registration", "_active")
 
-    def __init__(self, database: Database, key: NodeKey, callback: ObserverCallback) -> None:
+    def __init__(
+        self,
+        database: Database,
+        key: NodeKey,
+        registration: _ObserverRegistration,
+    ) -> None:
         self._database = database
         self._key = key
-        self._callback = callback
+        self._registration = registration
         self._active = True
 
     def unsubscribe(self) -> None:
+        self._database._reject_resource_hook_read("Subscription.unsubscribe()")
+        _reject_query_context("Subscription.unsubscribe()")
         with self._database._state_lock:
             if not self._active:
                 return
             self._active = False
-            self._database._unregister_observer(self._key, self._callback)
+            self._database._unregister_observer(self._key, self._registration)
 
 
 class Database:
@@ -535,20 +956,18 @@ class Database:
         observer_error_hook: ObserverErrorHook | None = None,
         store: ArtifactStore | None = None,
     ) -> None:
-        if mode not in {"strict", "checked", "fast"}:
+        _reject_database_construction()
+        if type(mode) is not str or mode not in {"strict", "checked", "fast"}:
             raise ValueError("mode must be one of: strict, checked, fast")
         if max_query_nodes is not None and (
             type(max_query_nodes) is not int or max_query_nodes <= 0
         ):
             raise ValueError("max_query_nodes must be a positive integer or None.")
-        self.mode = mode
-        self.max_query_nodes = max_query_nodes
+        self._mode = mode
+        self._max_query_nodes = max_query_nodes
         self._adapters = dict(adapters or {})
-        # Digest of each registered adapter's freeze/thaw implementation, keyed by
-        # the adapted type's key. Computed lazily and cached: _adapters is fixed at
-        # construction, so the digests never change over the database's life.
-        # Per-adapter-key implementation digests read from a loaded checkpoint's
-        # manifest; the warm gate compares these against the live registry.
+        # Per-adapter-key digests read from a loaded checkpoint's manifest; the
+        # warm gate compares these against the live, lifetime-pinned registry.
         self._checkpoint_adapter_digests: dict[str, str] = {}
         self._store = store
         self._revision = 0
@@ -566,6 +985,9 @@ class Database:
         self._request_token: ContextVar[int | None] = ContextVar(
             "pyinc_request_token", default=None
         )
+        self._request_query_fingerprints: ContextVar[dict[int, tuple[Any, str]] | None] = (
+            ContextVar("pyinc_request_query_fingerprints", default=None)
+        )
         self._span_active: ContextVar[bool] = ContextVar("pyinc_span_active", default=False)
         self._span_epoch_seen: ContextVar[int] = ContextVar("pyinc_span_epoch_seen", default=0)
         self._policy_fingerprint_stack: ContextVar[tuple[int, ...]] = ContextVar(
@@ -581,6 +1003,11 @@ class Database:
             "pyinc_module_capture_stack", default=()
         )
         self._request_counter = 0
+        # Calls whose frozen arguments are not substitutive (notably NaN) must
+        # never share a node merely because their canonical bytes match.  The
+        # counter gives each such live call/resource registration an ephemeral
+        # identity; these nodes are excluded from checkpoints below.
+        self._non_substitutive_identity_counter = 0
         self._span_epoch = 0
         self._stats: dict[str, int] = {
             "query_executions": 0,
@@ -595,29 +1022,14 @@ class Database:
         self._query_timings: dict[NodeKey, _TimingAggregate] = {}
         self._state_lock = threading.RLock()
         self._query_registry: dict[str, Any] = {}
-        self._query_fingerprint_memo: weakref.WeakKeyDictionary[
-            Any,
-            tuple[
-                tuple[Any, ...],
-                Any,
-                str,
-                tuple[tuple[ModuleType, Any], ...],
-            ],
-        ] = weakref.WeakKeyDictionary()
-        self._fingerprint_module_collector: ContextVar[dict[int, ModuleType] | None] = ContextVar(
-            "pyinc_fingerprint_module_collector", default=None
-        )
-        self._fingerprint_cacheable: ContextVar[bool] = ContextVar(
-            "pyinc_fingerprint_cacheable", default=True
-        )
-        self._resource_registry: dict[NodeKey, tuple[Any, Any]] = {}
+        self._resource_registry: dict[NodeKey, _ResourceRegistration] = {}
         self._call_snapshot_registry: dict[NodeKey, Any] = {}
-        self._observers: dict[NodeKey, list[ObserverCallback]] = {}
+        self._observers: dict[NodeKey, list[_ObserverRegistration]] = {}
         self._observer_error_hook: ObserverErrorHook = (
             observer_error_hook if observer_error_hook is not None else _default_observer_error_hook
         )
-        self._pending_events: ContextVar[list[tuple[NodeKey, QueryChangeEvent]] | None] = (
-            ContextVar("pyinc_pending_events", default=None)
+        self._pending_events: ContextVar[list[_PendingObserverEvent] | None] = ContextVar(
+            "pyinc_pending_events", default=None
         )
         # Resource nodes whose failure record holds this request's exception, so
         # the request scope can drop it (and the frames it pins) on the way out.
@@ -640,13 +1052,34 @@ class Database:
         self._checkpoint_root_pinned_query_objects: dict[str, Any] | None = None
         self._checkpoint_root_pinned_resources: dict[str, Any] | None = None
         _install_guards_once()
+        # An adapter is part of this Database's value boundary, not mutable
+        # request configuration.  Pin the complete implementation/state digest
+        # once and reject a later change before it can make a warm value differ
+        # from the same operation in a newly constructed Database.
+        self._adapter_lifetime_digests = self._current_adapter_digests()
+
+    @property
+    def mode(self) -> Mode:
+        self._reject_resource_hook_read("Database.mode")
+        _reject_query_context("Database.mode")
+        return self._mode
+
+    @property
+    def max_query_nodes(self) -> int | None:
+        self._reject_resource_hook_read("Database.max_query_nodes")
+        _reject_query_context("Database.max_query_nodes")
+        return self._max_query_nodes
 
     @property
     def revision(self) -> int:
+        self._reject_resource_hook_read("Database.revision")
+        _reject_query_context("Database.revision")
         with self._state_lock:
             return self._revision
 
     def statistics(self) -> DatabaseStatistics:
+        self._reject_resource_hook_read("Database.statistics()")
+        _reject_query_context("Database.statistics()")
         with self._state_lock:
             resource_count = sum(1 for k in self._records if k.kind == "resource")
             return DatabaseStatistics(
@@ -666,12 +1099,16 @@ class Database:
             )
 
     def reset_statistics(self) -> None:
+        self._reject_resource_hook_read("Database.reset_statistics()")
+        _reject_query_context("Database.reset_statistics()")
         with self._state_lock:
             for key in self._stats:
                 self._stats[key] = 0
             self._query_timings.clear()
 
     def query_profile(self) -> tuple[QueryProfile, ...]:
+        self._reject_resource_hook_read("Database.query_profile()")
+        _reject_query_context("Database.query_profile()")
         with self._state_lock:
             profiles: list[QueryProfile] = []
             for key, timing in sorted(self._query_timings.items(), key=lambda item: item[0].label):
@@ -689,6 +1126,8 @@ class Database:
             return tuple(profiles)
 
     def dependency_graph(self) -> tuple[DependencyGraphNode, ...]:
+        self._reject_resource_hook_read("Database.dependency_graph()")
+        _reject_query_context("Database.dependency_graph()")
         with self._state_lock:
             nodes: list[DependencyGraphNode] = []
             for key, record in self._records.items():
@@ -713,18 +1152,27 @@ class Database:
             return tuple(sorted(nodes, key=lambda n: n.label))
 
     def set(self, input_key: Any, value: Any) -> None:
+        self._reject_resource_hook_read("Database.set()")
+        _reject_query_context("Database.set()")
         from .core import Input
 
-        if not isinstance(input_key, Input):
+        if type(input_key) is not Input:
             raise TypeError("db.set() expects an Input instance.")
         with self._state_lock:
-            node_key = self._input_key(input_key)
-            snapshot = self._freeze_value(value)
+            # Registration is part of the commit. A value that cannot cross the
+            # membrane, or a comparator that raises, must not leave a phantom
+            # Input definition behind under this public key.
+            self._validate_input_registration(input_key)
+            node_key = self._prospective_input_key(input_key)
+            snapshot = self._freeze_owned_snapshot(value)
             digest = fingerprint_snapshot(snapshot)
             record = self._records.get(node_key)
-            if record is not None and self._compare_input_snapshots(
+            equal = record is not None and self._compare_input_snapshots(
                 input_key, record.snapshot, snapshot
-            ):
+            )
+            self._commit_input_registration(input_key)
+            if equal:
+                assert record is not None
                 record.snapshot = snapshot
                 record.digest = digest
                 record.verified_at = self._revision
@@ -764,6 +1212,8 @@ class Database:
             self._roll_span_request()
 
     def set_many(self, updates: Iterable[tuple[Any, Any]]) -> None:
+        self._reject_resource_hook_read("Database.set_many()")
+        _reject_query_context("Database.set_many()")
         from .core import Input
 
         with self._state_lock:
@@ -780,7 +1230,7 @@ class Database:
                     raise TypeError(
                         "db.set_many() expects an iterable of (Input, value) pairs."
                     ) from exc
-                if not isinstance(input_key, Input):
+                if type(input_key) is not Input:
                     raise TypeError("db.set_many() expects (Input, value) pairs.")
                 if input_key.key in seen_keys:
                     raise InputKeyError(
@@ -794,7 +1244,7 @@ class Database:
             # phase mutates database records, revisions, or statistics.
             pending: list[tuple[Any, NodeKey, Any, str]] = []
             for input_key, value in raw_pairs:
-                snapshot = self._freeze_value(value)
+                snapshot = self._freeze_owned_snapshot(value)
                 digest = fingerprint_snapshot(snapshot)
                 node_key = self._prospective_input_key(input_key)
                 pending.append((input_key, node_key, snapshot, digest))
@@ -808,8 +1258,12 @@ class Database:
                 )
                 decisions.append((equal, input_key, node_key, snapshot, digest))
 
-            # Commit registrations and record changes only after every freeze
-            # and comparator has succeeded.
+            # Commit registrations only after every freeze and comparator has
+            # succeeded. Input mutation deliberately does not write the
+            # external ArtifactStore: checkpoints persist the input frontier
+            # transactionally before publishing their manifest. Keeping store
+            # I/O out of this boundary makes set_many all-or-nothing even when
+            # a store cannot provide a multi-object transaction.
             for input_key, _value in raw_pairs:
                 self._commit_input_registration(input_key)
 
@@ -864,39 +1318,49 @@ class Database:
             self._roll_span_request()
 
     def get(self, query: _core.Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        self._reject_resource_hook_read("Database.get()")
+        _reject_cross_database_query_read(self, "Database.get()")
         from .core import Query
 
-        if not isinstance(query, Query):
+        if type(query) is not Query:
             raise TypeError("db.get() expects a @query-decorated callable.")
         with self._state_lock, self._request_scope() as pending:
-            key, call_snapshot = self._query_key(query, args, kwargs)
-            had_record = key in self._records
+            key: NodeKey | None = None
+            had_record = False
             try:
+                key, call_snapshot = self._query_key(query, args, kwargs)
+                had_record = key in self._records
                 if not had_record and self._checkpoint_query_records:
                     self._try_warm_from_checkpoint(query, key, call_snapshot)
                 self._ensure_query(query, key, call_snapshot)
-            except Exception:
-                if not had_record:
+            except BaseException as error:
+                self._mark_caught_query_failure(query, key, error)
+                if key is not None and not had_record:
                     self._discard_uncommitted_query(key)
                 raise
+            assert key is not None
             self._record_dependency(key)
             result = cast(T, self._expose_boundary_snapshot(self._records[key].snapshot))
         self._dispatch_events(pending)
         return result
 
     def explain(self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> str:
+        self._reject_resource_hook_read("Database.explain()")
+        _reject_query_context("Database.explain()")
         from .core import Query
 
-        if not isinstance(query, Query):
+        if type(query) is not Query:
             raise TypeError("db.explain() expects a @query-decorated callable.")
         return format_explanation(self.inspect(query, *args, **kwargs))
 
     def inspect(
         self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs
     ) -> InspectionNode:
+        self._reject_resource_hook_read("Database.inspect()")
+        _reject_query_context("Database.inspect()")
         from .core import Query
 
-        if not isinstance(query, Query):
+        if type(query) is not Query:
             raise TypeError("db.inspect() expects a @query-decorated callable.")
         with self._state_lock, self._request_scope() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
@@ -915,9 +1379,11 @@ class Database:
     def inspect_fresh(
         self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs
     ) -> InspectionNode:
+        self._reject_resource_hook_read("Database.inspect_fresh()")
+        _reject_query_context("Database.inspect_fresh()")
         from .core import Query
 
-        if not isinstance(query, Query):
+        if type(query) is not Query:
             raise TypeError("db.inspect_fresh() expects a @query-decorated callable.")
         with self._state_lock, self._request_scope() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
@@ -950,6 +1416,8 @@ class Database:
         inner span, or one opened inside a ``get``, joins the enclosing
         request and its close does nothing.
         """
+        self._reject_resource_hook_read("Database.request_span()")
+        _reject_query_context("Database.request_span()")
         scope = self._request_scope()
         with self._state_lock:
             pending = scope.__enter__()
@@ -995,6 +1463,8 @@ class Database:
         forwards here, whereas this method alone leaves the integrations memo
         answering from the old world.
         """
+        self._reject_resource_hook_read("Database.request_inputs_changed()")
+        _reject_query_context("Database.request_inputs_changed()")
         with self._state_lock:
             self._roll_span_request()
 
@@ -1027,6 +1497,7 @@ class Database:
             return
         self._request_counter += 1
         self._request_token.set(self._request_counter)
+        self._request_query_fingerprints.set({})
         self._span_epoch_seen.set(self._span_epoch)
 
     def observe(
@@ -1039,28 +1510,36 @@ class Database:
         """Register `callback` to fire whenever the query node's value changes.
 
         Observer callbacks fire once per top-level `get` / `inspect` /
-        `inspect_fresh` call in which the node was re-executed and produced a
-        new value (decision `"executed"`). Backdated and reused decisions do
-        not fire — by definition the stored value did not move.
+        `inspect_fresh` call in which a node with a prior stored value was
+        re-executed and produced a policy-distinct value. Cold execution,
+        unchanged untracked execution, backdating, and reuse do not fire.
 
         Callbacks run after the request scope completes and the kernel lock is
-        released, so a callback may safely call back into the database.
+        released, so a callback may safely call back into the database. Each
+        event captures its recipients when the value changes: a later
+        subscriber cannot receive an earlier event, while unsubscribing does
+        not retract an event already captured for that subscription.
         Exceptions from a callback are routed to the `observer_error_hook`
         (default: a one-line stderr log) and do not suppress sibling callbacks
         or corrupt kernel state.
         """
+        self._reject_resource_hook_read("Database.observe()")
+        _reject_query_context("Database.observe()")
         from .core import Query
 
-        if not isinstance(query, Query):
+        if type(query) is not Query:
             raise TypeError("db.observe() expects a @query-decorated callable.")
         if not callable(callback):
             raise TypeError("db.observe() expects a callable as its first argument.")
         with self._state_lock:
             key, _ = self._query_key(query, args, kwargs)
-            self._observers.setdefault(key, []).append(callback)
-        return Subscription(self, key, callback)
+            registration = _ObserverRegistration(callback)
+            self._observers.setdefault(key, []).append(registration)
+        return Subscription(self, key, registration)
 
     def report_untracked_read(self, reason: str) -> None:
+        self._reject_resource_hook_read("Database.report_untracked_read()")
+        _reject_cross_database_query_read(self, "Database.report_untracked_read()")
         with self._state_lock:
             frame = self._current_frame()
             if frame is None:
@@ -1088,8 +1567,12 @@ class Database:
         the checkpoint's dependency records.
 
         Raises ``ValueError`` if no ``ArtifactStore`` is available (either
-        passed directly or configured via ``Database(store=...)``).
+        passed directly or configured via ``Database(store=...)``), or if the
+        store reports bytes already bound to a required content address do not
+        match the checkpoint object being saved.
         """
+        self._reject_resource_hook_read("Database.save_checkpoint()")
+        _reject_query_context("Database.save_checkpoint()")
         _store = store if store is not None else self._store
         if _store is None:
             raise ValueError(
@@ -1116,6 +1599,8 @@ class Database:
         Raises ``ValueError`` if no ``ArtifactStore`` is available.
         Raises ``KeyError`` if *key* is not found in the store.
         """
+        self._reject_resource_hook_read("Database.load_checkpoint()")
+        _reject_query_context("Database.load_checkpoint()")
         _store = store if store is not None else self._store
         if _store is None:
             raise ValueError(
@@ -1153,11 +1638,38 @@ class Database:
                 return True
             if dep_record.is_untracked:
                 return True
+            if not snapshots_equal(dep_record.snapshot, dep_record.snapshot):
+                return True
             if dep_record.changed_at > record.verified_at:
                 return True
         return False
 
+    def _checkpoint_key_is_substitutive(self, key: NodeKey) -> bool:
+        """Whether a query call/resource parameter can identify a durable node."""
+
+        identity_snapshot: Any
+        if key.kind == "query":
+            call_snapshots = self._call_snapshots()
+            if key in call_snapshots:
+                identity_snapshot = call_snapshots[key]
+            elif key.args_digest in self._checkpoint_snapshot_cache:
+                identity_snapshot = self._checkpoint_snapshot_cache[key.args_digest]
+            else:
+                return False
+        elif key.kind == "resource":
+            registration = self._resource_objects().get(key)
+            if registration is not None:
+                identity_snapshot = registration.parameter_snapshot
+            elif key.args_digest in self._checkpoint_snapshot_cache:
+                identity_snapshot = self._checkpoint_snapshot_cache[key.args_digest]
+            else:
+                return False
+        else:
+            return False
+        return snapshots_equal(identity_snapshot, identity_snapshot)
+
     def _save_checkpoint_locked(self, store: ArtifactStore) -> str:
+        self._verify_adapter_lifetime()
         eligible = {
             key
             for key, record in self._records.items()
@@ -1175,6 +1687,17 @@ class Database:
             # record describes).
             and record.checkpointable
             and not record.probe_unconfirmed
+            # A snapshot that is not equal to itself under the public typed
+            # relation (notably NaN-containing values) is not substitutive.
+            # Restoring it in another process could change observable behavior
+            # such as hashing even when its canonical bytes are identical.
+            and snapshots_equal(record.snapshot, record.snapshot)
+            # Query arguments and resource parameters participate in the node
+            # identity. Equal canonical bytes cannot identify a NaN-containing
+            # call across a process boundary, and a non-substitutive probe can
+            # never justify a resource hint restore.
+            and self._checkpoint_key_is_substitutive(key)
+            and (key.kind != "resource" or snapshots_equal(record.probe, record.probe))
             and not self._record_is_stale_for_save(record)
             and (
                 key.args_digest in self._checkpoint_snapshot_cache
@@ -1201,6 +1724,11 @@ class Database:
         for key, record in self._records.items():
             if key not in eligible:
                 continue
+            self._require_snapshot_digest(
+                record.snapshot,
+                record.digest,
+                subject=f"{record.label} value",
+            )
             self._persist_snapshot_to(record.snapshot, store)
             # Persist what a fresh process needs to re-execute this leaf under its
             # own name, content-addressed by the digest already in the manifest:
@@ -1213,15 +1741,29 @@ class Database:
                 if call_snapshot is None:
                     call_snapshot = self._checkpoint_snapshot_cache.get(key.args_digest)
                 if call_snapshot is not None:
+                    self._require_snapshot_digest(
+                        call_snapshot,
+                        key.args_digest,
+                        subject=f"{record.label} call",
+                    )
                     self._persist_snapshot_to(call_snapshot, store)
             elif key.kind == "resource":
-                resource_pair = self._resource_objects().get(key)
-                if resource_pair is not None:
-                    _resource, parameter = resource_pair
-                    self._persist_snapshot_to(self._freeze_value(parameter), store)
+                registration = self._resource_objects().get(key)
+                if registration is not None:
+                    self._require_snapshot_digest(
+                        registration.parameter_snapshot,
+                        key.args_digest,
+                        subject=f"{record.label} parameter",
+                    )
+                    self._persist_snapshot_to(registration.parameter_snapshot, store)
                 else:
                     parameter_snapshot = self._checkpoint_snapshot_cache.get(key.args_digest)
                     if parameter_snapshot is not None:
+                        self._require_snapshot_digest(
+                            parameter_snapshot,
+                            key.args_digest,
+                            subject=f"{record.label} checkpoint parameter",
+                        )
                         self._persist_snapshot_to(parameter_snapshot, store)
             deps: list[dict[str, Any]] = []
             for dep_key in record.dependencies:
@@ -1231,6 +1773,12 @@ class Database:
                 if dep_key.kind == "input":
                     input_key = self._input_ident_for_key(dep_key)
                     input_obj = self._inputs_by_key[input_key]
+                    self._require_snapshot_digest(
+                        dep_record.snapshot,
+                        dep_record.digest,
+                        subject=f"{dep_record.label} value",
+                    )
+                    self._persist_snapshot_to(dep_record.snapshot, store)
                     deps.append(
                         {
                             "kind": "input",
@@ -1302,6 +1850,7 @@ class Database:
         manifest = {
             "pyinc_ckpt_version": _CHECKPOINT_MANIFEST_VERSION,
             "kernel_fingerprint_version": _KERNEL_FINGERPRINT_VERSION,
+            "mode": self._mode,
             "adapters": adapters_manifest,
             "records": records_list,
         }
@@ -1314,7 +1863,8 @@ class Database:
         return checkpoint_key
 
     def _load_checkpoint_locked(self, key: str, store: ArtifactStore) -> None:
-        if not isinstance(key, str) or not key.startswith("ck") or not self._is_digest(key[2:]):
+        self._verify_adapter_lifetime()
+        if type(key) is not str or not key.startswith("ck") or not self._is_digest(key[2:]):
             raise CheckpointIntegrityError(
                 "Checkpoint keys must be 'ck' followed by a lowercase SHA-256 digest."
             )
@@ -1322,7 +1872,7 @@ class Database:
             manifest_bytes = store.get(key)
         if manifest_bytes is None:
             raise KeyError(f"Checkpoint key {key!r} not found in the ArtifactStore.")
-        if not isinstance(manifest_bytes, bytes):
+        if type(manifest_bytes) is not bytes:
             raise CheckpointIntegrityError(f"Checkpoint {key!r} manifest payload is not bytes.")
         # The manifest is the root of trust: re-derive its content address
         # from the fetched bytes before parsing anything out of them.
@@ -1368,7 +1918,7 @@ class Database:
     @staticmethod
     def _is_digest(value: Any) -> bool:
         return (
-            isinstance(value, str)
+            type(value) is str
             and len(value) == 64
             and all(character in "0123456789abcdef" for character in value)
         )
@@ -1397,6 +1947,7 @@ class Database:
         required_root = {
             "pyinc_ckpt_version",
             "kernel_fingerprint_version",
+            "mode",
             "adapters",
             "records",
         }
@@ -1408,6 +1959,18 @@ class Database:
                 f"Checkpoint {key!r} was written by kernel fingerprint version "
                 f"{kernel_version!r}, but this kernel emits version "
                 f"{_KERNEL_FINGERPRINT_VERSION}; refusing to load."
+            )
+        checkpoint_mode = manifest["mode"]
+        if type(checkpoint_mode) is not str or checkpoint_mode not in {
+            "strict",
+            "checked",
+            "fast",
+        }:
+            raise malformed("field 'mode' must be 'strict', 'checked', or 'fast'.")
+        if checkpoint_mode != self._mode:
+            raise CheckpointModeError(
+                f"Checkpoint {key!r} was saved in {checkpoint_mode!r} mode and cannot "
+                f"be loaded in {self._mode!r} mode."
             )
 
         raw_adapters = manifest["adapters"]
@@ -1716,7 +2279,9 @@ class Database:
     def _read_validated_snapshot(self, store: ArtifactStore, digest: str) -> Snapshot | object:
         with self._allow_raw_reads_scope():
             payload = store.get(digest)
-        if not isinstance(payload, bytes) or hashlib.sha256(payload).hexdigest() != digest:
+        if type(payload) is not bytes:
+            return _MISSING_SNAPSHOT
+        if hashlib.sha256(payload).hexdigest() != digest:
             return _MISSING_SNAPSHOT
         try:
             snapshot = deserialize_snapshot(payload)
@@ -1732,6 +2297,8 @@ class Database:
         if ckpt is None:
             return False
         if ckpt.get("is_untracked"):
+            return False
+        if not snapshots_equal(call_snapshot, call_snapshot):
             return False
         # The root call snapshot is thawed to obtain the arguments passed to
         # the query. A changed adapter can therefore alter a fresh execution's
@@ -1769,7 +2336,7 @@ class Database:
         if dependencies is None:
             return False
         snapshot = self._load_snapshot_from_store(ckpt["snapshot_digest"])
-        if snapshot is _MISSING_SNAPSHOT:
+        if snapshot is _MISSING_SNAPSHOT or not snapshots_equal(snapshot, snapshot):
             return False
         # Normalise the warmed record onto this database's timeline: its old
         # changed_at belongs to the saving process and means nothing here.
@@ -1811,6 +2378,7 @@ class Database:
         if (
             call_snapshot is _MISSING_SNAPSHOT
             or not self._is_query_call_snapshot(call_snapshot)
+            or not snapshots_equal(call_snapshot, call_snapshot)
             or not self._adapter_keys_trusted(collect_adapter_keys(cast(Snapshot, call_snapshot)))
         ):
             return False
@@ -1825,7 +2393,7 @@ class Database:
         if dependencies is None:
             return False
         snapshot = self._load_snapshot_from_store(ckpt["snapshot_digest"])
-        if snapshot is _MISSING_SNAPSHOT:
+        if snapshot is _MISSING_SNAPSHOT or not snapshots_equal(snapshot, snapshot):
             return False
         # A dep warmed without its Query object is flagged checkpoint_loaded so
         # _maybe_changed_after re-verifies it transitively through its edges.
@@ -1915,7 +2483,17 @@ class Database:
         if not self._adapter_keys_trusted(collect_adapter_keys(record.snapshot)):
             return False
         expected_digest: str = dep["digest"]
-        return record.digest == expected_digest
+        return self._checkpoint_record_matches(record, expected_digest)
+
+    def _checkpoint_record_matches(self, record: NodeRecord, expected_digest: str) -> bool:
+        """Compare a live/restored record with checkpoint bytes substitutively."""
+        expected_snapshot = self._load_snapshot_from_store(expected_digest)
+        if expected_snapshot is _MISSING_SNAPSHOT:
+            return False
+        expected = cast(Snapshot, expected_snapshot)
+        if not self._adapter_keys_trusted(collect_adapter_keys(expected)):
+            return False
+        return snapshots_equal(record.snapshot, expected)
 
     def _verify_checkpoint_query_dep(self, dep: dict[str, Any]) -> bool:
         dep_key = NodeKey(
@@ -1935,13 +2513,13 @@ class Database:
             return False
         record = self._records.get(dep_key)
         if record is not None:
-            return record.digest == expected_digest
+            return self._checkpoint_record_matches(record, expected_digest)
         # Prefer warming the dep's subtree from the checkpoint (no execution:
         # resources come back via probe hints). If the subtree can't be warmed
         # -- e.g. it reaches a resource unresolvable from the pinned captures --
         # verify the dep by re-execution instead.
         if self._warm_checkpoint_dep_query(dep_key):
-            return self._records[dep_key].digest == expected_digest
+            return self._checkpoint_record_matches(self._records[dep_key], expected_digest)
         return self._execute_to_verify_query_dep(dep, dep_key, expected_digest)
 
     def _execute_to_verify_query_dep(
@@ -1953,8 +2531,9 @@ class Database:
         dep's call snapshot from the store (content-addressed by its args_digest;
         missing/corrupt ⇒ degrade to warm refusal), runs the pinned Query live --
         so its resources are probed against the real world -- and compares the
-        resulting digest to the manifest's expectation. Equal ⇒ verified and now
-        live (downstream warming can reuse it); different ⇒ refuse.
+        resulting snapshot to the manifest's expected snapshot under the typed,
+        substitutive relation. Equal means verified and live; different means
+        the parent must refuse checkpoint reuse.
         """
         pinned_objects = self._checkpoint_root_pinned_query_objects
         if pinned_objects is None:
@@ -1993,11 +2572,14 @@ class Database:
         self._call_snapshots()[dep_key] = call_snapshot
         try:
             self._ensure_query(query_obj, dep_key, call_snapshot)
+        except (ResourceDependencyError, QueryConcurrencyError):
+            self._discard_uncommitted_query(dep_key)
+            raise
         except Exception:
             self._discard_uncommitted_query(dep_key)
             return False
         record = self._records.get(dep_key)
-        return record is not None and record.digest == expected_digest
+        return record is not None and self._checkpoint_record_matches(record, expected_digest)
 
     def _verify_checkpoint_resource_dep(self, dep: dict[str, Any]) -> bool:
         dep_key = NodeKey(
@@ -2016,7 +2598,7 @@ class Database:
             return False
         record = self._records.get(dep_key)
         if record is not None:
-            return record.digest == expected_digest
+            return snapshots_equal(record.snapshot, cast(Snapshot, expected_snapshot))
         # No live record: resolve the resource object from the root's pinned
         # captures (identity match), thaw its parameter from the store, and probe
         # LIVE via _refresh_resource. That takes the checkpoint probe-hint fast
@@ -2028,24 +2610,33 @@ class Database:
         resolved = self._resolve_checkpoint_resource(dep_key)
         if resolved is None:
             return False
-        resource, parameter = resolved
-        self._resource_objects()[dep_key] = (resource, parameter)
+        resource, parameter, registration = resolved
+        self._resource_objects()[dep_key] = registration
         try:
             self._refresh_resource(resource, parameter, dep_key)
+        except (ResourceDependencyError, QueryConcurrencyError):
+            if dep_key not in self._records:
+                self._resource_objects().pop(dep_key, None)
+            raise
         except Exception:
             if dep_key not in self._records:
                 self._resource_objects().pop(dep_key, None)
             return False
         record = self._records.get(dep_key)
-        return record is not None and record.digest == expected_digest
+        return record is not None and snapshots_equal(
+            record.snapshot, cast(Snapshot, expected_snapshot)
+        )
 
-    def _resolve_checkpoint_resource(self, dep_key: NodeKey) -> tuple[Any, Any] | None:
+    def _resolve_checkpoint_resource(
+        self, dep_key: NodeKey
+    ) -> tuple[Any, Any, _ResourceRegistration] | None:
         """Resolve (resource object, parameter) for a checkpoint resource dep.
 
         The object comes from the warm root's pinned captures (matched on the
-        resource's content identity); the parameter is thawed from the store,
-        content-addressed by the dep's args_digest. Any missing piece ⇒ None,
-        which the caller treats as "cannot verify from the checkpoint".
+        resource's content identity); the parameter is rebuilt from the owned
+        snapshot in the store, content-addressed by the dep's args_digest. Any
+        missing or non-substitutive piece ⇒ None, which the caller treats as
+        "cannot verify from the checkpoint".
         """
         pinned = self._checkpoint_root_pinned_resources
         if pinned is None:
@@ -2066,26 +2657,15 @@ class Database:
         # change, so gate here explicitly.
         if not self._adapter_keys_trusted(collect_adapter_keys(parameter_snapshot)):
             return None
-        parameter = self._thaw_value(parameter_snapshot)
-        live_parameter_type_digest = fingerprint_snapshot(
-            (
-                "resource-parameter-types-v3",
-                self._resource_configuration_type_payload(parameter),
-            )
+        registration = _ResourceRegistration(
+            resource=resource,
+            parameter_snapshot=cast(Snapshot, parameter_snapshot),
+            parameter_type_digest=parameter_type_digest,
         )
-        if live_parameter_type_digest != parameter_type_digest:
+        materialized, parameter = self._materialize_resource_parameter(dep_key, registration)
+        if not materialized:
             return None
-        # Round-trip guard: the resource must be re-probed/loaded with a parameter
-        # structurally identical to the one it was keyed by. Thawing is lossy for
-        # values with no reconstructor -- a frozen dataclass parameter thaws to a
-        # plain dict -- so re-freeze the thawed parameter and require it to hash
-        # back to this dep's args_digest (computed the same way in _resource_key).
-        # A mismatch means we would drive the resource with a different-shaped
-        # parameter (probe/load raising, or a stale value under this dep_key);
-        # refuse so the caller re-executes live with the real parameter instead.
-        if fingerprint_snapshot(self._freeze_value(parameter)) != dep_key.args_digest:
-            return None
-        return resource, parameter
+        return resource, parameter, registration
 
     def _load_snapshot_from_store(self, digest: str) -> Snapshot | object:
         if digest in self._checkpoint_snapshot_cache:
@@ -2096,10 +2676,14 @@ class Database:
         return self._read_validated_snapshot(store, digest)
 
     def _persist_snapshot_to(self, snapshot: Snapshot, store: ArtifactStore) -> None:
+        """Put one checkpoint object, validating any existing content address.
+
+        ``contains`` establishes presence only. The store's idempotent ``put``
+        contract is what proves that bytes already bound to the digest are the
+        canonical payload, so checkpoint save must always exercise it.
+        """
         digest = fingerprint_snapshot(snapshot)
         with self._allow_raw_reads_scope():
-            if store.contains(digest):
-                return
             payload = serialize_snapshot(snapshot)
             store.put(digest, payload)
 
@@ -2122,9 +2706,11 @@ class Database:
         return key.identity.rsplit(":", 1)[0]
 
     def read_input(self, input_key: _core.Input[T]) -> T:
+        self._reject_resource_hook_read("Database.read_input()")
+        _reject_cross_database_query_read(self, "Database.read_input()")
         from .core import Input
 
-        if not isinstance(input_key, Input):
+        if type(input_key) is not Input:
             raise TypeError("db.read_input() expects an Input instance.")
         with self._state_lock:
             key = self._input_key(input_key)
@@ -2145,6 +2731,8 @@ class Database:
     def read_resource(self, resource: Any, parameter: Any) -> Any: ...
 
     def read_resource(self, resource: Any, parameter: Any) -> Any:
+        self._reject_resource_hook_read("Database.read_resource()")
+        _reject_cross_database_query_read(self, "Database.read_resource()")
         with self._state_lock, self._request_scope() as pending:
             key = self._resource_key(resource, parameter)
             outcome = _RefreshOutcome()
@@ -2152,6 +2740,14 @@ class Database:
                 self._refresh_resource(resource, parameter, key, outcome)
                 self._record_dependency(key)
                 result = self._expose_boundary_snapshot(self._records[key].snapshot)
+                from .resources import FileStatResource, _file_stat_public_value
+
+                if isinstance(resource, FileStatResource):
+                    result = _file_stat_public_value(result)
+            except (ResourceDependencyError, QueryConcurrencyError):
+                if key not in self._records:
+                    self._resource_objects().pop(key, None)
+                raise
             except Exception:
                 # A load that raised is still an observation: when it left a
                 # failure record behind, the reader depends on it exactly as it
@@ -2185,6 +2781,26 @@ class Database:
             existing.last_decision = "reused"
             existing.reason = "already checked in current request"
             self._stats["query_reuses"] += 1
+            self._mark_query_used(key)
+            return
+        if not snapshots_equal(call_snapshot, call_snapshot):
+            self._execute_query(
+                query,
+                key,
+                call_snapshot,
+                previous=existing,
+                reason="non-substitutive query arguments",
+            )
+            self._mark_query_used(key)
+            return
+        if not snapshots_equal(existing.snapshot, existing.snapshot):
+            self._execute_query(
+                query,
+                key,
+                call_snapshot,
+                previous=existing,
+                reason="non-substitutive cached result",
+            )
             self._mark_query_used(key)
             return
         if existing.is_untracked:
@@ -2225,6 +2841,8 @@ class Database:
         frame = ExecutionFrame(key=key)
         stack = self._execution_stack.get()
         token = self._execution_stack.set(stack + (frame,))
+        query_executions = _ACTIVE_QUERY_EXECUTIONS.get()
+        query_execution_token = _ACTIVE_QUERY_EXECUTIONS.set(query_executions + (self,))
         raw_reads_token = self._allow_raw_reads.set(False)
         try:
             # The guard covers the whole query boundary, not just the body:
@@ -2234,20 +2852,25 @@ class Database:
             with self._guard_untracked_reads():
                 query_args, query_kwargs = self._materialize_call(
                     call_snapshot,
-                    record_boundaries=self.mode == "checked",
+                    record_boundaries=self._mode == "checked",
                     frame=frame,
                 )
+                _raise_sticky_concurrency_violation(frame)
                 t0 = time.perf_counter_ns()
                 result = query.fn(self, *query_args, **query_kwargs)
+                _raise_sticky_concurrency_violation(frame)
                 elapsed = time.perf_counter_ns() - t0
-                if self.mode == "checked":
+                if self._mode == "checked":
                     for before, value in zip(
                         frame.boundary_fingerprints, frame.boundary_values, strict=True
                     ):
                         assert_not_mutated(before, self._fingerprint_value(value))
+                    _raise_sticky_concurrency_violation(frame)
                 snapshot = self._freeze_value(result)
+                _raise_sticky_concurrency_violation(frame)
             digest = fingerprint_snapshot(snapshot)
             impure = bool(frame.untracked_reasons)
+            value_changed = False
 
             if previous is None:
                 record = NodeRecord(
@@ -2265,31 +2888,19 @@ class Database:
             else:
                 record = previous
                 previous_changed_at = previous.changed_at
-                previous_digest = previous.digest
+                previous_snapshot = previous.snapshot
                 if query.eq is None and query.cutoff is None:
-                    # Both operands are canonical freeze outputs: the fresh
-                    # snapshot from _freeze_value above, the previous one from
-                    # an earlier freeze or a validated checkpoint load. freeze
-                    # is ==-preserving on its own outputs, so the semantic
-                    # comparison of the exposed values reduces to comparing
-                    # the stored snapshots directly -- the same decision in
-                    # every mode, with no thaw or re-freeze on the warm path.
-                    # Snapshot equality is the primary answer; the digests
-                    # settle the one shape it under-reports, a NaN payload,
-                    # which never equals itself but does normalize to a single
-                    # canonical encoding. The digests are already computed, so
-                    # the fallback costs a string compare.
-                    equal = (
-                        False
-                        if impure
-                        else (
-                            snapshots_equal(previous.snapshot, snapshot)
-                            or digest == previous_digest
-                        )
-                    )
+                    # Both operands are canonical freeze outputs.  The typed
+                    # structural relation is mode-independent, distinguishes
+                    # Python-equal numeric representations, and deliberately
+                    # refuses NaN rather than letting a digest backdate it.
+                    equal = False if impure else snapshots_equal(previous_snapshot, snapshot)
                 else:
-                    old_value = self._expose_snapshot(previous.snapshot)
-                    new_value = self._expose_snapshot(snapshot)
+                    # Policy code is user code. Give it owned operands even in
+                    # strict mode, where non-boundary exposure otherwise returns
+                    # the canonical Frozen* snapshot itself.
+                    old_value = self._expose_snapshot(detach_snapshot(previous_snapshot))
+                    new_value = self._expose_snapshot(detach_snapshot(snapshot))
                     equal = (
                         False
                         if impure
@@ -2300,19 +2911,20 @@ class Database:
                             right=new_value,
                         )
                     )
+                    _raise_sticky_concurrency_violation(frame)
                 record.snapshot = snapshot
                 record.digest = digest
                 if equal:
                     record.changed_at = previous_changed_at
                     decision = "backdated"
-                elif impure and digest == previous_digest:
+                elif impure and snapshots_equal(previous_snapshot, snapshot):
                     # `equal` was forced above, not observed: an untracked
                     # read skips the comparison entirely. When the re-run
-                    # then lands a byte-identical snapshot there is no new
+                    # then lands a substitutively equal snapshot there is no new
                     # value to propagate, so keep the old changed_at and
                     # leave the revision alone -- otherwise a stable impure
                     # leaf churns the counter on every warm request. This
-                    # digest short-circuit applies only to the forced case:
+                    # structural short-circuit applies only to the forced case:
                     # when a comparison actually ran and said unequal (a
                     # custom eq policy may, even for identical snapshots),
                     # the bump below stands.
@@ -2330,6 +2942,7 @@ class Database:
                     self._revision += 1
                     record.changed_at = self._revision
                     decision = "executed"
+                    value_changed = True
             self._query_records.add(key)
             record.verified_at = self._revision
             record.dependencies = frame.dependencies
@@ -2343,41 +2956,51 @@ class Database:
                 self._stats["query_backdates"] += 1
             else:
                 self._stats["query_executions"] += 1
+            if value_changed:
                 self._enqueue_observer_event(query, key, record)
             self._query_timings.setdefault(key, _TimingAggregate()).add(elapsed)
         finally:
             self._allow_raw_reads.reset(raw_reads_token)
+            _ACTIVE_QUERY_EXECUTIONS.reset(query_execution_token)
             self._execution_stack.reset(token)
 
     def _enqueue_observer_event(self, query: Any, key: NodeKey, record: NodeRecord) -> None:
-        if key not in self._observers:
+        registrations = self._observers.get(key)
+        if not registrations:
             return
         pending = self._pending_events.get()
         if pending is None:
             return
         pending.append(
-            (
-                key,
-                QueryChangeEvent(
+            _PendingObserverEvent(
+                event=QueryChangeEvent(
                     query_id=query.key,
                     args_digest=key.args_digest,
                     decision="executed",
                     changed_at=record.changed_at,
                     verified_at=record.verified_at,
                 ),
+                callbacks=tuple(registration.callback for registration in registrations),
             )
         )
 
-    def _unregister_observer(self, key: NodeKey, callback: ObserverCallback) -> None:
+    def _unregister_observer(self, key: NodeKey, registration: _ObserverRegistration) -> None:
         with self._state_lock:
-            callbacks = self._observers.get(key)
-            if callbacks is None:
+            registrations = self._observers.get(key)
+            if registrations is None:
                 return
-            try:
-                callbacks.remove(callback)
-            except ValueError:
+            index = next(
+                (
+                    index
+                    for index, candidate in enumerate(registrations)
+                    if candidate is registration
+                ),
+                None,
+            )
+            if index is None:
                 return
-            if not callbacks:
+            del registrations[index]
+            if not registrations:
                 del self._observers[key]
                 if key not in self._query_records:
                     self._call_snapshots().pop(key, None)
@@ -2387,15 +3010,13 @@ class Database:
                     ) and not any(item.identity == key.identity for item in self._query_records):
                         self._query_objects().pop(key.identity, None)
 
-    def _dispatch_events(self, events: list[tuple[NodeKey, QueryChangeEvent]] | None) -> None:
+    def _dispatch_events(self, events: list[_PendingObserverEvent] | None) -> None:
         if not events:
             return
-        with self._state_lock:
-            snapshots = [(event, tuple(self._observers.get(key, ()))) for key, event in events]
-        for event, callbacks in snapshots:
-            for callback in callbacks:
+        for pending in events:
+            for callback in pending.callbacks:
                 try:
-                    callback(event)
+                    callback(pending.event)
                 except Exception as exc:
                     with suppress(Exception):
                         self._observer_error_hook(exc)
@@ -2417,15 +3038,38 @@ class Database:
                 if self._verify_checkpoint_loaded_record(record):
                     return True
             else:
-                self._ensure_query(query_obj, key, call_snapshot)
+                # A digest cannot prove that a NaN-containing call is the same
+                # computation. Force the caller to rebuild the dependency with
+                # its current live arguments instead of rechecking an old
+                # ephemeral call node.
+                if not snapshots_equal(call_snapshot, call_snapshot):
+                    return True
+                try:
+                    self._ensure_query(query_obj, key, call_snapshot)
+                except Exception:
+                    # Verification happens before the parent's body runs. A
+                    # child failure here must make the dependency dirty so the
+                    # parent executes and observes that failure at its ordinary
+                    # call site, where its own exception handler can decide the
+                    # public result.
+                    return True
         elif key.kind == "resource":
-            resource_pair = self._resource_objects().get(key)
-            if resource_pair is None:
+            registration = self._resource_objects().get(key)
+            if registration is None:
                 return True
-            resource, parameter = resource_pair
+            materialized, parameter = self._materialize_resource_parameter(key, registration)
+            if not materialized:
+                # Some accepted parameter shapes (notably dataclasses and
+                # PathLike values) do not reconstruct with their original type.
+                # Without an exact owned live value, force the parent to execute
+                # and supply its parameter again instead of probing a different
+                # value under this node's old digest.
+                return True
             outcome = _RefreshOutcome()
             try:
-                self._refresh_resource(resource, parameter, key, outcome)
+                self._refresh_resource(registration.resource, parameter, key, outcome)
+            except (ResourceDependencyError, QueryConcurrencyError):
+                raise
             except Exception:
                 # A refresh that raises must not escape a dependent's
                 # verification pass: with a failure record describing *this*
@@ -2437,7 +3081,12 @@ class Database:
                 # trusted: report changed and let the dependent re-read.
                 if not outcome.failure_recorded:
                     return True
-        return self._records[key].is_untracked or self._records[key].changed_at > revision
+        current = self._records[key]
+        return (
+            current.is_untracked
+            or not snapshots_equal(current.snapshot, current.snapshot)
+            or current.changed_at > revision
+        )
 
     def _verify_checkpoint_loaded_record(self, record: NodeRecord) -> bool:
         """Re-verify a checkpoint-warmed record that has no live Query object.
@@ -2490,6 +3139,8 @@ class Database:
         outcome = outcome if outcome is not None else _RefreshOutcome()
         try:
             self._observe_resource(resource, parameter, key, outcome)
+        except (ResourceDependencyError, QueryConcurrencyError):
+            raise
         except Exception:
             if not outcome.failure_recorded:
                 record = self._records.get(key)
@@ -2519,7 +3170,9 @@ class Database:
                 # is never older than the observation the request already made.
                 outcome.failure_recorded = True
                 raise record.failure_exc.with_traceback(record.failure_traceback)
-        atomic = callable(getattr(resource, "probe_and_load", None))
+        with self._resource_hook_scope(resource, "probe_and_load"):
+            atomic_hook = getattr(resource, "probe_and_load", None)
+        atomic = callable(atomic_hook)
         if atomic and (
             (record is not None and not record.is_failed and not record.probe_unconfirmed)
             or (record is None and key in self._checkpoint_resource_probes)
@@ -2534,12 +3187,15 @@ class Database:
             # combined read decide, exactly as it would have without the
             # attempt.
             try:
-                with self._allow_raw_reads_scope():
+                with self._resource_hook_scope(resource, "probe"), self._allow_raw_reads_scope():
                     early_probe = resource.probe(parameter)
+            except (ResourceDependencyError, QueryConcurrencyError):
+                raise
             except Exception:
                 pass
             else:
-                early_probe_snapshot = freeze(early_probe, adapters=self._adapters)
+                with self._resource_hook_scope(resource, "probe"):
+                    early_probe_snapshot = self._freeze_owned_snapshot(early_probe)
                 if self._reuse_on_probe_hit(record, early_probe_snapshot, current_request):
                     return
                 if record is None and self._restore_from_probe_hint(
@@ -2548,8 +3204,15 @@ class Database:
                     return
         if atomic:
             try:
-                with self._allow_raw_reads_scope():
-                    probe, loaded_value = resource.probe_and_load(self, parameter)
+                with (
+                    self._resource_hook_scope(resource, "probe_and_load"),
+                    self._allow_raw_reads_scope(),
+                ):
+                    probe, loaded_value = cast(Callable[..., tuple[Any, Any]], atomic_hook)(
+                        self, parameter
+                    )
+            except (ResourceDependencyError, QueryConcurrencyError):
+                raise
             except Exception as exc:
                 outcome.failure_recorded = self._record_resource_failure(
                     key,
@@ -2560,24 +3223,30 @@ class Database:
                 )
                 raise
         else:
-            with self._allow_raw_reads_scope():
+            with self._resource_hook_scope(resource, "probe"), self._allow_raw_reads_scope():
                 probe = resource.probe(parameter)
             loaded_value = None
-        probe_snapshot = freeze(probe, adapters=self._adapters)
+        probe_hook_name = "probe_and_load" if atomic else "probe"
+        with self._resource_hook_scope(resource, probe_hook_name):
+            probe_snapshot = self._freeze_owned_snapshot(probe)
         if self._reuse_on_probe_hit(record, probe_snapshot, current_request):
             return
         if record is None and self._restore_from_probe_hint(key, probe_snapshot, current_request):
             return
         if not atomic:
             try:
-                with self._allow_raw_reads_scope():
+                with self._resource_hook_scope(resource, "load"), self._allow_raw_reads_scope():
                     loaded_value = resource.load(self, parameter)
+            except (ResourceDependencyError, QueryConcurrencyError):
+                raise
             except Exception as exc:
                 outcome.failure_recorded = self._record_resource_failure(
                     key, record, probe_snapshot, exc, current_request
                 )
                 raise
-        snapshot = self._freeze_value(loaded_value)
+        value_hook_name = "probe_and_load" if atomic else "load"
+        with self._resource_hook_scope(resource, value_hook_name):
+            snapshot = self._freeze_value(loaded_value)
         digest = fingerprint_snapshot(snapshot)
         if record is None:
             changed_at = self._revision
@@ -2635,7 +3304,8 @@ class Database:
             record is not None
             and not record.is_failed
             and not record.probe_unconfirmed
-            and record.probe == probe_snapshot
+            and snapshots_equal(record.snapshot, record.snapshot)
+            and snapshots_equal(record.probe, probe_snapshot)
         ):
             record.verified_at = self._revision
             record.last_decision = "reused"
@@ -2663,7 +3333,7 @@ class Database:
         if hint is None:
             return False
         expected_probe_snapshot, expected_digest = hint
-        if probe_snapshot == expected_probe_snapshot and self._adapter_keys_trusted(
+        if snapshots_equal(probe_snapshot, expected_probe_snapshot) and self._adapter_keys_trusted(
             collect_adapter_keys(expected_probe_snapshot)
         ):
             snapshot = self._load_snapshot_from_store(expected_digest)
@@ -2673,8 +3343,10 @@ class Database:
             # moves, so gate the restore just like every other thaw-into-live
             # path; on distrust fall through to the full load, which re-freezes
             # a fresh load under the live adapter.
-            if snapshot is not _MISSING_SNAPSHOT and self._adapter_keys_trusted(
-                collect_adapter_keys(snapshot)
+            if (
+                snapshot is not _MISSING_SNAPSHOT
+                and snapshots_equal(snapshot, snapshot)
+                and self._adapter_keys_trusted(collect_adapter_keys(snapshot))
             ):
                 self._records[key] = NodeRecord(
                     key=key,
@@ -2709,8 +3381,10 @@ class Database:
         ``probe_and_load`` to observe both from one read is what removes the gap.
         """
         try:
-            with self._allow_raw_reads_scope():
-                return freeze(resource.probe(parameter), adapters=self._adapters)
+            with self._resource_hook_scope(resource, "probe"), self._allow_raw_reads_scope():
+                return self._freeze_owned_snapshot(resource.probe(parameter))
+        except (ResourceDependencyError, QueryConcurrencyError):
+            raise
         except Exception:
             return _MISSING_SNAPSHOT
 
@@ -2739,7 +3413,11 @@ class Database:
         failure = f"{type(exc).__name__}: {exc}"
         if record is None:
             changed_at = self._revision
-        elif record.is_failed and not record.probe_unconfirmed and record.probe == probe_snapshot:
+        elif (
+            record.is_failed
+            and not record.probe_unconfirmed
+            and snapshots_equal(record.probe, probe_snapshot)
+        ):
             changed_at = record.changed_at
         else:
             self._revision += 1
@@ -2807,15 +3485,25 @@ class Database:
         call_snapshot = self._freeze_value((args, kwargs))
         args_digest = fingerprint_snapshot(call_snapshot)
         query_fingerprint = self._query_fingerprint(query)
+        identity = f"{query.key}:{query_fingerprint}"
+        identity = self._ephemeral_identity_for_non_substitutive(identity, call_snapshot)
         key = NodeKey(
             kind="query",
-            identity=f"{query.key}:{query_fingerprint}",
+            identity=identity,
             args_digest=args_digest,
             label=f"{query.key}[{args_digest[:12]}] {query.__name__}()",
         )
         self._query_objects()[key.identity] = query
         self._call_snapshots()[key] = call_snapshot
         return key, call_snapshot
+
+    def _ephemeral_identity_for_non_substitutive(self, identity: str, snapshot: Any) -> str:
+        """Make a content-colliding, non-substitutive value unique to this call."""
+
+        if snapshots_equal(snapshot, snapshot):
+            return identity
+        self._non_substitutive_identity_counter += 1
+        return f"{identity}:non-substitutive:{self._non_substitutive_identity_counter}"
 
     def _input_key(self, input_key: Any) -> NodeKey:
         key = self._input_records.get(input_key)
@@ -2869,34 +3557,97 @@ class Database:
     def _resource_key(self, resource: Any, parameter: Any) -> NodeKey:
         frozen_parameter = self._freeze_value(parameter)
         parameter_digest = fingerprint_snapshot(frozen_parameter)
-        resource_identity = fingerprint_snapshot(self._resource_identity_payload(resource))
-        parameter_type_digest = fingerprint_snapshot(
+        resource_identity = self._fingerprint_identity_payload(
+            self._resource_identity_payload(resource),
+            subject=(
+                f"Resource {type(resource).__module__}.{type(resource).__qualname__} identity"
+            ),
+        )
+        parameter_type_digest = self._fingerprint_identity_payload(
             (
                 "resource-parameter-types-v3",
                 self._resource_configuration_type_payload(parameter),
-            )
+            ),
+            subject="Resource parameter type identity",
         )
-        label = resource.label(parameter)
-        if not isinstance(label, str):
-            raise TypeError("Resource.label() must return a string.")
-        if not label:
-            raise ValueError("Resource.label() must return a non-empty string.")
+        with self._resource_hook_scope(resource, "label"):
+            label = resource.label(parameter)
+            if not isinstance(label, str):
+                raise TypeError("Resource.label() must return a string.")
+            if not label:
+                raise ValueError("Resource.label() must return a non-empty string.")
+        identity = (
+            f"{type(resource).__module__}:{type(resource).__qualname__}:"
+            f"{resource_identity}:{parameter_type_digest}"
+        )
+        identity = self._ephemeral_identity_for_non_substitutive(identity, frozen_parameter)
         key = NodeKey(
             kind="resource",
-            identity=(
-                f"{type(resource).__module__}:{type(resource).__qualname__}:"
-                f"{resource_identity}:{parameter_type_digest}"
-            ),
+            identity=identity,
             args_digest=parameter_digest,
             label=label,
         )
-        self._resource_objects()[key] = (resource, parameter)
+        self._resource_objects()[key] = _ResourceRegistration(
+            resource=resource,
+            parameter_snapshot=frozen_parameter,
+            parameter_type_digest=parameter_type_digest,
+        )
         return key
+
+    def _materialize_resource_parameter(
+        self,
+        key: NodeKey,
+        registration: _ResourceRegistration,
+    ) -> tuple[bool, Any]:
+        """Rebuild an owned live parameter only when its exact identity survives."""
+
+        snapshot_candidate = detach_snapshot(registration.parameter_snapshot)
+        if self._resource_parameter_matches_registration(
+            key,
+            registration,
+            snapshot_candidate,
+        ):
+            # An inbound Frozen* value already has the hook-visible type the
+            # caller supplied. Use the detached shell directly instead of
+            # thawing it into a different Python container type.
+            return True, snapshot_candidate
+        try:
+            # Give adapter thaw hooks their own copy too: a hook must never gain a
+            # reflective mutation path back into the registry's canonical value.
+            parameter = self._thaw_value(detach_snapshot(registration.parameter_snapshot))
+        except Exception:
+            return False, None
+        if not self._resource_parameter_matches_registration(key, registration, parameter):
+            return False, None
+        return True, parameter
+
+    def _resource_parameter_matches_registration(
+        self,
+        key: NodeKey,
+        registration: _ResourceRegistration,
+        parameter: Any,
+    ) -> bool:
+        try:
+            parameter_type_digest = self._fingerprint_identity_payload(
+                (
+                    "resource-parameter-types-v3",
+                    self._resource_configuration_type_payload(parameter),
+                ),
+                subject="Resource parameter type identity",
+            )
+            if parameter_type_digest != registration.parameter_type_digest:
+                return False
+            round_trip = self._freeze_owned_snapshot(parameter)
+        except Exception:
+            return False
+        return snapshots_equal(round_trip, registration.parameter_snapshot) and (
+            fingerprint_snapshot(round_trip) == key.args_digest
+        )
 
     def _materialize_call(
         self, call_snapshot: Any, *, record_boundaries: bool, frame: ExecutionFrame
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        if self.mode == "strict":
+        if self._mode == "strict":
             envelope = self._strict_snapshot_view(call_snapshot)
             if not self._is_materialized_call_envelope(envelope, kwargs_type=FrozenDict):
                 raise UnsupportedValueError("Invalid query call snapshot.")
@@ -3004,9 +3755,7 @@ class Database:
         if type(value) is FrozenList:
             return FrozenList(tuple(detach(item) for item in value.items))
         if type(value) is FrozenDict:
-            return FrozenDict(
-                tuple((detach(key), detach(item)) for key, item in value.entries)
-            )
+            return FrozenDict(tuple((detach(key), detach(item)) for key, item in value.entries))
         if type(value) is FrozenSet:
             return FrozenSet(value.kind, tuple(detach(item) for item in value.items))
         if type(value) is FrozenRecord:
@@ -3033,7 +3782,11 @@ class Database:
         record_boundaries: bool = False,
         frame: ExecutionFrame | None = None,
     ) -> Any:
-        if self.mode == "strict":
+        # Strict mode exposes the adapter envelope without calling ``thaw``, but
+        # that envelope is still meaningful only under the adapter state that
+        # produced it. Enforce the same lifetime pin in every mode.
+        self._verify_adapter_lifetime()
+        if self._mode == "strict":
             # Callers never see the FrozenGraph envelope: a graph-shaped result
             # is rebuilt into shared/cyclic Frozen* views at the boundary,
             # exactly as _materialize_call does for call arguments. Non-boundary
@@ -3052,7 +3805,7 @@ class Database:
         return self._expose_snapshot(
             snapshot,
             boundary=True,
-            record_boundaries=self.mode == "checked" and frame is not None,
+            record_boundaries=self._mode == "checked" and frame is not None,
             frame=frame,
         )
 
@@ -3061,6 +3814,38 @@ class Database:
         if frame is None:
             return
         frame.dependencies.add(key)
+
+    def _mark_caught_query_failure(
+        self,
+        query: Any,
+        key: NodeKey | None,
+        error: BaseException,
+    ) -> None:
+        """Conservatively invalidate a query that may handle a child failure.
+
+        A query publishes its dependency edges only after it returns. If a
+        nested query raises before publishing, its caller can catch the error
+        and otherwise publish a dependency-free fallback that remains cached
+        after the child heals. Mark each caller frame while the exception
+        unwinds; the eventual successful catcher then re-executes on every
+        request and is omitted from checkpoints.
+
+        A direct same-key recursive call is the one exception. ``CycleError``
+        is a deterministic property of that active frame, and preserving the
+        existing cached fallback keeps the supported self-cycle pattern useful.
+        Indirect cycles still propagate through distinct keys and take the
+        conservative path.
+        """
+        frame = self._current_frame()
+        if frame is None:
+            return
+        if key == frame.key and isinstance(error, CycleError):
+            return
+        query_key = getattr(query, "key", "<unknown>")
+        reason = f"caught failure from child query {query_key!r} before it published"
+        if reason not in frame.untracked_reasons:
+            frame.untracked_reasons.append(reason)
+        frame.checkpointable = False
 
     def _mark_frame_uncheckpointable(self) -> None:
         frame = self._current_frame()
@@ -3088,11 +3873,64 @@ class Database:
     def _query_objects(self) -> dict[str, Any]:
         return self._query_registry
 
-    def _resource_objects(self) -> dict[NodeKey, tuple[Any, Any]]:
+    def _resource_objects(self) -> dict[NodeKey, _ResourceRegistration]:
         return self._resource_registry
 
     def _call_snapshots(self) -> dict[NodeKey, Any]:
         return self._call_snapshot_registry
+
+    @contextmanager
+    def _resource_hook_scope(self, resource: Any, hook_name: str) -> Iterator[None]:
+        """Run one Resource hook under the no-database-dependencies contract.
+
+        The violation is sticky for the complete hook call. A hook cannot catch
+        ``ResourceDependencyError`` and publish a value whose provenance omits
+        the attempted database read.
+        """
+        context = _ResourceHookContext(
+            database=self,
+            resource_type=f"{type(resource).__module__}.{type(resource).__qualname__}",
+            hook_name=hook_name,
+        )
+        stack = _ACTIVE_RESOURCE_HOOKS.get()
+        token = _ACTIVE_RESOURCE_HOOKS.set(stack + (context,))
+        try:
+            yield
+        except BaseException as exc:
+            if context.violation is not None and exc is not context.violation:
+                raise context.violation from exc
+            raise
+        else:
+            if context.violation is not None:
+                raise context.violation
+        finally:
+            _ACTIVE_RESOURCE_HOOKS.reset(token)
+
+    def _reject_resource_hook_read(self, operation: str) -> None:
+        contexts = _ACTIVE_RESOURCE_HOOKS.get()
+        if not contexts:
+            return
+        active = contexts[-1]
+        error = active.violation
+        if error is None:
+            error = ResourceDependencyError(
+                f"Resource hook {active.resource_type}.{active.hook_name}() cannot call "
+                f"{operation}. Resource hooks must observe external state directly; "
+                "compose Input, Query, and Resource reads in a @query instead."
+            )
+        reason = (
+            f"Resource hook {active.resource_type}.{active.hook_name}() attempted "
+            f"the forbidden read {operation}."
+        )
+        for context in contexts:
+            if context.violation is None:
+                context.violation = error
+            frame = context.database._current_frame()
+            if frame is not None:
+                if reason not in frame.untracked_reasons:
+                    frame.untracked_reasons.append(reason)
+                frame.checkpointable = False
+        raise error
 
     @contextmanager
     def _allow_raw_reads_scope(self) -> Iterator[None]:
@@ -3116,139 +3954,270 @@ class Database:
             raise UntrackedReadError(message)
 
     def _query_fingerprint(self, query: Any) -> str:
-        cached = self._query_fingerprint_memo.get(query)
-        runtime_build = self._runtime_build_payload()
-        definition_observation = self._query_definition_observation(query)
-        if (
-            cached is not None
-            and cached[0] == runtime_build
-            and self._definition_observation_matches(cached[1], definition_observation)
-            and all(
-                self._module_observation_stamp(module) == expected for module, expected in cached[3]
-            )
-        ):
-            return cached[2]
+        request_memo = self._request_query_fingerprints.get()
+        if request_memo is not None:
+            cached = request_memo.get(id(query))
+            if cached is not None and cached[0] is query:
+                return cached[1]
 
-        modules: dict[int, ModuleType] = {}
-        collector_token = self._fingerprint_module_collector.set(modules)
-        cacheable_token = self._fingerprint_cacheable.set(True)
-        try:
-            result = fingerprint_snapshot(
-                (
-                    "query-v3",
-                    self._code_fingerprint(query.fn),
-                    self._policy_definition_payload(query.eq),
-                    self._policy_definition_payload(query.cutoff),
-                )
-            )
-        finally:
-            cacheable = self._fingerprint_cacheable.get()
-            self._fingerprint_cacheable.reset(cacheable_token)
-            self._fingerprint_module_collector.reset(collector_token)
-        module_observations = tuple(
-            (module, self._module_observation_stamp(module))
-            for _module_id, module in sorted(modules.items(), key=lambda item: item[1].__name__)
+        result = self._fingerprint_identity_payload(
+            (
+                "query-v4",
+                self._query_handle_payload(query),
+                self._code_fingerprint(query.fn),
+                self._policy_definition_payload(query.eq),
+                self._policy_definition_payload(query.cutoff),
+            ),
+            subject=f"Query {query.key!r} definition",
         )
-        if cacheable:
-            self._query_fingerprint_memo[query] = (
-                runtime_build,
-                definition_observation,
-                result,
-                module_observations,
-            )
-        else:
-            self._query_fingerprint_memo.pop(query, None)
+        if request_memo is not None:
+            # The query is pinned by this entry for the request's lifetime, so
+            # its id cannot be recycled into a false hit. No cached definition
+            # digest crosses a request boundary: every new request observes the
+            # full supported definition again before it can reuse a query record.
+            request_memo[id(query)] = (query, result)
         return result
 
     @staticmethod
-    def _query_definition_observation(query: Any) -> Any:
-        """Observe the live query definition for memoized-fingerprint reuse.
+    def _fingerprint_identity_payload(payload: Any, *, subject: str) -> str:
+        """Fingerprint only payloads that form a substitutive identity.
 
-        The observation records object *references* — per entry, not per
-        container, because a `__kwdefaults__` dict or a closure cell mutated in
-        place keeps its identity while changing the definition. Storing the
-        references in the memo pins their addresses, so identity comparison is
-        collision-free: any rebinding introduces an object that cannot be
-        identical to a still-pinned one, and a spurious mismatch only costs a
-        fingerprint recompute. The traversal mirrors what
-        `_function_definition_payload` folds into the fingerprint; modules stay
-        leaves because `_module_observation_stamp` covers their content.
+        Canonical bytes deliberately normalize NaN payloads, so a digest alone
+        cannot prove equality under the kernel's typed relation. Definition and
+        configuration identities have no safe "always changed" fallback: refuse
+        them rather than publish a stable key for non-substitutive state.
         """
-        from .core import Input, Query
 
-        seen: builtins.set[int] = set()
-
-        def observe_value(value: Any) -> Any:
-            if isinstance(value, Query):
-                return (value.key, observe_value(value.eq), observe_value(value.cutoff),
-                        observe_value(value.fn))
-            if isinstance(value, Input):
-                return (value.key, observe_value(value.eq), observe_value(value.cutoff))
-            if isinstance(value, FunctionType):
-                return observe_function(value)
-            return value
-
-        def observe_function(fn: FunctionType) -> Any:
-            if id(fn) in seen:
-                return fn
-            seen.add(id(fn))
-            code = fn.__code__
-            fn_globals = fn.__globals__
-            return (
-                fn,
-                code,
-                fn.__defaults__,
-                tuple(observe_value(value) for value in fn.__defaults__ or ()),
-                fn.__kwdefaults__,
-                tuple(
-                    (name, observe_value(value))
-                    for name, value in sorted((fn.__kwdefaults__ or {}).items())
-                ),
-                tuple(
-                    (cell, observe_cell(cell)) for cell in fn.__closure__ or ()
-                ),
-                tuple(
-                    (name, observe_value(fn_globals[name]))
-                    if name in fn_globals
-                    else (name, _UNBOUND_GLOBAL_OBSERVATION)
-                    for name in sorted(set(code.co_names))
-                ),
-                tuple((name, observe_value(value)) for name, value in sorted(vars(fn).items())),
+        if not snapshots_equal(payload, payload):
+            raise UnsupportedValueError(
+                f"{subject} contains a non-substitutive value such as NaN and "
+                "cannot be fingerprinted safely."
             )
+        return fingerprint_snapshot(payload)
 
-        def observe_cell(cell: Any) -> Any:
-            try:
-                contents = cell.cell_contents
-            except ValueError:
-                return _EMPTY_CELL_OBSERVATION
-            return observe_value(contents)
+    @staticmethod
+    def _query_handle_payload(query: Any) -> tuple[Any, ...]:
+        """Return the complete immutable public state copied onto a Query handle."""
 
         return (
+            "query-handle-v1",
             query.key,
-            observe_value(query.eq),
-            observe_value(query.cutoff),
-            observe_function(query.fn),
+            query.__module__,
+            query.__name__,
+            query.__qualname__,
+            query.__doc__,
         )
 
-    @classmethod
-    def _definition_observation_matches(cls, expected: Any, current: Any) -> bool:
-        """Compare observations by identity at the leaves, never by equality."""
+    def _captured_query_public_surface_payload(
+        self,
+        query: Any,
+        seen_functions: builtins.set[int],
+    ) -> tuple[Any, ...]:
+        """Pin identity-observable state exposed by a captured Query handle."""
 
-        if expected is current:
-            return True
-        if type(expected) is tuple and type(current) is tuple:
-            return len(expected) == len(current) and all(
-                cls._definition_observation_matches(old, new)
-                for old, new in zip(expected, current, strict=True)
+        fn = cast(FunctionType, query.fn)
+        return (
+            "captured-query-public-surface-v1",
+            tuple(
+                (
+                    name,
+                    self._state_site_incarnation(query, f"query.{name}", value),
+                    value
+                    if type(value) in {str, type(None)}
+                    else ("callable", type(value).__module__, type(value).__qualname__),
+                )
+                for name, value in (
+                    ("key", query.key),
+                    ("__module__", query.__module__),
+                    ("__name__", query.__name__),
+                    ("__qualname__", query.__qualname__),
+                    ("__doc__", query.__doc__),
+                    ("fn", fn),
+                    ("eq", query.eq),
+                    ("cutoff", query.cutoff),
+                )
+            ),
+            self._captured_function_public_surface_payload(
+                fn,
+                identity_owner=query,
+                site_prefix="query.fn",
+                seen_functions=seen_functions,
+            ),
+        )
+
+    @staticmethod
+    def _function_metadata_containers(
+        fn: FunctionType,
+    ) -> tuple[
+        tuple[Any, ...] | None,
+        dict[str, Any] | None,
+        dict[str, Any],
+        tuple[Any, ...],
+    ]:
+        """Return function metadata only when its public containers are exact.
+
+        FunctionType accepts tuple/dict subclasses for these attributes on
+        supported CPython versions. Their iteration can expose one value to the
+        fingerprint while overridden public lookup exposes another, so the
+        container implementation is part of the trust boundary.
+        """
+
+        defaults = fn.__defaults__
+        if defaults is not None and type(defaults) is not tuple:
+            raise UnsupportedValueError(
+                f"Function {fn.__module__}.{fn.__qualname__} must use an exact "
+                "tuple for __defaults__."
             )
-        return False
+        kwdefaults = fn.__kwdefaults__
+        if kwdefaults is not None and (
+            type(kwdefaults) is not dict or any(type(name) is not str for name in kwdefaults)
+        ):
+            raise UnsupportedValueError(
+                f"Function {fn.__module__}.{fn.__qualname__} must use an exact "
+                "dict with exact str keys for __kwdefaults__."
+            )
+        state = fn.__dict__
+        if type(state) is not dict or any(type(name) is not str for name in state):
+            raise UnsupportedValueError(
+                f"Function {fn.__module__}.{fn.__qualname__} must use an exact "
+                "dict with exact str keys for __dict__."
+            )
+        type_parameters = getattr(fn, "__type_params__", ())
+        if type(type_parameters) is not tuple:
+            raise UnsupportedValueError(
+                f"Function {fn.__module__}.{fn.__qualname__} must use an exact "
+                "tuple for __type_params__."
+            )
+        return defaults, kwdefaults, state, type_parameters
+
+    def _captured_function_public_surface_payload(
+        self,
+        fn: FunctionType,
+        *,
+        identity_owner: object,
+        site_prefix: str,
+        seen_functions: builtins.set[int],
+    ) -> tuple[Any, ...]:
+        defaults, kwdefaults, state, type_parameters = self._function_metadata_containers(fn)
+        annotation_function = getattr(fn, "__annotate__", None)
+        if annotation_function is not None and not isinstance(annotation_function, FunctionType):
+            raise UnsupportedValueError(
+                f"Function {fn.__module__}.{fn.__qualname__} has a non-Python "
+                "__annotate__ evaluator."
+            )
+        annotations = fn.__annotations__
+        if type(annotations) is not dict or any(type(name) is not str for name in annotations):
+            raise UnsupportedValueError(
+                f"Function {fn.__module__}.{fn.__qualname__} must use an exact "
+                "dict with exact str keys for __annotations__."
+            )
+        return (
+            "captured-function-public-surface-v1",
+            tuple(
+                (
+                    name,
+                    self._observable_site_incarnation(
+                        identity_owner, f"{site_prefix}.{name}", value
+                    ),
+                    value,
+                )
+                for name, value in (
+                    ("__name__", fn.__name__),
+                    ("__qualname__", fn.__qualname__),
+                    ("__module__", fn.__module__),
+                    ("__doc__", fn.__doc__),
+                )
+            ),
+            self._observable_site_incarnation(
+                identity_owner, f"{site_prefix}.__code__", fn.__code__
+            ),
+            self._observable_site_incarnation(
+                identity_owner, f"{site_prefix}.__defaults__", defaults
+            ),
+            self._observable_site_incarnation(
+                identity_owner, f"{site_prefix}.__kwdefaults__", kwdefaults
+            ),
+            self._observable_site_incarnation(
+                identity_owner, f"{site_prefix}.__annotations__", annotations
+            ),
+            tuple(
+                (
+                    name,
+                    self._observable_site_incarnation(
+                        identity_owner,
+                        f"{site_prefix}.__annotations__[{name}]",
+                        value,
+                    ),
+                    self._captured_dependency_digest(
+                        f"public-annotation[{name}]",
+                        value,
+                        seen_functions,
+                        owner=fn,
+                    ),
+                )
+                for name, value in annotations.items()
+            ),
+            self._observable_site_incarnation(identity_owner, f"{site_prefix}.__dict__", state),
+            self._observable_site_incarnation(
+                identity_owner,
+                f"{site_prefix}.__type_params__",
+                type_parameters,
+            ),
+            tuple(
+                (
+                    index,
+                    self._observable_site_incarnation(
+                        identity_owner,
+                        f"{site_prefix}.__type_params__[{index}]",
+                        value,
+                    ),
+                    self._captured_dependency_digest(
+                        f"public-type-parameter[{index}]",
+                        value,
+                        seen_functions,
+                        owner=fn,
+                    ),
+                )
+                for index, value in enumerate(type_parameters)
+            ),
+            (
+                (
+                    "annotation-function",
+                    self._observable_site_incarnation(
+                        identity_owner,
+                        f"{site_prefix}.__annotate__",
+                        annotation_function,
+                    ),
+                    self._captured_function_public_surface_payload(
+                        annotation_function,
+                        identity_owner=identity_owner,
+                        site_prefix=f"{site_prefix}.__annotate__",
+                        seen_functions=seen_functions | {id(fn)},
+                    ),
+                )
+                if annotation_function is not None and annotation_function is not fn
+                else (
+                    "recursive-annotation-function",
+                    fn.__module__,
+                    fn.__qualname__,
+                )
+                if annotation_function is fn
+                else None
+            ),
+            self._observable_site_incarnation(
+                identity_owner, f"{site_prefix}.__closure__", fn.__closure__
+            ),
+        )
 
     def _code_fingerprint(self, fn: FunctionType) -> str:
         payload = (
             *self._runtime_build_payload(),
             self._function_definition_payload(fn, set()),
         )
-        return fingerprint_snapshot(payload)
+        return self._fingerprint_identity_payload(
+            payload,
+            subject=f"Function {fn.__module__}.{fn.__qualname__} definition",
+        )
 
     def _runtime_build_payload(self) -> tuple[Any, ...]:
         """Interpreter and build identity shared by durable trust boundaries."""
@@ -3258,6 +4227,7 @@ class Database:
     def _function_definition_payload(
         self, fn: FunctionType, seen_functions: builtins.set[int]
     ) -> Any:
+        defaults, kwdefaults, _state, _type_parameters = self._function_metadata_containers(fn)
         fn_id = id(fn)
         if fn_id in seen_functions:
             return ("recursive-function", fn.__module__, fn.__qualname__)
@@ -3269,25 +4239,31 @@ class Database:
                 fn.__qualname__,
                 self._code_definition_payload(fn.__code__),
                 tuple(
-                    self._captured_dependency_digest(
-                        f"default[{index}]",
-                        value,
-                        seen_functions,
-                        owner=fn,
-                    )
-                    for index, value in enumerate(fn.__defaults__ or ())
-                ),
-                tuple(
                     (
-                        name,
+                        self._definition_access_incarnation(fn, f"default[{index}]", value),
                         self._captured_dependency_digest(
-                            f"kwdefault[{name}]",
+                            f"default[{index}]",
                             value,
                             seen_functions,
                             owner=fn,
                         ),
                     )
-                    for name, value in sorted((fn.__kwdefaults__ or {}).items())
+                    for index, value in enumerate(defaults or ())
+                ),
+                tuple(
+                    (
+                        name,
+                        (
+                            self._definition_access_incarnation(fn, f"kwdefault[{name}]", value),
+                            self._captured_dependency_digest(
+                                f"kwdefault[{name}]",
+                                value,
+                                seen_functions,
+                                owner=fn,
+                            ),
+                        ),
+                    )
+                    for name, value in (kwdefaults or {}).items()
                 ),
                 tuple(
                     (
@@ -3309,6 +4285,7 @@ class Database:
     def _function_metadata_payload(
         self, fn: FunctionType, seen_functions: builtins.set[int]
     ) -> Any:
+        _defaults, _kwdefaults, state, type_parameters = self._function_metadata_containers(fn)
         try:
             annotations = fn.__annotations__
         except Exception as exc:
@@ -3323,11 +4300,10 @@ class Database:
                 self._annotation_evaluator_payload(annotation_function, set()),
             )
         else:
-            if not isinstance(annotations, dict) or any(
-                not isinstance(name, str) for name in annotations
-            ):
+            if type(annotations) is not dict or any(type(name) is not str for name in annotations):
                 raise UnsupportedValueError(
-                    f"Function {fn.__module__}.{fn.__qualname__} has invalid annotations."
+                    f"Function {fn.__module__}.{fn.__qualname__} must use an exact "
+                    "dict with exact str keys for __annotations__."
                 )
             reflects_annotations = any(
                 name in {"__annotations__", "get_annotations", "get_type_hints"}
@@ -3337,27 +4313,23 @@ class Database:
             annotations_payload = tuple(
                 (
                     name,
-                    self._captured_dependency_digest(
-                        f"annotation[{name}]",
-                        value,
-                        seen_functions,
-                        owner=fn,
+                    (
+                        self._definition_access_incarnation(fn, f"annotation[{name}]", value),
+                        self._captured_dependency_digest(
+                            f"annotation[{name}]",
+                            value,
+                            seen_functions,
+                            owner=fn,
+                        ),
                     )
                     if reflects_annotations
                     else self._freeze_annotation_capture(value, set()),
                 )
-                for name, value in sorted(annotations.items())
+                for name, value in annotations.items()
             )
-        state = vars(fn)
-        if any(not isinstance(name, str) for name in state):
-            raise UnsupportedValueError(
-                f"Function {fn.__module__}.{fn.__qualname__} has invalid custom state."
-            )
-        type_parameters = getattr(fn, "__type_params__", ())
-        if not isinstance(type_parameters, tuple):
-            raise UnsupportedValueError(
-                f"Function {fn.__module__}.{fn.__qualname__} has invalid type parameters."
-            )
+        reflects_type_parameters = any(
+            "__type_params__" in code.co_names for code in self._walk_code_objects(fn.__code__)
+        )
         return (
             "function-metadata-v3",
             fn.__name__,
@@ -3368,17 +4340,151 @@ class Database:
             tuple(
                 (
                     name,
-                    self._captured_dependency_digest(
-                        f"attribute[{name}]",
-                        value,
-                        seen_functions,
-                        owner=fn,
+                    (
+                        self._definition_access_incarnation(fn, f"attribute[{name}]", value),
+                        self._captured_dependency_digest(
+                            f"attribute[{name}]",
+                            value,
+                            seen_functions,
+                            owner=fn,
+                        ),
                     ),
                 )
-                for name, value in sorted(state.items())
+                for name, value in state.items()
             ),
-            tuple(self._freeze_annotation_capture(value, set()) for value in type_parameters),
+            (
+                self._definition_access_incarnation(fn, "__type_params__", type_parameters),
+                tuple(
+                    (
+                        self._definition_access_incarnation(
+                            fn,
+                            f"type-parameter[{index}]",
+                            value,
+                        ),
+                        self._captured_dependency_digest(
+                            f"type-parameter[{index}]",
+                            value,
+                            seen_functions,
+                            owner=fn,
+                        ),
+                    )
+                    for index, value in enumerate(type_parameters)
+                ),
+            )
+            if reflects_type_parameters
+            else tuple(self._freeze_annotation_capture(value, set()) for value in type_parameters),
         )
+
+    def _definition_access_incarnation(
+        self, fn: FunctionType, site: str, value: Any
+    ) -> tuple[Any, ...]:
+        """Pin identity for a definition object directly available to Python.
+
+        Python exposes identity through more than an enumerable set of builtins:
+        protocol methods and extension callables can reveal it too. Defaults,
+        reflected annotations, and function attributes therefore carry a
+        process-local site generation in addition to their structural payload.
+        The registry retains the previous value until it can compare the next
+        one by identity, so allocator address reuse cannot erase a replacement.
+        A different process safely declines checkpoint reuse for this shape.
+        """
+
+        return self._definition_site_incarnation(fn, site, value)
+
+    def _definition_site_incarnation(
+        self, owner: FunctionType, site: str, value: Any
+    ) -> tuple[Any, ...]:
+        del self
+        with _DEFINITION_IDENTITY_LOCK:
+            sites = _DEFINITION_IDENTITY_SITES.get(owner)
+            if sites is None:
+                sites = {}
+                _DEFINITION_IDENTITY_SITES[owner] = sites
+            previous = sites.get(site)
+            if previous is not None and previous[0] is value:
+                generation = previous[1]
+            else:
+                _DEFINITION_IDENTITY_GENERATION[0] += 1
+                generation = _DEFINITION_IDENTITY_GENERATION[0]
+                sites[site] = (value, generation)
+        return (
+            "process-definition-site-incarnation",
+            _PROCESS_IDENTITY_TOKEN.nonce,
+            os.getpid(),
+            generation,
+        )
+
+    @staticmethod
+    def _state_identity_owner(owner: object) -> _StateIdentityOwner:
+        """Return process-stable identity state for a public configuration owner."""
+
+        owner_id = id(owner)
+        with _DEFINITION_IDENTITY_LOCK:
+            current = _STATE_IDENTITY_OWNERS.get(owner_id)
+            if current is not None and current.owns(owner):
+                return current
+            _DEFINITION_IDENTITY_GENERATION[0] += 1
+            current = _StateIdentityOwner(owner, _DEFINITION_IDENTITY_GENERATION[0])
+            if current.owner_ref is not None:
+                expected_generation = current.generation
+
+                def discard(
+                    _reference: weakref.ReferenceType[object],
+                    *,
+                    expected_generation: int = expected_generation,
+                    expected_id: int = owner_id,
+                    registry: dict[int, _StateIdentityOwner] = _STATE_IDENTITY_OWNERS,
+                    lock: _thread.RLock = _DEFINITION_IDENTITY_LOCK,
+                ) -> None:
+                    # Module globals may already be cleared when weakrefs fire
+                    # during interpreter shutdown. Keep the registry and lock
+                    # alive with the callback, without retaining the owner
+                    # state through the callback closure.
+                    with lock:
+                        registered = registry.get(expected_id)
+                        if (
+                            registered is not None
+                            and registered.generation == expected_generation
+                        ):
+                            del registry[expected_id]
+
+                current.owner_ref = weakref.ref(owner, discard)
+            _STATE_IDENTITY_OWNERS[owner_id] = current
+            return current
+
+    def _state_owner_incarnation(self, owner: object) -> tuple[Any, ...]:
+        state = self._state_identity_owner(owner)
+        return (
+            "process-state-owner-incarnation",
+            _PROCESS_IDENTITY_TOKEN.nonce,
+            os.getpid(),
+            state.generation,
+        )
+
+    def _state_site_incarnation(self, owner: object, site: str, value: Any) -> tuple[Any, ...]:
+        """Pin one recursively observable value within a stable state owner."""
+
+        state = self._state_identity_owner(owner)
+        with _DEFINITION_IDENTITY_LOCK:
+            previous = state.sites.get(site)
+            if previous is not None and previous[0] is value:
+                generation = previous[1]
+            else:
+                _DEFINITION_IDENTITY_GENERATION[0] += 1
+                generation = _DEFINITION_IDENTITY_GENERATION[0]
+                state.sites[site] = (value, generation)
+        return (
+            "process-state-site-incarnation",
+            _PROCESS_IDENTITY_TOKEN.nonce,
+            os.getpid(),
+            state.generation,
+            generation,
+        )
+
+    def _observable_site_incarnation(self, owner: object, site: str, value: Any) -> tuple[Any, ...]:
+        if isinstance(owner, FunctionType):
+            return self._definition_site_incarnation(owner, site, value)
+        return self._state_site_incarnation(owner, site, value)
 
     def _annotation_evaluator_payload(
         self, evaluator: FunctionType, active_ids: builtins.set[int]
@@ -3599,12 +4705,17 @@ class Database:
         if isinstance(value, int):
             return ("int", value)
         if isinstance(value, float):
-            return ("float-bits", struct.pack("!d", value))
+            return (
+                "float-bits",
+                struct.pack("!d", value),
+                self._definition_object_incarnation(value),
+            )
         if isinstance(value, complex):
             return (
                 "complex-bits",
                 struct.pack("!d", value.real),
                 struct.pack("!d", value.imag),
+                self._definition_object_incarnation(value),
             )
         if isinstance(value, str):
             return ("str", value)
@@ -3687,6 +4798,10 @@ class Database:
                     self._type_definition_payload(owner_type),
                     fn.__name__,
                 )
+            self._reject_callable_object_wrapper(
+                policy,
+                subject="Equality/cutoff policy",
+            )
             call = policy.__call__ if callable(policy) else None
             call_fn = getattr(call, "__func__", call)
             if isinstance(call_fn, FunctionType):
@@ -3704,6 +4819,7 @@ class Database:
                     "callable",
                     type(policy).__module__,
                     type(policy).__qualname__,
+                    self._state_owner_incarnation(policy),
                     self._implementation_type_payload(type(policy)),
                     definition,
                     state,
@@ -3728,7 +4844,13 @@ class Database:
         if isinstance(owner, type):
             return self._type_definition_payload(owner)
         try:
-            frozen = self._freeze_static_capture(owner, set())
+            frozen = self._freeze_captured_immutable_payload(
+                "bound-policy-owner",
+                owner,
+                set(),
+                owner=owner,
+                active_ids=set(),
+            )
         except UnsupportedValueError:
             if not allow_instance_state:
                 raise UnsupportedValueError(
@@ -3738,6 +4860,7 @@ class Database:
             frozen = self._policy_instance_state_payload(owner)
         return (
             "instance",
+            self._state_owner_incarnation(owner),
             self._implementation_type_payload(type(owner)),
             frozen,
         )
@@ -3758,35 +4881,68 @@ class Database:
                 f"Policy {type(policy).__module__}.{type(policy).__qualname__} "
                 "uses slot state that cannot be fingerprinted safely."
             )
-        try:
-            state = vars(policy)
-        except TypeError:
-            state = {}
-        return tuple(
-            (name, self._freeze_static_capture(value, set()))
-            for name, value in sorted(state.items())
+        state = self._static_instance_dict(policy)
+        if not state:
+            return ()
+        structural = tuple(
+            (name, self._freeze_static_capture(value, set())) for name, value in state.items()
         )
+        graph = freeze(tuple(state.items()))
+        identity = tuple(
+            (
+                name,
+                self._freeze_captured_immutable(
+                    f"policy-state.{name}",
+                    value,
+                    set(),
+                    owner=policy,
+                    active_ids=set(),
+                ),
+            )
+            for name, value in state.items()
+        )
+        return ("policy-state-v2", structural, graph, identity)
 
     def _input_policy_digest(self, input_obj: Any) -> str:
-        return fingerprint_snapshot(
+        return self._fingerprint_identity_payload(
             (
                 "input-policy-v3",
                 self._runtime_build_payload(),
                 self._policy_definition_payload(input_obj.eq),
                 self._policy_definition_payload(input_obj.cutoff),
-            )
+            ),
+            subject=f"Input {input_obj.key!r} policy",
         )
 
     def _current_adapter_digests(self) -> dict[str, str]:
-        """Implementation digest of each registered adapter, keyed by adapted type.
+        """Complete digest of each registered adapter, keyed by adapted type.
 
-        The registry is fixed, but adapter configuration may be instance state,
-        so recompute the small digest map at each checkpoint trust boundary.
+        The digest covers implementation and instance configuration.  The
+        registry itself is fixed, but callers can still hold and mutate an
+        adapter object, so lifetime checks recompute this small map.
         """
         return {
             _adapter_key(value_type): self._adapter_implementation_digest(adapter)
             for value_type, adapter in self._adapters.items()
         }
+
+    def _verify_adapter_lifetime(self) -> None:
+        """Reject adapter configuration that moved after construction."""
+        if not self._adapters:
+            return
+        current = self._current_adapter_digests()
+        if current == self._adapter_lifetime_digests:
+            return
+        changed = sorted(
+            key
+            for key in set(current) | set(self._adapter_lifetime_digests)
+            if current.get(key) != self._adapter_lifetime_digests.get(key)
+        )
+        names = ", ".join(changed)
+        raise UnsupportedValueError(
+            "ValueAdapter configuration changed after Database construction"
+            f" ({names}). Construct a new Database for the new adapter state."
+        )
 
     def _adapter_implementation_digest(self, adapter: ValueAdapter) -> str:
         """Fingerprint an adapter's ``freeze``/``thaw`` implementation.
@@ -3814,7 +4970,10 @@ class Database:
                 f"Adapter {type(adapter).__module__}."
                 f"{type(adapter).__qualname__} cannot be fingerprinted safely: {exc}"
             ) from exc
-        return fingerprint_snapshot(payload)
+        return self._fingerprint_identity_payload(
+            payload,
+            subject=(f"Adapter {type(adapter).__module__}.{type(adapter).__qualname__} identity"),
+        )
 
     def _adapter_state_payload(self, adapter: ValueAdapter) -> Any:
         slots = tuple(
@@ -3832,18 +4991,28 @@ class Database:
                 f"Adapter {type(adapter).__module__}.{type(adapter).__qualname__} "
                 "uses slot state that cannot be fingerprinted safely."
             )
+        state = self._static_instance_dict(adapter)
+        if not state:
+            return ()
         try:
-            state = vars(adapter)
-        except TypeError:
-            state = {}
-        try:
-            return tuple(
+            structural = tuple(
+                (name, self._freeze_static_capture(value, set())) for name, value in state.items()
+            )
+            graph = freeze(tuple(state.items()))
+            identity = tuple(
                 (
                     name,
-                    self._freeze_static_capture(value, set()),
+                    self._freeze_captured_immutable(
+                        f"adapter-state.{name}",
+                        value,
+                        set(),
+                        owner=adapter,
+                        active_ids=set(),
+                    ),
                 )
-                for name, value in sorted(state.items())
+                for name, value in state.items()
             )
+            return ("adapter-state-v2", structural, graph, identity)
         except UnsupportedValueError as exc:
             raise UnsupportedValueError(
                 f"Adapter {type(adapter).__module__}.{type(adapter).__qualname__} "
@@ -3879,6 +5048,7 @@ class Database:
         warm so the record re-executes and any adapted payload is re-frozen and
         re-thawed under the live adapter.
         """
+        self._verify_adapter_lifetime()
         if not self._checkpoint_adapter_digests and not self._adapters:
             # Fast path: no adapters anywhere means nothing to distrust.
             return True
@@ -3895,7 +5065,52 @@ class Database:
                 return False
         return True
 
+    @staticmethod
+    def _reject_callable_object_wrapper(value: Any, *, subject: str) -> None:
+        """Reject opaque callable instances that claim a wrapped function.
+
+        A Python function decorated with ``functools.wraps`` is still a
+        ``FunctionType`` and is fingerprinted through the function path. A
+        callable object is different: ``__wrapped__`` says nothing about its
+        ``__call__`` implementation or instance state, so treating it as the
+        wrapped function would make the query identity incomplete.
+        """
+
+        if isinstance(value, (FunctionType, MethodType, BuiltinFunctionType)):
+            return
+        if not callable(value):
+            return
+        wrapped_function = getattr(value, "__wrapped__", None)
+        if not isinstance(wrapped_function, FunctionType):
+            return
+        raise UnsupportedValueError(
+            f"{subject} uses callable object "
+            f"{type(value).__module__}.{type(value).__qualname__} with __wrapped__. "
+            "Callable-object wrappers are unsupported because __wrapped__ does not "
+            "identify their __call__ implementation or instance state; capture an "
+            "ordinary Python function or bound method instead."
+        )
+
     def _captured_dependency_digest(
+        self,
+        name: str,
+        value: Any,
+        seen_functions: builtins.set[int],
+        *,
+        owner: FunctionType,
+    ) -> Any:
+        return (
+            "captured-site-v1",
+            self._definition_site_incarnation(owner, f"capture[{name}]", value),
+            self._captured_dependency_payload(
+                name,
+                value,
+                seen_functions,
+                owner=owner,
+            ),
+        )
+
+    def _captured_dependency_payload(
         self,
         name: str,
         value: Any,
@@ -3905,21 +5120,35 @@ class Database:
     ) -> Any:
         from .core import Input, Query
 
+        if value is Database:
+            # Query bodies may name the public constructor only to receive the
+            # query-context contract error. Fingerprint the exact runtime module
+            # instead of recursively walking Database's process-global locks and
+            # ContextVars, which are intentionally not snapshot values.
+            return (
+                "database-type-v1",
+                self._module_identity_payload(sys.modules[__name__]),
+                value.__qualname__,
+            )
         if isinstance(value, Query):
             # Fold the captured query's full definition into the parent's
             # identity so a change to a dependency query's body moves the parent.
             return (
-                "query",
-                value.key,
-                self._function_definition_payload(value.fn, seen_functions),
+                "query-v2",
+                self._query_handle_payload(value),
+                self._captured_query_public_surface_payload(value, seen_functions),
+                self._function_definition_payload(cast(FunctionType, value.fn), seen_functions),
                 self._policy_definition_payload(value.eq),
                 self._policy_definition_payload(value.cutoff),
             )
         if isinstance(value, Input):
             return (
                 "input",
+                self._state_site_incarnation(value, "input.key", value.key),
                 value.key,
+                self._state_site_incarnation(value, "input.eq", value.eq),
                 self._policy_definition_payload(value.eq),
+                self._state_site_incarnation(value, "input.cutoff", value.cutoff),
                 self._policy_definition_payload(value.cutoff),
             )
         if self._is_resource_handle(value):
@@ -3954,6 +5183,12 @@ class Database:
             return (
                 "function",
                 self._module_identity_payload(defining_module),
+                self._captured_function_public_surface_payload(
+                    value,
+                    identity_owner=value,
+                    site_prefix="captured-function",
+                    seen_functions=seen_functions,
+                ),
                 definition,
             )
         if isinstance(value, MethodType):
@@ -3965,14 +5200,10 @@ class Database:
             )
         if isinstance(value, BuiltinFunctionType):
             return self._builtin_function_payload(value)
-        wrapped_function = getattr(value, "__wrapped__", None)
-        if isinstance(wrapped_function, FunctionType) and callable(value):
-            return (
-                "wrapped-function",
-                type(value).__module__,
-                type(value).__qualname__,
-                self._function_definition_payload(wrapped_function, seen_functions),
-            )
+        self._reject_callable_object_wrapper(
+            value,
+            subject=f"Query capture {name!r}",
+        )
         if isinstance(value, type):
             if "<locals>" in value.__qualname__ and self._type_fingerprint_stack.get():
                 return self._implementation_type_payload(value)
@@ -4002,30 +5233,54 @@ class Database:
         value: Any,
         seen_functions: builtins.set[int],
         *,
-        owner: FunctionType,
+        owner: object,
         active_ids: builtins.set[int],
     ) -> Any:
         """Encode immutable capture shapes while preserving nested dependencies."""
 
+        return (
+            "captured-value-site-v1",
+            self._observable_site_incarnation(owner, f"capture-value[{name}]", value),
+            self._freeze_captured_immutable_payload(
+                name,
+                value,
+                seen_functions,
+                owner=owner,
+                active_ids=active_ids,
+            ),
+        )
+
+    def _freeze_captured_immutable_payload(
+        self,
+        name: str,
+        value: Any,
+        seen_functions: builtins.set[int],
+        *,
+        owner: object,
+        active_ids: builtins.set[int],
+    ) -> Any:
+        """Encode one already-incarnated value and recurse through public state."""
+
         from .core import Input, Query
 
-        wrapped_function = getattr(value, "__wrapped__", None)
-        if (
-            isinstance(
-                value,
-                (
-                    Query,
-                    Input,
-                    ModuleType,
-                    FunctionType,
-                    MethodType,
-                    BuiltinFunctionType,
-                    type,
-                ),
-            )
-            or self._is_resource_handle(value)
-            or (isinstance(wrapped_function, FunctionType) and callable(value))
-        ):
+        if isinstance(value, type):
+            return ("captured-type", self._type_definition_payload(value))
+        if isinstance(
+            value,
+            (
+                Query,
+                Input,
+                ModuleType,
+                FunctionType,
+                MethodType,
+                BuiltinFunctionType,
+            ),
+        ) or self._is_resource_handle(value):
+            if not isinstance(owner, FunctionType):
+                raise UnsupportedValueError(
+                    "Managed handles and behavior objects are not supported inside "
+                    "policy, adapter, or resource configuration state."
+                )
             return (
                 "captured-dependency",
                 self._captured_dependency_digest(
@@ -4035,6 +5290,43 @@ class Database:
                     owner=owner,
                 ),
             )
+        self._reject_callable_object_wrapper(
+            value,
+            subject=f"Nested query capture {name!r}",
+        )
+        if type(value) is inspect.Signature:
+            with self._capture_guard(value, active_ids):
+
+                def signature_value(label: str, item: Any) -> Any:
+                    if item is inspect.Signature.empty:
+                        return ("empty",)
+                    return self._freeze_captured_immutable(
+                        f"{name}.{label}",
+                        item,
+                        seen_functions,
+                        owner=owner,
+                        active_ids=active_ids,
+                    )
+
+                return (
+                    "capture-inspect-signature-v1",
+                    tuple(
+                        (
+                            parameter.name,
+                            int(parameter.kind),
+                            signature_value(
+                                f"parameter[{parameter.name}].default",
+                                parameter.default,
+                            ),
+                            signature_value(
+                                f"parameter[{parameter.name}].annotation",
+                                parameter.annotation,
+                            ),
+                        )
+                        for parameter in value.parameters.values()
+                    ),
+                    signature_value("return_annotation", value.return_annotation),
+                )
         if isinstance(value, slice):
             return (
                 "capture-slice",
@@ -4090,7 +5382,7 @@ class Database:
             with self._capture_guard(value, active_ids):
                 items = tuple(
                     self._freeze_captured_immutable(
-                        f"{name}[member]",
+                        f"{name}[member:{id(item)}]",
                         item,
                         seen_functions,
                         owner=owner,
@@ -4108,6 +5400,117 @@ class Database:
                     self._captured_instance_dict_payload(
                         name,
                         value,
+                        seen_functions,
+                        owner=owner,
+                        active_ids=active_ids,
+                    ),
+                )
+        if type(value) is FrozenList:
+            with self._capture_guard(value, active_ids):
+                return (
+                    "capture-frozen-list",
+                    tuple(
+                        self._freeze_captured_immutable(
+                            f"{name}.items[{index}]",
+                            item,
+                            seen_functions,
+                            owner=owner,
+                            active_ids=active_ids,
+                        )
+                        for index, item in enumerate(value.items)
+                    ),
+                )
+        if type(value) is FrozenDict:
+            with self._capture_guard(value, active_ids):
+                return (
+                    "capture-frozen-dict",
+                    tuple(
+                        (
+                            self._freeze_captured_immutable(
+                                f"{name}.entries[{index}].key",
+                                key,
+                                seen_functions,
+                                owner=owner,
+                                active_ids=active_ids,
+                            ),
+                            self._freeze_captured_immutable(
+                                f"{name}.entries[{index}].value",
+                                item,
+                                seen_functions,
+                                owner=owner,
+                                active_ids=active_ids,
+                            ),
+                        )
+                        for index, (key, item) in enumerate(value.entries)
+                    ),
+                )
+        if type(value) is FrozenSet:
+            with self._capture_guard(value, active_ids):
+                return (
+                    "capture-frozen-set",
+                    value.kind,
+                    tuple(
+                        self._freeze_captured_immutable(
+                            f"{name}.items[{index}]",
+                            item,
+                            seen_functions,
+                            owner=owner,
+                            active_ids=active_ids,
+                        )
+                        for index, item in enumerate(value.items)
+                    ),
+                )
+        if type(value) is FrozenRecord:
+            with self._capture_guard(value, active_ids):
+                return (
+                    "capture-frozen-record",
+                    value.type_name,
+                    tuple(
+                        (
+                            field_name,
+                            self._freeze_captured_immutable(
+                                f"{name}.entries[{index}].{field_name}",
+                                item,
+                                seen_functions,
+                                owner=owner,
+                                active_ids=active_ids,
+                            ),
+                        )
+                        for index, (field_name, item) in enumerate(value.entries)
+                    ),
+                )
+        if type(value) is FrozenAdapterValue:
+            with self._capture_guard(value, active_ids):
+                return (
+                    "capture-frozen-adapter-value",
+                    value.adapter_key,
+                    self._freeze_captured_immutable(
+                        f"{name}.payload",
+                        value.payload,
+                        seen_functions,
+                        owner=owner,
+                        active_ids=active_ids,
+                    ),
+                )
+        if type(value) is FrozenRef:
+            return ("capture-frozen-ref", value.index)
+        if type(value) is FrozenGraph:
+            with self._capture_guard(value, active_ids):
+                return (
+                    "capture-frozen-graph",
+                    tuple(
+                        self._freeze_captured_immutable(
+                            f"{name}.nodes[{index}]",
+                            item,
+                            seen_functions,
+                            owner=owner,
+                            active_ids=active_ids,
+                        )
+                        for index, item in enumerate(value.nodes)
+                    ),
+                    self._freeze_captured_immutable(
+                        f"{name}.root",
+                        value.root,
                         seen_functions,
                         owner=owner,
                         active_ids=active_ids,
@@ -4152,12 +5555,13 @@ class Database:
                             active_ids=active_ids,
                         ),
                     )
-                    for state_name, item in sorted(self._static_instance_dict(value).items())
+                    for state_name, item in self._static_instance_dict(value).items()
                     if state_name not in field_names
                 )
                 return (
                     "capture-frozen-dataclass",
                     self._type_definition_payload(type(value)),
+                    self._definition_object_incarnation(value),
                     field_payload,
                     extra_state,
                 )
@@ -4169,7 +5573,7 @@ class Database:
         value: Any,
         seen_functions: builtins.set[int],
         *,
-        owner: FunctionType,
+        owner: object,
         active_ids: builtins.set[int],
     ) -> Any:
         slots = self._instance_slots(type(value))
@@ -4190,7 +5594,7 @@ class Database:
                     active_ids=active_ids,
                 ),
             )
-            for state_name, item in sorted(self._static_instance_dict(value).items())
+            for state_name, item in self._static_instance_dict(value).items()
         )
 
     def _bound_python_method_payload(
@@ -4282,6 +5686,18 @@ class Database:
     def _implementation_dependency_type_payload(
         self, value: type[Any], seen_types: builtins.set[int]
     ) -> Any:
+        if value is ValueAdapter:
+            # Concrete adapters may explicitly inherit the public Protocol.
+            # Its typing machinery is not adapter behavior and contains
+            # runtime-owned mutable bookkeeping that cannot be frozen.  The
+            # protocol identity and the common build payload pin that base;
+            # the concrete type and its hooks are fingerprinted in full.
+            return (
+                "value-adapter-protocol-v1",
+                value.__module__,
+                value.__qualname__,
+                self._runtime_build_payload(),
+            )
         if value.__module__ == "builtins":
             return ("builtin-type", value.__module__, value.__qualname__)
         if value.__module__.partition(".")[0] in sys.stdlib_module_names:
@@ -4414,8 +5830,8 @@ class Database:
                 "__orig_bases__",
                 "__parameters__",
             }
-            attributes: list[tuple[str, Any]] = []
-            for name, attribute in sorted(namespace.items()):
+            attributes: list[tuple[str, Any, Any]] = []
+            for name, attribute in namespace.items():
                 payload: Any
                 if name in {"__module__", "__qualname__"}:
                     continue
@@ -4426,6 +5842,15 @@ class Database:
                 if isinstance(attribute, FunctionType):
                     payload = (
                         "function",
+                        self._state_site_incarnation(
+                            value, f"type-attribute[{name}].__code__", attribute.__code__
+                        ),
+                        self._captured_function_public_surface_payload(
+                            attribute,
+                            identity_owner=value,
+                            site_prefix=f"type-attribute[{name}]",
+                            seen_functions=set(),
+                        ),
                         self._function_definition_payload(attribute, set()),
                     )
                 elif isinstance(attribute, (staticmethod, classmethod)):
@@ -4438,6 +5863,17 @@ class Database:
                         )
                     payload = (
                         type(attribute).__name__,
+                        self._state_site_incarnation(
+                            value,
+                            f"type-attribute[{name}].__func__.__code__",
+                            descriptor_function.__code__,
+                        ),
+                        self._captured_function_public_surface_payload(
+                            descriptor_function,
+                            identity_owner=value,
+                            site_prefix=f"type-attribute[{name}].__func__",
+                            seen_functions=set(),
+                        ),
                         self._function_definition_payload(descriptor_function, set()),
                     )
                 elif isinstance(attribute, property):
@@ -4446,6 +5882,14 @@ class Database:
                         tuple(
                             (
                                 label,
+                                self._captured_function_public_surface_payload(
+                                    cast(FunctionType, function),
+                                    identity_owner=value,
+                                    site_prefix=f"type-attribute[{name}].{label}",
+                                    seen_functions=set(),
+                                )
+                                if function is not None
+                                else None,
                                 self._function_definition_payload(
                                     cast(FunctionType, function), set()
                                 )
@@ -4475,13 +5919,95 @@ class Database:
                     try:
                         payload = (
                             "value",
-                            self._freeze_static_capture(attribute, set()),
+                            self._freeze_captured_immutable(
+                                f"type-attribute[{name}]",
+                                attribute,
+                                set(),
+                                owner=value,
+                                active_ids=set(),
+                            ),
                         )
                     except UnsupportedValueError:
                         if is_local or name in referenced_names:
                             raise
                         continue
-                attributes.append((name, payload))
+                attributes.append(
+                    (
+                        name,
+                        self._state_site_incarnation(value, f"type-attribute[{name}]", attribute),
+                        payload,
+                    )
+                )
+            try:
+                public_annotations = value.__annotations__
+            except Exception as exc:
+                raise UnsupportedValueError(
+                    f"Type {value.__module__}.{value.__qualname__} annotations "
+                    "cannot be fingerprinted safely."
+                ) from exc
+            if type(public_annotations) is not dict or any(
+                type(name) is not str for name in public_annotations
+            ):
+                raise UnsupportedValueError(
+                    f"Type {value.__module__}.{value.__qualname__} must use an exact "
+                    "dict with exact str keys for __annotations__."
+                )
+            annotation_evaluator = namespace.get("__annotate_func__")
+            evaluator_identity = (
+                (
+                    self._captured_function_public_surface_payload(
+                        annotation_evaluator,
+                        identity_owner=value,
+                        site_prefix="type.__annotate_func__",
+                        seen_functions=set(),
+                    )
+                )
+                if isinstance(annotation_evaluator, FunctionType)
+                else None
+            )
+            annotation_identity = (
+                self._state_site_incarnation(value, "type.__annotations__", public_annotations),
+                evaluator_identity,
+                tuple(
+                    (
+                        name,
+                        self._state_site_incarnation(
+                            value, f"type-annotations[{name}]", annotation
+                        ),
+                        self._freeze_captured_immutable(
+                            f"type-annotations[{name}]",
+                            annotation,
+                            set(),
+                            owner=value,
+                            active_ids=set(),
+                        ),
+                    )
+                    for name, annotation in public_annotations.items()
+                ),
+            )
+            namespace_identity = tuple(
+                (
+                    name,
+                    self._state_site_incarnation(value, f"type-namespace[{name}]", attribute),
+                )
+                for name, attribute in namespace.items()
+            )
+            generated_method_identity = tuple(
+                (
+                    name,
+                    self._state_site_incarnation(
+                        value, f"generated-type-method[{name}]", attribute
+                    ),
+                    self._captured_function_public_surface_payload(
+                        attribute,
+                        identity_owner=value,
+                        site_prefix=f"generated-type-method[{name}]",
+                        seen_functions=set(),
+                    ),
+                )
+                for name, attribute in namespace.items()
+                if generated_dataclass_method(name, attribute)
+            )
             return (
                 "implementation-type-v3",
                 value.__module__,
@@ -4499,6 +6025,9 @@ class Database:
                     for base in value.__bases__
                 ),
                 self._local_dataclass_behavior_payload(value),
+                namespace_identity,
+                annotation_identity,
+                generated_method_identity,
                 tuple(attributes),
             )
         finally:
@@ -4509,6 +6038,43 @@ class Database:
         params = getattr(value, "__dataclass_params__", None)
         if params is None:
             return None
+        dataclass_fields = vars(value).get("__dataclass_fields__")
+        if type(dataclass_fields) is not dict or any(
+            type(name) is not str for name in dataclass_fields
+        ):
+            raise UnsupportedValueError(
+                f"Dataclass {value.__module__}.{value.__qualname__} must use an "
+                "exact __dataclass_fields__ dict with exact str keys."
+            )
+        if any(type(item) is not DataclassField for item in dataclass_fields.values()):
+            raise UnsupportedValueError(
+                f"Dataclass {value.__module__}.{value.__qualname__} has an invalid Field object."
+            )
+
+        def public_value(site: str, item: Any) -> Any:
+            if item is MISSING:
+                return ("missing",)
+            if isinstance(item, FunctionType):
+                return (
+                    "function",
+                    self._captured_function_public_surface_payload(
+                        item,
+                        identity_owner=value,
+                        site_prefix=site,
+                        seen_functions=set(),
+                    ),
+                    self._function_definition_payload(item, set()),
+                )
+            if isinstance(item, BuiltinFunctionType):
+                return ("builtin", self._builtin_function_payload(item))
+            return self._freeze_captured_immutable(
+                site,
+                item,
+                set(),
+                owner=value,
+                active_ids=set(),
+            )
+
         parameter_names = (
             "init",
             "repr",
@@ -4524,29 +6090,124 @@ class Database:
         parameters = tuple(
             (
                 name,
-                getattr(params, name) if hasattr(params, name) else ("missing",),
+                (
+                    self._state_site_incarnation(
+                        value,
+                        f"dataclass-params.{name}",
+                        parameter_value,
+                    ),
+                    public_value(f"dataclass-params.{name}", parameter_value),
+                )
+                if (parameter_value := getattr(params, name, MISSING)) is not MISSING
+                else ("missing",),
             )
             for name in parameter_names
         )
-        field_payloads = tuple(
-            (
-                item.name,
-                getattr(getattr(item, "_field_type", None), "name", None),
-                bool(item.init),
-                bool(item.repr),
-                item.hash,
-                bool(item.compare),
-                item.kw_only,
-                self._freeze_annotation_capture(item.type, set()),
-                freeze(dict(item.metadata), adapters=self._adapters),
-                self._resource_configuration_type_payload(dict(item.metadata)),
-                item.doc if hasattr(item, "doc") else ("missing",),
-                self._dataclass_default_payload(item.default),
-                self._dataclass_default_factory_payload(item.default_factory),
+        field_payloads: list[Any] = []
+        for field_name, item in dataclass_fields.items():
+            if type(item.name) is not str or item.name != field_name:
+                raise UnsupportedValueError(
+                    f"Dataclass {value.__module__}.{value.__qualname__} has an "
+                    "inconsistent Field name."
+                )
+            metadata = item.metadata
+            if type(metadata) not in {dict, MappingProxyType}:
+                raise UnsupportedValueError(
+                    f"Dataclass {value.__module__}.{value.__qualname__} Field "
+                    f"{field_name!r} must use an exact dict or mappingproxy for metadata."
+                )
+            public_attributes = tuple(
+                (
+                    attribute_name,
+                    self._state_site_incarnation(
+                        value,
+                        f"dataclass-field[{field_name}].{attribute_name}",
+                        attribute_value,
+                    ),
+                    public_value(
+                        f"dataclass-field[{field_name}].{attribute_name}",
+                        attribute_value,
+                    ),
+                )
+                for attribute_name in (
+                    "name",
+                    "type",
+                    "default",
+                    "default_factory",
+                    "init",
+                    "repr",
+                    "hash",
+                    "compare",
+                    "kw_only",
+                    "doc",
+                )
+                if (attribute_value := getattr(item, attribute_name, MISSING)) is not MISSING
             )
-            for item in fields(value)
+            metadata_identity = (
+                self._state_site_incarnation(
+                    value,
+                    f"dataclass-field[{field_name}].metadata",
+                    metadata,
+                ),
+                tuple(
+                    (
+                        public_value(
+                            f"dataclass-field[{field_name}].metadata[{index}].key",
+                            key,
+                        ),
+                        public_value(
+                            f"dataclass-field[{field_name}].metadata[{index}].value",
+                            metadata_value,
+                        ),
+                    )
+                    for index, (key, metadata_value) in enumerate(metadata.items())
+                ),
+            )
+            field_payloads.append(
+                (
+                    item.name,
+                    self._state_site_incarnation(
+                        value,
+                        f"dataclass-field[{field_name}]",
+                        item,
+                    ),
+                    (
+                        self._state_site_incarnation(
+                            value,
+                            f"dataclass-field[{field_name}]._field_type",
+                            item._field_type,
+                        ),
+                        type(item._field_type).__module__,
+                        type(item._field_type).__qualname__,
+                        getattr(item._field_type, "name", None),
+                    ),
+                    public_attributes,
+                    metadata_identity,
+                    getattr(getattr(item, "_field_type", None), "name", None),
+                    bool(item.init),
+                    bool(item.repr),
+                    item.hash,
+                    bool(item.compare),
+                    item.kw_only,
+                    self._freeze_annotation_capture(item.type, set()),
+                    freeze(dict(metadata), adapters=self._adapters),
+                    self._resource_configuration_type_payload(dict(metadata)),
+                    item.doc if hasattr(item, "doc") else ("missing",),
+                    self._dataclass_default_payload(item.default),
+                    self._dataclass_default_factory_payload(item.default_factory),
+                )
+            )
+        return (
+            "dataclass-behavior-v4",
+            self._state_site_incarnation(value, "__dataclass_params__", params),
+            self._state_site_incarnation(
+                value,
+                "__dataclass_fields__",
+                dataclass_fields,
+            ),
+            parameters,
+            tuple(field_payloads),
         )
-        return ("dataclass-behavior-v3", parameters, field_payloads)
 
     def _dataclass_default_payload(self, value: Any) -> Any:
         if value is MISSING:
@@ -4622,11 +6283,16 @@ class Database:
         def walk_value(value: Any) -> None:
             if isinstance(value, Query):
                 query_objects.setdefault(value.key, value)
-                walk_function(value.fn)
+                walk_function(cast(FunctionType, value.fn))
             elif isinstance(value, Input):
                 return
             elif self._is_resource_handle(value):
-                identity = fingerprint_snapshot(self._resource_identity_payload(value))
+                identity = self._fingerprint_identity_payload(
+                    self._resource_identity_payload(value),
+                    subject=(
+                        f"Resource {type(value).__module__}.{type(value).__qualname__} identity"
+                    ),
+                )
                 resource_objects.setdefault(
                     f"{type(value).__module__}:{type(value).__qualname__}:{identity}",
                     value,
@@ -4666,9 +6332,10 @@ class Database:
                     if state_name not in field_names:
                         walk_value(item)
             else:
-                wrapped_function = getattr(value, "__wrapped__", None)
-                if isinstance(wrapped_function, FunctionType) and callable(value):
-                    walk_function(wrapped_function)
+                self._reject_callable_object_wrapper(
+                    value,
+                    subject="Checkpoint query capture",
+                )
 
         walk_function(fn)
         return query_objects, resource_objects
@@ -4799,17 +6466,21 @@ class Database:
 
         if isinstance(value, Query):
             return (
-                "query",
-                value.key,
-                self._function_definition_payload(value.fn, seen_functions),
+                "query-v2",
+                self._query_handle_payload(value),
+                self._captured_query_public_surface_payload(value, seen_functions),
+                self._function_definition_payload(cast(FunctionType, value.fn), seen_functions),
                 self._policy_definition_payload(value.eq),
                 self._policy_definition_payload(value.cutoff),
             )
         if isinstance(value, Input):
             return (
                 "input",
+                self._state_site_incarnation(value, "input.key", value.key),
                 value.key,
+                self._state_site_incarnation(value, "input.eq", value.eq),
                 self._policy_definition_payload(value.eq),
+                self._state_site_incarnation(value, "input.cutoff", value.cutoff),
                 self._policy_definition_payload(value.cutoff),
             )
         if isinstance(value, ModuleType):
@@ -4832,6 +6503,12 @@ class Database:
             return (
                 "function",
                 self._module_identity_payload(defining_module),
+                self._captured_function_public_surface_payload(
+                    value,
+                    identity_owner=value,
+                    site_prefix="captured-module-function",
+                    seen_functions=seen_functions,
+                ),
                 definition,
             )
         if isinstance(value, BuiltinFunctionType):
@@ -4867,25 +6544,31 @@ class Database:
             self._module_identity_payload(defining_module),
             self._code_definition_payload(function.__code__),
             tuple(
-                self._captured_dependency_digest(
-                    f"default[{index}]",
-                    item,
-                    seen_functions,
-                    owner=function,
+                (
+                    self._definition_access_incarnation(function, f"default[{index}]", item),
+                    self._captured_dependency_digest(
+                        f"default[{index}]",
+                        item,
+                        seen_functions,
+                        owner=function,
+                    ),
                 )
                 for index, item in enumerate(function.__defaults__ or ())
             ),
             tuple(
                 (
                     name,
-                    self._captured_dependency_digest(
-                        f"kwdefault[{name}]",
-                        item,
-                        seen_functions,
-                        owner=function,
+                    (
+                        self._definition_access_incarnation(function, f"kwdefault[{name}]", item),
+                        self._captured_dependency_digest(
+                            f"kwdefault[{name}]",
+                            item,
+                            seen_functions,
+                            owner=function,
+                        ),
                     ),
                 )
-                for name, item in sorted((function.__kwdefaults__ or {}).items())
+                for name, item in (function.__kwdefaults__ or {}).items()
             ),
             tuple(
                 (
@@ -4940,11 +6623,8 @@ class Database:
                 raise UnsupportedValueError(
                     f"Source-pinned mutable global {name!r} is not snapshot-safe."
                 ) from error
-            if self._fingerprint_module_collector.get() is not None:
-                self._fingerprint_cacheable.set(False)
             # Retain snapshot-safe initialized state so a changed source module
-            # cannot hide behind a mutable binding. In-process mutation after a
-            # memoized identity remains under the documented module-patch limit.
+            # cannot hide behind a mutable binding.
             return (
                 "source-pinned-mutable-module-global",
                 type(value).__module__,
@@ -4953,8 +6633,6 @@ class Database:
             )
 
     def _source_pinned_type_payload(self, value: type[Any]) -> Any:
-        if self._fingerprint_module_collector.get() is not None:
-            self._fingerprint_cacheable.set(False)
         anchors: list[Any] = []
         for dependency in (type(value), *value.__mro__):
             if dependency.__module__ == "builtins":
@@ -4999,9 +6677,6 @@ class Database:
         explicitly listed in `docs/kernel-contract.md` as out of scope; users
         relying on such state must route it through `Input` / `Resource`.
         """
-        collector = self._fingerprint_module_collector.get()
-        if collector is not None:
-            collector.setdefault(id(module), module)
         namespace = vars(module)
         module_name = module.__name__
         if sys.modules.get(module_name) is not module:
@@ -5089,12 +6764,12 @@ class Database:
                 raise UnsupportedValueError(
                     f"Captured module {module_name!r} has a non-string __all__."
                 )
-            all_tuple = tuple(sorted(all_attr))
+            all_tuple = tuple(all_attr)
         else:
             raise UnsupportedValueError(f"Captured module {module_name!r} has an unsafe __all__.")
 
         stable_constants: list[tuple[str, Any]] = []
-        for name, item in sorted(namespace.items()):
+        for name, item in namespace.items():
             if name.startswith("__") or name in {"__all__", "__version__"}:
                 continue
             if isinstance(item, (FunctionType, ModuleType, type)):
@@ -5137,69 +6812,21 @@ class Database:
         file_identity = ("file-sha256", import_identity, digest)
         return (version_digest, file_identity, all_tuple, constants_payload)
 
-    def _module_observation_stamp(self, module: ModuleType) -> Any:
-        """Return a cheap invalidation token for a memoized module identity."""
-
-        namespace = vars(module)
-        specification = namespace.get("__spec__")
-        if not isinstance(specification, importlib.machinery.ModuleSpec):
-            return ("invalid-spec", module.__name__)
-        version = namespace.get("__version__")
-        try:
-            version_payload = self._module_constant_payload(version, set())
-        except UnsupportedValueError:
-            version_payload = ("unsafe-version", type(version).__qualname__)
-        all_attr = namespace.get("__all__")
-        all_payload = (
-            tuple(sorted(all_attr))
-            if isinstance(all_attr, (list, tuple))
-            and type(all_attr) in {list, tuple}
-            and all(type(item) is str for item in all_attr)
-            else None
-        )
-        origin = specification.origin
-        if origin in {"built-in", "frozen"}:
-            source_observation: Any = ("runtime-module", origin)
-        else:
-            file_path = namespace.get("__file__")
-            if not isinstance(file_path, str):
-                source_observation = ("missing-file",)
-            else:
-                # Observed by content, never by stat identity: the stamp gates
-                # reuse of a memoized fingerprint, so it carries the same
-                # collision risk the identity payload does.
-                with self._allow_raw_reads_scope():
-                    try:
-                        source_observation = (
-                            "file-sha256",
-                            hashlib.sha256(Path(file_path).read_bytes()).hexdigest(),
-                        )
-                    except OSError:
-                        source_observation = ("unreadable-file",)
-        return (
-            module.__name__,
-            sys.modules.get(module.__name__) is module,
-            specification.name,
-            sys.modules.get(specification.name) is module,
-            origin,
-            namespace.get("__loader__") is specification.loader,
-            namespace.get("__package__"),
-            namespace.get("__cached__"),
-            version_payload,
-            all_payload,
-            source_observation,
-        )
-
     def _module_constant_payload(self, value: Any, active_ids: builtins.set[int]) -> Any:
         if type(value) in (str, bytes, int, bool, type(None)):
             return value
         if type(value) is float:
-            return ("float-bits", struct.pack(">d", value))
+            return (
+                "float-bits",
+                struct.pack(">d", value),
+                self._definition_object_incarnation(value),
+            )
         if type(value) is complex:
             return (
                 "complex-bits",
                 struct.pack(">d", value.real),
                 struct.pack(">d", value.imag),
+                self._definition_object_incarnation(value),
             )
         if isinstance(value, range):
             return ("range", value.start, value.stop, value.step)
@@ -5230,23 +6857,39 @@ class Database:
             )
         token = self._resource_fingerprint_stack.set(stack + (resource_id,))
         try:
-            resource_identity = getattr(resource, "identity", None)
-            configuration = resource_identity() if callable(resource_identity) else resource
-            try:
-                frozen_configuration = freeze(configuration, adapters=self._adapters)
-            except UnsupportedValueError as exc:
-                raise UnsupportedValueError(
-                    f"Resource {type(resource).__module__}:{type(resource).__qualname__} must be snapshot-safe "
-                    "or define identity()."
-                ) from exc
+            with self._resource_hook_scope(resource, "identity"):
+                resource_identity = getattr(resource, "identity", None)
+                self._reject_callable_object_wrapper(
+                    resource_identity,
+                    subject=(
+                        f"Resource hook {type(resource).__module__}."
+                        f"{type(resource).__qualname__}.identity"
+                    ),
+                )
+                configuration = resource_identity() if callable(resource_identity) else resource
+                try:
+                    frozen_configuration = freeze(configuration, adapters=self._adapters)
+                except UnsupportedValueError as exc:
+                    raise UnsupportedValueError(
+                        f"Resource {type(resource).__module__}:{type(resource).__qualname__} "
+                        "must be snapshot-safe or define identity()."
+                    ) from exc
+                direct_configuration = self._identity_reachable_from_owner(resource, configuration)
+                configuration_type_payload = self._resource_configuration_type_payload(
+                    configuration,
+                    identity_owner=resource,
+                    identity_site="resource-configuration",
+                    pin_root_identity=direct_configuration,
+                )
             return (
                 "resource-v3",
                 self._runtime_build_payload(),
                 type(resource).__module__,
                 type(resource).__qualname__,
+                self._state_owner_incarnation(resource),
                 self._implementation_type_payload(type(resource)),
                 frozen_configuration,
-                self._resource_configuration_type_payload(configuration),
+                configuration_type_payload,
                 self._resource_method_payload(resource, "probe"),
                 self._resource_method_payload(resource, "load"),
                 self._resource_method_payload(resource, "probe_and_load"),
@@ -5255,7 +6898,59 @@ class Database:
         finally:
             self._resource_fingerprint_stack.reset(token)
 
-    def _resource_configuration_type_payload(self, configuration: Any) -> Any:
+    def _identity_reachable_from_owner(self, owner: object, target: object) -> bool:
+        """Find an identity() result retained in snapshot-safe owner state."""
+
+        seen: builtins.set[int] = set()
+
+        def walk(value: Any) -> bool:
+            if value is target:
+                return True
+            value_type = type(value)
+            if value_type in {str, bytes, int, float, bool, type(None), complex, FrozenRef}:
+                return False
+            value_id = id(value)
+            if value_id in seen:
+                return False
+            seen.add(value_id)
+            if value_type in {list, tuple}:
+                return any(walk(item) for item in value)
+            if value_type is dict:
+                return any(walk(key) or walk(item) for key, item in value.items())
+            if value_type in {set, frozenset}:
+                return any(walk(item) for item in value)
+            if value_type is FrozenList:
+                return any(walk(item) for item in value.items)
+            if value_type is FrozenDict:
+                return any(walk(key) or walk(item) for key, item in value.entries)
+            if value_type is FrozenSet:
+                return any(walk(item) for item in value.items)
+            if value_type is FrozenRecord:
+                return any(walk(item) for _name, item in value.entries)
+            if value_type is FrozenAdapterValue:
+                return walk(value.payload)
+            if value_type is FrozenGraph:
+                return any(walk(item) for item in value.nodes) or walk(value.root)
+            if is_dataclass(value) and not isinstance(value, type):
+                return any(
+                    walk(object.__getattribute__(value, item.name)) for item in fields(value)
+                )
+            try:
+                state = self._static_instance_dict(value)
+            except UnsupportedValueError:
+                return False
+            return any(walk(item) for item in state.values())
+
+        return walk(owner)
+
+    def _resource_configuration_type_payload(
+        self,
+        configuration: Any,
+        *,
+        identity_owner: object | None = None,
+        identity_site: str = "configuration",
+        pin_root_identity: bool = False,
+    ) -> Any:
         """Pin behavior erased by the ordinary boundary snapshot.
 
         ``freeze`` remains the value contract for resource configuration, but it
@@ -5268,6 +6963,7 @@ class Database:
         """
 
         active: dict[int, int] = {}
+        identity_index = [0]
 
         def guarded(value: Any, build: Callable[[], Any]) -> Any:
             object_id = id(value)
@@ -5295,7 +6991,7 @@ class Database:
                     freeze(item, adapters=self._adapters),
                     encode(item),
                 )
-                for name, item in sorted(self._static_instance_dict(value).items())
+                for name, item in self._static_instance_dict(value).items()
                 if name not in excluded
             )
 
@@ -5306,7 +7002,23 @@ class Database:
                     return candidate, adapter
             return None
 
-        def encode(value: Any) -> Any:
+        def encode(value: Any, *, pin_identity: bool = True) -> Any:
+            index = identity_index[0]
+            identity_index[0] += 1
+            payload = encode_payload(value)
+            if identity_owner is None or not pin_identity:
+                return payload
+            return (
+                "configuration-site-v1",
+                self._state_site_incarnation(
+                    identity_owner,
+                    f"{identity_site}[{index}]",
+                    value,
+                ),
+                payload,
+            )
+
+        def encode_payload(value: Any) -> Any:
             if type(value) in (str, bytes, int, float, bool, type(None), complex):
                 if type(value) is float:
                     return ("float-bits", struct.pack(">d", value))
@@ -5317,16 +7029,60 @@ class Database:
                         struct.pack(">d", value.imag),
                     )
                 return ("plain-value",)
-            if type(value) in {
-                FrozenList,
-                FrozenDict,
-                FrozenSet,
-                FrozenRecord,
-                FrozenAdapterValue,
-                FrozenGraph,
-                FrozenRef,
-            }:
-                return ("frozen-snapshot", type(value).__qualname__)
+            if type(value) is FrozenList:
+                return guarded(
+                    value,
+                    lambda: (
+                        "frozen-list",
+                        tuple(encode(item) for item in value.items),
+                    ),
+                )
+            if type(value) is FrozenDict:
+                return guarded(
+                    value,
+                    lambda: (
+                        "frozen-dict",
+                        tuple((encode(key), encode(item)) for key, item in value.entries),
+                    ),
+                )
+            if type(value) is FrozenSet:
+                return guarded(
+                    value,
+                    lambda: (
+                        "frozen-set",
+                        value.kind,
+                        tuple(encode(item) for item in value.items),
+                    ),
+                )
+            if type(value) is FrozenRecord:
+                return guarded(
+                    value,
+                    lambda: (
+                        "frozen-record",
+                        value.type_name,
+                        tuple((name, encode(item)) for name, item in value.entries),
+                    ),
+                )
+            if type(value) is FrozenAdapterValue:
+                return guarded(
+                    value,
+                    lambda: (
+                        "frozen-adapter-value",
+                        value.adapter_key,
+                        encode(value.payload),
+                    ),
+                )
+            if type(value) is FrozenGraph:
+                return guarded(
+                    value,
+                    lambda: (
+                        "frozen-graph",
+                        tuple(encode(item) for item in value.nodes),
+                        encode(value.root),
+                    ),
+                )
+            if type(value) is FrozenRef:
+                return ("frozen-ref", value.index)
 
             adapter_match = adapter_for(value)
             if adapter_match is not None:
@@ -5400,7 +7156,6 @@ class Database:
                             "Resource configuration mapping keys collapse to "
                             "the same frozen identity."
                         )
-                    items.sort(key=lambda item: fingerprint_snapshot(item[0]))
                     return (
                         "mapping",
                         self._implementation_type_payload(type(value))
@@ -5465,28 +7220,36 @@ class Database:
                 "identity encoding."
             )
 
-        return encode(configuration)
+        return encode(configuration, pin_identity=pin_root_identity)
 
     def _resource_method_payload(self, resource: Any, method_name: str) -> Any:
-        method = getattr(resource, method_name, None)
-        if method is None:
-            return (method_name, "missing")
-        fn = getattr(method, "__func__", method)
-        if isinstance(fn, FunctionType):
-            return (method_name, self._function_definition_payload(fn, set()))
-        if isinstance(fn, BuiltinFunctionType):
-            return (method_name, self._builtin_function_payload(fn))
-        if callable(method):
+        with self._resource_hook_scope(resource, method_name):
+            method = getattr(resource, method_name, None)
+            if method is None:
+                return (method_name, "missing")
+            fn = getattr(method, "__func__", method)
+            if isinstance(fn, FunctionType):
+                return (method_name, self._function_definition_payload(fn, set()))
+            if isinstance(fn, BuiltinFunctionType):
+                return (method_name, self._builtin_function_payload(fn))
+            if callable(method):
+                self._reject_callable_object_wrapper(
+                    method,
+                    subject=(
+                        f"Resource hook {type(resource).__module__}."
+                        f"{type(resource).__qualname__}.{method_name}"
+                    ),
+                )
+                return (
+                    method_name,
+                    "callable",
+                    self._policy_definition_payload(method),
+                )
             return (
                 method_name,
-                "callable",
-                self._policy_definition_payload(method),
+                type(method).__module__,
+                type(method).__qualname__,
             )
-        return (
-            method_name,
-            type(method).__module__,
-            type(method).__qualname__,
-        )
 
     def _freeze_static_capture(self, value: Any, active_ids: builtins.set[int]) -> Any:
         scalar_types = (str, bytes, int, float, bool, type(None), complex)
@@ -5494,12 +7257,17 @@ class Database:
             return ("ellipsis",)
         if type(value) in scalar_types:
             if type(value) is float:
-                return ("float-bits", struct.pack(">d", value))
+                return (
+                    "float-bits",
+                    struct.pack(">d", value),
+                    self._definition_object_incarnation(value),
+                )
             if type(value) is complex:
                 return (
                     "complex-bits",
                     struct.pack(">d", value.real),
                     struct.pack(">d", value.imag),
+                    self._definition_object_incarnation(value),
                 )
             return value
         if isinstance(value, type):
@@ -5674,6 +7442,12 @@ class Database:
             FrozenRecord,
             FrozenAdapterValue,
         }:
+            if not snapshots_equal(value, value):
+                return (
+                    "non-substitutive-frozen-snapshot",
+                    id(value),
+                    serialize_snapshot(value),
+                )
             return value
         if isinstance(value, os.PathLike):
             if is_stdlib_path(value):
@@ -5752,11 +7526,43 @@ class Database:
                         name,
                         self._freeze_static_capture(item, active_ids),
                     )
-                    for name, item in sorted(self._static_instance_dict(value).items())
+                    for name, item in self._static_instance_dict(value).items()
                     if name not in field_names
                 )
-                return ("frozen-dataclass", type_payload, field_payload, extra_state)
+                return (
+                    "frozen-dataclass",
+                    type_payload,
+                    self._definition_object_incarnation(value),
+                    field_payload,
+                    extra_state,
+                )
         raise UnsupportedValueError("Unsupported ambient capture.")
+
+    @staticmethod
+    def _definition_object_incarnation(value: Any) -> tuple[Any, ...]:
+        """Pin process-local identity only when structural state is not substitutive."""
+
+        value_type = type(value)
+        non_reflexive = type(value) in {float, complex} and value != value
+        equality_implementation: object = value_type.__eq__
+        hash_implementation: object = value_type.__hash__
+        identity_based = (
+            is_dataclass(value)
+            and not isinstance(value, type)
+            and (equality_implementation is object.__eq__ or hash_implementation is object.__hash__)
+        )
+        if non_reflexive or identity_based:
+            # The current object is strongly reachable through the function,
+            # policy, adapter, or resource definition while that definition is
+            # observed. A separate process receives a distinct token and safely
+            # declines checkpoint reuse even if its allocator repeats an address.
+            return (
+                "process-local-incarnation",
+                _PROCESS_IDENTITY_TOKEN.nonce,
+                os.getpid(),
+                id(value),
+            )
+        return ("structural-incarnation",)
 
     @staticmethod
     def _static_scalar_base_value(value: Any) -> Any:
@@ -5788,10 +7594,8 @@ class Database:
             state = object.__getattribute__(value, "__dict__")
         except (AttributeError, TypeError):
             return {}
-        if not isinstance(state, dict):
-            raise UnsupportedValueError(
-                "Ambient capture instance state is not a concrete dictionary."
-            )
+        if type(state) is not dict or any(type(name) is not str for name in state):
+            raise UnsupportedValueError("Instance state must be an exact dict with exact str keys.")
         return state
 
     def _static_instance_dict_payload(self, value: Any, active_ids: builtins.set[int]) -> Any:
@@ -5804,7 +7608,7 @@ class Database:
             )
         return tuple(
             (name, self._freeze_static_capture(item, active_ids))
-            for name, item in sorted(self._static_instance_dict(value).items())
+            for name, item in self._static_instance_dict(value).items()
         )
 
     @contextmanager
@@ -5819,12 +7623,16 @@ class Database:
             active_ids.remove(object_id)
 
     def _is_resource_handle(self, value: Any) -> bool:
-        return all(callable(getattr(value, name, None)) for name in ("label", "probe", "load"))
+        for name in ("label", "probe", "load"):
+            with self._resource_hook_scope(value, name):
+                if not callable(getattr(value, name, None)):
+                    return False
+        return True
 
     @contextmanager
     def _request_scope(
         self,
-    ) -> Iterator[list[tuple[NodeKey, QueryChangeEvent]] | None]:
+    ) -> Iterator[list[_PendingObserverEvent] | None]:
         current = self._request_token.get()
         if current is not None:
             # A span's request id must reflect every change committed while
@@ -5836,7 +7644,8 @@ class Database:
             return
         self._request_counter += 1
         token = self._request_token.set(self._request_counter)
-        pending: list[tuple[NodeKey, QueryChangeEvent]] = []
+        fingerprints_token = self._request_query_fingerprints.set({})
+        pending: list[_PendingObserverEvent] = []
         events_token = self._pending_events.set(pending)
         failures: list[NodeKey] = []
         failures_token = self._request_failures.set(failures)
@@ -5846,6 +7655,7 @@ class Database:
             self._pending_events.reset(events_token)
             self._release_failure_exceptions(failures)
             self._request_failures.reset(failures_token)
+            self._request_query_fingerprints.reset(fingerprints_token)
             self._request_token.reset(token)
             self._evict_query_nodes_if_needed()
 
@@ -5854,7 +7664,7 @@ class Database:
         self._query_last_used[key] = self._query_touch_counter
 
     def _evict_query_nodes_if_needed(self) -> None:
-        limit = self.max_query_nodes
+        limit = self._max_query_nodes
         if limit is None:
             return
         while len(self._query_records) > limit:
@@ -5906,10 +7716,35 @@ class Database:
         return stack[-1]
 
     def _freeze_value(self, value: Any) -> Snapshot:
-        snapshot = freeze(value, adapters=self._adapters)
+        snapshot = self._freeze_owned_snapshot(value)
         if self._store is not None:
             self._persist_snapshot(snapshot)
         return snapshot
+
+    def _freeze_owned_snapshot(self, value: Any) -> Snapshot:
+        self._verify_adapter_lifetime()
+        snapshot = detach_snapshot(freeze(value, adapters=self._adapters))
+        self._verify_adapter_lifetime()
+        return snapshot
+
+    @staticmethod
+    def _require_snapshot_digest(
+        snapshot: Snapshot,
+        expected_digest: str,
+        *,
+        subject: str,
+    ) -> None:
+        try:
+            payload = serialize_snapshot(snapshot)
+        except (OverflowError, RecursionError, TypeError, UnsupportedValueError, ValueError) as exc:
+            raise CheckpointIntegrityError(
+                f"Cannot save checkpoint: {subject} is not a valid canonical snapshot."
+            ) from exc
+        actual_digest = hashlib.sha256(payload).hexdigest()
+        if actual_digest != expected_digest:
+            raise CheckpointIntegrityError(
+                f"Cannot save checkpoint: {subject} no longer matches its recorded digest."
+            )
 
     def _persist_snapshot(self, snapshot: Snapshot) -> None:
         """Write the snapshot's serialized bytes to the configured ArtifactStore.
@@ -5926,13 +7761,22 @@ class Database:
             store.put(digest, payload)
 
     def _thaw_value(self, value: Any) -> Any:
-        return thaw(value, adapters=self._adapters)
+        self._verify_adapter_lifetime()
+        thawed = thaw(value, adapters=self._adapters)
+        self._verify_adapter_lifetime()
+        return thawed
 
     def _fingerprint_value(self, value: Any) -> str:
-        return fingerprint(value, adapters=self._adapters)
+        self._verify_adapter_lifetime()
+        digest = fingerprint(value, adapters=self._adapters)
+        self._verify_adapter_lifetime()
+        return digest
 
     def _semantic_equal(self, left: Any, right: Any) -> bool:
-        return semantic_equal(left, right, adapters=self._adapters)
+        self._verify_adapter_lifetime()
+        equal = semantic_equal(left, right, adapters=self._adapters)
+        self._verify_adapter_lifetime()
+        return equal
 
     def _compare_input_snapshots(
         self, input_key: Any, previous: Snapshot, snapshot: Snapshot
@@ -5950,8 +7794,8 @@ class Database:
         return self._compare_values(
             eq=input_key.eq,
             cutoff=input_key.cutoff,
-            left=self._thaw_value(previous),
-            right=self._thaw_value(snapshot),
+            left=self._thaw_value(detach_snapshot(previous)),
+            right=self._thaw_value(detach_snapshot(snapshot)),
         )
 
     def _compare_values(
@@ -5963,8 +7807,9 @@ class Database:
         right: Any,
     ) -> bool:
         if cutoff is not None:
-            return self._freeze_cutoff_token(cutoff(left)) == self._freeze_cutoff_token(
-                cutoff(right)
+            return snapshots_equal(
+                self._freeze_cutoff_token(cutoff(left)),
+                self._freeze_cutoff_token(cutoff(right)),
             )
         if eq is None:
             return self._semantic_equal(left, right)
@@ -5972,8 +7817,14 @@ class Database:
 
     def _freeze_cutoff_token(self, value: Any) -> Snapshot:
         try:
-            return self._freeze_value(value)
+            return self._freeze_owned_snapshot(value)
         except UnsupportedValueError as exc:
             raise UnsupportedValueError(
                 "Cutoff functions must return snapshot-safe values."
             ) from exc
+
+
+# Install before callers can cache an unguarded Python-level launch method.
+# Database construction retains the idempotent call as a defensive check for
+# unusual module-loading environments.
+_install_guards_once()

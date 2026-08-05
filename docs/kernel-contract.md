@@ -15,9 +15,13 @@ When a recomputed value is semantically equal to the previously stored value,
 the record is **backdated** (also called **early cutoff**): its `changed_at`
 revision is not advanced, so downstream dependents remain green and avoid
 unnecessary recomputation. For queries without an `eq=`/`cutoff=` policy, that
-equality decision is computed on the canonical stored snapshots themselves and
-is identical in `strict`, `checked`, and `fast`; `eq=`/`cutoff=` policies
-continue to receive mode-exposed values.
+equality decision is a deep typed comparison of the canonical stored snapshots
+and is identical in `strict`, `checked`, and `fast`. It requires both equal
+structure and equal scalar representation: Python-equal values such as `1` and
+`1.0`, `True` and `1`, and positive and negative floating-point zero are
+different. NaN is never equal for cutoff purposes. `eq=` policies continue to
+receive mode-exposed values; `cutoff=` tokens use the same typed snapshot
+relation as the default policy.
 
 ## Conditions for From-Scratch Consistency
 
@@ -31,11 +35,42 @@ handled by registered `ValueAdapter` instances. `freeze` converts
 dataclasses → `FrozenRecord`; tuples are a native member of the `Snapshot`
 union and are frozen element-wise.
 
+Mapping insertion order is not part of the value-boundary semantics.
+`freeze()` orders entries by each frozen typed key's canonical fingerprint;
+this is not ordinary Python insertion order and is not promised to match key
+comparison order. `FrozenDict` iteration in `strict`, and the insertion order
+of dictionaries thawed in `checked` or `fast`, follow that fingerprint order.
+Fresh execution, warm reuse, and same-mode checkpoint reload therefore expose
+the same order, but code that needs an order-bearing value must use a tuple of
+key/value pairs or a `ValueAdapter` that explicitly models order.
+(See: `test_mapping_boundaries_use_canonical_iteration_order_warm_fresh_and_checkpoint`)
+
+As a standalone value utility, `freeze()` preserves the identity of an
+already-canonical, tree-shaped `Frozen*` value. A `Database` does not retain
+that caller-owned shell: inputs, query calls and results, resource parameters,
+resource values and probes, and nested `ValueAdapter` payloads are recursively
+detached before they enter a record or checkpoint hint. Graph node tables and
+`FrozenRef` indexes are copied without changing their alias/cycle topology or
+content digest. When a resource parameter cannot be reconstructed with the
+same type and frozen digest, dependency verification conservatively re-executes
+the parent so the resource receives a fresh live parameter.
+
 Dataclasses thaw to dictionaries because the kernel does not import and
 reconstruct arbitrary user classes. A dataclass, frozen wrapper, or composite
 containing one cannot therefore be used as a mapping key or set member unless a
 `ValueAdapter` reconstructs a hashable value; `freeze` rejects such positions
 before they can produce a snapshot that later fails to thaw.
+`FrozenDict` keys and `FrozenSet` members must also retain cardinality and
+lookup semantics after thaw. Typed-distinct snapshots that Python would merge,
+such as `1` with `1.0`, `True` with `1`, or positive with negative zero, are
+rejected in hash positions. Adapter-produced collisions are detected during
+thaw before a collapsed mapping or set can escape.
+
+`Database.set()` and `set_many()` validate registrations, freeze every pending
+value, and run custom comparison policies before committing input registries,
+records, counters, revisions, or artifact objects. A rejected value or raising
+comparator therefore leaves no phantom key registration and no partial input
+transaction.
 
 `freeze()` and `thaw()` are boundary utilities, not a general object
 serializer. Passing an adapter registry to `freeze()` does not embed executable
@@ -43,19 +78,22 @@ reconstruction logic in the snapshot; the matching registry must also be
 available to `thaw()`. Without an adapter, a dataclass's class identity is not
 reconstructed.
 
-The kernel stores frozen snapshots internally. `strict` exposes the immutable
+The kernel stores frozen snapshots internally. `strict` exposes read-only
 `Frozen*` views themselves (a query receives, for example, a `FrozenDict` where
 the other modes hand it a `dict`); `checked` and `fast` expose owned thawed
-values. No external alias to a value that crossed the boundary can influence
-the stored snapshot.
+values. The strict views reject ordinary mutation but are not capability-level
+immutable: reflection such as `object.__setattr__` can bypass a frozen
+dataclass wrapper. No external alias or reflectively changed public view can
+influence the stored snapshot because boundary shells are detached.
 
 Cyclic and shared object graphs are supported via the `FrozenGraph` /
 `FrozenRef` snapshot variants: `freeze` memoizes mutable containers (`list`,
 `dict`, `set`, dataclass) by id and emits a `FrozenGraph(nodes, root)` envelope
 when shared identity or back-edges are detected. `thaw` reconstructs identity
 faithfully via two-pass allocate-then-fill so a list-with-itself round-trips to
-an actual self-referential list. Pure trees pay no overhead — they continue to
-return the bare flat snapshot shape.
+an actual self-referential list. Pure trees avoid only the `FrozenGraph`
+envelope; they still incur the ordinary deep traversal and snapshot allocation
+performed by `freeze`.
 
 Memoization is by **mutable container** identity, so the graph support above
 covers exactly those four types. Values crossing through a `ValueAdapter`, a
@@ -78,6 +116,55 @@ resource's `probe` and the probe component of its `probe_and_load` must agree
 on an unchanged world; stored probe/value pairs always originate from one
 `probe_and_load` observation.
 
+Resource hooks observe external state; they are not query-composition frames.
+The `identity`, `label`, `probe`, `load`, and `probe_and_load` hooks must not
+call any `Database` observation API or read an `Input`, query, or another
+resource, whether through the same database or a different one. Put those
+managed reads beside the resource read in a `@query` so the query owns every
+dependency edge. A violation raises `ResourceDependencyError` in all modes.
+The violation is sticky for the hook invocation: catching it inside the hook
+cannot publish a dependency-free value. Direct external I/O remains allowed
+inside state-observation hooks.
+
+Query evaluation is synchronous. The runtime rejects the following launch
+families before their worker or child process starts and raises
+`QueryConcurrencyError` in every mode:
+
+- `threading.Thread.start` and the available low-level `_thread` start aliases
+- `ThreadPoolExecutor.submit` and `ProcessPoolExecutor.submit`
+- `multiprocessing.Process.start`, `multiprocessing.Pool` construction, and
+  Pool submission APIs
+- `subprocess.Popen`
+- available `os.fork*`, `os.exec*`, `os.posix_spawn*`, `os.spawn*`,
+  `os.system`, `os.popen`, and `os.startfile` entry points
+
+The violation is sticky across nested query frames and Resource-hook scopes:
+catching the immediate exception cannot publish a result. Resource hooks may
+use `subprocess.Popen` and the external-command `os.posix_spawn*`, `os.spawn*`,
+`os.system`, `os.popen`, or `os.startfile` families as direct external I/O, but
+they may not create threads, executors, multiprocessing workers, or fork/exec
+the live database process. The Resource's probe/value contract must account for
+the command observation. Top-level concurrency outside query or hook execution
+is unaffected.
+
+The database API is deliberately narrower while a query or its equality/cutoff
+policy is executing. The active query may compose another query with the same
+`Database`, read an `Input` or `Resource` through that same database, and call
+`db.report_untracked_read(reason)`. No other public `Database` operation is
+legal there: construction, mutation, inspection, statistics/profile/graph
+access, mode/configuration access, observer subscription or unsubscription,
+request control, and checkpoint save/load raise `QueryContextError` before
+validating arguments or changing state. Managed reads through another
+`Database` raise the same error because the active database cannot publish a
+dependency edge into the other graph. This rule is identical in `strict`,
+`checked`, and `fast` modes.
+
+The same boundary applies to integration composition. Layer-3 integration
+entrypoints and the request/decode memo helpers are top-level APIs; invoking
+one from a query raises `QueryContextError` before argument or path handling,
+external reads, or integration memo mutation. Query authors compose stable
+Layer-2 `@query` payload APIs from the defining integration module instead.
+
 The kernel intercepts the following during query execution and raises
 `UntrackedReadError` if they are called outside a resource scope:
 
@@ -87,15 +174,20 @@ The kernel intercepts the following during query execution and raises
 - `Path.iterdir`
 
 Reads not intercepted by this mechanism (see limitation 1) must be declared
-via `db.report_untracked_read()` ([Escape Hatches](#escape-hatches)).
+via `db.report_untracked_read()` ([Escape Hatches](#escape-hatches)). The
+declaration prevents reuse of that node; it does not convert the read into a
+tracked dependency.
 
 **3. Deterministic queries w.r.t. tracked dependencies.**
 Given the same tracked inputs, resources, and sub-query results, a query function
 must return a semantically equal value. Nondeterminism (timestamps, random
-numbers, process state) must either be routed through a Resource or declared via
-`report_untracked_read()`. Query bodies and equality/cutoff policies must have
-fingerprintable implementations and snapshot-safe captures. Dynamically scoped
-local classes are rejected; define stable implementation types at module scope.
+numbers, process state) must be routed through a Resource for this condition to
+hold. `report_untracked_read()` can prevent stale memo reuse when such a read
+cannot be tracked, but a separately timed fresh evaluation may still observe a
+different world. Query bodies and equality/cutoff policies must have
+fingerprintable implementations and snapshot-safe statically discovered
+captures. Dynamically scoped local classes are rejected; define stable
+implementation types at module scope.
 
 Custom `eq=`/`cutoff=` policies must also be **substitutive** for every
 dependent computation: when a policy reports two values unchanged, each
@@ -106,6 +198,47 @@ representative, so from-scratch consistency then holds *modulo the declared
 equivalence* rather than on exact values.
 (See: `test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative`)
 
+Policies receive detached operands in every mode. In strict mode those are
+detached `Frozen*` snapshots; Input policies retain their documented thawed
+operands. Reflective or ordinary mutation by a buggy comparator therefore
+cannot alter a stored record or the candidate that will be published. This is
+defense in depth, not permission to mutate: policies must remain deterministic,
+pure, and side-effect-free.
+
+### Static capture analysis
+
+Query and policy identity uses static capture analysis. It inspects code,
+defaults, annotations, function state, and the globals/nonlocals discoverable
+from the function's bytecode, then recursively fingerprints supported captured
+queries, functions, modules, methods, and immutable values. A directly named
+mutable global or closure is rejected in all three modes.
+
+Python can observe object identity through `id`, `is`, protocol methods, and
+extension callables. Every directly captured global/nonlocal — including an
+`Input`, `Query`, `Resource`, function, module, method, or type — and every
+directly accessible default, reflected annotation, or function attribute
+therefore carries a process-local site incarnation in addition to its
+structural payload. Replacing a site with a distinct structurally equal object
+moves the query identity. The site registry retains the prior object until the
+identity comparison, so allocator address reuse cannot hide the replacement.
+Because the incarnation has no cross-process meaning, a checkpoint reader in
+another process safely executes such a query. A capture-free query whose
+behavior-bearing data enters through explicit query arguments can reuse a
+checkpoint across processes; queries that capture managed handles remain
+correct but conservatively execute there.
+
+This is not a runtime namespace trace or capability sandbox. Dynamic lookups
+such as `globals()[name]`, `locals()[name]`, `vars(namespace)[name]`,
+`getattr(owner, name)`, `eval`/`exec`, runtime imports, and similar reflection
+can read behavior-bearing state that the static walk does not name. Such state
+is outside the soundness envelope and can leave both warm and checkpoint-loaded
+results stale. Put the state behind an `Input` or `Resource`; when it genuinely
+cannot be tracked, call `db.report_untracked_read(reason)` before the read so
+the node is re-executed and omitted from checkpoints. The public
+`explain_query_captures()` helper reports only this statically discoverable
+capture set.
+(See: `test_dynamic_globals_lookup_is_outside_static_capture_analysis_and_checkpoint_trust`)
+
 ## Mode-Specific Enforcement
 
 | Mechanism | `strict` | `checked` | `fast` |
@@ -113,7 +246,10 @@ equivalence* rather than on exact values.
 | Values exposed as frozen | Yes | No (owned copies) | No (owned copies) |
 | Mutation detection at boundary | `TypeError` on write | Fingerprint before/after | None |
 | Untracked read interception | Yes | Yes | Yes |
-| Mutable closure/global rejection | Yes | Yes | Yes |
+| Resource-hook dependency rejection | Yes | Yes | Yes |
+| Query/Resource worker-launch rejection | Yes | Yes | Yes |
+| Caught child-failure fallback invalidation | Yes | Yes | Yes |
+| Direct mutable captures found by static analysis rejected | Yes | Yes | Yes |
 | Semantic equality for cutoffs | Yes | Yes | Yes |
 | Backdating on equal recomputation | Yes | Yes | Yes |
 
@@ -128,8 +264,9 @@ probe-comparison machinery drive invalidation:
   the exception propagates, so a later `get()` re-checks that node instead of
   treating the reader as dependency-free.
 - The exception surfaces **inside the query body**, where the query's own
-  `try`/`except` can see it. A refresh that raises while a dependent is being
-  verified never escapes `get()`.
+  `try`/`except` can see it. If the query does not catch it, the exception
+  propagates from `get()`; dependent verification re-enters the reader so its
+  handler sees the same live failure rather than swallowing it in the kernel.
 - An unchanged failing probe does not move the revision, so a query that handled
   the failure stays green across repeated requests. A changed probe — or a
   transition between success and failure in either direction — invalidates the
@@ -165,6 +302,17 @@ Two boundaries apply:
   of raising — `FileResource.probe` returns `("missing",)` for an absent file. A
   resource whose `probe` *also* raises is outside the contract, and what the
   kernel does then depends on what it already knows about that node.
+
+  `FileResource` and `BinaryFileResource` apply that missing probe to every
+  non-regular target as well. They open nonblockingly and use `fstat` on the
+  opened descriptor before reading, so a FIFO, Unix socket, device, directory,
+  or a symlink retargeted to one cannot block in a pre-stat/read race.
+  Embedded-NUL paths and symbolic-link loops are likewise conservative path
+  states rather than raw `ValueError`, `OSError`, or version-dependent
+  `RuntimeError` escapes. File resources use their missing state,
+  `DirectoryResource` returns an absent empty listing, `FileStatResource`
+  returns `exists=False`, and `ResolvedPathResource` returns `None`. These
+  probes remain tracked and are rechecked after warm and checkpoint reuse.
 
   - **No record yet:** the read is the node's first, nothing is recorded, the
     exception propagates unchanged, and a query that catches it is cached as if
@@ -242,6 +390,38 @@ does not consult that stale `changed_at`: the unconfirmed mark reports the node
 changed on every refresh and retires its probe until a real observation replaces
 it.
 
+## Caught Child Query Failures
+
+A query result and its dependency edges publish together only after the query
+returns. When a nested query raises before that point, there is no failed query
+record to attach as an edge. The kernel therefore takes the conservative path:
+each caller frame the exception unwinds through is marked untracked and
+checkpoint-ineligible. If one of those callers catches the exception and
+returns a fallback, that successful catcher re-executes on every request rather
+than retaining a dependency-free answer after the child heals. Repeated failures
+from the same child add one inspection reason, not one per attempt. A later
+successful execution replaces the conservative mark with the dependencies it
+actually read.
+
+The same rule covers failures while constructing a nested query key, attempting
+a checkpoint warm, or executing the child. If a previously successful child
+fails while the kernel is verifying a parent's dependency, that verification is
+reported as changed and the parent body runs; the exception then appears at the
+ordinary child call site, where the parent's `try`/`except` can handle it.
+Cold child state created by the failed attempt is rolled back, and a handled
+fallback is omitted from checkpoints so a loading database re-derives it from
+live state in `strict`, `checked`, and `fast` modes.
+
+A direct recursive call to the exact same query key remains the narrow
+exception. Its `CycleError` is a deterministic property of the already-active
+frame, so a query may catch that error and cache its fallback. Indirect cycles
+cross distinct query keys and use the conservative rule above.
+(See: `test_caught_cold_child_failure_heals_without_stale_fallback`,
+`test_child_success_failure_and_heal_are_handled_in_parent_body`,
+`test_failure_propagates_across_query_frames_and_deduplicates`,
+`test_caught_failure_record_is_omitted_from_same_mode_checkpoint`,
+`test_query_catching_its_own_cycle_keeps_committed_registries`)
+
 ## Request Spans
 
 `db.request_span()` is a context manager that holds one request open across
@@ -316,13 +496,23 @@ These fall **outside** the soundness envelope. The kernel does not guarantee
 from-scratch consistency when any of these apply.
 
 **1. Unintercepted ambient reads.**
-The condition 2 guard covers an enumerated set of entry points, not a category of
-behaviour. Everything else that observes external state bypasses it and silently
-violates condition 2 unless declared via `db.report_untracked_read(reason)`:
-`os.open()` (the low-level syscall), C-extension I/O, subprocess output, network
-calls, `ctypes` memory access, and similar.
+The condition 2 guard covers an enumerated set of entry points, not a category
+of behaviour. Everything else that observes external state bypasses it and
+silently violates condition 2 unless declared via
+`db.report_untracked_read(reason)`: `os.open()` (the low-level syscall),
+C-extension I/O, network calls, `ctypes` memory access, and similar. Direct
+external-command launch through the enumerated standard-library APIs instead
+raises `QueryConcurrencyError`; observe command output in a Resource hook.
 (See: `test_os_open_bypasses_untracked_read_guard`,
 `test_condition_two_entry_points_stay_guarded`)
+
+The concurrent-launch guard is likewise enumerated. It covers the documented
+`threading`, `_thread`, `concurrent.futures`, `multiprocessing`, `subprocess`,
+and `os` launch families, including the ordinary cached and prewarmed executor
+paths. It is not a capability sandbox: a native extension or private runtime
+mechanism that creates a thread or process without traversing a wrapped or
+audited CPython entry point can escape the current `ContextVar` and lies outside
+the soundness envelope.
 
 Three of those gaps sit close enough to the guarded set to be named individually.
 
@@ -338,10 +528,11 @@ Three of those gaps sit close enough to the guarded set to be named individually
   Route the observation through `FileStatResource`, whose probe covers
   existence, size, and mtime, through `ResolvedPathResource` when the
   observation is where a path canonicalizes to, or declare it with
-  `db.report_untracked_read(reason)`.
+  `db.report_untracked_read(reason)`, accepting that the declaration prevents
+  memo reuse but does not make the metadata observation tracked.
   (See: `test_file_metadata_reads_bypass_untracked_read_guard`,
   `test_stat_only_query_is_never_invalidated_by_the_file_it_stats`,
-  `test_report_untracked_read_restores_consistency_for_a_stat_only_query`,
+  `test_report_untracked_read_prevents_stat_query_memo_reuse`,
   `test_file_stat_resource_tracks_metadata_changes`,
   `test_resolved_path_resource_tracks_symlink_retargeting`)
 - **The byte-oriented environment.** `os.getenv` and `os.environ` are
@@ -354,12 +545,14 @@ Three of those gaps sit close enough to the guarded set to be named individually
   (See: `test_working_directory_reads_bypass_untracked_read_guard`)
 
 **2. Custom `eq=`/`cutoff=` with side effects.**
-If `eq=` or `cutoff=` callbacks perform ambient reads or mutations, the
-equivalence check itself becomes a hidden dependency. The kernel cannot detect
-this. These callbacks must be deterministic and side-effect-free; the kernel will
-continue to function but may make incorrect backdating decisions if they are not.
-This limitation does not relax identity validation: policy captures and callable
-instance state still have to be snapshot-safe.
+If `eq=` or `cutoff=` callbacks perform ambient reads or external mutations,
+the equivalence check itself becomes a hidden dependency. Detached operands
+protect stored snapshots from comparator mutation, but the kernel cannot make
+other side effects deterministic. These callbacks must be deterministic and
+side-effect-free; the kernel may make incorrect backdating decisions if they
+are not. This limitation does not relax identity validation: statically
+discovered policy captures and callable instance state still have to be
+snapshot-safe.
 (See: `test_custom_eq_with_side_effect_does_not_corrupt_graph`)
 
 **3. Mutation in `fast` mode.**
@@ -383,13 +576,20 @@ following hold:
   probe changes whenever its `load` result changes, and probe values are
   snapshot-safe and process-independent;
 - **(iii)** adapters for any adapted snapshot type are registered in the
-  loading process with unchanged `freeze`/`thaw` implementations;
+  loading process with unchanged `freeze`/`thaw` implementations and instance
+  configuration;
 - **(iv)** the checkpoint key and the store it loads from come from a trusted
   channel. Content addressing proves that bytes match the key they were asked
   for by — it does not authenticate where the key came from. A coherent
   attacker-selected key names a coherent attacker-selected manifest, so keys
   and store contents must be produced by a prior trusted `save_checkpoint`,
   not accepted from an untrusted input (see `SECURITY.md`).
+- **(v)** the loading database uses the same `strict`, `checked`, or `fast`
+  execution mode recorded by the saving database. Cross-mode loads raise
+  `CheckpointModeError` before any checkpoint state is staged.
+- **(vi)** query behavior stays within the static capture-analysis envelope;
+  dynamic namespace/reflection reads either use an `Input`/`Resource` or call
+  `report_untracked_read()` and are therefore absent from the checkpoint.
 
 Under these conditions `load_checkpoint(key)` followed by `db.get(query)`
 returns the value a fresh recomputation on the same declared state would, in all
@@ -398,13 +598,16 @@ three modes. The mechanisms that earn this:
 - **Query identities are recomputed live in the loading process.** A query's
   identity pins the interpreter/build identity (see
   [Interpreter and Build Identity](#interpreter-and-build-identity)) and the
-  full function-definition payload — a canonical typed code-object encoding,
-  defaults, keyword defaults, comparator policies, and the definitions of
-  transitively captured queries, functions, and modules — so a body or policy
-  edit anywhere in the captured graph, or a build-configuration change,
-  produces a different identity and the stale record simply misses. This
-  encoding never depends on object reference counts and supports nested code
-  and slice constants.
+  complete supported static function-definition payload — a canonical typed
+  code-object encoding, defaults, keyword defaults, comparator policies, and
+  the definitions of transitively and statically captured queries, functions,
+  and modules — so a body or policy edit anywhere in that discovered graph, or
+  a build-configuration change, produces a different identity and the stale
+  record simply misses. This encoding never depends on object reference counts
+  and supports nested code and slice constants. Direct capture sites also carry
+  a process incarnation: capture-free definitions can reproduce their identity
+  across processes, while definitions that expose captured-object identity
+  intentionally miss and execute.
 - **Inputs and dependency edges verify exactly.** Warmed records carry their
   real dependency edges; each input and sub-query dependency is re-checked
   against the live graph by digest before the record is trusted. Input policy
@@ -427,25 +630,39 @@ code is not pinned into any identity), records marked untracked via
 mismatches. A tampered, truncated, wrong-version, or wrong-kernel-fingerprint
 manifest is rejected loudly with a typed `CheckpointError` subclass.
 
-Residual limitations that stay outside the envelope: the module-monkey-patch
-gap of limitation 5 applies across runs exactly as it does in-process; and a
-checkpoint does not survive an interpreter or build-configuration change — such
-records miss safely (they re-execute) rather than being trusted.
+Dynamic namespace/reflection reads are not automatically recognized as
+unverifiable. Unless declared untracked, a query containing one can be restored
+and reused with the same static identity while the dynamically reached object
+has changed; condition (vi) excludes that program from checkpoint trust.
 
-**5. Ambient module or class monkey-patching.**
+Residual limitations that stay outside the envelope: the dynamic
+namespace/reflection and module-monkey-patch gaps of limitation 5 apply across
+runs exactly as they do in-process; and a checkpoint does not survive an
+interpreter or build-configuration change — such records miss safely (they
+re-execute) rather than being trusted.
+
+**5. Dynamic namespace/reflection and ambient monkey-patching.**
 Captured modules contribute their `__version__`, a SHA-256 digest of their
 source or compiled file bytes, declared `__all__`, stable scalar constants, and
 the behavior reached through statically resolvable attribute chains. Re-exported
-functions and submodules pin their defining modules transitively; dynamic access
-to a custom module is rejected when the behavior cannot be proven. A third-party
-version bump or source-file edit invalidates cached results that capture that
-module. Query definitions are weakly memoized per `Database` for high-cardinality
-calls, with runtime-build and captured-module observations rechecked before reuse
-so the memo cannot hide those changes. An in-process
-monkey-patch of an existing module or module-owned class attribute (for example,
-`sys.modules["foo"].X = 42` or `foo.Model.flag = True` without reloading or
-touching the file) is **not** detected. Route such mutable state through an
-`Input` or a custom `Resource`.
+functions and submodules found by the static walk pin their defining modules
+transitively; statically found dynamic access to a custom module may be rejected
+when its behavior cannot be proven. A third-party version bump or source-file
+edit invalidates cached results that statically capture that module. The
+complete supported static definition is fingerprinted once per request before
+a stored query identity can be selected or reused. Repeated uses in that
+request share only the final digest, and no live-definition fingerprint cache
+entry crosses the request boundary. A `request_span` is a declared-stable
+request; `request_inputs_changed()` rolls the span forward and clears its
+request-local digest cache.
+
+The static walk does not discover a value named only by a string passed through
+`globals()`, `vars()`, dynamic `getattr`, `eval`/`exec`, import machinery, or a
+similar reflection path. An in-process monkey-patch of an existing module or
+module-owned class attribute (for example, `sys.modules["foo"].X = 42` or
+`foo.Model.flag = True` without reloading or touching the file) is likewise not
+detected. Route such mutable state through an `Input` or custom `Resource`, or
+declare the read untracked before performing it.
 
 **6. LRU eviction under active dependencies.**
 If `max_query_nodes` is set low enough that an intermediate query is evicted while
@@ -453,21 +670,15 @@ a dependent is still active, the dependent will re-execute the intermediate from
 scratch on its next request. This is correct but may degrade performance.
 (See: `test_rewiring_with_lru_eviction`)
 
-**7. Catching an exception raised by a child query.**
-The edge a failing *resource* read publishes before its exception propagates has
-no query-side equivalent: a query's record and dependency edges publish only
-after it returns, so a query that catches an exception raised by a sub-query is
-cached with no edge to it and is not re-executed when a later change would make
-that sub-query succeed. Model a failure the caller means to handle as a returned
-value, or route it through a `Resource`.
-(See: `test_caught_query_failure_does_not_publish_a_dependency_edge`)
-
 ## Escape Hatches
 
 - **`db.report_untracked_read(reason)`** — marks the current query as impure;
   forces re-execution on every request and disables backdating for that node.
   Downstream consumers re-verify but can still backdate if their own results are
-  unchanged.
+  unchanged. This guarantees only that the node's prior memo is not reused. It
+  does not track time, randomness, network state, or another nondeterministic
+  observation, and it does not promise equality with a fresh evaluation made
+  at a different time.
   (See: `test_report_untracked_read_forces_reexecution_on_every_request`,
   `test_impure_child_prevents_parent_backdating_unless_result_unchanged`)
 
@@ -484,17 +695,23 @@ value, or route it through a `Resource`.
   - **Semantic round-trip.** For any accepted value, `thaw(freeze(x))` is
     semantically equal to `x` wherever the adapted type is consumed.
   - **Pinned adapter state.** Adapter instance configuration is immutable for
-    the registered lifetime; implementations and configuration participate in
-    query and checkpoint identity.
+    the `Database` lifetime. Construction captures a complete implementation
+    and instance-state digest; every adapter boundary verifies it before and
+    after use and rejects a mismatch with `UnsupportedValueError`. Adapter
+    configuration is therefore a database invariant, not part of ordinary
+    query identity. Checkpoint manifests independently record the same digest
+    to prevent reuse across databases configured with different adapters.
 
   (See: `test_adapter_freeze_of_a_query_result_runs_under_the_guard`,
   `test_adapter_thaw_of_query_arguments_runs_under_the_guard`)
 
 - **`eq=` / `cutoff=`** on `Input` and `@query` — allows custom equivalence.
-  `eq=` compares thawed values directly; `cutoff=` compares snapshot-safe tokens.
-  These are mutually exclusive. Cutoff tokens must be snapshot-safe, and the
-  declared equivalence must be substitutive for dependents (condition 3) for
-  the guarantee to hold on exact values.
+  `Input.eq` compares thawed values directly; query `eq=` compares mode-exposed
+  values. Every operand is detached from stored and candidate snapshots before
+  policy code runs. `cutoff=` compares snapshot-safe tokens with the kernel's
+  deep typed relation. These are mutually exclusive. Cutoff tokens must be
+  snapshot-safe, and the declared equivalence must be substitutive for
+  dependents (condition 3) for the guarantee to hold on exact values.
   (See: `test_input_cutoff_suppresses_equal_updates`,
   `test_query_cutoff_backdates_and_skips_downstream`)
 
@@ -513,24 +730,41 @@ a fresh `Database` into an empty directory.
 
 ## Additional Kernel Properties
 
-- Query identity includes the function-definition payload — supported captured
-  values and the full definition payloads of transitively captured queries, so
-  a body edit to a dependency query moves the parent's identity — plus the
-  interpreter/build identity (see
+- Query identity includes the supported static function-definition payload —
+  statically discovered values and the definition payloads of transitively
+  captured queries, so a body edit to a discovered dependency query moves the
+  parent's identity — plus the interpreter/build identity (see
   [Interpreter and Build Identity](#interpreter-and-build-identity)).
-  Mutable closure/global captures and local/dynamically unbound type objects
-  are rejected. Module-level types are pinned through their defining module
-  identity. Use `pyinc.explain_query_captures(fn)` to preview how each capture
-  will be classified before the first `db.get()`.
-- `Query` is public, and `@query(key=...)` accepts an explicit stable key; the
+  Direct mutable closure/global captures and local/dynamically unbound type
+  objects found by this static analysis are rejected. Dynamic namespace and
+  reflection paths are outside that analysis, as documented under
+  [Static capture analysis](#static-capture-analysis). Non-function callable
+  objects that expose `__wrapped__` are also rejected when used as captures,
+  equality/cutoff policies, or the
+  `identity`, `probe`, `load`, and `probe_and_load` resource hooks: the wrapped
+  function is not a substitutive identity for the object's `__call__`
+  implementation and state. Ordinary decorated Python functions, decorated
+  bound methods, query handles, and fully identified resources remain supported.
+  Module-level types are pinned through their defining module identity. Use
+  `pyinc.explain_query_captures(fn)` to preview how each statically discoverable
+  capture will be classified before the first `db.get()`.
+- `Query` is public, and `@query(key=...)` accepts an explicit stable exact
+  `str` key (subclasses are rejected); the
   default is `module:qualname`. Coroutine and generator queries are rejected at
-  decoration time.
+  decoration time. A query handle is slotted and immutable. Its observable data
+  surface is the read-only `fn`, `eq`, `cutoff`, and `key` properties plus the
+  copied `__module__`, `__name__`, `__qualname__`, `__doc__`, and `__wrapped__`
+  callable metadata; arbitrary attributes cannot be attached. A statically
+  captured query fingerprints that complete surface and the referenced
+  function and policy definitions.
 - `Resource[KeyT, ValueT, ProbeT]` and `Database.read_resource(...)` are public.
   Resource identity includes the resource's configuration, the implementations
   of every state-observation hook (`probe`, `load`, `probe_and_load`, and
   `identity`), and the interpreter/build identity. The built-in resources
   (condition 2) cover text, binary, environment, stat, directory, and
-  path-resolution observation.
+  path-resolution observation. Resource hooks may observe external state but
+  cannot read database-managed state; compose Inputs, queries, and resources in
+  the calling query instead.
 - `Database.inspect(...)` exposes the last recorded provenance tree as structured
   data. `Database.explain(...)` formats it for humans. Inspection is
   observational and does not force an extra verification pass;
@@ -565,13 +799,17 @@ a `threading.RLock` that serialises every public state read and mutation,
 including queries, resources, inputs, statistics, profiles, dependency graphs,
 resets, checkpoint operations, and subscriptions.
 
-The ambient-read guard is installed globally exactly once and dispatches
-per-context via a `ContextVar` stack of active databases — two threads inside
-queries on different `Database` instances do not stomp each other's
-enforcement, and raw I/O from a thread that is *not* inside any query continues
-to work unaffected. If many threads share a single `Database`, work serialises
-on the per-instance lock; if they hold separate `Database` instances they run
-in parallel.
+The ambient-read and concurrent-launch guards are installed globally exactly
+once and dispatch per context via `ContextVar` stacks of active databases. Two
+top-level threads using different `Database` instances do not stomp each
+other's enforcement, and raw I/O from a thread that is *not* inside any query
+continues to work unaffected. Starting a worker from a query through an
+enumerated API raises `QueryConcurrencyError`: the worker would escape the
+ambient-read context, and joining a child database read while holding the
+parent lock could deadlock. If many top-level threads share one `Database`,
+work serialises on its lock; separate instances may execute concurrently. On
+ordinary GIL-enabled CPython, CPU-bound Python bytecode does not thereby run in
+parallel, though I/O and code that releases the GIL may overlap.
 
 ## Snapshot Serialization and Store Keys
 
@@ -592,20 +830,36 @@ older persisted records are rejected rather than silently reused.
 ## Checkpoint Save and Load
 
 An outbound `ArtifactStore` (`InMemoryArtifactStore` /
-`FileSystemArtifactStore`) optionally accepts every snapshot the kernel
-freezes, keyed by its internally derived content digest, via `Database(store=...)`.
+`FileSystemArtifactStore`) accepts persisted query/call snapshots and the
+complete snapshot frontier needed by an explicit checkpoint, keyed by internal
+content digests, via `Database(store=...)`. `set` and `set_many` keep input
+mutation in memory; checkpoint save persists their reachable snapshots before
+publishing its manifest. This keeps input transactions independent of stores
+that cannot atomically write several objects.
 Snapshot bytes use the encoding described in
 [Snapshot Serialization and Store Keys](#snapshot-serialization-and-store-keys).
 
+The protocol's `contains(digest)` method has a concrete
+`get(digest) is not None` default. It is a presence convenience, not an
+integrity check. `save_checkpoint` therefore calls the store's idempotent
+`put` for every result snapshot, query call snapshot, and resource parameter,
+even when that address is already present. A conforming store accepts identical
+bytes and raises `ValueError` for conflicting bytes; such a conflict aborts the
+save before a new checkpoint manifest is published. `InMemoryArtifactStore.keys()`
+returns a detached read-only snapshot, so callers cannot mutate its backing
+object table or observe later writes through an earlier result.
+
 On top of this, `Database.save_checkpoint(store=None) -> str` serialises the
 current query and resource records — their snapshot bytes, call snapshots,
-resource parameters, dependency edges, and per-adapter implementation digests —
-into a content-addressed manifest (schema v6), returning a key prefixed with
+resource parameters, dependency edges, execution mode, and per-adapter implementation digests —
+into a content-addressed manifest (schema v7), returning a key prefixed with
 `"ck"`. Adapter digests include `freeze`/`thaw` code, snapshot-safe instance
-configuration, and the interpreter/build identity. Saving rejects an adapter
-whose captures or state cannot be pinned; loading under such an adapter safely
-misses and re-executes instead of thawing checkpoint bytes across an
-unverifiable implementation boundary. Records whose cached value no longer
+configuration, and the interpreter/build identity. `Database` construction
+rejects an adapter whose statically discovered captures or state cannot be
+pinned; checkpoint loading under a different, pinnable adapter safely misses
+and re-executes instead of thawing bytes across a changed implementation
+boundary. Records whose cached
+value no longer
 matches the live graph (a "dirty" save with no intervening `get`) are omitted
 rather than persisted stale, so a reload never warms a value a fresh run would
 not produce.
@@ -639,28 +893,34 @@ only through a validated file handle. Lock files retain the same protected
 directory handle chain for the lock's lifetime.
 
 Unsafe object, directory, or lock paths surface a typed `ArtifactStoreError`;
-lock timeouts surface `ArtifactStoreLockError`.
+this includes an unresolvable root or internal directory and a symbolic-link
+loop regardless of the exception spelling used by the running Python version.
+Lock timeouts surface `ArtifactStoreLockError`.
 
 ## Push Observers
 
 `Database.observe(callback, query, *args, **kwargs)` registers a callback that
 fires when the identified query node's stored value changes. It returns a
-`Subscription` whose `unsubscribe()` method detaches the callback; repeated
-unsubscribes are no-ops.
+`Subscription` whose `unsubscribe()` method detaches that exact registration
+from future changes; callback equality is never used to choose a registration,
+and repeated unsubscribes are no-ops.
 
 Fires exactly when:
 
-- the node was (re-)executed during a top-level `get` / `inspect` /
-  `inspect_fresh` call, **and**
-- the resulting decision was `"executed"` — either a cold execution (no
-  prior record) or a true recompute where the new value did not match the
-  previous one under `eq=` / `cutoff=` / semantic equality.
+- the node already had a stored value before the request, **and**
+- it re-executed during a top-level `get` / `inspect` / `inspect_fresh` call,
+  **and**
+- the new value did not match the previous value under `eq=` / `cutoff=` /
+  semantic equality.
 
 Does **not** fire on:
 
+- cold execution, including recreation after LRU eviction or a checkpoint miss;
 - `"backdated"` — the recomputation was backdated (see
   [The Guarantee](#the-guarantee));
 - `"reused"` — dependencies were unchanged so no recomputation happened;
+- an untracked re-execution that produced the same structural value, even
+  though its inspection decision remains `"executed"`;
 - `db.set(...)` / `db.set_many(...)` — input mutation alone does not
   execute any query. Observers fire on the next `get` that triggers
   dependent re-execution.
@@ -674,19 +934,29 @@ Dispatch model:
   buffered by gets inside the span are delivered when the outermost span
   closes — on a clean close and when the span body raises — and an inner
   span's close delivers nothing.
-- For each event, the callback list for that node is snapshotted once at
-  dispatch time under the state lock, then dispatched lock-free. A
-  subscription added during dispatch will not see the current batch; one
-  removed during dispatch will still receive events already snapshotted.
+- Each event snapshots its callback recipients under the state lock at the
+  instant the changed value is published, then carries that immutable recipient
+  tuple until lock-free dispatch. A subscription created later in the same
+  `request_span` cannot receive an earlier event. Unsubscribing after an event
+  occurred does not retract that delivery; consequently, removing oneself or a
+  sibling during dispatch does not alter the rest of the already-captured
+  event or batch, but it does prevent capture by future events.
 - Exceptions raised by a callback are routed to the
   `observer_error_hook` passed to `Database(...)` (default: a one-line
   stderr log) and do not suppress sibling callbacks for the same event.
-- Subscriptions survive LRU eviction of their node: if the evicted node is
-  later re-executed, the callback fires normally.
+- Subscriptions survive LRU eviction of their node. Recreating the evicted node
+  is cold and emits nothing; a later policy-distinct recomputation fires
+  normally.
 
 `QueryChangeEvent` is a frozen dataclass carrying the node's `query_id`,
 `args_digest`, decision (`"executed"`), and the `changed_at` / `verified_at`
 revisions at the time of execution.
+
+The observer regression suite, including `tests/test_observer_semantics.py`,
+exercises these rules in all three modes: equal callback objects, late
+subscription, unsubscription before and during dispatch, multi-event batches,
+LRU/cold behavior, untracked stable execution, and checkpoint-warm versus fresh
+event histories.
 
 ## Public Surface
 
@@ -703,10 +973,10 @@ Core:
 | `query` | Decorator declaring a pure incremental query. |
 | `Query` | The declared-query object `@query` returns; readable from other queries and from `db.get`. |
 | `Resource` | Base class for tracked external values; see the Resource hooks above. |
-| `FileResource` | Text-file resource: content-hash probe, decoded string value. |
-| `BinaryFileResource` | Byte-file resource: content-hash probe, raw bytes value. |
-| `FileStatResource` | Stat-signature resource for existence/shape checks without content reads. |
-| `FileStatSnapshot` | The frozen stat observation `FileStatResource` produces. |
+| `FileResource` | Regular text-file resource: nonblocking descriptor validation, content-hash probe, decoded string value. |
+| `BinaryFileResource` | Regular byte-file resource: nonblocking descriptor validation, content-hash probe, raw bytes value. |
+| `FileStatResource` | Stat-signature resource for existence/shape checks without content reads; `read()` returns `FileStatSnapshot` in every mode. |
+| `FileStatSnapshot` | The frozen typed stat observation `FileStatResource` produces, with `.exists`, `.size`, and `.mtime_ns`. |
 | `EnvResource` | Environment-variable resource. |
 | `DirectoryResource` | Directory-listing resource. |
 | `ResolvedPathResource` | Symlink-aware path canonicalization as a tracked value. |
@@ -715,15 +985,15 @@ Values and snapshots:
 
 | Name | What it is |
 |---|---|
-| `freeze` | Deep-convert a value into its canonical immutable snapshot. |
+| `freeze` | Deep-convert a value into its canonical owned snapshot. |
 | `thaw` | Rebuild the mutable form of a snapshot. |
 | `semantic_equal` | The kernel's semantic-equality decision over two values. |
 | `serialize_snapshot` | Encode a canonical snapshot into the stable `K2` byte grammar. |
 | `deserialize_snapshot` | Decode and validate `K2` bytes back into a snapshot. |
-| `FrozenList` | Immutable list view crossing cached boundaries. |
-| `FrozenDict` | Immutable mapping view crossing cached boundaries. |
-| `FrozenSet` | Immutable set view crossing cached boundaries. |
-| `FrozenRecord` | Immutable dataclass snapshot preserving type identity. |
+| `FrozenList` | Read-only list view crossing cached boundaries. |
+| `FrozenDict` | Read-only mapping view crossing cached boundaries. |
+| `FrozenSet` | Read-only set view crossing cached boundaries. |
+| `FrozenRecord` | Read-only dataclass snapshot retaining a qualified-name tag and fields, not reconstructible Python type identity. |
 | `FrozenGraph` | Canonical encoding of a cyclic or shared object graph. |
 | `FrozenRef` | Back-edge marker inside a `FrozenGraph` node table. |
 | `FrozenAdapterValue` | Snapshot produced by a registered `ValueAdapter`. |
@@ -736,7 +1006,7 @@ Actions and stores:
 | `action` | Decorator declaring a filesystem-reconciling action over declared outputs. |
 | `Action` | The declared-action object: `reconcile` and `plan`. |
 | `Output` | One declared file output: relative path plus content. |
-| `ReconcileResult` | What a reconcile did: created, updated, repaired, deleted, unchanged, plus `dry_run`. |
+| `ReconcileResult` | What a reconcile did: created, updated, repaired, actually deleted, unchanged, dry-run `would_delete`, plus `dry_run`. |
 | `ArtifactStore` | Interface for durable content-addressed artifact storage. |
 | `InMemoryArtifactStore` | Process-local store for tests and ephemeral use. |
 | `FileSystemArtifactStore` | Durable on-disk store with advisory locking. |
@@ -745,16 +1015,38 @@ Inspection and observation:
 
 | Name | What it is |
 |---|---|
-| `DatabaseStatistics` | Node, edge, and work counters for one database. |
-| `InspectionNode` | One node in an `inspect`/`explain` report: decision, reason, dependencies. |
+| `DatabaseStatistics` | Current node counts plus cumulative request/work counters for one database. |
+| `InspectionNode` | One node in an `inspect`/`explain` report: revisions, latest verification decision, latest recomputation outcome, reason, impurity, and dependencies. |
 | `DependencyGraphNode` | One labeled node in the exported dependency graph. |
-| `QueryProfile` | Per-query execution/reuse/backdate counts from profiling. |
-| `CaptureInfo` | One captured name in an `explain_query_captures` report. |
-| `explain_query_captures` | Preview how a query's captures will be classified before first `get`. |
+| `QueryProfile` | Per-query-node body-execution timing aggregates; reuse has no execution sample. |
+| `CaptureInfo` | One statically discoverable captured name in an `explain_query_captures` report. |
+| `explain_query_captures` | Preview how a query's statically discoverable captures will be classified before first `get`; dynamic namespace/reflection reads are absent. |
 | `Subscription` | Handle returned by `Database.observe`; closes the subscription. |
 | `QueryChangeEvent` | Delivered to observers when a subscribed query's result changes. |
 | `ObserverCallback` | Callback type receiving `QueryChangeEvent`s. |
 | `ObserverErrorHook` | Callback type receiving exceptions raised by observers. |
+
+`InspectionNode.last_decision` is the most recent verification decision for the
+node (`executed`, `backdated`, `reused`, or `failed`).
+`InspectionNode.last_recompute` is the most recent outcome that actually ran
+the node body or resource load; a later reuse changes `last_decision` but leaves
+`last_recompute` intact. `changed_at` is the revision at which the stored value
+last changed, while `verified_at` is the revision through which its dependencies
+were last verified. The remaining fields are `label`, `kind`, `reason`,
+`untracked_reasons`, recursive `dependencies`, and derived `is_untracked`.
+
+`DatabaseStatistics` reports current `node_count`, `input_count`,
+`query_count`, and `resource_count`; cumulative `query_executions`,
+`query_reuses`, `query_backdates`, `resource_loads`, `resource_probe_hits`,
+`input_sets`, `input_equal_ignores`, and `evictions`; and the database-lifetime
+`total_requests`. `reset_statistics()` clears the cumulative work counters and
+query timings, not the graph or lifetime request ordinal.
+
+Each `QueryProfile` contains `query_label`, `execution_count`, and nanosecond
+`total_ns`, integer `mean_ns`, `min_ns`, `max_ns`, and `last_ns`. A body that
+executes and backdates contributes a timing sample because it ran; a reused
+query does not. Profiles are per argument-specific query node and include only
+samples since construction or the last `reset_statistics()`.
 
 Errors:
 
@@ -763,11 +1055,15 @@ Errors:
 | `PyIncError` | Base error for pyinc; every error below is catchable as this. |
 | `MutationError` | A query mutated one of its boundary inputs. |
 | `UntrackedReadError` | Code performed an undeclared external read. |
+| `ResourceDependencyError` | A Resource hook attempted to read database-managed state. |
+| `QueryContextError` | A query attempted a forbidden database operation, cross-database read, or Layer-3 integration call. |
+| `QueryConcurrencyError` | Query or Resource execution attempted to launch concurrent work. |
 | `UnsupportedValueError` | A value cannot cross a cached boundary safely. |
 | `CycleError` | Query evaluation encountered a dependency cycle. |
 | `InputKeyError` | An input key is invalid or conflicts within a database. |
 | `CheckpointError` | Base error for durable-checkpoint failures. |
 | `CheckpointVersionError` | A checkpoint uses an unsupported manifest or kernel version. |
+| `CheckpointModeError` | A checkpoint was saved under a different execution mode. |
 | `CheckpointManifestError` | A checkpoint manifest is malformed or internally inconsistent. |
 | `CheckpointIntegrityError` | Checkpoint bytes do not match their content address. |
 | `ActionError` | Base error for output reconciliation failures. |
@@ -804,6 +1100,12 @@ The mutation adversarial suite (`test_external_alias_mutation_after_boundary_cro
 value membrane protects cached state from external mutation, deep mutation, and
 cross-query aliasing.
 
+`tests/test_query_concurrency.py` exercises the synchronous-query boundary in
+all three modes: low-level thread aliases, cached and prewarmed executors,
+multiprocessing Process/Pool paths, command launch, fork, sticky caught
+violations, same-mode checkpoint reloads, same/cross-database deadlock shapes,
+and positive top-level and Resource-command cases.
+
 The durable cross-run guarantee (limitation 4) is checked by the same
 fresh-recomputation equivalence, extended to the checkpoint path:
 
@@ -820,3 +1122,7 @@ fresh-recomputation equivalence, extended to the checkpoint path:
   manifests, changed query/adapter/resource implementations, and
   runtime-import-reached dependencies each fall back to safe re-execution or a
   loud `ValueError` rather than serving a stale or tampered value.
+- `tests/test_checkpoint_store_integrity.py` — preseeded conflicting bytes are
+  rejected for query results and calls plus resource results and parameters;
+  equal preseeded bytes remain idempotent, every mode warms like a fresh run,
+  and warmed checkpoint resaves cannot endorse corrupt destination state.

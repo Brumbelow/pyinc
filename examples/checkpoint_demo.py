@@ -1,12 +1,15 @@
 """Demonstrate cross-run cache reuse via save_checkpoint / load_checkpoint.
 
-The checkpoint API lets a process serialise its entire node-record cache to an
-ArtifactStore and reload it in a subsequent process, skipping re-execution for
-any query whose declared inputs and resource probes are unchanged.
+The checkpoint API stores the eligible, dependency-closed query and resource
+records in an ArtifactStore and reloads them in a subsequent process, skipping
+re-execution for records whose declared inputs, code, mode, adapters, and
+resource probes still verify. Inputs, failures, untracked nodes, and stale or
+unverifiable records are not a serialized copy of the entire in-memory cache.
 
-This script simulates two "runs" in a single process to make the behaviour
-visible without spawning a subprocess.  In real use, each run would be a
-separate invocation sharing the same FileSystemArtifactStore path.
+This script simulates three database runs in one process to make unchanged and
+changed-input behavior visible without spawning subprocesses. In real use,
+each run would be a separate invocation sharing the same
+FileSystemArtifactStore path.
 """
 
 from __future__ import annotations

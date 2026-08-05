@@ -1,6 +1,6 @@
 # `pyinc_codegen` — JSON-Schema → Typed Python Compiler
 
-`pyinc_codegen` is a reference *consumer* of pyinc: the first useful file→file
+`pyinc_codegen` is a reference *consumer* of pyinc: a useful file→file
 compiler built on the kernel. It reads a JSON Schema document and generates a
 typed Python model per definition, plus a documentation file per definition and
 an aggregate `__init__.py`, emitting everything through the [`@action`
@@ -292,8 +292,10 @@ does not validate instances.
 The query graph is decomposed so the kernel's backdating gives output-granular
 incrementality, which the action layer turns into write-granular incrementality:
 
-- **whitespace / key reorder** — the `schema_text` cutoff is the canonicalized
-  JSON, so formatting-only edits backdate and nothing downstream runs or writes.
+- **whitespace / key reorder** — exact `schema_text` executes and publishes the
+  new spelling. Parsed definition/diagnostic payloads recompute and backdate when
+  their complete values are equal, so render dependents are reused and nothing
+  is written.
 - **description-only change** — rewrites only the affected `docs/<x>.md`. The
   description-free `definition_structure` payload backdates, so the `.py`
   render query is reused and the model is not rewritten.

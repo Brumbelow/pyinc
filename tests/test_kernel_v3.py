@@ -548,7 +548,7 @@ def test_query_identity_and_pinned_walk_recurse_into_tuple_query() -> None:
     assert db.get(first) == 13
     assert db.get(second) == 21
     assert db._query_key(first, (), {})[0].identity != db._query_key(second, (), {})[0].identity
-    queries, _resources = db._collect_pinned_capture_objects(first.fn)
+    queries, _resources = db._collect_pinned_capture_objects(cast(FunctionType, first.fn))
     assert queries[first_child.key] is first_child
 
 
@@ -602,7 +602,9 @@ def test_pinned_capture_walk_recurses_through_immutable_shapes_and_methods() -> 
         _pin = nested
         return child(db) + cast(Callable[[], int], bound)()
 
-    queries, resources = Database()._collect_pinned_capture_objects(parent.fn)
+    queries, resources = Database()._collect_pinned_capture_objects(
+        cast(FunctionType, parent.fn)
+    )
 
     assert queries[child.key] is child
     assert resource in resources.values()
@@ -850,7 +852,6 @@ def test_source_pinned_module_function_keeps_safe_transitive_globals(
     store = InMemoryArtifactStore()
     writer = Database(store=store)
     assert writer.get(read_answer) == 1
-    assert read_answer not in writer._query_fingerprint_memo
     checkpoint = writer.save_checkpoint()
 
     helper_path.write_text("def answer():\n    return 2\n", encoding="utf-8")
@@ -1114,7 +1115,7 @@ def test_set_many_rejects_duplicate_keys_before_mutating() -> None:
     assert db.statistics().node_count == 0
 
 
-def test_caught_query_failure_does_not_publish_a_dependency_edge() -> None:
+def test_caught_query_failure_marks_catcher_untracked_without_child_edge() -> None:
     @query
     def failing(db: Database) -> int:
         raise RuntimeError("boom")
@@ -1128,25 +1129,34 @@ def test_caught_query_failure_does_not_publish_a_dependency_edge() -> None:
 
     db = Database()
     assert db.get(catches_failure) == 7
-    assert db.inspect(catches_failure).dependencies == ()
+    parent_key, _call_snapshot = db._query_key(catches_failure, (), {})
+    parent_record = db._records[parent_key]
+    assert parent_record.dependencies == set()
+    assert parent_record.untracked_reasons == [
+        f"caught failure from child query {failing.key!r} before it published"
+    ]
+    assert not parent_record.checkpointable
     assert all("failing" not in key.label for key in db._call_snapshot_registry)
     assert all(query_obj is not failing for query_obj in db._query_registry.values())
 
 
-def test_query_catching_its_own_cycle_keeps_committed_registries() -> None:
-    @query
+@pytest.mark.parametrize("mode", ("strict", "checked", "fast"))
+def test_query_catching_its_own_cycle_keeps_committed_registries(mode: str) -> None:
+    @query(key=f"caught-self-cycle-{mode}")
     def catches_cycle(db: Database) -> int:
         try:
             return catches_cycle(db)
         except CycleError:
             return 1
 
-    db = Database()
+    db = Database(mode=mode)
     assert db.get(catches_cycle) == 1
     key = next(iter(db._query_records))
     assert key in db._records
     assert key in db._call_snapshot_registry
     assert db._query_registry[key.identity] is catches_cycle
+    assert db._records[key].untracked_reasons == []
+    assert db._records[key].checkpointable
     assert db.get(catches_cycle) == 1
     assert db.inspect(catches_cycle).last_decision == "reused"
 
@@ -1185,7 +1195,6 @@ def test_high_cardinality_query_state_stays_bounded_by_lru_limit() -> None:
     assert len(db._query_timings) == limit
     assert len(db.query_profile()) == limit
     assert len(db._query_registry) == 1
-    assert len(db._query_fingerprint_memo) == 1
     assert all(not isinstance(timing, list) for timing in db._query_timings.values())
 
 
@@ -1545,7 +1554,7 @@ def test_resource_labels_are_validated_but_do_not_define_node_identity() -> None
         db.read_resource(resource, "other")
 
 
-def test_resource_configuration_and_parameter_preserve_nan_identity_bits() -> None:
+def test_resource_configuration_rejects_non_substitutive_nan_identity() -> None:
     @dataclass(frozen=True)
     class FloatResource(Resource[float, bytes, bytes]):
         configured: float
@@ -1568,11 +1577,12 @@ def test_resource_configuration_and_parameter_preserve_nan_identity_bits() -> No
     second = FloatResource(second_nan)
     db = Database()
 
-    assert (
-        db._resource_key(first, first_nan).identity != db._resource_key(second, second_nan).identity
-    )
-    assert db.read_resource(first, first_nan) == bytes.fromhex("7ff80000000000017ff8000000000001")
-    assert db.read_resource(second, second_nan) == bytes.fromhex("7ff80000000000027ff8000000000002")
+    for resource, parameter in ((first, first_nan), (second, second_nan)):
+        with pytest.raises(
+            UnsupportedValueError,
+            match="contains a non-substitutive value such as NaN",
+        ):
+            db.read_resource(resource, parameter)
 
 
 def test_checkpoint_schema_v4_can_warm_a_none_result() -> None:

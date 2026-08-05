@@ -64,9 +64,7 @@ def _expected_rows(targets: Sequence[str]) -> tuple[tuple[str, str, str], ...]:
         except KeyError as error:
             raise KeyError(f"unknown bench target: {target!r}") from error
         rows.extend(
-            (target, scenario, engine)
-            for scenario, engines in matrix
-            for engine in engines
+            (target, scenario, engine) for scenario, engines in matrix for engine in engines
         )
     return tuple(rows)
 
@@ -91,7 +89,7 @@ CountExpectation = int | tuple[int, int]
 @dataclass(frozen=True)
 class WorkExpectation:
     query_executions: CountExpectation
-    query_reuses: CountExpectation
+    query_reuses_fixture: int
     query_backdates: CountExpectation
     resource_loads: CountExpectation
     memo_nodes: CountExpectation
@@ -102,7 +100,7 @@ class WorkExpectation:
 
 def _work(
     query_executions: CountExpectation,
-    query_reuses: CountExpectation,
+    query_reuses_fixture: int,
     query_backdates: CountExpectation,
     resource_loads: CountExpectation,
     memo_nodes: CountExpectation,
@@ -112,7 +110,7 @@ def _work(
 ) -> WorkExpectation:
     return WorkExpectation(
         query_executions,
-        query_reuses,
+        query_reuses_fixture,
         query_backdates,
         resource_loads,
         memo_nodes,
@@ -123,10 +121,13 @@ def _work(
 
 
 # These envelopes are the reviewed deterministic-work contract for the release
-# harness. Ranges are used only for call-level reuse counts affected by
-# digest-sorted verification order, and for codegen removal where that order can
-# execute either 8 or 12 nodes. Execution ceilings remain far below a cold/full
-# graph, so deterministic over-recomputation fails the release gate.
+# harness. Every expectation field is enforced absolutely. The separate
+# call-level query-reuse value only seeds fixtures; the five-run gate checks its
+# same-path determinism without presenting it as a cross-path envelope. Codegen
+# removal has an execution range
+# because digest-sorted verification can execute either 8 or 12 nodes. Those
+# ceilings remain far below a cold/full graph, so deterministic
+# over-recomputation fails the release gate.
 PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("synthetic", "cold"): _work(7, 0, 0, 0, 14, 7, 18, 18),
     ("synthetic", "unchanged"): _work(0, 7, 0, 0, 14, 0, 18, 0),
@@ -136,20 +137,18 @@ PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("calc", "cold"): _work(15, 23, 0, 2, 17, 17, 22, 22),
     ("calc", "unchanged"): _work(0, 38, 0, 0, 17, 0, 22, 0),
     ("calc", "unreferenced_file_edit"): _work(0, 38, 0, 0, 17, 0, 22, 0),
-    ("calc", "comment_only_referenced_edit"): _work(0, 37, 1, 1, 17, 0, 22, 0),
-    ("calc", "localized_semantic_edit"): _work(5, (38, 39), 5, 1, 17, 0, 22, 0),
-    ("calc", "high_fanout_shared_edit"): _work(7, (42, 43), 4, 1, 17, 0, 22, 0),
-    ("calc", "removed_emitted_artifact"): _work(4, (28, 29), 4, 1, 17, 0, 22, 0),
+    ("calc", "comment_only_referenced_edit"): _work(1, 37, 1, 1, 17, 0, 22, 0),
+    ("calc", "localized_semantic_edit"): _work(5, 38, 5, 1, 17, 0, 22, 0),
+    ("calc", "high_fanout_shared_edit"): _work(7, 42, 4, 1, 17, 0, 22, 0),
+    ("calc", "removed_emitted_artifact"): _work(4, 28, 4, 1, 17, 0, 22, 0),
     ("calc", "tampered_generated_output"): _work(0, 29, 0, 0, 17, 0, 22, 0),
     ("calc", "checkpoint_restore"): _work(0, 3, 0, 0, 15, 15, 19, 19),
     ("codegen", "cold"): _work(29, 175, 0, 1, 30, 30, 43, 43),
     ("codegen", "unchanged"): _work(0, 204, 0, 0, 30, 0, 43, 0),
-    ("codegen", "comment_only_referenced_edit"): _work(0, 203, 1, 1, 30, 0, 43, 0),
-    ("codegen", "localized_semantic_edit"): _work(6, (201, 209), 10, 1, 30, 0, 43, 0),
-    ("codegen", "high_fanout_shared_edit"): _work(6, (212, 220), 14, 1, 30, 0, 43, 0),
-    ("codegen", "removed_emitted_artifact"): _work(
-        (8, 12), (150, 158), 7, 1, 30, 0, 40, -3
-    ),
+    ("codegen", "comment_only_referenced_edit"): _work(1, 203, 10, 1, 30, 0, 43, 0),
+    ("codegen", "localized_semantic_edit"): _work(6, 205, 10, 1, 30, 0, 43, 0),
+    ("codegen", "high_fanout_shared_edit"): _work(6, 216, 14, 1, 30, 0, 43, 0),
+    ("codegen", "removed_emitted_artifact"): _work((8, 12), 160, 7, 1, 30, 0, 40, -3),
     ("codegen", "tampered_generated_output"): _work(0, 154, 0, 0, 30, 0, 40, 0),
     ("codegen", "checkpoint_restore"): _work(0, 37, 0, 0, 24, 24, 33, 33),
     ("action", "cold"): _work(3, 0, 0, 0, 5, 3, 3, 3),
@@ -165,11 +164,11 @@ def _minimum(expectation: CountExpectation) -> int:
 
 
 def expected_work_metrics(target: str, scenario: str) -> WorkMetrics:
-    """Return one valid fixture value for the authoritative work envelope."""
+    """Return one fixture vector for the benchmark work contract."""
     expectation = PYINC_WORK_EXPECTATIONS[(target, scenario)]
     return WorkMetrics(
         query_executions=_minimum(expectation.query_executions),
-        query_reuses=_minimum(expectation.query_reuses),
+        query_reuses=expectation.query_reuses_fixture,
         query_backdates=_minimum(expectation.query_backdates),
         resource_loads=_minimum(expectation.resource_loads),
         memo_nodes=_minimum(expectation.memo_nodes),
@@ -178,9 +177,19 @@ def expected_work_metrics(target: str, scenario: str) -> WorkMetrics:
         dep_graph_edge_delta=_minimum(expectation.dep_graph_edge_delta),
     )
 
+
 _WORK_FIELDS = (
     "query_executions",
     "query_reuses",
+    "query_backdates",
+    "resource_loads",
+    "memo_nodes",
+    "memo_node_delta",
+    "dep_graph_edges",
+    "dep_graph_edge_delta",
+)
+_AUTHORITATIVE_WORK_FIELDS = (
+    "query_executions",
     "query_backdates",
     "resource_loads",
     "memo_nodes",
@@ -265,10 +274,21 @@ def _work_values(result: ScenarioResult) -> tuple[int | None, ...]:
     )
 
 
+def _authoritative_work_values(result: ScenarioResult) -> tuple[int | None, ...]:
+    return (
+        result.query_executions,
+        result.query_backdates,
+        result.resource_loads,
+        result.memo_nodes,
+        result.memo_node_delta,
+        result.dep_graph_edges,
+        result.dep_graph_edge_delta,
+    )
+
+
 def _expectation_values(expectation: WorkExpectation) -> tuple[CountExpectation, ...]:
     return (
         expectation.query_executions,
-        expectation.query_reuses,
         expectation.query_backdates,
         expectation.resource_loads,
         expectation.memo_nodes,
@@ -287,8 +307,8 @@ def _matches_expectation(actual: int, expected: CountExpectation) -> bool:
 def _validate_authoritative_work(result: ScenarioResult) -> None:
     expectation = PYINC_WORK_EXPECTATIONS[(result.target, result.scenario)]
     for field, actual, expected in zip(
-        _WORK_FIELDS,
-        _work_values(result),
+        _AUTHORITATIVE_WORK_FIELDS,
+        _authoritative_work_values(result),
         _expectation_values(expectation),
         strict=True,
     ):
@@ -397,9 +417,7 @@ def aggregate_repetitions(
     return summaries
 
 
-def _write_samples_csv(
-    repetitions: Sequence[Sequence[ScenarioResult]], path: Path
-) -> None:
+def _write_samples_csv(repetitions: Sequence[Sequence[ScenarioResult]], path: Path) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(_SAMPLE_FIELDS)
@@ -465,8 +483,9 @@ def _write_markdown(summaries: Sequence[BenchmarkSummary], path: Path) -> None:
         "# pyinc benchmark",
         "",
         (
-            "Correctness and deterministic work are release gates. Timings are informational "
-            "and report the median and range from five isolated `PYTHONHASHSEED=0` processes."
+            "Correctness, authoritative deterministic work, and same-path repeatability are "
+            "release gates. Timings are informational and report the median and range from "
+            "five isolated `PYTHONHASHSEED=0` processes."
         ),
         "",
         (
@@ -489,6 +508,10 @@ def _write_markdown(summaries: Sequence[BenchmarkSummary], path: Path) -> None:
             "## Results",
             "",
             "Work is `executions/reuses/backdates/resource loads`; graph is `nodes/edges`.",
+            "`reuses` is a call-level diagnostic that must repeat exactly across the five "
+            "same-path runs but has no absolute cross-path envelope: absolute path arguments "
+            "can change verification order and repeated already-checked calls without changing "
+            "executions or graph work.",
             "",
             "| target | scenario | engine | median ms | min-max ms | work | graph | fresh |",
             "|---|---|---|---:|---:|---:|---:|:---:|",

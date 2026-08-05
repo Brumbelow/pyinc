@@ -4,16 +4,16 @@ import ast
 import os
 import unicodedata
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal, TypeAlias, overload
 
 from pyinc._python_lexing import identifier_tokens
 from pyinc.core import query
 from pyinc.integrations.python_source import source_text
 from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
+from pyinc.resources import _resolved_path
 from pyinc.runtime import Database
 
-from ._decoding import decoded, once_per_request
+from ._decoding import _layer3_entrypoint, decoded, once_per_request
 
 ScopeKind: TypeAlias = Literal[
     "module", "class", "function", "lambda", "comprehension", "type_alias"
@@ -988,6 +988,11 @@ def scope_tree_payload(db: Database, path: str) -> ScopeTreePayload:
         parsed = ast.parse(source, filename=path)
     except SyntaxError:
         return path, tuple(), tuple(), tuple()
+    except ValueError:
+        # An embedded NUL is invalid as the compiler filename even when the
+        # conservative file-resource value is empty. Preserve the same
+        # empty-source module scope that another missing path produces.
+        parsed = ast.parse("", filename="<invalid-path>")
     result = _ScopeBuilder(path, source, parsed).build()
     scopes = tuple(
         (item.id, item.kind, _range_payload(item.range), item.parent_id) for item in result.scopes
@@ -1066,11 +1071,11 @@ def _decode_scope_tree(payload: ScopeTreePayload) -> ScopeTree:
     return ScopeTree(result_path, scopes, tuple(bindings), occurrences)
 
 
+@_layer3_entrypoint
 def scope_tree(db: Database, path: str | os.PathLike[str]) -> ScopeTree:
-    normalized = str(Path(path).resolve(strict=False))
-    return once_per_request(
-        db, "scope_tree", (normalized,), lambda: _scope_tree(db, normalized)
-    )
+    raw_path = os.fspath(path)
+    normalized = _resolved_path(raw_path) or raw_path
+    return once_per_request(db, "scope_tree", (normalized,), lambda: _scope_tree(db, normalized))
 
 
 def _scope_tree(db: Database, normalized: str) -> ScopeTree:
@@ -1095,6 +1100,7 @@ def symbol_at(
 ) -> SymbolId | None: ...
 
 
+@_layer3_entrypoint
 def symbol_at(
     db: Database,
     root_or_path: str | os.PathLike[str],

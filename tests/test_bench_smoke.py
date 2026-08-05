@@ -141,7 +141,8 @@ def test_report_artifacts_contain_raw_and_summarized_samples(
     assert comparator["query_executions"] == comparator["dep_graph_edges"] == ""
 
     markdown = markdown_path.read_text(encoding="utf-8")
-    assert "Correctness and deterministic work are release gates" in markdown
+    assert "Correctness, authoritative deterministic work" in markdown
+    assert "no absolute cross-path envelope" in markdown
     assert "STALE CONTROL" in markdown
     assert json.loads(metadata_path.read_text(encoding="utf-8")) == metadata
 
@@ -162,6 +163,21 @@ def test_repetition_validation_rejects_work_count_drift() -> None:
     )
     with pytest.raises(AssertionError, match="non-deterministic work counts"):
         harness.validate_repetitions(repetitions)
+
+
+def test_path_dependent_reuse_calls_are_not_an_absolute_work_gate() -> None:
+    repetitions = [_valid_matrix() for _ in range(harness.REPETITIONS)]
+    index = next(
+        index
+        for index, row in enumerate(repetitions[0])
+        if row.target == "codegen"
+        and row.scenario == "removed_emitted_artifact"
+        and row.engine == "pyinc"
+    )
+    for results in repetitions:
+        results[index] = replace(results[index], query_reuses=162)
+
+    harness.validate_repetitions(repetitions)
 
 
 @pytest.mark.parametrize(

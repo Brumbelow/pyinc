@@ -5,13 +5,22 @@ from pyinc.errors import (
     CycleError,
     MutationError,
     PyIncError,
+    QueryConcurrencyError,
+    ResourceDependencyError,
     UnsupportedValueError,
     UntrackedReadError,
 )
 
 
 def test_error_hierarchy_inherits_from_base() -> None:
-    for cls in (MutationError, UntrackedReadError, UnsupportedValueError, CycleError):
+    for cls in (
+        MutationError,
+        UntrackedReadError,
+        ResourceDependencyError,
+        QueryConcurrencyError,
+        UnsupportedValueError,
+        CycleError,
+    ):
         assert issubclass(cls, PyIncError)
 
 
@@ -25,6 +34,8 @@ def test_error_messages_are_preserved() -> None:
         PyIncError,
         MutationError,
         UntrackedReadError,
+        ResourceDependencyError,
+        QueryConcurrencyError,
         UnsupportedValueError,
         CycleError,
     ):
@@ -33,7 +44,14 @@ def test_error_messages_are_preserved() -> None:
 
 
 def test_errors_are_catchable_by_base_class() -> None:
-    for cls in (MutationError, UntrackedReadError, UnsupportedValueError, CycleError):
+    for cls in (
+        MutationError,
+        UntrackedReadError,
+        ResourceDependencyError,
+        QueryConcurrencyError,
+        UnsupportedValueError,
+        CycleError,
+    ):
         with_caught = False
         try:
             raise cls("test")
@@ -47,6 +65,8 @@ def test_error_types_are_exported_from_package() -> None:
         "PyIncError",
         "MutationError",
         "UntrackedReadError",
+        "ResourceDependencyError",
+        "QueryConcurrencyError",
         "UnsupportedValueError",
         "CycleError",
     ):

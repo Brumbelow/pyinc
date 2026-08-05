@@ -391,7 +391,7 @@ def test_action_translates_unsafe_read_during_classification(
     root.mkdir()
     (root / "owned").write_bytes(b"current")
     declared = Action(lambda _db: (), tool="unsafe-read")
-    monkeypatch.setattr(action_module, "_read_manifest", lambda *_args: (False, {}))
+    monkeypatch.setattr(action_module, "_read_manifest", lambda *_args: (False, {}, False))
 
     def unsafe_read(_path: Path) -> bytes:
         raise UnsafeFilesystemPathError("target became unsafe")
@@ -417,12 +417,13 @@ def test_action_dry_run_ignores_already_missing_orphan(
     monkeypatch.setattr(
         action_module,
         "_read_manifest",
-        lambda *_args: (True, {"missing": digest, "present": digest}),
+        lambda *_args: (True, {"missing": digest, "present": digest}, False),
     )
 
     result = declared._reconcile_locked({}, root=root, state_dir=root, dry_run=True)
 
-    assert result.deleted == ("present",)
+    assert result.deleted == ()
+    assert result.would_delete == ("present",)
 
 
 def test_action_rechecks_target_type_before_writing(
@@ -441,7 +442,7 @@ def test_action_rechecks_target_type_before_writing(
         return (raced_directory, None if calls == 1 else metadata)
 
     declared = Action(lambda _db: (), tool="write-race")
-    monkeypatch.setattr(action_module, "_read_manifest", lambda *_args: (False, {}))
+    monkeypatch.setattr(action_module, "_read_manifest", lambda *_args: (False, {}, False))
     monkeypatch.setattr(action_module, "_safe_target", target_state)
 
     with pytest.raises(ActionPathError, match="not a regular file"):
@@ -482,13 +483,13 @@ def test_action_rechecks_orphan_before_deleting(
     monkeypatch.setattr(
         action_module,
         "_read_manifest",
-        lambda *_args: (True, {"owned": action_module._content_hash(b"owned")}),
+        lambda *_args: (True, {"owned": action_module._content_hash(b"owned")}, False),
     )
     monkeypatch.setattr(action_module, "_safe_target", target_state)
 
     if outcome == "missing":
         result = declared._reconcile_locked({}, root=root, state_dir=root, dry_run=False)
-        assert result.deleted == ("owned",)
+        assert result.deleted == ()
         assert regular.read_bytes() == b"owned"
     else:
         with pytest.raises(ActionPathError, match="non-regular owned target"):
@@ -496,13 +497,13 @@ def test_action_rechecks_orphan_before_deleting(
         assert directory.is_dir()
 
 
-def test_unreadable_migration_directories_are_left_to_the_write_and_prune_steps(
-    tmp_path: Path,
-) -> None:
+def test_unreadable_migration_directories_fail_closed_during_preflight(tmp_path: Path) -> None:
     missing = tmp_path / "missing"
 
-    assert _holds_only_desired_outputs(missing, "missing", {"missing/model.py"}) is False
-    assert _unprunable_entry(missing, "missing", set(), {}) is None
+    with pytest.raises(ActionPathError, match="Cannot inspect migration directory"):
+        _holds_only_desired_outputs(missing, "missing", {"missing/model.py"})
+    with pytest.raises(ActionPathError, match="Cannot inspect prunable directory"):
+        _unprunable_entry(missing, "missing", set(), {})
 
 
 def test_action_supports_direct_decorator_form() -> None:

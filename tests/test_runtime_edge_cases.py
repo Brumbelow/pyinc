@@ -37,6 +37,7 @@ from pyinc.runtime import (
     ExecutionFrame,
     NodeKey,
     NodeRecord,
+    _ObserverRegistration,
 )
 from pyinc.value import (
     FrozenAdapterValue,
@@ -253,9 +254,9 @@ class _UnloadableResource(Resource[str, str, str]):
 class _TallyingFailingResource(Resource[str, str, tuple[str, ...]]):
     """Never loads, appending one character per call to ``<key>.calls``.
 
-    The tally lives beside the resource's own key because a query's capture set
-    may not contain mutable state -- a counter attribute or module global is
-    rejected before the first ``get()``.
+    The tally lives beside the resource's own key because a statically discovered
+    query capture set may not contain mutable state -- a directly named counter
+    attribute or module global is rejected before the first ``get()``.
     """
 
     def _tally(self, key: str, event: str) -> None:
@@ -307,8 +308,8 @@ class _DeniableFileResource(Resource[str, str, tuple[str, ...]]):
     """A file resource whose probe and load both raise while a marker exists.
 
     Models the failure neither the probe nor the load survives. The marker lives
-    beside the key on disk because a query's capture set may not hold mutable
-    state.
+    beside the key on disk because a statically discovered query capture set may
+    not hold mutable state.
     """
 
     def _denied(self, path: str) -> bool:
@@ -401,6 +402,7 @@ def _manifest(
     return {
         "pyinc_ckpt_version": _CHECKPOINT_MANIFEST_VERSION,
         "kernel_fingerprint_version": 2,
+        "mode": "strict",
         "adapters": adapters or {},
         "records": records or [],
     }
@@ -774,7 +776,7 @@ def test_static_capture_rejects_mutable_slotted_cyclic_and_invalid_state() -> No
     with pytest.raises(UnsupportedValueError, match="Cyclic ambient values"):
         db._freeze_static_capture(value, {id(value)})
 
-    with pytest.raises(UnsupportedValueError, match="not a concrete dictionary"):
+    with pytest.raises(UnsupportedValueError, match="exact dict with exact str keys"):
         db._static_instance_dict(_NonDictState())
     with pytest.raises(UnsupportedValueError, match="Unsupported scalar subclass"):
         db._static_scalar_base_value(object())
@@ -848,7 +850,7 @@ def test_annotation_evaluator_and_function_metadata_cover_lazy_and_invalid_annot
         return None
 
     invalid_annotations.__annotations__ = {cast(Any, 1): int}
-    with pytest.raises(UnsupportedValueError, match="invalid annotations"):
+    with pytest.raises(UnsupportedValueError, match="exact dict with exact str keys"):
         db._function_metadata_payload(cast(FunctionType, invalid_annotations), set())
 
     class BrokenAnnotations:
@@ -900,7 +902,9 @@ def test_policy_payload_covers_functions_builtins_descriptors_callable_state_and
     def equal(left: int, right: int) -> bool:
         return left == right
 
-    assert db._policy_definition_payload(None)[0] == "default-semantic-equality-v3"
+    default_policy = db._policy_definition_payload(None)
+    assert default_policy[0] == "default-semantic-equality-v3"
+    assert default_policy[1] == 2
     assert db._policy_definition_payload(equal)[0] == "function"
     policy = _PolicyCallable()
     assert db._policy_definition_payload(policy)[0] == "callable"
@@ -955,9 +959,8 @@ def test_adapter_fingerprints_cover_state_methods_and_trust_failures() -> None:
     with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted"):
         Database()._adapter_method_payload(cast(Any, _UnsafeMethodAdapter()), "freeze")
 
-    unsafe_db = Database(adapters={_RuntimeType: cast(Any, _SlottedAdapter())})
-    unsafe_db._checkpoint_adapter_digests = {adapter_key: digest}
-    assert not unsafe_db._adapter_keys_trusted([adapter_key])
+    with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+        Database(adapters={_RuntimeType: cast(Any, _SlottedAdapter())})
 
 
 def test_captured_immutable_and_type_payloads_cover_behavior_bearing_shapes() -> None:
@@ -978,16 +981,18 @@ def test_captured_immutable_and_type_payloads_cover_behavior_bearing_shapes() ->
             ),
         )
 
-    assert captured(slice(1, 2, 1))[0] == "capture-slice"
-    assert captured((1, 2))[0] == "capture-tuple"
+    slice_capture = captured(slice(1, 2, 1))
+    assert slice_capture[0] == "captured-value-site-v1"
+    assert slice_capture[2][0] == "capture-slice"
+    assert captured((1, 2))[2][0] == "capture-tuple"
     tuple_subclass = _TupleSubclass((1, 2))
     tuple_subclass.metadata = "safe"
-    assert captured(tuple_subclass)[0] == "capture-tuple-subclass"
-    assert captured(frozenset({1, 2}))[0] == "capture-frozenset"
+    assert captured(tuple_subclass)[2][0] == "capture-tuple-subclass"
+    assert captured(frozenset({1, 2}))[2][0] == "capture-frozenset"
     frozen_subclass = _FrozenSetSubclass({1, 2})
     frozen_subclass.metadata = "safe"
-    assert captured(frozen_subclass)[0] == "capture-frozenset-subclass"
-    assert captured(_FrozenRuntimeConfig(1))[0] == "capture-frozen-dataclass"
+    assert captured(frozen_subclass)[2][0] == "capture-frozenset-subclass"
+    assert captured(_FrozenRuntimeConfig(1))[2][0] == "capture-frozen-dataclass"
     with pytest.raises(UnsupportedValueError, match="Mutable dataclass"):
         captured(_MutableRuntimeConfig(1))
 
@@ -1087,6 +1092,10 @@ def test_checkpoint_manifest_root_and_record_validation_errors() -> None:
     wrong_kernel = _manifest()
     wrong_kernel["kernel_fingerprint_version"] = 1
     rejects(wrong_kernel, "kernel fingerprint version")
+
+    invalid_mode = _manifest()
+    invalid_mode["mode"] = "unknown"
+    rejects(invalid_mode, "field 'mode'")
 
     adapters_not_object = _manifest()
     adapters_not_object["adapters"] = []
@@ -1354,16 +1363,18 @@ def test_runtime_internal_cleanup_and_missing_registration_branches() -> None:
     def other_callback(event: object) -> None:
         return None
 
-    db._observers[key] = [callback]
+    registration = _ObserverRegistration(callback)
+    other_registration = _ObserverRegistration(other_callback)
+    db._observers[key] = [registration]
     db._enqueue_observer_event(cast(Any, type("Q", (), {"key": "query"})()), key, record)
 
     missing_key = NodeKey("query", "missing", _DIGEST, "missing")
-    db._unregister_observer(missing_key, callback)
-    db._unregister_observer(key, other_callback)
+    db._unregister_observer(missing_key, registration)
+    db._unregister_observer(key, other_registration)
 
     db._query_objects()[key.identity] = object()
     db._call_snapshots()[key] = ((), FrozenDict(()))
-    db._unregister_observer(key, callback)
+    db._unregister_observer(key, registration)
     assert key.identity not in db._query_objects()
 
     value = Input[int]("register-twice")
@@ -1397,14 +1408,21 @@ def test_ensure_tracked_read_honors_query_frames_and_raw_read_scope() -> None:
 def test_default_observer_hook_is_used_when_callback_raises(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    value = Input[int]("default-observer-hook")
+
     @query
     def observed(db: Database) -> int:
-        return 1
+        return value.read(db)
 
     def fail(event: object) -> None:
         raise RuntimeError("observer failed")
 
     db = Database()
-    db.observe(fail, observed)
+    db.set(value, 1)
     assert db.get(observed) == 1
+    db.observe(fail, observed)
+    db.inspect_fresh(observed)
+    assert capsys.readouterr().err == ""
+    db.set(value, 2)
+    assert db.get(observed) == 2
     assert "observer callback raised RuntimeError: observer failed" in capsys.readouterr().err

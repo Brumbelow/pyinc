@@ -103,6 +103,7 @@ def test_reconcile_result_is_frozen_dataclass() -> None:
         dry_run=False,
     )
     assert res.created == ("a",)
+    assert res.would_delete == ()
     with pytest.raises(Exception):  # noqa: B017 - FrozenInstanceError
         res.dry_run = True  # type: ignore[misc]
 
@@ -573,7 +574,8 @@ def test_plan_reports_layout_migration_deletion_without_mutating(tmp_path: Path)
 
     assert plan.dry_run is True
     assert plan.created == ("pkg/model.py",)
-    assert plan.deleted == ("pkg",)
+    assert plan.deleted == ()
+    assert plan.would_delete == ("pkg",)
     assert (tmp_path / "pkg").read_text(encoding="utf-8") == "file layout"
     assert not (tmp_path / "pkg").is_dir()
     assert manifest.read_bytes() == manifest_before
@@ -1382,9 +1384,9 @@ def test_orphan_deletion_precedes_manifest_publication(
     original_unlink = action_module.unlink_regular_file
     original_manifest = action_module._write_manifest
 
-    def record_unlink(path: Path) -> bool:
+    def record_unlink(path: Path, *, expected_digest: str | None = None) -> bool:
         events.append("delete")
-        return bool(original_unlink(path))
+        return bool(original_unlink(path, expected_digest=expected_digest))
 
     def record_manifest(*args: object, **kwargs: object) -> None:
         events.append("manifest")

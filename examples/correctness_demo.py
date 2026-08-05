@@ -1,9 +1,9 @@
-"""pyinc correctness demo — showcasing what makes pyinc unique.
+"""pyinc correctness demo — exercising its tracked consistency contract.
 
 This demo walks through pyinc's core differentiators in sequence:
 
 1. Incremental recomputation with dependency tracking
-2. Backdating (early cutoff) — comment-only edits skip downstream work
+2. Exact raw inputs plus semantic backdating — comment-only edits skip downstream work
 3. Selective recomputation — only affected queries re-execute
 4. Untracked read enforcement — raw open() raises inside queries
 5. Mutation protection — frozen values reject writes in strict mode
@@ -27,43 +27,43 @@ from pyinc import Database, FileResource, UntrackedReadError, query
 _FILES = FileResource()
 
 
-# A cutoff function that compares by AST structure, not raw text.
-# Comment-only edits produce the same AST → backdated (early cutoff).
-def _ast_cutoff(source: str) -> str:
-    try:
-        return ast.dump(ast.parse(source))
-    except SyntaxError:
-        return source
-
-
-@query(cutoff=_ast_cutoff)
+@query
 def read_source(db: Database, path: str) -> str:
-    """Read a Python source file through the resource API."""
+    """Read exact Python source text through the resource API."""
     return _FILES.read(db, path)
+
+
+@query
+def source_structure(db: Database, path: str) -> tuple[str, str, int, int]:
+    """Return the complete AST-derived payload consumed by this pipeline.
+
+    Comment-only edits leave this payload equal, while ``read_source`` still
+    publishes the exact changed text.
+    """
+    source = read_source(db, path)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ("source", source, 0, 0)
+    functions = sum(
+        1 for node in ast.iter_child_nodes(tree) if isinstance(node, ast.FunctionDef)
+    )
+    imports = sum(
+        1 for node in ast.iter_child_nodes(tree) if isinstance(node, ast.Import | ast.ImportFrom)
+    )
+    return ("ast", ast.dump(tree), functions, imports)
 
 
 @query
 def count_functions(db: Database, path: str) -> int:
     """Count top-level function definitions in a source file."""
-    source = read_source(db, path)
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return 0
-    return sum(1 for node in ast.iter_child_nodes(tree) if isinstance(node, ast.FunctionDef))
+    return source_structure(db, path)[2]
 
 
 @query
 def count_imports(db: Database, path: str) -> int:
     """Count import statements in a source file."""
-    source = read_source(db, path)
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return 0
-    return sum(
-        1 for node in ast.iter_child_nodes(tree) if isinstance(node, ast.Import | ast.ImportFrom)
-    )
+    return source_structure(db, path)[3]
 
 
 @query
@@ -109,8 +109,8 @@ def main() -> None:
         print("\nProvenance tree:")
         print(db.explain(summary, str(sample)))
 
-        # --- Phase 2: Comment-only edit → backdating (early cutoff) ---
-        _banner("Phase 2: Comment-only edit → backdating (early cutoff)")
+        # --- Phase 2: Exact raw edit → parsed backdating (early cutoff) ---
+        _banner("Phase 2: Exact raw edit → parsed backdating (early cutoff)")
 
         print("Adding a comment to the source file...")
         sample.write_text(
@@ -132,10 +132,14 @@ def main() -> None:
 
         node = db.inspect(summary, str(sample))
         print(f"\nsummary decision: {node.last_decision}")
-        print("  (read_source was re-read from disk but the AST cutoff")
-        print("   detected no structural change → downstream queries")
-        print("   were backdated and did NOT re-execute)")
-        print("\nFull provenance:")
+        print(f"  raw source recompute: {db.inspect(read_source, str(sample)).last_recompute}")
+        print(
+            "  parsed payload recompute: "
+            f"{db.inspect(source_structure, str(sample)).last_recompute}"
+        )
+        print("  (the exact raw node changed; the complete AST payload backdated,")
+        print("   so count queries and the summary were reused)")
+        print("\nRecorded dependency explanation:")
         print(db.explain(summary, str(sample)))
 
         # --- Phase 3: Structural edit → selective recomputation ---
@@ -181,14 +185,14 @@ def main() -> None:
         except UntrackedReadError as exc:
             print(f"Caught UntrackedReadError: {exc}")
             print("\n  pyinc patches builtins.open during query execution.")
-            print("  All file reads must go through FileResource to maintain")
+            print("  Tracked file-content dependencies go through a Resource to maintain")
             print("  the from-scratch consistency guarantee.")
 
         # --- Phase 5: Mutation protection (strict mode) ---
         _banner("Phase 5: Mutation protection (strict mode)")
 
         @query
-        def get_config(db: Database) -> dict[str, int]:
+        def get_config(db: Database) -> Mapping[str, int]:
             return {"a": 1, "b": 2}
 
         frozen_result: Mapping[str, int] = db.get(get_config)

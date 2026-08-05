@@ -271,7 +271,7 @@ def test_definition_range_uses_decomposed_source_spelling(tmp_path: Path) -> Non
     )
 
 
-def test_comment_only_edit_backdates_source_and_reuses_downstream(
+def test_trailing_comment_executes_exact_source_and_backdates_equal_analysis(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "sample.py"
@@ -285,7 +285,8 @@ def test_comment_only_edit_backdates_source_and_reuses_downstream(
     second = file_analysis(db, path)
 
     assert second.imports == (ImportRef(module="os", kind="import", range=_range(0, 0, 9)),)
-    assert db.inspect(source_text, str(path)).last_recompute == "backdated"
+    assert db.inspect(source_text, str(path)).last_recompute == "executed"
+    assert db.inspect(import_statements_for_file, str(path)).last_recompute == "backdated"
     assert db.inspect(imports_for_file, str(path)).last_decision == "reused"
     assert db.inspect(file_analysis_payload, str(path)).last_decision == "reused"
 
@@ -454,12 +455,8 @@ def test_workspace_python_files_tracks_symlink_retargeting(tmp_path: Path) -> No
     _symlink_or_skip(link, outside)
 
     fresh = Database(mode="checked")
-    assert db.get(workspace_python_files, str(root)) == fresh.get(
-        workspace_python_files, str(root)
-    )
-    assert workspace_analysis(db, root) == workspace_analysis(
-        Database(mode="checked"), root
-    )
+    assert db.get(workspace_python_files, str(root)) == fresh.get(workspace_python_files, str(root))
+    assert workspace_analysis(db, root) == workspace_analysis(Database(mode="checked"), root)
 
 
 def test_workspace_analysis_reuses_when_only_outside_symlink_target_changes(

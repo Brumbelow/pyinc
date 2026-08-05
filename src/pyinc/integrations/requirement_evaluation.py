@@ -26,6 +26,8 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _layer3_entrypoint
+
 # ---------------------------------------------------------------------------
 # Payload type aliases
 # ---------------------------------------------------------------------------
@@ -457,8 +459,7 @@ def _eval_compare(
             diagnostics.append(
                 (
                     "extras-not-modeled",
-                    "marker references 'extra'; extras are not modeled — "
-                    "treating as empty string",
+                    "marker references 'extra'; extras are not modeled — treating as empty string",
                 )
             )
         if text == "platform_version":
@@ -718,6 +719,7 @@ def _decode_applicable(payload: ApplicableRequirementPayload) -> ApplicableRequi
     )
 
 
+@_layer3_entrypoint
 def evaluate_markers(db: Database, marker: str) -> MarkerEvaluation:
     """Evaluate a PEP 508 marker expression against the current Python environment."""
     payload = cast(
@@ -728,6 +730,7 @@ def evaluate_markers(db: Database, marker: str) -> MarkerEvaluation:
     return MarkerEvaluation(marker=text, value=value, diagnostics=diagnostics)
 
 
+@_layer3_entrypoint
 def evaluate_version_specifier(
     db: Database, specifier: str, version: str
 ) -> VersionSpecifierEvaluation:
@@ -742,6 +745,7 @@ def evaluate_version_specifier(
     )
 
 
+@_layer3_entrypoint
 def applicable_requirements(
     db: Database, path: str | os.PathLike[str]
 ) -> ApplicableRequirementsAnalysis:
@@ -760,6 +764,7 @@ def applicable_requirements(
     )
 
 
+@_layer3_entrypoint
 def workspace_applicable_requirements(
     db: Database, root: str | os.PathLike[str]
 ) -> ApplicableRequirementsAnalysis | None:

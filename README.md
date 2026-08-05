@@ -25,24 +25,20 @@ python -m pip install pyinc
 
 `pyinc` applies the established red-green incremental query model — the
 [Salsa](https://salsa-rs.github.io/salsa/) lineage that rust-analyzer is built
-on — to Python. The model is not new, and incremental recomputation for Python
-has a history of its own:
-[IncPy](https://www.usenix.org/conference/tapp-10/towards-practical-incremental-recomputation-scientists-implementation-python)
-explored it in 2010, [Adapton](https://matthewhammer.org/adapton/) listed a
-Python implementation, and libraries such as
-[Loman](https://pypi.org/project/loman/), [Darl](https://pypi.org/project/darl/),
-and [Cascade Query](https://github.com/hmatt1/cascade-query) each cover parts
-of this ground.
+on — to Python. Pull evaluation, dependency verification, and equal-result
+early cutoff/backdating are established techniques, and incremental
+recomputation for Python predates this project. The
+[dated related-work matrix](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/related-work.md)
+pins primary evidence for IncPy, Adapton, Loman, Cascade Query, and Calyxos.
 
-What `pyinc` adds is a soundness envelope for Python's mutable runtime, built
-so the cache-invalidation bugs that usually come with a hand-rolled caching
-layer — the editor still underlining an error you fixed a minute ago — have
-somewhere to be caught: deep owned snapshots including shared and cyclic
-graphs, guarded ambient reads with explicit resources, implementation-aware
-query and resource identities, integrity-checked durable checkpoints,
-declared-output reconciliation, and warm-versus-fresh differential testing
-behind a documented consistency contract.
-[The FAQ](https://github.com/Brumbelow/pyinc/blob/main/docs/faq.md)
+Among systems surveyed as of 2026-08-04, `pyinc` combines deep owned snapshots
+including shared and cyclic graphs, strict/checked/fast enforcement modes,
+enumerated ambient-read guards with explicit resources, implementation and
+interpreter-build identities, trust-bounded content-addressed checkpoints,
+declared-output action reconciliation, and differential from-scratch-
+consistency testing. That integrated Python-specific assurance envelope — not
+the graph algorithm — is the project's proposed contribution.
+[The FAQ](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/faq.md)
 covers how it compares with Salsa and with `functools.lru_cache`.
 
 ## Quick start
@@ -73,20 +69,20 @@ node instead of invalidating anything downstream.
 
 For files, environment variables, and directories, use a `Resource` rather
 than reading ambient state directly inside a query. The
-[getting-started guide](https://github.com/Brumbelow/pyinc/blob/main/docs/getting-started.md)
+[getting-started guide](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/getting-started.md)
 walks through inputs, resources, modes, inspection, and a first declared-output
 action.
 
 ## See it on a real workspace
 
-![Editing pytest under pyinc's watcher](https://raw.githubusercontent.com/Brumbelow/pyinc/main/docs/assets/demo.gif)
+![Editing pytest under pyinc's watcher](https://raw.githubusercontent.com/Brumbelow/pyinc/v3.1.2/docs/assets/demo.gif)
 
 `pyinc-tools` was pointed at a pinned checkout of pytest — nothing in it adapted
 for `pyinc` — and watched while single files were edited: in a single recorded
 run, 109.08 s to analyze all 270 files from cold, then 632 ms to catch up after
 an edit. Timings are machine-specific;
-[the demo page](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) has
-the clips, the full provenance, and the deterministic work counts.
+[the demo page](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/demo.md) has
+the clips, the recorded evidence, and the deterministic work counts.
 
 ## Correctness contract
 
@@ -97,20 +93,23 @@ made provided three conditions hold; outside them, no guarantee is made:
 1. **Owned value boundaries.** Query arguments, query results, and `Input`
    values are snapshot-safe or handled by a registered `ValueAdapter`.
 2. **Tracked ambient reads.** External state read by a query goes through a
-   `Resource`; reads the guard cannot intercept are declared with
-   `db.report_untracked_read(reason)`.
+   `Resource`. `db.report_untracked_read(reason)` may be used for reads the
+   guard cannot intercept, but it only prevents memo reuse for that node; it
+   does not turn the observation into a tracked or deterministic dependency.
 3. **Deterministic queries.** The same tracked dependencies produce a
    semantically equal result, and custom `eq=`/`cutoff=` policies are
    substitutive for dependents — a coarser policy narrows the guarantee to
-   consistency modulo the equivalence it declares.
+   consistency modulo the equivalence it declares. Query identity uses static
+   capture analysis; state reached only through dynamic namespace/reflection
+   APIs must be modeled as an `Input`/`Resource` or declared untracked.
 
-The [kernel contract](https://github.com/Brumbelow/pyinc/blob/main/docs/kernel-contract.md)
+The [kernel contract](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/kernel-contract.md)
 defines the exact value rules, intercepted operations, execution modes, durable
 checkpoint trust boundary, and documented limitations.
 
 Releases are cut from a signed tag whose whole commit range is signature-checked
 and published through PyPI trusted publishing;
-[releases and verification](https://github.com/Brumbelow/pyinc/blob/main/docs/releases.md)
+[releases and verification](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/releases.md)
 shows how to verify a download.
 
 ## Packages
@@ -120,29 +119,31 @@ surface is a subpackage of `pyinc`:
 
 | Package | Purpose | Start here |
 |---|---|---|
-| `pyinc` | Stable query kernel, resources, snapshots, artifact stores, and declared-output actions. | [Kernel contract](https://github.com/Brumbelow/pyinc/blob/main/docs/kernel-contract.md) |
-| `pyinc.integrations` | Stable, frozen analysis results and high-level entrypoints for Python source, configuration, dependencies, symbols, and notebooks. | [Integration contract](https://github.com/Brumbelow/pyinc/blob/main/docs/integration-contract.md) |
-| `pyinc_tools` | `pyinc-tools analyze`, a polling watcher, `WorkspaceSession`, and a stdio LSP server built on the integration API. | [Tooling guide](https://github.com/Brumbelow/pyinc/blob/main/docs/pyinc-tools-guide.md) |
-| `pyinc_codegen` | JSON Schema to typed Python generation through the public query and action APIs. | [Codegen guide](https://github.com/Brumbelow/pyinc/blob/main/docs/codegen-guide.md) |
+| `pyinc` | Stable query kernel, resources, snapshots, artifact stores, and declared-output actions. | [Kernel contract](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/kernel-contract.md) |
+| `pyinc.integrations` | Stable, frozen analysis results and high-level entrypoints for Python source, configuration, dependencies, symbols, and notebooks. | [Integration contract](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/integration-contract.md) |
+| `pyinc_tools` | `pyinc-tools analyze`, a polling watcher, `WorkspaceSession`, and a stdio LSP server built on the integration API. | [Tooling guide](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/pyinc-tools-guide.md) |
+| `pyinc_codegen` | JSON Schema to typed Python generation through the public query and action APIs. | [Codegen guide](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/codegen-guide.md) |
 
 Queries remain pure. Filesystem writes belong to the separate `@action` layer,
 which reconciles a complete desired output set with atomic file replacement,
 tamper repair, orphan cleanup, and dry-run planning. See the
-[action contract](https://github.com/Brumbelow/pyinc/blob/main/docs/action-contract.md).
+[action contract](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/action-contract.md).
 
 ## Documentation
 
-- [Getting started](https://github.com/Brumbelow/pyinc/blob/main/docs/getting-started.md) — build a small graph, add a tracked file, choose a mode, inspect work, and write a first action.
-- [Demo](https://github.com/Brumbelow/pyinc/blob/main/docs/demo.md) — the watcher running on a real workspace.
-- [FAQ](https://github.com/Brumbelow/pyinc/blob/main/docs/faq.md) — how this relates to Salsa, why not `lru_cache`, threading, and when not to use it.
-- [Architecture](https://github.com/Brumbelow/pyinc/blob/main/docs/architecture.md) — package boundaries and how the kernel, integrations, tools, and codegen fit together.
-- [Kernel contract](https://github.com/Brumbelow/pyinc/blob/main/docs/kernel-contract.md) — the normative soundness envelope.
-- [Action contract](https://github.com/Brumbelow/pyinc/blob/main/docs/action-contract.md) — declared-output reconciliation.
-- [Integration contract](https://github.com/Brumbelow/pyinc/blob/main/docs/integration-contract.md) — stable entrypoints, result types, supported shapes, and limits.
-- [`pyinc-tools` guide](https://github.com/Brumbelow/pyinc/blob/main/docs/pyinc-tools-guide.md) and [LSP reference](https://github.com/Brumbelow/pyinc/blob/main/docs/lsp-reference.md) — CLI, editor setup, overlays, protocol methods, and user-visible limitations.
-- [Integration authoring](https://github.com/Brumbelow/pyinc/blob/main/docs/integration-authoring.md) — the three-layer integration pattern.
-- [Migrating from 2.x](https://github.com/Brumbelow/pyinc/blob/main/docs/migration-v3.md) — state cleanup and 3.0 API changes.
-- [Releases and verification](https://github.com/Brumbelow/pyinc/blob/main/docs/releases.md) — signed tags, trusted publishing, and checking a download.
+- [Getting started](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/getting-started.md) — build a small graph, add a tracked file, choose a mode, inspect work, and write a first action.
+- [Demo](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/demo.md) — the watcher running on a real workspace.
+- [FAQ](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/faq.md) — how this relates to Salsa, why not `lru_cache`, threading, and when not to use it.
+- [Related work](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/related-work.md) — dated, pinned primary-source comparisons and the project's scoped positioning.
+- [Architecture](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/architecture.md) — package boundaries and how the kernel, integrations, tools, and codegen fit together.
+- [Kernel contract](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/kernel-contract.md) — the normative soundness envelope.
+- [Action contract](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/action-contract.md) — declared-output reconciliation.
+- [Integration contract](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/integration-contract.md) — stable entrypoints, result types, supported shapes, and limits.
+- [Public API tiers](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/public-api.md) — exact kernel, aggregate integration, module composition, tools, and codegen semver surfaces.
+- [`pyinc-tools` guide](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/pyinc-tools-guide.md) and [LSP reference](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/lsp-reference.md) — CLI, editor setup, overlays, protocol methods, and user-visible limitations.
+- [Integration authoring](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/integration-authoring.md) — the three-layer integration pattern.
+- [Migrating from 2.x](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/migration-v3.md) — state cleanup and 3.0 API changes.
+- [Releases and verification](https://github.com/Brumbelow/pyinc/blob/v3.1.2/docs/releases.md) — signed tags, trusted publishing, and checking a download.
 
 ## Development
 
@@ -151,7 +152,9 @@ git clone https://github.com/Brumbelow/pyinc.git
 cd pyinc
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install -e '.[dev]'
+python3 -m pip install --require-hashes --only-binary=:all: -r requirements/toolchain.lock
+python3 -m pip install --no-build-isolation --no-deps -e .
+python3 scripts/check_toolchain.py --verify-installed
 python3 scripts/check_docs.py
 pytest -q
 python3 -m mypy src tests bench scripts

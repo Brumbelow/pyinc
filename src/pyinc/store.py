@@ -15,6 +15,7 @@ import re
 import stat
 from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from ._locking import FileLock, _validate_lock_timeout
@@ -48,6 +49,9 @@ class ArtifactStore(Protocol):
     * Raise :class:`ValueError` from :meth:`put` if a digest is rebound to
       different bytes — silently keeping either value violates the soundness
       model and would mask corruption.
+
+    Explicit subclasses may inherit the :meth:`contains` implementation;
+    structural implementations may provide a more efficient equivalent.
     """
 
     def get(self, digest: str) -> bytes | None:
@@ -58,6 +62,7 @@ class ArtifactStore(Protocol):
 
     def contains(self, digest: str) -> bool:
         """Return ``True`` if ``digest`` is present. Default: ``get(...) is not None``."""
+        return self.get(digest) is not None
 
 
 class InMemoryArtifactStore:
@@ -87,7 +92,8 @@ class InMemoryArtifactStore:
         return digest in self._items
 
     def keys(self) -> Mapping[str, bytes]:
-        return self._items
+        """Return a read-only snapshot of the currently stored objects."""
+        return MappingProxyType(dict(self._items))
 
 
 class FileSystemArtifactStore:
@@ -105,7 +111,7 @@ class FileSystemArtifactStore:
             if "\0" in root_text:
                 raise ValueError("embedded null character in path")
             self._root = Path(root_text).resolve(strict=False)
-        except (OSError, TypeError, ValueError) as error:
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
             raise ArtifactStoreError(f"Artifact-store root path is invalid: {error}") from error
         self._objects = self._root / "objects"
         self._locks = self._root / "locks"
@@ -134,7 +140,7 @@ class FileSystemArtifactStore:
                 raise ArtifactStoreError(
                     f"Artifact-store path is not a directory: {path}"
                 ) from error
-            except OSError as error:
+            except (OSError, RuntimeError, ValueError) as error:
                 raise ArtifactStoreError(
                     f"Cannot safely create artifact-store directory: {path}"
                 ) from error
@@ -142,9 +148,18 @@ class FileSystemArtifactStore:
             metadata = path.lstat()
         except FileNotFoundError:
             return False
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ArtifactStoreError(
+                f"Cannot safely inspect artifact-store directory: {path}"
+            ) from error
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise ArtifactStoreError(f"Artifact-store path is not a directory: {path}")
-        resolved = path.resolve(strict=True)
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ArtifactStoreError(
+                f"Cannot safely resolve artifact-store directory: {path}"
+            ) from error
         try:
             common = os.path.commonpath((os.fspath(self._root), os.fspath(resolved)))
         except ValueError as error:
@@ -165,6 +180,10 @@ class FileSystemArtifactStore:
             metadata = target.lstat()
         except FileNotFoundError:
             return target, None
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ArtifactStoreError(
+                f"Cannot safely inspect artifact-store object: {target}"
+            ) from error
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise ArtifactStoreError(f"Artifact-store object is not a regular file: {target}")
         return target, metadata

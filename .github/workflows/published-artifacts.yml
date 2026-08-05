@@ -1,6 +1,9 @@
 name: Validate published artifacts
 
 on:
+  release:
+    types:
+      - published
   workflow_dispatch:
     inputs:
       version:
@@ -12,23 +15,58 @@ permissions:
   contents: read
 
 jobs:
+  resolve-release:
+    name: Resolve exact published release
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      ref: ${{ steps.release.outputs.ref }}
+    steps:
+      - name: Validate release identity
+        id: release
+        env:
+          PUBLISHED_TAG: ${{ github.event.release.tag_name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          if test "$GITHUB_EVENT_NAME" = release; then
+            case "$PUBLISHED_TAG" in
+              v*) version="${PUBLISHED_TAG#v}" ;;
+              *) echo "Published release tag must start with v" >&2; exit 1 ;;
+            esac
+          else
+            version="$REQUESTED_VERSION"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+            echo "Invalid exact release version: ${version}" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "ref=v$version" >> "$GITHUB_OUTPUT"
+
   artifact-hashes:
     name: Compare PyPI and GitHub Release hashes
+    needs: resolve-release
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v${{ inputs.version }}
+          ref: ${{ needs.resolve-release.outputs.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.14'
 
+      - name: Install locked verification toolchain
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements/toolchain.lock
+          python scripts/check_toolchain.py --verify-installed
+
       - name: Compare published artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-          PYINC_VERSION: ${{ inputs.version }}
+          PYINC_VERSION: ${{ needs.resolve-release.outputs.version }}
         shell: bash
         run: |
           python scripts/release_artifacts.py verify-published \
@@ -38,19 +76,19 @@ jobs:
 
   validate-install:
     name: Install (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    needs: artifact-hashes
+    needs: [resolve-release, artifact-hashes]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       max-parallel: 5
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-2025, macos-15]
         python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
       - name: Check out the exact release tag
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v${{ inputs.version }}
+          ref: ${{ needs.resolve-release.outputs.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -59,10 +97,11 @@ jobs:
 
       - name: Install exact version from PyPI
         env:
-          PYINC_VERSION: ${{ inputs.version }}
+          PYINC_VERSION: ${{ needs.resolve-release.outputs.version }}
         shell: bash
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --require-hashes --only-binary=:all: -r requirements/toolchain.lock
+          python scripts/check_toolchain.py --verify-installed
           python -m pip install \
             --index-url https://pypi.org/simple/ \
             --no-cache-dir \
@@ -73,6 +112,6 @@ jobs:
 
       - name: Validate packages, CLI, imports, and generated cyclic fixtures
         env:
-          PYINC_VERSION: ${{ inputs.version }}
+          PYINC_VERSION: ${{ needs.resolve-release.outputs.version }}
         shell: bash
         run: python scripts/validate_install.py --expected-version "$PYINC_VERSION"

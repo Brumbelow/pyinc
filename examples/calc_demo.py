@@ -2,8 +2,9 @@
 
 Builds a tiny ``.calc`` workspace, reconciles the emitted results to disk via the
 ``@action`` layer, and shows the incremental properties: an edit to an
-unreferenced file does no work and no writes; a comment-only edit backdates the
-parse; removing an ``emit`` deletes only that owned output.
+unreferenced file runs zero query bodies and performs zero writes; a
+comment-only edit backdates the parse; removing an ``emit`` deletes only that
+owned output.
 
 Run: ``python examples/calc_demo.py``
 """
@@ -19,7 +20,7 @@ from pathlib import Path
 # script's directory to sys.path).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from calc.engine import calc_emit, calc_source, evaluate_name  # noqa: E402
+from calc.engine import calc_emit, calc_source, evaluate_name, parse_calc  # noqa: E402
 
 from pyinc import Database  # noqa: E402
 
@@ -43,7 +44,8 @@ def main() -> None:
         calc_emit.reconcile(db, str(root), root=out)
         print(f"alpha={evaluate_name(db, str(root), 'alpha')[1]}")  # 42
 
-        # Editing a file that nothing includes does no query work and no writes.
+        # Editing a file that nothing includes runs zero query bodies and writes
+        # no outputs; the top-level request and action preflight still occur.
         db.reset_statistics()
         unrelated.write_text("let z = 2\n", encoding="utf-8")
         unrelated_run = calc_emit.reconcile(db, str(root), root=out)
@@ -51,13 +53,15 @@ def main() -> None:
         print(f"unrelated_edit_changes={changes}")
         print(f"unrelated_edit_executions={db.statistics().query_executions}")
 
-        # A comment-only edit reparses but backdates the semantic parse.
+        # A comment-only edit changes exact raw text, then the complete semantic
+        # parse payload backdates and keeps evaluation/output work clean.
         root.write_text(
             '# header\ninclude "constants.calc"\nlet alpha = base + 2\nemit alpha\nemit base\n',
             encoding="utf-8",
         )
         calc_emit.reconcile(db, str(root), root=out)
-        backdated = db.inspect(calc_source, str(root)).last_recompute == "backdated"
+        assert db.inspect(calc_source, str(root)).last_recompute == "executed"
+        backdated = db.inspect(parse_calc, str(root)).last_recompute == "backdated"
         print(f"comment_edit_backdated={backdated}")
 
         # Removing an emit deletes only that owned output.

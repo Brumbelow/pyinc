@@ -21,8 +21,9 @@ jobs:
 
       - name: Install benchmark dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[bench]'
+          python -m pip install --require-hashes --only-binary=:all: -r requirements/toolchain.lock
+          python -m pip install --no-build-isolation --no-deps -e .
+          python scripts/check_toolchain.py --verify-installed
 
       - name: Run benchmark
         env:

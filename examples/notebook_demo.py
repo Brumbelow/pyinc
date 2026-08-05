@@ -61,9 +61,10 @@ def main() -> None:
 
         first_changed = db.inspect(notebook_analysis_payload, str(path)).changed_at
 
-        # Re-running the notebook produces new outputs and execution_count entries
-        # but leaves cell sources unchanged. The cutoff token ignores those fields,
-        # so the analysis node is backdated and downstream consumers stay valid.
+        # Re-running the notebook changes the exact raw text but leaves cell
+        # sources unchanged. Parsed payloads deliberately omit outputs and
+        # execution counts, so those equal payloads backdate and the aggregate
+        # analysis remains at its prior changed revision.
         nb["cells"][1]["outputs"] = [
             {"output_type": "stream", "name": "stdout", "text": "loaded 1024 rows\n"}
         ]

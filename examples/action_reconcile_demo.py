@@ -2,8 +2,9 @@
 
 Queries derive *desired* outputs (pure, tracked); a separate @action reconciles
 them with the filesystem: it writes only what changed, repairs out-of-band
-edits via content hashing, deletes outputs it previously owned but no longer
-declares, and supports a dry-run plan. Side effects never enter a query.
+edits via content hashing, deletes an output it previously owned only while the
+file's current SHA-256 still matches the ledger, and supports a dry-run plan.
+Side effects never enter a query.
 
 Run: ``python examples/action_reconcile_demo.py``
 """
@@ -51,10 +52,14 @@ def main() -> None:
         repaired = emit.reconcile(db, str(src), root=out)
         print(f"tamper_repaired={repaired.repaired}")
 
-        # Removing a declaration deletes only that owned output.
+        # Removing a declaration deletes only that owned output because the
+        # repaired bytes now exactly match the ledger digest. A drifted orphan
+        # would be released from ownership and left on disk.
+        assert (out / "beta.txt").read_text(encoding="utf-8") == "beta:hi"
         db.set(NAMES, ("alpha",))
         removed = emit.reconcile(db, str(src), root=out)
         print(f"orphan_deleted={removed.deleted}")
+        assert removed.deleted == ("beta.txt",)
 
         # Dry-run plan writes nothing.
         plan_root = root / "planned"

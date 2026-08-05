@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import os
+import struct
 import tomllib
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -13,6 +15,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
 
+from ._decoding import _layer3_entrypoint
 from ._resources import file_probe, file_read_snapshot, file_text
 
 ConfigKeyPayload: TypeAlias = tuple[str, str, str, str]
@@ -94,32 +97,25 @@ class _TomlNestingLimitError(ValueError):
 
 
 # Table and array nesting is capped because every section re-emits the dot path of
-# all its ancestors: `config_sections_payload` grows with the square of the nesting
-# depth, so this cap is what bounds the *cache*, not just the parse. `json_config`
-# caps `_MAX_JSON_DEPTH` and `xml_config` caps `_MAX_XML_DEPTH` for the same reason
-# and against the same budget — a document at the cap must not cache more than
-# ~1 MiB.
+# all its ancestors: `config_sections_payload` grows with the square of nesting
+# depth. The cap bounds that depth-amplification term, not total bytes or memory;
+# one scalar string or key may still be arbitrarily large.
 #
-# Unlike in those two, the budget is not what binds here. Depth counts the
-# document's implicit top-level table as level 1, the way `json_config` counts the
-# outermost `{`, so `[a.b]` is three levels. `freeze` refuses to snapshot a value
-# nested deeper than `value._MAX_SNAPSHOT_DEPTH`, which is 200, and
-# `_toml_cutoff_value` spends *two* snapshot levels on every table against one on
-# every array: it rewrites each table as a tuple of `(key, value)` pairs, so the
-# pair tuple is a level of its own. An all-table document therefore reaches snapshot
-# depth 2 x 100 = exactly 200 at this cap and cannot exceed it — measured, 99 nested
-# inline tables (100 levels with the root) freeze and 100 raise
-# `UnsupportedValueError` out of the cutoff, while an all-array document at the same
-# cap reaches snapshot depth 101 and every mixture of the two falls between. That
-# relation is what makes the escape unreachable rather than merely caught, and it is
-# the reason this cap sits at half of `json_config`'s: TOML's cutoff value costs
-# twice as much per table as JSON's, which freezes the parsed document as-is.
+# Depth counts the document's implicit top-level table as level 1, the way
+# `json_config` counts the outermost `{`, so `[a.b]` is three levels. `freeze`
+# refuses to snapshot a value nested deeper than `value._MAX_SNAPSHOT_DEPTH`,
+# which is 200, and
+# `_toml_cutoff_value` represents each TOML container with one tagged tuple and
+# stores table keys and child nodes in alternating positions. Every container
+# therefore spends one snapshot level, and the tagged scalar leaf spends one
+# more. A document at this cap reaches at most 101 snapshot levels, safely below
+# `value._MAX_SNAPSHOT_DEPTH` (200).
 #
-# The ~1 MiB budget would have allowed considerably more. Measured with 20-character
-# table names, a document at this cap caches 205 KiB of section payload text
-# (101 KiB of it section names); at 200 levels the same document would cache
-# 824 KiB, still inside the budget but past what `freeze` will accept. 100 levels is
-# an order of magnitude deeper than any real configuration document.
+# The published 100-level cap deliberately leaves headroom under the snapshot limit.
+# Measured with 20-character table names, a document at the cap caches 205 KiB
+# of section payload text (101 KiB of it section names), and its projection is
+# 101 levels deep. It is still an order of magnitude deeper than ordinary
+# configuration documents.
 _MAX_TOML_DEPTH = 100
 
 
@@ -186,7 +182,7 @@ def _load_toml(text: str) -> dict[str, Any]:
 # per inline-table and array level, so whether a document within the cap parses at
 # all remains a property of the call site as well as of the file, and a caller
 # entering with its stack nearly spent turns a valid document into this diagnostic
-# and drops its cutoff token back to the raw file text. `json_config` and
+# and makes the semantic projection fall back to raw file text. `json_config` and
 # `xml_config` emit the same shape for the same reason and carry the same residual.
 _STACK_EXHAUSTED_DIAGNOSTIC = "TOML parsing exhausted the interpreter stack"
 
@@ -210,10 +206,22 @@ def _toml_value_type(value: Any) -> str:
 
 
 def _toml_value_to_string(value: Any) -> str:
+    """Render a TOML value canonically at every nesting level."""
     if isinstance(value, datetime | date | time):
         return value.isoformat()
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "-nan" if math.copysign(1.0, value) < 0 else "nan"
+        if math.isinf(value):
+            return "-inf" if value < 0 else "inf"
+        return repr(value)
     if isinstance(value, dict):
-        return repr(sorted(value.items()))
+        rendered = ", ".join(
+            f"{key!r}: {_toml_value_to_string(item)}" for key, item in sorted(value.items())
+        )
+        return "{" + rendered + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value_to_string(item) for item in value) + "]"
     return repr(value)
 
 
@@ -259,16 +267,16 @@ def _walk_sections(
     return sections
 
 
-def _config_cutoff_token(text: str) -> tuple[str, str]:
+def _config_cutoff_token(text: str) -> tuple[str, object]:
     try:
         parsed = _load_toml(text)
         snapshot = freeze(_toml_cutoff_value(parsed))
-        return ("parsed", repr(snapshot))
+        return ("parsed", snapshot)
     except (ValueError, RecursionError, OverflowError, UnsupportedValueError):
         # `_load_toml` bounds `_toml_cutoff_value`'s recursion and `freeze`'s walk
         # at the cap, so neither can raise for a document that got this far. The
         # clause stays defensive anyway: an unforeseen path degrades to the raw
-        # text, which only misses a cutoff, rather than escaping `config_analysis`.
+        # text rather than escaping a direct projection test.
         # `freeze` refuses a value outside the snapshot grammar with
         # `UnsupportedValueError`, which is a `PyIncError` and not a `ValueError`,
         # so it has to be named for the clause to cover the `freeze` call at all.
@@ -276,6 +284,22 @@ def _config_cutoff_token(text: str) -> tuple[str, str]:
 
 
 def _toml_cutoff_value(value: Any) -> object:
+    """Return an injective tagged tree over the values produced by ``tomllib``.
+
+    Tables use a flat ``("table", key, child, ...)`` shape so a table costs one
+    snapshot level rather than one level for the table plus one for each entry.
+    Keys occupy fixed alternating positions and every value node carries its own
+    type tag, so tables, arrays, temporal values, strings, and numeric types
+    cannot collide. Floats retain their complete IEEE-754 binary64 identity.
+    """
+    if isinstance(value, bool):
+        return ("boolean", value)
+    if isinstance(value, int):
+        return ("integer", value)
+    if isinstance(value, float):
+        return ("float64", struct.pack(">d", value).hex())
+    if isinstance(value, str):
+        return ("string", value)
     if isinstance(value, datetime):
         return ("datetime", value.isoformat())
     if isinstance(value, date):
@@ -283,10 +307,15 @@ def _toml_cutoff_value(value: Any) -> object:
     if isinstance(value, time):
         return ("time", value.isoformat())
     if isinstance(value, dict):
-        return tuple((key, _toml_cutoff_value(item)) for key, item in sorted(value.items()))
+        token: list[object] = ["table"]
+        for key, item in sorted(value.items()):
+            token.extend((key, _toml_cutoff_value(item)))
+        return tuple(token)
     if isinstance(value, list):
-        return tuple(_toml_cutoff_value(item) for item in value)
-    return value
+        return ("array", *(_toml_cutoff_value(item) for item in value))
+    raise UnsupportedValueError(
+        f"Unsupported parsed TOML value of type {type(value).__qualname__}."
+    )
 
 
 def _try_parse_toml(text: str) -> dict[str, Any] | None:
@@ -341,7 +370,7 @@ def _config_shape_diagnostics(parsed: dict[str, Any]) -> tuple[DiagnosticPayload
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_config_cutoff_token)
+@query
 def config_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 
@@ -439,6 +468,7 @@ def _decode_section(payload: ConfigSectionPayload) -> ConfigSection:
     )
 
 
+@_layer3_entrypoint
 def config_analysis(db: Database, path: str | os.PathLike[str]) -> ConfigAnalysis:
     normalized = os.fspath(path)
     payload = cast(ConfigAnalysisPayload, thaw(db.get(config_analysis_payload, normalized)))
@@ -453,6 +483,7 @@ def config_analysis(db: Database, path: str | os.PathLike[str]) -> ConfigAnalysi
     )
 
 
+@_layer3_entrypoint
 def workspace_config_analysis(db: Database, root: str | os.PathLike[str]) -> ConfigAnalysis | None:
     normalized_root = os.fspath(root)
     entries = _DIRECTORIES.read(db, normalized_root)

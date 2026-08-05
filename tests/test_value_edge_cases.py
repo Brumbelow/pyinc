@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 
-from pyinc import UnsupportedValueError, deserialize_snapshot, freeze, serialize_snapshot
+from pyinc import UnsupportedValueError, deserialize_snapshot, freeze, serialize_snapshot, thaw
 from pyinc.value import (
     FrozenAdapterValue,
     FrozenDict,
@@ -56,6 +56,10 @@ class _IterableOnly:
 def _invalid_order(values: tuple[Any, ...]) -> tuple[Any, ...]:
     ordered = tuple(sorted(values, key=fingerprint_snapshot))
     return tuple(reversed(ordered))
+
+
+def _canonical_order(values: tuple[Any, ...]) -> tuple[Any, ...]:
+    return tuple(sorted(values, key=fingerprint_snapshot))
 
 
 def test_adapter_registry_rejects_duplicate_type_identifiers() -> None:
@@ -205,6 +209,62 @@ def test_snapshot_validation_rejects_noncanonical_dict_and_set_order() -> None:
         serialize_snapshot(FrozenSet("set", (first, second)))
 
 
+@pytest.mark.parametrize(
+    ("left", "right"),
+    (
+        (1, 1.0),
+        (True, 1),
+        (0.0, -0.0),
+        ((1,), (1.0,)),
+        (FrozenSet("frozenset", (1,)), FrozenSet("frozenset", (1.0,))),
+    ),
+)
+def test_snapshot_validation_rejects_builtin_keys_and_members_that_collide_after_thaw(
+    left: object, right: object
+) -> None:
+    ordered = _canonical_order((left, right))
+    dictionary = FrozenDict(tuple((key, str(index)) for index, key in enumerate(ordered)))
+
+    with pytest.raises(UnsupportedValueError, match="collide after thaw"):
+        serialize_snapshot(dictionary)
+    with pytest.raises(UnsupportedValueError, match="collide after thaw"):
+        freeze(dictionary)
+    for kind in ("set", "frozenset"):
+        with pytest.raises(UnsupportedValueError, match="collide after thaw"):
+            serialize_snapshot(FrozenSet(kind, ordered))
+
+
+def test_thaw_rejects_adapter_keys_and_members_that_collapse_cardinality() -> None:
+    class CollidingAdapter:
+        def freeze(self, value: _AdaptedValue, freeze_value: Any) -> object:
+            return freeze_value(value.value)
+
+        def thaw(self, snapshot: Any, thaw_value: Any) -> int:
+            thaw_value(snapshot)
+            return 1
+
+    adapter_key = _adapter_key(_AdaptedValue)
+    keys = _canonical_order(
+        (FrozenAdapterValue(adapter_key, 1), FrozenAdapterValue(adapter_key, 2))
+    )
+    adapters = {_AdaptedValue: CollidingAdapter()}
+
+    dictionary = FrozenDict(tuple((key, index) for index, key in enumerate(keys)))
+    with pytest.raises(UnsupportedValueError, match="keys collide after thaw"):
+        thaw(dictionary, adapters=adapters)
+    for kind in ("set", "frozenset"):
+        with pytest.raises(UnsupportedValueError, match="members collide after thaw"):
+            thaw(FrozenSet(kind, keys), adapters=adapters)
+
+
+def test_snapshot_validation_rejects_keys_that_become_unhashable() -> None:
+    unhashable_key = FrozenDict((("nested", 1),))
+    snapshot = FrozenDict(((unhashable_key, "value"),))
+
+    with pytest.raises(UnsupportedValueError, match="remain hashable after thaw"):
+        serialize_snapshot(snapshot)
+
+
 def test_snapshot_reference_collection_stops_at_nested_graph_boundaries() -> None:
     nested_graph = FrozenGraph((FrozenList((FrozenRef(0),)),), FrozenRef(0))
     snapshot = FrozenList(
@@ -239,6 +299,13 @@ def test_deserialize_rejects_malformed_tags_delimiters_and_lengths(payload: byte
 def test_snapshot_equality_helper_returns_a_real_bool() -> None:
     assert snapshots_equal(FrozenList((1,)), FrozenList((1,))) is True
     assert snapshots_equal(FrozenList((1,)), FrozenList((2,))) is False
+
+
+def test_snapshot_equality_helper_does_not_short_circuit_same_nan_wrapper() -> None:
+    snapshot = FrozenList((float("nan"),))
+
+    assert snapshot == snapshot
+    assert snapshots_equal(snapshot, snapshot) is False
 
 
 def test_snapshot_hashability_analysis_covers_refs_and_nested_shapes() -> None:
@@ -308,7 +375,7 @@ def test_graph_canonicalization_rewrites_all_nested_snapshot_kinds() -> None:
                 )
             ),
             FrozenDict((("key", FrozenRef(3)),)),
-            FrozenSet("set", (FrozenRef(3),)),
+            FrozenSet("set", (3,)),
             FrozenRecord("Record", (("field", FrozenRef(0)),)),
         ),
         root=FrozenRef(0),

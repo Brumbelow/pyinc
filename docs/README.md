@@ -13,6 +13,7 @@ each have one job.
 | [LSP Reference](lsp-reference.md) | Check an advertised method or its user-visible limitations. |
 | [Demo](demo.md) | See the watcher running on a real workspace. |
 | [FAQ](faq.md) | Compare pyinc with Salsa or `lru_cache`, or decide whether it fits your workload. |
+| [Related Work](related-work.md) | Review the dated primary-source matrix, exact survey pins, and scoped project positioning. |
 | [Codegen Guide](codegen-guide.md) | Generate typed Python models from JSON Schema through the action layer. |
 | [Migrating from 2.x](migration-v3.md) | Discard incompatible state and update code for 3.0. |
 | [Releases and Verification](releases.md) | Check a published artifact, or see what the release pipeline enforces. |
@@ -24,6 +25,7 @@ each have one job.
 | [Kernel Contract](kernel-contract.md) | From-scratch consistency, its three conditions, execution modes, checkpoints, and limits. |
 | [Action Contract](action-contract.md) | Portable declared outputs, atomic publication, ownership, repair, deletion, and dry runs. |
 | [Integration Contract](integration-contract.md) | Stable integration entrypoints/result types, supported input shapes, and key limits. |
+| [Public API tiers](public-api.md) | The exact kernel, aggregate, module-level composition, tools, and codegen semver surfaces. |
 
 ## Extend or understand the project
 

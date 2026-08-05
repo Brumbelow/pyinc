@@ -25,8 +25,10 @@ Please confirm each holds for the reproducer — see
 
 - [ ] Owned value boundaries — every value crossing a boundary is snapshot-safe
       or has a registered `ValueAdapter`
-- [ ] Tracked ambient reads — external state goes through a `Resource`, or is
-      declared with `db.report_untracked_read(reason)`
+- [ ] Tracked ambient reads — external state goes through a `Resource`; if
+      `db.report_untracked_read(reason)` is involved, account separately for
+      nondeterministic timing because the declaration prevents memo reuse but
+      does not track the observation
 - [ ] Deterministic queries — the same tracked dependencies produce a
       semantically equal result
 

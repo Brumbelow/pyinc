@@ -16,6 +16,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _layer3_entrypoint
 from ._resources import file_probe, file_read_snapshot, file_text
 
 # ---------------------------------------------------------------------------
@@ -172,13 +173,34 @@ def _parse_metadata_fields(text: str, field_name: str) -> tuple[str, ...]:
     return tuple(str(value).strip() for value in message.get_all(field_name, ()))
 
 
-def _metadata_cutoff_token(text: str) -> tuple[str, ...]:
-    """Cutoff: only the parsed field values, not comments or whitespace."""
-    name = _parse_metadata_field(text, "Name") or ""
-    version = _parse_metadata_field(text, "Version") or ""
+def _required_metadata_field(text: str, field_name: str) -> str | None:
+    """Return one mandatory field, treating blank content as absent."""
+    value = _parse_metadata_field(text, field_name)
+    return value if value else None
+
+
+def _metadata_cutoff_token(text: str) -> tuple[object, ...]:
+    """Project parsed fields for cutoff-congruence tests.
+
+    The exact raw metadata query deliberately does not use this projection.
+    Missing, empty, and whitespace-only mandatory fields all produce the same
+    rejected-package payload, so they deliberately share the invalid token.
+    Every metadata-derived field in ``InstalledPackagePayload`` is otherwise
+    represented; ``top_level.txt`` is tracked through its own exact query.
+    """
+    name = _required_metadata_field(text, "Name")
+    version = _required_metadata_field(text, "Version")
+    if name is None or version is None:
+        return ("invalid-required-field",)
     summary = _parse_metadata_field(text, "Summary") or ""
     requires = _parse_metadata_fields(text, "Requires-Dist")
-    return (name, version, summary, *requires)
+    return (
+        "package",
+        ("name", name),
+        ("version", version),
+        ("summary", summary),
+        ("requires-dist", requires),
+    )
 
 
 def _get_site_packages_dirs() -> tuple[str, ...]:
@@ -224,9 +246,9 @@ def _dist_info_listing(db: Database, site_dir: str) -> tuple[str, ...]:
     return tuple(sorted(entry for entry in entries if re.match(_DIST_INFO_PAT, entry)))
 
 
-@query(cutoff=_metadata_cutoff_token)
+@query
 def _metadata_text(db: Database, metadata_path: str) -> str:
-    """Read a dist-info METADATA file. Cutoff on parsed fields only."""
+    """Read exact dist-info METADATA text."""
     return _METADATA.read(db, metadata_path)
 
 
@@ -249,8 +271,8 @@ def _package_metadata_payload(
     if not text:
         return None
 
-    name = _parse_metadata_field(text, "Name")
-    version = _parse_metadata_field(text, "Version")
+    name = _required_metadata_field(text, "Name")
+    version = _required_metadata_field(text, "Version")
     if name is None or version is None:
         return None
 
@@ -343,6 +365,7 @@ def _decode_package(payload: InstalledPackagePayload) -> InstalledPackageRef:
     )
 
 
+@_layer3_entrypoint
 def installed_packages_analysis(db: Database) -> InstalledPackagesAnalysis:
     """Discover all installed packages and stdlib modules."""
     raw = cast(
@@ -357,6 +380,7 @@ def installed_packages_analysis(db: Database) -> InstalledPackagesAnalysis:
     )
 
 
+@_layer3_entrypoint
 def resolve_import_name(db: Database, import_name: str) -> ImportNameResolution:
     """Resolve an import name to its origin: stdlib, installed, or unknown."""
     raw = cast(

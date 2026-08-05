@@ -285,10 +285,8 @@ def _nested_tables(levels: int, name: str = "configuration") -> str:
     """A document `levels` containers deep, all tables, with a leaf key at the bottom.
 
     Depth counts the document's implicit top-level table, so `levels` written header
-    lines would be `levels + 1`; this writes `levels - 1` of them. The leaf key
-    matters: `_toml_cutoff_value` renders an empty table as `()`, one snapshot level
-    rather than two, so a document that bottoms out in an empty table is a level
-    cheaper to freeze than the worst case at the same depth.
+    lines would be `levels + 1`; this writes `levels - 1` of them. The leaf key makes
+    the projection include its deepest tagged scalar node.
     """
     headers = "\n".join("[" + ".".join([name] * d) + "]" for d in range(1, levels))
     return headers + "\nleaf = 1\n"
@@ -415,11 +413,10 @@ def test_toml_json_and_xml_report_a_nesting_limit_in_the_same_words(tmp_path: Pa
 
 
 def _in_a_deep_stacked_thread(work: Callable[[], None]) -> None:
-    """Run `work` with enough stack and budget to reach the kernel's snapshot limit.
+    """Run `work` with ample native and interpreter stack.
 
-    Without this the parse or the cutoff's `freeze` runs out of interpreter budget
-    first, and the run would never get far enough to show which of the two limits
-    is doing the rejecting.
+    This keeps the parser and semantic projection at the documented TOML cap
+    independent of the test runner thread's remaining stack.
     """
     original_limit = sys.getrecursionlimit()
     original_stack = threading.stack_size(64 * 1024 * 1024)
@@ -433,42 +430,24 @@ def _in_a_deep_stacked_thread(work: Callable[[], None]) -> None:
         threading.stack_size(original_stack)
 
 
-def test_the_nesting_cap_keeps_every_accepted_document_snapshot_safe(tmp_path: Path) -> None:
-    # `_toml_cutoff_value` rewrites every table as a tuple of `(key, value)` pairs,
-    # so a table costs two snapshot levels where an array costs one. An all-table
-    # document at the cap therefore lands on exactly the kernel's limit.
-    assert 2 * _MAX_TOML_DEPTH <= _MAX_SNAPSHOT_DEPTH
+def test_the_nesting_cap_keeps_every_accepted_document_snapshot_safe() -> None:
+    # One tagged tuple per container plus one tagged scalar leaf stays well below
+    # the kernel limit even for an all-table document at the TOML cap.
+    assert _MAX_TOML_DEPTH + 1 <= _MAX_SNAPSHOT_DEPTH
 
-    path = tmp_path / "pyproject.toml"
-    path.write_text(_nested_tables(_MAX_TOML_DEPTH + 1), encoding="utf-8")
-    observed: list[Any] = []
+    observed: list[str] = []
 
-    def _recompute() -> None:
-        db = Database()
-        try:
-            config_analysis(db, str(path))
-            # The cutoff runs only on recomputation, so the edit is what reaches it.
-            path.write_text(_nested_tables(_MAX_TOML_DEPTH + 1) + "\n", encoding="utf-8")
-            observed.append(config_analysis(db, str(path)).diagnostics)
-        except Exception as exc:  # pragma: no cover - the escape this test locks out
-            observed.append(exc)
+    def _project() -> None:
+        observed.append(toml_config._config_cutoff_token(_nested_tables(_MAX_TOML_DEPTH))[0])
 
-    _in_a_deep_stacked_thread(_recompute)
+    _in_a_deep_stacked_thread(_project)
 
-    assert observed == [
-        (
-            (
-                "toml-decode-error",
-                f"TOML nesting exceeds the supported limit of {_MAX_TOML_DEPTH} levels",
-            ),
-        )
-    ]
+    assert observed == ["parsed"]
 
 
 def test_every_container_shape_at_the_cap_survives_the_cutoff() -> None:
-    # Tables cost two snapshot levels and arrays one, so the all-table shape is the
-    # worst case and every mixture of the two sits below it. The cutoff must hand
-    # back a semantic token for all of them, not degrade to the raw text.
+    # Every table and array costs one tagged tuple level. The projection must hand
+    # back a semantic token for every mixture, not degrade to the raw text.
     shapes = [
         "d" * (_MAX_TOML_DEPTH - 1),
         "l" * (_MAX_TOML_DEPTH - 1),
@@ -642,7 +621,8 @@ def test_a_freeze_failure_in_the_cutoff_degrades_to_the_raw_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The cap makes this unreachable, so the defensive clause is checked directly:
-    # an unforeseen failure must miss a cutoff, never escape `config_analysis`.
+    # an unforeseen failure must produce the exact raw fallback, never escape a
+    # direct projection call.
     def _refuse(_value: Any) -> Any:
         raise ValueError("unforeseen")
 

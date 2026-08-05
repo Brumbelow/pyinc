@@ -18,7 +18,7 @@ from pyinc.integrations.scope_resolution import ScopeTree, SymbolId, scope_tree,
 from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
 from pyinc.runtime import Database
 
-from ._decoding import decoded, once_per_request
+from ._decoding import _layer3_entrypoint, decoded, once_per_request
 
 # ---------------------------------------------------------------------------
 # Literal aliases
@@ -1212,17 +1212,14 @@ def _ranges_for_path(db: Database, path: str) -> dict[tuple[str, int], SourceRan
     )
 
 
-def _build_source_ranges(
-    lexical: ScopeTree, source: str
-) -> dict[tuple[str, int], SourceRange]:
+def _build_source_ranges(lexical: ScopeTree, source: str) -> dict[tuple[str, int], SourceRange]:
     """Exact source spans for a file's bindings, keyed by name and line.
 
     The result is memoized and handed to every caller, so it is read-only by
     contract: the three call sites only look names up in it.
     """
     ranges = {
-        (binding.name, binding.range.start.line): binding.range
-        for binding in lexical.bindings
+        (binding.name, binding.range.start.line): binding.range for binding in lexical.bindings
     }
     tree = _try_parse(source)
     if tree is None:
@@ -1247,6 +1244,7 @@ def _build_source_ranges(
 # on a workspace-sized request that copy dominated the cost of decoding.
 
 
+@_layer3_entrypoint
 def module_symbol_table(
     db: Database,
     root: str | os.PathLike[str],
@@ -1338,6 +1336,7 @@ def _resolve_qualified_name(
     return replace(decoded, range=source_range)
 
 
+@_layer3_entrypoint
 def workspace_symbol_index(db: Database, root: str | os.PathLike[str]) -> WorkspaceSymbolIndex:
     normalized_root = _normalize_path(root)
     payload = db.get(workspace_symbol_index_payload, normalized_root)
@@ -1367,6 +1366,7 @@ def workspace_symbol_index(db: Database, root: str | os.PathLike[str]) -> Worksp
     return replace(decoded, entries=tuple(entries))
 
 
+@_layer3_entrypoint
 def find_references(
     db: Database,
     root: str | os.PathLike[str],
@@ -1848,6 +1848,7 @@ def _decode_class_model(payload: ResolvedClassModelPayload) -> ClassModel:
     )
 
 
+@_layer3_entrypoint
 def class_model(
     db: Database,
     root: str | os.PathLike[str],

@@ -11,6 +11,7 @@ from pyinc.resources import DirectoryResource, Resource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
 
+from ._decoding import _layer3_entrypoint
 from ._resources import file_probe, file_read_snapshot, file_text
 from .source_geometry import SourcePosition, SourceRange
 
@@ -159,7 +160,7 @@ def _env_cutoff_token(text: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_env_cutoff_token)
+@query
 def env_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 
@@ -199,6 +200,7 @@ def env_analysis_payload(db: Database, path: str) -> EnvAnalysisPayload:
 # ---------------------------------------------------------------------------
 
 
+@_layer3_entrypoint
 def env_analysis(db: Database, path: str | os.PathLike[str]) -> EnvFileAnalysis:
     normalized = os.fspath(path)
     payload = cast(EnvAnalysisPayload, thaw(db.get(env_analysis_payload, normalized)))
@@ -221,6 +223,7 @@ def env_analysis(db: Database, path: str | os.PathLike[str]) -> EnvFileAnalysis:
     )
 
 
+@_layer3_entrypoint
 def workspace_env_analysis(
     db: Database,
     root: str | os.PathLike[str],

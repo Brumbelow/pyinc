@@ -62,7 +62,7 @@ def test_whitespace_edit_backdates_and_writes_nothing(tmp_path: Path) -> None:  
     res = generate(db, str(p), out)
     assert res.created == () and res.updated == () and res.repaired == ()
     assert res.deleted == ()
-    assert db.inspect(schema_text, str(p)).last_recompute == "backdated"
+    assert db.inspect(schema_text, str(p)).last_recompute == "executed"
     assert db.inspect(model_python, str(p), "A").last_decision == "reused"
 
 

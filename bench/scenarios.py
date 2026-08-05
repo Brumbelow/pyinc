@@ -101,18 +101,17 @@ def _expect_incremental_work(target: str, scenario: str, work: WorkMetrics) -> N
             f"{target}/{scenario} performed {work.query_executions} query executions"
         )
     if scenario == "comment_only_referenced_edit" and (
-        work.query_executions != 0 or work.query_backdates < 1
+        work.query_executions != 1 or work.query_backdates < 1
     ):
         raise AssertionError(
-            f"{target}/{scenario} did not backdate cleanly: "
+            f"{target}/{scenario} did not execute the exact raw boundary and "
+            "backdate the semantic payloads cleanly: "
             f"executions={work.query_executions}, backdates={work.query_backdates}"
         )
     if scenario == "localized_semantic_edit" and work.query_executions == 0:
         raise AssertionError(f"{target}/{scenario} did not execute the affected query path")
     if scenario == "tampered_generated_output" and work.query_executions != 0:
-        raise AssertionError(
-            f"{target}/{scenario} recomputed queries while repairing an output"
-        )
+        raise AssertionError(f"{target}/{scenario} recomputed queries while repairing an output")
 
 
 # --------------------------------------------------------------------------- #
@@ -177,9 +176,7 @@ def _synthetic(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioRes
         cached_jbranch = memory.cache(jbranch)
 
         def compute_with_joblib() -> int:
-            return sum(
-                cached_jbranch(i, state["root"], state["leaf"][i]) for i in range(_WIDTH)
-            )
+            return sum(cached_jbranch(i, state["root"], state["leaf"][i]) for i in range(_WIDTH))
 
         joblib_compute = compute_with_joblib
 
@@ -200,10 +197,14 @@ def _synthetic(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioRes
             value, secs = measure(
                 lambda: sum(state["root"] + state["leaf"][i] * 2 for i in range(_WIDTH))
             )
-            results.append(_comparator_row("synthetic", scenario, "full", secs, value == reference()))
+            results.append(
+                _comparator_row("synthetic", scenario, "full", secs, value == reference())
+            )
         if "naive" in comparators:
             value, secs = measure(naive_compute)
-            results.append(_comparator_row("synthetic", scenario, "naive", secs, value == reference()))
+            results.append(
+                _comparator_row("synthetic", scenario, "naive", secs, value == reference())
+            )
         if joblib_compute is not None:
             value, secs = measure(joblib_compute)
             results.append(
@@ -229,9 +230,7 @@ def _synthetic(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioRes
         return db2.get(_aggregate)
 
     value, secs, work = measure_database(db2, restore)
-    results.append(
-        _pyinc_row("synthetic", "checkpoint_restore", secs, work, value == reference())
-    )
+    results.append(_pyinc_row("synthetic", "checkpoint_restore", secs, work, value == reference()))
     return results
 
 
@@ -454,9 +453,7 @@ def _codegen(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResul
         )
         _expect_incremental_work("codegen", scenario, work_metrics)
         results.append(
-            _pyinc_row(
-                "codegen", scenario, secs, work_metrics, _tree(out_inc) == reference_tree
-            )
+            _pyinc_row("codegen", scenario, secs, work_metrics, _tree(out_inc) == reference_tree)
         )
         if "full" in comparators:
             full_dir = work / "full"
@@ -620,9 +617,7 @@ def _action_target(*, out_dir: Path, comparators: Sequence[str]) -> list[Scenari
         )
         _expect_incremental_work("action", scenario, work_metrics)
         results.append(
-            _pyinc_row(
-                "action", scenario, secs, work_metrics, _tree(out_inc) == reference_tree
-            )
+            _pyinc_row("action", scenario, secs, work_metrics, _tree(out_inc) == reference_tree)
         )
         if "full" in comparators:
             full_dir = work / "full"

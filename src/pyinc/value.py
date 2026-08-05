@@ -28,8 +28,10 @@ class ValueAdapter(Protocol):
     `freeze` and `thaw` are deterministic, side-effect-free, and read no
     ambient state (at query boundaries they run under the ambient-read
     guard); results are owned by the receiver; the round trip preserves
-    semantics; and adapter instance configuration stays immutable for the
-    registered lifetime. See the kernel contract's `ValueAdapter` entry.
+    semantics; and adapter implementation and instance configuration stay
+    immutable for the `Database` lifetime. A database fingerprints that state
+    at construction and rejects a later mismatch. See the kernel contract's
+    `ValueAdapter` entry.
     """
 
     def freeze(self, value: Any, freeze: FreezeFn) -> Any:
@@ -61,6 +63,8 @@ class FrozenList(Sequence[Any]):
 
 @dataclass(frozen=True)
 class FrozenDict(Mapping[Any, Any]):
+    """Immutable mapping iterated in canonical frozen-key fingerprint order."""
+
     entries: tuple[tuple[Any, Any], ...]
 
     def __getitem__(self, key: Any) -> Any:
@@ -200,10 +204,60 @@ class _FreezeState:
 
 
 def freeze(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> Snapshot:
+    """Return the canonical owned snapshot representation of ``value``.
+
+    Mapping entries are ordered by the fingerprint of each frozen typed key.
+    Their ordinary Python insertion order is intentionally not retained.
+    """
+
     registry = _coerce_registry(adapters)
     result = _freeze_root(value, registry)
     _validate_snapshot(result)
     return result
+
+
+def detach_snapshot(snapshot: Snapshot) -> Snapshot:
+    """Return an owned copy of a validated canonical snapshot.
+
+    ``freeze`` intentionally preserves the identity of already-frozen tree
+    wrappers.  That is useful for its public value API, but a cache boundary
+    must not retain those caller-owned shells: frozen dataclasses can still be
+    changed reflectively with ``object.__setattr__``.  Clone every wrapper,
+    including graph nodes and references, while keeping the canonical graph
+    table and reference indexes unchanged.
+    """
+
+    _validate_snapshot(snapshot)
+
+    def clone(value: Any) -> Any:
+        value_type = type(value)
+        if value_type is FrozenList:
+            return FrozenList(tuple(clone(item) for item in value.items))
+        if value_type is FrozenDict:
+            return FrozenDict(tuple((clone(key), clone(item)) for key, item in value.entries))
+        if value_type is FrozenSet:
+            return FrozenSet(value.kind, tuple(clone(item) for item in value.items))
+        if value_type is FrozenRecord:
+            return FrozenRecord(
+                value.type_name,
+                tuple((name, clone(item)) for name, item in value.entries),
+            )
+        if value_type is FrozenAdapterValue:
+            return FrozenAdapterValue(value.adapter_key, clone(value.payload))
+        if value_type is FrozenRef:
+            return FrozenRef(value.index)
+        if value_type is FrozenGraph:
+            return FrozenGraph(
+                tuple(clone(node) for node in value.nodes),
+                clone(value.root),
+            )
+        if value_type is tuple:
+            return tuple(clone(item) for item in value)
+        return value
+
+    detached = cast(Snapshot, clone(snapshot))
+    _validate_snapshot(detached)
+    return detached
 
 
 def _freeze_root(value: Any, registry: _AdapterRegistry) -> Snapshot:
@@ -632,14 +686,25 @@ def _thaw(value: Any, registry: _AdapterRegistry, env: list[Any] | None) -> Any:
     if isinstance(value, FrozenList):
         return [_thaw(item, registry, env) for item in value.items]
     if isinstance(value, FrozenDict):
-        return {
-            _thaw(key, registry, env): _thaw(item, registry, env) for key, item in value.entries
-        }
+        thawed: dict[Any, Any] = {}
+        for key, item in value.entries:
+            thawed_key = _thaw(key, registry, env)
+            before = len(thawed)
+            thawed[thawed_key] = _thaw(item, registry, env)
+            if len(thawed) == before:
+                raise UnsupportedValueError("FrozenDict keys collide after thaw.")
+        return thawed
     if isinstance(value, FrozenSet):
         thawed_items = tuple(_thaw(item, registry, env) for item in value.items)
         if value.kind == "frozenset":
-            return frozenset(thawed_items)
-        return set(thawed_items)
+            thawed_frozenset = frozenset(thawed_items)
+            if len(thawed_frozenset) != len(thawed_items):
+                raise UnsupportedValueError("FrozenSet members collide after thaw.")
+            return thawed_frozenset
+        thawed_set = set(thawed_items)
+        if len(thawed_set) != len(thawed_items):
+            raise UnsupportedValueError("FrozenSet members collide after thaw.")
+        return thawed_set
     if isinstance(value, FrozenRecord):
         return {key: _thaw(item, registry, env) for key, item in value.entries}
     if isinstance(value, tuple):
@@ -681,12 +746,19 @@ def _fill_shell(shell: Any, node: Any, registry: _AdapterRegistry, env: list[Any
         return
     if isinstance(node, FrozenDict):
         for key, item in node.entries:
-            shell[_thaw(key, registry, env)] = _thaw(item, registry, env)
+            thawed_key = _thaw(key, registry, env)
+            before = len(shell)
+            shell[thawed_key] = _thaw(item, registry, env)
+            if len(shell) == before:
+                raise UnsupportedValueError("FrozenDict keys collide after thaw.")
         return
     if isinstance(node, FrozenSet):
         if node.kind == "set":
             for item in node.items:
+                before = len(shell)
                 shell.add(_thaw(item, registry, env))
+                if len(shell) == before:
+                    raise UnsupportedValueError("FrozenSet members collide after thaw.")
         return
     if isinstance(node, FrozenRecord):
         for key, item in node.entries:
@@ -730,6 +802,39 @@ def _validate_snapshot(snapshot: Any) -> None:
                 f"{description} must contain valid Unicode scalar values."
             ) from exc
         return value
+
+    def known_thawed_hash_value(value: Any) -> tuple[bool, Any]:
+        if value is None or type(value) in IMMUTABLE_SCALARS:
+            return True, value
+        if type(value) is tuple:
+            items: list[Any] = []
+            for item in value:
+                known, thawed = known_thawed_hash_value(item)
+                if not known:
+                    return False, None
+                items.append(thawed)
+            return True, tuple(items)
+        if type(value) is FrozenSet and value.kind == "frozenset":
+            items = []
+            for item in value.items:
+                known, thawed = known_thawed_hash_value(item)
+                if not known:
+                    return False, None
+                items.append(thawed)
+            return True, frozenset(items)
+        return False, None
+
+    def reject_known_thaw_collisions(values: list[Any], description: str) -> None:
+        known_values: list[Any] = []
+        for value in values:
+            known, thawed = known_thawed_hash_value(value)
+            if not known:
+                continue
+            if any(thawed == previous for previous in known_values):
+                raise UnsupportedValueError(
+                    f"{description} contains values that collide after thaw."
+                )
+            known_values.append(thawed)
 
     def walk(value: Any, depth: int, graph_size: int | None) -> None:
         if depth > _MAX_SNAPSHOT_DEPTH:
@@ -807,6 +912,10 @@ def _validate_snapshot(snapshot: Any) -> None:
                     raise UnsupportedValueError("FrozenDict contains duplicate frozen keys.")
                 if key_digests != sorted(key_digests):
                     raise UnsupportedValueError("FrozenDict keys are not in canonical order.")
+                keys = [entry[0] for entry in value.entries]
+                if any(not _snapshot_thaws_hashably(key, [], set()) for key in keys):
+                    raise UnsupportedValueError("FrozenDict keys must remain hashable after thaw.")
+                reject_known_thaw_collisions(keys, "FrozenDict keys")
                 return
             if type(value) is FrozenSet:
                 if type(value.kind) is not str or value.kind not in {
@@ -824,6 +933,11 @@ def _validate_snapshot(snapshot: Any) -> None:
                     raise UnsupportedValueError("FrozenSet contains duplicate frozen members.")
                 if item_digests != sorted(item_digests):
                     raise UnsupportedValueError("FrozenSet members are not in canonical order.")
+                if any(not _snapshot_thaws_hashably(item, [], set()) for item in value.items):
+                    raise UnsupportedValueError(
+                        "FrozenSet members must remain hashable after thaw."
+                    )
+                reject_known_thaw_collisions(list(value.items), "FrozenSet members")
                 return
             if type(value) is FrozenRecord:
                 require_metadata_string(value.type_name, "FrozenRecord.type_name")
@@ -1229,13 +1343,79 @@ def _read_length_prefixed_int(buf: memoryview, offset: int) -> tuple[int, int]:
 
 
 def snapshots_equal(left: Any, right: Any) -> bool:
-    return bool(left == right)
+    """Compare canonical snapshots without Python's numeric coercions.
+
+    Snapshot equality is deliberately stricter than Python container equality.
+    The two values must have the same snapshot variant and recursively equal
+    structure, and scalar representations must agree exactly.  The ordinary
+    scalar comparison remains part of the decision, so NaN is never treated as
+    unchanged, even when both operands are the same wrapper object.
+
+    Callers pass canonical outputs of :func:`freeze` (or validated checkpoint
+    snapshots), so graph references are compared as finite node-table data
+    rather than followed recursively.
+    """
+
+    left_type = type(left)
+    if left_type is not type(right):
+        return False
+    if left is None:
+        return True
+    if left_type in (bool, int, str, bytes):
+        return bool(left == right)
+    if left_type is float:
+        return bool(left == right) and struct.pack(">d", left) == struct.pack(">d", right)
+    if left_type is complex:
+        return (
+            bool(left == right)
+            and struct.pack(">d", left.real) == struct.pack(">d", right.real)
+            and struct.pack(">d", left.imag) == struct.pack(">d", right.imag)
+        )
+    if left_type is tuple:
+        return len(left) == len(right) and all(
+            snapshots_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if left_type is FrozenList:
+        return snapshots_equal(left.items, right.items)
+    if left_type is FrozenDict:
+        return len(left.entries) == len(right.entries) and all(
+            snapshots_equal(left_key, right_key) and snapshots_equal(left_item, right_item)
+            for (left_key, left_item), (right_key, right_item) in zip(
+                left.entries, right.entries, strict=True
+            )
+        )
+    if left_type is FrozenSet:
+        return left.kind == right.kind and snapshots_equal(left.items, right.items)
+    if left_type is FrozenRecord:
+        return (
+            left.type_name == right.type_name
+            and len(left.entries) == len(right.entries)
+            and all(
+                left_name == right_name and snapshots_equal(left_item, right_item)
+                for (left_name, left_item), (right_name, right_item) in zip(
+                    left.entries, right.entries, strict=True
+                )
+            )
+        )
+    if left_type is FrozenAdapterValue:
+        return left.adapter_key == right.adapter_key and snapshots_equal(
+            left.payload, right.payload
+        )
+    if left_type is FrozenRef:
+        return bool(left.index == right.index)
+    if left_type is FrozenGraph:
+        return snapshots_equal(left.nodes, right.nodes) and snapshots_equal(left.root, right.root)
+    return False
 
 
 def semantic_equal(
     left: Any, right: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None
 ) -> bool:
-    return freeze(left, adapters=adapters) == freeze(right, adapters=adapters)
+    return snapshots_equal(
+        freeze(left, adapters=adapters),
+        freeze(right, adapters=adapters),
+    )
 
 
 def assert_not_mutated(before: str, after: str) -> None:

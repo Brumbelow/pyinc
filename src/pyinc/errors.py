@@ -13,6 +13,18 @@ class UntrackedReadError(PyIncError):
     """Raised when code performs an undeclared external read."""
 
 
+class ResourceDependencyError(PyIncError, RuntimeError):
+    """Raised when a Resource hook reads database-managed state."""
+
+
+class QueryContextError(PyIncError, RuntimeError):
+    """Raised for query-time administration, cross-database reads, or Layer-3 calls."""
+
+
+class QueryConcurrencyError(PyIncError, RuntimeError):
+    """Raised when query or Resource execution attempts concurrent launch."""
+
+
 class UnsupportedValueError(PyIncError):
     """Raised when a value cannot cross a cached boundary safely."""
 
@@ -31,6 +43,10 @@ class CheckpointError(PyIncError):
 
 class CheckpointVersionError(CheckpointError, ValueError):
     """Raised when a checkpoint uses an unsupported manifest or kernel version."""
+
+
+class CheckpointModeError(CheckpointError, ValueError):
+    """Raised when a checkpoint was saved under another execution mode."""
 
 
 class CheckpointManifestError(CheckpointError, ValueError):

@@ -12,6 +12,8 @@ def read_clock(db: Database) -> int:
 
 
 def main() -> None:
+    # The declaration prevents memo reuse; it does not make the clock a tracked
+    # dependency or promise equality with a separately timed fresh evaluation.
     db = Database()
     first = db.get(read_clock)
     second = db.get(read_clock)

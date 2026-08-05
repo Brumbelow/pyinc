@@ -15,6 +15,8 @@ from pyinc.integrations.installed_packages import (
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _layer3_entrypoint
+
 # ---------------------------------------------------------------------------
 # Payload type aliases
 # ---------------------------------------------------------------------------
@@ -159,6 +161,7 @@ def _decode_status(payload: DependencyStatusPayload) -> DependencyStatus:
     )
 
 
+@_layer3_entrypoint
 def dependency_check_analysis(
     db: Database, declared_deps: tuple[str, ...]
 ) -> DependencyCheckAnalysis:
@@ -175,6 +178,7 @@ def dependency_check_analysis(
     )
 
 
+@_layer3_entrypoint
 def workspace_dependency_check(
     db: Database, root: str, declared_deps: tuple[str, ...]
 ) -> DependencyCheckAnalysis:

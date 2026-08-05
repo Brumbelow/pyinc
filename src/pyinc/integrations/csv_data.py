@@ -12,6 +12,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import freeze, thaw
 
+from ._decoding import _layer3_entrypoint
 from ._resources import file_probe, file_read_snapshot, file_text
 
 CsvColumnPayload: TypeAlias = tuple[str, int]
@@ -147,7 +148,7 @@ def _csv_cutoff_token(text: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_csv_cutoff_token)
+@query
 def csv_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 
@@ -198,6 +199,7 @@ def csv_analysis_payload(db: Database, path: str) -> CsvAnalysisPayload:
 # ---------------------------------------------------------------------------
 
 
+@_layer3_entrypoint
 def csv_analysis(db: Database, path: str | os.PathLike[str]) -> CsvAnalysis:
     normalized = os.fspath(path)
     payload = cast(CsvAnalysisPayload, thaw(db.get(csv_analysis_payload, normalized)))
@@ -212,6 +214,7 @@ def csv_analysis(db: Database, path: str | os.PathLike[str]) -> CsvAnalysis:
     )
 
 
+@_layer3_entrypoint
 def workspace_csv_analysis(
     db: Database,
     root: str | os.PathLike[str],

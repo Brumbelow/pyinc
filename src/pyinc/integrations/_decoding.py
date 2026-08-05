@@ -34,16 +34,18 @@ does rewrite the mirror inside one of its own methods calls
 
 from __future__ import annotations
 
+import inspect
+import sys
 import weakref
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, ParamSpec, TypeVar
 
-if TYPE_CHECKING:
-    from pyinc.runtime import Database
+from pyinc.runtime import Database
 
 _T = TypeVar("_T")
+_P = ParamSpec("_P")
 
 # The bound is on entry count, not on bytes: an entry holds one decoded value,
 # and a workspace-level entry is a whole analysis rather than a small object.
@@ -53,24 +55,58 @@ _T = TypeVar("_T")
 # time, which keeps lookups a single dict hit.
 _MAX_ENTRIES = 8192
 
-_CACHES: weakref.WeakKeyDictionary[
-    Database, dict[tuple[Any, ...], tuple[tuple[Any, ...], Any]]
-] = weakref.WeakKeyDictionary()
+_CACHES: weakref.WeakKeyDictionary[Database, dict[tuple[Any, ...], tuple[tuple[Any, ...], Any]]] = (
+    weakref.WeakKeyDictionary()
+)
 
 _REQUEST: ContextVar[tuple[Database, dict[Any, Any]] | None] = ContextVar(
     "pyinc_integration_request", default=None
 )
+_LAYER3_IMPLEMENTATIONS: dict[str, Callable[..., Any]] = {}
 
 
-def decoded(
-    db: Database, kind: str, sources: tuple[Any, ...], decode: Callable[[], _T]
-) -> _T:
+def _reject_layer3_call(operation: str) -> None:
+    """Reach the runtime guard without pinning its live ContextVar as query state."""
+
+    reject = sys.modules["pyinc.runtime"].__dict__["_reject_layer3_query_context"]
+    reject(operation)
+
+
+def _layer3_entrypoint(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    """Guard a decoded entrypoint without exposing its implementation for unwrapping."""
+
+    token = f"{function.__module__}:{function.__qualname__}"
+    operation = f"{function.__name__}()"
+    _LAYER3_IMPLEMENTATIONS[token] = function
+
+    def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        _reject_layer3_call(operation)
+        implementations: dict[str, Callable[_P, _T]] = globals()["_LAYER3_IMPLEMENTATIONS"]
+        return implementations[token](*args, **kwargs)
+
+    for attribute in ("__module__", "__name__", "__qualname__", "__doc__", "__annotations__"):
+        setattr(guarded, attribute, getattr(function, attribute))
+    if hasattr(function, "__type_params__"):
+        guarded.__dict__["__type_params__"] = function.__type_params__
+    guarded.__dict__["__signature__"] = inspect.signature(function)
+    return guarded
+
+
+def decoded(db: Database, kind: str, sources: tuple[Any, ...], decode: Callable[[], _T]) -> _T:
     """Return ``decode()`` for these ``sources``, reusing an earlier result.
 
     ``sources`` must name every value the decode reads, and ``kind`` keeps two
     decoders that read the same payload from colliding.
     """
 
+    _reject_layer3_call("decoded()")
+    implementation: Callable[[Database, str, tuple[Any, ...], Callable[[], _T]], _T] = globals()[
+        "_decoded"
+    ]
+    return implementation(db, kind, sources, decode)
+
+
+def _decoded(db: Database, kind: str, sources: tuple[Any, ...], decode: Callable[[], _T]) -> _T:
     if db.mode != "strict":
         return decode()
     cache = _CACHES.get(db)
@@ -90,13 +126,19 @@ def decoded(
     return value
 
 
-@contextmanager
-def request_scope(db: Database) -> Iterator[None]:
+def request_scope(db: Database) -> AbstractContextManager[None]:
     """Declare that ``db``'s inputs cannot change for the duration.
 
     Repeated entrypoint calls inside the span answer from the first one.
     """
 
+    _reject_layer3_call("request_scope()")
+    implementation: Callable[[Database], AbstractContextManager[None]] = globals()["_request_scope"]
+    return implementation(db)
+
+
+@contextmanager
+def _request_scope(db: Database) -> Iterator[None]:
     token = _REQUEST.set((db, {}))
     try:
         yield
@@ -115,6 +157,12 @@ def request_inputs_changed() -> None:
     re-runs against the moved inputs.
     """
 
+    _reject_layer3_call("request_inputs_changed()")
+    implementation: Callable[[], None] = globals()["_request_inputs_changed"]
+    implementation()
+
+
+def _request_inputs_changed() -> None:
     scope = _REQUEST.get()
     if scope is not None:
         scope[1].clear()
@@ -126,6 +174,16 @@ def once_per_request(
 ) -> _T:
     """Return ``compute()``, answering from this request if it already ran."""
 
+    _reject_layer3_call("once_per_request()")
+    implementation: Callable[[Database, str, tuple[Any, ...], Callable[[], _T]], _T] = globals()[
+        "_once_per_request"
+    ]
+    return implementation(db, kind, args, compute)
+
+
+def _once_per_request(
+    db: Database, kind: str, args: tuple[Any, ...], compute: Callable[[], _T]
+) -> _T:
     scope = _REQUEST.get()
     if scope is None or scope[0] is not db:
         return compute()
