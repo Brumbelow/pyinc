@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
         SignedHistoryError,
         main,
         verify_signed_history,
+        verify_signed_tag,
     )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -26,6 +28,7 @@ else:
         SignedHistoryError,
         main,
         verify_signed_history,
+        verify_signed_tag,
     )
 
 pytestmark = pytest.mark.skipif(
@@ -140,6 +143,28 @@ def _commit(
     _run(["git", "config", "commit.gpgsign", "true" if sign else "false"], cwd=path, env=env)
     _run(["git", "commit", "--quiet", "--allow-empty", "-m", message], cwd=path, env=env)
     return _run(["git", "rev-parse", "HEAD"], cwd=path, env=env).strip()
+
+
+def _tag(
+    path: Path,
+    keys: SigningKeys,
+    name: str,
+    *,
+    fingerprint: str | None = None,
+    sign: bool = True,
+) -> str:
+    """Record an annotated tag, signed by the chosen key unless sign is false."""
+
+    env = _repository_env(keys)
+    if fingerprint is not None:
+        _run(["git", "config", "user.signingkey", fingerprint], cwd=path, env=env)
+    _run(["git", "config", "tag.gpgsign", "true" if sign else "false"], cwd=path, env=env)
+    _run(
+        ["git", "tag", "-s" if sign else "-a", "-m", f"Release {name}", name],
+        cwd=path,
+        env=env,
+    )
+    return name
 
 
 def _expire_key(keys: SigningKeys, fingerprint: str) -> None:
@@ -557,6 +582,79 @@ def test_rejects_malformed_commit_identifiers(
         )
 
 
+def test_verifies_a_tag_signed_by_the_release_key(
+    repository: Path, signing_keys: SigningKeys
+) -> None:
+    _commit(repository, signing_keys, "Baseline")
+    tag = _tag(repository, signing_keys, "v9.0.0")
+    verify_signed_tag(
+        repository=repository,
+        tag=tag,
+        expected_fingerprint=signing_keys.release_fingerprint,
+    )
+
+
+def test_rejects_a_tag_signed_by_a_foreign_key(
+    repository: Path, signing_keys: SigningKeys
+) -> None:
+    _commit(repository, signing_keys, "Baseline")
+    tag = _tag(
+        repository,
+        signing_keys,
+        "v9-0-1",
+        fingerprint=signing_keys.foreign_fingerprint,
+    )
+    with pytest.raises(SignedHistoryError, match=f"tag {tag} is not signed by"):
+        verify_signed_tag(
+            repository=repository,
+            tag=tag,
+            expected_fingerprint=signing_keys.release_fingerprint,
+        )
+
+
+def test_rejects_an_unsigned_annotated_tag(
+    repository: Path, signing_keys: SigningKeys
+) -> None:
+    _commit(repository, signing_keys, "Baseline")
+    tag = _tag(repository, signing_keys, "v9-0-2", sign=False)
+    assert _run(["git", "cat-file", "-t", tag], cwd=repository).strip() == "tag"
+    with pytest.raises(SignedHistoryError, match=f"tag {tag} is not signed by"):
+        verify_signed_tag(
+            repository=repository,
+            tag=tag,
+            expected_fingerprint=signing_keys.release_fingerprint,
+        )
+
+
+def test_rejects_a_tag_whose_signing_key_expired(
+    repository: Path, signing_keys: SigningKeys
+) -> None:
+    expiring = _generate_key(
+        signing_keys.gnupghome, "pyinc expiring tag <expiring-tag@example.invalid>"
+    )
+    _commit(repository, signing_keys, "Baseline")
+    tag = _tag(repository, signing_keys, "v9-0-3", fingerprint=expiring)
+    # As with commits, gpg keeps reporting VALIDSIG once the key expires, so only
+    # the EXPKEYSIG status separates this tag from a good one.
+    _expire_key(signing_keys, expiring)
+    status = subprocess.run(
+        ["git", "verify-tag", "--raw", tag],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert f"VALIDSIG {expiring}" in status.stdout + status.stderr
+    with pytest.raises(
+        SignedHistoryError,
+        match=f"tag {tag} is signed by {expiring} but the signature "
+        "was made by an expired key",
+    ):
+        verify_signed_tag(
+            repository=repository, tag=tag, expected_fingerprint=expiring
+        )
+
+
 def test_cli_reports_success(
     repository: Path,
     signing_keys: SigningKeys,
@@ -612,6 +710,73 @@ def test_cli_accepts_an_allowlisted_structural_merge(
     assert "2 commits satisfy the signed-history policy" in captured.out
 
 
+def test_cli_verifies_a_named_tag(
+    repository: Path,
+    signing_keys: SigningKeys,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline = _commit(repository, signing_keys, "Baseline")
+    head = _commit(repository, signing_keys, "Change")
+    tag = _tag(repository, signing_keys, "v9-1-0")
+    exit_code = main(
+        [
+            "--repository",
+            str(repository),
+            "--baseline",
+            baseline,
+            "--head",
+            head,
+            "--expected-fingerprint",
+            signing_keys.release_fingerprint,
+            "--tag",
+            tag,
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert f"verified tag {tag}" in captured.out
+    assert "1 commits satisfy the signed-history policy" in captured.out
+
+
+def test_cli_fails_on_a_tag_signed_by_a_foreign_key(
+    repository: Path,
+    signing_keys: SigningKeys,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline = _commit(repository, signing_keys, "Baseline")
+    head = _commit(
+        repository,
+        signing_keys,
+        "Change",
+        fingerprint=signing_keys.release_fingerprint,
+    )
+    tag = _tag(
+        repository,
+        signing_keys,
+        "v9-1-1",
+        fingerprint=signing_keys.foreign_fingerprint,
+    )
+    exit_code = main(
+        [
+            "--repository",
+            str(repository),
+            "--baseline",
+            baseline,
+            "--head",
+            head,
+            "--expected-fingerprint",
+            signing_keys.release_fingerprint,
+            "--tag",
+            tag,
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert f"tag {tag} is not signed by" in captured.err
+    # The tag is checked before the range walk, so no commit line is printed.
+    assert "satisfy the signed-history policy" not in captured.out
+
+
 def test_cli_reports_a_missing_repository_without_a_traceback(
     tmp_path: Path,
     signing_keys: SigningKeys,
@@ -662,3 +827,62 @@ def test_cli_reports_failure_on_stderr(
     assert exit_code == 1
     assert "error:" in captured.err
     assert head in captured.err
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _workflow_text(name: str) -> str:
+    return (_REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+
+
+def _workflow_value(text: str, key: str) -> str:
+    matches: list[str] = re.findall(rf"(?m)^\s*{key}:\s*([0-9A-Fa-f]{{40}})\s*$", text)
+    assert matches, f"{key} with a 40-hex value is missing"
+    assert len(set(matches)) == 1, f"{key} carries conflicting values"
+    return matches[0]
+
+
+def test_release_workflow_pins_full_commit_identifiers() -> None:
+    text = _workflow_text("release.yml")
+    fingerprint = _workflow_value(text, "EXPECTED_FINGERPRINT")
+    baseline = _workflow_value(text, "TRUSTED_BASELINE")
+    allowed = _workflow_value(text, "ALLOWED_MERGE_COMMIT")
+    assert fingerprint == fingerprint.upper()
+    assert baseline == baseline.lower()
+    assert allowed == allowed.lower()
+
+
+def test_release_workflow_fingerprint_matches_the_shipped_key() -> None:
+    text = _workflow_text("release.yml")
+    fingerprint = _workflow_value(text, "EXPECTED_FINGERPRINT")
+    listing = _run(
+        [
+            "gpg",
+            "--batch",
+            "--with-colons",
+            "--show-keys",
+            str(_REPO_ROOT / ".github" / "release-signing-key.asc"),
+        ]
+    )
+    key_fingerprints = [
+        line.split(":")[9]
+        for line in listing.splitlines()
+        if line.split(":")[0] == "fpr"
+    ]
+    assert fingerprint in key_fingerprints
+    primary_count = sum(
+        1 for line in listing.splitlines() if line.split(":")[0] == "pub"
+    )
+    assert primary_count == 1
+
+
+def test_release_workflow_calls_the_extracted_verifier() -> None:
+    text = _workflow_text("release.yml")
+    assert "scripts/verify_signed_history.py" in text
+    assert "--tag" in text
+    assert "--allowed-merge-commit" in text
+    # The release-candidate tag is verified by the script too, not by shell.
+    assert '--tag "$rc_tag"' in text
+    assert "while IFS= read -r commit" not in text
+    assert "verify_expected_signature" not in text

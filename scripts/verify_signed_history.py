@@ -1,4 +1,4 @@
-"""Verify every commit in a release range against the release signing key."""
+"""Verify release tags and every commit in a range against the release signing key."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ _DISQUALIFYING_STATUSES = {
 
 
 class SignedHistoryError(ValueError):
-    """The commit range does not satisfy the signed-history policy."""
+    """The tags or the commit range do not satisfy the signed-history policy."""
 
 
 @dataclass(frozen=True)
@@ -51,15 +51,21 @@ def _git(repository: Path, *arguments: str) -> str:
     return completed.stdout
 
 
-def _signature_status(repository: Path, commit: str) -> str:
+def _raw_verification(repository: Path, subcommand: str, reference: str) -> str:
+    """Collect the GnuPG status lines git writes, which land on stderr."""
+
     completed = subprocess.run(
-        ["git", "verify-commit", "--raw", commit],
+        ["git", subcommand, "--raw", reference],
         cwd=repository,
         capture_output=True,
         text=True,
         check=False,
     )
     return completed.stdout + completed.stderr
+
+
+def _signature_status(repository: Path, commit: str) -> str:
+    return _raw_verification(repository, "verify-commit", commit)
 
 
 def _is_signed_by(status: str, expected_fingerprint: str) -> bool:
@@ -83,6 +89,34 @@ def _signature_disqualification(status: str) -> str | None:
         if reason is not None:
             return reason
     return None
+
+
+def _require_trusted_signature(
+    status: str, subject: str, expected_fingerprint: str
+) -> None:
+    """Reject unless the status shows a current signature from the expected key."""
+
+    if not _is_signed_by(status, expected_fingerprint):
+        summary = " / ".join(
+            line for line in status.splitlines() if line.startswith("[GNUPG:]")
+        )
+        _reject(
+            f"{subject} is not signed by {expected_fingerprint}: "
+            f"{summary or 'no signature status reported'}"
+        )
+    disqualification = _signature_disqualification(status)
+    if disqualification is not None:
+        _reject(
+            f"{subject} is signed by {expected_fingerprint} but the signature "
+            f"{disqualification}"
+        )
+
+
+def verify_signed_tag(repository: Path, tag: str, expected_fingerprint: str) -> None:
+    """Verify that an annotated tag carries a usable release-key signature."""
+
+    status = _raw_verification(repository, "verify-tag", tag)
+    _require_trusted_signature(status, f"tag {tag}", expected_fingerprint)
 
 
 def _parent_commits(repository: Path, commit: str) -> tuple[str, ...]:
@@ -154,26 +188,16 @@ def verify_signed_history(
     verdicts: list[CommitVerdict] = []
     for commit in listing.split():
         status = _signature_status(repository, commit)
-        if _is_signed_by(status, expected_fingerprint):
-            disqualification = _signature_disqualification(status)
-            if disqualification is not None:
-                _reject(
-                    f"commit {commit} is signed by {expected_fingerprint} but the "
-                    f"signature {disqualification}"
-                )
-            verdicts.append(CommitVerdict(commit=commit, verified=True, allowlisted=False))
-            continue
-        if commit in allowed_merge_commits:
+        # The allowlist only covers commits the release key never signed; a commit
+        # bearing a revoked or expired release signature is refused outright.
+        if commit in allowed_merge_commits and not _is_signed_by(
+            status, expected_fingerprint
+        ):
             _require_structural_merge(repository, commit, expected_fingerprint)
             verdicts.append(CommitVerdict(commit=commit, verified=False, allowlisted=True))
             continue
-        summary = " / ".join(
-            line for line in status.splitlines() if line.startswith("[GNUPG:]")
-        )
-        _reject(
-            f"commit {commit} is not signed by {expected_fingerprint}: "
-            f"{summary or 'no signature status reported'}"
-        )
+        _require_trusted_signature(status, f"commit {commit}", expected_fingerprint)
+        verdicts.append(CommitVerdict(commit=commit, verified=True, allowlisted=False))
     return tuple(verdicts)
 
 
@@ -189,6 +213,13 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         default=[],
         dest="allowed_merge_commits",
         metavar="COMMIT",
+    )
+    parser.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        dest="tags",
+        metavar="TAG",
     )
     return parser.parse_args(argv)
 
@@ -206,6 +237,13 @@ def _describe(verdicts: Iterable[CommitVerdict]) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parse_arguments(argv)
     try:
+        for tag in arguments.tags:
+            verify_signed_tag(
+                repository=arguments.repository,
+                tag=tag,
+                expected_fingerprint=arguments.expected_fingerprint,
+            )
+            print(f"verified tag {tag}")
         verdicts = verify_signed_history(
             repository=arguments.repository,
             baseline=arguments.baseline,
