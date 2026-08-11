@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import NoReturn
 
 _FULL_COMMIT_PATTERN = re.compile(r"\A[0-9a-f]{40}\Z")
+# GnuPG still reports VALIDSIG for these, so a fingerprint match alone is not trust.
+_DISQUALIFYING_STATUSES = {
+    "REVKEYSIG": "was made by a revoked key",
+    "EXPKEYSIG": "was made by an expired key",
+    "EXPSIG": "has expired",
+}
 
 
 class SignedHistoryError(ValueError):
@@ -66,6 +72,19 @@ def _is_signed_by(status: str, expected_fingerprint: str) -> bool:
     return False
 
 
+def _signature_disqualification(status: str) -> str | None:
+    """Report why a signature must be refused despite matching the expected key."""
+
+    for line in status.splitlines():
+        fields = line.split()
+        if len(fields) < 2 or fields[0] != "[GNUPG:]":
+            continue
+        reason = _DISQUALIFYING_STATUSES.get(fields[1])
+        if reason is not None:
+            return reason
+    return None
+
+
 def _parent_commits(repository: Path, commit: str) -> tuple[str, ...]:
     fields = _git(repository, "rev-list", "--parents", "-n", "1", commit).split()
     return tuple(fields[1:])
@@ -82,10 +101,17 @@ def _require_structural_merge(
     if len(parents) < 2:
         _reject(f"allowlisted commit {commit} is not a merge commit")
     for parent in parents:
-        if not _is_signed_by(_signature_status(repository, parent), expected_fingerprint):
+        parent_status = _signature_status(repository, parent)
+        if not _is_signed_by(parent_status, expected_fingerprint):
             _reject(
                 f"allowlisted merge {commit} has parent {parent} that is not "
                 f"signed by {expected_fingerprint}"
+            )
+        disqualification = _signature_disqualification(parent_status)
+        if disqualification is not None:
+            _reject(
+                f"allowlisted merge {commit} has parent {parent} whose signature "
+                f"{disqualification}"
             )
     merge_tree = _tree_identifier(repository, commit)
     parent_trees = {_tree_identifier(repository, parent) for parent in parents}
@@ -129,6 +155,12 @@ def verify_signed_history(
     for commit in listing.split():
         status = _signature_status(repository, commit)
         if _is_signed_by(status, expected_fingerprint):
+            disqualification = _signature_disqualification(status)
+            if disqualification is not None:
+                _reject(
+                    f"commit {commit} is signed by {expected_fingerprint} but the "
+                    f"signature {disqualification}"
+                )
             verdicts.append(CommitVerdict(commit=commit, verified=True, allowlisted=False))
             continue
         if commit in allowed_merge_commits:
@@ -181,7 +213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_fingerprint=arguments.expected_fingerprint,
             allowed_merge_commits=frozenset(arguments.allowed_merge_commits),
         )
-    except SignedHistoryError as error:
+    except (OSError, SignedHistoryError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     description = _describe(verdicts)

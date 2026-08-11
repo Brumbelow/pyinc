@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -139,6 +140,74 @@ def _commit(
     _run(["git", "config", "commit.gpgsign", "true" if sign else "false"], cwd=path, env=env)
     _run(["git", "commit", "--quiet", "--allow-empty", "-m", message], cwd=path, env=env)
     return _run(["git", "rev-parse", "HEAD"], cwd=path, env=env).strip()
+
+
+def _expire_key(keys: SigningKeys, fingerprint: str) -> None:
+    """Expire a fixture key, waiting until gpg itself reports it as expired."""
+
+    base_env = {**os.environ, "GNUPGHOME": keys.gnupghome}
+    _run(
+        [
+            "gpg",
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-set-expire",
+            fingerprint,
+            "seconds=1",
+        ],
+        env=base_env,
+    )
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        listing = _run(
+            ["gpg", "--batch", "--with-colons", "--list-keys", fingerprint],
+            env=base_env,
+        )
+        validity = next(
+            (line.split(":")[1] for line in listing.splitlines() if line.startswith("pub")),
+            "",
+        )
+        if validity == "e":
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"gpg never reported {fingerprint} as expired")
+
+
+def _merge_of_parents(
+    repository: Path,
+    keys: SigningKeys,
+    *,
+    first_parent: str,
+    second_parent: str,
+    sign_fingerprint: str,
+) -> str:
+    """Record a merge with chosen parents, keeping the first parent's tree."""
+
+    env = _repository_env(keys)
+    tree = _run(
+        ["git", "rev-parse", f"{first_parent}^{{tree}}"], cwd=repository, env=env
+    ).strip()
+    merge = _run(
+        [
+            "git",
+            "commit-tree",
+            tree,
+            "-p",
+            first_parent,
+            "-p",
+            second_parent,
+            "-m",
+            "Merge recorded for the fixture",
+            f"-S{sign_fingerprint}",
+        ],
+        cwd=repository,
+        env=env,
+    ).strip()
+    _run(["git", "update-ref", "refs/heads/main", merge], cwd=repository, env=env)
+    return merge
 
 
 @pytest.fixture()
@@ -348,6 +417,94 @@ def test_allowlisted_merge_requires_tree_equal_to_a_parent(
         )
 
 
+def test_rejects_commit_signed_by_an_expired_key(
+    repository: Path, signing_keys: SigningKeys
+) -> None:
+    expiring = _generate_key(
+        signing_keys.gnupghome, "pyinc expiring <expiring@example.invalid>"
+    )
+    baseline = _commit(repository, signing_keys, "Baseline")
+    head = _commit(
+        repository, signing_keys, "Signed before expiry", fingerprint=expiring
+    )
+    # gpg keeps reporting VALIDSIG for this signature once the key expires; only the
+    # EXPKEYSIG status distinguishes it from a good one.
+    _expire_key(signing_keys, expiring)
+    status = subprocess.run(
+        ["git", "verify-commit", "--raw", head],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert f"VALIDSIG {expiring}" in status.stdout + status.stderr
+    with pytest.raises(
+        SignedHistoryError,
+        match=f"commit {head} is signed by {expiring} but the signature "
+        "was made by an expired key",
+    ):
+        verify_signed_history(
+            repository=repository,
+            baseline=baseline,
+            head=head,
+            expected_fingerprint=expiring,
+            allowed_merge_commits=frozenset(),
+        )
+
+
+def test_allowlisted_merge_rejects_a_parent_signed_by_an_expired_key(
+    repository: Path, signing_keys: SigningKeys
+) -> None:
+    expiring = _generate_key(
+        signing_keys.gnupghome, "pyinc expiring parent <parent@example.invalid>"
+    )
+    ancestor = _commit(repository, signing_keys, "Ancestor", fingerprint=expiring)
+    baseline = _commit(repository, signing_keys, "Baseline", fingerprint=expiring)
+    # Both parents sit outside baseline..merge, so only the parent check can refuse
+    # them once their signing key expires.
+    merge = _merge_of_parents(
+        repository,
+        signing_keys,
+        first_parent=baseline,
+        second_parent=ancestor,
+        sign_fingerprint=signing_keys.foreign_fingerprint,
+    )
+    _expire_key(signing_keys, expiring)
+    with pytest.raises(SignedHistoryError, match="whose signature was made by an expired key"):
+        verify_signed_history(
+            repository=repository,
+            baseline=baseline,
+            head=merge,
+            expected_fingerprint=expiring,
+            allowed_merge_commits=frozenset({merge}),
+        )
+
+
+def test_allowlisted_merge_checks_parents_beyond_the_first(
+    repository: Path, signing_keys: SigningKeys
+) -> None:
+    unsigned = _commit(repository, signing_keys, "Unsigned ancestor", sign=False)
+    baseline = _commit(repository, signing_keys, "Baseline")
+    first_parent = _commit(repository, signing_keys, "Mainline change")
+    # The unsigned commit predates the baseline, so the range walk never sees it; it
+    # is reachable only as the merge's SECOND parent.
+    merge = _merge_of_parents(
+        repository,
+        signing_keys,
+        first_parent=first_parent,
+        second_parent=unsigned,
+        sign_fingerprint=signing_keys.foreign_fingerprint,
+    )
+    with pytest.raises(SignedHistoryError, match=f"parent {unsigned} that is not signed"):
+        verify_signed_history(
+            repository=repository,
+            baseline=baseline,
+            head=merge,
+            expected_fingerprint=signing_keys.release_fingerprint,
+            allowed_merge_commits=frozenset({merge}),
+        )
+
+
 def test_allowlisting_cannot_launder_an_ordinary_commit(
     repository: Path, signing_keys: SigningKeys
 ) -> None:
@@ -423,6 +580,58 @@ def test_cli_reports_success(
     assert exit_code == 0
     assert f"verified {head}" in captured.out
     assert "1 commits satisfy the signed-history policy" in captured.out
+
+
+def test_cli_accepts_an_allowlisted_structural_merge(
+    repository: Path,
+    signing_keys: SigningKeys,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline, merge = _merge_from_branch(
+        repository,
+        signing_keys,
+        merge_fingerprint=signing_keys.foreign_fingerprint,
+    )
+    exit_code = main(
+        [
+            "--repository",
+            str(repository),
+            "--baseline",
+            baseline,
+            "--head",
+            merge,
+            "--expected-fingerprint",
+            signing_keys.release_fingerprint,
+            "--allowed-merge-commit",
+            merge,
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert f"allowlisted structural merge {merge}" in captured.out
+    assert "2 commits satisfy the signed-history policy" in captured.out
+
+
+def test_cli_reports_a_missing_repository_without_a_traceback(
+    tmp_path: Path,
+    signing_keys: SigningKeys,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "--repository",
+            str(tmp_path / "absent"),
+            "--baseline",
+            "0" * 40,
+            "--head",
+            "1" * 40,
+            "--expected-fingerprint",
+            signing_keys.release_fingerprint,
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.err.startswith("error:")
 
 
 def test_cli_reports_failure_on_stderr(
