@@ -102,7 +102,11 @@ Releases are cut by the maintainer. The tag name must equal the
 `CHANGELOG.md` section in the same change. The release workflow verifies every
 commit in the released range against the release signing key, so those commits
 reach `main` as a fast-forward push of locally signed commits rather than
-through the GitHub merge button. This does not affect ordinary pull requests.
+through the GitHub merge button. One historical merge-button commit is pinned
+in the release workflow's structural allowlist and verified by shape (all
+parents signed, tree identical to a parent); new merge commits are still
+rejected, so the fast-forward rule above is the one to follow. This does not
+affect ordinary pull requests.
 [`docs/releases.md`](docs/releases.md) describes the rest of the pipeline.
 
 ## Reporting a security issue

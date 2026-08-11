@@ -23,8 +23,17 @@ is:
 **The tag and the history behind it.** The tag must be annotated, must carry a
 good signature from that key, and must point at the current tip of `main`. Every
 commit from a pinned trusted baseline up to the tag is then verified against the
-same key individually, so an unsigned or foreign commit anywhere in the released
-range fails the release instead of shipping inside it.
+same key individually by
+[`scripts/verify_signed_history.py`](../scripts/verify_signed_history.py), so an
+unsigned or foreign commit anywhere in the released range fails the release
+instead of shipping inside it. The workflow pins one structural exception: the
+pull-request merge `3cf59c6f0a2a24ef8306a8a1ded35ac482024dbc`, created by
+GitHub's merge button, is accepted only because it is a merge whose parents all
+verify against the release key and whose tree is byte-identical to a parent's
+tree — it can introduce no content that did not itself arrive maintainer-signed.
+Any other unsigned or foreign commit, merge or not, still fails the release. The
+same check runs in CI on every push to `main`, so a violation surfaces on the
+push that introduces it rather than at the next release.
 
 **Release metadata.**
 [`scripts/verify_release_metadata.py`](../scripts/verify_release_metadata.py)

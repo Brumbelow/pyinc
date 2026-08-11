@@ -44,6 +44,12 @@ decided at release time.
 
 - `ResolvedPathResource`: symlink-aware path canonicalization as a tracked
   resource value, total over unresolvable paths.
+- The release workflow's per-commit signature verification now lives in
+  `scripts/verify_signed_history.py`, is unit-tested against throwaway
+  repositories with real keys, and also runs in CI on every push to `main`.
+  The pull-request merge `3cf59c6` is accepted through a structural allowlist
+  — a merge whose parents all verify against the release key and whose tree
+  is identical to a parent's — instead of failing the released range.
 
 ### Changed
 
