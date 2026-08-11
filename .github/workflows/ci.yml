@@ -110,7 +110,7 @@ jobs:
   signed-history:
     name: Verify signed history
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'Brumbelow/pyinc'
     env:
       EXPECTED_FINGERPRINT: 2B6DF408BD973740052925DC894C75E1B1D05EA2
       TRUSTED_BASELINE: 8db85ec7a647bd7b74bf04f07e94a9bd78675193

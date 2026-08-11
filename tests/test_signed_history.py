@@ -17,6 +17,7 @@ import pytest
 
 if TYPE_CHECKING:
     from scripts.verify_signed_history import (
+        _DISQUALIFYING_STATUSES,
         SignedHistoryError,
         main,
         verify_signed_history,
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
     from verify_signed_history import (  # noqa: E402
+        _DISQUALIFYING_STATUSES,
         SignedHistoryError,
         main,
         verify_signed_history,
@@ -199,6 +201,33 @@ def _expire_key(keys: SigningKeys, fingerprint: str) -> None:
             return
         time.sleep(0.2)
     raise AssertionError(f"gpg never reported {fingerprint} as expired")
+
+
+def _revoke_key(keys: SigningKeys, fingerprint: str, staged: Path) -> None:
+    """Revoke a fixture key with the certificate gpg wrote when it was generated."""
+
+    base_env = {**os.environ, "GNUPGHOME": keys.gnupghome}
+    generated = Path(keys.gnupghome) / "openpgp-revocs.d" / f"{fingerprint}.rev"
+    if not generated.is_file():
+        pytest.skip(f"gpg wrote no revocation certificate for {fingerprint}")
+    # gpg puts a colon in front of the armour header so the certificate cannot be
+    # imported by accident; left in place, the import reports no OpenPGP data and
+    # the key stays valid. Stage the stripped copy outside GNUPGHOME so gpg never
+    # reads a second certificate out of its own directory.
+    staged.write_text(
+        generated.read_text(encoding="utf-8").replace(":-----BEGIN", "-----BEGIN", 1),
+        encoding="utf-8",
+    )
+    _run(["gpg", "--batch", "--import", str(staged)], env=base_env)
+    listing = _run(
+        ["gpg", "--batch", "--with-colons", "--list-keys", fingerprint], env=base_env
+    )
+    validity = next(
+        (line.split(":")[1] for line in listing.splitlines() if line.startswith("pub")),
+        "",
+    )
+    if validity != "r":
+        raise AssertionError(f"gpg reports {fingerprint} as {validity!r}, not revoked")
 
 
 def _merge_of_parents(
@@ -473,6 +502,49 @@ def test_rejects_commit_signed_by_an_expired_key(
             baseline=baseline,
             head=head,
             expected_fingerprint=expiring,
+            allowed_merge_commits=frozenset(),
+        )
+
+
+def test_every_disqualifying_status_is_accounted_for() -> None:
+    # Frozen deliberately: each key is a GnuPG status that accompanies a VALIDSIG,
+    # so dropping one silently downgrades an untrusted signature to a trusted one.
+    assert set(_DISQUALIFYING_STATUSES) == {"REVKEYSIG", "EXPKEYSIG", "EXPSIG"}
+
+
+def test_rejects_commit_signed_by_a_revoked_key(
+    repository: Path, signing_keys: SigningKeys, tmp_path: Path
+) -> None:
+    revoked = _generate_key(
+        signing_keys.gnupghome, "pyinc withdrawn <withdrawn@example.invalid>"
+    )
+    baseline = _commit(repository, signing_keys, "Baseline")
+    head = _commit(
+        repository, signing_keys, "Signed before revocation", fingerprint=revoked
+    )
+    _revoke_key(signing_keys, revoked, tmp_path / "withdrawn-revocation.asc")
+    status = subprocess.run(
+        ["git", "verify-commit", "--raw", head],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # gpg reports REVKEYSIG alongside an unchanged VALIDSIG, so the fingerprint
+    # match survives the revocation and only the status line refuses the commit.
+    combined = status.stdout + status.stderr
+    assert f"VALIDSIG {revoked}" in combined
+    assert "REVKEYSIG" in combined
+    with pytest.raises(
+        SignedHistoryError,
+        match=f"commit {head} is signed by {revoked} but the signature "
+        "was made by a revoked key",
+    ):
+        verify_signed_history(
+            repository=repository,
+            baseline=baseline,
+            head=head,
+            expected_fingerprint=revoked,
             allowed_merge_commits=frozenset(),
         )
 
@@ -916,5 +988,44 @@ def test_ci_and_release_workflows_agree_on_trust_inputs() -> None:
     ci_text = _workflow_text("ci.yml")
     for key in ("EXPECTED_FINGERPRINT", "TRUSTED_BASELINE", "ALLOWED_MERGE_COMMIT"):
         assert _workflow_value(release_text, key) == _workflow_value(ci_text, key)
-    assert "scripts/verify_signed_history.py" in ci_text
-    assert "fetch-depth: 0" in ci_text
+
+
+def _job_text(text: str, job: str) -> str:
+    """Return one job's block, ending where the next top-level job key begins."""
+
+    match = re.search(rf"(?ms)^  {re.escape(job)}:$\n.*?(?=^  \S|\Z)", text)
+    assert match, f"the {job} job is missing"
+    return match.group(0)
+
+
+_CI_SIGNED_HISTORY_GUARD = (
+    "if: github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    " && github.repository == 'Brumbelow/pyinc'"
+)
+
+
+def test_ci_workflow_pins_the_signed_history_gate() -> None:
+    # Two shipped documents say CI verifies signed history on every push to main,
+    # and this job is the only thing behind that claim, so the call is pinned flag
+    # by flag: a job that still mentions the script but drops --baseline would pass
+    # a name-only check while verifying nothing.
+    job = _job_text(_workflow_text("ci.yml"), "signed-history")
+    invocations = _verifier_invocations(job)
+    assert len(invocations) == 1
+    call = invocations[0]
+    for flag in (
+        "--repository .",
+        '--baseline "$TRUSTED_BASELINE"',
+        '--head "$GITHUB_SHA"',
+        '--expected-fingerprint "$EXPECTED_FINGERPRINT"',
+        '--allowed-merge-commit "$ALLOWED_MERGE_COMMIT"',
+    ):
+        assert flag in call, f"the CI verifier call is missing {flag}"
+    # A push event names no tag, so a --tag here could only fail the push it guards.
+    assert "--tag" not in call
+    # Pinned whole rather than clause by clause: dropping the repository test would
+    # hand every fork a red job it has no key to make green, and dropping either of
+    # the others would run the gate where $GITHUB_SHA is not the audited history.
+    assert _CI_SIGNED_HISTORY_GUARD in job
+    # The range walk needs the whole history, not the default shallow clone.
+    assert "fetch-depth: 0" in job
