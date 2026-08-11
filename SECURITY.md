@@ -66,11 +66,11 @@ is welcome.
 Releases are published to PyPI from a tagged, signed commit through trusted
 publishing, with no stored API token. The release workflow verifies the
 annotated tag and every commit in the released range against the key in
-`.github/release-signing-key.asc` — with a single pinned exception, a merge
-commit accepted only when every parent verifies against that key and its tree
-equals a parent's tree, so every released byte still traces to maintainer-signed
-content — each GitHub Release carries a `SHA256SUMS` file covering the exact
-distributions published to PyPI, and a separate manually dispatched workflow
-re-verifies after publication that the two match.
+`.github/release-signing-key.asc` — with a single pinned exception (the merge
+`3cf59c6`), accepted only when every parent verifies against that key and its
+tree equals a parent's tree, so every released byte still traces to
+maintainer-signed content — each GitHub Release carries a `SHA256SUMS` file
+covering the exact distributions published to PyPI, and a separate manually
+dispatched workflow re-verifies after publication that the two match.
 [`docs/releases.md`](docs/releases.md) describes the pipeline and how to check a
 download.

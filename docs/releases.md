@@ -32,8 +32,8 @@ GitHub's merge button, is accepted only because it is a merge whose parents all
 verify against the release key and whose tree is byte-identical to a parent's
 tree — it can introduce no content that did not itself arrive maintainer-signed.
 Any other unsigned or foreign commit, merge or not, still fails the release. The
-same check runs in CI on every push to `main`, so a violation surfaces on the
-push that introduces it rather than at the next release.
+same commit-range check runs in CI on every push to `main`, so a violation
+surfaces on the push that introduces it rather than at the next release.
 
 **Release metadata.**
 [`scripts/verify_release_metadata.py`](../scripts/verify_release_metadata.py)

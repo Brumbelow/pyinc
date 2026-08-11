@@ -104,9 +104,9 @@ commit in the released range against the release signing key, so those commits
 reach `main` as a fast-forward push of locally signed commits rather than
 through the GitHub merge button. One historical merge-button commit is pinned
 in the release workflow's structural allowlist and verified by shape (all
-parents signed, tree identical to a parent); new merge commits are still
-rejected, so the fast-forward rule above is the one to follow. This does not
-affect ordinary pull requests.
+parents signed by the release key, tree identical to a parent); new
+merge-button commits are still rejected, so the fast-forward rule above is the
+one to follow. This does not affect ordinary pull requests.
 [`docs/releases.md`](docs/releases.md) describes the rest of the pipeline.
 
 ## Reporting a security issue
