@@ -830,6 +830,9 @@ def test_cli_reports_failure_on_stderr(
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+_EXPECTED_FINGERPRINT = "2B6DF408BD973740052925DC894C75E1B1D05EA2"
+_TRUSTED_BASELINE = "8db85ec7a647bd7b74bf04f07e94a9bd78675193"
+_ALLOWED_MERGE_COMMIT = "3cf59c6f0a2a24ef8306a8a1ded35ac482024dbc"
 
 
 def _workflow_text(name: str) -> str:
@@ -843,14 +846,27 @@ def _workflow_value(text: str, key: str) -> str:
     return matches[0]
 
 
-def test_release_workflow_pins_full_commit_identifiers() -> None:
-    text = _workflow_text("release.yml")
-    fingerprint = _workflow_value(text, "EXPECTED_FINGERPRINT")
-    baseline = _workflow_value(text, "TRUSTED_BASELINE")
-    allowed = _workflow_value(text, "ALLOWED_MERGE_COMMIT")
-    assert fingerprint == fingerprint.upper()
-    assert baseline == baseline.lower()
-    assert allowed == allowed.lower()
+@pytest.mark.parametrize("workflow", ["release.yml", "ci.yml"])
+def test_workflows_pin_the_audited_trust_inputs(workflow: str) -> None:
+    # Pinned by value rather than by shape: a mistyped but well-formed identifier
+    # would otherwise ship with the suite green.
+    text = _workflow_text(workflow)
+    assert _workflow_value(text, "EXPECTED_FINGERPRINT") == _EXPECTED_FINGERPRINT
+    assert _workflow_value(text, "TRUSTED_BASELINE") == _TRUSTED_BASELINE
+    assert _workflow_value(text, "ALLOWED_MERGE_COMMIT") == _ALLOWED_MERGE_COMMIT
+
+
+def _primary_key_fingerprint(listing: str) -> str:
+    """Return the primary fingerprint: the first fpr line after the pub line."""
+
+    primary_seen = False
+    for line in listing.splitlines():
+        fields = line.split(":")
+        if fields[0] == "pub":
+            primary_seen = True
+        elif primary_seen and fields[0] == "fpr":
+            return fields[9]
+    raise AssertionError("the key listing carries no primary fingerprint")
 
 
 def test_release_workflow_fingerprint_matches_the_shipped_key() -> None:
@@ -865,24 +881,40 @@ def test_release_workflow_fingerprint_matches_the_shipped_key() -> None:
             str(_REPO_ROOT / ".github" / "release-signing-key.asc"),
         ]
     )
-    key_fingerprints = [
-        line.split(":")[9]
-        for line in listing.splitlines()
-        if line.split(":")[0] == "fpr"
-    ]
-    assert fingerprint in key_fingerprints
+    # The workflow's awk stops at the first fpr line, so the pin has to be the
+    # primary key: a subkey fingerprint would import cleanly and verify nothing.
+    assert fingerprint == _primary_key_fingerprint(listing)
     primary_count = sum(
         1 for line in listing.splitlines() if line.split(":")[0] == "pub"
     )
     assert primary_count == 1
 
 
+def _verifier_invocations(text: str) -> list[str]:
+    """Return each verify_signed_history.py command, line continuations joined."""
+
+    joined = re.sub(r"\\\n\s*", " ", text)
+    return [line for line in joined.splitlines() if "verify_signed_history.py" in line]
+
+
 def test_release_workflow_calls_the_extracted_verifier() -> None:
     text = _workflow_text("release.yml")
-    assert "scripts/verify_signed_history.py" in text
-    assert "--tag" in text
-    assert "--allowed-merge-commit" in text
-    # The release-candidate tag is verified by the script too, not by shell.
-    assert '--tag "$rc_tag"' in text
+    # Flags are matched against the verifier's own commands, not the whole file:
+    # the release-metadata step hands the same --tag "$GITHUB_REF_NAME" to another
+    # script, so a file-wide match stays green after the tag wiring is deleted here.
+    invocations = _verifier_invocations(text)
+    assert len(invocations) == 2
+    assert all("--allowed-merge-commit" in call for call in invocations)
+    assert any('--tag "$GITHUB_REF_NAME"' in call for call in invocations)
+    assert any('--tag "$rc_tag"' in call for call in invocations)
     assert "while IFS= read -r commit" not in text
     assert "verify_expected_signature" not in text
+
+
+def test_ci_and_release_workflows_agree_on_trust_inputs() -> None:
+    release_text = _workflow_text("release.yml")
+    ci_text = _workflow_text("ci.yml")
+    for key in ("EXPECTED_FINGERPRINT", "TRUSTED_BASELINE", "ALLOWED_MERGE_COMMIT"):
+        assert _workflow_value(release_text, key) == _workflow_value(ci_text, key)
+    assert "scripts/verify_signed_history.py" in ci_text
+    assert "fetch-depth: 0" in ci_text

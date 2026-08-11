@@ -106,3 +106,43 @@ jobs:
           .artifact-venv/bin/python examples/action_reconcile_demo.py
           .artifact-venv/bin/python examples/calc_demo.py
           .artifact-venv/bin/python examples/codegen_demo.py
+
+  signed-history:
+    name: Verify signed history
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      EXPECTED_FINGERPRINT: 2B6DF408BD973740052925DC894C75E1B1D05EA2
+      TRUSTED_BASELINE: 8db85ec7a647bd7b74bf04f07e94a9bd78675193
+      ALLOWED_MERGE_COMMIT: 3cf59c6f0a2a24ef8306a8a1ded35ac482024dbc
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14'
+
+      - name: Import the release signing key
+        env:
+          GNUPGHOME: ${{ runner.temp }}/pyinc-release-gnupg
+        run: |
+          install -d -m 700 "$GNUPGHOME"
+          gpg --batch --import .github/release-signing-key.asc
+          primary_count="$(gpg --batch --with-colons --list-keys | awk -F: '$1 == "pub" { count++ } END { print count + 0 }')"
+          test "$primary_count" = 1
+          actual_fingerprint="$(gpg --batch --with-colons --fingerprint | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test "$actual_fingerprint" = "$EXPECTED_FINGERPRINT"
+
+      - name: Verify signed history
+        env:
+          GNUPGHOME: ${{ runner.temp }}/pyinc-release-gnupg
+        run: |
+          python scripts/verify_signed_history.py \
+            --repository . \
+            --baseline "$TRUSTED_BASELINE" \
+            --head "$GITHUB_SHA" \
+            --expected-fingerprint "$EXPECTED_FINGERPRINT" \
+            --allowed-merge-commit "$ALLOWED_MERGE_COMMIT"
