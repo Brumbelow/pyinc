@@ -81,6 +81,22 @@ class Query(Generic[P, T]):
         return db.get(self, *args, **kwargs)
 
     def compare(self, old_value: Any, new_value: Any) -> bool:
+        """Decide equivalence of two exposed values under this query's policy.
+
+        Registry-free by contract: values needing a ValueAdapter cannot be
+        compared here -- the runtime performs its own comparison over stored
+        snapshots and never calls this helper. The default policy is the
+        kernel's canonical relation via ``semantic_equal``.
+
+        The cutoff arm decides by that same relation over frozen tokens, but
+        it freezes without a Database, so it differs from the kernel's cutoff
+        comparison in what it rejects rather than in what it decides: a token
+        needing a ValueAdapter raises ``UnsupportedValueError`` here even
+        where the kernel, holding the registry, would compare it, and the
+        failure carries freeze's own message instead of the kernel's "Cutoff
+        functions must return snapshot-safe values." No token frozen here
+        reaches a configured ArtifactStore.
+        """
         if self.cutoff is not None:
             return semantic_equal(self.cutoff(old_value), self.cutoff(new_value))
         comparator = self.eq or semantic_equal
