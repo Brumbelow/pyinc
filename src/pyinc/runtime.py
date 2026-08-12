@@ -3036,21 +3036,19 @@ class Database:
         self,
         snapshot: Any,
         *,
-        boundary: bool = False,
         record_boundaries: bool = False,
         frame: ExecutionFrame | None = None,
     ) -> Any:
+        # Exposure always detaches: the stored snapshot itself is never handed
+        # out, so nothing done to what came back can reach the record. Callers
+        # never see the FrozenGraph envelope either -- a graph-shaped result is
+        # rebuilt into shared/cyclic Frozen* views, exactly as _materialize_call
+        # does for call arguments.
         if self.mode == "strict":
-            # Callers never see the FrozenGraph envelope: a graph-shaped result
-            # is rebuilt into shared/cyclic Frozen* views at the boundary,
-            # exactly as _materialize_call does for call arguments. Raw
-            # exposure hands back the stored snapshot itself, so it is for
-            # kernel-internal readers only -- a recomputed query's eq=/cutoff=
-            # policy takes detached operands from _policy_operand instead.
-            exposed = self._strict_snapshot_view(snapshot) if boundary else snapshot
+            exposed = self._strict_snapshot_view(snapshot)
         else:
             exposed = self._thaw_value(snapshot)
-        if boundary and record_boundaries and frame is not None:
+        if record_boundaries and frame is not None:
             frame.boundary_fingerprints.append(self._fingerprint_value(exposed))
             frame.boundary_values.append(exposed)
         return exposed
@@ -3058,23 +3056,22 @@ class Database:
     def _policy_operand(self, snapshot: Any) -> Any:
         """Detach a stored snapshot before a user eq=/cutoff= policy sees it.
 
-        strict exposes detached Frozen* views -- _strict_snapshot_view
-        rebuilds every shell precisely because object.__setattr__ bypasses
-        frozen-dataclass setters, and it handles FrozenGraph cycles, so a
-        cyclic result is comparable without re-freezing. checked and fast
-        thaw, which already allocates fresh containers. Either way the
-        operand shares no mutable shell with the record it came from.
+        A policy operand is exposed exactly as a caller-boundary value is,
+        without the checked-mode mutation bookkeeping: strict rebuilds every
+        Frozen* shell -- _strict_snapshot_view exists precisely because
+        object.__setattr__ bypasses frozen-dataclass setters, and it handles
+        FrozenGraph cycles, so a cyclic result is comparable without
+        re-freezing -- while checked and fast thaw, which already allocates
+        fresh containers. Either way the operand shares no mutable shell with
+        the record it came from.
         """
 
-        if self.mode == "strict":
-            return self._strict_snapshot_view(snapshot)
-        return self._thaw_value(snapshot)
+        return self._expose_snapshot(snapshot)
 
     def _expose_boundary_snapshot(self, snapshot: Any) -> Any:
         frame = self._current_frame()
         return self._expose_snapshot(
             snapshot,
-            boundary=True,
             record_boundaries=self.mode == "checked" and frame is not None,
             frame=frame,
         )
