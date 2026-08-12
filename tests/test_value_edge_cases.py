@@ -344,8 +344,12 @@ _COLLIDING_KEY_PAIRS: tuple[tuple[object, object], ...] = (
 @pytest.mark.parametrize(("left", "right"), _COLLIDING_KEY_PAIRS)
 def test_thaw_colliding_dict_keys_are_rejected(left: object, right: object) -> None:
     wrapper = FrozenDict(cast(Any, _ordered_entries(left, right)))
-    with pytest.raises(UnsupportedValueError, match="collapse"):
+    with pytest.raises(UnsupportedValueError, match="collapse") as raised:
         freeze(wrapper)
+    # Name the pair, not just the fault: a caller holding a large mapping has
+    # to be told which two keys to separate.
+    assert repr(left) in str(raised.value)
+    assert repr(right) in str(raised.value)
     with pytest.raises(UnsupportedValueError, match="collapse"):
         serialize_snapshot(wrapper)
 
@@ -354,8 +358,10 @@ def test_thaw_colliding_dict_keys_are_rejected(left: object, right: object) -> N
 @pytest.mark.parametrize(("left", "right"), _COLLIDING_KEY_PAIRS)
 def test_thaw_colliding_set_members_are_rejected(kind: str, left: object, right: object) -> None:
     wrapper = FrozenSet(kind, _ordered_members(left, right))
-    with pytest.raises(UnsupportedValueError, match="collapse"):
+    with pytest.raises(UnsupportedValueError, match="collapse") as raised:
         freeze(wrapper)
+    assert repr(left) in str(raised.value)
+    assert repr(right) in str(raised.value)
     with pytest.raises(UnsupportedValueError, match="collapse"):
         serialize_snapshot(wrapper)
 
@@ -402,6 +408,27 @@ def test_nan_bearing_positions_are_refused_because_the_encoding_cannot_see_them(
         freeze(FrozenDict(cast(Any, _ordered_entries((1, nan), (1.0, nan)))))
 
 
+def test_live_values_carrying_distinct_nan_objects_are_rejected() -> None:
+    first = float("nan")
+    second = float("nan")
+    assert first is not second
+    # Nothing hand-built here: NaN hashes by object identity, so a live dict
+    # and a live set both keep these two entries apart and hand freeze two
+    # keys. The one-NaN-class rule refuses them anyway, and that refusal is
+    # deliberate -- both cases encode to the same bytes as the shared-NaN
+    # version, which does collapse on thaw, so accepting these would make
+    # acceptance depend on object sharing the encoding cannot express.
+    # Freezing ordinary values can therefore be rejected by this rule.
+    live_dict = {(1, first): "a", (1.0, second): "b"}
+    assert len(live_dict) == 2
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(live_dict)
+    live_set = {(1, first), (1.0, second)}
+    assert len(live_set) == 2
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(live_set)
+
+
 def test_distinct_after_thaw_positions_stay_accepted() -> None:
     accepted = [
         FrozenDict(cast(Any, _ordered_entries(1, 2.5))),
@@ -410,6 +437,10 @@ def test_distinct_after_thaw_positions_stay_accepted() -> None:
         # Infinities key by sign rather than by exact value; asking for the
         # exact value of an infinite float would raise instead of rejecting.
         FrozenSet("frozenset", _ordered_members(float("inf"), float("-inf"), 1e300)),
+        # Exactly the pair a float cast loses: float(2**53 + 1) is float(2**53),
+        # so a float-keyed class would refuse two keys a live dict keeps apart.
+        FrozenDict(cast(Any, _ordered_entries(2**53 + 1, float(2**53)))),
+        FrozenSet("frozenset", _ordered_members(2**53 + 1, float(2**53))),
     ]
     for wrapper in accepted:
         snapshot = freeze(wrapper)

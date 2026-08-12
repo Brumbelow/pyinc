@@ -1485,7 +1485,11 @@ def _thaw_equivalence_key(snapshot: Any) -> object:
     so entries that encode differently can collapse into one key or member
     after thaw. Fraction keeps large integers exact where a float cast would
     not. Non-hash-position types fall back to their canonical fingerprint,
-    which rejects nothing the digest-uniqueness rule does not already reject.
+    which rejects nothing the digest-uniqueness rule does not already reject --
+    adapter values included, and there the fallback is a deliberate gap rather
+    than coverage: two payloads that encode differently can still thaw into
+    equal adapted values, and separating those needs the adapter registry this
+    validator is not given.
     """
 
     if snapshot is None:
