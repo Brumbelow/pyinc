@@ -239,6 +239,12 @@ def test_deserialize_rejects_malformed_tags_delimiters_and_lengths(payload: byte
 def test_snapshot_equality_helper_returns_a_real_bool() -> None:
     assert snapshots_equal(FrozenList((1,)), FrozenList((1,))) is True
     assert snapshots_equal(FrozenList((1,)), FrozenList((2,))) is False
+    # The relation is canonical-encoding equality, not Python ==: the numeric
+    # tower does not unify, and a canonical NaN equals a canonical NaN.
+    assert snapshots_equal(FrozenList((1,)), FrozenList((1.0,))) is False
+    assert snapshots_equal(FrozenList((True,)), FrozenList((1,))) is False
+    nan = float.fromhex("nan")
+    assert snapshots_equal(FrozenList((nan,)), FrozenList((nan,))) is True
 
 
 def test_snapshot_hashability_analysis_covers_refs_and_nested_shapes() -> None:

@@ -4034,7 +4034,7 @@ def test_freshly_built_nan_result_backdates_and_holds_dependents(mode: str) -> N
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_equal_int_float_recompute_backdates(mode: str) -> None:
+def test_int_to_float_recompute_executes(mode: str) -> None:
     stage = Input[int]("stage")
 
     @query
@@ -4044,21 +4044,19 @@ def test_equal_int_float_recompute_backdates(mode: str) -> None:
     db = Database(mode=mode)
     db.set(stage, 0)
     assert db.get(measure) == 1
-    changed_at = _inspect_node(db, measure).changed_at
-    backdates = db.statistics().query_backdates
 
     db.set(stage, 1)
     revision_after_set = db.revision
-    assert db.get(measure) == 1.0
+    value = db.get(measure)
+    assert type(cast(Any, value)) is float
     record = _inspect_node(db, measure)
-    assert record.last_decision == "backdated"
-    assert record.changed_at == changed_at
-    assert db.revision == revision_after_set
-    assert db.statistics().query_backdates == backdates + 1
+    assert record.last_decision == "executed"
+    assert db.revision == revision_after_set + 1
+    assert record.changed_at == db.revision
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_equal_bool_int_recompute_backdates(mode: str) -> None:
+def test_bool_to_int_recompute_executes(mode: str) -> None:
     stage = Input[int]("stage")
 
     @query
@@ -4068,17 +4066,15 @@ def test_equal_bool_int_recompute_backdates(mode: str) -> None:
     db = Database(mode=mode)
     db.set(stage, 0)
     db.get(flag)
-    changed_at = _inspect_node(db, flag).changed_at
 
     db.set(stage, 1)
-    db.get(flag)
-    record = _inspect_node(db, flag)
-    assert record.last_decision == "backdated"
-    assert record.changed_at == changed_at
+    value = db.get(flag)
+    assert type(cast(Any, value)) is int
+    assert _inspect_node(db, flag).last_decision == "executed"
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_negative_zero_recompute_backdates(mode: str) -> None:
+def test_negative_zero_recompute_executes(mode: str) -> None:
     stage = Input[int]("stage")
 
     @query
@@ -4097,23 +4093,23 @@ def test_negative_zero_recompute_backdates(mode: str) -> None:
     db.get(nested)
 
     db.set(stage, 1)
-    db.get(bare)
+    assert math.copysign(1.0, cast(float, db.get(bare))) == -1.0
     db.get(nested)
-    assert _inspect_node(db, bare).last_decision == "backdated"
-    assert _inspect_node(db, nested).last_decision == "backdated"
+    assert _inspect_node(db, bare).last_decision == "executed"
+    assert _inspect_node(db, nested).last_decision == "executed"
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_numeric_dict_key_recompute_decisions(mode: str) -> None:
     stage = Input[int]("stage")
 
+    # An int key and a float key are different canonical encodings, so both
+    # shapes execute -- the single-entry case used to backdate because raw
+    # == unified 1 and 1.0.
     @query
     def single_entry(db: Database) -> object:
         return {1: "a"} if stage.read(db) == 0 else {1.0: "a"}
 
-    # With two entries the canonical entry order distinguishes the int key
-    # from the float key, so the stored snapshots differ and the recompute
-    # executes. Pinned exactly as it behaves today.
     @query
     def double_entry(db: Database) -> object:
         return {1: "a", 2: "b"} if stage.read(db) == 0 else {1.0: "a", 2: "b"}
@@ -4126,7 +4122,7 @@ def test_numeric_dict_key_recompute_decisions(mode: str) -> None:
     db.set(stage, 1)
     db.get(single_entry)
     db.get(double_entry)
-    assert _inspect_node(db, single_entry).last_decision == "backdated"
+    assert _inspect_node(db, single_entry).last_decision == "executed"
     assert _inspect_node(db, double_entry).last_decision == "executed"
 
 

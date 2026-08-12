@@ -1232,12 +1232,13 @@ def test_nan_payloads_are_canonicalized_and_prefrozen_payloads_are_validated() -
 
 
 def test_semantic_equality_of_canonical_snapshots_matches_snapshot_equality() -> None:
-    """freeze is ==-preserving on its own outputs.
+    """freeze is encoding-preserving on its own outputs.
 
-    The runtime's default backdate decision relies on this reduction: for
-    canonical snapshots ``a`` and ``b`` (outputs of ``freeze``), re-freezing
-    never changes the encoding and ``semantic_equal(a, b)`` coincides with
-    comparing the snapshots directly.
+    For canonical snapshots ``a`` and ``b``, re-freezing never changes the
+    canonical encoding, so ``semantic_equal(a, b)`` coincides with
+    ``snapshots_equal(a, b)``. The runtime's default backdate decision is
+    exactly ``snapshots_equal`` on the stored snapshots (no digest fallback),
+    so this reduction is what makes the one relation one.
     """
 
     @dataclass(frozen=True)
@@ -1308,3 +1309,46 @@ def test_semantic_equality_of_canonical_snapshots_matches_snapshot_equality() ->
         right = freeze(right_value, adapters=adapters)
         assert fingerprint_snapshot(freeze(left, adapters=adapters)) == fingerprint_snapshot(left)
         assert semantic_equal(left, right, adapters=adapters) == snapshots_equal(left, right)
+
+
+_TOWER_PAIRS: tuple[tuple[object, object], ...] = (
+    (1, 1.0),
+    (True, 1),
+    (False, 0),
+    (0.0, -0.0),
+    (1, 1 + 0j),
+)
+
+
+def test_canonical_relation_separates_the_numeric_tower() -> None:
+    for left, right in _TOWER_PAIRS:
+        assert not semantic_equal(left, right), (left, right)
+        assert not semantic_equal([left], [right])
+        assert not semantic_equal((left,), (right,))
+        assert not semantic_equal({"k": left}, {"k": right})
+        assert not semantic_equal({left}, {right})
+        assert not semantic_equal(frozenset({left}), frozenset({right}))
+
+
+def test_canonical_relation_separates_nested_dataclass_fields() -> None:
+    @dataclass(frozen=True)
+    class Holder:
+        x: Any
+
+    for left, right in _TOWER_PAIRS:
+        assert not semantic_equal(Holder(left), Holder(right)), (left, right)
+
+
+def test_canonical_relation_makes_nan_reflexive() -> None:
+    nan = float("nan")
+    assert semantic_equal(nan, nan)
+    assert semantic_equal((1.0, nan), (1.0, nan))
+    assert semantic_equal([nan], [nan])
+    assert snapshots_equal(freeze([nan]), freeze([nan]))
+
+
+def test_canonical_relation_still_equates_equal_values() -> None:
+    assert semantic_equal([1, 2], [1, 2])
+    assert semantic_equal({"a": 1.5}, {"a": 1.5})
+    assert not semantic_equal([1, 2], [1, 3])
+    assert not semantic_equal([1, 2], (1, 2))

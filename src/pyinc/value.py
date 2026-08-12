@@ -1389,13 +1389,31 @@ def _read_length_prefixed_int(buf: memoryview, offset: int) -> tuple[int, int]:
 
 
 def snapshots_equal(left: Any, right: Any) -> bool:
-    return bool(left == right)
+    """Canonical equality over snapshots: equality of canonical encodings.
+
+    This is THE default relation for every backdate, input-update, probe and
+    cutoff decision. It compares type tags before values, so the numeric
+    tower never unifies (1, 1.0, True are three different values and 0.0
+    differs from -0.0), and a canonical NaN equals a canonical NaN. The
+    identity shortcut is sound here because the encoding is a pure function
+    of the object.
+    """
+
+    if left is right:
+        return True
+    left_buffer = bytearray()
+    _encode_snapshot(left, left_buffer)
+    right_buffer = bytearray()
+    _encode_snapshot(right, right_buffer)
+    return left_buffer == right_buffer
 
 
 def semantic_equal(
     left: Any, right: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None
 ) -> bool:
-    return freeze(left, adapters=adapters) == freeze(right, adapters=adapters)
+    return snapshots_equal(
+        freeze(left, adapters=adapters), freeze(right, adapters=adapters)
+    )
 
 
 def assert_not_mutated(before: str, after: str) -> None:
