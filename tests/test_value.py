@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -329,6 +330,61 @@ def test_freeze_rejects_hand_built_wrapper_cycles_without_recursing() -> None:
     object.__setattr__(shell, "items", (holder,))
     with pytest.raises(UnsupportedValueError, match="object cycles"):
         freeze(holder)
+
+
+def test_freeze_detach_shares_leaf_tuples_and_clones_tuples_holding_shells() -> None:
+    leaf_tuple = (1, "a")
+    mixed_tuple = (1, FrozenList((2,)))
+    clone = cast(FrozenList, freeze(FrozenList((leaf_tuple, mixed_tuple))))
+
+    # An all-leaf tuple is shared: it is immutable and holds no rebindable
+    # shell, so the detach returns it unchanged rather than reallocating.
+    assert clone.items[0] is leaf_tuple
+    # A tuple holding a shell must be rebuilt, or the shell stays aliased.
+    assert clone.items[1] is not mixed_tuple
+    assert clone.items[1] == mixed_tuple
+    assert clone.items[1][1] is not mixed_tuple[1]
+
+
+def test_freeze_rejects_malformed_wrapper_shells_with_the_kernel_error() -> None:
+    # _detach_wrapper reads shell fields directly (unpacking entry pairs,
+    # iterating items), so the input grammar has to be checked before the
+    # clone walk. Otherwise a malformed shell either escapes as a raw
+    # ValueError -- which none of runtime.py's UnsupportedValueError boundary
+    # handlers catch -- or gets silently normalized into a well-formed
+    # snapshot, which would let an invalid wrapper enter the store.
+    cases: list[tuple[Any, str]] = [
+        (
+            FrozenDict(entries=cast(Any, (("a", 1, 2),))),
+            "FrozenDict entries must be key/value pairs.",
+        ),
+        (
+            FrozenRecord("R", cast(Any, (("x",),))),
+            "FrozenRecord entries must be field/value pairs.",
+        ),
+        (FrozenList(items=cast(Any, [1, 2])), "FrozenList.items must be a tuple."),
+        (FrozenList(items=cast(Any, "ab")), "FrozenList.items must be a tuple."),
+        (FrozenSet(kind="set", items=cast(Any, [1])), "FrozenSet.items must be a tuple."),
+        (FrozenDict(entries=cast(Any, [("a", 1)])), "FrozenDict.entries must be a tuple."),
+        (FrozenRecord("R", cast(Any, [("x", 1)])), "FrozenRecord.entries must be a tuple."),
+    ]
+    for wrapper, message in cases:
+        with pytest.raises(UnsupportedValueError, match=re.escape(message)):
+            freeze(wrapper)
+
+
+def test_freeze_rejects_malformed_wrapper_shells_nested_in_raw_containers() -> None:
+    # The same guard has to fire for a wrapper reached through a raw spine;
+    # inlining used to rebuild these into well-formed snapshots silently.
+    with pytest.raises(
+        UnsupportedValueError, match=re.escape("FrozenList.items must be a tuple.")
+    ):
+        freeze([FrozenList(items=cast(Any, [1, 2]))])
+    with pytest.raises(
+        UnsupportedValueError,
+        match=re.escape("FrozenDict entries must be key/value pairs."),
+    ):
+        freeze({"k": FrozenDict(entries=cast(Any, (("a", 1, 2),)))})
 
 
 # ---------------------------------------------------------------------------

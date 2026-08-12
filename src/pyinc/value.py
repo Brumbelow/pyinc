@@ -255,6 +255,13 @@ def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snap
             )
         return cast(Snapshot, value)
     if type(value) in _FROZEN_TYPES:
+        # Both walks below read shell fields directly -- unpacking entry pairs
+        # and iterating `items` -- so the field shapes have to be checked
+        # first. Without this an inbound shell with a 3-element entry escapes
+        # as a raw ValueError past every boundary handler, and one whose
+        # `items` is a list gets rebuilt into a well-formed snapshot instead
+        # of rejected.
+        _validate_wrapper_shape(value)
         if state.refreeze_wrappers or _wrapper_aliases_structure(value):
             # A strict-mode boundary view rebuilds a FrozenGraph snapshot into
             # wrapper objects that genuinely share or cycle through each other.
@@ -375,6 +382,80 @@ def _freeze_dataclass(value: Any, registry: _AdapterRegistry, state: _FreezeStat
         ),
     )
     return FrozenRecord(type(value).__qualname__, frozen_items)
+
+
+def _validate_wrapper_shape(value: Any, seen: set[int] | None = None) -> None:
+    """Reject an inbound Frozen* shell whose fields are not the declared shapes.
+
+    `_wrapper_aliases_structure` and `_detach_wrapper` both read these fields
+    directly, so a malformed shell would otherwise escape as a raw
+    `ValueError` -- which no boundary handler catches -- or be silently
+    rebuilt into a well-formed snapshot by the clone.
+
+    `_validate_snapshot` cannot serve here even though it owns the same rules:
+    an inbound wrapper is allowed to be a genuinely cyclic or shared Python
+    object graph, which is precisely what `_refreeze_wrapper` re-encodes,
+    while the canonical grammar forbids exactly that. So this walk is
+    visit-once rather than path-scoped and checks only the field shapes the
+    two walks depend on; ordering, duplicate-key, and cycle rules stay with
+    the canonical validator that runs on the result. The messages are kept
+    identical to it so a caller sees a single contract.
+    """
+
+    value_type = type(value)
+    if value_type not in _FROZEN_TYPES and value_type is not tuple:
+        return
+    if value_type is FrozenRef:
+        return
+    if seen is None:
+        seen = set()
+    object_id = id(value)
+    if object_id in seen:
+        return
+    seen.add(object_id)
+    if value_type is FrozenList:
+        if type(value.items) is not tuple:
+            raise UnsupportedValueError("FrozenList.items must be a tuple.")
+        for item in value.items:
+            _validate_wrapper_shape(item, seen)
+        return
+    if value_type is FrozenDict:
+        if type(value.entries) is not tuple:
+            raise UnsupportedValueError("FrozenDict.entries must be a tuple.")
+        for entry in value.entries:
+            if type(entry) is not tuple or len(entry) != 2:
+                raise UnsupportedValueError("FrozenDict entries must be key/value pairs.")
+            _validate_wrapper_shape(entry[0], seen)
+            _validate_wrapper_shape(entry[1], seen)
+        return
+    if value_type is FrozenSet:
+        if type(value.kind) is not str or value.kind not in {"set", "frozenset"}:
+            raise UnsupportedValueError("FrozenSet.kind must be 'set' or 'frozenset'.")
+        if type(value.items) is not tuple:
+            raise UnsupportedValueError("FrozenSet.items must be a tuple.")
+        for item in value.items:
+            _validate_wrapper_shape(item, seen)
+        return
+    if value_type is FrozenRecord:
+        if type(value.entries) is not tuple:
+            raise UnsupportedValueError("FrozenRecord.entries must be a tuple.")
+        for entry in value.entries:
+            if type(entry) is not tuple or len(entry) != 2:
+                raise UnsupportedValueError("FrozenRecord entries must be field/value pairs.")
+            _validate_wrapper_shape(entry[1], seen)
+        return
+    if value_type is FrozenAdapterValue:
+        _validate_wrapper_shape(value.payload, seen)
+        return
+    if value_type is FrozenGraph:
+        if type(value.nodes) is not tuple or not value.nodes:
+            raise UnsupportedValueError("FrozenGraph.nodes must be a non-empty tuple.")
+        for node in value.nodes:
+            _validate_wrapper_shape(node, seen)
+        _validate_wrapper_shape(value.root, seen)
+        return
+    for item in value:
+        _validate_wrapper_shape(item, seen)
 
 
 def _wrapper_aliases_structure(value: Any) -> bool:
