@@ -5262,11 +5262,14 @@ def test_failing_probe_type_flip_counts_as_changed(mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_checkpoint_hint_probe_type_flip_reloads(mode: str) -> None:
+@pytest.mark.parametrize(("first", "second"), _TOWER_FLIPS)
+def test_checkpoint_hint_probe_type_flip_reloads(
+    mode: str, first: object, second: object
+) -> None:
     # Settled by the hint-restore gate, the third probe comparison. It has
     # neither a digest filter nor a record to fall back on, so a flip it calls
     # equal hands back checkpoint bytes for a world that has already moved.
-    cell = _TokenProbeCell(token=1, payload="alpha")
+    cell = _TokenProbeCell(token=first, payload="alpha")
     resource = _HeldTokenResource(cell)
 
     @query
@@ -5278,17 +5281,47 @@ def test_checkpoint_hint_probe_type_flip_reloads(mode: str) -> None:
     assert saver.get(loaded) == "alpha"
     key = saver.save_checkpoint()
 
-    cell.token = 1.0
+    cell.token = second
     cell.payload = "beta"
     restored = Database(mode=mode, store=store)
     restored.load_checkpoint(key)
     loads_before = restored.statistics().resource_loads
     assert restored.get(loaded) == "beta"
-    # The hint declined: this value came from a load, not from the store.
-    assert restored.statistics().resource_loads > loads_before
+    # The hint declined: this value came from a load and not from the
+    # checkpoint bytes -- exactly one load, the miss falling straight through.
+    assert restored.statistics().resource_loads == loads_before + 1
 
     fresh = Database(mode=mode)
     assert fresh.get(loaded) == "beta"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_checkpoint_hint_probe_without_flip_restores_from_store(mode: str) -> None:
+    # The control for the flip pin above. With the probe standing still the
+    # hint is meant to fire, so the miss up there is the flip's doing rather
+    # than a hint that never restores anything in the first place.
+    cell = _TokenProbeCell(token=1, payload="alpha")
+    resource = _HeldTokenResource(cell)
+
+    @query
+    def loaded(db: Database) -> str:
+        return resource.read(db, "hint-steady-cell")
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    assert saver.get(loaded) == "alpha"
+    key = saver.save_checkpoint()
+
+    # The probe holds, but what a load would return moves: only a restore from
+    # the checkpoint bytes can still answer "alpha" here.
+    cell.payload = "beta"
+    restored = Database(mode=mode, store=store)
+    restored.load_checkpoint(key)
+    hits_before = restored.statistics().resource_probe_hits
+    loads_before = restored.statistics().resource_loads
+    assert restored.get(loaded) == "alpha"
+    assert restored.statistics().resource_probe_hits == hits_before + 1
+    assert restored.statistics().resource_loads == loads_before
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -5339,3 +5372,81 @@ def test_nan_cutoff_token_backdates(mode: str) -> None:
     # deciding site as the flip pin above, reached with the same policy arm:
     # nothing but the token comparison can produce this decision.
     assert _inspect_node(db, gated).last_decision == "backdated"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(("first", "second"), _TOWER_FLIPS)
+def test_checkpoint_reload_after_type_flip_matches_fresh(
+    mode: str, first: object, second: object
+) -> None:
+    # The saving database reached its answer by executing through a flip. A
+    # checkpoint has to carry that answer across the process boundary: warm
+    # from durable state is only sound while it is what a fresh run gives.
+    stage = Input[int]("ckp-flip-stage")
+
+    @query
+    def measure(db: Database) -> object:
+        return first if stage.read(db) == 0 else second
+
+    @query
+    def described(db: Database) -> str:
+        return _tower_repr(measure(db))
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    saver.set(stage, 0)
+    saver.get(described)
+    saver.set(stage, 1)
+    assert saver.get(described) == _tower_repr(second)
+    key = saver.save_checkpoint()
+
+    restored = Database(mode=mode, store=store)
+    restored.set(stage, 1)
+    restored.load_checkpoint(key)
+    executions_before = restored.statistics().query_executions
+
+    fresh = Database(mode=mode)
+    fresh.set(stage, 1)
+    assert restored.get(described) == fresh.get(described) == _tower_repr(second)
+    # Warm, not recomputed: the reload answered the request from the
+    # checkpoint, so this is the stored answer being right and not a
+    # re-execution papering over a stored one that was wrong.
+    assert restored.statistics().query_executions == executions_before
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_checkpoint_reload_after_nan_backdate_matches_fresh(mode: str) -> None:
+    # The NaN half of the same question. Here the saving database backdated --
+    # canonical NaN equals canonical NaN -- so the checkpoint persists a record
+    # whose value outlived a change to its dependency. It still has to reload
+    # into the answer a fresh database gives.
+    stage = Input[int]("ckp-nan-stage")
+
+    @query
+    def produce(db: Database) -> float:
+        stage.read(db)
+        return float("nan")
+
+    @query
+    def described(db: Database) -> str:
+        return _tower_repr(produce(db))
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    saver.set(stage, 0)
+    saver.get(described)
+    backdates_before = saver.statistics().query_backdates
+    saver.set(stage, 1)
+    assert saver.get(described) == "float:nan"
+    assert saver.statistics().query_backdates == backdates_before + 1
+    key = saver.save_checkpoint()
+
+    restored = Database(mode=mode, store=store)
+    restored.set(stage, 1)
+    restored.load_checkpoint(key)
+    executions_before = restored.statistics().query_executions
+
+    fresh = Database(mode=mode)
+    fresh.set(stage, 1)
+    assert restored.get(described) == fresh.get(described) == "float:nan"
+    assert restored.statistics().query_executions == executions_before
