@@ -387,6 +387,38 @@ def test_freeze_rejects_malformed_wrapper_shells_nested_in_raw_containers() -> N
         freeze({"k": FrozenDict(entries=cast(Any, (("a", 1, 2),)))})
 
 
+def test_freeze_detaches_hash_positions() -> None:
+    # Mapping keys and set members are frozen through their own _freeze_root,
+    # so the detach guarantee has to hold on that boundary too.
+    member = FrozenSet("frozenset", (1,))
+
+    as_set_member = cast(FrozenSet, freeze({member}))
+    assert as_set_member.items[0] is not member
+    assert as_set_member.items[0] == member
+
+    as_dict_key = cast(FrozenDict, freeze({member: "v"}))
+    stored_key = as_dict_key.entries[0][0]
+    assert stored_key is not member
+    assert stored_key == member
+
+
+def test_freeze_detaches_graph_ref_cells() -> None:
+    # A FrozenRef is a frozen dataclass like every other shell, so handing one
+    # back by identity leaves the caller holding a live index into the stored
+    # node table -- rebindable long after the snapshot was validated.
+    ref = FrozenRef(0)
+    graph = FrozenGraph(nodes=(FrozenList((ref,)),), root=ref)
+    stored = cast(FrozenGraph, freeze(graph))
+
+    assert stored.root is not ref
+    assert cast(FrozenList, stored.nodes[0]).items[0] is not ref
+    before = fingerprint_snapshot(stored)
+    assert before == fingerprint_snapshot(graph)
+
+    object.__setattr__(ref, "index", 7)
+    assert fingerprint_snapshot(stored) == before
+
+
 # ---------------------------------------------------------------------------
 # Group D: Type conversion and rejection
 # ---------------------------------------------------------------------------
@@ -952,6 +984,67 @@ def test_strict_view_of_tuple_shared_list_round_trips_through_set_and_arguments(
     ignores = db.statistics().input_equal_ignores
     db.set(stored, view)
     assert db.statistics().input_equal_ignores == ignores + 1
+
+
+def test_freeze_of_aliased_wrappers_detaches_every_member_shell() -> None:
+    member = FrozenSet("frozenset", (2,))
+    shared = FrozenList((member,))
+    snapshot = cast(FrozenGraph, freeze((shared, shared)))
+
+    assert isinstance(snapshot, FrozenGraph)
+    node = cast(FrozenList, snapshot.nodes[0])
+    assert node is not shared
+    # The re-encode pass used to hand the frozenset member through by
+    # identity; the caller could then rebind its items inside the stored graph.
+    assert node.items[0] is not member
+    assert node.items[0] == member
+
+
+def test_freeze_of_aliased_dict_detaches_its_keys() -> None:
+    key = FrozenSet("frozenset", (3,))
+    shared = FrozenDict(((key, 1),))
+    snapshot = cast(FrozenGraph, freeze((shared, shared)))
+
+    node = cast(FrozenDict, snapshot.nodes[0])
+    assert node is not shared
+    stored_key = node.entries[0][0]
+    assert stored_key is not key
+    assert stored_key == key
+
+
+def test_freeze_of_aliased_wrappers_detaches_nested_graph_envelopes() -> None:
+    # A nested FrozenGraph is its own reference namespace, so neither the
+    # re-encode pass nor the canonical renumbering that follows it descends
+    # into one -- both used to carry the caller's envelope straight into the
+    # stored snapshot.
+    spine = [1]
+    inner = cast(FrozenGraph, freeze((spine, spine)))
+    shared = FrozenList((inner,))
+    snapshot = cast(FrozenGraph, freeze((shared, shared)))
+
+    stored = cast(FrozenList, snapshot.nodes[0]).items[0]
+    assert stored is not inner
+    assert stored == inner
+    assert cast(FrozenGraph, stored).nodes[0] is not inner.nodes[0]
+
+
+def test_freeze_of_aliased_dict_preserves_canonical_entry_order() -> None:
+    raw = {1: "a", 2: "b"}
+    shared = cast(FrozenDict, freeze(raw))
+    snapshot = cast(FrozenGraph, freeze((shared, shared)))
+    baseline = freeze((raw, raw))
+    assert fingerprint_snapshot(snapshot) == fingerprint_snapshot(baseline)
+
+
+def test_freeze_of_aliased_wrappers_rejects_malformed_nested_shells() -> None:
+    # The re-encode pass clones through _detach_wrapper as well, and that walk
+    # is shape-trusting by design: the guard has to fire in _freeze before the
+    # aliasing decision, not somewhere inside the two walks it protects.
+    shared = FrozenList((FrozenList(items=cast(Any, [1, 2])),))
+    with pytest.raises(
+        UnsupportedValueError, match=re.escape("FrozenList.items must be a tuple.")
+    ):
+        freeze((shared, shared))
 
 
 # ---------------------------------------------------------------------------

@@ -528,19 +528,28 @@ def _refreeze_wrapper(value: Any, state: _FreezeState) -> Snapshot:
             lambda: FrozenList(tuple(_refreeze_wrapper(item, state) for item in value.items)),
         )
     if value_type is FrozenDict:
-        # Keys were frozen in isolated states and carry no references; keep
-        # them byte-identical so the canonical entry order is preserved.
+        # Keys were frozen in isolated states and carry no references, but
+        # they can still be caller-held shells; detach them. Cloning is
+        # structure-preserving, so the canonical entry order (keyed by each
+        # key's fingerprint) is unchanged.
         return _freeze_via_memo(
             value,
             state,
             lambda: FrozenDict(
-                tuple((key, _refreeze_wrapper(item, state)) for key, item in value.entries)
+                tuple(
+                    (_detach_wrapper(key), _refreeze_wrapper(item, state))
+                    for key, item in value.entries
+                )
             ),
         )
     if value_type is FrozenSet:
         if value.kind == "set":
-            return _freeze_via_memo(value, state, lambda: FrozenSet("set", value.items))
-        return cast(Snapshot, value)
+            return _freeze_via_memo(
+                value,
+                state,
+                lambda: FrozenSet("set", tuple(_detach_wrapper(item) for item in value.items)),
+            )
+        return _detach_wrapper(value)
     if value_type is FrozenRecord:
         return _freeze_via_memo(
             value,
@@ -557,7 +566,11 @@ def _refreeze_wrapper(value: Any, state: _FreezeState) -> Snapshot:
         with _active_guard(value, state):
             return tuple(_refreeze_wrapper(item, state) for item in value)
     if value_type in (FrozenGraph, FrozenRef):
-        return cast(Snapshot, value)
+        # A nested graph carries its own reference namespace, so neither this
+        # pass nor the canonical renumbering that follows it descends into
+        # one: without a detach here the caller's envelope, node table and all,
+        # lands in the stored snapshot untouched.
+        return _detach_wrapper(value)
     raise UnsupportedValueError(f"Unsupported snapshot value {value_type.__qualname__}.")
 
 
@@ -599,7 +612,10 @@ def _detach_wrapper(value: Any, active: set[int] | None = None) -> Snapshot:
     if value_type not in _FROZEN_TYPES and value_type is not tuple:
         return cast(Snapshot, value)
     if value_type is FrozenRef:
-        return cast(Snapshot, value)
+        # A ref cell is a rebindable shell like every other one: handing the
+        # caller's back leaves it holding a live index into the stored node
+        # table, rewritable long after the snapshot was validated.
+        return FrozenRef(value.index)
     if active is None:
         active = set()
     object_id = id(value)
