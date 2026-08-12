@@ -5133,3 +5133,76 @@ def test_nan_verdict_is_identical_on_input_and_query_paths(mode: str) -> None:
     db.set(stage, 1)
     db.get(produce)
     assert db.statistics().query_backdates == backdates_before + 1
+
+
+# Pairs Python's == calls equal and the canonical encoding separates. Each is a
+# flip a warm database has to execute through, so that its answer is the answer
+# a database built from scratch would give.
+_TOWER_FLIPS: tuple[tuple[object, object], ...] = ((1, 1.0), (1, True), (0.0, -0.0))
+
+
+def _tower_repr(value: object) -> str:
+    return f"{type(value).__name__}:{value!r}"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(("first", "second"), _TOWER_FLIPS)
+def test_result_type_flip_matches_fresh(
+    mode: str, first: object, second: object
+) -> None:
+    stage = Input[int]("stage")
+
+    @query
+    def measure(db: Database) -> object:
+        return first if stage.read(db) == 0 else second
+
+    @query
+    def described(db: Database) -> str:
+        return _tower_repr(measure(db))
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(described)
+    changed_at = _inspect_node(db, measure).changed_at
+
+    db.set(stage, 1)
+    warm = db.get(described)
+    # The flip published a new value: a backdate would have held measure's
+    # changed_at at the pre-flip revision and left the reader on the old type.
+    # measure's own last_decision is not the witness here -- the reader reaches
+    # it a second time while re-executing, which restamps it as reused.
+    assert _inspect_node(db, measure).changed_at > changed_at
+    assert _inspect_node(db, described).last_decision == "executed"
+
+    fresh = Database(mode=mode)
+    fresh.set(stage, 1)
+    assert warm == fresh.get(described) == _tower_repr(second)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(("first", "second"), _TOWER_FLIPS)
+@pytest.mark.parametrize("entry_point", ["set", "set_many"])
+def test_input_type_flip_matches_fresh(
+    mode: str, first: object, second: object, entry_point: str
+) -> None:
+    point = Input[object]("tower-point")
+
+    @query
+    def describe(db: Database) -> str:
+        return _tower_repr(point.read(db))
+
+    db = Database(mode=mode)
+    if entry_point == "set":
+        db.set(point, first)
+        db.get(describe)
+        db.set(point, second)
+    else:
+        db.set_many([(point, first)])
+        db.get(describe)
+        db.set_many([(point, second)])
+    assert db.statistics().input_equal_ignores == 0
+
+    fresh = Database(mode=mode)
+    fresh.set(point, second)
+    assert db.get(describe) == fresh.get(describe)
+    assert _inspect_node(db, describe).last_decision == "executed"
