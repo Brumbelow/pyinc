@@ -4994,3 +4994,112 @@ def test_failure_record_probe_token_is_detached(mode: str) -> None:
     with pytest.raises(FileNotFoundError):
         db.get(loaded)
     assert db._records[key].changed_at > changed_at_before
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_checkpoint_preserves_owned_input_snapshots_after_caller_mutation(
+    mode: str,
+) -> None:
+    # A checkpoint is where a corrupted snapshot would become durable, so the
+    # reload has to answer from the persisted bytes and match a from-scratch
+    # database. This stays GREEN with freeze's wrapper detach reverted: reading
+    # an input thaws it before the query result is frozen, so the caller's shell
+    # never reaches the persisted query snapshot. The input boundary itself is
+    # pinned by test_input_boundary_owns_prefrozen_wrappers; this one pins that
+    # the ownership survives the round trip.
+    held = _held_wrapper()
+    payload = Input[object]("ckp-owned-input")
+
+    @query
+    def echoed(db: Database) -> object:
+        return payload.read(db)
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    saver.set(payload, held)
+    saver.get(echoed)
+    _corrupt(held)
+    key = saver.save_checkpoint()
+
+    restored = Database(mode=mode, store=store)
+    restored.set(payload, freeze([1, 2, 3]))
+    restored.load_checkpoint(key)
+
+    fresh = Database(mode=mode)
+    fresh.set(payload, freeze([1, 2, 3]))
+    executions_before = restored.statistics().query_executions
+    assert list(cast(Any, restored.get(echoed))) == list(cast(Any, fresh.get(echoed)))
+    # The warm answer came out of the persisted bytes; a re-derivation would
+    # make the equality above prove nothing about what was stored.
+    assert restored.statistics().query_executions == executions_before
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_checkpoint_preserves_owned_result_snapshots_after_caller_mutation(
+    mode: str,
+) -> None:
+    # The wrapper crosses as an ARGUMENT and comes back as the RESULT rather
+    # than being captured in the query closure, for the same reason the
+    # non-checkpoint sibling does: captured-value mutation will later re-key a
+    # query and would quietly turn a closure-based version of this into a fresh
+    # execution. The envelope rebuilds the wrapper before the body runs, so this
+    # too stays green with the detach reverted -- what it pins is that the
+    # reload serves the ingested bytes rather than re-deriving them.
+    held = _held_wrapper()
+
+    @query
+    def echo(db: Database, value: object) -> object:
+        return value
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    assert list(cast(Any, saver.get(echo, held))) == [1, 2, 3]
+    _corrupt(held)
+    key = saver.save_checkpoint()
+
+    restored = Database(mode=mode, store=store)
+    restored.load_checkpoint(key)
+    # The same args encoding keys the checkpoint-warmed node; the restored
+    # answer is the ingested bytes, not a view through the caller's object.
+    executions_before = restored.statistics().query_executions
+    assert list(cast(Any, restored.get(echo, freeze([1, 2, 3])))) == [1, 2, 3]
+    assert restored.statistics().query_executions == executions_before
+
+    fresh = Database(mode=mode)
+    assert list(cast(Any, fresh.get(echo, freeze([1, 2, 3])))) == [1, 2, 3]
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_checkpoint_hint_restore_owns_the_probe_it_stores(mode: str) -> None:
+    # Restoring a recordless resource from its checkpoint probe hint is the one
+    # place a record is born without a load, and the probe it keeps is the live
+    # one the caller's object produced. A retained probe would compare with
+    # itself at the next request and pin the restored value forever.
+    token = cast(FrozenList, freeze(["v1"]))
+    cell = _TokenProbeCell(token=token, payload="alpha")
+    resource = _HeldTokenResource(cell)
+
+    @query
+    def loaded(db: Database) -> str:
+        return resource.read(db, "hint-cell")
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    assert saver.get(loaded) == "alpha"
+    key = saver.save_checkpoint()
+
+    restored = Database(mode=mode, store=store)
+    restored.load_checkpoint(key)
+    loads_before = restored.statistics().resource_loads
+    assert restored.get(loaded) == "alpha"
+    # The hint answered: no load ran, so the record was born on the restore path.
+    assert restored.statistics().resource_loads == loads_before
+    record = restored._records[restored._resource_key(resource, "hint-cell")]
+    assert record.probe is not token
+
+    object.__setattr__(token, "items", ("v2",))
+    cell.payload = "beta"
+    assert restored.get(loaded) == "beta"
+
+    fresh = Database(mode=mode)
+    assert fresh.get(loaded) == "beta"
