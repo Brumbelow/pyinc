@@ -2269,23 +2269,26 @@ class Database:
                 if query.eq is None and query.cutoff is None:
                     # Both operands are canonical freeze outputs: the fresh
                     # snapshot from _freeze_value above, the previous one from
-                    # an earlier freeze or a validated checkpoint load. freeze
-                    # is ==-preserving on its own outputs, so the semantic
-                    # comparison of the exposed values reduces to comparing
-                    # the stored snapshots directly -- the same decision in
-                    # every mode, with no thaw or re-freeze on the warm path.
-                    # Snapshot equality is the primary answer; the digests
-                    # settle the one shape it under-reports, a NaN payload,
-                    # which never equals itself but does normalize to a single
-                    # canonical encoding. The digests are already computed, so
-                    # the fallback costs a string compare.
+                    # an earlier freeze or a validated checkpoint load. The
+                    # decision is the one canonical relation, snapshots_equal
+                    # -- equality of the canonical encodings of the stored
+                    # snapshots, the same decision in every mode, with no thaw
+                    # and no second opinion. A NaN normalizes to a single
+                    # canonical encoding, so it is reflexive here by
+                    # construction rather than through a digest side channel.
+                    # The digest test in front is a filter, not a verdict: a
+                    # digest is sha256 of that same encoding and a query
+                    # record's snapshot is never written without the matching
+                    # digest beside it (store loads re-derive and check the
+                    # pair on the way in), so unequal digests prove unequal
+                    # encodings and settle the changed case without encoding
+                    # anything. Equal digests decide nothing on their own --
+                    # the byte comparison still runs, so no collision is ever
+                    # trusted.
                     equal = (
-                        False
-                        if impure
-                        else (
-                            snapshots_equal(previous.snapshot, snapshot)
-                            or digest == previous_digest
-                        )
+                        not impure
+                        and digest == previous_digest
+                        and snapshots_equal(previous.snapshot, snapshot)
                     )
                 else:
                     old_value = self._expose_snapshot(previous.snapshot)

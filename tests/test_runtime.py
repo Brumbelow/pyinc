@@ -3983,10 +3983,11 @@ def test_prefrozen_nan_wrapper_result_backdates(mode: str) -> None:
     db.get(constant_items)
 
     # Each execution stores its own detached clone, so the backdate can no
-    # longer rest on the two records holding one object. It still does not
-    # exercise the NaN digest fallback: detach clones wrapper shells and shares
-    # leaf scalars, so both snapshots hold the very same NaN float and plain
-    # snapshot equality already answers true. The digest disjunct is pinned by
+    # longer rest on the two records holding one object. It still does not pin
+    # NaN reflexivity across distinct floats: detach clones wrapper shells and
+    # shares leaf scalars, so both snapshots hold the very same NaN float and
+    # no comparison of them ever has to decide whether two distinct NaNs are
+    # equal. That case is pinned by
     # test_freshly_built_nan_result_backdates_and_holds_dependents, which
     # builds a distinct NaN per execution.
     db.set(stage, 1)
@@ -4007,6 +4008,10 @@ def test_prefrozen_nan_wrapper_result_backdates(mode: str) -> None:
 def test_freshly_built_nan_result_backdates_and_holds_dependents(mode: str) -> None:
     stage = Input[int]("stage")
 
+    # Freshly built operands each run: before the canonical relation this
+    # backdate was carried ONLY by the digest fallback the runtime no longer
+    # has. It now rests on snapshots_equal itself; if this test executes
+    # instead of backdating, the canonical relation lost NaN reflexivity.
     @query
     def measurement(db: Database) -> object:
         stage.read(db)
@@ -4129,10 +4134,10 @@ def test_numeric_dict_key_recompute_decisions(mode: str) -> None:
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("shape", ["bare", "tuple", "dict_value", "set_member", "dict_key"])
 def test_nan_result_backdates_on_every_recompute(mode: str, shape: str) -> None:
-    # A NaN never equals itself, so comparing the snapshots alone would call
-    # every one of these an unequal result forever. The canonical encoding
-    # normalizes NaN to a single bit pattern, and the digests decide it, in
-    # every position a NaN can hold and in every mode.
+    # A NaN never equals itself under ==, so a relation resting on that would
+    # call every one of these an unequal result forever. The canonical
+    # encoding normalizes NaN to one byte sequence, so snapshots_equal calls
+    # it equal in every position a NaN can hold and in every mode.
     stage = Input[int]("stage")
 
     @query
@@ -5099,3 +5104,32 @@ def test_checkpoint_hint_restore_owns_the_probe_it_stores(mode: str) -> None:
 
     fresh = Database(mode=mode)
     assert fresh.get(loaded) == "beta"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_nan_verdict_is_identical_on_input_and_query_paths(mode: str) -> None:
+    # One relation: db.set(x, nan) twice is an equal update (was: a change),
+    # and a query returning nan twice still backdates. The two paths can no
+    # longer drift because both call snapshots_equal on stored snapshots.
+    marker = Input[float]("nan-input")
+    db = Database(mode=mode)
+    db.set(marker, float("nan"))
+    sets_before = db.statistics().input_sets
+    ignores_before = db.statistics().input_equal_ignores
+    db.set(marker, float("nan"))
+    assert db.statistics().input_sets == sets_before
+    assert db.statistics().input_equal_ignores == ignores_before + 1
+
+    stage = Input[int]("nan-query-stage")
+
+    @query
+    def produce(db_: Database) -> float:
+        stage.read(db_)
+        return float("nan")
+
+    db.set(stage, 0)
+    db.get(produce)
+    backdates_before = db.statistics().query_backdates
+    db.set(stage, 1)
+    db.get(produce)
+    assert db.statistics().query_backdates == backdates_before + 1
