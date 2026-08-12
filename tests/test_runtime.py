@@ -4885,3 +4885,112 @@ def test_adapter_payload_boundary_owns_prefrozen_wrappers(mode: str) -> None:
     assert payload is not held
     _corrupt(held)
     assert fingerprint_snapshot(record.snapshot) == record.digest
+
+
+@dataclass
+class _TokenProbeCell:
+    """The world a held-token resource models: a probe token and a payload.
+
+    It rides on the resource instance and stays out of ``identity()``. A
+    resource's method capture set may not hold ambient mutable state, and the
+    world a resource observes is not part of what distinguishes the resource,
+    so the node key is unaffected when either half moves.
+    """
+
+    token: Any
+    payload: str = ""
+
+
+@dataclass(frozen=True)
+class _HeldTokenResource(Resource[str, str, Any]):
+    """Probe returns a held pre-frozen wrapper token; load returns a string."""
+
+    cell: _TokenProbeCell
+
+    def identity(self) -> Any:
+        return "held-token"
+
+    def probe(self, key: str) -> Any:
+        return self.cell.token
+
+    def load(self, db: Database, key: str) -> str:
+        return self.cell.payload
+
+    def label(self, key: str) -> str:
+        return f"held-token[{key}]"
+
+
+@dataclass(frozen=True)
+class _FailingHeldTokenResource(Resource[str, str, Any]):
+    """Probe returns a held pre-frozen wrapper token; the load always raises."""
+
+    cell: _TokenProbeCell
+
+    def identity(self) -> Any:
+        return "failing-held-token"
+
+    def probe(self, key: str) -> Any:
+        return self.cell.token
+
+    def load(self, db: Database, key: str) -> str:
+        raise FileNotFoundError(key)
+
+    def label(self, key: str) -> str:
+        return f"failing-held-token[{key}]"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_held_probe_token_is_detached_and_cannot_pin_the_resource(mode: str) -> None:
+    token = cast(FrozenList, freeze(["v1"]))
+    cell = _TokenProbeCell(token=token, payload="alpha")
+    resource = _HeldTokenResource(cell)
+
+    @query
+    def loaded(db: Database) -> str:
+        return resource.read(db, "pin-cell")
+
+    db = Database(mode=mode)
+    assert db.get(loaded) == "alpha"
+    record = db._records[db._resource_key(resource, "pin-cell")]
+    # The stored probe must be a clone: were it the caller's token, the
+    # comparison at the probe-hit gate would be the token compared with
+    # itself and could never miss.
+    assert record.probe is not token
+
+    # The external world moves: the held token's content changes in place.
+    object.__setattr__(token, "items", ("v2",))
+    cell.payload = "beta"
+
+    hits_before = db.statistics().resource_probe_hits
+    assert db.get(loaded) == "beta"
+    assert db.statistics().resource_probe_hits == hits_before
+
+    fresh = Database(mode=mode)
+    assert fresh.get(loaded) == "beta"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_failure_record_probe_token_is_detached(mode: str) -> None:
+    token = cast(FrozenList, freeze(["broken-v1"]))
+    resource = _FailingHeldTokenResource(_TokenProbeCell(token=token))
+
+    @query
+    def loaded(db: Database) -> str:
+        return resource.read(db, "fail-cell")
+
+    db = Database(mode=mode)
+    with pytest.raises(FileNotFoundError):
+        db.get(loaded)
+    key = db._resource_key(resource, "fail-cell")
+    record = db._records[key]
+    assert record.probe is not token
+    assert fingerprint_snapshot(record.probe) == fingerprint_snapshot(freeze(["broken-v1"]))
+
+    # A failure record that held the caller's token would compare it with
+    # itself too, so a failing world that moves would keep changed_at frozen
+    # and leave every dependent of the failure green across the change.
+    changed_at_before = record.changed_at
+    object.__setattr__(token, "items", ("broken-v2",))
+    with pytest.raises(FileNotFoundError):
+        db.get(loaded)
+    assert db._records[key].changed_at > changed_at_before
