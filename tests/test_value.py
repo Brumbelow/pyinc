@@ -1352,3 +1352,16 @@ def test_canonical_relation_still_equates_equal_values() -> None:
     assert semantic_equal({"a": 1.5}, {"a": 1.5})
     assert not semantic_equal([1, 2], [1, 3])
     assert not semantic_equal([1, 2], (1, 2))
+
+
+def test_canonical_relation_refuses_values_that_are_not_snapshots() -> None:
+    """The relation is defined by the encoding, so it has no `==` fallback.
+
+    A value the encoder cannot describe gets no verdict at all -- answering
+    `False` for it would be an equality claim the encoding never made.
+    """
+
+    with pytest.raises(TypeError):
+        snapshots_equal(object(), object())
+    with pytest.raises(UnsupportedValueError):
+        semantic_equal(object(), object())

@@ -11,13 +11,18 @@ evaluation matches a fresh evaluation on the same declared inputs and resources 
 provided the three conditions below hold. Outside those conditions no
 guarantee is made.
 
-When a recomputed value is semantically equal to the previously stored value,
+When a recomputed value is canonically equal to the previously stored value,
 the record is **backdated** (also called **early cutoff**): its `changed_at`
 revision is not advanced, so downstream dependents remain green and avoid
-unnecessary recomputation. For queries without an `eq=`/`cutoff=` policy, that
-equality decision is computed on the canonical stored snapshots themselves and
-is identical in `strict`, `checked`, and `fast`; `eq=`/`cutoff=` policies
-continue to receive mode-exposed values.
+unnecessary recomputation. The default equality decision is
+**canonical-encoding equality** over the stored snapshots: two values are
+equal exactly when their canonical snapshot encodings are byte-identical, so
+`1`, `1.0`, and `True` are three different values, `0.0` differs from `-0.0`,
+and a canonical NaN equals a canonical NaN. The same relation decides default
+input updates, resource probe comparisons, checkpoint probe hints, and the
+token comparison behind a `cutoff=` policy, and it is identical in `strict`,
+`checked`, and `fast`; an `eq=` policy decides under its own relation instead,
+over the detached operands described below.
 
 ## Conditions for From-Scratch Consistency
 
@@ -32,10 +37,26 @@ dataclasses → `FrozenRecord`; tuples are a native member of the `Snapshot`
 union and are frozen element-wise.
 
 Dataclasses thaw to dictionaries because the kernel does not import and
-reconstruct arbitrary user classes. A dataclass, frozen wrapper, or composite
-containing one cannot therefore be used as a mapping key or set member unless a
-`ValueAdapter` reconstructs a hashable value; `freeze` rejects such positions
-before they can produce a snapshot that later fails to thaw.
+reconstruct arbitrary user classes. A dataclass, a wrapper that thaws to a
+mutable container, or a composite containing one cannot therefore be used as a
+mapping key or set member; `freeze` rejects such positions before they can
+produce a snapshot that later fails to thaw. A `ValueAdapter` that
+reconstructs a hashable value is necessary to carry such a value into a hash
+position, but it is not sufficient: the same gate rejects hash positions that
+are distinct under the snapshot encoding but collapse under Python `==`/`hash`
+after thaw. `FrozenDict` keys and `FrozenSet` members such as `1` beside
+`1.0`, `True` beside `1`, or `0.0` beside `-0.0` raise `UnsupportedValueError`
+from `freeze`, `thaw`, `serialize_snapshot`, and `deserialize_snapshot` alike,
+with the collapsing pair named in the error; two positions carrying the same
+adapter key are refused as soon as their payloads collapse, because the
+encoding cannot ask the adapter whether the values it rebuilds would still
+differ. Where the encoding cannot see the answer the gate is deliberately
+conservative rather than nondeterministic: every canonical NaN is one class,
+so a live `dict` keyed by `(1, nan)` and `(1.0, nan)` with distinct NaN
+objects — two keys to Python, which hashes a NaN by identity — is rejected as
+well. A container that would silently change cardinality on thaw is refused at
+the boundary instead of being stored, whether `freeze` built it from live
+values or it arrived hand-assembled or decoded from bytes.
 
 `freeze()` and `thaw()` are boundary utilities, not a general object
 serializer. Passing an adapter registry to `freeze()` does not embed executable
@@ -47,7 +68,13 @@ The kernel stores frozen snapshots internally. `strict` exposes the immutable
 `Frozen*` views themselves (a query receives, for example, a `FrozenDict` where
 the other modes hand it a `dict`); `checked` and `fast` expose owned thawed
 values. No external alias to a value that crossed the boundary can influence
-the stored snapshot.
+the stored snapshot. This holds in both directions: `freeze` returns a
+snapshot the kernel owns outright — an already-frozen wrapper is cloned rather
+than passed through by identity, a tree-shaped one into a structurally
+identical, identically fingerprinted copy and an aliased or cyclic one into
+the same canonical graph encoding the equivalent raw structure produces — so
+holding the object you passed in never grants a reference into a stored
+record, a stored resource probe, or a mapping key or set member.
 
 Cyclic and shared object graphs are supported via the `FrozenGraph` /
 `FrozenRef` snapshot variants: `freeze` memoizes mutable containers (`list`,
@@ -491,7 +518,13 @@ value, or route it through a `Resource`.
   `test_adapter_thaw_of_query_arguments_runs_under_the_guard`)
 
 - **`eq=` / `cutoff=`** on `Input` and `@query` — allows custom equivalence.
-  `eq=` compares thawed values directly; `cutoff=` compares snapshot-safe tokens.
+  `eq=` compares detached operands, never the stored snapshots themselves: a
+  recomputed query result reaches the comparator as thawed values in `checked`
+  and `fast` and as detached `Frozen*` views in `strict` (a graph-shaped
+  result as shared/cyclic views, not as the `FrozenGraph` envelope), while an
+  input update reaches it as thawed values in every mode. `cutoff=` derives
+  its snapshot-safe tokens from those same detached operands, and the tokens
+  are compared under the canonical relation.
   These are mutually exclusive. Cutoff tokens must be snapshot-safe, and the
   declared equivalence must be substitutive for dependents (condition 3) for
   the guarantee to hold on exact values.
@@ -717,7 +750,7 @@ Values and snapshots:
 |---|---|
 | `freeze` | Deep-convert a value into its canonical immutable snapshot. |
 | `thaw` | Rebuild the mutable form of a snapshot. |
-| `semantic_equal` | The kernel's semantic-equality decision over two values. |
+| `semantic_equal` | The kernel's canonical equality decision: two values are equal when their frozen snapshots' canonical encodings match. |
 | `serialize_snapshot` | Encode a canonical snapshot into the stable `K2` byte grammar. |
 | `deserialize_snapshot` | Decode and validate `K2` bytes back into a snapshot. |
 | `FrozenList` | Immutable list view crossing cached boundaries. |

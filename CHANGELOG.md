@@ -39,6 +39,23 @@ decided at release time.
   visited-set decisions instead of leaving warm traversals stale.
 - A deeply nested checkpoint manifest raises `CheckpointManifestError`
   instead of escaping as a raw `RecursionError`.
+- `FrozenDict` keys and `FrozenSet` members that are distinct under the
+  snapshot encoding but collapse under Python `==`/`hash` after thaw (such as
+  `1` beside `1.0`, or `True` beside `1`) are rejected with
+  `UnsupportedValueError` from `freeze`, `thaw`, `serialize_snapshot` and
+  `deserialize_snapshot`, instead of thawing to a container of different
+  cardinality with fabricated pairings. Fresh live values are rejected on the
+  same terms as hand-assembled or decoded snapshots: every canonical NaN is
+  one class, so
+  `freeze({(1, float.fromhex("nan")): "a", (1.0, float.fromhex("nan")): "b"})`
+  now raises where it previously froze and thawed back to two entries. Two
+  hash positions sharing one adapter key are refused as soon as their payloads
+  collapse, because the encoding cannot ask the adapter what it would rebuild.
+- Custom `eq=` and `cutoff=` policies receive detached operands in every mode.
+  A comparator that reflectively mutates its operands can no longer corrupt
+  the stored snapshot behind a record's digest in `strict` mode. Strict-mode
+  comparators over a graph-shaped result now see shared/cyclic `Frozen*` views
+  rather than the `FrozenGraph` envelope.
 
 ### Added
 
@@ -81,6 +98,29 @@ decided at release time.
   numbers.
 - The development-status classifier is `4 - Beta` until the hardened release
   has soaked and an external audit of the fixes closes.
+- The default equality relation everywhere is canonical-encoding equality over
+  the stored snapshots. `semantic_equal(1, 1.0)`, `semantic_equal(True, 1)`,
+  `semantic_equal(False, 0)`, `semantic_equal(0.0, -0.0)` and
+  `semantic_equal(1, 1 + 0j)` are now `False`, `semantic_equal(nan, nan)` is
+  now `True` on every path, and the query backdate, input update, resource
+  probe, checkpoint probe hint and cutoff-token decisions all run on that one
+  relation: a cutoff token whose type flipped now invalidates where Python
+  equality called it unchanged, and a NaN cutoff token now backdates where it
+  never could. This replaces the digest-fallback backdating described under
+  [3.1.0] — the relation is reflexive for NaN by construction, so the query
+  backdate decision keeps no second opinion, and the digests it already holds
+  only filter in front of the byte comparison. The comparison helper behind
+  the relation, `pyinc.value.snapshots_equal`, now raises on values that are
+  not snapshots instead of falling back to Python `==` and answering `False`;
+  the runtime never hands it one, and `pyinc.semantic_equal` freezes both
+  operands before comparing.
+- `pyinc.freeze` always returns a snapshot the `Database` owns: an
+  already-frozen wrapper is cloned into a detached snapshot instead of passing
+  through by identity, at every boundary — query arguments and results, input
+  values, resource probe tokens, mapping keys and set members, and adapter
+  payloads. A tree-shaped wrapper clones to a structurally identical,
+  identically fingerprinted snapshot; wrappers that alias or cycle re-encode
+  to the canonical `FrozenGraph` the equivalent raw structure produces.
 
 ## [3.1.1] - 2026-08-03
 
