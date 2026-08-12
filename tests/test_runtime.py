@@ -22,6 +22,7 @@ from pyinc import (
     EnvResource,
     FileResource,
     FileStatResource,
+    FrozenAdapterValue,
     FrozenDict,
     FrozenGraph,
     FrozenList,
@@ -3820,8 +3821,9 @@ class BoxedAdapter(ValueAdapter):
         return Boxed(thaw(data["payload"]))
 
 
-# A module-level pre-frozen wrapper: freeze passes it through by identity, so
-# every execution stores the very same snapshot object, NaN payload included.
+# A module-level pre-frozen wrapper. freeze detaches it into a Database-owned
+# clone at every boundary; the backdate below is justified by the equality
+# relation over the stored snapshots, never by shared object identity.
 _NAN_ITEMS = cast(FrozenList, freeze([float("nan")]))
 
 
@@ -3980,6 +3982,13 @@ def test_prefrozen_nan_wrapper_result_backdates(mode: str) -> None:
     db.set(stage, 0)
     db.get(constant_items)
 
+    # Each execution stores its own detached clone, so the backdate can no
+    # longer rest on the two records holding one object. It still does not
+    # exercise the NaN digest fallback: detach clones wrapper shells and shares
+    # leaf scalars, so both snapshots hold the very same NaN float and plain
+    # snapshot equality already answers true. The digest disjunct is pinned by
+    # test_freshly_built_nan_result_backdates_and_holds_dependents, which
+    # builds a distinct NaN per execution.
     db.set(stage, 1)
     revision_after_set = db.revision
     second = db.get(constant_items)
@@ -4708,3 +4717,165 @@ def test_cross_thread_request_inputs_changed_reopens_the_span(tmp_path: Path) ->
         declarer.start()
         declarer.join()
         assert db.get(read_text) == "new!"
+
+
+def _held_wrapper() -> FrozenList:
+    return cast(FrozenList, freeze([1, 2, 3]))
+
+
+def _corrupt(wrapper: FrozenList) -> None:
+    object.__setattr__(wrapper, "items", (9, 9, 9))
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("entry_point", ["set", "set_many"])
+def test_input_boundary_owns_prefrozen_wrappers(mode: str, entry_point: str) -> None:
+    held = _held_wrapper()
+    payload = Input[object]("owned-input")
+
+    @query
+    def echoed(db: Database) -> object:
+        return payload.read(db)
+
+    db = Database(mode=mode)
+    if entry_point == "set":
+        db.set(payload, held)
+    else:
+        db.set_many([(payload, held)])
+    first = db.get(echoed)
+    assert list(cast(Any, first)) == [1, 2, 3]
+
+    record = db._records[db._input_key(payload)]
+    assert record.snapshot is not held
+    _corrupt(held)
+    assert fingerprint_snapshot(record.snapshot) == record.digest
+
+    fresh = Database(mode=mode)
+    fresh.set(payload, freeze([1, 2, 3]))
+    assert list(cast(Any, db.get(echoed))) == list(cast(Any, fresh.get(echoed)))
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_query_result_boundary_owns_prefrozen_wrappers(mode: str) -> None:
+    # The wrapper crosses as an ARGUMENT and comes back as the RESULT rather
+    # than being captured in the query closure: captured-value mutation will
+    # later re-key a query, which would quietly turn a closure-based version of
+    # this pin into a fresh execution.
+    held = _held_wrapper()
+
+    @query
+    def echo(db: Database, value: object) -> object:
+        return value
+
+    db = Database(mode=mode)
+    first = db.get(echo, held)
+    assert list(cast(Any, first)) == [1, 2, 3]
+
+    record = _query_record(db, echo, held)
+    assert record.snapshot is not held
+
+    _corrupt(held)
+    assert fingerprint_snapshot(record.snapshot) == record.digest
+    # An equal-encoding argument keys the same node: the warm hit must serve
+    # the ingested value, untouched by the caller's reflective mutation.
+    assert list(cast(Any, db.get(echo, freeze([1, 2, 3])))) == [1, 2, 3]
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_query_result_boundary_owns_returned_wrappers(mode: str) -> None:
+    # The sibling above routes the wrapper through the argument envelope, which
+    # rebuilds it before the body ever runs -- so that test cannot observe the
+    # result boundary on its own. Returning a captured wrapper is the only way
+    # to hand the result freeze the caller's object. This pin therefore takes a
+    # single get and never re-reads after the corruption, so it stays honest
+    # once a captured value's mutation re-keys its query.
+    held = _held_wrapper()
+
+    @query
+    def emit(db: Database) -> object:
+        return held
+
+    db = Database(mode=mode)
+    assert list(cast(Any, db.get(emit))) == [1, 2, 3]
+
+    record = _query_record(db, emit)
+    assert record.snapshot is not held
+    _corrupt(held)
+    assert fingerprint_snapshot(record.snapshot) == record.digest
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_query_argument_envelope_never_aliased_the_caller(mode: str) -> None:
+    # Pin of a NON-bug: the (args, kwargs) call envelope always takes the
+    # freeze memo path (the kwargs dict forces a rebuild), so the retained
+    # call snapshot never aliased the caller even before the ownership fix.
+    held = _held_wrapper()
+
+    @query
+    def width(db: Database, payload: object) -> int:
+        return len(cast(Any, payload))
+
+    db = Database(mode=mode)
+    assert db.get(width, held) == 3
+    key, call_snapshot = db._query_key(width, (held,), {})
+    assert call_snapshot[0][0] is not held
+    assert key in db._records
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_resource_load_boundary_owns_prefrozen_wrappers(mode: str) -> None:
+    held = _held_wrapper()
+
+    # A query's (and a resource method's) capture set may not contain mutable
+    # state, so the held wrapper is captured directly rather than through the
+    # holder dict a probe/load pair would normally share.
+    @dataclass(frozen=True)
+    class _HeldValueResource(Resource[str, Any, Any]):
+        def probe(self, key: str) -> Any:
+            return "stable"
+
+        def load(self, db: Database, key: str) -> Any:
+            return held
+
+        def label(self, key: str) -> str:
+            return f"held-value[{key}]"
+
+    resource = _HeldValueResource()
+
+    @query
+    def loaded(db: Database) -> object:
+        return resource.read(db, "cell")
+
+    db = Database(mode=mode)
+    first = db.get(loaded)
+    assert list(cast(Any, first)) == [1, 2, 3]
+
+    record = db._records[db._resource_key(resource, "cell")]
+    assert record.snapshot is not held
+    _corrupt(held)
+    assert fingerprint_snapshot(record.snapshot) == record.digest
+    assert list(cast(Any, db.get(loaded))) == [1, 2, 3]
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_adapter_payload_boundary_owns_prefrozen_wrappers(mode: str) -> None:
+    held = _held_wrapper()
+
+    class _HeldPayloadAdapter(ValueAdapter):
+        def freeze(self, value: Any, freeze_fn: Any) -> Any:
+            return held
+
+        def thaw(self, snapshot: Any, thaw_fn: Any) -> Any:
+            # The cast keeps mypy strict green: Boxed.__init__ declares an int
+            # payload, and this test never invokes thaw.
+            return Boxed(cast(Any, list(snapshot)))
+
+    boxed = Input[Boxed]("owned-adapter")
+    db = Database(mode=mode, adapters={Boxed: _HeldPayloadAdapter()})
+    db.set(boxed, Boxed(0))
+
+    record = db._records[db._input_key(boxed)]
+    payload = cast(FrozenAdapterValue, record.snapshot).payload
+    assert payload is not held
+    _corrupt(held)
+    assert fingerprint_snapshot(record.snapshot) == record.digest
