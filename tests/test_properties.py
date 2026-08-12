@@ -3,6 +3,7 @@ from __future__ import annotations
 import site
 import tempfile
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -15,6 +16,7 @@ from pyinc import (
     InMemoryArtifactStore,
     Input,
     MutationError,
+    freeze,
     query,
 )
 from pyinc.integrations.python_source import workspace_analysis
@@ -256,8 +258,13 @@ def test_workspace_queries_match_fresh_recomputation(
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @settings(max_examples=40, deadline=None)
-@given(values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=20))
-def test_aliasing_mutation_boundaries_behave_by_mode(mode: str, values: list[int]) -> None:
+@given(
+    values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=20),
+    prefrozen=st.booleans(),
+)
+def test_aliasing_mutation_boundaries_behave_by_mode(
+    mode: str, values: list[int], prefrozen: bool
+) -> None:
     payload = Input[tuple[dict[str, int], dict[str, int]]]("payload")
 
     @query
@@ -276,7 +283,8 @@ def test_aliasing_mutation_boundaries_behave_by_mode(mode: str, values: list[int
         # Two independent dicts at the boundary — identity is not preserved across
         # the membrane unless the caller deliberately shared the input. See the
         # companion test that exercises the shared-identity case.
-        db.set(payload, ({"x": value}, {"x": value}))
+        raw = ({"x": value}, {"x": value})
+        db.set(payload, freeze(raw) if prefrozen else raw)
         if mode == "fast":
             assert db.get(mutate_left) == value
             assert db.get(read_right) == value
@@ -489,3 +497,40 @@ def test_checkpoint_reload_matches_fresh_recomputation(
         fresh.set(bias, bias_value)
 
         assert reloaded.get(combiner) == fresh.get(combiner)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=40, deadline=None)
+@given(values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=8))
+def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
+    mode: str, values: list[int]
+) -> None:
+    payload = Input[object]("prefrozen-owned")
+
+    @query
+    def total(db: Database) -> int:
+        return sum(list(cast("list[int]", payload.read(db))))
+
+    @query
+    def echo(db: Database, value: object) -> object:
+        return value
+
+    db = Database(mode=mode)
+    held = freeze(list(values))
+    held_argument = freeze(list(values))
+    db.set(payload, held)
+    expected = sum(values)
+    assert db.get(total) == expected
+    assert list(cast("list[int]", db.get(echo, held_argument))) == list(values)
+
+    object.__setattr__(held, "items", tuple(v + 1 for v in values))
+    object.__setattr__(held_argument, "items", tuple(v + 1 for v in values))
+
+    fresh = Database(mode=mode)
+    fresh.set(payload, freeze(list(values)))
+    assert db.get(total) == fresh.get(total) == expected
+    # Pre-frozen wrappers arrive as input AND argument values: an equal-encoding
+    # argument keys the node held_argument keyed at ingest, and the warm answer is
+    # the ingested list, untouched by the mutation.
+    assert list(cast("list[int]", db.get(echo, freeze(list(values))))) == list(values)
+    assert list(cast("list[int]", fresh.get(echo, freeze(list(values))))) == list(values)
