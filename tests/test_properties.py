@@ -514,13 +514,16 @@ def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
     # input side is masked by memoization -- total is warm before the caller
     # mutates the wrapper it handed over, so the cached answer is returned
     # without re-reading the stored snapshot. The argument side is masked by the
-    # result boundary, which re-encodes the answer, so a mutation of the caller's
-    # argument wrapper is unobservable in any mode. The pins that go red without
-    # the fix live in tests/test_runtime.py:
-    # test_query_result_boundary_owns_returned_wrappers for result ingest and
-    # test_query_argument_envelope_never_aliased_the_caller for the call
-    # envelope. What this property does add is warm-vs-fresh agreement across
-    # the pre-frozen ingest path in all three modes.
+    # call envelope: _query_key freezes (args, kwargs) as one graph, and the
+    # empty kwargs dict forces the freeze memo path, so _finalize_snapshot
+    # inlines refs and rebuilds every wrapper leaf before the body runs -- the
+    # caller's argument object never reaches the query body, so mutating it
+    # afterwards is unobservable in any mode. The pin that goes red without the
+    # fix is tests/test_runtime.py::test_query_result_boundary_owns_returned_wrappers,
+    # for result ingest; test_query_argument_envelope_never_aliased_the_caller
+    # in the same file pins the envelope as a non-bug and is green on both
+    # sides. What this property does add is warm-vs-fresh agreement across the
+    # pre-frozen ingest path in all three modes.
     payload = Input[object]("prefrozen-owned")
 
     @query
