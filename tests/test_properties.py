@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import math
 import site
 import tempfile
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -18,20 +19,30 @@ from pyinc import (
     MutationError,
     freeze,
     query,
+    semantic_equal,
 )
 from pyinc.integrations.python_source import workspace_analysis
 
-Operation = tuple[str, int | str]
+Operation = tuple[str, object]
 WorkspaceState = tuple[str, str, bool]
-CheckpointOp = tuple[str, int | str]
+CheckpointOp = tuple[str, object]
+
+
+def boundary_scalars() -> st.SearchStrategy[object]:
+    # The numeric pool every replay property drives its inputs from. Integers
+    # alone cannot observe a numeric-tower or NaN mistake in the reuse
+    # decision, because no two of them are equal-but-differently-typed and none
+    # of them is unequal to itself. This pool carries both bool/int collisions,
+    # both zeros, a float equal to an int, a non-integral float, and NaN.
+    return st.sampled_from([-3, 0, 1, 7, True, False, 0.0, -0.0, 1.0, 2.5, float("nan")])
 
 
 def operation_sequences() -> st.SearchStrategy[list[Operation]]:
     choose_side = st.tuples(st.just("chooser"), st.sampled_from(["left", "right"]))
     update_value = st.one_of(
-        st.tuples(st.just("left"), st.integers(min_value=-20, max_value=20)),
-        st.tuples(st.just("right"), st.integers(min_value=-20, max_value=20)),
-        st.tuples(st.just("offset"), st.integers(min_value=-20, max_value=20)),
+        st.tuples(st.just("left"), boundary_scalars()),
+        st.tuples(st.just("right"), boundary_scalars()),
+        st.tuples(st.just("offset"), boundary_scalars()),
     )
     return st.lists(st.one_of(choose_side, update_value), min_size=1, max_size=30)
 
@@ -46,10 +57,10 @@ def test_incremental_results_match_fresh_recomputation(
     steps: list[Operation],
 ) -> None:
     chooser = Input[str]("chooser")
-    left = Input[int]("left")
-    right = Input[int]("right")
-    offset = Input[int]("offset")
-    state: dict[str, int | str] = {
+    left = Input[object]("left")
+    right = Input[object]("right")
+    offset = Input[object]("offset")
+    state: dict[str, object] = {
         "chooser": "left",
         "left": 0,
         "right": 0,
@@ -63,18 +74,21 @@ def test_incremental_results_match_fresh_recomputation(
     }
 
     @query
-    def selected(db: Database) -> int:
+    def selected(db: Database) -> object:
         if chooser.read(db) == "left":
             return left.read(db)
         return right.read(db)
 
     @query
     def parity(db: Database) -> str:
-        return "even" if selected(db) % 2 == 0 else "odd"
+        value = cast(Any, selected(db))
+        if isinstance(value, float) and math.isnan(value):
+            return "nan"
+        return "even" if value % 2 == 0 else "odd"
 
     @query
-    def describe(db: Database) -> tuple[str, int]:
-        return parity(db), selected(db) + offset.read(db)
+    def describe(db: Database) -> tuple[str, object]:
+        return parity(db), cast(Any, selected(db)) + offset.read(db)
 
     incremental = Database(mode=mode, max_query_nodes=max_query_nodes)
     for name, value in state.items():
@@ -88,7 +102,30 @@ def test_incremental_results_match_fresh_recomputation(
         for current_name, current_value in state.items():
             fresh.set(inputs[current_name], current_value)
 
-        assert incremental.get(describe) == fresh.get(describe)
+        fresh_before = fresh.statistics().query_executions
+        fresh_result = fresh.get(describe)
+        fresh_executions = fresh.statistics().query_executions - fresh_before
+
+        warm_before = incremental.statistics().query_executions
+        assert semantic_equal(incremental.get(describe), fresh_result)
+        warm_executions = incremental.statistics().query_executions - warm_before
+
+        # Equality on its own is satisfiable by a warm database that quietly
+        # recomputes everything, which would make this property a statement
+        # about the query bodies rather than about reuse. Witness the reuse:
+        # the cold side really evaluated, the warm side never outworked it, and
+        # a repeat request over an unchanged graph executes nothing. Under the
+        # eviction cap the graph deliberately drops nodes, so the repeat can
+        # only be held to doing strictly less than a cold evaluation there.
+        assert fresh_executions > 0
+        assert warm_executions <= fresh_executions
+        repeat_before = incremental.statistics().query_executions
+        assert semantic_equal(incremental.get(describe), fresh_result)
+        repeat_executions = incremental.statistics().query_executions - repeat_before
+        if max_query_nodes is None:
+            assert repeat_executions == 0
+        else:
+            assert repeat_executions < fresh_executions
 
 
 def file_contents() -> st.SearchStrategy[list[str]]:
@@ -407,8 +444,8 @@ def test_multi_level_rewiring_matches_fresh_recomputation(
 
 
 def checkpoint_op_sequences() -> st.SearchStrategy[list[CheckpointOp]]:
-    set_scale = st.tuples(st.just("set_scale"), st.integers(min_value=-8, max_value=8))
-    set_bias = st.tuples(st.just("set_bias"), st.integers(min_value=-8, max_value=8))
+    set_scale = st.tuples(st.just("set_scale"), boundary_scalars())
+    set_bias = st.tuples(st.just("set_bias"), boundary_scalars())
     write = st.tuples(
         st.just("write"),
         st.sampled_from(["", "a", "abc", "hello world", "x\ny\nz", "unicode-é"]),
@@ -431,8 +468,8 @@ def test_checkpoint_reload_matches_fresh_recomputation(
     max_query_nodes: int | None,
     steps: list[CheckpointOp],
 ) -> None:
-    scale = Input[int]("ckp_scale")
-    bias = Input[int]("ckp_bias")
+    scale = Input[object]("ckp_scale")
+    bias = Input[object]("ckp_bias")
     files = FileResource()
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -443,11 +480,11 @@ def test_checkpoint_reload_matches_fresh_recomputation(
             return len(files.read(db, str(path)))
 
         @query
-        def combiner(db: Database) -> int:
-            return cell_size(db) * scale.read(db) + bias.read(db)
+        def combiner(db: Database) -> object:
+            return cast(Any, cell_size(db)) * scale.read(db) + bias.read(db)
 
-        scale_value = 1
-        bias_value = 0
+        scale_value: object = 1
+        bias_value: object = 0
         content = ""
         path.write_text(content, encoding="utf-8")
 
@@ -459,11 +496,9 @@ def test_checkpoint_reload_matches_fresh_recomputation(
         last_key: str | None = None
         for kind, payload in steps:
             if kind == "set_scale":
-                assert isinstance(payload, int)
                 scale_value = payload
                 saver.set(scale, scale_value)
             elif kind == "set_bias":
-                assert isinstance(payload, int)
                 bias_value = payload
                 saver.set(bias, bias_value)
             elif kind == "write":
@@ -500,7 +535,30 @@ def test_checkpoint_reload_matches_fresh_recomputation(
         fresh.set(scale, scale_value)
         fresh.set(bias, bias_value)
 
-        assert reloaded.get(combiner) == fresh.get(combiner)
+        fresh_before = fresh.statistics().query_executions
+        fresh_result = fresh.get(combiner)
+        fresh_executions = fresh.statistics().query_executions - fresh_before
+        assert fresh_executions > 0
+
+        warm_before = reloaded.statistics().query_executions
+        assert semantic_equal(reloaded.get(combiner), fresh_result)
+        assert reloaded.statistics().query_executions - warm_before <= fresh_executions
+
+        # How much the reload can warm depends on how far the graph moved after
+        # the last save, so the warm case is pinned directly instead: save the
+        # graph this reload just evaluated and load that into a third database.
+        # That checkpoint describes the declared state exactly, so the answer
+        # has to come back with no query executed at all. Without this witness
+        # every equality above would hold just as well against a load_checkpoint
+        # that warmed nothing and let each read recompute in silence.
+        warm_key = reloaded.save_checkpoint()
+        rewarmed = Database(mode=mode, max_query_nodes=max_query_nodes, store=store)
+        rewarmed.set(scale, scale_value)
+        rewarmed.set(bias, bias_value)
+        rewarmed.load_checkpoint(warm_key)
+        rewarmed_before = rewarmed.statistics().query_executions
+        assert semantic_equal(rewarmed.get(combiner), fresh_result)
+        assert rewarmed.statistics().query_executions == rewarmed_before
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -509,26 +567,42 @@ def test_checkpoint_reload_matches_fresh_recomputation(
 def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
     mode: str, values: list[int]
 ) -> None:
-    # Honest about its reach: every assertion below also passes with the freeze
-    # detach reverted, so this observes detachment rather than pinning it. The
-    # input side is masked by memoization -- total is warm before the caller
-    # mutates the wrapper it handed over, so the cached answer is returned
-    # without re-reading the stored snapshot. The argument side is masked by the
-    # call envelope: _query_key freezes (args, kwargs) as one graph, and the
-    # empty kwargs dict forces the freeze memo path, so _finalize_snapshot
-    # inlines refs and rebuilds every wrapper leaf before the body runs -- the
-    # caller's argument object never reaches the query body, so mutating it
-    # afterwards is unobservable in any mode. The pin that goes red without the
-    # fix is tests/test_runtime.py::test_query_result_boundary_owns_returned_wrappers,
+    # Honest about its reach, arm by arm.
+    #
+    # The INPUT arm pins detachment, through total_after_mutation alone: that
+    # query's first evaluation happens after the caller mutates the wrapper it
+    # handed over, so no cached answer can stand in for a fresh read of the
+    # stored snapshot. With freeze's wrapper detach reverted it reads the
+    # caller's mutated items instead -- 9 against a fresh 6 for values
+    # [1, 2, 3] -- in all three modes. The warm `total` assertions do not pin
+    # anything -- total is already memoized before the mutation, so its cached
+    # answer comes back without the stored snapshot being re-read at all, which
+    # is what the execution witness below records.
+    #
+    # The ARGUMENT arm is coverage on both sides of the fix, because the call
+    # envelope hides the mutation: _query_key freezes (args, kwargs) as one
+    # graph, and the empty kwargs dict forces the freeze memo path, so
+    # _finalize_snapshot inlines refs and rebuilds every wrapper leaf before the
+    # body runs. The caller's argument object never reaches the query body, so
+    # mutating it afterwards is unobservable in any mode. The pin that goes red
+    # without the fix is
+    # tests/test_runtime.py::test_query_result_boundary_owns_returned_wrappers,
     # for result ingest; test_query_argument_envelope_never_aliased_the_caller
     # in the same file pins the envelope as a non-bug and is green on both
-    # sides. What this property does add is warm-vs-fresh agreement across the
-    # pre-frozen ingest path in all three modes.
+    # sides. What the argument assertions add is warm-vs-fresh agreement across
+    # the pre-frozen ingest path in all three modes.
     payload = Input[object]("prefrozen-owned")
 
     @query
     def total(db: Database) -> int:
         return sum(list(cast("list[int]", payload.read(db))))
+
+    @query
+    def total_after_mutation(db: Database) -> int:
+        # A distinct body so this keys its own node rather than reusing total's
+        # cached answer. Nothing requests it until the caller mutation below has
+        # already happened.
+        return sum(list(cast("list[int]", payload.read(db)))) + 0
 
     @query
     def echo(db: Database, value: object) -> object:
@@ -547,9 +621,22 @@ def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
 
     fresh = Database(mode=mode)
     fresh.set(payload, freeze(list(values)))
+    warm_before = db.statistics().query_executions
     assert db.get(total) == fresh.get(total) == expected
+    # No execution on this side: the equality above is the memo answering, which
+    # is precisely why it cannot discriminate.
+    assert db.statistics().query_executions == warm_before
+
+    cold_before = db.statistics().query_executions
+    warm_after_mutation = db.get(total_after_mutation)
+    # This one did execute, for the first time, with the caller's mutation
+    # already applied -- so it reads the stored snapshot rather than a memo.
+    assert db.statistics().query_executions > cold_before
+    assert semantic_equal(warm_after_mutation, fresh.get(total_after_mutation))
+    assert warm_after_mutation == expected
+
     # Pre-frozen wrappers arrive as input AND argument values: an equal-encoding
-    # argument keys the node held_argument keyed at ingest, and the warm answer is
-    # the ingested list, untouched by the mutation.
+    # argument keys the node that held_argument keyed at ingest, and the warm
+    # answer is the ingested list, untouched by the mutation.
     assert list(cast("list[int]", db.get(echo, freeze(list(values))))) == list(values)
     assert list(cast("list[int]", fresh.get(echo, freeze(list(values))))) == list(values)
