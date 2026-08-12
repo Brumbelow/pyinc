@@ -4358,6 +4358,11 @@ def test_hostile_eq_cannot_corrupt_the_stored_record(mode: str) -> None:
     db.set(stage, 1)
     db.get(produce)
 
+    # The hostile verdict is False, so the recompute counts as a change. The
+    # default relation would call [1] and [1] equal and backdate, so this
+    # witnesses that the policy really ran -- the corruption checks below
+    # cannot pass because the comparison was skipped.
+    assert _inspect_node(db, produce).last_decision == "executed"
     record = _query_record(db, produce)
     assert fingerprint_snapshot(record.snapshot) == record.digest
 
@@ -4391,19 +4396,160 @@ def test_eq_operands_are_not_the_stored_snapshots(
     db = Database(mode=mode)
     db.set(stage, 0)
     db.get(produce)
+    # The left operand is the snapshot the first execution stored; the record's
+    # snapshot field is overwritten by the second execution, so the object has
+    # to be held here to be compared against. Holding it also keeps the id
+    # check conclusive: a released object's id can be handed to a new one.
+    first = cast(FrozenList, _query_record(db, produce).snapshot)
     db.set(stage, 1)
     db.get(produce)
 
-    record = _query_record(db, produce)
-    stored = cast(FrozenList, record.snapshot)
+    second = cast(FrozenList, _query_record(db, produce).snapshot)
+    assert first is not second
     reported = capsys.readouterr().out.splitlines()
     assert len(reported) == 2
-    for line in reported:
+    # Left is compared against the snapshot it came from, right against the one
+    # the recompute just stored.
+    for line, stored in zip(reported, (first, second), strict=True):
         _, shell, items = line.split(":")
         assert int(shell) != id(stored)
         # 0 stands for a thawed operand, which is a list and has no items
         # tuple to share -- thaw allocates the whole container fresh.
         assert int(items) != id(stored.items)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_hostile_cutoff_cannot_corrupt_the_stored_record(
+    mode: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stage = Input[int]("hostile-cutoff-stage")
+
+    def hostile_cutoff(value: Any) -> object:
+        # A policy may not capture mutable state, so the "it ran" witness
+        # leaves through the print stream.
+        print("cutoff-ran")
+        if isinstance(value, FrozenDict):
+            object.__setattr__(value, "entries", (("token", "CORRUPTED"),))
+            return "CORRUPTED"
+        value["token"] = "CORRUPTED"
+        return "stable"
+
+    @query(cutoff=hostile_cutoff)
+    def gated(db: Database) -> dict[str, str]:
+        stage.read(db)
+        return {"token": "stable"}
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(gated)
+    db.set(stage, 1)
+    db.get(gated)
+
+    # One call per operand: the cutoff really saw both sides, so the checks
+    # below cannot pass with a policy that never fired.
+    assert capsys.readouterr().out == "cutoff-ran\ncutoff-ran\n"
+    record = _query_record(db, gated)
+    assert fingerprint_snapshot(record.snapshot) == record.digest
+
+    fresh = Database(mode=mode)
+    fresh.set(stage, 1)
+    assert dict(cast(Any, db.get(gated))) == dict(cast(Any, fresh.get(gated))) == {
+        "token": "stable"
+    }
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_checkpoint_after_hostile_comparator_still_verifies(mode: str) -> None:
+    stage = Input[int]("hostile-ckp-stage")
+
+    def hostile_eq(left: object, right: object) -> bool:
+        for operand in (left, right):
+            if isinstance(operand, FrozenList):
+                object.__setattr__(operand, "items", ("CORRUPTED",))
+            elif isinstance(operand, list):
+                operand.clear()
+                operand.append("CORRUPTED")
+        return False
+
+    @query(eq=hostile_eq)
+    def produce(db: Database) -> list[int]:
+        stage.read(db)
+        return [1]
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    saver.set(stage, 0)
+    saver.get(produce)
+    saver.set(stage, 1)
+    saver.get(produce)
+    # The False verdict is the policy's, not the default relation's, which
+    # would have backdated [1] against [1].
+    assert _inspect_node(saver, produce).last_decision == "executed"
+    key = saver.save_checkpoint()
+
+    restored = Database(mode=mode, store=store)
+    restored.set(stage, 1)
+    restored.load_checkpoint(key)
+
+    fresh = Database(mode=mode)
+    fresh.set(stage, 1)
+    assert list(cast(Any, restored.get(produce))) == list(
+        cast(Any, fresh.get(produce))
+    ) == [1]
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_hostile_comparator_cannot_poison_a_shared_warmed_snapshot(mode: str) -> None:
+    """A warmed record is the snapshot cache's own object, shared per digest.
+
+    Two records warmed from one digest hold the same ``Snapshot`` instance, so
+    a comparator that reached the stored object would damage every record
+    warmed from that digest, not only the query it was declared on.
+    """
+
+    stage = Input[int]("hostile-share-stage")
+
+    def hostile_eq(left: object, right: object) -> bool:
+        for operand in (left, right):
+            if isinstance(operand, FrozenList):
+                object.__setattr__(operand, "items", ("CORRUPTED",))
+            elif isinstance(operand, list):
+                operand.clear()
+                operand.append("CORRUPTED")
+        return False
+
+    @query(eq=hostile_eq)
+    def poisoner(db: Database) -> list[int]:
+        stage.read(db)
+        return [1]
+
+    @query
+    def bystander(db: Database) -> list[int]:
+        return [1]
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    saver.set(stage, 0)
+    saver.get(poisoner)
+    saver.get(bystander)
+    key = saver.save_checkpoint()
+
+    restored = Database(mode=mode, store=store)
+    restored.set(stage, 0)
+    restored.load_checkpoint(key)
+    restored.get(poisoner)
+    restored.get(bystander)
+    poisoned_record = _query_record(restored, poisoner)
+    bystander_record = _query_record(restored, bystander)
+    # Both queries return [1], so both warmed from the one cache entry.
+    assert poisoned_record.snapshot is bystander_record.snapshot
+
+    restored.set(stage, 1)
+    restored.get(poisoner)
+    assert _inspect_node(restored, poisoner).last_decision == "executed"
+
+    assert fingerprint_snapshot(bystander_record.snapshot) == bystander_record.digest
+    assert list(cast(Any, restored.get(bystander))) == [1]
 
 
 # ---------------------------------------------------------------------------
