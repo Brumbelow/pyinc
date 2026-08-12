@@ -2638,7 +2638,7 @@ class Database:
             record is not None
             and not record.is_failed
             and not record.probe_unconfirmed
-            and record.probe == probe_snapshot
+            and snapshots_equal(record.probe, probe_snapshot)
         ):
             record.verified_at = self._revision
             record.last_decision = "reused"
@@ -2666,7 +2666,7 @@ class Database:
         if hint is None:
             return False
         expected_probe_snapshot, expected_digest = hint
-        if probe_snapshot == expected_probe_snapshot and self._adapter_keys_trusted(
+        if snapshots_equal(probe_snapshot, expected_probe_snapshot) and self._adapter_keys_trusted(
             collect_adapter_keys(expected_probe_snapshot)
         ):
             snapshot = self._load_snapshot_from_store(expected_digest)
@@ -2742,7 +2742,11 @@ class Database:
         failure = f"{type(exc).__name__}: {exc}"
         if record is None:
             changed_at = self._revision
-        elif record.is_failed and not record.probe_unconfirmed and record.probe == probe_snapshot:
+        elif (
+            record.is_failed
+            and not record.probe_unconfirmed
+            and snapshots_equal(record.probe, probe_snapshot)
+        ):
             changed_at = record.changed_at
         else:
             self._revision += 1
@@ -5966,8 +5970,13 @@ class Database:
         right: Any,
     ) -> bool:
         if cutoff is not None:
-            return self._freeze_cutoff_token(cutoff(left)) == self._freeze_cutoff_token(
-                cutoff(right)
+            # The caller chooses WHICH token stands for the value; whether two
+            # tokens are the same observation is the kernel's one relation, so
+            # the tokens are frozen and compared canonically -- the numeric
+            # tower stays separated and a NaN token is equal to itself.
+            return snapshots_equal(
+                self._freeze_cutoff_token(cutoff(left)),
+                self._freeze_cutoff_token(cutoff(right)),
             )
         if eq is None:
             return self._semantic_equal(left, right)

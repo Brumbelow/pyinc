@@ -5206,3 +5206,136 @@ def test_input_type_flip_matches_fresh(
     fresh.set(point, second)
     assert db.get(describe) == fresh.get(describe)
     assert _inspect_node(db, describe).last_decision == "executed"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(("first", "second"), _TOWER_FLIPS)
+def test_probe_token_type_flip_reloads(
+    mode: str, first: object, second: object
+) -> None:
+    # Settled at the probe-hit gate, which compares the stored probe with the
+    # live one and has nothing standing in front of it: no digest filter, no
+    # second opinion. A flip that gate calls equal serves the stale payload.
+    cell = _TokenProbeCell(token=first, payload="alpha")
+    resource = _HeldTokenResource(cell)
+
+    @query
+    def loaded(db: Database) -> str:
+        return resource.read(db, "flip-cell")
+
+    db = Database(mode=mode)
+    assert db.get(loaded) == "alpha"
+
+    cell.token = second
+    cell.payload = "beta"
+    hits_before = db.statistics().resource_probe_hits
+    assert db.get(loaded) == "beta"
+    assert db.statistics().resource_probe_hits == hits_before
+
+    fresh = Database(mode=mode)
+    assert fresh.get(loaded) == "beta"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_failing_probe_type_flip_counts_as_changed(mode: str) -> None:
+    # Settled by the failure record's own probe comparison, which likewise
+    # stands alone: a failure record carries no digest to filter on.
+    cell = _TokenProbeCell(token=1)
+    resource = _FailingHeldTokenResource(cell)
+
+    @query
+    def loaded(db: Database) -> str:
+        return resource.read(db, "fail-flip-cell")
+
+    db = Database(mode=mode)
+    with pytest.raises(FileNotFoundError):
+        db.get(loaded)
+    key = db._resource_key(resource, "fail-flip-cell")
+    changed_at_before = db._records[key].changed_at
+
+    cell.token = 1.0
+    with pytest.raises(FileNotFoundError):
+        db.get(loaded)
+    # An int probe and a float probe are different observations: the failure
+    # record must register a change, not an unchanged-failure backdate.
+    assert db._records[key].changed_at > changed_at_before
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_checkpoint_hint_probe_type_flip_reloads(mode: str) -> None:
+    # Settled by the hint-restore gate, the third probe comparison. It has
+    # neither a digest filter nor a record to fall back on, so a flip it calls
+    # equal hands back checkpoint bytes for a world that has already moved.
+    cell = _TokenProbeCell(token=1, payload="alpha")
+    resource = _HeldTokenResource(cell)
+
+    @query
+    def loaded(db: Database) -> str:
+        return resource.read(db, "hint-flip-cell")
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    assert saver.get(loaded) == "alpha"
+    key = saver.save_checkpoint()
+
+    cell.token = 1.0
+    cell.payload = "beta"
+    restored = Database(mode=mode, store=store)
+    restored.load_checkpoint(key)
+    loads_before = restored.statistics().resource_loads
+    assert restored.get(loaded) == "beta"
+    # The hint declined: this value came from a load, not from the store.
+    assert restored.statistics().resource_loads > loads_before
+
+    fresh = Database(mode=mode)
+    assert fresh.get(loaded) == "beta"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(("first", "second"), _TOWER_FLIPS)
+def test_cutoff_token_type_flip_executes_downstream(
+    mode: str, first: object, second: object
+) -> None:
+    # Settled by the cutoff-token comparison. A declared cutoff sends the
+    # recompute decision down the policy arm, which has no digest pre-filter
+    # in front of it, so the token relation is the entire verdict here.
+    stage = Input[int]("cutoff-flip-stage")
+
+    @query(cutoff=lambda value: value["token"])
+    def gated(db: Database) -> dict[str, Any]:
+        step = stage.read(db)
+        return {"token": first if step == 0 else second, "step": step}
+
+    @query
+    def downstream(db: Database) -> str:
+        return _tower_repr(gated(db)["token"])
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(downstream)
+    db.set(stage, 1)
+    warm = db.get(downstream)
+
+    fresh = Database(mode=mode)
+    fresh.set(stage, 1)
+    assert warm == fresh.get(downstream) == _tower_repr(second)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_nan_cutoff_token_backdates(mode: str) -> None:
+    stage = Input[int]("cutoff-nan-stage")
+
+    @query(cutoff=lambda value: value["token"])
+    def gated(db: Database) -> dict[str, Any]:
+        return {"token": float("nan"), "step": stage.read(db)}
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(gated)
+    db.set(stage, 1)
+    db.get(gated)
+    # Canonical NaN tokens are equal under the one relation, so an unchanged
+    # NaN token is a backdate, exactly as an unchanged NaN result is. Same
+    # deciding site as the flip pin above, reached with the same policy arm:
+    # nothing but the token comparison can produce this decision.
+    assert _inspect_node(db, gated).last_decision == "backdated"
