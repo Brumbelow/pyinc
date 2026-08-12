@@ -4756,11 +4756,17 @@ def test_input_boundary_owns_prefrozen_wrappers(mode: str, entry_point: str) -> 
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_query_result_boundary_owns_prefrozen_wrappers(mode: str) -> None:
+def test_query_argument_round_trip_serves_the_ingested_value(mode: str) -> None:
     # The wrapper crosses as an ARGUMENT and comes back as the RESULT rather
     # than being captured in the query closure: captured-value mutation will
     # later re-key a query, which would quietly turn a closure-based version of
     # this pin into a fresh execution.
+    #
+    # This test stays GREEN with freeze's wrapper detach reverted -- the
+    # argument envelope rebuilds the wrapper before the body ever sees it, so
+    # nothing here can observe the result-ingest boundary. That boundary is
+    # pinned by test_query_result_boundary_owns_returned_wrappers; do not
+    # delete it as a duplicate of this one.
     held = _held_wrapper()
 
     @query
