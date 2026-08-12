@@ -42,21 +42,34 @@ mutable container, or a composite containing one cannot therefore be used as a
 mapping key or set member; `freeze` rejects such positions before they can
 produce a snapshot that later fails to thaw. A `ValueAdapter` that
 reconstructs a hashable value is necessary to carry such a value into a hash
-position, but it is not sufficient: the same gate rejects hash positions that
-are distinct under the snapshot encoding but collapse under Python `==`/`hash`
-after thaw. `FrozenDict` keys and `FrozenSet` members such as `1` beside
-`1.0`, `True` beside `1`, or `0.0` beside `-0.0` raise `UnsupportedValueError`
-from `freeze`, `thaw`, `serialize_snapshot`, and `deserialize_snapshot` alike,
-with the collapsing pair named in the error; two positions carrying the same
-adapter key are refused as soon as their payloads collapse, because the
-encoding cannot ask the adapter whether the values it rebuilds would still
-differ. Where the encoding cannot see the answer the gate is deliberately
-conservative rather than nondeterministic: every canonical NaN is one class,
-so a live `dict` keyed by `(1, nan)` and `(1.0, nan)` with distinct NaN
-objects — two keys to Python, which hashes a NaN by identity — is rejected as
-well. A container that would silently change cardinality on thaw is refused at
-the boundary instead of being stored, whether `freeze` built it from live
-values or it arrived hand-assembled or decoded from bytes.
+position, but it is not sufficient, for two independent reasons. First, an
+adapted value whose payload contains a `FrozenGraph` is refused outright,
+registered adapter or not: the shared or cyclic state such a payload rebuilds
+stays mutable after the value is inserted, so nothing at the boundary can
+establish that its hash is stable. (That refusal reuses the general message
+and asks for a `ValueAdapter` even where one is registered; the fix is to keep
+the cycle out of the payload, not to register another adapter.) Second, the
+same gate rejects hash positions that are distinct under the snapshot encoding
+but collapse under Python `==`/`hash` after thaw. `FrozenDict` keys and
+`FrozenSet` members such as `1` beside `1.0`, `True` beside `1`, or `0.0`
+beside `-0.0` raise `UnsupportedValueError` from `freeze`, `thaw`,
+`serialize_snapshot`, and `deserialize_snapshot` alike, with the collapsing
+pair named in the error; two positions carrying the same adapter key are
+refused as soon as their payloads collapse, because the encoding cannot ask
+the adapter whether the values it rebuilds would still differ. Where the
+encoding cannot see the answer the gate is deliberately conservative rather
+than nondeterministic: every canonical NaN is one class, so a live `dict`
+keyed by `(1, nan)` and `(1.0, nan)` with distinct NaN objects — two keys to
+Python, which hashes a NaN by identity — is rejected, both halves of the key
+having collapsed at once: `1` with `1.0` under the numeric rule, the two NaNs
+under the one-class rule. Keys that stay apart somewhere, `(2, nan)` beside
+`(3, nan)`, are accepted. A container that would silently change cardinality
+on thaw is refused at the boundary instead of being stored, whether `freeze`
+built it from live values or it arrived hand-assembled or decoded from bytes —
+for every adapter that satisfies the semantic round-trip law below. An adapter
+that thaws two distinct payloads into equal values breaks that law, and this
+gate, which reads payload encodings rather than running the adapter, cannot
+see it coming.
 
 `freeze()` and `thaw()` are boundary utilities, not a general object
 serializer. Passing an adapter registry to `freeze()` does not embed executable
@@ -73,8 +86,10 @@ snapshot the kernel owns outright — an already-frozen wrapper is cloned rather
 than passed through by identity, a tree-shaped one into a structurally
 identical, identically fingerprinted copy and an aliased or cyclic one into
 the same canonical graph encoding the equivalent raw structure produces — so
-holding the object you passed in never grants a reference into a stored
-record, a stored resource probe, or a mapping key or set member.
+nothing done through the object you passed in can influence a stored record, a
+stored resource probe, or a mapping key or set member. Leaf scalars and
+all-leaf tuples are still shared with the clone, deliberately: no `Frozen*`
+shell is, and nothing reflective can rebind a leaf.
 
 Cyclic and shared object graphs are supported via the `FrozenGraph` /
 `FrozenRef` snapshot variants: `freeze` memoizes mutable containers (`list`,
@@ -518,13 +533,13 @@ value, or route it through a `Resource`.
   `test_adapter_thaw_of_query_arguments_runs_under_the_guard`)
 
 - **`eq=` / `cutoff=`** on `Input` and `@query` — allows custom equivalence.
-  `eq=` compares detached operands, never the stored snapshots themselves: a
-  recomputed query result reaches the comparator as thawed values in `checked`
-  and `fast` and as detached `Frozen*` views in `strict` (a graph-shaped
-  result as shared/cyclic views, not as the `FrozenGraph` envelope), while an
-  input update reaches it as thawed values in every mode. `cutoff=` derives
-  its snapshot-safe tokens from those same detached operands, and the tokens
-  are compared under the canonical relation.
+  `eq=` compares detached operands, so nothing a comparator does to them can
+  reach the stored snapshot: a recomputed query result reaches the comparator
+  as thawed values in `checked` and `fast` and as detached `Frozen*` views in
+  `strict` (a graph-shaped result as shared/cyclic views, not as the
+  `FrozenGraph` envelope), while an input update reaches it as thawed values
+  in every mode. `cutoff=` derives its snapshot-safe tokens from those same
+  detached operands, and the tokens are compared under the canonical relation.
   These are mutually exclusive. Cutoff tokens must be snapshot-safe, and the
   declared equivalence must be substitutive for dependents (condition 3) for
   the guarantee to hold on exact values.

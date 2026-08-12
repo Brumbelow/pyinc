@@ -102,18 +102,18 @@ decided at release time.
   the stored snapshots. `semantic_equal(1, 1.0)`, `semantic_equal(True, 1)`,
   `semantic_equal(False, 0)`, `semantic_equal(0.0, -0.0)` and
   `semantic_equal(1, 1 + 0j)` are now `False`, `semantic_equal(nan, nan)` is
-  now `True` on every path, and the query backdate, input update, resource
-  probe, checkpoint probe hint and cutoff-token decisions all run on that one
-  relation: a cutoff token whose type flipped now invalidates where Python
-  equality called it unchanged, and a NaN cutoff token now backdates where it
-  never could. This replaces the digest-fallback backdating described under
-  [3.1.0] — the relation is reflexive for NaN by construction, so the query
-  backdate decision keeps no second opinion, and the digests it already holds
-  only filter in front of the byte comparison. The comparison helper behind
-  the relation, `pyinc.value.snapshots_equal`, now raises on values that are
-  not snapshots instead of falling back to Python `==` and answering `False`;
-  the runtime never hands it one, and `pyinc.semantic_equal` freezes both
-  operands before comparing.
+  now `True` on every path, and the query backdate, default input update,
+  resource probe, checkpoint probe hint and cutoff-token decisions all run on
+  that one relation: a cutoff token whose type flipped now invalidates where
+  Python equality called it unchanged, and a NaN cutoff token now backdates
+  where it never could. This replaces the digest-fallback backdating described
+  under [3.1.0] — the relation is reflexive for NaN by construction, so the
+  query backdate decision keeps no second opinion, and the digests it already
+  holds only filter in front of the byte comparison. The comparison helper
+  behind the relation, `pyinc.value.snapshots_equal`, now raises on values that
+  are not snapshots instead of falling back to Python `==` and answering
+  `False`; the runtime never hands it one, and `pyinc.semantic_equal` freezes
+  both operands before comparing.
 - `pyinc.freeze` always returns a snapshot the `Database` owns: an
   already-frozen wrapper is cloned into a detached snapshot instead of passing
   through by identity, at every boundary — query arguments and results, input
