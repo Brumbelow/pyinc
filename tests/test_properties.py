@@ -29,11 +29,13 @@ CheckpointOp = tuple[str, object]
 
 
 def boundary_scalars() -> st.SearchStrategy[object]:
-    # The numeric pool every replay property drives its inputs from. Integers
-    # alone cannot observe a numeric-tower or NaN mistake in the reuse
-    # decision, because no two of them are equal-but-differently-typed and none
-    # of them is unequal to itself. This pool carries both bool/int collisions,
-    # both zeros, a float equal to an int, a non-integral float, and NaN.
+    # The numeric pool behind operation_sequences and checkpoint_op_sequences,
+    # so it feeds test_incremental_results_match_fresh_recomputation and
+    # test_checkpoint_reload_matches_fresh_recomputation. Integers alone cannot
+    # observe a numeric-tower or NaN mistake in the reuse decision, because no
+    # two of them are equal-but-differently-typed and none of them is unequal to
+    # itself. This pool carries both bool/int collisions, both zeros, a float
+    # equal to an int, a non-integral float, and NaN.
     return st.sampled_from([-3, 0, 1, 7, True, False, 0.0, -0.0, 1.0, 2.5, float("nan")])
 
 
@@ -118,6 +120,9 @@ def test_incremental_results_match_fresh_recomputation(
         # eviction cap the graph deliberately drops nodes, so the repeat can
         # only be held to doing strictly less than a cold evaluation there.
         assert fresh_executions > 0
+        # A bound, not the discriminating assertion: a warm database that
+        # recomputed everything satisfies it with equality. The repeat request
+        # below is what separates reuse from silent recomputation.
         assert warm_executions <= fresh_executions
         repeat_before = incremental.statistics().query_executions
         assert semantic_equal(incremental.get(describe), fresh_result)
@@ -542,6 +547,8 @@ def test_checkpoint_reload_matches_fresh_recomputation(
 
         warm_before = reloaded.statistics().query_executions
         assert semantic_equal(reloaded.get(combiner), fresh_result)
+        # A bound again, satisfied with equality by a reload that warmed nothing
+        # -- the rewarmed database below is the assertion with teeth.
         assert reloaded.statistics().query_executions - warm_before <= fresh_executions
 
         # How much the reload can warm depends on how far the graph moved after
@@ -599,10 +606,12 @@ def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
 
     @query
     def total_after_mutation(db: Database) -> int:
-        # A distinct body so this keys its own node rather than reusing total's
-        # cached answer. Nothing requests it until the caller mutation below has
-        # already happened.
-        return sum(list(cast("list[int]", payload.read(db)))) + 0
+        # The same body as total, which is fine: a query is keyed by
+        # module:qualname and never by its body, so this is a separate node with
+        # nothing memoized in it. Nothing requests it until the caller mutation
+        # below has happened, so its first evaluation is forced to read the
+        # stored snapshot rather than answer from a cache.
+        return sum(list(cast("list[int]", payload.read(db))))
 
     @query
     def echo(db: Database, value: object) -> object:
