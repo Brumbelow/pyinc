@@ -40,6 +40,7 @@ from pyinc import (
     ValueAdapter,
     freeze,
     query,
+    serialize_snapshot,
 )
 from pyinc.runtime import _MISSING_SNAPSHOT
 from pyinc.value import fingerprint_snapshot
@@ -5492,3 +5493,12 @@ def test_store_bytes_carrying_a_thaw_collision_are_not_warmed_into_a_database() 
     store.put(digest, payload)
     db = Database(store=store)
     assert db._read_validated_snapshot(store, digest) is _MISSING_SNAPSHOT
+
+    # Control: the sentinel above is the collapse refusal, not one of the other
+    # ways this method answers missing -- an absent or non-bytes payload, a
+    # digest mismatch, a decode error, a fingerprint mismatch. The same
+    # construction over a single-key mapping warms and hands back its snapshot.
+    control = serialize_snapshot(FrozenDict(((1, "a"),)))
+    control_digest = hashlib.sha256(control).hexdigest()
+    store.put(control_digest, control)
+    assert db._read_validated_snapshot(store, control_digest) == FrozenDict(((1, "a"),))

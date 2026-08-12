@@ -11,6 +11,7 @@ from hypothesis import strategies as st
 
 from pyinc import UnsupportedValueError, deserialize_snapshot, freeze, serialize_snapshot, thaw
 from pyinc.value import (
+    _KERNEL_FINGERPRINT_PREFIX,
     FrozenAdapterValue,
     FrozenDict,
     FrozenGraph,
@@ -467,7 +468,7 @@ def _raw_snapshot_bytes(snapshot: object) -> bytes:
     # Encode WITHOUT validation: serialize_snapshot now refuses colliding
     # wrappers, so the untrusted-bytes matrix must build its payloads from the
     # raw encoder, exactly as a hostile store would.
-    buffer = bytearray(b"K2;")
+    buffer = bytearray(_KERNEL_FINGERPRINT_PREFIX)
     _encode_snapshot(snapshot, buffer)
     return bytes(buffer)
 
@@ -594,3 +595,44 @@ def test_adapter_hash_positions_that_stay_distinct_are_accepted(kind: str) -> No
         assert fingerprint_snapshot(restored) == fingerprint_snapshot(snapshot)
         thawed = thaw(snapshot, adapters=cast(Any, registry))
         assert len(cast(Any, thawed)) == 2
+
+
+class _IdentityAdapted:
+    # An adapted type whose values compare by identity rather than by payload.
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+
+class _IdentityAdaptedAdapter:
+    def freeze(self, value: _IdentityAdapted, freeze_value: Any) -> object:
+        return freeze_value(value.value)
+
+    def thaw(self, snapshot: Any, thaw_value: Any) -> _IdentityAdapted:
+        return _IdentityAdapted(thaw_value(snapshot))
+
+
+def test_identity_equal_adapted_values_are_refused_though_they_would_not_collapse() -> None:
+    adapters: dict[type[Any], Any] = {_IdentityAdapted: _IdentityAdaptedAdapter()}
+    left = _IdentityAdapted(1)
+    right = _IdentityAdapted(1.0)
+    # Nothing hand-built here, and this is the live route for adapted hash
+    # positions -- each key or member is frozen through _freeze_hash_position
+    # and the pair is judged when the finished wrapper is validated. These two
+    # compare by identity, so a live dict and a live set each keep both, and
+    # thawing would keep both as well: the adapter builds a fresh object per
+    # position.
+    assert left != right
+    live_dict = {left: "x", right: "y"}
+    assert len(live_dict) == 2
+    live_set = {left, right}
+    assert len(live_set) == 2
+    # Refused anyway, and deliberately. The payloads 1 and 1.0 already share a
+    # post-thaw equivalence class, and the same-adapter rule refuses on that
+    # alone: the validator decides from the encoding and never runs the
+    # adapter, so it cannot see the __eq__ that would keep these apart.
+    # Over-rejecting is the safe direction -- loosening the rule later only
+    # accepts more snapshots, which breaks nothing.
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(live_dict, adapters=adapters)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(live_set, adapters=adapters)
