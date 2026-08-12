@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 
-from pyinc import UnsupportedValueError, deserialize_snapshot, freeze, serialize_snapshot
+from pyinc import UnsupportedValueError, deserialize_snapshot, freeze, serialize_snapshot, thaw
 from pyinc.value import (
     FrozenAdapterValue,
     FrozenDict,
@@ -322,3 +322,97 @@ def test_graph_canonicalization_rewrites_all_nested_snapshot_kinds() -> None:
     canonical = _canonicalize_graph(graph)
     assert canonical.root == FrozenRef(0)
     assert len(canonical.nodes) == 4
+
+
+def _ordered_entries(*keys: object) -> tuple[tuple[object, str], ...]:
+    return tuple(sorted(((key, "v") for key in keys), key=lambda e: fingerprint_snapshot(e[0])))
+
+
+def _ordered_members(*members: object) -> tuple[object, ...]:
+    return tuple(sorted(members, key=fingerprint_snapshot))
+
+
+_COLLIDING_KEY_PAIRS: tuple[tuple[object, object], ...] = (
+    (1, 1.0),
+    (True, 1),
+    (1, 1 + 0j),
+    (0, False),
+    (0.0, -0.0),
+)
+
+
+@pytest.mark.parametrize(("left", "right"), _COLLIDING_KEY_PAIRS)
+def test_thaw_colliding_dict_keys_are_rejected(left: object, right: object) -> None:
+    wrapper = FrozenDict(cast(Any, _ordered_entries(left, right)))
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(wrapper)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        serialize_snapshot(wrapper)
+
+
+@pytest.mark.parametrize("kind", ["set", "frozenset"])
+@pytest.mark.parametrize(("left", "right"), _COLLIDING_KEY_PAIRS)
+def test_thaw_colliding_set_members_are_rejected(kind: str, left: object, right: object) -> None:
+    wrapper = FrozenSet(kind, _ordered_members(left, right))
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(wrapper)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        serialize_snapshot(wrapper)
+
+
+def test_thaw_colliding_frozenset_in_mapping_key_position_is_rejected() -> None:
+    collider = FrozenSet("frozenset", _ordered_members(1, 1.0))
+    # A hand-built wrapper is reached by the recursive walk under freeze's own
+    # _validate_snapshot call; a live dict/set key is reached by the separate
+    # _validate_snapshot call inside _freeze_hash_position. Both routes must
+    # refuse the collider, so neither needs a check of its own.
+    wrapper = FrozenDict(((collider, "v"),))
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(wrapper)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze({collider: "v"})
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze({collider})
+
+
+def test_deserialize_rejects_thaw_colliding_bytes() -> None:
+    # The exact byte string measured in the audit: a FrozenDict carrying the
+    # keys 1.0 and 1, whose thaw fabricated the pairing {1.0: 'a'}.
+    payload = b"K2;D2:f20:0x1.0000000000000p+0;s1:b;i1:1;s1:a;;"
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        deserialize_snapshot(payload)
+
+
+def test_nan_bearing_positions_are_refused_because_the_encoding_cannot_see_them() -> None:
+    nan = float.fromhex("nan")
+    # These two snapshots carry byte-identical encodings, yet thawing them
+    # produces a colliding pair or a distinct pair depending only on whether
+    # one NaN float object was shared: tuple equality takes an identity
+    # shortcut per element, and NaN is unequal to itself otherwise.
+    shared = FrozenList(((1, nan), (1.0, nan)))
+    unshared = FrozenList(((1, float.fromhex("nan")), (1.0, float.fromhex("nan"))))
+    assert serialize_snapshot(shared) == serialize_snapshot(unshared)
+    shared_left, shared_right = thaw(shared)
+    unshared_left, unshared_right = thaw(unshared)
+    assert shared_left == shared_right
+    assert unshared_left != unshared_right
+    # A validator that reads only the encoding cannot tell those two apart, so
+    # every canonical NaN is one class and the key position is refused.
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(FrozenDict(cast(Any, _ordered_entries((1, nan), (1.0, nan)))))
+
+
+def test_distinct_after_thaw_positions_stay_accepted() -> None:
+    accepted = [
+        FrozenDict(cast(Any, _ordered_entries(1, 2.5))),
+        FrozenDict(cast(Any, _ordered_entries("1", 1))),
+        FrozenSet("frozenset", _ordered_members(1, "1", b"1")),
+        # Infinities key by sign rather than by exact value; asking for the
+        # exact value of an infinite float would raise instead of rejecting.
+        FrozenSet("frozenset", _ordered_members(float("inf"), float("-inf"), 1e300)),
+    ]
+    for wrapper in accepted:
+        snapshot = freeze(wrapper)
+        thawed = thaw(snapshot)
+        assert len(thawed) == len(cast(Any, wrapper))
+        assert fingerprint_snapshot(freeze(thawed)) == fingerprint_snapshot(snapshot)

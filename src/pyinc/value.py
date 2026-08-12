@@ -8,6 +8,7 @@ import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
+from fractions import Fraction
 from types import NoneType
 from typing import Any, Protocol, cast, overload
 
@@ -956,6 +957,7 @@ def _validate_snapshot(snapshot: Any) -> None:
                 if type(value.entries) is not tuple:
                     raise UnsupportedValueError("FrozenDict.entries must be a tuple.")
                 key_digests: list[str] = []
+                key_classes: dict[object, Any] = {}
                 for entry in value.entries:
                     if type(entry) is not tuple or len(entry) != 2:
                         raise UnsupportedValueError("FrozenDict entries must be key/value pairs.")
@@ -963,6 +965,17 @@ def _validate_snapshot(snapshot: Any) -> None:
                     walk(key, depth + 1, graph_size)
                     walk(item, depth + 1, graph_size)
                     key_digests.append(encoded_digest(key))
+                    # Distinct encodings are not distinct keys: thaw restores the
+                    # numeric tower, so keys that encode differently -- 1 and
+                    # 1.0, 0.0 and -0.0 -- can still be one entry of the thawed
+                    # dict, which would silently drop the other key's value.
+                    key_class = _thaw_equivalence_key(key)
+                    if key_class in key_classes:
+                        raise UnsupportedValueError(
+                            f"FrozenDict keys {key_classes[key_class]!r} and "
+                            f"{key!r} collapse to one key after thaw."
+                        )
+                    key_classes[key_class] = key
                 if len(set(key_digests)) != len(key_digests):
                     raise UnsupportedValueError("FrozenDict contains duplicate frozen keys.")
                 if key_digests != sorted(key_digests):
@@ -977,9 +990,19 @@ def _validate_snapshot(snapshot: Any) -> None:
                 if type(value.items) is not tuple:
                     raise UnsupportedValueError("FrozenSet.items must be a tuple.")
                 item_digests: list[str] = []
+                member_classes: dict[object, Any] = {}
                 for item in value.items:
                     walk(item, depth + 1, graph_size)
                     item_digests.append(encoded_digest(item))
+                    # Same rule as the FrozenDict keys above: members that thaw
+                    # into equal-and-equally-hashing values are one member.
+                    member_class = _thaw_equivalence_key(item)
+                    if member_class in member_classes:
+                        raise UnsupportedValueError(
+                            f"FrozenSet members {member_classes[member_class]!r} and "
+                            f"{item!r} collapse to one member after thaw."
+                        )
+                    member_classes[member_class] = item
                 if len(set(item_digests)) != len(item_digests):
                     raise UnsupportedValueError("FrozenSet contains duplicate frozen members.")
                 if item_digests != sorted(item_digests):
@@ -1441,6 +1464,55 @@ def _freeze_hash_position(value: Any, registry: _AdapterRegistry, _state: _Freez
             "after thaw; register a ValueAdapter for this value."
         )
     return snapshot
+
+
+def _real_number_key(value: float) -> object:
+    if math.isnan(value):
+        # Conservative: whether two thawed NaN-carrying positions collapse
+        # depends on float object identity, which the encoding cannot see,
+        # so all canonical NaNs share one class and colliding pairs are
+        # refused rather than accepted nondeterministically.
+        return "nan"
+    if math.isinf(value):
+        return "+inf" if value > 0 else "-inf"
+    return Fraction(value)
+
+
+def _thaw_equivalence_key(snapshot: Any) -> object:
+    """Map a hash-position snapshot to its post-thaw ==/hash equivalence class.
+
+    Python's numeric tower unifies bool/int/float/complex under == and hash,
+    so entries that encode differently can collapse into one key or member
+    after thaw. Fraction keeps large integers exact where a float cast would
+    not. Non-hash-position types fall back to their canonical fingerprint,
+    which rejects nothing the digest-uniqueness rule does not already reject.
+    """
+
+    if snapshot is None:
+        return ("none",)
+    snapshot_type = type(snapshot)
+    if snapshot_type is bool or snapshot_type is int:
+        return ("num", Fraction(int(snapshot)), Fraction(0))
+    if snapshot_type is float:
+        return ("num", _real_number_key(snapshot), Fraction(0))
+    if snapshot_type is complex:
+        return (
+            "num",
+            _real_number_key(snapshot.real),
+            _real_number_key(snapshot.imag),
+        )
+    if snapshot_type is str:
+        return ("str", snapshot)
+    if snapshot_type is bytes:
+        return ("bytes", snapshot)
+    if snapshot_type is tuple:
+        return ("tuple", tuple(_thaw_equivalence_key(item) for item in snapshot))
+    if snapshot_type is FrozenSet and snapshot.kind == "frozenset":
+        return (
+            "frozenset",
+            frozenset(_thaw_equivalence_key(item) for item in snapshot.items),
+        )
+    return ("encoded", fingerprint_snapshot(snapshot))
 
 
 def _snapshot_thaws_hashably(snapshot: Any, nodes: list[Any], active_refs: set[int]) -> bool:
