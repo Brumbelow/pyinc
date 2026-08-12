@@ -268,7 +268,7 @@ def test_freeze_deeply_nested_five_levels() -> None:
     assert thawed == value
 
 
-def test_freeze_already_frozen_values_pass_through() -> None:
+def test_freeze_already_frozen_values_are_detached_clones() -> None:
     fl = FrozenList(items=(1, 2))
     fd = FrozenDict(entries=(("a", 1),))
     fs = FrozenSet(kind="set", items=(1,))
@@ -277,15 +277,58 @@ def test_freeze_already_frozen_values_pass_through() -> None:
     fref = FrozenRef(index=0)
     fg = FrozenGraph(nodes=(FrozenList(items=(FrozenRef(0),)),), root=FrozenRef(0))
 
-    # Already-frozen values hit the early return — identity preserved.
-    assert freeze(fl) is fl
-    assert freeze(fd) is fd
-    assert freeze(fs) is fs
-    assert freeze(fr) is fr
-    assert freeze(fa) is fa
+    # Frozen* shells are frozen dataclasses whose fields object.__setattr__ can
+    # rebind, so a stored snapshot must never share a shell with the caller:
+    # freeze hands back an equal, identically fingerprinted clone.
+    for wrapper in (fl, fd, fs, fr, fa, fg):
+        clone = freeze(wrapper)
+        assert clone is not wrapper
+        assert clone == wrapper
+        assert fingerprint_snapshot(clone) == fingerprint_snapshot(wrapper)
     with pytest.raises(UnsupportedValueError, match="FrozenRef index"):
         freeze(fref)
-    assert freeze(fg) is fg
+
+
+def test_freeze_clones_reach_every_nested_shell() -> None:
+    inner = FrozenList((1,))
+    outer = FrozenDict((("k", FrozenRecord("R", (("x", inner),))),))
+    clone = cast(FrozenDict, freeze(outer))
+
+    cloned_record = clone.entries[0][1]
+    assert cloned_record is not outer.entries[0][1]
+    assert cloned_record["x"] is not inner
+    assert cloned_record["x"] == inner
+
+
+def test_freeze_clones_graph_envelopes_and_their_node_tables() -> None:
+    shared = [1]
+    fg = cast(FrozenGraph, freeze((shared, shared)))
+    clone = cast(FrozenGraph, freeze(fg))
+
+    assert clone is not fg
+    assert clone == fg
+    assert fingerprint_snapshot(clone) == fingerprint_snapshot(fg)
+    assert all(
+        node is not original
+        for node, original in zip(clone.nodes, fg.nodes, strict=True)
+    )
+
+
+def test_freeze_rejects_hand_built_wrapper_cycles_without_recursing() -> None:
+    # The cycle spine must be a kind="frozenset" FrozenSet: it is the one
+    # wrapper shape _wrapper_aliases_structure never descends (its walk covers
+    # only the four graph-capable types, FrozenAdapterValue, and tuples), so
+    # this cycle reaches _freeze's pass-through branch and, after this task,
+    # _detach_wrapper's own guard. Do NOT "simplify" the spine to a FrozenList:
+    # that shape is intercepted by the aliasing detection at value.py:256 and
+    # re-routed through _refreeze_wrapper, whose _active_guard raises a
+    # DIFFERENT message ("Cyclic values cannot cross cached boundaries through
+    # this container type.", value.py:1338-1340) and never reaches the detach.
+    shell = FrozenSet("frozenset", ())
+    holder = FrozenAdapterValue("test:T", shell)
+    object.__setattr__(shell, "items", (holder,))
+    with pytest.raises(UnsupportedValueError, match="object cycles"):
+        freeze(holder)
 
 
 # ---------------------------------------------------------------------------
@@ -649,11 +692,21 @@ def test_freeze_reencodes_wrappers_shared_through_mixed_list_and_tuple_spines() 
 
 def test_freeze_tuple_of_unshared_wrappers_stays_a_plain_tuple() -> None:
     items = (FrozenList((1,)), FrozenList((2,)))
-    snapshot = freeze(items)
+    snapshot = cast(tuple[Any, ...], freeze(items))
 
     assert type(snapshot) is tuple
     assert snapshot == items
-    assert snapshot[0] is items[0]
+    # The raw tuple spine used to leak its wrapper elements by identity
+    # (freeze((w,))[0] is w); ownership now requires clones.
+    assert snapshot[0] is not items[0]
+    assert snapshot[0] == items[0]
+
+    # Nested spines leaked identically (freeze(((w,),))[0][0] was w — the
+    # register's aliasing survey); the detach must recurse through them.
+    nested = cast(tuple[Any, ...], freeze(((items[0],),)))
+    assert type(nested) is tuple
+    assert nested[0][0] is not items[0]
+    assert nested[0][0] == items[0]
 
 
 def test_freeze_reencodes_cyclic_wrapper_structure_as_the_raw_frozen_graph() -> None:

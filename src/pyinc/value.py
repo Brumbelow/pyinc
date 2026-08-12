@@ -211,7 +211,8 @@ def _freeze_root(value: Any, registry: _AdapterRegistry) -> Snapshot:
 
     A wrapper reached twice is a back-edge only once every wrapper on the way
     registers in the memo, and the first pass deliberately does not register
-    them: a tree wrapper has to keep passing through with its identity intact.
+    them: a tree wrapper has to keep inlining as a tree rather than becoming a
+    node-table entry.
     Sharing whose lowest common ancestor is a raw tuple therefore cannot be
     seen until the aliased wrapper is met, by which point the first occurrence
     is already inlined. So the walk that finds it is the freeze itself, and the
@@ -234,8 +235,9 @@ def _finalize_snapshot(snapshot: Snapshot, state: _FreezeState) -> Snapshot:
     if state.has_back_edge:
         return _canonicalize_graph(FrozenGraph(nodes=tuple(state.nodes), root=snapshot))
     if not state.nodes:
-        # No memoization happened at all — preserve the snapshot as-is so already-frozen
-        # values pass through with identity intact.
+        # No memoization happened at all -- the walk already produced a
+        # Database-owned snapshot (wrapper inputs were detached in _freeze),
+        # so there are no refs to inline.
         return snapshot
     # Memoized but no back-edges: inline FrozenRefs so the public snapshot has the
     # same flat shape as v1 for tree-shaped inputs.
@@ -273,7 +275,7 @@ def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snap
             else:
                 state.wrapper_ids.add(id(value))
                 state.live_refs.append(value)
-        return cast(Snapshot, value)
+        return _detach_wrapper(value)
     adapter_match = registry.for_value(value)
     if adapter_match is not None:
         adapter_key, adapter = adapter_match
@@ -378,8 +380,8 @@ def _freeze_dataclass(value: Any, registry: _AdapterRegistry, state: _FreezeStat
 def _wrapper_aliases_structure(value: Any) -> bool:
     """Report whether an already-frozen wrapper aliases any of its own parts.
 
-    A plain tree wrapper passes through `freeze` untouched with identity
-    intact, but a wrapper whose object graph revisits one of the four
+    A plain tree wrapper is detached into an equal clone that keeps its tree
+    shape, but a wrapper whose object graph revisits one of the four
     graph-capable container types (shared or cyclic) has to be re-encoded.
     Hash positions (mapping keys, set members) are frozen in isolated states
     and can never carry references, so they stay unvisited here exactly as
@@ -500,6 +502,67 @@ def _inline_refs(value: Snapshot, nodes: list[Any]) -> Snapshot:
     if isinstance(value, tuple):
         return tuple(_inline_refs(item, nodes) for item in value)
     return value
+
+
+def _detach_wrapper(value: Any, active: set[int] | None = None) -> Snapshot:
+    """Deep-clone a snapshot so it shares no Frozen* shell with the caller.
+
+    Every Frozen* type is a frozen dataclass, and ``object.__setattr__``
+    rebinds its fields, so a stored snapshot sharing a shell with the caller
+    would let the caller corrupt the record it came from. Leaf scalars and
+    all-leaf tuples stay shared -- nothing reflective can rebind them --
+    which is the same rule the strict boundary view applies on the way out.
+    """
+
+    value_type = type(value)
+    if value_type not in _FROZEN_TYPES and value_type is not tuple:
+        return cast(Snapshot, value)
+    if value_type is FrozenRef:
+        return cast(Snapshot, value)
+    if active is None:
+        active = set()
+    object_id = id(value)
+    if object_id in active:
+        raise UnsupportedValueError(
+            "Snapshot wrappers may not contain direct Python object cycles."
+        )
+    active.add(object_id)
+    try:
+        if value_type is FrozenList:
+            return FrozenList(tuple(_detach_wrapper(item, active) for item in value.items))
+        if value_type is FrozenDict:
+            return FrozenDict(
+                tuple(
+                    (_detach_wrapper(key, active), _detach_wrapper(item, active))
+                    for key, item in value.entries
+                )
+            )
+        if value_type is FrozenSet:
+            return FrozenSet(
+                value.kind, tuple(_detach_wrapper(item, active) for item in value.items)
+            )
+        if value_type is FrozenRecord:
+            return FrozenRecord(
+                value.type_name,
+                tuple(
+                    (name, _detach_wrapper(item, active)) for name, item in value.entries
+                ),
+            )
+        if value_type is FrozenAdapterValue:
+            return FrozenAdapterValue(
+                value.adapter_key, _detach_wrapper(value.payload, active)
+            )
+        if value_type is FrozenGraph:
+            return FrozenGraph(
+                nodes=tuple(_detach_wrapper(node, active) for node in value.nodes),
+                root=_detach_wrapper(value.root, active),
+            )
+        detached = tuple(_detach_wrapper(item, active) for item in value)
+        if all(item is original for item, original in zip(detached, value, strict=True)):
+            return cast(Snapshot, value)
+        return detached
+    finally:
+        active.discard(object_id)
 
 
 def _canonicalize_graph(graph: FrozenGraph) -> FrozenGraph:
