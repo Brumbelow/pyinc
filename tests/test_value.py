@@ -789,8 +789,8 @@ def test_freeze_tuple_of_unshared_wrappers_stays_a_plain_tuple() -> None:
     assert snapshot[0] is not items[0]
     assert snapshot[0] == items[0]
 
-    # Nested spines leaked identically (freeze(((w,),))[0][0] was w — the
-    # register's aliasing survey); the detach must recurse through them.
+    # Nested spines leaked identically (freeze(((w,),))[0][0] was w), so the
+    # detach must recurse through them rather than stopping at the outer tuple.
     nested = cast(tuple[Any, ...], freeze(((items[0],),)))
     assert type(nested) is tuple
     assert nested[0][0] is not items[0]

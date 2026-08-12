@@ -284,6 +284,10 @@ def test_aliasing_mutation_boundaries_behave_by_mode(
         # the membrane unless the caller deliberately shared the input. See the
         # companion test that exercises the shared-identity case.
         raw = ({"x": value}, {"x": value})
+        # The pre-frozen arm asks whether an already-frozen payload reaches the
+        # queries with the same mode behaviour as a raw one. It says nothing
+        # about wrapper ownership -- the caller never mutates what it handed
+        # over -- so it stays green with the freeze detach reverted too.
         db.set(payload, freeze(raw) if prefrozen else raw)
         if mode == "fast":
             assert db.get(mutate_left) == value
@@ -505,6 +509,18 @@ def test_checkpoint_reload_matches_fresh_recomputation(
 def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
     mode: str, values: list[int]
 ) -> None:
+    # Honest about its reach: every assertion below also passes with the freeze
+    # detach reverted, so this observes detachment rather than pinning it. The
+    # input side is masked by memoization -- total is warm before the caller
+    # mutates the wrapper it handed over, so the cached answer is returned
+    # without re-reading the stored snapshot. The argument side is masked by the
+    # result boundary, which re-encodes the answer, so a mutation of the caller's
+    # argument wrapper is unobservable in any mode. The pins that go red without
+    # the fix live in tests/test_runtime.py:
+    # test_query_result_boundary_owns_returned_wrappers for result ingest and
+    # test_query_argument_envelope_never_aliased_the_caller for the call
+    # envelope. What this property does add is warm-vs-fresh agreement across
+    # the pre-frozen ingest path in all three modes.
     payload = Input[object]("prefrozen-owned")
 
     @query
