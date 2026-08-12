@@ -2186,26 +2186,28 @@ def test_mutation_of_query_return_value_does_not_corrupt_memo(mode: str) -> None
 def test_custom_eq_with_side_effect_does_not_corrupt_graph(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    def parity_eq(left: int, right: int) -> bool:
+    def parity_eq(left: Any, right: Any) -> bool:
         print("custom comparator ran")
-        return left % 2 == right % 2
+        return bool(left[0] % 2 == right[0] % 2)
 
     number = Input[int]("number")
 
     @query(eq=parity_eq)
-    def transform(db: Database) -> int:
-        return number.read(db)
+    def transform(db: Database) -> list[int]:
+        return [number.read(db)]
 
     @query
     def describe(db: Database) -> str:
-        return f"v={transform(db)}"
+        return f"v={transform(db)[0]}"
 
     db = Database()
     db.set(number, 3)
     assert db.get(describe) == "v=3"
 
-    # Change input: 3 → 5 (both odd), parity_eq(3, 5) → True → backdated.
-    # eq callback fires with a side effect; kernel should still function correctly.
+    # Change input: 3 → 5 (both odd), parity_eq([3], [5]) → True → backdated.
+    # The comparator sees a container -- a FrozenList view here, since this
+    # database is strict -- so a corrupting comparator would have a shell to
+    # rebind; eq fires with a side effect and the kernel still functions.
     db.set(number, 5)
     assert db.get(describe) == "v=3"  # Backdated — parity says equal.
     assert "custom comparator ran" in capsys.readouterr().out
@@ -4330,6 +4332,78 @@ def test_impure_custom_eq_skips_policy_but_still_exposes(mode: str) -> None:
     # short-circuit forces the decision: two compare exposures plus the
     # caller-boundary thaw.
     assert BoxedAdapter.thaw_calls == 3
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_hostile_eq_cannot_corrupt_the_stored_record(mode: str) -> None:
+    stage = Input[int]("hostile-eq-stage")
+
+    def hostile_eq(left: object, right: object) -> bool:
+        for operand in (left, right):
+            if isinstance(operand, FrozenList):
+                object.__setattr__(operand, "items", ("CORRUPTED",))
+            elif isinstance(operand, list):
+                operand.clear()
+                operand.append("CORRUPTED")
+        return False
+
+    @query(eq=hostile_eq)
+    def produce(db: Database) -> list[int]:
+        stage.read(db)
+        return [1]
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(produce)
+    db.set(stage, 1)
+    db.get(produce)
+
+    record = _query_record(db, produce)
+    assert fingerprint_snapshot(record.snapshot) == record.digest
+
+    fresh = Database(mode=mode)
+    fresh.set(stage, 1)
+    assert list(cast(Any, db.get(produce))) == list(cast(Any, fresh.get(produce))) == [1]
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_eq_operands_are_not_the_stored_snapshots(
+    mode: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stage = Input[int]("eq-identity-stage")
+
+    def spy_eq(left: object, right: object) -> bool:
+        # A policy may not capture mutable state, so the operand identities
+        # leave through the print stream. The stored snapshot and its items
+        # tuple are alive while these ids are taken, so no distinct object can
+        # carry their id: an id match would mean the comparator holds the
+        # record itself.
+        for operand in (left, right):
+            items = id(operand.items) if isinstance(operand, FrozenList) else 0
+            print(f"eq-operand:{id(operand)}:{items}")
+        return False
+
+    @query(eq=spy_eq)
+    def produce(db: Database) -> list[int]:
+        stage.read(db)
+        return [1]
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(produce)
+    db.set(stage, 1)
+    db.get(produce)
+
+    record = _query_record(db, produce)
+    stored = cast(FrozenList, record.snapshot)
+    reported = capsys.readouterr().out.splitlines()
+    assert len(reported) == 2
+    for line in reported:
+        _, shell, items = line.split(":")
+        assert int(shell) != id(stored)
+        # 0 stands for a thawed operand, which is a list and has no items
+        # tuple to share -- thaw allocates the whole container fresh.
+        assert int(items) != id(stored.items)
 
 
 # ---------------------------------------------------------------------------

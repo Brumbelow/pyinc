@@ -2291,8 +2291,8 @@ class Database:
                         and snapshots_equal(previous.snapshot, snapshot)
                     )
                 else:
-                    old_value = self._expose_snapshot(previous.snapshot)
-                    new_value = self._expose_snapshot(snapshot)
+                    old_value = self._policy_operand(previous.snapshot)
+                    new_value = self._policy_operand(snapshot)
                     equal = (
                         False
                         if impure
@@ -3043,9 +3043,10 @@ class Database:
         if self.mode == "strict":
             # Callers never see the FrozenGraph envelope: a graph-shaped result
             # is rebuilt into shared/cyclic Frozen* views at the boundary,
-            # exactly as _materialize_call does for call arguments. Non-boundary
-            # exposure feeds the equality/cutoff comparison and keeps the raw
-            # snapshot -- a cyclic view cannot be re-frozen for that check.
+            # exactly as _materialize_call does for call arguments. Raw
+            # exposure hands back the stored snapshot itself, so it is for
+            # kernel-internal readers only -- a recomputed query's eq=/cutoff=
+            # policy takes detached operands from _policy_operand instead.
             exposed = self._strict_snapshot_view(snapshot) if boundary else snapshot
         else:
             exposed = self._thaw_value(snapshot)
@@ -3053,6 +3054,21 @@ class Database:
             frame.boundary_fingerprints.append(self._fingerprint_value(exposed))
             frame.boundary_values.append(exposed)
         return exposed
+
+    def _policy_operand(self, snapshot: Any) -> Any:
+        """Detach a stored snapshot before a user eq=/cutoff= policy sees it.
+
+        strict exposes detached Frozen* views -- _strict_snapshot_view
+        rebuilds every shell precisely because object.__setattr__ bypasses
+        frozen-dataclass setters, and it handles FrozenGraph cycles, so a
+        cyclic result is comparable without re-freezing. checked and fast
+        thaw, which already allocates fresh containers. Either way the
+        operand shares no mutable shell with the record it came from.
+        """
+
+        if self.mode == "strict":
+            return self._strict_snapshot_view(snapshot)
+        return self._thaw_value(snapshot)
 
     def _expose_boundary_snapshot(self, snapshot: Any) -> Any:
         frame = self._current_frame()
