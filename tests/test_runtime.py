@@ -41,6 +41,7 @@ from pyinc import (
     freeze,
     query,
 )
+from pyinc.runtime import _MISSING_SNAPSHOT
 from pyinc.value import fingerprint_snapshot
 
 _GLOBAL_BOX = {"x": 1}
@@ -5450,3 +5451,44 @@ def test_checkpoint_reload_after_nan_backdate_matches_fresh(mode: str) -> None:
     fresh.set(stage, 1)
     assert restored.get(described) == fresh.get(described) == "float:nan"
     assert restored.statistics().query_executions == executions_before
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_thaw_colliding_wrappers_are_refused_at_database_boundaries(
+    mode: str,
+) -> None:
+    colliding_entries: tuple[tuple[Any, Any], ...] = tuple(
+        sorted(
+            [(1, "a"), (1.0, "b")],
+            key=lambda entry: fingerprint_snapshot(entry[0]),
+        )
+    )
+    colliding = FrozenDict(colliding_entries)
+
+    @query
+    def size(db: Database, payload: object) -> int:
+        return len(cast(Any, payload))
+
+    db = Database(mode=mode)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        db.get(size, colliding)
+
+    holder = Input[object]("collider")
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        db.set(holder, colliding)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        db.set_many([(holder, colliding)])
+
+
+def test_store_bytes_carrying_a_thaw_collision_are_not_warmed_into_a_database() -> None:
+    # The store-warm entry point. Every warmed byte path decodes through
+    # Database._read_validated_snapshot, which validates the payload and
+    # answers a refused one as a missing artifact rather than handing back a
+    # snapshot whose thaw would drop a key. Bytes stored under their own true
+    # digest -- the digest check below passes -- therefore warm nothing.
+    payload = b"K2;D2:f20:0x1.0000000000000p+0;s1:b;i1:1;s1:a;;"
+    digest = hashlib.sha256(payload).hexdigest()
+    store = InMemoryArtifactStore()
+    store.put(digest, payload)
+    db = Database(store=store)
+    assert db._read_validated_snapshot(store, digest) is _MISSING_SNAPSHOT

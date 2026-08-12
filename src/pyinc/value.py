@@ -1484,12 +1484,9 @@ def _thaw_equivalence_key(snapshot: Any) -> object:
     Python's numeric tower unifies bool/int/float/complex under == and hash,
     so entries that encode differently can collapse into one key or member
     after thaw. Fraction keeps large integers exact where a float cast would
-    not. Non-hash-position types fall back to their canonical fingerprint,
-    which rejects nothing the digest-uniqueness rule does not already reject --
-    adapter values included, and there the fallback is a deliberate gap rather
-    than coverage: two payloads that encode differently can still thaw into
-    equal adapted values, and separating those needs the adapter registry this
-    validator is not given.
+    not. An adapted value carries its payload's class under its own adapter
+    key. Remaining types fall back to their canonical fingerprint, which
+    rejects nothing the digest-uniqueness rule does not already reject.
     """
 
     if snapshot is None:
@@ -1516,6 +1513,15 @@ def _thaw_equivalence_key(snapshot: Any) -> object:
             "frozenset",
             frozenset(_thaw_equivalence_key(item) for item in snapshot.items),
         )
+    if snapshot_type is FrozenAdapterValue:
+        # An adapter rebuilds its value from the payload alone, so two
+        # positions under one adapter key whose payloads already share a class
+        # run the same user code over equivalent inputs. Whether the results
+        # collapse is then the adapter's business, and this validator holds no
+        # registry to ask -- so it refuses the pair instead of guessing.
+        # Distinct adapter keys stay distinct: nothing in the encoding says
+        # whether two adapters can produce equal values.
+        return ("adapter", snapshot.adapter_key, _thaw_equivalence_key(snapshot.payload))
     return ("encoded", fingerprint_snapshot(snapshot))
 
 
