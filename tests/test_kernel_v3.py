@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import CodeType, FunctionType, MethodType, ModuleType
-from typing import Any, TypeVar, cast
+from typing import Any, NamedTuple, TypeVar, cast
 
 import pytest
 
@@ -66,6 +66,16 @@ class _ObservedBox:
 
 _observed_box = _ObservedBox(2)
 _observed_alias = dict[str, _ObservedBox]
+
+
+class _ObservedPair(NamedTuple):
+    box: _ObservedBox
+    tag: str
+
+
+_observed_pair = _ObservedPair(_observed_box, "pair")
+_observed_plain = (_observed_box, "plain")
+_observed_members = frozenset({_observed_box})
 
 
 class _CountingEq:
@@ -1433,6 +1443,132 @@ def test_memoized_fingerprint_tracks_input_policy_object_state() -> None:
     memoized, truth = _memo_and_truth(db, read_tolerant)
     assert memoized == truth
     assert memoized == Database()._query_fingerprint(read_tolerant)
+
+
+def test_memoized_fingerprint_tracks_state_inside_a_captured_named_tuple() -> None:
+    @query(key="memo-named-tuple")
+    def paired(db: Database) -> int:
+        return _observed_pair.box.factor
+
+    db = Database()
+    db._query_fingerprint(paired)
+    original = _observed_box.factor
+    object.__setattr__(_observed_box, "factor", original + 3)
+    try:
+        memoized, truth = _memo_and_truth(db, paired)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(paired)
+    finally:
+        object.__setattr__(_observed_box, "factor", original)
+
+
+def test_memoized_fingerprint_tracks_state_inside_captured_tuples_and_frozensets() -> None:
+    @query(key="memo-tuple-and-frozenset")
+    def collected(db: Database) -> int:
+        return _observed_plain[0].factor + len(_observed_members)
+
+    db = Database()
+    db._query_fingerprint(collected)
+    original = _observed_box.factor
+    object.__setattr__(_observed_box, "factor", original + 4)
+    try:
+        memoized, truth = _memo_and_truth(db, collected)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(collected)
+    finally:
+        object.__setattr__(_observed_box, "factor", original)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="type-alias and type-parameter syntax require Python 3.12",
+)
+def test_memoized_fingerprint_tracks_type_alias_and_type_parameter_annotations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_annotation_shape_helper"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Target:\n"
+        "    SCALE = 2\n"
+        "\n"
+        "\n"
+        "type Alias = Target\n"
+        "\n"
+        "\n"
+        "def bounded[T: Target](value: T) -> T:\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    helper = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-annotation-alias")
+        def aliased(db: Database, value: Any = None) -> int:
+            return 1
+
+        @query(key="memo-annotation-bound")
+        def parameterized(db: Database) -> int:
+            return 1
+
+        # An alias and a type-parameter bound both keep their content behind
+        # the annotated module's class, reached through the evaluators the
+        # fingerprint folds rather than through the alias object itself.
+        aliased.fn.__annotations__["value"] = helper.Alias
+        cast(Any, parameterized.fn).__type_params__ = helper.bounded.__type_params__
+
+        db = Database()
+        db._query_fingerprint(aliased)
+        db._query_fingerprint(parameterized)
+        monkeypatch.setattr(helper.Target, "SCALE", 3)
+        for target in (aliased, parameterized):
+            memoized, truth = _memo_and_truth(db, target)
+            assert memoized == truth
+            assert memoized == Database()._query_fingerprint(target)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_memoized_fingerprint_tracks_annotation_types_a_reflecting_body_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-annotation-reflected-type")
+    def reflected(db: Database, store: Any = None) -> int:
+        return len(_ObservedConsts.__annotations__)
+
+    # A body that reads annotations back makes the fingerprint fold each
+    # annotated value as an ambient capture, which pins the annotated type's
+    # namespace; without that read the same type is pinned by module anchor
+    # alone, and an added attribute would move neither side.
+    reflected.fn.__annotations__["store"] = InMemoryArtifactStore
+    db = Database()
+    db._query_fingerprint(reflected)
+    monkeypatch.setattr(InMemoryArtifactStore, "_observed_marker", 1, raising=False)
+    memoized, truth = _memo_and_truth(db, reflected)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(reflected)
+
+
+def test_memoized_fingerprint_tracks_instance_state_a_reflecting_body_reads() -> None:
+    @query(key="memo-annotation-reflected-instance")
+    def reflected(db: Database, box: Any = None) -> int:
+        return len(_ObservedConsts.__annotations__)
+
+    # The instance counterpart of the type case above. This shape exists only
+    # on the reflecting side of that switch: without the read, an annotated
+    # object is refused outright rather than folded field by field.
+    reflected.fn.__annotations__["box"] = _observed_box
+    db = Database()
+    db._query_fingerprint(reflected)
+    original = _observed_box.factor
+    object.__setattr__(_observed_box, "factor", original + 6)
+    try:
+        memoized, truth = _memo_and_truth(db, reflected)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(reflected)
+    finally:
+        object.__setattr__(_observed_box, "factor", original)
 
 
 def test_binary_file_resource_reads_bytes_from_one_observation(tmp_path: Path) -> None:

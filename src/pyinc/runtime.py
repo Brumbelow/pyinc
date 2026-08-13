@@ -3231,11 +3231,17 @@ class Database:
                     value,
                     tuple(observe_value(item) for item in typing.get_args(value)),
                 )
-            if type(value) in {tuple, frozenset}:
+            if isinstance(value, (tuple, frozenset)):
                 if id(value) in seen:
                     return value
                 seen.add(id(value))
-                return (value, tuple(observe_value(item) for item in value))
+                items = tuple(observe_value(item) for item in value)
+                if type(value) in {tuple, frozenset}:
+                    return (value, items)
+                # Mirrors the tuple- and frozenset-subclass arms of
+                # _freeze_captured_immutable, which fold the subclass type and
+                # its instance state alongside the elements.
+                return (value, items, observe_type(type(value)), observe_state(value))
             if isinstance(value, slice):
                 return (
                     value,
@@ -3273,14 +3279,6 @@ class Database:
             if id(value) in seen:
                 return value
             seen.add(id(value))
-            state: Any
-            try:
-                # The slot _static_instance_dict reads. Going through vars()
-                # instead would follow a proxying __getattribute__ to a mapping
-                # rebuilt on every read, which identity comparison never matches.
-                state = object.__getattribute__(value, "__dict__")
-            except (AttributeError, TypeError):
-                state = None
             fields_observation: Any = None
             if is_dataclass(value):
                 fields_observation = tuple(
@@ -3291,13 +3289,23 @@ class Database:
                 value,
                 observe_type(type(value)),
                 fields_observation,
-                # Only a concrete instance dictionary is observed: the payload
-                # refuses ambient capture state that is not one, and pinning a
-                # proxy would pin an object rebuilt on the next read.
-                tuple((name, observe_value(item)) for name, item in sorted(state.items()))
-                if isinstance(state, dict)
-                else None,
+                observe_state(value),
             )
+
+        def observe_state(value: Any) -> Any:
+            try:
+                # The slot _static_instance_dict reads. Going through vars()
+                # instead would follow a proxying __getattribute__ to a mapping
+                # rebuilt on every read, which identity comparison never matches.
+                state = object.__getattribute__(value, "__dict__")
+            except (AttributeError, TypeError):
+                return None
+            # Only a concrete instance dictionary is observed: the payload
+            # refuses ambient capture state that is not one, and pinning a
+            # proxy would pin an object rebuilt on the next read.
+            if not isinstance(state, dict):
+                return None
+            return tuple((name, observe_value(item)) for name, item in sorted(state.items()))
 
         def observe_function(fn: FunctionType) -> Any:
             if id(fn) in seen:
@@ -3358,6 +3366,64 @@ class Database:
                     observe_annotation(typing.get_origin(value)),
                     tuple(observe_annotation(item) for item in typing.get_args(value)),
                 )
+            if type(value).__qualname__ == "TypeAliasType" and type(value).__module__ in {
+                "typing",
+                "typing_extensions",
+            }:
+                if id(value) in seen:
+                    return value
+                seen.add(id(value))
+                # Mirrors _freeze_annotation_capture: an alias keeps its
+                # definition in a lazy evaluator where it has one and in
+                # __value__ otherwise, plus its own type parameters.
+                evaluator = getattr(value, "evaluate_value", None)
+                return (
+                    value,
+                    observe_function(evaluator)
+                    if isinstance(evaluator, FunctionType)
+                    else observe_annotation(getattr(value, "__value__", None)),
+                    tuple(
+                        observe_annotation(item)
+                        for item in getattr(value, "__type_params__", None) or ()
+                    ),
+                )
+            parameter_types = tuple(
+                candidate
+                for candidate in (
+                    getattr(typing, "TypeVar", None),
+                    getattr(typing, "ParamSpec", None),
+                    getattr(typing, "TypeVarTuple", None),
+                )
+                if isinstance(candidate, type)
+            )
+            if parameter_types and isinstance(value, parameter_types):
+                if id(value) in seen:
+                    return value
+                seen.add(id(value))
+                # Mirrors the annotation-parameter arm: a bound, a constraint
+                # set and a default reach their content through a lazy
+                # evaluator where one exists and through the resolved
+                # attribute otherwise.
+                parts: list[Any] = []
+                for evaluator_name, value_name in (
+                    ("evaluate_bound", "__bound__"),
+                    ("evaluate_constraints", "__constraints__"),
+                    ("evaluate_default", "__default__"),
+                ):
+                    evaluator = getattr(value, evaluator_name, None)
+                    if isinstance(evaluator, FunctionType):
+                        parts.append(observe_function(evaluator))
+                        continue
+                    try:
+                        part = getattr(value, value_name, None)
+                    except Exception:
+                        part = None
+                    parts.append(
+                        tuple(observe_annotation(item) for item in part)
+                        if isinstance(part, tuple)
+                        else observe_annotation(part)
+                    )
+                return (value, tuple(parts))
             return observe_value(value)
 
         def observe_metadata(fn: FunctionType) -> Any:
