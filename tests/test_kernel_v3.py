@@ -1723,19 +1723,23 @@ def test_memoized_fingerprint_tracks_resource_configuration_folded_as_capture_st
 def test_resource_capturing_fingerprints_track_reconfiguration() -> None:
     class ScaledResource(Resource[int, int, int]):
         def __init__(self, scale: int) -> None:
-            self.scale = scale
+            # The configuration lives in a list, so rebinding nothing and
+            # writing into it in place leaves every reference the observation
+            # pins identical. Holding it in a plain attribute would let the
+            # observation catch the write and prove nothing about the digest.
+            self.parts = [scale]
 
-        def identity(self) -> tuple[str, int]:
-            return ("scaled-resource", self.scale)
+        def identity(self) -> tuple[str, tuple[int, ...]]:
+            return ("scaled-resource", tuple(self.parts))
 
         def label(self, key: int) -> str:
             return f"scaled[{key}]"
 
         def probe(self, key: int) -> int:
-            return self.scale
+            return self.parts[0]
 
         def load(self, db: Database, key: int) -> int:
-            return self.scale * key
+            return self.parts[0] * key
 
     resource = ScaledResource(2)
 
@@ -1748,17 +1752,53 @@ def test_resource_capturing_fingerprints_track_reconfiguration() -> None:
     assert scaled in db._query_fingerprint_memo
 
     db._query_fingerprint(scaled)
-    resource.scale = 3
-    # identity() hands back a fresh object every call, so no reference
-    # observation can see this write. The memo carries a digest of the
-    # configuration the fold read instead, and re-reading it is what catches
-    # the reconfiguration.
+    resource.parts[0] = 3
+    # identity() hands back a fresh object every call, so its value cannot be
+    # pinned by reference, and this in-place write moves nothing the
+    # observation holds. The memo carries a digest of the configuration the
+    # fold read instead, and re-reading it is what catches the change.
     memoized, truth = _memo_and_truth(db, scaled)
     assert memoized == truth
     assert memoized == Database()._query_fingerprint(scaled)
     warm = db.get(scaled)
     fresh = Database().get(scaled)
     assert warm == fresh == 30
+
+
+def test_memoized_fingerprint_reuses_the_memo_for_an_unchanged_resource_query() -> None:
+    class SteadyResource(Resource[int, int, int]):
+        def __init__(self, scale: int) -> None:
+            self.parts = [scale]
+
+        def identity(self) -> tuple[str, tuple[int, ...]]:
+            return ("steady-resource", tuple(self.parts))
+
+        def label(self, key: int) -> str:
+            return f"steady[{key}]"
+
+        def probe(self, key: int) -> int:
+            return self.parts[0]
+
+        def load(self, db: Database, key: int) -> int:
+            return self.parts[0] * key
+
+    resource = SteadyResource(2)
+
+    @query(key="memo-resource-steady")
+    def steady(db: Database) -> int:
+        return db.read_resource(resource, 10)
+
+    db = Database()
+    first = db._query_fingerprint(steady)
+    entry = db._query_fingerprint_memo[steady]
+    assert db._query_fingerprint(steady) == first
+    # The counterpart of the capture-free guard, for the one shape whose memo
+    # is gated by a re-read rather than by a reference: a recompute stores a
+    # freshly built entry, so entry identity separates a served memo from one
+    # that recomputed the same digest. A configuration digest that failed to
+    # reproduce itself would recompute here while every coherence pin stayed
+    # green.
+    assert db._query_fingerprint_memo[steady] is entry
 
 
 def test_declared_mid_span_resource_reconfiguration_reaches_the_next_request() -> None:

@@ -614,6 +614,12 @@ class Database:
         self._fingerprint_resource_collector: ContextVar[list[tuple[Any, str]] | None] = ContextVar(
             "pyinc_fingerprint_resource_collector", default=None
         )
+        # Plain instance state, not a ContextVar like the request slots beside
+        # it, and deliberately so: the only cross-thread effect is one request
+        # replacing another's cache, which costs the loser fresh reads and can
+        # never hand anyone a digest from a request that has already ended.
+        # Degrading toward re-reading is the safe direction, so the weaker
+        # container buys simplicity without opening a staleness class.
         self._request_resource_digests: dict[int, tuple[Any, str]] | None = None
         self._fingerprint_cacheable: ContextVar[bool] = ContextVar(
             "pyinc_fingerprint_cacheable", default=True
@@ -3190,7 +3196,7 @@ class Database:
             for _module_id, module in sorted(modules.items(), key=lambda item: item[1].__name__)
         )
         # One pair per resource object: a resource reached from several slots
-        # of one walk is re-read once and digests identically every time, so
+        # of one walk is stored once and digests identically every time, so
         # the repeats only cost the guard re-reads.
         deduped_resources: dict[int, tuple[Any, str]] = {}
         for observed_resource, observed_digest in resources:
