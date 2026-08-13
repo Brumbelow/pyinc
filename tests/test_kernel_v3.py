@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import CodeType, FunctionType, MethodType, ModuleType
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import pytest
 
@@ -41,6 +41,18 @@ class _ImmutableCaptureBox:
 @dataclass(frozen=True)
 class _BoundMethodOwner:
     base: int
+
+
+def _memo_and_truth(db: Database, target: Any) -> tuple[str, str]:
+    """The memoized fingerprint next to the recomputed truth for ``target``.
+
+    Callers prime the memo, apply a mutation, then compare the two: a coherent
+    memo either recomputes or was already equal; only a stale hit differs.
+    """
+
+    memoized = db._query_fingerprint(target)
+    db._query_fingerprint_memo.pop(target, None)
+    return memoized, db._query_fingerprint(target)
 
 
 def test_input_keys_are_nonempty_keyword_configured_and_unique_per_database() -> None:
@@ -1187,6 +1199,79 @@ def test_high_cardinality_query_state_stays_bounded_by_lru_limit() -> None:
     assert len(db._query_registry) == 1
     assert len(db._query_fingerprint_memo) == 1
     assert all(not isinstance(timing, list) for timing in db._query_timings.values())
+
+
+def test_memoized_fingerprint_tracks_function_docstrings() -> None:
+    @query(key="memo-fn-doc")
+    def documented(db: Database) -> int:
+        """Original docstring."""
+        return 1
+
+    db = Database()
+    db._query_fingerprint(documented)
+    documented.fn.__doc__ = "Changed docstring."
+    memoized, truth = _memo_and_truth(db, documented)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(documented)
+
+
+def test_memoized_fingerprint_tracks_in_place_annotation_mutation() -> None:
+    @query(key="memo-fn-annotations")
+    def annotated(db: Database, value: int) -> int:
+        return value
+
+    db = Database()
+    db._query_fingerprint(annotated)
+    annotated.fn.__annotations__["value"] = str
+    memoized, truth = _memo_and_truth(db, annotated)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(annotated)
+
+
+def test_memoized_fingerprint_tracks_name_and_type_params() -> None:
+    @query(key="memo-fn-name")
+    def named(db: Database) -> int:
+        return 1
+
+    db = Database()
+    db._query_fingerprint(named)
+    named.fn.__name__ = "renamed"
+    memoized, truth = _memo_and_truth(db, named)
+    assert memoized == truth
+
+    db._query_fingerprint(named)
+    named.fn.__qualname__ = "renamed_qualname"
+    memoized, truth = _memo_and_truth(db, named)
+    assert memoized == truth
+
+    db._query_fingerprint(named)
+    named.fn.__module__ = "renamed_module"
+    memoized, truth = _memo_and_truth(db, named)
+    assert memoized == truth
+
+    db._query_fingerprint(named)
+    cast(Any, named.fn).__type_params__ = (TypeVar("T"),)
+    memoized, truth = _memo_and_truth(db, named)
+    assert memoized == truth
+
+
+def test_memoized_fingerprint_tracks_rebound_lazy_annotate() -> None:
+    def make_evaluator(marker: int) -> Any:
+        def __annotate__(format: int) -> dict[str, Any]:
+            raise NameError(f"deferred {marker}")
+
+        return __annotate__
+
+    @query(key="memo-fn-annotate")
+    def lazy(db: Database) -> int:
+        return 1
+
+    cast(Any, lazy.fn).__annotate__ = make_evaluator(1)
+    db = Database()
+    db._query_fingerprint(lazy)
+    cast(Any, lazy.fn).__annotate__ = make_evaluator(2)
+    memoized, truth = _memo_and_truth(db, lazy)
+    assert memoized == truth
 
 
 def test_binary_file_resource_reads_bytes_from_one_observation(tmp_path: Path) -> None:

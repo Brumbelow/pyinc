@@ -3191,7 +3191,8 @@ class Database:
         collision-free: any rebinding introduces an object that cannot be
         identical to a still-pinned one, and a spurious mismatch only costs a
         fingerprint recompute. The traversal mirrors what
-        `_function_definition_payload` folds into the fingerprint; modules stay
+        `_function_definition_payload` folds into the fingerprint, including
+        the function metadata `_function_metadata_payload` reads; modules stay
         leaves because `_module_observation_stamp` covers their content.
         """
         from .core import Input, Query
@@ -3234,6 +3235,7 @@ class Database:
                     for name in sorted(set(code.co_names))
                 ),
                 tuple((name, observe_value(value)) for name, value in sorted(vars(fn).items())),
+                observe_metadata(fn),
             )
 
         def observe_cell(cell: Any) -> Any:
@@ -3242,6 +3244,38 @@ class Database:
             except ValueError:
                 return _EMPTY_CELL_OBSERVATION
             return observe_value(contents)
+
+        def observe_metadata(fn: FunctionType) -> Any:
+            try:
+                annotations = fn.__annotations__
+            except Exception:
+                annotate = getattr(fn, "__annotate__", None)
+                annotations_observation: Any = (
+                    observe_function(annotate)
+                    if isinstance(annotate, FunctionType)
+                    else annotate
+                )
+            else:
+                annotations_observation = (
+                    annotations,
+                    tuple(
+                        (name, observe_value(item))
+                        for name, item in sorted(annotations.items())
+                    )
+                    if isinstance(annotations, dict)
+                    and all(isinstance(name, str) for name in annotations)
+                    else annotations,
+                )
+            type_parameters = getattr(fn, "__type_params__", ())
+            return (
+                fn.__name__,
+                fn.__qualname__,
+                fn.__module__,
+                fn.__doc__,
+                annotations_observation,
+                type_parameters,
+                tuple(observe_value(item) for item in type_parameters or ()),
+            )
 
         return (
             query.key,
