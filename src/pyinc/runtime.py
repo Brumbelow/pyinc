@@ -614,6 +614,7 @@ class Database:
         self._fingerprint_resource_collector: ContextVar[list[tuple[Any, str]] | None] = ContextVar(
             "pyinc_fingerprint_resource_collector", default=None
         )
+        self._request_resource_digests: dict[int, tuple[Any, str]] | None = None
         self._fingerprint_cacheable: ContextVar[bool] = ContextVar(
             "pyinc_fingerprint_cacheable", default=True
         )
@@ -1016,6 +1017,11 @@ class Database:
         the intermediate ids need no bookkeeping.
         """
         self._span_epoch += 1
+        # A declared change is the one thing that may move a resource's
+        # configuration inside a request, so the once-per-request digests go
+        # with it and the span's next read re-reads.
+        if self._request_resource_digests is not None:
+            self._request_resource_digests.clear()
         self._sync_span_to_epoch()
 
     def _sync_span_to_epoch(self) -> None:
@@ -3183,13 +3189,19 @@ class Database:
             (module, self._module_observation_stamp(module))
             for _module_id, module in sorted(modules.items(), key=lambda item: item[1].__name__)
         )
+        # One pair per resource object: a resource reached from several slots
+        # of one walk is re-read once and digests identically every time, so
+        # the repeats only cost the guard re-reads.
+        deduped_resources: dict[int, tuple[Any, str]] = {}
+        for observed_resource, observed_digest in resources:
+            deduped_resources.setdefault(id(observed_resource), (observed_resource, observed_digest))
         if cacheable:
             self._query_fingerprint_memo[query] = (
                 runtime_build,
                 definition_observation,
                 result,
                 module_observations,
-                tuple(resources),
+                tuple(deduped_resources.values()),
             )
         else:
             self._query_fingerprint_memo.pop(query, None)
@@ -3207,9 +3219,23 @@ class Database:
         than serving a fingerprint nothing checked.
         """
 
+        # Re-read at most once per request. That is exactly the scope the
+        # kernel already gives resource validation -- a span declares that the
+        # world holds still until it closes, and a caller changing it mid-span
+        # must say so, which rolls the request and clears this cache -- so
+        # reusing a digest inside one request introduces no consistency class
+        # the kernel did not already have. Outside a request the cache does
+        # not exist and every read is fresh.
+        cache = self._request_resource_digests
+        if cache is not None:
+            entry = cache.get(id(resource))
+            # The resource object is kept beside its digest: an id freed and
+            # reused by another object must not answer from this cache.
+            if entry is not None and entry[0] is resource:
+                return entry[1]
         try:
             configuration = self._resource_configuration(resource)
-            return fingerprint_snapshot(
+            digest = fingerprint_snapshot(
                 (
                     freeze(configuration, adapters=self._adapters),
                     self._resource_configuration_type_payload(configuration),
@@ -3217,6 +3243,9 @@ class Database:
             )
         except Exception:
             return _UNREADABLE_RESOURCE_DIGEST
+        if cache is not None:
+            cache[id(resource)] = (resource, digest)
+        return digest
 
     def _query_definition_observation(self, query: Any) -> Any:
         """Observe the live query definition for memoized-fingerprint reuse.
@@ -6170,9 +6199,13 @@ class Database:
         events_token = self._pending_events.set(pending)
         failures: list[NodeKey] = []
         failures_token = self._request_failures.set(failures)
+        # Lives for exactly this request, so a resource's configuration is
+        # re-read once per request rather than once per memo guard.
+        self._request_resource_digests = {}
         try:
             yield pending
         finally:
+            self._request_resource_digests = None
             self._pending_events.reset(events_token)
             self._release_failure_exceptions(failures)
             self._request_failures.reset(failures_token)

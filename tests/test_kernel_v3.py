@@ -1761,6 +1761,45 @@ def test_resource_capturing_fingerprints_track_reconfiguration() -> None:
     assert warm == fresh == 30
 
 
+def test_declared_mid_span_resource_reconfiguration_reaches_the_next_request() -> None:
+    class SpanResource(Resource[int, int, int]):
+        def __init__(self, scale: int) -> None:
+            # A list, so the observation pins the container by reference and an
+            # in-place write moves nothing it can see. Only re-reading the
+            # configuration catches this.
+            self.parts = [scale]
+
+        def identity(self) -> tuple[str, tuple[int, ...]]:
+            return ("span-resource", tuple(self.parts))
+
+        def label(self, key: int) -> str:
+            return f"span[{key}]"
+
+        def probe(self, key: int) -> int:
+            return self.parts[0]
+
+        def load(self, db: Database, key: int) -> int:
+            return self.parts[0] * key
+
+    resource = SpanResource(2)
+
+    @query(key="memo-resource-span")
+    def scaled(db: Database) -> int:
+        return db.read_resource(resource, 10)
+
+    db = Database()
+    with db.request_span():
+        assert db.get(scaled) == 20
+        before = db._query_fingerprint(scaled)
+        resource.parts[0] = 3
+        # A span holds the world still, so the configuration digest is read
+        # once for the whole request; declaring the change is what releases
+        # that hold, and the next read inside the span must see it.
+        db.request_inputs_changed()
+        assert db._query_fingerprint(scaled) != before
+        assert db.get(scaled) == 30
+
+
 def test_memoized_fingerprint_still_serves_capture_free_queries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
