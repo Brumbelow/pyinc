@@ -1801,6 +1801,78 @@ def test_memoized_fingerprint_reuses_the_memo_for_an_unchanged_resource_query() 
     assert db._query_fingerprint_memo[steady] is entry
 
 
+def test_memoized_fingerprint_tracks_rebound_module_attributes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_rebound_attribute_module"
+    (tmp_path / f"{module_name}.py").write_text("SCALE = 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+
+    @query(key="memo-module-attribute")
+    def scaled(db: Database) -> int:
+        return cast(int, module.SCALE) * 10
+
+    db = Database()
+    db._query_fingerprint(scaled)
+    monkeypatch.setattr(module, "SCALE", 5)
+    memoized, truth = _memo_and_truth(db, scaled)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(scaled)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_rebound_module_attribute_matches_fresh(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_rebound_attribute_{mode}"
+    (tmp_path / f"{module_name}.py").write_text("SCALE = 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+
+    @query(key=f"module-attribute-fsc-{mode}")
+    def scaled(db: Database) -> int:
+        return cast(int, module.SCALE) * 10
+
+    db = Database(mode=mode)
+    assert db.get(scaled) == 10
+    monkeypatch.setattr(module, "SCALE", 5)
+    executions = db.statistics().query_executions
+    warm = db.get(scaled)
+    fresh = Database(mode=mode).get(scaled)
+    assert warm == fresh == 50
+    assert db.statistics().query_executions == executions + 1
+
+
+def test_memoized_fingerprint_reuses_the_memo_for_an_unchanged_module_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_unchanged_attribute_module"
+    (tmp_path / f"{module_name}.py").write_text(
+        "SCALE = 1\ndef helper():\n    return 2\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+
+    @query(key="memo-module-attribute-steady")
+    def scaled(db: Database) -> int:
+        return cast(int, module.SCALE) * cast(int, module.helper())
+
+    db = Database()
+    first = db._query_fingerprint(scaled)
+    entry = db._query_fingerprint_memo[scaled]
+    assert db._query_fingerprint(scaled) == first
+    # The counterpart of the coherence pins above, for the guard arm that
+    # re-resolves attribute chains: a re-resolution answering with a fresh
+    # object every call would recompute here with every coherence pin still
+    # green. A recompute stores a newly built entry, so entry identity
+    # separates a served memo from one that rebuilt the same digest.
+    assert db._query_fingerprint_memo[scaled] is entry
+
+
 def test_declared_mid_span_resource_reconfiguration_reaches_the_next_request() -> None:
     class SpanResource(Resource[int, int, int]):
         def __init__(self, scale: int) -> None:

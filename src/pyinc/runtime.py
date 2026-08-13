@@ -101,6 +101,10 @@ _DEFAULT_SEMANTIC_EQUALITY_VERSION = 1
 _MISSING_SNAPSHOT = object()
 _EMPTY_CELL_OBSERVATION = object()
 _UNBOUND_GLOBAL_OBSERVATION = object()
+# Answer for a captured module attribute that has vanished. No target a memo
+# recorded can be this object, so the guard falls through to the recompute that
+# reports the missing attribute.
+_MISSING_MODULE_ATTRIBUTE = object()
 # Not a hexadecimal digest, so it can never equal a stored one and always
 # forces the memo guard to fall through to a full recompute.
 _UNREADABLE_RESOURCE_DIGEST = "unreadable-resource"
@@ -606,11 +610,15 @@ class Database:
                 str,
                 tuple[tuple[ModuleType, Any], ...],
                 tuple[tuple[Any, str], ...],
+                tuple[tuple[ModuleType, tuple[str, ...], Any], ...],
             ],
         ] = weakref.WeakKeyDictionary()
         self._fingerprint_module_collector: ContextVar[dict[int, ModuleType] | None] = ContextVar(
             "pyinc_fingerprint_module_collector", default=None
         )
+        self._fingerprint_attribute_collector: ContextVar[
+            list[tuple[ModuleType, tuple[str, ...], Any]] | None
+        ] = ContextVar("pyinc_fingerprint_attribute_collector", default=None)
         self._fingerprint_resource_collector: ContextVar[list[tuple[Any, str]] | None] = ContextVar(
             "pyinc_fingerprint_resource_collector", default=None
         )
@@ -3169,13 +3177,19 @@ class Database:
                 self._resource_identity_digest(resource) == expected
                 for resource, expected in cached[4]
             )
+            and all(
+                self._resolve_module_path_target(module, path) is expected
+                for module, path, expected in cached[5]
+            )
         ):
             return cached[2]
 
         modules: dict[int, ModuleType] = {}
         resources: list[tuple[Any, str]] = []
+        attributes: list[tuple[ModuleType, tuple[str, ...], Any]] = []
         collector_token = self._fingerprint_module_collector.set(modules)
         resource_token = self._fingerprint_resource_collector.set(resources)
+        attribute_token = self._fingerprint_attribute_collector.set(attributes)
         cacheable_token = self._fingerprint_cacheable.set(True)
         try:
             result = fingerprint_snapshot(
@@ -3189,6 +3203,7 @@ class Database:
         finally:
             cacheable = self._fingerprint_cacheable.get()
             self._fingerprint_cacheable.reset(cacheable_token)
+            self._fingerprint_attribute_collector.reset(attribute_token)
             self._fingerprint_resource_collector.reset(resource_token)
             self._fingerprint_module_collector.reset(collector_token)
         module_observations = tuple(
@@ -3201,6 +3216,19 @@ class Database:
         deduped_resources: dict[int, tuple[Any, str]] = {}
         for observed_resource, observed_digest in resources:
             deduped_resources.setdefault(id(observed_resource), (observed_resource, observed_digest))
+        # One entry per (module, path) chain: the same chain folded from several
+        # slots of one walk reads the same live target every time, so keeping
+        # the first record loses nothing and the guard re-resolves it once. The
+        # records hold every module they name, so no id can be freed and reused
+        # while this loop keys on one.
+        deduped_attributes: dict[
+            tuple[int, tuple[str, ...]], tuple[ModuleType, tuple[str, ...], Any]
+        ] = {}
+        for observed_module, observed_path, observed_target in attributes:
+            deduped_attributes.setdefault(
+                (id(observed_module), observed_path),
+                (observed_module, observed_path, observed_target),
+            )
         if cacheable:
             self._query_fingerprint_memo[query] = (
                 runtime_build,
@@ -3208,6 +3236,7 @@ class Database:
                 result,
                 module_observations,
                 tuple(deduped_resources.values()),
+                tuple(deduped_attributes.values()),
             )
         else:
             self._query_fingerprint_memo.pop(query, None)
@@ -3266,14 +3295,16 @@ class Database:
         `_function_definition_payload` folds into the fingerprint — function
         metadata, captured class bodies, and captured instance and policy
         state — pinning each entry's reference where the payload folds its
-        value; modules stay leaves because `_module_observation_stamp` covers
-        their content, and so do the types the payload pins by module anchor
-        rather than by a namespace walk. Resources get no arm of their own
-        either: what a fold reads out of `identity()` is gated by the recorded
-        configuration digests the memo carries alongside this observation, and
-        every slot that reaches a resource for anything else folds it as the
-        ordinary class or instance it is, so the arms below already observe it
-        from whichever slot arrives first.
+        value; modules stay leaves, and so do the types the payload pins by
+        module anchor rather than by a namespace walk. A module's file content
+        is gated by `_module_observation_stamp`, and the statically accessed
+        attributes whose live values the fingerprint folds are re-resolved by
+        identity against the memo's recorded targets. Resources get no arm of
+        their own either: what a fold reads out of `identity()` is gated by the
+        recorded configuration digests the memo carries alongside this
+        observation, and every slot that reaches a resource for anything else
+        folds it as the ordinary class or instance it is, so the arms below
+        already observe it from whichever slot arrives first.
         """
         from .core import Input, Query
 
@@ -3297,8 +3328,9 @@ class Database:
             if isinstance(value, FunctionType):
                 return observe_function(value)
             if isinstance(value, ModuleType):
-                # Modules are gated by the memoized module observations (the
-                # content stamp).
+                # Modules are gated by the memoized module observations: the
+                # content stamp, plus the statically accessed attribute targets
+                # the memo re-resolves by identity.
                 return value
             if isinstance(value, type):
                 return observe_type(value)
@@ -5110,6 +5142,7 @@ class Database:
         steps: list[Any] = []
         for index, attribute_name in enumerate(path):
             if not isinstance(current, ModuleType):
+                self._record_module_path_target(module, path, current)
                 return (
                     tuple(steps),
                     self._module_attribute_payload(current, seen_functions),
@@ -5130,10 +5163,26 @@ class Database:
                 )
             )
             current = namespace[attribute_name]
+        self._record_module_path_target(module, path, current)
         return (
             tuple(steps),
             self._module_attribute_payload(current, seen_functions),
         )
+
+    def _record_module_path_target(
+        self, module: ModuleType, path: tuple[str, ...], target: Any
+    ) -> None:
+        """Hand the memo the object whose payload this chain just folded.
+
+        Recorded only while a fingerprint is being computed; outside that scope
+        the collector is unset and the walk records nothing. ``target`` is the
+        value the walk stopped on, which is exactly what
+        ``_resolve_module_path_target`` re-derives for the memo guard.
+        """
+
+        collector = self._fingerprint_attribute_collector.get()
+        if collector is not None:
+            collector.append((module, path, target))
 
     def _module_attribute_payload(self, value: Any, seen_functions: builtins.set[int]) -> Any:
         from .core import Input, Query
@@ -5336,9 +5385,13 @@ class Database:
         * a sorted `__all__` tuple when declared, capturing the module's
           publicly promised surface.
 
-        In-process monkey-patch of module attributes is *not* covered and is
-        explicitly listed in `docs/kernel-contract.md` as out of scope; users
-        relying on such state must route it through `Input` / `Resource`.
+        No namespace value is carried here: the behavior behind a captured
+        module's statically accessed attribute chains is folded live by
+        `_captured_module_path_payload`, and the fingerprint memo re-resolves
+        those chains by identity before reusing a digest that folded them. That
+        recheck is by identity only: state mutated in place behind such a chain
+        moves the freshly folded payload but not the recorded target, so it
+        belongs in an `Input` or a `Resource`.
         """
         collector = self._fingerprint_module_collector.get()
         if collector is not None:
@@ -5477,6 +5530,26 @@ class Database:
                 ) from exc
         file_identity = ("file-sha256", import_identity, digest)
         return (version_digest, file_identity, all_tuple, constants_payload)
+
+    @staticmethod
+    def _resolve_module_path_target(module: ModuleType, path: tuple[str, ...]) -> Any:
+        """Resolve the object a static module-attribute chain currently names.
+
+        Walks exactly as `_captured_module_path_payload` does: attribute by
+        attribute through module namespaces, stopping at the first non-module
+        value (whose payload is what the fingerprint folded). A vanished
+        attribute resolves to a sentinel no recorded target can be.
+        """
+
+        current: Any = module
+        for attribute_name in path:
+            if not isinstance(current, ModuleType):
+                return current
+            namespace = vars(current)
+            if attribute_name not in namespace:
+                return _MISSING_MODULE_ATTRIBUTE
+            current = namespace[attribute_name]
+        return current
 
     def _module_observation_stamp(self, module: ModuleType) -> Any:
         """Return a cheap invalidation token for a memoized module identity."""
