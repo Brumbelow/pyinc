@@ -4552,6 +4552,158 @@ def test_hostile_comparator_cannot_poison_a_shared_warmed_snapshot(mode: str) ->
     assert list(cast(Any, restored.get(bystander))) == [1]
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_operand_type"),
+    [("strict", "FrozenList"), ("checked", "list"), ("fast", "list")],
+)
+def test_custom_eq_over_a_graph_shaped_result_sees_the_graph(
+    mode: str, expected_operand_type: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A graph-shaped result reaches `eq=` as the graph, not as its envelope.
+
+    The operand carries the result's own back-edge and its shared identity, so
+    a comparator has to be cycle-aware to read it at all; a structural one
+    recurses forever, which the uniformity test below pins.
+    """
+
+    stage = Input[int]("graph-eq-stage")
+
+    def parity_eq(left: object, right: object) -> bool:
+        # A policy may not capture mutable state, so the operand shapes leave
+        # through the print stream.
+        for operand in (left, right):
+            item = cast(Any, operand)
+            print(
+                f"{type(item).__name__}:cycle={item[0] is item}"
+                f":shared={item[1] is item[2]}"
+            )
+        left_tag = cast(int, cast(Any, left)[1][0])
+        right_tag = cast(int, cast(Any, right)[1][0])
+        return left_tag % 2 == right_tag % 2
+
+    @query(eq=parity_eq)
+    def graph_shaped(db: Database) -> list[Any]:
+        shared = [stage.read(db)]
+        value: list[Any] = []
+        value.append(value)
+        value.extend((shared, shared))
+        return value
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(graph_shaped)
+    first_digest = _query_record(db, graph_shaped).digest
+    assert capsys.readouterr().out == ""
+
+    db.set(stage, 2)
+    result = cast(Any, db.get(graph_shaped))
+    # The reported type is the mode's container view, never `FrozenGraph`: the
+    # envelope is rebuilt into the graph it encodes before the policy runs.
+    assert capsys.readouterr().out.splitlines() == [
+        f"{expected_operand_type}:cycle=True:shared=True"
+    ] * 2
+
+    record = _query_record(db, graph_shaped)
+    # The two snapshots differ, so the default relation would have called this
+    # a change: only the policy's verdict can backdate it.
+    assert record.digest != first_digest
+    assert _inspect_node(db, graph_shaped).last_decision == "backdated"
+    assert fingerprint_snapshot(record.snapshot) == record.digest
+    assert result[0] is result
+    assert result[1] is result[2]
+    assert result[1][0] == 2
+
+    # An odd tag lands on the other side of the declared equivalence, so the
+    # same comparator reports a change.
+    db.set(stage, 3)
+    db.get(graph_shaped)
+    assert _inspect_node(db, graph_shaped).last_decision == "executed"
+    changed = _query_record(db, graph_shaped)
+    assert fingerprint_snapshot(changed.snapshot) == changed.digest
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_operand_type"),
+    [("strict", "FrozenList"), ("checked", "list"), ("fast", "list")],
+)
+def test_cutoff_token_decides_over_a_cyclic_result(
+    mode: str, expected_operand_type: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stage = Input[int]("graph-cutoff-stage")
+
+    def parity_cutoff(value: object) -> object:
+        operand = cast(Any, value)
+        print(f"cutoff:{type(operand).__name__}:cycle={operand[0] is operand}")
+        return cast(int, operand[1][0]) % 2
+
+    @query(cutoff=parity_cutoff)
+    def graph_shaped(db: Database) -> list[Any]:
+        shared = [stage.read(db)]
+        value: list[Any] = []
+        value.append(value)
+        value.extend((shared, shared))
+        return value
+
+    db = Database(mode=mode)
+    db.set(stage, 0)
+    db.get(graph_shaped)
+    first_digest = _query_record(db, graph_shaped).digest
+    assert capsys.readouterr().out == ""
+
+    db.set(stage, 2)
+    result = cast(Any, db.get(graph_shaped))
+    # One call per operand: the token function saw both sides of the cycle.
+    assert capsys.readouterr().out.splitlines() == [
+        f"cutoff:{expected_operand_type}:cycle=True"
+    ] * 2
+
+    record = _query_record(db, graph_shaped)
+    # Equal tokens over unequal snapshots: the token comparison decided.
+    assert record.digest != first_digest
+    assert _inspect_node(db, graph_shaped).last_decision == "backdated"
+    assert fingerprint_snapshot(record.snapshot) == record.digest
+    assert result[0] is result
+    assert result[1][0] == 2
+
+    db.set(stage, 3)
+    db.get(graph_shaped)
+    assert _inspect_node(db, graph_shaped).last_decision == "executed"
+    changed = _query_record(db, graph_shaped)
+    assert fingerprint_snapshot(changed.snapshot) == changed.digest
+
+
+def test_structural_eq_over_cyclic_operands_raises_in_every_mode() -> None:
+    """A naive structural comparator fails identically in all three modes.
+
+    Strict once handed the comparator the finite `FrozenGraph` envelope, so a
+    structural `==` returned a verdict there while `checked` and `fast` blew
+    the stack on the thawed cycle. The operand is the graph itself in every
+    mode now, so the modes agree -- which is why all three run in one test
+    rather than as parametrized cases.
+    """
+
+    stage = Input[int]("graph-structural-stage")
+
+    def structural_eq(left: object, right: object) -> bool:
+        return left == right
+
+    @query(eq=structural_eq)
+    def graph_shaped(db: Database) -> list[Any]:
+        shared = [stage.read(db)]
+        value: list[Any] = []
+        value.append(value)
+        value.extend((shared, shared))
+        return value
+
+    for mode in ("strict", "checked", "fast"):
+        db = Database(mode=mode)
+        db.set(stage, 0)
+        db.get(graph_shaped)
+        db.set(stage, 1)
+        with pytest.raises(RecursionError):
+            db.get(graph_shaped)
+
+
 # ---------------------------------------------------------------------------
 # Request spans
 # ---------------------------------------------------------------------------

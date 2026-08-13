@@ -43,33 +43,37 @@ mapping key or set member; `freeze` rejects such positions before they can
 produce a snapshot that later fails to thaw. A `ValueAdapter` that
 reconstructs a hashable value is necessary to carry such a value into a hash
 position, but it is not sufficient, for two independent reasons. First, an
-adapted value whose payload contains a `FrozenGraph` is refused outright,
-registered adapter or not: the shared or cyclic state such a payload rebuilds
-stays mutable after the value is inserted, so nothing at the boundary can
-establish that its hash is stable. (That refusal reuses the general message
-and asks for a `ValueAdapter` even where one is registered; the fix is to keep
-the cycle out of the payload, not to register another adapter.) Second, the
-same gate rejects hash positions that are distinct under the snapshot encoding
-but collapse under Python `==`/`hash` after thaw. `FrozenDict` keys and
-`FrozenSet` members such as `1` beside `1.0`, `True` beside `1`, or `0.0`
-beside `-0.0` raise `UnsupportedValueError` from `freeze`, `thaw`,
-`serialize_snapshot`, and `deserialize_snapshot` alike, with the collapsing
-pair named in the error; two positions carrying the same adapter key are
-refused as soon as their payloads collapse, because the encoding cannot ask
-the adapter whether the values it rebuilds would still differ. Where the
-encoding cannot see the answer the gate is deliberately conservative rather
-than nondeterministic: every canonical NaN is one class, so a live `dict`
-keyed by `(1, nan)` and `(1.0, nan)` with distinct NaN objects — two keys to
-Python, which hashes a NaN by identity — is rejected, both halves of the key
-having collapsed at once: `1` with `1.0` under the numeric rule, the two NaNs
-under the one-class rule. Keys that stay apart somewhere, `(2, nan)` beside
-`(3, nan)`, are accepted. A container that would silently change cardinality
-on thaw is refused at the boundary instead of being stored, whether `freeze`
-built it from live values or it arrived hand-assembled or decoded from bytes —
-for every adapter that satisfies the semantic round-trip law below. An adapter
-that thaws two distinct payloads into equal values breaks that law, and this
-gate, which reads payload encodings rather than running the adapter, cannot
-see it coming.
+adapted value whose payload contains a `FrozenGraph` is refused, registered
+adapter or not: the shared or cyclic state such a payload rebuilds stays
+mutable after the value is inserted, so nothing at the boundary can establish
+that its hash is stable. (That refusal reuses the general message and asks for
+a `ValueAdapter` even where one is registered; the fix is to keep the cycle out
+of the payload, not to register another adapter.) That check runs where
+`freeze` builds a hash position out of a live mapping or set, so it is the
+live route that is closed; a snapshot already carrying such a key is not
+refused — `freeze`, `serialize_snapshot`, and `deserialize_snapshot` all
+accept a hand-assembled or byte-decoded one. Second, an independent gate —
+the snapshot validator every entry point runs — rejects hash positions that
+are distinct under the snapshot encoding but collapse under Python `==`/`hash`
+after thaw. `FrozenDict` keys and `FrozenSet` members such as `1` beside
+`1.0`, `True` beside `1`, or `0.0` beside `-0.0` raise `UnsupportedValueError`
+from `freeze`, `thaw`, `serialize_snapshot`, and `deserialize_snapshot` alike,
+with the collapsing pair named in the error; two positions carrying the same
+adapter key are refused as soon as their payloads collapse, because the
+encoding cannot ask the adapter whether the values it rebuilds would still
+differ. Where the encoding cannot see the answer the gate is deliberately
+conservative rather than nondeterministic: every canonical NaN is one class,
+so a live `dict` keyed by `(1, nan)` and `(1.0, nan)` with distinct NaN
+objects — two keys to Python, which hashes a NaN by identity — is rejected,
+both halves of the key having collapsed at once: `1` with `1.0` under the
+numeric rule, the two NaNs under the one-class rule. Keys that stay apart
+somewhere, `(2, nan)` beside `(3, nan)`, are accepted. A container that would
+silently change cardinality on thaw is refused at the boundary instead of
+being stored, whether `freeze` built it from live values or it arrived
+hand-assembled or decoded from bytes — for every adapter that satisfies the
+semantic round-trip law below. An adapter that thaws two distinct payloads
+into equal values breaks that law, and this gate, which reads payload
+encodings rather than running the adapter, cannot see it coming.
 
 `freeze()` and `thaw()` are boundary utilities, not a general object
 serializer. Passing an adapter registry to `freeze()` does not embed executable
@@ -540,11 +544,18 @@ value, or route it through a `Resource`.
   `FrozenGraph` envelope), while an input update reaches it as thawed values
   in every mode. `cutoff=` derives its snapshot-safe tokens from those same
   detached operands, and the tokens are compared under the canonical relation.
+  A cyclic operand is handed over as the cycle it is, so a comparator or token
+  function that walks it structurally recurses forever: `left == right` over
+  cyclic operands raises `RecursionError` identically in `strict`, `checked`,
+  and `fast`, and a policy declared on a query that can return a cyclic result
+  must be cycle-aware.
   These are mutually exclusive. Cutoff tokens must be snapshot-safe, and the
   declared equivalence must be substitutive for dependents (condition 3) for
   the guarantee to hold on exact values.
   (See: `test_input_cutoff_suppresses_equal_updates`,
-  `test_query_cutoff_backdates_and_skips_downstream`)
+  `test_query_cutoff_backdates_and_skips_downstream`,
+  `test_custom_eq_over_a_graph_shaped_result_sees_the_graph`,
+  `test_structural_eq_over_cyclic_operands_raises_in_every_mode`)
 
 ## Output Reconciliation (Actions)
 

@@ -319,12 +319,13 @@ def test_freeze_rejects_hand_built_wrapper_cycles_without_recursing() -> None:
     # The cycle spine must be a kind="frozenset" FrozenSet: it is the one
     # wrapper shape _wrapper_aliases_structure never descends (its walk covers
     # only the four graph-capable types, FrozenAdapterValue, and tuples), so
-    # this cycle reaches _freeze's pass-through branch and, after this task,
-    # _detach_wrapper's own guard. Do NOT "simplify" the spine to a FrozenList:
-    # that shape is intercepted by the aliasing detection at value.py:256 and
-    # re-routed through _refreeze_wrapper, whose _active_guard raises a
-    # DIFFERENT message ("Cyclic values cannot cross cached boundaries through
-    # this container type.", value.py:1338-1340) and never reaches the detach.
+    # this cycle reaches _freeze's pass-through branch and, since freeze
+    # detaches pre-frozen wrappers, _detach_wrapper's own guard. Do NOT
+    # "simplify" the spine to a FrozenList: that shape is intercepted by the
+    # aliasing detection at value.py:266 and re-routed through
+    # _refreeze_wrapper, whose _active_guard raises a DIFFERENT message
+    # ("Cyclic values cannot cross cached boundaries through this container
+    # type.", value.py:1597-1599) and never reaches the detach.
     shell = FrozenSet("frozenset", ())
     holder = FrozenAdapterValue("test:T", shell)
     object.__setattr__(shell, "items", (holder,))

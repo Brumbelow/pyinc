@@ -55,7 +55,11 @@ decided at release time.
   A comparator that reflectively mutates its operands can no longer corrupt
   the stored snapshot behind a record's digest in `strict` mode. Strict-mode
   comparators over a graph-shaped result now see shared/cyclic `Frozen*` views
-  rather than the `FrozenGraph` envelope.
+  rather than the `FrozenGraph` envelope. Structural comparison of a cyclic
+  result is uniform across modes as a result: `left == right` raises
+  `RecursionError` in `strict` as it already did in `checked` and `fast`, the
+  old strict verdict having come from walking the finite envelope. A policy on
+  a query that can return a cyclic result must be cycle-aware.
 
 ### Added
 
