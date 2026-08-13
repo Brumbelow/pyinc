@@ -50,6 +50,9 @@ def _memo_and_truth(db: Database, target: Any) -> tuple[str, str]:
     memo either recomputes or was already equal; only a stale hit differs.
     """
 
+    # Uncacheable queries are popped from the memo, which would make the
+    # comparison below trivially true; only memoized queries can be probed.
+    assert target in db._query_fingerprint_memo
     memoized = db._query_fingerprint(target)
     db._query_fingerprint_memo.pop(target, None)
     return memoized, db._query_fingerprint(target)
