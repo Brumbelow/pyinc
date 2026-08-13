@@ -3200,6 +3200,15 @@ class Database:
         from .core import Input, Query
 
         seen: builtins.set[int] = set()
+        parameter_types = tuple(
+            candidate
+            for candidate in (
+                getattr(typing, "TypeVar", None),
+                getattr(typing, "ParamSpec", None),
+                getattr(typing, "TypeVarTuple", None),
+            )
+            if isinstance(candidate, type)
+        )
 
         def observe_value(value: Any) -> Any:
             if isinstance(value, Query):
@@ -3231,6 +3240,10 @@ class Database:
                     value,
                     tuple(observe_value(item) for item in typing.get_args(value)),
                 )
+            if is_type_alias(value):
+                return observe_type_alias(value)
+            if parameter_types and isinstance(value, parameter_types):
+                return observe_type_parameter(value)
             if isinstance(value, (tuple, frozenset)):
                 if id(value) in seen:
                     return value
@@ -3366,65 +3379,71 @@ class Database:
                     observe_annotation(typing.get_origin(value)),
                     tuple(observe_annotation(item) for item in typing.get_args(value)),
                 )
-            if type(value).__qualname__ == "TypeAliasType" and type(value).__module__ in {
+            if is_type_alias(value):
+                return observe_type_alias(value)
+            if parameter_types and isinstance(value, parameter_types):
+                return observe_type_parameter(value)
+            return observe_value(value)
+
+        def is_type_alias(value: Any) -> bool:
+            return type(value).__qualname__ == "TypeAliasType" and type(value).__module__ in {
                 "typing",
                 "typing_extensions",
-            }:
-                if id(value) in seen:
-                    return value
-                seen.add(id(value))
-                # Mirrors _freeze_annotation_capture: an alias keeps its
-                # definition in a lazy evaluator where it has one and in
-                # __value__ otherwise, plus its own type parameters.
-                evaluator = getattr(value, "evaluate_value", None)
-                return (
-                    value,
-                    observe_function(evaluator)
-                    if isinstance(evaluator, FunctionType)
-                    else observe_annotation(getattr(value, "__value__", None)),
-                    tuple(
-                        observe_annotation(item)
-                        for item in getattr(value, "__type_params__", None) or ()
-                    ),
-                )
-            parameter_types = tuple(
-                candidate
-                for candidate in (
-                    getattr(typing, "TypeVar", None),
-                    getattr(typing, "ParamSpec", None),
-                    getattr(typing, "TypeVarTuple", None),
-                )
-                if isinstance(candidate, type)
+            }
+
+        def observe_type_alias(value: Any) -> Any:
+            # One fold for both slots that reach an alias, annotation and
+            # ambient capture, because _freeze_annotation_capture and
+            # _freeze_static_capture read the same evaluator and __value__.
+            # Folding on first contact, whichever slot arrives first, is what
+            # makes the shared `seen` set below safe. Nested values take
+            # observe_value, which matches the ambient reading and never
+            # observes less than the annotation one, so neither slot is
+            # short-changed by the other having arrived first.
+            if id(value) in seen:
+                # A later contact returns the pinned object: the first one
+                # already folded it, and both paths fold it the same way.
+                return value
+            seen.add(id(value))
+            evaluator = getattr(value, "evaluate_value", None)
+            return (
+                value,
+                observe_function(evaluator)
+                if isinstance(evaluator, FunctionType)
+                else observe_value(getattr(value, "__value__", None)),
+                tuple(
+                    observe_value(item) for item in getattr(value, "__type_params__", None) or ()
+                ),
             )
-            if parameter_types and isinstance(value, parameter_types):
-                if id(value) in seen:
-                    return value
-                seen.add(id(value))
-                # Mirrors the annotation-parameter arm: a bound, a constraint
-                # set and a default reach their content through a lazy
-                # evaluator where one exists and through the resolved
-                # attribute otherwise.
-                parts: list[Any] = []
-                for evaluator_name, value_name in (
-                    ("evaluate_bound", "__bound__"),
-                    ("evaluate_constraints", "__constraints__"),
-                    ("evaluate_default", "__default__"),
-                ):
-                    evaluator = getattr(value, evaluator_name, None)
-                    if isinstance(evaluator, FunctionType):
-                        parts.append(observe_function(evaluator))
-                        continue
-                    try:
-                        part = getattr(value, value_name, None)
-                    except Exception:
-                        part = None
-                    parts.append(
-                        tuple(observe_annotation(item) for item in part)
-                        if isinstance(part, tuple)
-                        else observe_annotation(part)
-                    )
-                return (value, tuple(parts))
-            return observe_value(value)
+
+        def observe_type_parameter(value: Any) -> Any:
+            # The same single fold for a type parameter reached from either
+            # slot: a bound, a constraint set and a default carry their content
+            # in a lazy evaluator where one exists and in the resolved
+            # attribute otherwise.
+            if id(value) in seen:
+                return value
+            seen.add(id(value))
+            parts: list[Any] = []
+            for evaluator_name, value_name in (
+                ("evaluate_bound", "__bound__"),
+                ("evaluate_constraints", "__constraints__"),
+                ("evaluate_default", "__default__"),
+            ):
+                evaluator = getattr(value, evaluator_name, None)
+                if isinstance(evaluator, FunctionType):
+                    parts.append(observe_function(evaluator))
+                    continue
+                try:
+                    part = getattr(value, value_name, None)
+                except Exception:
+                    part = None
+                parts.append(
+                    tuple(observe_value(item) for item in part)
+                    if isinstance(part, tuple)
+                    else observe_value(part)
+                )
+            return (value, tuple(parts))
 
         def observe_metadata(fn: FunctionType) -> Any:
             # _function_metadata_payload folds annotation values as ambient

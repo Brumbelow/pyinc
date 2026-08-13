@@ -1479,14 +1479,11 @@ def test_memoized_fingerprint_tracks_state_inside_captured_tuples_and_frozensets
         object.__setattr__(_observed_box, "factor", original)
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 12),
-    reason="type-alias and type-parameter syntax require Python 3.12",
-)
-def test_memoized_fingerprint_tracks_type_alias_and_type_parameter_annotations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module_name = "pyinc_annotation_shape_helper"
+def _import_alias_helper_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module_name: str
+) -> Any:
+    """Import a real module whose alias and type parameter hold one class."""
+
     (tmp_path / f"{module_name}.py").write_text(
         "class Target:\n"
         "    SCALE = 2\n"
@@ -1501,7 +1498,18 @@ def test_memoized_fingerprint_tracks_type_alias_and_type_parameter_annotations(
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
-    helper = importlib.import_module(module_name)
+    return importlib.import_module(module_name)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="type-alias and type-parameter syntax require Python 3.12",
+)
+def test_memoized_fingerprint_tracks_type_alias_and_type_parameter_annotations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_annotation_shape_helper"
+    helper = _import_alias_helper_module(tmp_path, monkeypatch, module_name)
     try:
 
         @query(key="memo-annotation-alias")
@@ -1523,6 +1531,71 @@ def test_memoized_fingerprint_tracks_type_alias_and_type_parameter_annotations(
         db._query_fingerprint(parameterized)
         monkeypatch.setattr(helper.Target, "SCALE", 3)
         for target in (aliased, parameterized):
+            memoized, truth = _memo_and_truth(db, target)
+            assert memoized == truth
+            assert memoized == Database()._query_fingerprint(target)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="type-alias and type-parameter syntax require Python 3.12",
+)
+def test_memoized_fingerprint_tracks_an_alias_reached_from_body_and_annotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_annotation_shape_two_slots"
+    helper = _import_alias_helper_module(tmp_path, monkeypatch, module_name)
+    try:
+        alias = helper.Alias
+
+        @query(key="memo-alias-two-slots")
+        def doubled(db: Database, value: Any = None) -> int:
+            return len(str(alias))
+
+        # The body reaches the alias before the annotation entry does, so the
+        # first slot to arrive has to be the one that folds it; a shallow
+        # first look would leave the second slot with nothing left to observe.
+        doubled.fn.__annotations__["value"] = alias
+        db = Database()
+        db._query_fingerprint(doubled)
+        monkeypatch.setattr(helper.Target, "SCALE", 3)
+        memoized, truth = _memo_and_truth(db, doubled)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(doubled)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="type-alias and type-parameter syntax require Python 3.12",
+)
+def test_memoized_fingerprint_tracks_alias_and_type_parameter_captures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_annotation_shape_captures"
+    helper = _import_alias_helper_module(tmp_path, monkeypatch, module_name)
+    try:
+        alias = helper.Alias
+        parameter = helper.bounded.__type_params__[0]
+
+        # Neither query annotates with these objects: they are ordinary
+        # captures, which the fingerprint folds through the same evaluators.
+        @query(key="memo-alias-capture")
+        def captures_alias(db: Database) -> int:
+            return len(str(alias))
+
+        @query(key="memo-parameter-capture")
+        def captures_parameter(db: Database) -> int:
+            return len(str(parameter))
+
+        db = Database()
+        db._query_fingerprint(captures_alias)
+        db._query_fingerprint(captures_parameter)
+        monkeypatch.setattr(helper.Target, "SCALE", 3)
+        for target in (captures_alias, captures_parameter):
             memoized, truth = _memo_and_truth(db, target)
             assert memoized == truth
             assert memoized == Database()._query_fingerprint(target)
