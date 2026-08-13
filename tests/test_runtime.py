@@ -5235,7 +5235,19 @@ def test_resource_load_boundary_owns_prefrozen_wrappers(mode: str) -> None:
     assert record.snapshot is not held
     _corrupt(held)
     assert fingerprint_snapshot(record.snapshot) == record.digest
-    assert list(cast(Any, db.get(loaded))) == [1, 2, 3]
+    # Ownership is asserted on the stored record and on the value already
+    # handed to the caller, not through a second db.get. The wrapper this
+    # resource captured is part of its identity, so corrupting it moves the
+    # resource identity and the query's with it, and a later request
+    # legitimately rebuilds against the corrupted world. The earlier form of
+    # this assertion read [1, 2, 3] from a second db.get only because a
+    # memoized fingerprint held the query key still; the kernel no longer
+    # consults that memo for a fingerprint that folds resource configuration.
+    # What the boundary owes is unchanged and is what is checked here: the
+    # copy it took is detached in content, not merely in identity, and still
+    # agrees with its own digest.
+    assert list(cast(Any, record.snapshot)) == [1, 2, 3]
+    assert list(cast(Any, first)) == [1, 2, 3]
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

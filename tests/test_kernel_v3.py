@@ -78,6 +78,43 @@ _observed_plain = (_observed_box, "plain")
 _observed_members = frozenset({_observed_box})
 
 
+class _ObservedResourceShape:
+    """A plain class that answers the label/probe/load resource-handle probes."""
+
+    MARKER = 1
+
+    def label(self, key: int) -> str:
+        return f"shaped[{key}]"
+
+    def probe(self, key: int) -> int:
+        return 0
+
+    def load(self, db: Database, key: int) -> int:
+        return 0
+
+
+class _ObservedShapeHolder:
+    nested = _ObservedResourceShape
+
+
+@dataclass(frozen=True)
+class _ObservedScaledResource(Resource[int, int, int]):
+    scale: int = 2
+
+    def label(self, key: int) -> str:
+        return f"observed[{key}]"
+
+    def probe(self, key: int) -> int:
+        return self.scale
+
+    def load(self, db: Database, key: int) -> int:
+        return self.scale * key
+
+
+class _ObservedResourceHolder:
+    nested = _ObservedScaledResource(2)
+
+
 class _CountingEq:
     def __init__(self, tolerance: int) -> None:
         self.tolerance = tolerance
@@ -1642,6 +1679,107 @@ def test_memoized_fingerprint_tracks_instance_state_a_reflecting_body_reads() ->
         assert memoized == Database()._query_fingerprint(reflected)
     finally:
         object.__setattr__(_observed_box, "factor", original)
+
+
+def test_memoized_fingerprint_tracks_a_resource_shaped_class_in_a_captured_class_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-resource-shaped-class")
+    def shaped(db: Database) -> int:
+        return _ObservedShapeHolder.nested.MARKER
+
+    # A class answers the label/probe/load probes that recognize a resource
+    # handle exactly as an instance does, but a class reached inside a
+    # captured class body is folded through the type payload and never
+    # through a resource identity, so the observation has to descend it.
+    db = Database()
+    db._query_fingerprint(shaped)
+    monkeypatch.setattr(_ObservedResourceShape, "MARKER", 2)
+    memoized, truth = _memo_and_truth(db, shaped)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(shaped)
+
+
+def test_memoized_fingerprint_tracks_resource_configuration_folded_as_capture_state() -> None:
+    @query(key="memo-resource-class-body-state")
+    def configured(db: Database) -> int:
+        return _ObservedResourceHolder.nested.scale
+
+    # Reached inside a captured class body, a resource is folded field by
+    # field like any other frozen dataclass and its identity() never runs, so
+    # this query stays memoized and the memo has to see the write.
+    db = Database()
+    db._query_fingerprint(configured)
+    nested = _ObservedResourceHolder.nested
+    object.__setattr__(nested, "scale", 5)
+    try:
+        memoized, truth = _memo_and_truth(db, configured)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(configured)
+    finally:
+        object.__setattr__(nested, "scale", 2)
+
+
+def test_resource_capturing_fingerprints_are_not_memoized() -> None:
+    class ScaledResource(Resource[int, int, int]):
+        def __init__(self, scale: int) -> None:
+            self.scale = scale
+
+        def identity(self) -> tuple[str, int]:
+            return ("scaled-resource", self.scale)
+
+        def label(self, key: int) -> str:
+            return f"scaled[{key}]"
+
+        def probe(self, key: int) -> int:
+            return self.scale
+
+        def load(self, db: Database, key: int) -> int:
+            return self.scale * key
+
+    resource = ScaledResource(2)
+
+    @query(key="memo-resource-config")
+    def scaled(db: Database) -> int:
+        return db.read_resource(resource, 10)
+
+    db = Database()
+    assert db.get(scaled) == 20
+    assert scaled not in db._query_fingerprint_memo
+
+    db._query_fingerprint(scaled)
+    resource.scale = 3
+    # There is no memo entry to serve a stale digest: the reconfigured
+    # resource is folded afresh on every request.
+    assert scaled not in db._query_fingerprint_memo
+    assert db._query_fingerprint(scaled) == Database()._query_fingerprint(scaled)
+    warm = db.get(scaled)
+    fresh = Database().get(scaled)
+    assert warm == fresh == 30
+
+
+def test_memoized_fingerprint_still_serves_capture_free_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = Database._code_fingerprint
+
+    def counting(self: Database, fn: FunctionType) -> str:
+        nonlocal calls
+        calls += 1
+        return original(self, fn)
+
+    monkeypatch.setattr(Database, "_code_fingerprint", counting)
+
+    @query
+    def plain(db: Database, value: int) -> int:
+        return value
+
+    db = Database()
+    for item in range(5):
+        assert db.get(plain, item) == item
+    assert plain in db._query_fingerprint_memo
+    assert calls == 1
 
 
 def test_binary_file_resource_reads_bytes_from_one_observation(tmp_path: Path) -> None:

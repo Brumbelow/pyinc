@@ -3195,7 +3195,10 @@ class Database:
         state — pinning each entry's reference where the payload folds its
         value; modules stay leaves because `_module_observation_stamp` covers
         their content, and so do the types the payload pins by module anchor
-        rather than by a namespace walk.
+        rather than by a namespace walk. Resources get no arm of their own: a
+        fingerprint folding a resource's `identity()` is never memoized, and
+        every other slot folds a resource as the ordinary class or instance it
+        is, so the arms below already observe it from whichever slot arrives.
         """
         from .core import Input, Query
 
@@ -3218,9 +3221,9 @@ class Database:
                 return (value, value.key, observe_value(value.eq), observe_value(value.cutoff))
             if isinstance(value, FunctionType):
                 return observe_function(value)
-            if isinstance(value, ModuleType) or self._is_resource_handle(value):
+            if isinstance(value, ModuleType):
                 # Modules are gated by the memoized module observations (the
-                # content stamp); resources stay identity leaves here.
+                # content stamp).
                 return value
             if isinstance(value, type):
                 return observe_type(value)
@@ -5483,6 +5486,12 @@ class Database:
         raise UnsupportedValueError("Unsupported stable module constant.")
 
     def _resource_identity_payload(self, resource: Any) -> Any:
+        if self._fingerprint_module_collector.get() is not None:
+            # A resource's identity() runs user code and returns fresh objects
+            # on every call, so no reference observation can gate a memoized
+            # fingerprint that folds it. Queries capturing a resource pay the
+            # full fingerprint on every request instead of risking a stale memo.
+            self._fingerprint_cacheable.set(False)
         resource_id = id(resource)
         stack = self._resource_fingerprint_stack.get()
         if resource_id in stack:
