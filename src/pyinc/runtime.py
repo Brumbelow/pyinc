@@ -101,6 +101,9 @@ _DEFAULT_SEMANTIC_EQUALITY_VERSION = 1
 _MISSING_SNAPSHOT = object()
 _EMPTY_CELL_OBSERVATION = object()
 _UNBOUND_GLOBAL_OBSERVATION = object()
+# Not a hexadecimal digest, so it can never equal a stored one and always
+# forces the memo guard to fall through to a full recompute.
+_UNREADABLE_RESOURCE_DIGEST = "unreadable-resource"
 
 
 def _build_runtime_build_payload() -> tuple[Any, ...]:
@@ -602,10 +605,14 @@ class Database:
                 Any,
                 str,
                 tuple[tuple[ModuleType, Any], ...],
+                tuple[tuple[Any, str], ...],
             ],
         ] = weakref.WeakKeyDictionary()
         self._fingerprint_module_collector: ContextVar[dict[int, ModuleType] | None] = ContextVar(
             "pyinc_fingerprint_module_collector", default=None
+        )
+        self._fingerprint_resource_collector: ContextVar[list[tuple[Any, str]] | None] = ContextVar(
+            "pyinc_fingerprint_resource_collector", default=None
         )
         self._fingerprint_cacheable: ContextVar[bool] = ContextVar(
             "pyinc_fingerprint_cacheable", default=True
@@ -3146,11 +3153,17 @@ class Database:
             and all(
                 self._module_observation_stamp(module) == expected for module, expected in cached[3]
             )
+            and all(
+                self._resource_identity_digest(resource) == expected
+                for resource, expected in cached[4]
+            )
         ):
             return cached[2]
 
         modules: dict[int, ModuleType] = {}
+        resources: list[tuple[Any, str]] = []
         collector_token = self._fingerprint_module_collector.set(modules)
+        resource_token = self._fingerprint_resource_collector.set(resources)
         cacheable_token = self._fingerprint_cacheable.set(True)
         try:
             result = fingerprint_snapshot(
@@ -3164,6 +3177,7 @@ class Database:
         finally:
             cacheable = self._fingerprint_cacheable.get()
             self._fingerprint_cacheable.reset(cacheable_token)
+            self._fingerprint_resource_collector.reset(resource_token)
             self._fingerprint_module_collector.reset(collector_token)
         module_observations = tuple(
             (module, self._module_observation_stamp(module))
@@ -3175,10 +3189,34 @@ class Database:
                 definition_observation,
                 result,
                 module_observations,
+                tuple(resources),
             )
         else:
             self._query_fingerprint_memo.pop(query, None)
         return result
+
+    def _resource_identity_digest(self, resource: Any) -> str:
+        """Re-read a captured resource's configuration for the memo guard.
+
+        A resource's ``identity()`` runs user code and hands back a fresh
+        object every call, so the reference observation that gates the rest of
+        the memo cannot see it. This re-runs the read and digests its value
+        instead, which is what makes a resource-folding fingerprint memoizable
+        at all. Any failure answers with a value no stored digest can equal, so
+        a resource that has become unreadable forces the full recompute rather
+        than serving a fingerprint nothing checked.
+        """
+
+        try:
+            configuration = self._resource_configuration(resource)
+            return fingerprint_snapshot(
+                (
+                    freeze(configuration, adapters=self._adapters),
+                    self._resource_configuration_type_payload(configuration),
+                )
+            )
+        except Exception:
+            return _UNREADABLE_RESOURCE_DIGEST
 
     def _query_definition_observation(self, query: Any) -> Any:
         """Observe the live query definition for memoized-fingerprint reuse.
@@ -3195,10 +3233,12 @@ class Database:
         state — pinning each entry's reference where the payload folds its
         value; modules stay leaves because `_module_observation_stamp` covers
         their content, and so do the types the payload pins by module anchor
-        rather than by a namespace walk. Resources get no arm of their own: a
-        fingerprint folding a resource's `identity()` is never memoized, and
-        every other slot folds a resource as the ordinary class or instance it
-        is, so the arms below already observe it from whichever slot arrives.
+        rather than by a namespace walk. Resources get no arm of their own
+        either: what a fold reads out of `identity()` is gated by the recorded
+        configuration digests the memo carries alongside this observation, and
+        every slot that reaches a resource for anything else folds it as the
+        ordinary class or instance it is, so the arms below already observe it
+        from whichever slot arrives first.
         """
         from .core import Input, Query
 
@@ -5485,13 +5525,14 @@ class Database:
             return ("frozenset", tuple(sorted(items, key=fingerprint_snapshot)))
         raise UnsupportedValueError("Unsupported stable module constant.")
 
+    @staticmethod
+    def _resource_configuration(resource: Any) -> Any:
+        """Read the configuration a resource distinguishes itself by."""
+
+        resource_identity = getattr(resource, "identity", None)
+        return resource_identity() if callable(resource_identity) else resource
+
     def _resource_identity_payload(self, resource: Any) -> Any:
-        if self._fingerprint_module_collector.get() is not None:
-            # A resource's identity() runs user code and returns fresh objects
-            # on every call, so no reference observation can gate a memoized
-            # fingerprint that folds it. Queries capturing a resource pay the
-            # full fingerprint on every request instead of risking a stale memo.
-            self._fingerprint_cacheable.set(False)
         resource_id = id(resource)
         stack = self._resource_fingerprint_stack.get()
         if resource_id in stack:
@@ -5502,8 +5543,7 @@ class Database:
             )
         token = self._resource_fingerprint_stack.set(stack + (resource_id,))
         try:
-            resource_identity = getattr(resource, "identity", None)
-            configuration = resource_identity() if callable(resource_identity) else resource
+            configuration = self._resource_configuration(resource)
             try:
                 frozen_configuration = freeze(configuration, adapters=self._adapters)
             except UnsupportedValueError as exc:
@@ -5511,6 +5551,24 @@ class Database:
                     f"Resource {type(resource).__module__}:{type(resource).__qualname__} must be snapshot-safe "
                     "or define identity()."
                 ) from exc
+            collector = self._fingerprint_resource_collector.get()
+            if collector is not None:
+                # The configuration this fold just read, recorded so the memo
+                # guard can re-read it and compare. The configuration *type*
+                # payload rides along because two configurations can freeze
+                # alike while their classes carry different behavior, and the
+                # fold below folds both.
+                collector.append(
+                    (
+                        resource,
+                        fingerprint_snapshot(
+                            (
+                                frozen_configuration,
+                                self._resource_configuration_type_payload(configuration),
+                            )
+                        ),
+                    )
+                )
             return (
                 "resource-v3",
                 self._runtime_build_payload(),

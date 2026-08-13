@@ -1720,7 +1720,7 @@ def test_memoized_fingerprint_tracks_resource_configuration_folded_as_capture_st
         object.__setattr__(nested, "scale", 2)
 
 
-def test_resource_capturing_fingerprints_are_not_memoized() -> None:
+def test_resource_capturing_fingerprints_track_reconfiguration() -> None:
     class ScaledResource(Resource[int, int, int]):
         def __init__(self, scale: int) -> None:
             self.scale = scale
@@ -1745,14 +1745,17 @@ def test_resource_capturing_fingerprints_are_not_memoized() -> None:
 
     db = Database()
     assert db.get(scaled) == 20
-    assert scaled not in db._query_fingerprint_memo
+    assert scaled in db._query_fingerprint_memo
 
     db._query_fingerprint(scaled)
     resource.scale = 3
-    # There is no memo entry to serve a stale digest: the reconfigured
-    # resource is folded afresh on every request.
-    assert scaled not in db._query_fingerprint_memo
-    assert db._query_fingerprint(scaled) == Database()._query_fingerprint(scaled)
+    # identity() hands back a fresh object every call, so no reference
+    # observation can see this write. The memo carries a digest of the
+    # configuration the fold read instead, and re-reading it is what catches
+    # the reconfiguration.
+    memoized, truth = _memo_and_truth(db, scaled)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(scaled)
     warm = db.get(scaled)
     fresh = Database().get(scaled)
     assert warm == fresh == 30

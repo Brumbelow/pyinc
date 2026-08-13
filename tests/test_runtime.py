@@ -5241,8 +5241,8 @@ def test_resource_load_boundary_owns_prefrozen_wrappers(mode: str) -> None:
     # resource identity and the query's with it, and a later request
     # legitimately rebuilds against the corrupted world. The earlier form of
     # this assertion read [1, 2, 3] from a second db.get only because a
-    # memoized fingerprint held the query key still; the kernel no longer
-    # consults that memo for a fingerprint that folds resource configuration.
+    # memoized fingerprint held the query key still, and the memo no longer
+    # hides an edit to a value the resource's own methods close over.
     # What the boundary owes is unchanged and is what is checked here: the
     # copy it took is detached in content, not merely in identity, and still
     # agrees with its own digest.
