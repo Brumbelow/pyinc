@@ -43,6 +43,39 @@ class _BoundMethodOwner:
     base: int
 
 
+class _ObservedConsts:
+    SCALE = 2
+
+
+def _observed_compute_one(value: int) -> int:
+    return value + 1
+
+
+def _observed_compute_two(value: int) -> int:
+    return value + 2
+
+
+class _ObservedPlain:
+    compute = staticmethod(_observed_compute_one)
+
+
+@dataclass(frozen=True)
+class _ObservedBox:
+    factor: int
+
+
+_observed_box = _ObservedBox(2)
+_observed_alias = dict[str, _ObservedBox]
+
+
+class _CountingEq:
+    def __init__(self, tolerance: int) -> None:
+        self.tolerance = tolerance
+
+    def __call__(self, left: Any, right: Any) -> bool:
+        return abs(int(left) - int(right)) <= self.tolerance
+
+
 def _memo_and_truth(db: Database, target: Any) -> tuple[str, str]:
     """The memoized fingerprint next to the recomputed truth for ``target``.
 
@@ -1275,6 +1308,131 @@ def test_memoized_fingerprint_tracks_rebound_lazy_annotate() -> None:
     cast(Any, lazy.fn).__annotate__ = make_evaluator(2)
     memoized, truth = _memo_and_truth(db, lazy)
     assert memoized == truth
+
+
+def test_memoized_fingerprint_tracks_captured_class_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-class-attr")
+    def scaled(db: Database) -> int:
+        return _ObservedConsts.SCALE + 0
+
+    db = Database()
+    db._query_fingerprint(scaled)
+    monkeypatch.setattr(_ObservedConsts, "SCALE", 3)
+    memoized, truth = _memo_and_truth(db, scaled)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(scaled)
+
+
+def test_memoized_fingerprint_tracks_method_rebinding_on_a_captured_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-class-method")
+    def computed(db: Database) -> int:
+        return _ObservedPlain.compute(1)
+
+    db = Database()
+    db._query_fingerprint(computed)
+    monkeypatch.setattr(_ObservedPlain, "compute", staticmethod(_observed_compute_two))
+    memoized, truth = _memo_and_truth(db, computed)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(computed)
+
+
+def test_memoized_fingerprint_tracks_frozen_dataclass_field_writes() -> None:
+    @query(key="memo-dataclass-field")
+    def boxed(db: Database) -> int:
+        return _observed_box.factor
+
+    db = Database()
+    db._query_fingerprint(boxed)
+    original = _observed_box.factor
+    object.__setattr__(_observed_box, "factor", original + 1)
+    try:
+        memoized, truth = _memo_and_truth(db, boxed)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(boxed)
+    finally:
+        object.__setattr__(_observed_box, "factor", original)
+
+
+def test_memoized_fingerprint_tracks_frozen_dataclass_defaults() -> None:
+    @query(key="memo-dataclass-default")
+    def defaulted(db: Database, box: _ObservedBox = _observed_box) -> int:
+        return box.factor
+
+    db = Database()
+    db._query_fingerprint(defaulted)
+    original = _observed_box.factor
+    object.__setattr__(_observed_box, "factor", original + 5)
+    try:
+        memoized, truth = _memo_and_truth(db, defaulted)
+        assert memoized == truth
+    finally:
+        object.__setattr__(_observed_box, "factor", original)
+
+
+def test_memoized_fingerprint_tracks_frozen_dataclass_kwdefaults() -> None:
+    @query(key="memo-dataclass-kwdefault")
+    def defaulted(db: Database, *, box: _ObservedBox = _observed_box) -> int:
+        return box.factor
+
+    db = Database()
+    db._query_fingerprint(defaulted)
+    original = _observed_box.factor
+    object.__setattr__(_observed_box, "factor", original + 7)
+    try:
+        memoized, truth = _memo_and_truth(db, defaulted)
+        assert memoized == truth
+    finally:
+        object.__setattr__(_observed_box, "factor", original)
+
+
+def test_memoized_fingerprint_reuses_the_memo_for_an_unchanged_definition() -> None:
+    @query(key="memo-warm-reuse")
+    def scaled(db: Database, kind: Any = _observed_alias) -> int:
+        return _ObservedConsts.SCALE + _observed_box.factor + _ObservedPlain.compute(1)
+
+    db = Database()
+    first = db._query_fingerprint(scaled)
+    entry = db._query_fingerprint_memo[scaled]
+    assert db._query_fingerprint(scaled) == first
+    # A recompute stores a freshly built memo entry, so entry identity tells a
+    # reused observation apart from one that merely recomputed the same digest.
+    assert db._query_fingerprint_memo[scaled] is entry
+
+
+def test_memoized_fingerprint_tracks_annotation_class_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-annotation-class")
+    def annotated(db: Database, value: int) -> int:
+        return value
+
+    annotated.fn.__annotations__["value"] = _ObservedConsts
+    db = Database()
+    db._query_fingerprint(annotated)
+    monkeypatch.setattr(_ObservedConsts, "SCALE", 4)
+    memoized, truth = _memo_and_truth(db, annotated)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(annotated)
+
+
+def test_memoized_fingerprint_tracks_input_policy_object_state() -> None:
+    tolerant = Input[int]("memo-policy-input", eq=_CountingEq(0))
+
+    @query(key="memo-policy-query")
+    def read_tolerant(db: Database) -> int:
+        return tolerant.read(db)
+
+    db = Database()
+    db.set(tolerant, 1)
+    db._query_fingerprint(read_tolerant)
+    cast(_CountingEq, tolerant.eq).tolerance = 5
+    memoized, truth = _memo_and_truth(db, read_tolerant)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(read_tolerant)
 
 
 def test_binary_file_resource_reads_bytes_from_one_observation(tmp_path: Path) -> None:

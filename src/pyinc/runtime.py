@@ -3180,8 +3180,7 @@ class Database:
             self._query_fingerprint_memo.pop(query, None)
         return result
 
-    @staticmethod
-    def _query_definition_observation(query: Any) -> Any:
+    def _query_definition_observation(self, query: Any) -> Any:
         """Observe the live query definition for memoized-fingerprint reuse.
 
         The observation records object *references* — per entry, not per
@@ -3190,10 +3189,13 @@ class Database:
         references in the memo pins their addresses, so identity comparison is
         collision-free: any rebinding introduces an object that cannot be
         identical to a still-pinned one, and a spurious mismatch only costs a
-        fingerprint recompute. The traversal mirrors what
-        `_function_definition_payload` folds into the fingerprint, including
-        the function metadata `_function_metadata_payload` reads; modules stay
-        leaves because `_module_observation_stamp` covers their content.
+        fingerprint recompute. It traverses the same slots as
+        `_function_definition_payload` folds into the fingerprint — function
+        metadata, captured class bodies, and captured instance and policy
+        state — pinning each entry's reference where the payload folds its
+        value; modules stay leaves because `_module_observation_stamp` covers
+        their content, and so do the types the payload pins by module anchor
+        rather than by a namespace walk.
         """
         from .core import Input, Query
 
@@ -3204,10 +3206,98 @@ class Database:
                 return (value.key, observe_value(value.eq), observe_value(value.cutoff),
                         observe_value(value.fn))
             if isinstance(value, Input):
-                return (value.key, observe_value(value.eq), observe_value(value.cutoff))
+                return (value, value.key, observe_value(value.eq), observe_value(value.cutoff))
             if isinstance(value, FunctionType):
                 return observe_function(value)
-            return value
+            if isinstance(value, ModuleType) or self._is_resource_handle(value):
+                # Modules are gated by the memoized module observations (the
+                # content stamp); resources stay identity leaves here.
+                return value
+            if isinstance(value, type):
+                return observe_type(value)
+            if isinstance(value, MethodType):
+                return (value, observe_value(value.__func__), observe_instance(value.__self__))
+            if isinstance(value, GenericAlias):
+                # Mirrors _freeze_annotation_capture: a parameterized generic
+                # carries its definition in its origin and arguments, and it
+                # exposes no instance dictionary for the walk below to read.
+                return (
+                    value,
+                    observe_value(value.__origin__),
+                    tuple(observe_value(item) for item in value.__args__),
+                )
+            if isinstance(value, UnionType):
+                return (
+                    value,
+                    tuple(observe_value(item) for item in typing.get_args(value)),
+                )
+            if type(value) in {tuple, frozenset}:
+                if id(value) in seen:
+                    return value
+                seen.add(id(value))
+                return (value, tuple(observe_value(item) for item in value))
+            if isinstance(value, slice):
+                return (
+                    value,
+                    observe_value(value.start),
+                    observe_value(value.stop),
+                    observe_value(value.step),
+                )
+            if type(value).__module__ == "builtins":
+                return value
+            return observe_instance(value)
+
+        def observe_type(cls: type[Any]) -> Any:
+            if cls.__module__ == "builtins" or (
+                cls.__module__.partition(".")[0] in sys.stdlib_module_names
+            ):
+                # Mirrors _type_definition_payload: builtin and stdlib types
+                # are pinned by name anchor and runtime build, never by a
+                # namespace walk, so their contents need no observation.
+                return cls
+            if id(cls) in seen:
+                return cls
+            seen.add(id(cls))
+            return (
+                cls,
+                observe_type(type(cls)) if type(cls) is not type else type,
+                tuple(observe_type(base) for base in cls.__bases__),
+                tuple((name, observe_value(item)) for name, item in sorted(vars(cls).items())),
+            )
+
+        def observe_instance(value: Any) -> Any:
+            if isinstance(value, ModuleType):
+                return value
+            if isinstance(value, type):
+                return observe_type(value)
+            if id(value) in seen:
+                return value
+            seen.add(id(value))
+            state: Any
+            try:
+                # The slot _static_instance_dict reads. Going through vars()
+                # instead would follow a proxying __getattribute__ to a mapping
+                # rebuilt on every read, which identity comparison never matches.
+                state = object.__getattribute__(value, "__dict__")
+            except (AttributeError, TypeError):
+                state = None
+            fields_observation: Any = None
+            if is_dataclass(value):
+                fields_observation = tuple(
+                    (item.name, observe_value(object.__getattribute__(value, item.name)))
+                    for item in fields(value)
+                )
+            return (
+                value,
+                observe_type(type(value)),
+                fields_observation,
+                # Only a concrete instance dictionary is observed: the payload
+                # refuses ambient capture state that is not one, and pinning a
+                # proxy would pin an object rebuilt on the next read.
+                tuple((name, observe_value(item)) for name, item in sorted(state.items()))
+                if isinstance(state, dict)
+                else None,
+            )
 
         def observe_function(fn: FunctionType) -> Any:
             if id(fn) in seen:
@@ -3245,7 +3335,41 @@ class Database:
                 return _EMPTY_CELL_OBSERVATION
             return observe_value(contents)
 
+        def observe_annotation(value: Any) -> Any:
+            if isinstance(value, type):
+                top_level = value.__module__.partition(".")[0]
+                if (
+                    value.__module__ == "builtins"
+                    or top_level in sys.stdlib_module_names
+                    or top_level == "pyinc"
+                ):
+                    # Mirrors _freeze_annotation_capture: an annotation type
+                    # from builtins, the standard library or pyinc is pinned by
+                    # module anchor and module identity, which no in-place
+                    # namespace edit can move, so its body needs no walk.
+                    return value
+                return observe_type(value)
+            if isinstance(value, GenericAlias) or (
+                type(value).__module__ in {"typing", "types"}
+                and typing.get_origin(value) is not None
+            ):
+                return (
+                    value,
+                    observe_annotation(typing.get_origin(value)),
+                    tuple(observe_annotation(item) for item in typing.get_args(value)),
+                )
+            return observe_value(value)
+
         def observe_metadata(fn: FunctionType) -> Any:
+            # _function_metadata_payload folds annotation values as ambient
+            # captures when the body reads its own annotations back, and as
+            # annotation captures otherwise; the observation follows the switch.
+            reflects_annotations = any(
+                name in {"__annotations__", "get_annotations", "get_type_hints"}
+                for code in self._walk_code_objects(fn.__code__)
+                for name in code.co_names
+            )
+            observe_entry = observe_value if reflects_annotations else observe_annotation
             try:
                 annotations = fn.__annotations__
             except Exception:
@@ -3259,7 +3383,7 @@ class Database:
                 annotations_observation = (
                     annotations,
                     tuple(
-                        (name, observe_value(item))
+                        (name, observe_entry(item))
                         for name, item in sorted(annotations.items())
                     )
                     if isinstance(annotations, dict)
@@ -3274,7 +3398,7 @@ class Database:
                 fn.__doc__,
                 annotations_observation,
                 type_parameters,
-                tuple(observe_value(item) for item in type_parameters or ()),
+                tuple(observe_annotation(item) for item in type_parameters or ()),
             )
 
         return (
