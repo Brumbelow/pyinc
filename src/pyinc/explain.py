@@ -373,7 +373,7 @@ def _classify_handle_state(query: Any) -> list[CaptureInfo]:
         try:
             database._query_handle_state_payload(query, set())
         except Exception as exc:
-            results.append(_handle_state_entry("handle", type(query).__qualname__, exc))
+            results.append(_handle_state_entry("handle[*]", type(query).__qualname__, exc))
     return results
 
 

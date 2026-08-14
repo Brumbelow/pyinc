@@ -553,3 +553,23 @@ def test_unsafe_query_handle_state_is_rejected_by_explain_and_kernel() -> None:
     assert info.kind == "rejected"
     with pytest.raises(UnsupportedValueError):
         Database().get(holds_mutable_handle_state)
+
+
+def test_rebound_wrapped_on_a_query_handle_is_rejected_by_explain_and_kernel() -> None:
+    @query
+    def rebinds_wrapped(db: Database) -> int:
+        return 1
+
+    # `__wrapped__` is a contract name, so the per-entry walk never looks at it;
+    # the fold of the whole handle is the only thing that reaches this refusal,
+    # and without it explain would call a query the kernel refuses accepted.
+    cast(Any, rebinds_wrapped).__wrapped__ = {"seen": 1}
+
+    report = {item.name: item for item in explain_query_captures(rebinds_wrapped)}
+    info = report["handle[*]"]
+    assert info.accepted is False
+    assert info.kind == "rejected"
+    assert info.origin == "handle"
+    assert "__wrapped__" in info.rejection_reason
+    with pytest.raises(UnsupportedValueError):
+        Database().get(rebinds_wrapped)
