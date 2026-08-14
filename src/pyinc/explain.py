@@ -257,8 +257,14 @@ def _classify_capture(
             kind = "resource"
             database._resource_identity_payload(value)
         elif isinstance(value, ModuleType):
+            # A module's identity payload is half of what the kernel folds for
+            # a captured module: beside it go the attribute paths the owning
+            # query reads off the capture statically, and a non-stdlib module
+            # reached any other way is refused there. Routing this through the
+            # kernel's own capture arm keeps that verdict -- and the carve-outs
+            # it makes -- this report's verdict too.
             kind = "module"
-            database._module_identity_payload(value)
+            database._captured_dependency_digest(name, value, set(), owner=owner_function)
         elif isinstance(value, FunctionType):
             kind = "function"
             database._function_definition_payload(value, set())
@@ -316,14 +322,91 @@ def _classify_capture(
     )
 
 
+def _handle_state_entry(name: str, type_name: str, error: Exception | None) -> CaptureInfo:
+    if error is None:
+        return CaptureInfo(
+            name=name,
+            origin="handle",
+            type_name=type_name,
+            accepted=True,
+            kind="handle",
+        )
+    return CaptureInfo(
+        name=name,
+        origin="handle",
+        type_name=type_name,
+        accepted=False,
+        kind="rejected",
+        rejection_reason=str(error) or type(error).__qualname__,
+    )
+
+
+def _classify_handle_state(query: Any) -> list[CaptureInfo]:
+    """Report the state a query handle carries beyond its contract fields.
+
+    The kernel folds a handle's own dictionary into query identity, so an
+    attribute written on the handle can refuse a query whose captures are all
+    clean, and a report that only ever looks at the function would call that
+    query accepted. Every verdict here is the kernel's own: each entry outside
+    the contract fields is folded by the builder the fold uses for one entry,
+    and a refusal that builder cannot reach -- a handle given a non-string
+    name, an annotation carrier or type parameters the fold rejects -- is
+    reported against the handle itself by folding the whole of it.
+    """
+
+    from .runtime import Database
+
+    database = Database()
+    state = vars(query)
+    results: list[CaptureInfo] = []
+    for name in sorted(name for name in state if isinstance(name, str)):
+        if name in Database._QUERY_HANDLE_CONTRACT_NAMES:
+            continue
+        value = state[name]
+        error: Exception | None = None
+        try:
+            database._query_handle_entry_payload(query, name, value, set())
+        except Exception as exc:
+            error = exc
+        results.append(_handle_state_entry(f"handle[{name}]", type(value).__qualname__, error))
+    if all(item.accepted for item in results):
+        try:
+            database._query_handle_state_payload(query, set())
+        except Exception as exc:
+            results.append(_handle_state_entry("handle", type(query).__qualname__, exc))
+    return results
+
+
 def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
     from .core import Query
+    from .runtime import _reflective_namespace_offenses
 
-    target = fn_or_query.fn if isinstance(fn_or_query, Query) else fn_or_query
+    handle = fn_or_query if isinstance(fn_or_query, Query) else None
+    target = handle.fn if handle is not None else fn_or_query
     if not isinstance(target, FunctionType):
         raise TypeError("explain_query_captures() expects a function or @query-decorated callable.")
 
     results: list[CaptureInfo] = []
+    # Ahead of the capture set, and from the kernel's own detector: these loads
+    # reach namespace state no entry below can describe, and the kernel refuses
+    # them off the body before it folds a single capture. Reporting a clean
+    # capture set for such a body would describe a query the kernel will not
+    # accept.
+    for offense in _reflective_namespace_offenses(target.__code__):
+        results.append(
+            CaptureInfo(
+                name=f"reflective[{offense}]",
+                origin="code",
+                type_name="code",
+                accepted=False,
+                kind="rejected",
+                rejection_reason=(
+                    "Reflective namespace reads bypass capture fingerprinting; "
+                    "access module attributes directly, or move mutable state "
+                    "behind Input/Resource nodes."
+                ),
+            )
+        )
     for index, value in enumerate(target.__defaults__ or ()):
         results.append(_classify_capture(f"default[{index}]", value, "default", owner=target))
     for default_name, value in sorted((target.__kwdefaults__ or {}).items()):
@@ -358,4 +441,6 @@ def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
     )
     for metadata_name, value, origin in metadata:
         results.append(_classify_capture(metadata_name, value, origin, owner=target))
+    if handle is not None:
+        results.extend(_classify_handle_state(handle))
     return tuple(results)

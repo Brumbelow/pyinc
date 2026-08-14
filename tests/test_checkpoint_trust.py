@@ -12,6 +12,7 @@ corruption raises a loud `ValueError`.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -2090,3 +2091,39 @@ def test_unchanged_query_handle_attribute_still_warms_from_a_checkpoint() -> Non
     assert loaded.get(selfread) == 3
     assert loaded.inspect(selfread).last_recompute == "reused"
     assert loaded.statistics().query_executions == 0
+
+
+def test_reflective_queries_stay_rejected_after_a_checkpoint_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_checkpoint_reflective"
+    (tmp_path / f"{module_name}.py").write_text(
+        'CONFIG_MODE = "A"\n\n\ndef reader():\n    return globals()["CONFIG_MODE"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    reader = module.reader
+
+    anchor = Input[int]("reflective-durability-anchor")
+
+    @query(key="checkpoint-reflective")
+    def read_config(db: Database) -> str:
+        return cast(str, reader())
+
+    store = InMemoryArtifactStore()
+    saver = Database(store=store)
+    saver.set(anchor, 1)
+    # A refused query never reaches a stored record, so the durable claim is
+    # not about what a checkpoint holds: it is that loading one cannot smuggle
+    # the refusal away on the far side.
+    with pytest.raises(UnsupportedValueError):
+        saver.get(read_config)
+    checkpoint = saver.save_checkpoint()
+
+    loaded = Database(store=store)
+    loaded.set(anchor, 1)
+    loaded.load_checkpoint(checkpoint)
+    with pytest.raises(UnsupportedValueError):
+        loaded.get(read_config)

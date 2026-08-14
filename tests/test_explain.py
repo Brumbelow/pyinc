@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import functools
+import importlib
 import os
 import sys
 from dataclasses import FrozenInstanceError, dataclass
+from pathlib import Path
 from types import ModuleType
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -339,6 +341,30 @@ def test_explain_query_captures_matches_dynamic_module_rejection(
         Database().get(uses_dynamic_module)
 
 
+def test_dynamically_read_module_is_rejected_by_explain_and_kernel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_explain_dynamic_attribute"
+    (tmp_path / f"{module_name}.py").write_text("VALUE = 3\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+
+    @query
+    def reads_dynamically(db: Database) -> int:
+        return cast(int, getattr(module, "VALUE"))  # noqa: B009 - the shape under test
+
+    # The module has a real source file, so its identity payload alone accepts
+    # it; what refuses it is the fold over the attribute paths the body reads
+    # statically, of which this body has none.
+    info = {item.name: item for item in explain_query_captures(reads_dynamically)}["module"]
+    assert not info.accepted
+    assert info.kind == "rejected"
+    assert "dynamically" in info.rejection_reason
+    with pytest.raises(UnsupportedValueError, match="dynamically"):
+        Database().get(reads_dynamically)
+
+
 def test_explain_query_captures_rejects_local_type_capture() -> None:
     class LocalHelper:
         value = 1
@@ -462,3 +488,68 @@ def test_explain_query_captures_reports_origin_for_closure_vs_global() -> None:
     by_name = {i.name: i for i in infos}
     assert by_name["local_tuple"].origin == "closure"
     assert by_name["_IMMUTABLE_TUPLE"].origin == "global"
+
+
+def test_reflective_namespace_reads_surface_in_explain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_explain_reflective"
+    (tmp_path / f"{module_name}.py").write_text(
+        'CONFIG_MODE = "A"\n\n\ndef reader():\n    return globals()["CONFIG_MODE"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    reader = module.reader
+
+    @query
+    def read_config(db: Database) -> str:
+        return cast(str, reader())
+
+    report = explain_query_captures(read_config)
+    rejected = [item for item in report if not item.accepted]
+    assert rejected, "the reflective capture must not be reported clean"
+    reasons = " ".join(item.rejection_reason for item in rejected)
+    assert "reflective" in reasons
+
+
+def test_reflective_read_in_the_query_body_itself_surfaces_in_explain() -> None:
+    @query
+    def direct(db: Database) -> Any:
+        return globals().get("does_not_matter")
+
+    report = explain_query_captures(direct)
+    names = {item.name for item in report if not item.accepted}
+    assert "reflective[globals]" in names
+
+
+def test_query_handle_state_is_reported_and_accepted_by_both_surfaces() -> None:
+    @query
+    def keeps_handle_state(db: Database) -> int:
+        return 1
+
+    cast(Any, keeps_handle_state).revision = 3
+
+    # The refusing shape below is only half the parity claim: handle state the
+    # fold accepts has to be reported as carried and accepted, not omitted.
+    report = {item.name: item for item in explain_query_captures(keeps_handle_state)}
+    info = report["handle[revision]"]
+    assert info.accepted is True
+    assert info.origin == "handle"
+    assert Database().get(keeps_handle_state) == 1
+
+
+def test_unsafe_query_handle_state_is_rejected_by_explain_and_kernel() -> None:
+    @query
+    def holds_mutable_handle_state(db: Database) -> int:
+        return 1
+
+    cast(Any, holds_mutable_handle_state).cache = {"seen": 1}
+
+    report = {item.name: item for item in explain_query_captures(holds_mutable_handle_state)}
+    info = report["handle[cache]"]
+    assert info.accepted is False
+    assert info.kind == "rejected"
+    with pytest.raises(UnsupportedValueError):
+        Database().get(holds_mutable_handle_state)

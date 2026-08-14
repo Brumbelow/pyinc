@@ -3885,7 +3885,7 @@ def test_module_reached_query_handle_with_a_non_string_name_is_refused(
 
 
 _REFLECTIVE_FIXTURE_SOURCE = '''\
-"""Four reflective reads of one mutable module global, plus a direct read."""
+"""Five reflective reads of one mutable module global, plus a benign getattr."""
 
 import sys
 
@@ -3904,6 +3904,10 @@ def via_getattr():
     return getattr(sys.modules[__name__], "CONFIG_MODE")
 
 
+def via_dict():
+    return sys.modules[__name__].__dict__["CONFIG_MODE"]
+
+
 def via_eval():
     return eval("CONFIG_MODE")
 
@@ -3913,7 +3917,9 @@ def benign_getattr(target):
 '''
 
 
-@pytest.mark.parametrize("shape", ["via_globals", "via_vars", "via_getattr", "via_eval"])
+@pytest.mark.parametrize(
+    "shape", ["via_globals", "via_vars", "via_getattr", "via_dict", "via_eval"]
+)
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_reflective_namespace_reads_are_rejected(
     shape: str, mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3967,3 +3973,38 @@ def test_benign_getattr_on_ordinary_objects_stays_accepted(
         return benign(_ObservedBox(3))
 
     assert Database().get(probed) is None
+
+
+_FUNCTION_SCOPE_IMPORT_SOURCE = '''\
+"""A getattr namespace read whose module handle is imported at function scope."""
+
+CONFIG_MODE = "A"
+
+
+def via_function_scope_import():
+    import sys
+
+    return getattr(sys.modules[__name__], "CONFIG_MODE")
+'''
+
+
+def test_function_scope_import_is_outside_the_getattr_combination_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_reflective_function_scope_import"
+    (tmp_path / f"{module_name}.py").write_text(_FUNCTION_SCOPE_IMPORT_SOURCE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    reader = module.via_function_scope_import
+
+    @query(key="reflective-function-scope-import")
+    def read_config(db: Database) -> str:
+        return cast(str, reader())
+
+    # getattr is refused only beside a namespace handle the reading code loads
+    # globally -- an importlib reference, or sys with a .modules access. An
+    # import inside the body binds sys as a local, no such global load exists,
+    # and this shape is accepted. The boundary is recorded here so a later
+    # change to the rule has to answer for it deliberately.
+    assert Database().get(read_config) == "A"
