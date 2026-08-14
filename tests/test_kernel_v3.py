@@ -99,7 +99,13 @@ class _ObservedBox:
     factor: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ObservedSlottedBox:
+    factor: int
+
+
 _observed_box = _ObservedBox(2)
+_observed_slotted_box = _ObservedSlottedBox(2)
 _observed_alias = dict[str, _ObservedBox]
 
 
@@ -2197,6 +2203,25 @@ def test_instance_state_reached_from_default_and_body_matches_fresh(mode: str) -
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_slotted_instance_state_change_matches_fresh(mode: str) -> None:
+    @query(key=f"slotted-instance-fsc-{mode}")
+    def boxed(db: Database) -> int:
+        return _observed_slotted_box.factor * 10
+
+    db = Database(mode=mode)
+    assert db.get(boxed) == 20
+    original = _observed_slotted_box.factor
+    object.__setattr__(_observed_slotted_box, "factor", 3)
+    try:
+        # A slotted instance carries no instance dictionary, so the state
+        # observation finds nothing to read and the dataclass-field walk is
+        # the only thing between this write and a warm answer.
+        _assert_warm_matches_fresh(db, mode, boxed, 30)
+    finally:
+        object.__setattr__(_observed_slotted_box, "factor", original)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_captured_function_docstring_change_matches_fresh(
     mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2326,6 +2351,24 @@ def test_resource_configuration_change_matches_fresh(mode: str) -> None:
     # fingerprint is that identity: a warm database's answer for it has to
     # equal what a database that never saw the earlier configuration derives.
     assert db._query_fingerprint(scaled) == Database(mode=mode)._query_fingerprint(scaled)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_resource_configuration_read_in_the_body_matches_fresh(mode: str) -> None:
+    resource = _ObservedPartsResource(2)
+
+    @query(key=f"resource-capture-only-fsc-{mode}")
+    def scaled(db: Database) -> int:
+        return resource.parts[0] * 10
+
+    db = Database(mode=mode)
+    assert db.get(scaled) == 20
+    # The resource is captured but never read through the database, so no
+    # resource edge re-probes on this query's behalf. The configuration
+    # reaches the verdict through the fingerprint alone, which is what the
+    # recorded digest has to catch.
+    resource.parts[0] = 3
+    _assert_warm_matches_fresh(db, mode, scaled, 30)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -2588,9 +2631,44 @@ def test_state_inside_a_chain_landed_instance_keeps_the_warm_verdict(
 
 @pytest.mark.parametrize(
     "shape, source",
-    [("dict", "TABLE = {'scale': 2}\n"), ("list", "TABLE = [2]\n")],
+    [
+        ("dict", "TABLE = {'scale': 2}\n"),
+        ("list", "TABLE = [2]\n"),
+        (
+            "object",
+            "class Holder:\n"
+            "    def __init__(self):\n"
+            "        self.scale = 2\n"
+            "\n"
+            "\n"
+            "TABLE = Holder()\n",
+        ),
+        (
+            "mutable_dataclass",
+            "from dataclasses import dataclass\n"
+            "\n"
+            "\n"
+            "@dataclass\n"
+            "class Holder:\n"
+            "    scale: int = 2\n"
+            "\n"
+            "\n"
+            "TABLE = Holder()\n",
+        ),
+        (
+            "slotted_object",
+            "class Holder:\n"
+            "    __slots__ = ('scale',)\n"
+            "\n"
+            "    def __init__(self):\n"
+            "        self.scale = 2\n"
+            "\n"
+            "\n"
+            "TABLE = Holder()\n",
+        ),
+    ],
 )
-def test_chain_landing_on_a_mutable_container_is_refused(
+def test_chain_landing_the_payload_cannot_pin_is_refused(
     shape: str, source: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module_name = f"pyinc_chain_landed_{shape}_module"
@@ -2602,12 +2680,13 @@ def test_chain_landing_on_a_mutable_container_is_refused(
 
         @query(key=f"chain-landed-{shape}")
         def sized(db: Database) -> int:
-            return len(module.TABLE)
+            return len(str(module.TABLE))
 
-        # The counterpart of the two boundary pins above: a chain landing on a
-        # mutable container is refused when the fingerprint is built, so the
-        # shapes the memo cannot follow inside are the ones the payload
-        # accepts in the first place.
+        # The counterpart of the two boundary pins above, and the bound on
+        # them: a chain landing on any of these is refused when the
+        # fingerprint is built, so the warm answers those pins document are
+        # confined to the two shapes that are accepted and then not followed
+        # inside — a class and a frozen dataclass.
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
             Database().get(sized)
     finally:

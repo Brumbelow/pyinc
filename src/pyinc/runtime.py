@@ -3316,13 +3316,15 @@ class Database:
         attribute chain is re-resolved and its target compared by identity; and
         the definitions behind chain-reached functions, whose globals and
         defaults the payload folds live, are observed by
-        `_module_function_target_observation`. Where a chain lands on a class
-        or an instance instead, no arm follows anything inside it: the memo
-        compares the landing object by identity while the payload folds its
-        members, so neither a member written in place nor a binding one of
-        those members reads is observed. Resources get no arm of their own
-        either: what a fold
-        reads out of `identity()` is gated by the recorded configuration
+        `_module_function_target_observation`. Where a chain lands on a class,
+        or on a frozen dataclass instance, instead, no arm follows anything
+        inside it: the memo compares the landing object by identity while the
+        payload folds its members, so neither a member written in place nor a
+        binding one of those members reads is observed. Those two shapes are
+        the whole of that residue: a plain object, a mutable dataclass and any
+        other instance shape are refused when the fingerprint is built rather
+        than carried stale. Resources get no arm of their own either: what a
+        fold reads out of `identity()` is gated by the recorded configuration
         digests the memo carries alongside this observation, and every slot
         that reaches a resource for anything else folds it as the ordinary
         class or instance it is, so the arms below already observe it from
@@ -5473,12 +5475,14 @@ class Database:
         that folded any of this, the memo re-derives the constants inside
         `_module_observation_stamp`, re-resolves each chain and compares its
         target by identity, and observes the definitions behind chain-reached
-        functions. A chain that lands on a class or an instance is where that
-        stops: its members are folded by the payload and compared here only
-        through the landing object's identity, so a member written in place,
-        and equally a module binding one of those members reads, moves the fold
-        and nothing the memo checks. Such state belongs in an `Input` or a
-        `Resource`.
+        functions. A chain that lands on a class, or on a frozen dataclass
+        instance, is where that stops: its members are folded by the payload
+        and compared here only through the landing object's identity, so a
+        member written in place, and equally a module binding one of those
+        members reads, moves the fold and nothing the memo checks. Every other
+        landing -- a plain object, a mutable dataclass, a dict, a list -- is
+        refused outright when the fingerprint is built, so those carry nothing
+        stale. Such state belongs in an `Input` or a `Resource`.
         """
         collector = self._fingerprint_module_collector.get()
         if collector is not None:
