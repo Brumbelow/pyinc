@@ -1974,3 +1974,89 @@ def test_settled_save_reuse_unchanged() -> None:
     # A settled save must still warm on reload -- guard against over-omission.
     assert reloaded.get(settled_reuse_q) == 12
     assert reloaded.inspect(settled_reuse_q).last_recompute == "reused"
+
+
+# ---------------------------------------------------------------------------
+# Query handle state: a body may read attributes off its own handle, and
+# writing one is a supported way to reparameterize the query. Identity moves
+# with the write, so a checkpoint saved beforehand can no longer answer for the
+# query: the record misses and the body re-executes against the state that is
+# there now. Left alone, the same records still warm.
+# ---------------------------------------------------------------------------
+
+
+def test_query_handle_attribute_change_invalidates_checkpointed_records() -> None:
+    @query(key="checkpoint-handle-attr")
+    def selfread(db: Database) -> int:
+        return int(cast(Any, selfread).threshold)
+
+    store = InMemoryArtifactStore()
+    cast(Any, selfread).threshold = 1
+    saver = Database(store=store)
+    assert saver.get(selfread) == 1
+    saved_identity = saver._query_key(selfread, (), {})[0].identity
+    checkpoint = saver.save_checkpoint()
+
+    cast(Any, selfread).threshold = 2
+    loaded = Database(store=store)
+    loaded.load_checkpoint(checkpoint)
+    # The write moves the node the stored record is keyed by. That is what
+    # makes the record unreachable rather than merely unused, so the value
+    # below cannot be the saved 1 dressed up as a recomputation.
+    assert loaded._query_key(selfread, (), {})[0].identity != saved_identity
+
+    value = loaded.get(selfread)
+    assert value == Database().get(selfread) == 2
+    assert loaded.inspect(selfread).last_recompute == "executed"
+
+
+def test_query_handle_attribute_the_body_never_reads_invalidates_records() -> None:
+    @query(key="checkpoint-handle-attr-unread")
+    def stamped(db: Database) -> int:
+        return 42
+
+    store = InMemoryArtifactStore()
+    saver = Database(store=store)
+    assert saver.get(stamped) == 42
+    saved_identity = saver._query_key(stamped, (), {})[0].identity
+    checkpoint = saver.save_checkpoint()
+
+    # This body reads nothing off its handle, so the write below cannot reach
+    # the query through the capture the test above relies on -- the handle fold
+    # is the only thing that can see it, and it reaches the whole handle rather
+    # than the part some body happens to read. The value is unchanged by
+    # construction: what is pinned is that the stored record stops answering,
+    # which is the only way a later write that *does* change the value can be
+    # trusted to miss as well.
+    cast(Any, stamped).threshold = 2
+    loaded = Database(store=store)
+    loaded.load_checkpoint(checkpoint)
+    assert loaded._query_key(stamped, (), {})[0].identity != saved_identity
+    assert loaded.get(stamped) == 42
+    assert loaded.inspect(stamped).last_recompute == "executed"
+    assert loaded.statistics().query_executions == 1
+
+
+def test_unchanged_query_handle_attribute_still_warms_from_a_checkpoint() -> None:
+    @query(key="checkpoint-handle-attr-stable")
+    def selfread(db: Database) -> int:
+        return int(cast(Any, selfread).threshold)
+
+    store = InMemoryArtifactStore()
+    cast(Any, selfread).threshold = 3
+    saver = Database(store=store)
+    assert saver.get(selfread) == 3
+    saved_identity = saver._query_key(selfread, (), {})[0].identity
+    checkpoint = saver.save_checkpoint()
+
+    loaded = Database(store=store)
+    loaded.load_checkpoint(checkpoint)
+    # Control on the misses above: folding handle state into identity must not
+    # cost every query that carries some its checkpoint. An untouched handle
+    # keys the same node and the stored record answers without running the
+    # body, which is what keeps those misses from reading as a query shape that
+    # can never warm at all.
+    assert loaded._query_key(selfread, (), {})[0].identity == saved_identity
+    assert loaded.get(selfread) == 3
+    assert loaded.inspect(selfread).last_recompute == "reused"
+    assert loaded.statistics().query_executions == 0
