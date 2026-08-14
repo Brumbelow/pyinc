@@ -202,6 +202,16 @@ class _ObservedDualDescriptorHolder:
         return _observed_shared_source() * 100
 
 
+def _observed_cached_source() -> int:
+    return 3
+
+
+class _ObservedCachedHolder:
+    @functools.cached_property
+    def read(self) -> int:
+        return _observed_cached_source() * 10
+
+
 class _CountingEq:
     def __init__(self, tolerance: int) -> None:
         self.tolerance = tolerance
@@ -3435,3 +3445,51 @@ def test_module_attribute_and_direct_capture_agree_on_wrapped_callables(
         assert direct_db.statistics().query_executions == direct_executions + 1
     finally:
         sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_function_behind_a_captured_cached_property_matches_fresh(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @query(key=f"cached-property-fsc-{mode}")
+    def read(db: Database) -> int:
+        return _ObservedCachedHolder().read
+
+    db = Database(mode=mode)
+    assert db.get(read) == 30
+    monkeypatch.setattr(
+        sys.modules[__name__], "_observed_cached_source", _observed_descriptor_replacement
+    )
+    _assert_warm_matches_fresh(db, mode, read, 110)
+
+
+def test_captured_cached_property_folds_the_function_behind_the_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="cached-property-fingerprint")
+    def read(db: Database) -> int:
+        return _ObservedCachedHolder().read
+
+    before = Database()._query_fingerprint(read)
+    monkeypatch.setattr(
+        sys.modules[__name__], "_observed_cached_source", _observed_descriptor_replacement
+    )
+    after = Database()._query_fingerprint(read)
+    assert before != after
+
+
+def test_memoized_fingerprint_tracks_functions_behind_a_captured_cached_property(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-descriptor-cached-property")
+    def read(db: Database) -> int:
+        return _ObservedCachedHolder().read
+
+    db = Database()
+    db._query_fingerprint(read)
+    monkeypatch.setattr(
+        sys.modules[__name__], "_observed_cached_source", _observed_descriptor_replacement
+    )
+    memoized, truth = _memo_and_truth(db, read)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(read)

@@ -19,6 +19,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMappin
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
+from functools import cached_property
 from pathlib import Path
 from types import (
     BuiltinFunctionType,
@@ -4941,6 +4942,15 @@ class Database:
                             f"function {name!r}."
                         )
                     functions.append(descriptor_function)
+                elif isinstance(attribute, cached_property):
+                    getter = attribute.func
+                    if not isinstance(getter, FunctionType):
+                        raise UnsupportedValueError(
+                            f"Local implementation {value.__module__}."
+                            f"{value.__qualname__} has a non-Python cached "
+                            f"property function {name!r}."
+                        )
+                    functions.append(getter)
                 elif isinstance(attribute, property):
                     for property_function in (
                         attribute.fget,
@@ -4998,6 +5008,22 @@ class Database:
                     payload = (
                         type(attribute).__name__,
                         self._function_definition_payload(descriptor_function, set()),
+                    )
+                elif isinstance(attribute, cached_property):
+                    # The fourth descriptor kind, unwrapped like the other
+                    # three: the getter runs once per instance, and the
+                    # definition behind it is what decides the value the
+                    # instance then keeps.
+                    getter = attribute.func
+                    if not isinstance(getter, FunctionType):
+                        raise UnsupportedValueError(
+                            f"Local implementation {value.__module__}."
+                            f"{value.__qualname__} has a non-Python cached "
+                            f"property function {name!r}."
+                        )
+                    payload = (
+                        "cached-property",
+                        self._function_definition_payload(getter, set()),
                     )
                 elif isinstance(attribute, property):
                     payload = (
