@@ -350,8 +350,8 @@ class _WindowsDirectoryHandles:
 def _windows_file_from_handle(handle: int, flags: int, mode: str) -> BinaryIO:
     msvcrt: Any = importlib.import_module("msvcrt")
     # hasattr instead of getattr: capture fingerprinting rejects a getattr
-    # load beside an importlib reference as a reflective namespace read, so
-    # this function would be refused if it were ever fingerprinted.
+    # load beside an importlib reference as a reflective namespace read, and
+    # this function is reachable from resource-captured readers.
     binary_flag = cast(Any, os).O_BINARY if hasattr(os, "O_BINARY") else 0
     descriptor = int(msvcrt.open_osfhandle(handle, flags | binary_flag))
     return cast(BinaryIO, os.fdopen(descriptor, mode))

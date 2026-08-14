@@ -166,7 +166,7 @@ def _walk_reflective_code(code: CodeType) -> Iterator[CodeType]:
 
 @functools.lru_cache(maxsize=2048)
 def _reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
-    """Builtin names through which *code* can read a namespace it never captures.
+    """Names whose loads let *code* read a namespace it never captures.
 
     Capture fingerprinting is static: it resolves the names a code object
     references against the function's globals. globals()['NAME'],
