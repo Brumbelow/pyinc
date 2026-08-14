@@ -542,9 +542,14 @@ class Database:
     _QUERY_HANDLE_ANNOTATION_NAMES: ClassVar[frozenset[str]] = frozenset(
         {"__annotate__", "__annotations__"}
     )
-    # Instance-dictionary names the payloads beside the handle fold own: the
-    # contract fields they fold directly, and the alias functools.wraps gives
-    # the function. Neither the fold nor the observation of it repeats them.
+    # Instance-dictionary names the generic walk over a handle skips because
+    # something else owns them: the contract fields the payloads beside the
+    # handle fold directly, and `__wrapped__`, which the fold and the
+    # observation each give an arm of their own. It stays on this list rather
+    # than joining the walk: folded unconditionally, a handle's reference to
+    # its own function would carry that function's defining module into the
+    # ambient-capture route, which refuses a module with no stable source
+    # identity -- every query defined in `__main__` among them.
     _QUERY_HANDLE_SIBLING_NAMES: ClassVar[frozenset[str]] = frozenset(
         {"fn", "eq", "cutoff", "key", "__wrapped__"}
     )
@@ -3298,11 +3303,16 @@ class Database:
         query instead of a change the stored records cannot see.
 
         The contract fields are excluded: `fn`, `eq` and `cutoff` are folded by
-        the payloads beside this one, `key` names the node this fingerprint is
-        spliced into, and `__wrapped__` is `fn` under the name functools.wraps
-        gives it. Routing them through the ambient-capture digest would also
-        refuse the callable policy objects the policy payload accepts, and fold
-        the query's own function a second time.
+        the payloads beside this one, and `key` names the node this fingerprint
+        is spliced into. Routing them through the ambient-capture digest would
+        also refuse the callable policy objects the policy payload accepts, and
+        fold the query's own function a second time.
+
+        `__wrapped__` is conditional rather than excluded. While it still points
+        at `fn`, a marker stands in for it and the sibling payload owns it; once
+        it points anywhere else it is folded like any other attribute, so
+        rebinding it moves identity exactly as rebinding it on a plain captured
+        function does.
 
         Annotations and type parameters take the annotation vocabulary the
         function metadata payload uses, not the ambient-capture one: an
@@ -3329,6 +3339,13 @@ class Database:
         token = self._query_handle_stack.set(stack + (handle_id,))
         try:
             state = vars(query)
+            # Before the sorts below, which compare names against each other:
+            # a handle whose dictionary was given a non-string key answers with
+            # the kernel's own refusal rather than a TypeError out of sorted().
+            if any(not isinstance(name, str) for name in state):
+                raise UnsupportedValueError(
+                    f"Query handle {query.key!r} has invalid custom state."
+                )
             # Both carriers are folded, never one instead of the other: which
             # of them functools.wraps copies depends on the interpreter, and a
             # handle can be given the other one afterwards.
@@ -3361,6 +3378,21 @@ class Database:
                     f"Query handle {query.key!r} has invalid annotations."
                 )
             annotations_payload = (annotate_payload, eager_payload)
+            # functools.wraps points __wrapped__ at the function this handle
+            # already folds, and a marker says so. Rebound, it is an ordinary
+            # entry: a body can call whatever it points at now, so what it
+            # points at has to be folded like any other attribute. It cannot
+            # simply join the walk below -- the marker is what keeps a query
+            # defined in a module with no stable source identity from being
+            # refused for carrying a reference to its own function.
+            wrapped = state.get("__wrapped__")
+            wrapped_payload: Any = (
+                ("wrapped-is-fn",)
+                if wrapped is query.fn
+                else self._query_handle_entry_payload(
+                    query, "__wrapped__", wrapped, seen_functions
+                )
+            )
             type_parameters = state.get("__type_params__", ())
             if not isinstance(type_parameters, tuple):
                 raise UnsupportedValueError(
@@ -3373,6 +3405,7 @@ class Database:
                 state.get("__module__"),
                 state.get("__doc__"),
                 annotations_payload,
+                wrapped_payload,
                 tuple(self._freeze_annotation_capture(item, set()) for item in type_parameters),
                 tuple(
                     (name, self._query_handle_entry_payload(query, name, item, seen_functions))
@@ -3855,10 +3888,13 @@ class Database:
             # annotation carrier is pinned beside the function's own, because
             # that payload folds the handle's copy by content only where the
             # two references have come apart; pinning both is what notices
-            # either of them being rebound. Everything else is pinned per
-            # entry, except the names the payload leaves to a sibling: the arms
-            # beside this one observe the key, the policies and the function,
-            # and nothing folds the __wrapped__ alias for them.
+            # either of them being rebound. __wrapped__ gets the same treatment
+            # for the same reason: a marker while it points at the function,
+            # its definition once it points elsewhere, since the payload then
+            # folds that definition live. Everything else is pinned per entry,
+            # except the contract fields the payload leaves to a sibling --
+            # the arms beside this one observe the key, the policies and the
+            # function.
             state = vars(handle)
             annotate = state.get("__annotate__")
             if annotate is None:
@@ -3888,8 +3924,12 @@ class Database:
                             for name, item in sorted(eager.items())
                         ),
                     )
+            wrapped = state.get("__wrapped__")
             return (
                 (annotate_observation, eager_observation),
+                (wrapped, handle.fn)
+                if wrapped is handle.fn
+                else (wrapped, handle.fn, observe_value(wrapped)),
                 tuple(
                     (name, observe_value(item))
                     for name, item in sorted(state.items())

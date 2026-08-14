@@ -270,6 +270,14 @@ def _wrapped_cache_decorated(value: int) -> int:
     return value * 2
 
 
+def _handle_wrapped_one(db: Database) -> int:
+    return 1
+
+
+def _handle_wrapped_two(db: Database) -> int:
+    return 2
+
+
 def _memo_and_truth(db: Database, target: Any) -> tuple[str, str]:
     """The memoized fingerprint next to the recomputed truth for ``target``.
 
@@ -3692,6 +3700,15 @@ def test_query_handle_annotations_of_its_own_move_the_fingerprint() -> None:
     assert memoized == truth
     assert memoized == with_eager
 
+    # Their content, not merely their presence: a fold that noticed only that
+    # the handle had annotations of its own would answer the same here.
+    cast(Any, annotated).__annotations__ = {"value": bytes, "return": int}
+    with_other_eager = Database()._query_fingerprint(annotated)
+    assert with_other_eager not in {before, with_eager}
+    memoized, truth = _memo_and_truth(db, annotated)
+    assert memoized == truth
+    assert memoized == with_other_eager
+
     def evaluate(format: int) -> dict[str, Any]:
         return {"value": bytes, "return": int}
 
@@ -3701,6 +3718,54 @@ def test_query_handle_annotations_of_its_own_move_the_fingerprint() -> None:
     memoized, truth = _memo_and_truth(db, annotated)
     assert memoized == truth
     assert memoized == with_evaluator
+
+
+def test_rebound_wrapped_function_on_a_query_handle_matches_fresh() -> None:
+    # functools.wraps points __wrapped__ at the decorated function, and a body
+    # can call whatever it points at now. Rebinding it is the same kind of
+    # write as rebinding any other attribute on the handle, so it moves
+    # identity the same way -- exactly as rebinding __wrapped__ on a plain
+    # captured function does.
+    @query(key="handle-wrapped-rebind")
+    def reader(db: Database) -> int:
+        return int(cast(Any, reader).__wrapped__(db))
+
+    cast(Any, reader).__wrapped__ = _handle_wrapped_one
+    db = Database()
+    assert db.get(reader) == 1
+
+    before = Database()._query_fingerprint(reader)
+    cast(Any, reader).__wrapped__ = _handle_wrapped_two
+    after = Database()._query_fingerprint(reader)
+    assert after != before
+
+    memoized, truth = _memo_and_truth(db, reader)
+    assert memoized == truth
+    assert memoized == after
+    _assert_warm_matches_fresh(db, "strict", reader, 2)
+
+
+def test_memoized_fingerprint_tracks_metadata_behind_a_rebound_wrapped_function(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-handle-wrapped")
+    def reader(db: Database) -> int:
+        return int(cast(Any, reader).__wrapped__(db))
+
+    cast(Any, reader).__wrapped__ = _handle_wrapped_one
+    db = Database()
+    db._query_fingerprint(reader)
+    before = Database()._query_fingerprint(reader)
+    # Once __wrapped__ points somewhere other than the query's own function,
+    # the payload folds that function's definition live. The handle's
+    # reference to it does not move when its metadata does, and the module
+    # stamp carries no function metadata either, so the observation has to
+    # follow the function itself rather than pin it by reference.
+    monkeypatch.setattr(_handle_wrapped_one, "__doc__", "Rebound helper documentation.")
+    truth = Database()._query_fingerprint(reader)
+    assert truth != before
+    memoized, recomputed = _memo_and_truth(db, reader)
+    assert memoized == recomputed == truth
 
 
 def test_query_handles_holding_a_reference_cycle_have_finite_identity() -> None:
