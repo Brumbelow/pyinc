@@ -30,7 +30,8 @@ class ValueAdapter(Protocol):
     ambient state (at query boundaries they run under the ambient-read
     guard); results are owned by the receiver; the round trip preserves
     semantics; and adapter instance configuration stays immutable for the
-    registered lifetime. See the kernel contract's `ValueAdapter` entry.
+    registered lifetime (enforced at request scope; see the kernel contract's
+    `ValueAdapter` entry).
     """
 
     def freeze(self, value: Any, freeze: FreezeFn) -> Any:

@@ -17,6 +17,10 @@ class UnsupportedValueError(PyIncError):
     """Raised when a value cannot cross a cached boundary safely."""
 
 
+class AdapterContractError(PyIncError):
+    """Raised when a registered adapter's configuration changes after construction."""
+
+
 class CycleError(PyIncError):
     """Raised when query evaluation encounters a dependency cycle."""
 

@@ -13,6 +13,7 @@ from typing import Any, ClassVar, cast
 import pytest
 
 from pyinc import (
+    AdapterContractError,
     BinaryFileResource,
     CycleError,
     Database,
@@ -3825,6 +3826,35 @@ class BoxedAdapter(ValueAdapter):
         return Boxed(thaw(data["payload"]))
 
 
+class _MutableCurrency:
+    def __init__(self, amount: int) -> None:
+        self.amount = amount
+
+
+class _CurrencyAdapter:
+    def __init__(self) -> None:
+        self.scale = 1
+
+    def freeze(self, value: Any, recurse: Callable[[Any], Any]) -> Any:
+        return recurse(value.amount * self.scale)
+
+    def thaw(self, snapshot: Any, recurse: Callable[[Any], Any]) -> Any:
+        return _MutableCurrency(recurse(snapshot))
+
+
+class _SlottedAdapter:
+    __slots__ = ("scale",)
+
+    def __init__(self) -> None:
+        self.scale = 1
+
+    def freeze(self, value: Any, recurse: Callable[[Any], Any]) -> Any:
+        return recurse(value.amount * self.scale)
+
+    def thaw(self, snapshot: Any, recurse: Callable[[Any], Any]) -> Any:
+        return _MutableCurrency(recurse(snapshot))
+
+
 # A module-level pre-frozen wrapper. freeze detaches it into a Database-owned
 # clone at every boundary; the backdate below is justified by the equality
 # relation over the stored snapshots, never by shared object identity.
@@ -3971,6 +4001,64 @@ def test_backdate_compare_does_not_thaw_adapted_values(mode: str) -> None:
     # The only thaw on the warm request is the caller-boundary exposure; the
     # equality decision runs on the stored snapshots directly.
     assert BoxedAdapter.thaw_calls == 1
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_mutating_a_registered_adapter_raises_at_the_next_request(mode: str) -> None:
+    adapter = _CurrencyAdapter()
+    source = Input[Any]("adapter-drift-source")
+    db = Database(mode=mode, adapters={_MutableCurrency: adapter})
+    db.set(source, _MutableCurrency(5))
+
+    @query(key=f"adapter-drift-{mode}")
+    def read_amount(db_: Database) -> Any:
+        return source.read(db_)
+
+    db.get(read_amount)
+    adapter.scale = 100
+    with pytest.raises(AdapterContractError, match="_MutableCurrency"):
+        db.get(read_amount)
+
+
+def test_adapter_configuration_does_not_participate_in_query_identity() -> None:
+    adapter = _CurrencyAdapter()
+    db = Database(adapters={_MutableCurrency: adapter})
+
+    @query(key="adapter-identity-pin")
+    def constant(db_: Database) -> int:
+        return 1
+
+    before = db._query_key(constant, (), {})[0].identity
+    adapter.scale = 100
+    after = db._query_key(constant, (), {})[0].identity
+    assert before == after
+
+
+def test_unverifiable_adapters_construct_and_skip_the_request_check() -> None:
+    adapter = _SlottedAdapter()
+    db = Database(adapters={_MutableCurrency: adapter})
+
+    @query(key="adapter-unverifiable")
+    def constant(db_: Database) -> int:
+        return 1
+
+    assert db.get(constant) == 1
+    adapter.scale = 2
+    # Slot state defeats fingerprinting, so in-process drift is undetectable;
+    # the documented law (and the checkpoint boundary's refusal) is the only
+    # protection for such adapters. The request must not raise.
+    assert db.get(constant) == 1
+
+
+def test_adapter_free_databases_pay_nothing_at_request_scope() -> None:
+    db = Database()
+
+    @query(key="adapter-free")
+    def constant(db_: Database) -> int:
+        return 1
+
+    assert db.get(constant) == 1
+    assert db._registered_adapter_digests == {}
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

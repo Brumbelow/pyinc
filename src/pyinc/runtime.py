@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, ParamSpec, TypeVar, cast, overl
 
 from ._path_identity import is_stdlib_path
 from .errors import (
+    AdapterContractError,
     CheckpointIntegrityError,
     CheckpointManifestError,
     CheckpointVersionError,
@@ -582,9 +583,6 @@ class Database:
         self.mode = mode
         self.max_query_nodes = max_query_nodes
         self._adapters = dict(adapters or {})
-        # Digest of each registered adapter's freeze/thaw implementation, keyed by
-        # the adapted type's key. Computed lazily and cached: _adapters is fixed at
-        # construction, so the digests never change over the database's life.
         # Per-adapter-key implementation digests read from a loaded checkpoint's
         # manifest; the warm gate compares these against the live registry.
         self._checkpoint_adapter_digests: dict[str, str] = {}
@@ -699,6 +697,18 @@ class Database:
         # probe-hint restoration). Set at the warm root, consulted transitively.
         self._checkpoint_root_pinned_query_objects: dict[str, Any] | None = None
         self._checkpoint_root_pinned_resources: dict[str, Any] | None = None
+        # Digest of each registered adapter's implementation and instance
+        # configuration, taken once at construction. Mutating a registered
+        # adapter afterwards violates the value-boundary law; every top-level
+        # request re-derives the map and raises AdapterContractError when it
+        # moved. None means at least one adapter cannot be fingerprinted, so
+        # in-process drift is undetectable and enforcement falls back to the
+        # documented law (the checkpoint boundary still refuses trust there).
+        self._registered_adapter_digests: dict[str, str] | None
+        try:
+            self._registered_adapter_digests = self._current_adapter_digests()
+        except UnsupportedValueError:
+            self._registered_adapter_digests = None
         _install_guards_once()
 
     @property
@@ -4559,6 +4569,43 @@ class Database:
             for value_type, adapter in self._adapters.items()
         }
 
+    def _verify_registered_adapters(self) -> None:
+        """Raise if a registered adapter's configuration moved since construction.
+
+        Adapter instance configuration is contractually immutable for the
+        registered lifetime. The digests are taken once at construction;
+        re-deriving the small map at each top-level request turns a silent
+        warm-not-equal-fresh into a loud typed error without changing any
+        cache key. An unverifiable registry (an adapter that cannot be
+        fingerprinted) skips the check: drift there is undetectable
+        in-process, and the checkpoint boundary already refuses to trust
+        such adapters.
+        """
+
+        expected = self._registered_adapter_digests
+        if expected is None or not self._adapters:
+            return
+        try:
+            current = self._current_adapter_digests()
+        except UnsupportedValueError as exc:
+            raise AdapterContractError(
+                "A registered adapter is no longer fingerprintable; its "
+                "configuration changed after Database construction."
+            ) from exc
+        if current == expected:
+            return
+        moved = sorted(
+            key
+            for key in expected.keys() | current.keys()
+            if expected.get(key) != current.get(key)
+        )
+        raise AdapterContractError(
+            "Adapter instance configuration changed after Database construction "
+            f"for adapter key(s): {', '.join(moved)}. Registered adapters are "
+            "immutable for the database's lifetime; build a new Database with "
+            "the reconfigured adapter instead."
+        )
+
     def _adapter_implementation_digest(self, adapter: ValueAdapter) -> str:
         """Fingerprint an adapter's ``freeze``/``thaw`` implementation.
 
@@ -6882,6 +6929,7 @@ class Database:
             self._sync_span_to_epoch()
             yield None
             return
+        self._verify_registered_adapters()
         self._request_counter += 1
         token = self._request_token.set(self._request_counter)
         pending: list[tuple[NodeKey, QueryChangeEvent]] = []

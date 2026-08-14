@@ -530,8 +530,13 @@ value, or route it through a `Resource`.
   - **Semantic round-trip.** For any accepted value, `thaw(freeze(x))` is
     semantically equal to `x` wherever the adapted type is consumed.
   - **Pinned adapter state.** Adapter instance configuration is immutable for
-    the registered lifetime; implementations and configuration participate in
-    query and checkpoint identity.
+    the registered lifetime. Implementations and configuration participate in
+    checkpoint identity — never in query identity — and the kernel enforces
+    the law in-process: each top-level request re-derives the registered
+    adapters' digests and raises `AdapterContractError`, naming the adapter
+    key, if any digest moved since construction. An adapter that cannot be
+    fingerprinted is exempt from the in-process check; checkpoints refuse to
+    trust its records instead.
 
   (See: `test_adapter_freeze_of_a_query_result_runs_under_the_guard`,
   `test_adapter_thaw_of_query_arguments_runs_under_the_guard`)
@@ -823,6 +828,7 @@ Errors:
 | `MutationError` | A query mutated one of its boundary inputs. |
 | `UntrackedReadError` | Code performed an undeclared external read. |
 | `UnsupportedValueError` | A value cannot cross a cached boundary safely. |
+| `AdapterContractError` | A registered adapter's instance configuration changed after `Database` construction. |
 | `CycleError` | Query evaluation encountered a dependency cycle. |
 | `InputKeyError` | An input key is invalid or conflicts within a database. |
 | `CheckpointError` | Base error for durable-checkpoint failures. |
