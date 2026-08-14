@@ -3855,6 +3855,44 @@ class _SlottedAdapter:
         return _MutableCurrency(recurse(snapshot))
 
 
+class _InheritedCurrencyAdapter(ValueAdapter):
+    def __init__(self) -> None:
+        self.scale = 1
+
+    def freeze(self, value: Any, freeze: Any) -> Any:
+        return freeze(value.amount * self.scale)
+
+    def thaw(self, snapshot: Any, thaw: Any) -> Any:
+        return _MutableCurrency(thaw(snapshot))
+
+
+class _CountingCurrencyAdapter(ValueAdapter):
+    freeze_calls: ClassVar[int] = 0
+    thaw_calls: ClassVar[int] = 0
+
+    def freeze(self, value: Any, freeze: Any) -> Any:
+        type(self).freeze_calls += 1
+        return freeze(value.amount)
+
+    def thaw(self, snapshot: Any, thaw: Any) -> Any:
+        type(self).thaw_calls += 1
+        return _MutableCurrency(thaw(snapshot))
+
+
+class _UnorderableKey:
+    def __lt__(self, other: object) -> bool:
+        raise ValueError("adapter state key refuses to be ordered")
+
+
+def _plant_undigestable_state_key(adapter: Any, shape: str) -> None:
+    # An adapter's own state dict is written directly here; setattr cannot
+    # produce either key, and both defeat the sort the state digest performs.
+    if shape == "mixed-key-types":
+        adapter.__dict__[1] = 1
+    else:
+        adapter.__dict__[_UnorderableKey()] = 1
+
+
 # A module-level pre-frozen wrapper. freeze detaches it into a Database-owned
 # clone at every boundary; the backdate below is justified by the equality
 # relation over the stored snapshots, never by shared object identity.
@@ -4030,8 +4068,13 @@ def test_adapter_configuration_does_not_participate_in_query_identity() -> None:
 
     before = db._query_key(constant, (), {})[0].identity
     adapter.scale = 100
-    after = db._query_key(constant, (), {})[0].identity
-    assert before == after
+    memoized = db._query_key(constant, (), {})[0].identity
+    # The fingerprint memo observes no adapter state, so a primed read reports
+    # the pre-mutation fingerprint whatever the payload folds; dropping the
+    # entry makes the last read rebuild it from the live registry.
+    db._query_fingerprint_memo.pop(constant, None)
+    recomputed = db._query_key(constant, (), {})[0].identity
+    assert before == memoized == recomputed
 
 
 def test_unverifiable_adapters_construct_and_skip_the_request_check() -> None:
@@ -4059,6 +4102,71 @@ def test_adapter_free_databases_pay_nothing_at_request_scope() -> None:
 
     assert db.get(constant) == 1
     assert db._registered_adapter_digests == {}
+
+
+def test_mutating_an_adapter_that_inherits_the_protocol_base_raises() -> None:
+    adapter = _InheritedCurrencyAdapter()
+    source = Input[Any]("adapter-drift-base-source")
+    db = Database(adapters={_MutableCurrency: adapter})
+    db.set(source, _MutableCurrency(5))
+
+    @query(key="adapter-drift-protocol-base")
+    def read_amount(db_: Database) -> Any:
+        return source.read(db_)
+
+    db.get(read_amount)
+    adapter.scale = 100
+    with pytest.raises(AdapterContractError, match="_MutableCurrency"):
+        db.get(read_amount)
+
+
+def test_class_level_adapter_counters_do_not_trip_the_request_check() -> None:
+    adapter = _CountingCurrencyAdapter()
+    source = Input[Any]("adapter-counter-source")
+    db = Database(mode="checked", adapters={_MutableCurrency: adapter})
+    db.set(source, _MutableCurrency(5))
+
+    @query(key="adapter-counter")
+    def read_amount(db_: Database) -> Any:
+        return source.read(db_).amount
+
+    assert db.get(read_amount) == 5
+    calls = _CountingCurrencyAdapter.freeze_calls + _CountingCurrencyAdapter.thaw_calls
+    assert calls > 0
+    db.set(source, _MutableCurrency(6))
+    # Every boundary crossing moves the counters, and they live on the class,
+    # not in the adapter's own state -- so the request check never sees them.
+    assert db.get(read_amount) == 6
+    assert _CountingCurrencyAdapter.freeze_calls + _CountingCurrencyAdapter.thaw_calls > calls
+
+
+@pytest.mark.parametrize("shape", ["mixed-key-types", "unorderable-key"])
+def test_adapters_whose_state_keys_defeat_digesting_construct_unverified(shape: str) -> None:
+    adapter = _CurrencyAdapter()
+    _plant_undigestable_state_key(adapter, shape)
+    db = Database(adapters={_MutableCurrency: adapter})
+    assert db._registered_adapter_digests is None
+
+    @query(key=f"adapter-undigestable-state-{shape}")
+    def constant(db_: Database) -> int:
+        return 1
+
+    assert db.get(constant) == 1
+
+
+@pytest.mark.parametrize("shape", ["mixed-key-types", "unorderable-key"])
+def test_mutating_an_adapter_into_an_undigestable_shape_raises(shape: str) -> None:
+    adapter = _CurrencyAdapter()
+    db = Database(adapters={_MutableCurrency: adapter})
+
+    @query(key=f"adapter-undigestable-drift-{shape}")
+    def constant(db_: Database) -> int:
+        return 1
+
+    assert db.get(constant) == 1
+    _plant_undigestable_state_key(adapter, shape)
+    with pytest.raises(AdapterContractError, match="no longer fingerprintable"):
+        db.get(constant)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

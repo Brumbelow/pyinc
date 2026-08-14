@@ -52,8 +52,11 @@ data is rejected so memo reuse never depends on hidden Python object mutation.
 Query identity is based on a stable key and a canonical typed encoding of the
 complete supported function definition. It includes code objects and nested
 constants, immutable and transitive captures, defaults, equality/cutoff
-policies, adapter/resource implementations, and relevant interpreter/build
-flags. It does not depend on marshal reference-table behavior.
+policies, resource implementations, and relevant interpreter/build flags. It
+does not depend on marshal reference-table behavior. Registered adapters are
+not part of it: their implementations and configuration are checkpoint
+identity, and configuration drift is caught in-process by the request-scope
+check instead.
 
 Resource node identity includes configuration plus the implementations of
 `probe`, `load`, `probe_and_load`, and `identity`. The public generic
