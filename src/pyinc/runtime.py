@@ -35,7 +35,7 @@ from types import (
     UnionType,
     WrapperDescriptorType,
 )
-from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, ClassVar, ParamSpec, TypeVar, cast, overload
 
 from ._path_identity import is_stdlib_path
 from .errors import (
@@ -534,6 +534,31 @@ class Subscription:
 
 
 class Database:
+    # The two instance-dictionary names a query handle carries its annotations
+    # under. They are folded and observed through the annotation vocabulary
+    # rather than the ambient-capture one, so an annotation naming a
+    # module-anchored type stays an anchor instead of becoming a namespace
+    # walk.
+    _QUERY_HANDLE_ANNOTATION_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {"__annotate__", "__annotations__"}
+    )
+    # Instance-dictionary names the payloads beside the handle fold own: the
+    # contract fields they fold directly, and the alias functools.wraps gives
+    # the function. Neither the fold nor the observation of it repeats them.
+    _QUERY_HANDLE_SIBLING_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {"fn", "eq", "cutoff", "key", "__wrapped__"}
+    )
+    # Instance-dictionary names `_query_handle_state_payload` folds by hand or
+    # leaves to one of those siblings, so its walk over the rest of the handle
+    # skips them. Class attributes rather than module constants: every module
+    # constant this file defines is folded again for every query whose
+    # annotations anchor to a pyinc type.
+    _QUERY_HANDLE_CONTRACT_NAMES: ClassVar[frozenset[str]] = (
+        _QUERY_HANDLE_ANNOTATION_NAMES
+        | _QUERY_HANDLE_SIBLING_NAMES
+        | frozenset({"__doc__", "__module__", "__name__", "__qualname__", "__type_params__"})
+    )
+
     def __init__(
         self,
         mode: Mode = "strict",
@@ -590,6 +615,9 @@ class Database:
         )
         self._wrapped_callable_stack: ContextVar[tuple[int, ...]] = ContextVar(
             "pyinc_wrapped_callable_stack", default=()
+        )
+        self._query_handle_stack: ContextVar[tuple[int, ...]] = ContextVar(
+            "pyinc_query_handle_stack", default=()
         )
         self._request_counter = 0
         self._span_epoch = 0
@@ -3212,6 +3240,7 @@ class Database:
                     self._code_fingerprint(query.fn),
                     self._policy_definition_payload(query.eq),
                     self._policy_definition_payload(query.cutoff),
+                    self._query_handle_state_payload(query, set()),
                 )
             )
         finally:
@@ -3257,6 +3286,139 @@ class Database:
         else:
             self._query_fingerprint_memo.pop(query, None)
         return result
+
+    def _query_handle_state_payload(self, query: Any, seen_functions: builtins.set[int]) -> Any:
+        """Fold the Query handle's own mutable surface into query identity.
+
+        The handle is a plain object: functools.wraps copies function metadata
+        onto it at decoration time, nothing prevents later assignment, and a
+        query body may read attributes off its own handle. Any of them moving
+        has to move identity exactly as the equivalent function attribute does,
+        which is what makes writing one a supported way to reparameterize a
+        query instead of a change the stored records cannot see.
+
+        The contract fields are excluded: `fn`, `eq` and `cutoff` are folded by
+        the payloads beside this one, `key` names the node this fingerprint is
+        spliced into, and `__wrapped__` is `fn` under the name functools.wraps
+        gives it. Routing them through the ambient-capture digest would also
+        refuse the callable policy objects the policy payload accepts, and fold
+        the query's own function a second time.
+
+        Annotations and type parameters take the annotation vocabulary the
+        function metadata payload uses, not the ambient-capture one: an
+        annotation naming a module-anchored type is pinned by that anchor,
+        where the capture digest would walk the type's whole namespace. Where
+        the handle still carries the function's own evaluator or its own
+        annotations dictionary -- the objects functools.wraps copied across --
+        a marker stands in for their content, which that same metadata payload
+        has already folded; only a handle given annotations of its own is
+        folded here.
+
+        A query held on another query's handle is folded as the dependency it
+        is, which puts a reference cycle within reach. Such a cycle is marked
+        rather than refused: the contact that entered the handle folds
+        everything the repeat would fold again, so eliding the back edge loses
+        nothing, and both handles stay writable the way this fold exists to
+        support.
+        """
+
+        handle_id = id(query)
+        stack = self._query_handle_stack.get()
+        if handle_id in stack:
+            return ("recursive-query-handle", query.key)
+        token = self._query_handle_stack.set(stack + (handle_id,))
+        try:
+            state = vars(query)
+            # Both carriers are folded, never one instead of the other: which
+            # of them functools.wraps copies depends on the interpreter, and a
+            # handle can be given the other one afterwards.
+            annotate = state.get("__annotate__")
+            if annotate is None:
+                annotate_payload: Any = None
+            elif annotate is getattr(query.fn, "__annotate__", None):
+                annotate_payload = ("evaluator-of-function",)
+            elif isinstance(annotate, FunctionType):
+                annotate_payload = (
+                    "lazy-annotations",
+                    self._annotation_evaluator_payload(annotate, set()),
+                )
+            else:
+                raise UnsupportedValueError(
+                    f"Query handle {query.key!r} has an invalid annotation evaluator."
+                )
+            eager = state.get("__annotations__")
+            if eager is None:
+                eager_payload: Any = None
+            elif eager is self._function_own_annotations(query.fn):
+                eager_payload = ("annotations-of-function",)
+            elif isinstance(eager, dict) and all(isinstance(name, str) for name in eager):
+                eager_payload = tuple(
+                    (name, self._freeze_annotation_capture(item, set()))
+                    for name, item in sorted(eager.items())
+                )
+            else:
+                raise UnsupportedValueError(
+                    f"Query handle {query.key!r} has invalid annotations."
+                )
+            annotations_payload = (annotate_payload, eager_payload)
+            type_parameters = state.get("__type_params__", ())
+            if not isinstance(type_parameters, tuple):
+                raise UnsupportedValueError(
+                    f"Query handle {query.key!r} has invalid type parameters."
+                )
+            return (
+                "query-handle-v3",
+                state.get("__name__"),
+                state.get("__qualname__"),
+                state.get("__module__"),
+                state.get("__doc__"),
+                annotations_payload,
+                tuple(self._freeze_annotation_capture(item, set()) for item in type_parameters),
+                tuple(
+                    (name, self._query_handle_entry_payload(query, name, item, seen_functions))
+                    for name, item in sorted(state.items())
+                    if name not in self._QUERY_HANDLE_CONTRACT_NAMES
+                ),
+            )
+        finally:
+            self._query_handle_stack.reset(token)
+
+    @staticmethod
+    def _function_own_annotations(fn: Any) -> Any:
+        """The annotations dictionary a function holds, or None if reading fails.
+
+        Only ever compared by identity, against what a query handle carries
+        under the same name. A read that raises -- an annotation naming
+        something unresolvable, under a lazy evaluator -- answers None, which
+        no dictionary on a handle can be, so the handle's own copy is folded
+        rather than treated as the function's.
+        """
+
+        try:
+            return fn.__annotations__
+        except Exception:
+            return None
+
+    def _query_handle_entry_payload(
+        self, query: Any, name: str, value: Any, seen_functions: builtins.set[int]
+    ) -> Any:
+        """Fold one attribute written on a query handle."""
+
+        try:
+            return self._captured_dependency_digest(
+                f"handle[{name}]", value, seen_functions, owner=query.fn
+            )
+        except UnsupportedValueError as exc:
+            # The digest refuses in the vocabulary of an ambient capture, which
+            # is not what this is: nothing read it out of an enclosing scope,
+            # someone wrote it on the handle. The remedy is the same one, and
+            # it stops short of naming the capture-set preview -- that reports
+            # what the body closes over, never what the handle carries.
+            raise UnsupportedValueError(
+                f"Query {query.key!r} holds unsupported state {name!r} of type "
+                f"{type(value).__module__}.{type(value).__qualname__} on its handle. "
+                "Move mutable state behind Input/Resource nodes or use an immutable value."
+            ) from exc
 
     def _resource_identity_digest(self, resource: Any) -> str:
         """Re-read a captured resource's configuration for the memo guard.
@@ -3310,17 +3472,19 @@ class Database:
         fingerprint recompute. It traverses the same slots as
         `_function_definition_payload` folds into the fingerprint — function
         metadata, captured class bodies, and captured instance and policy
-        state — pinning each entry's reference where the payload folds its
-        value; modules stay leaves, and so do the types the payload pins by
-        module anchor rather than by a namespace walk.
+        state — plus the query handle's own instance dictionary, which
+        `_query_handle_state_payload` folds beside it, pinning each entry's
+        reference where the payload folds its value; modules stay leaves, and
+        so do the types the payload pins by module anchor rather than by a
+        namespace walk.
 
         A module is covered by three memo arms instead, because this walk never
         enters one: `_module_observation_stamp` re-derives its file bytes,
         import metadata and module-level constants; each statically accessed
         attribute chain is re-resolved and its target compared by identity; and
-        the definitions behind chain-reached functions and wraps-decorated
-        callable objects, whose globals, defaults and instance state the
-        payload folds live, are observed by
+        the definitions behind chain-reached functions, wraps-decorated
+        callable objects and query handles, whose globals, defaults, instance
+        and handle state the payload folds live, are observed by
         `_module_function_target_observation`. Where a chain lands on a class
         or a frozen dataclass instance instead -- named directly, or held
         inside an immutable container the payload accepts, such as a tuple, a
@@ -3339,13 +3503,12 @@ class Database:
         first.
         """
 
-        observe_value, observe_function = self._definition_observers()
-        return (
-            query.key,
-            observe_value(query.eq),
-            observe_value(query.cutoff),
-            observe_function(query.fn),
-        )
+        # The query arm of `observe_value` is this observation: it folds the
+        # key, the policies, the function and the handle state, and it marks
+        # the handle before descending, so a body that captures its own query
+        # pins it by reference there instead of walking it a second time.
+        observe_value, _observe_function = self._definition_observers()
+        return observe_value(query)
 
     def _module_function_target_observation(
         self, records: tuple[tuple[ModuleType, tuple[str, ...], Any], ...]
@@ -3361,12 +3524,21 @@ class Database:
         `__call__` definition and its instance state are read live while the
         landing object's own identity holds still -- so it is observed here
         too, which is what makes `import m; m.f` and `from m import f` reuse a
-        stored fingerprint on the same conditions. One observer family covers
-        every record, in the order the memo stored them, so a value two chains
-        share is folded on first contact the same way here as it was when the
-        stored observation was built.
+        stored fingerprint on the same conditions. A Query landing is the third
+        such shape: the payload folds its function, its policies and its handle
+        state live, none of which moves the handle the chain resolves to. One
+        observer family covers every record, in the order the memo stored them,
+        so a value two chains share is folded on first contact the same way
+        here as it was when the stored observation was built.
         """
 
+        from .core import Query
+
+        # A Query is named before the wrapped-callable clause rather than left
+        # to it: functools.wraps does put a __wrapped__ function on every
+        # handle, so the clause would catch one by accident, and the memo would
+        # lose the handle silently if that ever stopped being true.
+        #
         # The type exclusion mirrors `_module_attribute_payload`, which routes
         # a class to its type branch before the wrapped-callable one: a class
         # landing is compared by identity alone, whether or not it carries a
@@ -3374,7 +3546,7 @@ class Database:
         targets = [
             target
             for _module, _path, target in records
-            if isinstance(target, FunctionType)
+            if isinstance(target, (FunctionType, Query))
             or (
                 not isinstance(target, type)
                 and isinstance(getattr(target, "__wrapped__", None), FunctionType)
@@ -3416,8 +3588,20 @@ class Database:
 
         def observe_value(value: Any) -> Any:
             if isinstance(value, Query):
-                return (value.key, observe_value(value.eq), observe_value(value.cutoff),
-                        observe_value(value.fn))
+                if id(value) in seen:
+                    return value
+                # Marked before the walk below, which reaches this arm again
+                # for a query held on another query's handle. Everything the
+                # payload folds for a captured query is folded here on this
+                # first contact, so a later one pins the handle by reference.
+                seen.add(id(value))
+                return (
+                    value.key,
+                    observe_value(value.eq),
+                    observe_value(value.cutoff),
+                    observe_value(value.fn),
+                    observe_query_handle(value),
+                )
             if isinstance(value, Input):
                 return (value, value.key, observe_value(value.eq), observe_value(value.cutoff))
             if isinstance(value, FunctionType):
@@ -3665,6 +3849,54 @@ class Database:
                     else observe_value(part)
                 )
             return (value, tuple(parts))
+
+        def observe_query_handle(handle: Any) -> Any:
+            # Mirrors `_query_handle_state_payload` arm for arm. Each
+            # annotation carrier is pinned beside the function's own, because
+            # that payload folds the handle's copy by content only where the
+            # two references have come apart; pinning both is what notices
+            # either of them being rebound. Everything else is pinned per
+            # entry, except the names the payload leaves to a sibling: the arms
+            # beside this one observe the key, the policies and the function,
+            # and nothing folds the __wrapped__ alias for them.
+            state = vars(handle)
+            annotate = state.get("__annotate__")
+            if annotate is None:
+                annotate_observation: Any = None
+            else:
+                function_annotate = getattr(handle.fn, "__annotate__", None)
+                annotate_observation = (
+                    (annotate, function_annotate)
+                    if annotate is function_annotate
+                    else (annotate, function_annotate, observe_value(annotate))
+                )
+            eager = state.get("__annotations__")
+            if eager is None:
+                eager_observation: Any = None
+            else:
+                function_annotations = self._function_own_annotations(handle.fn)
+                if eager is function_annotations or not (
+                    isinstance(eager, dict) and all(isinstance(name, str) for name in eager)
+                ):
+                    eager_observation = (eager, function_annotations)
+                else:
+                    eager_observation = (
+                        eager,
+                        function_annotations,
+                        tuple(
+                            (name, observe_annotation(item))
+                            for name, item in sorted(eager.items())
+                        ),
+                    )
+            return (
+                (annotate_observation, eager_observation),
+                tuple(
+                    (name, observe_value(item))
+                    for name, item in sorted(state.items())
+                    if name not in self._QUERY_HANDLE_ANNOTATION_NAMES
+                    and name not in self._QUERY_HANDLE_SIBLING_NAMES
+                ),
+            )
 
         def observe_metadata(fn: FunctionType) -> Any:
             # _function_metadata_payload folds annotation values as ambient
@@ -4393,6 +4625,7 @@ class Database:
                 self._function_definition_payload(value.fn, seen_functions),
                 self._policy_definition_payload(value.eq),
                 self._policy_definition_payload(value.cutoff),
+                self._query_handle_state_payload(value, seen_functions),
             )
         if isinstance(value, Input):
             return (
@@ -5444,6 +5677,7 @@ class Database:
                 self._function_definition_payload(value.fn, seen_functions),
                 self._policy_definition_payload(value.eq),
                 self._policy_definition_payload(value.cutoff),
+                self._query_handle_state_payload(value, seen_functions),
             )
         if isinstance(value, Input):
             return (

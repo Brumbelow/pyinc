@@ -3569,3 +3569,181 @@ def test_memoized_fingerprint_tracks_functions_behind_a_captured_cached_property
     memoized, truth = _memo_and_truth(db, read)
     assert memoized == truth
     assert memoized == Database()._query_fingerprint(read)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_query_handle_attribute_change_matches_fresh(mode: str) -> None:
+    # A query body may read attributes off its own handle. Writing one is a
+    # supported way to reparameterize the query: identity moves with the
+    # attribute, so the stored record no longer answers and the new value is
+    # recomputed rather than served stale.
+    @query(key=f"handle-state-{mode}")
+    def selfread(db: Database) -> int:
+        return int(cast(Any, selfread).threshold)
+
+    cast(Any, selfread).threshold = 1
+    db = Database(mode=mode)
+    assert db.get(selfread) == 1
+    cast(Any, selfread).threshold = 5
+    _assert_warm_matches_fresh(db, mode, selfread, 5)
+
+
+def test_query_handle_doc_and_attributes_move_the_fingerprint() -> None:
+    @query(key="handle-fingerprint")
+    def documented(db: Database) -> int:
+        """Handle docstring."""
+
+        return 1
+
+    before = Database()._query_fingerprint(documented)
+    cast(Any, documented).__doc__ = "Changed handle docstring."
+    after_doc = Database()._query_fingerprint(documented)
+    assert before != after_doc
+
+    cast(Any, documented).threshold = 9
+    after_attr = Database()._query_fingerprint(documented)
+    assert after_attr not in {before, after_doc}
+
+    # Memo path: a reused database must agree with the recomputed truth.
+    db = Database()
+    db._query_fingerprint(documented)
+    cast(Any, documented).threshold = 10
+    memoized, truth = _memo_and_truth(db, documented)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(documented)
+
+
+def test_captured_query_handle_state_moves_the_parent_fingerprint() -> None:
+    @query(key="handle-helper")
+    def helper(db: Database) -> int:
+        return 1
+
+    @query(key="handle-parent")
+    def parent(db: Database) -> int:
+        return helper(db) + 1
+
+    db = Database()
+    db._query_fingerprint(parent)
+    before = Database()._query_fingerprint(parent)
+    cast(Any, helper).__doc__ = "Rebound helper documentation."
+    after = Database()._query_fingerprint(parent)
+    assert before != after
+
+    memoized, truth = _memo_and_truth(db, parent)
+    assert memoized == truth
+    assert memoized == after
+
+
+def test_module_reached_query_handle_state_moves_the_parent_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_query_handle"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from pyinc import Database, query\n"
+        "\n"
+        "\n"
+        '@query(key="module-handle-child")\n'
+        "def child(db: Database) -> int:\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="module-handle-parent")
+        def parent(db: Database) -> int:
+            return cast(int, module.child(db)) + 1
+
+        db = Database()
+        db._query_fingerprint(parent)
+        before = Database()._query_fingerprint(parent)
+        # The chain names child, whose object identity this write leaves alone,
+        # and a Query is not one of the module constants the stamp folds, so
+        # neither of those memo arms moves: the handle fold is what sees it,
+        # and the observation has to follow it through the same chain.
+        monkeypatch.setattr(module.child, "__doc__", "Rebound child documentation.")
+        after = Database()._query_fingerprint(parent)
+        assert before != after
+
+        memoized, truth = _memo_and_truth(db, parent)
+        assert memoized == truth
+        assert memoized == after
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_query_handle_annotations_of_its_own_move_the_fingerprint() -> None:
+    @query(key="handle-annotations")
+    def annotated(db: Database, value: int) -> int:
+        return value
+
+    db = Database()
+    db._query_fingerprint(annotated)
+    before = Database()._query_fingerprint(annotated)
+    # The handle starts out carrying the function's own annotations, which the
+    # function payload folds; giving it annotations of its own is what this
+    # fold has to see, on either carrier the interpreter uses.
+    cast(Any, annotated).__annotations__ = {"value": str, "return": int}
+    with_eager = Database()._query_fingerprint(annotated)
+    assert with_eager != before
+    memoized, truth = _memo_and_truth(db, annotated)
+    assert memoized == truth
+    assert memoized == with_eager
+
+    def evaluate(format: int) -> dict[str, Any]:
+        return {"value": bytes, "return": int}
+
+    cast(Any, annotated).__annotate__ = evaluate
+    with_evaluator = Database()._query_fingerprint(annotated)
+    assert with_evaluator not in {before, with_eager}
+    memoized, truth = _memo_and_truth(db, annotated)
+    assert memoized == truth
+    assert memoized == with_evaluator
+
+
+def test_query_handles_holding_a_reference_cycle_have_finite_identity() -> None:
+    @query(key="handle-cycle-first")
+    def first(db: Database) -> int:
+        return 1
+
+    @query(key="handle-cycle-second")
+    def second(db: Database) -> int:
+        return 2
+
+    @query(key="handle-cycle-solo")
+    def solo(db: Database) -> int:
+        return 3
+
+    # A query held on another query's handle is folded as the dependency it is,
+    # so a pair holding each other -- or a handle holding itself -- is a cycle
+    # the fold has to survive. The repeat is marked, and what it would have
+    # folded is still folded by the contact that entered the handle: writing an
+    # attribute on either side of the cycle still moves the other's identity.
+    cast(Any, first).peer = second
+    cast(Any, second).peer = first
+    cast(Any, solo).mine = solo
+
+    before_first = Database()._query_fingerprint(first)
+    cast(Any, second).threshold = 5
+    assert Database()._query_fingerprint(first) != before_first
+
+    before_solo = Database()._query_fingerprint(solo)
+    cast(Any, solo).threshold = 7
+    assert Database()._query_fingerprint(solo) != before_solo
+
+
+def test_query_handle_with_unsafe_attribute_is_rejected() -> None:
+    @query(key="handle-unsafe")
+    def broken(db: Database) -> int:
+        return 1
+
+    cast(Any, broken).state = {"mutable": True}
+    # Named as what it is -- state written on the handle, not a value the body
+    # closed over -- and carrying the same remedy the capture refusals give.
+    with pytest.raises(
+        UnsupportedValueError,
+        match=r"Query 'handle-unsafe' holds unsupported state 'state' of type builtins.dict",
+    ):
+        Database().get(broken)
