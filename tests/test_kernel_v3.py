@@ -60,6 +60,40 @@ class _ObservedPlain:
     compute = staticmethod(_observed_compute_one)
 
 
+def _observed_static_source() -> int:
+    return 3
+
+
+def _observed_class_source() -> int:
+    return 5
+
+
+def _observed_property_source() -> int:
+    return 7
+
+
+def _observed_descriptor_replacement() -> int:
+    return 11
+
+
+class _ObservedStaticHolder:
+    @staticmethod
+    def read() -> int:
+        return _observed_static_source() * 10
+
+
+class _ObservedClassHolder:
+    @classmethod
+    def read(cls) -> int:
+        return _observed_class_source() * 10
+
+
+class _ObservedPropertyHolder:
+    @property
+    def read(self) -> int:
+        return _observed_property_source() * 10
+
+
 @dataclass(frozen=True)
 class _ObservedBox:
     factor: int
@@ -1883,6 +1917,60 @@ def test_memoized_fingerprint_reuses_the_memo_for_an_unchanged_module_capture(
         assert db._query_fingerprint_memo[scaled] is entry
     finally:
         sys.modules.pop(module_name, None)
+
+
+def test_memoized_fingerprint_tracks_functions_behind_a_captured_staticmethod(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-descriptor-static")
+    def read(db: Database) -> int:
+        return _ObservedStaticHolder.read()
+
+    db = Database()
+    db._query_fingerprint(read)
+    # The class body payload unwraps the descriptor and folds the function
+    # inside it, globals and all. The descriptor object itself is untouched by
+    # this rebinding, so an observation that stops at the wrapper sees nothing.
+    monkeypatch.setattr(
+        sys.modules[__name__], "_observed_static_source", _observed_descriptor_replacement
+    )
+    memoized, truth = _memo_and_truth(db, read)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(read)
+
+
+def test_memoized_fingerprint_tracks_functions_behind_a_captured_classmethod(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-descriptor-class")
+    def read(db: Database) -> int:
+        return _ObservedClassHolder.read()
+
+    db = Database()
+    db._query_fingerprint(read)
+    monkeypatch.setattr(
+        sys.modules[__name__], "_observed_class_source", _observed_descriptor_replacement
+    )
+    memoized, truth = _memo_and_truth(db, read)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(read)
+
+
+def test_memoized_fingerprint_tracks_functions_behind_a_captured_property(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-descriptor-property")
+    def read(db: Database) -> int:
+        return _ObservedPropertyHolder().read
+
+    db = Database()
+    db._query_fingerprint(read)
+    monkeypatch.setattr(
+        sys.modules[__name__], "_observed_property_source", _observed_descriptor_replacement
+    )
+    memoized, truth = _memo_and_truth(db, read)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(read)
 
 
 def test_memoized_fingerprint_tracks_constants_outside_the_captured_chain(

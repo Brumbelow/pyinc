@@ -3316,9 +3316,12 @@ class Database:
         attribute chain is re-resolved and its target compared by identity; and
         the definitions behind chain-reached functions, whose globals and
         defaults the payload folds live, are observed by
-        `_module_function_target_observation`. What no arm follows is state
-        mutated in place behind a chain — a class body or an instance reached
-        through one. Resources get no arm of their own either: what a fold
+        `_module_function_target_observation`. Where a chain lands on a class
+        or an instance instead, no arm follows anything inside it: the memo
+        compares the landing object by identity while the payload folds its
+        members, so neither a member written in place nor a binding one of
+        those members reads is observed. Resources get no arm of their own
+        either: what a fold
         reads out of `identity()` is gated by the recorded configuration
         digests the memo carries alongside this observation, and every slot
         that reaches a resource for anything else folds it as the ordinary
@@ -3438,6 +3441,21 @@ class Database:
                     observe_value(value.start),
                     observe_value(value.stop),
                     observe_value(value.step),
+                )
+            if isinstance(value, (staticmethod, classmethod)):
+                # Descriptors are builtin by type and anything but a leaf by
+                # content: _type_definition_payload folds the function they
+                # wrap, so the observation has to reach it too. Before the
+                # builtins arm below, which would otherwise pin the wrapper and
+                # see none of the definition behind it.
+                return (value, observe_value(value.__func__))
+            if isinstance(value, property):
+                return (
+                    value,
+                    tuple(
+                        observe_value(function)
+                        for function in (value.fget, value.fset, value.fdel)
+                    ),
                 )
             if type(value).__module__ == "builtins":
                 return value
@@ -5455,9 +5473,12 @@ class Database:
         that folded any of this, the memo re-derives the constants inside
         `_module_observation_stamp`, re-resolves each chain and compares its
         target by identity, and observes the definitions behind chain-reached
-        functions. What no arm follows is state mutated in place behind a
-        chain — a class body or an instance reached through one — which belongs
-        in an `Input` or a `Resource`.
+        functions. A chain that lands on a class or an instance is where that
+        stops: its members are folded by the payload and compared here only
+        through the landing object's identity, so a member written in place,
+        and equally a module binding one of those members reads, moves the fold
+        and nothing the memo checks. Such state belongs in an `Input` or a
+        `Resource`.
         """
         collector = self._fingerprint_module_collector.get()
         if collector is not None:
