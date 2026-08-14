@@ -800,6 +800,72 @@ def test_v5_manifest_rejected_loudly() -> None:
         db.load_checkpoint(key)
 
 
+class _CheckpointConsts:
+    SCALE = 2
+
+
+def test_captured_class_attribute_change_rekeys_the_saved_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="checkpoint-class-attr")
+    def scaled(db: Database) -> int:
+        return _CheckpointConsts.SCALE + 0
+
+    store = InMemoryArtifactStore()
+    saver = Database(store=store)
+    assert saver.get(scaled) == 2
+    monkeypatch.setattr(_CheckpointConsts, "SCALE", 3)
+    executions = saver.statistics().query_executions
+    assert saver.get(scaled) == 3
+    assert saver.statistics().query_executions == executions + 1
+    checkpoint = saver.save_checkpoint()
+
+    loaded = Database(store=store)
+    loaded.load_checkpoint(checkpoint)
+    # A record is filed under the identity its database derived when it ran,
+    # so a saving database that answered from a fingerprint predating the
+    # change would write the earlier identity into the manifest and this load
+    # would miss it. Reuse is the witness that the saved identity is the one a
+    # loading database derives from the same live class.
+    assert loaded.get(scaled) == Database().get(scaled) == 3
+    assert loaded.inspect(scaled).last_recompute == "reused"
+
+
+def test_record_saved_after_a_captured_class_change_is_not_warmed_into_the_old_world(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = Input[int]("checkpoint_class_attr_limit")
+
+    @query(key="checkpoint-class-attr-window")
+    def scaled(db: Database) -> int:
+        return limit.read(db) * _CheckpointConsts.SCALE
+
+    store = InMemoryArtifactStore()
+    saver = Database(store=store)
+    saver.set(limit, 10)
+    assert saver.get(scaled) == 20
+
+    with monkeypatch.context() as patched:
+        patched.setattr(_CheckpointConsts, "SCALE", 3)
+        saver.set(limit, 20)
+        # The input change forces this execution whatever the captured class
+        # holds, so the value saved below is a value of the changed world.
+        assert saver.get(scaled) == 60
+        checkpoint = saver.save_checkpoint()
+
+    # The class is back to what it was before that execution, and the record
+    # must not be reachable from here: only its identity records which capture
+    # produced it, and a database that never held the changed class must
+    # recompute rather than warm the value that class produced.
+    loaded = Database(store=store)
+    loaded.set(limit, 20)
+    loaded.load_checkpoint(checkpoint)
+    scratch = Database()
+    scratch.set(limit, 20)
+    assert loaded.get(scaled) == scratch.get(scaled) == 40
+    assert loaded.inspect(scaled).last_recompute == "executed"
+
+
 # ---------------------------------------------------------------------------
 # Reuse restoration (D5): execute-to-verify the frontier by re-execution and
 # re-establish a resource's live record from its checkpoint probe hint.

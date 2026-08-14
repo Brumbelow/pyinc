@@ -150,6 +150,51 @@ class _ObservedResourceHolder:
     nested = _ObservedScaledResource(2)
 
 
+class _ObservedPartsResource(Resource[int, int, int]):
+    def __init__(self, scale: int) -> None:
+        # A list, so a write into the configuration leaves every reference an
+        # observation can pin identical and only re-reading identity() sees it.
+        self.parts = [scale]
+
+    def identity(self) -> tuple[str, tuple[int, ...]]:
+        return ("observed-parts-resource", tuple(self.parts))
+
+    def label(self, key: int) -> str:
+        return f"parts[{key}]"
+
+    def probe(self, key: int) -> int:
+        return self.parts[0]
+
+    def load(self, db: Database, key: int) -> int:
+        return self.parts[0] * key
+
+
+class _ObservedPartsHolder:
+    """Class-body slot for a resource that a query also captures directly."""
+
+    nested: Any = None
+
+
+def _observed_documented() -> int:
+    """ab"""
+
+    return 1
+
+
+def _observed_shared_source() -> int:
+    return 3
+
+
+class _ObservedDualDescriptorHolder:
+    @staticmethod
+    def scaled() -> int:
+        return _observed_shared_source() * 10
+
+    @property
+    def offset(self) -> int:
+        return _observed_shared_source() * 100
+
+
 class _CountingEq:
     def __init__(self, tolerance: int) -> None:
         self.tolerance = tolerance
@@ -171,6 +216,23 @@ def _memo_and_truth(db: Database, target: Any) -> tuple[str, str]:
     memoized = db._query_fingerprint(target)
     db._query_fingerprint_memo.pop(target, None)
     return memoized, db._query_fingerprint(target)
+
+
+def _assert_warm_matches_fresh(db: Database, mode: str, target: Any, expected: Any) -> None:
+    """Pin *db*'s warm answer for *target* against a from-scratch database.
+
+    ``db`` has already answered *target* once and something the fingerprint
+    covers has changed since. The execution counter is read before the warm
+    call: a query whose identity moved with the change has no record to reuse
+    and must execute, so a warm answer that merely repeated the stored one
+    fails here instead of passing as agreement.
+    """
+
+    executions = db.statistics().query_executions
+    warm = db.get(target)
+    fresh = Database(mode=mode).get(target)
+    assert warm == fresh == expected
+    assert db.statistics().query_executions == executions + 1
 
 
 def test_input_keys_are_nonempty_keyword_configured_and_unique_per_database() -> None:
@@ -2079,6 +2141,475 @@ def test_rebound_global_behind_a_captured_module_function_matches_fresh(
         fresh = Database(mode=mode).get(scaled)
         assert warm == fresh == 70
         assert db.statistics().query_executions == executions + 1
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_captured_class_attribute_change_matches_fresh(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @query(key=f"class-attr-fsc-{mode}")
+    def scaled(db: Database) -> int:
+        return _ObservedConsts.SCALE + 0
+
+    db = Database(mode=mode)
+    assert db.get(scaled) == 2
+    monkeypatch.setattr(_ObservedConsts, "SCALE", 3)
+    _assert_warm_matches_fresh(db, mode, scaled, 3)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_class_attribute_reached_from_body_and_annotation_matches_fresh(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @query(key=f"class-attr-two-slots-fsc-{mode}")
+    def scaled(db: Database, value: Any = None) -> int:
+        return _ObservedConsts.SCALE + 0
+
+    # One class in two slots: the body captures it and the annotation names
+    # it. Whichever slot arrives first is the one that folds the class body,
+    # because the second finds the class already seen.
+    scaled.fn.__annotations__["value"] = _ObservedConsts
+    db = Database(mode=mode)
+    assert db.get(scaled) == 2
+    monkeypatch.setattr(_ObservedConsts, "SCALE", 4)
+    _assert_warm_matches_fresh(db, mode, scaled, 4)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_instance_state_reached_from_default_and_body_matches_fresh(mode: str) -> None:
+    @query(key=f"instance-state-fsc-{mode}")
+    def boxed(db: Database, item: _ObservedBox = _observed_box) -> int:
+        return item.factor + _observed_box.factor
+
+    db = Database(mode=mode)
+    assert db.get(boxed) == 4
+    original = _observed_box.factor
+    object.__setattr__(_observed_box, "factor", 5)
+    try:
+        # The default value and the captured global are one instance, so a
+        # field written in place has to be seen through whichever of the two
+        # slots the walk reaches first.
+        _assert_warm_matches_fresh(db, mode, boxed, 10)
+    finally:
+        object.__setattr__(_observed_box, "factor", original)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_captured_function_docstring_change_matches_fresh(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @query(key=f"metadata-fsc-{mode}")
+    def documented(db: Database) -> int:
+        return len(_observed_documented.__doc__ or "")
+
+    db = Database(mode=mode)
+    assert db.get(documented) == 2
+    monkeypatch.setattr(_observed_documented, "__doc__", "abcd")
+    _assert_warm_matches_fresh(db, mode, documented, 4)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_function_metadata_reached_from_default_and_body_matches_fresh(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @query(key=f"metadata-two-slots-fsc-{mode}")
+    def documented(db: Database, fn: Any = _observed_documented) -> int:
+        return len(_observed_documented.__doc__ or "")
+
+    db = Database(mode=mode)
+    assert db.get(documented) == 2
+    # The same function object arrives as a default value and as a captured
+    # global; only one of the two folds its metadata, and the docstring has
+    # to move the verdict either way.
+    monkeypatch.setattr(_observed_documented, "__doc__", "abcdef")
+    _assert_warm_matches_fresh(db, mode, documented, 6)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_shared_policy_state_change_matches_fresh(mode: str) -> None:
+    comparator = _CountingEq(0)
+    tolerant = Input[int](f"policy-fsc-input-{mode}", eq=comparator)
+
+    @query(key=f"policy-fsc-{mode}", eq=comparator)
+    def read_tolerant(db: Database) -> int:
+        return tolerant.read(db) + 1
+
+    db = Database(mode=mode)
+    db.set(tolerant, 1)
+    assert db.get(read_tolerant) == 2
+    # One comparator in two slots: the input's policy, reached through the
+    # captured input, and the query's own policy. A policy decides what counts
+    # as a change rather than what the query returns, so the value cannot move
+    # here; what the change owes is the recompute the counter below checks and
+    # agreement with a database that never held the earlier tolerance.
+    comparator.tolerance = 5
+    executions = db.statistics().query_executions
+    warm = db.get(read_tolerant)
+    fresh_db = Database(mode=mode)
+    fresh_db.set(tolerant, 1)
+    assert warm == fresh_db.get(read_tolerant) == 2
+    assert db.statistics().query_executions == executions + 1
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="type-alias and type-parameter syntax require Python 3.12",
+)
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_alias_reached_from_body_and_annotation_matches_fresh(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_alias_verdict_helper_{mode}"
+    helper = _import_alias_helper_module(tmp_path, monkeypatch, module_name)
+    try:
+        alias = helper.Alias
+
+        @query(key=f"alias-two-slots-fsc-{mode}")
+        def scaled(db: Database, value: Any = None) -> int:
+            return cast(int, alias.__value__.SCALE) + 0
+
+        # The alias is captured by the body and named by the annotation, and
+        # the class it resolves to is reached only through its evaluator.
+        scaled.fn.__annotations__["value"] = alias
+        db = Database(mode=mode)
+        assert db.get(scaled) == 2
+        monkeypatch.setattr(helper.Target, "SCALE", 3)
+        _assert_warm_matches_fresh(db, mode, scaled, 3)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="type-alias and type-parameter syntax require Python 3.12",
+)
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_type_parameter_reached_from_body_and_annotation_matches_fresh(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_parameter_verdict_helper_{mode}"
+    helper = _import_alias_helper_module(tmp_path, monkeypatch, module_name)
+    try:
+        parameter = helper.bounded.__type_params__[0]
+
+        @query(key=f"parameter-two-slots-fsc-{mode}")
+        def scaled(db: Database, value: Any = None) -> int:
+            return cast(int, parameter.__bound__.SCALE) + 0
+
+        # A bound carries its content behind the same class, reached from the
+        # captured parameter and from the annotation that names it.
+        scaled.fn.__annotations__["value"] = parameter
+        db = Database(mode=mode)
+        assert db.get(scaled) == 2
+        monkeypatch.setattr(helper.Target, "SCALE", 4)
+        _assert_warm_matches_fresh(db, mode, scaled, 4)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_resource_configuration_change_matches_fresh(mode: str) -> None:
+    resource = _ObservedPartsResource(2)
+
+    @query(key=f"resource-config-fsc-{mode}")
+    def scaled(db: Database) -> int:
+        return db.read_resource(resource, 10)
+
+    db = Database(mode=mode)
+    assert db.get(scaled) == 20
+    resource.parts[0] = 3
+    _assert_warm_matches_fresh(db, mode, scaled, 30)
+    # The resource edge re-probes on its own, so agreement on the value alone
+    # would not say the configuration reached this query's identity. The
+    # fingerprint is that identity: a warm database's answer for it has to
+    # equal what a database that never saw the earlier configuration derives.
+    assert db._query_fingerprint(scaled) == Database(mode=mode)._query_fingerprint(scaled)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_resource_reached_from_capture_and_class_body_matches_fresh(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resource = _ObservedPartsResource(2)
+    monkeypatch.setattr(_ObservedPartsHolder, "nested", resource)
+
+    @query(key=f"resource-two-slots-fsc-{mode}")
+    def scaled(db: Database) -> int:
+        return db.read_resource(resource, 10) + len(_ObservedPartsHolder.nested.parts)
+
+    db = Database(mode=mode)
+    assert db.get(scaled) == 21
+    # One resource in two slots: a direct capture, which folds it through
+    # identity(), and a captured class body, which folds it as an ordinary
+    # instance. Whichever the walk reaches first decides how the
+    # configuration is recorded, and the write has to survive that choice.
+    resource.parts[0] = 3
+    _assert_warm_matches_fresh(db, mode, scaled, 31)
+    assert db._query_fingerprint(scaled) == Database(mode=mode)._query_fingerprint(scaled)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_module_function_reached_from_chain_and_capture_matches_fresh(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_module_two_slots_{mode}"
+    replacement_name = f"pyinc_module_two_slots_replacement_{mode}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "def inner():\n    return 3\n\n\ndef helper():\n    return inner() * 10\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{replacement_name}.py").write_text(
+        "def inner():\n    return 4\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    replacement = importlib.import_module(replacement_name)
+    try:
+        captured = module.helper
+
+        @query(key=f"module-two-slots-fsc-{mode}")
+        def scaled(db: Database) -> int:
+            return cast(int, module.helper()) + cast(int, captured())
+
+        db = Database(mode=mode)
+        assert db.get(scaled) == 60
+        # One function in two slots: the chain names it and re-resolves it,
+        # and the closure holds the same object directly. The rebinding below
+        # moves neither reference and swaps no constant the module stamp
+        # carries; what it changes is the globals behind that function.
+        monkeypatch.setattr(module, "inner", replacement.inner)
+        _assert_warm_matches_fresh(db, mode, scaled, 80)
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(replacement_name, None)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_rebound_function_on_a_captured_chain_matches_fresh(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_chain_target_swap_{mode}"
+    replacement_name = f"pyinc_chain_target_swap_replacement_{mode}"
+    (tmp_path / f"{module_name}.py").write_text("def helper():\n    return 10\n", encoding="utf-8")
+    (tmp_path / f"{replacement_name}.py").write_text(
+        "def helper():\n    return 20\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    replacement = importlib.import_module(replacement_name)
+    try:
+
+        @query(key=f"chain-target-swap-fsc-{mode}")
+        def scaled(db: Database) -> int:
+            return cast(int, module.helper())
+
+        db = Database(mode=mode)
+        assert db.get(scaled) == 10
+        # A function is no constant, so the module stamp carries nothing about
+        # this rebinding; what the chain names is a different object now, and
+        # only re-resolving it says so.
+        monkeypatch.setattr(module, "helper", replacement.helper)
+        _assert_warm_matches_fresh(db, mode, scaled, 20)
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(replacement_name, None)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_rebound_function_behind_a_captured_chain_matches_fresh(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_chain_global_swap_{mode}"
+    replacement_name = f"pyinc_chain_global_swap_replacement_{mode}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "def inner():\n    return 3\n\n\ndef helper():\n    return inner() * 10\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{replacement_name}.py").write_text(
+        "def inner():\n    return 4\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    replacement = importlib.import_module(replacement_name)
+    try:
+
+        @query(key=f"chain-global-swap-fsc-{mode}")
+        def scaled(db: Database) -> int:
+            return cast(int, module.helper())
+
+        db = Database(mode=mode)
+        assert db.get(scaled) == 30
+        # The chain still names the same function and the swapped-in value is
+        # a function rather than a constant, so neither the re-resolved target
+        # nor the module stamp moves: the change lives in the globals the
+        # fingerprint folded out of the function behind the chain.
+        monkeypatch.setattr(module, "inner", replacement.inner)
+        _assert_warm_matches_fresh(db, mode, scaled, 40)
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(replacement_name, None)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_constant_outside_the_captured_chain_matches_fresh(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_offchain_verdict_{mode}"
+    (tmp_path / f"{module_name}.py").write_text("SCALE = 1\nOTHER = 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key=f"offchain-constant-fsc-{mode}")
+        def scaled(db: Database) -> int:
+            return cast(int, module.SCALE) * 10
+
+        db = Database(mode=mode)
+        assert db.get(scaled) == 10
+        # OTHER sits on no access path, so the result cannot move with it.
+        # The fingerprint folds every constant the captured module holds, so
+        # the verdict still does: the warm read re-executes rather than
+        # answering from a record keyed under the earlier namespace.
+        monkeypatch.setattr(module, "OTHER", 9)
+        _assert_warm_matches_fresh(db, mode, scaled, 10)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_function_behind_a_captured_staticmethod_matches_fresh(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @query(key=f"descriptor-fsc-{mode}")
+    def read(db: Database) -> int:
+        return _ObservedStaticHolder.read()
+
+    db = Database(mode=mode)
+    assert db.get(read) == 30
+    monkeypatch.setattr(
+        sys.modules[__name__], "_observed_static_source", _observed_descriptor_replacement
+    )
+    _assert_warm_matches_fresh(db, mode, read, 110)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_function_behind_two_captured_descriptors_matches_fresh(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @query(key=f"descriptor-two-slots-fsc-{mode}")
+    def read(db: Database) -> int:
+        return _ObservedDualDescriptorHolder.scaled() + _ObservedDualDescriptorHolder().offset
+
+    db = Database(mode=mode)
+    assert db.get(read) == 330
+    # One function behind two descriptors of the same captured class: a
+    # staticmethod and a property, unwrapped from one class-body walk.
+    monkeypatch.setattr(
+        sys.modules[__name__], "_observed_shared_source", _observed_descriptor_replacement
+    )
+    _assert_warm_matches_fresh(db, mode, read, 1210)
+
+
+def test_rebinding_inside_a_chain_landed_class_keeps_the_warm_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_chain_landed_class_module"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Consts:\n    SCALE = 2\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="chain-landed-class-boundary")
+        def scaled(db: Database) -> int:
+            return cast(int, module.Consts.SCALE) + 0
+
+        db = Database()
+        assert db.get(scaled) == 2
+        monkeypatch.setattr(module.Consts, "SCALE", 3)
+        executions = db.statistics().query_executions
+        # The documented boundary of the memo, stated as behavior: where a
+        # chain lands on a class, the memo pins the landing object by
+        # reference and follows nothing inside it, so a database that already
+        # answered this query keeps answering from the earlier identity. Only
+        # a database fingerprinting it for the first time sees the rebinding.
+        assert db.get(scaled) == 2
+        assert db.statistics().query_executions == executions
+        assert Database().get(scaled) == 3
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_state_inside_a_chain_landed_instance_keeps_the_warm_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_chain_landed_instance_module"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from dataclasses import dataclass\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Holder:\n"
+        "    scale: int\n"
+        "\n"
+        "\n"
+        "instance = Holder(2)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="chain-landed-instance-boundary")
+        def scaled(db: Database) -> int:
+            return cast(int, module.instance.scale) + 0
+
+        db = Database()
+        assert db.get(scaled) == 2
+        object.__setattr__(module.instance, "scale", 3)
+        executions = db.statistics().query_executions
+        # The instance half of the same boundary: the landing object is one
+        # reference to the memo, whatever its fields do.
+        assert db.get(scaled) == 2
+        assert db.statistics().query_executions == executions
+        assert Database().get(scaled) == 3
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize(
+    "shape, source",
+    [("dict", "TABLE = {'scale': 2}\n"), ("list", "TABLE = [2]\n")],
+)
+def test_chain_landing_on_a_mutable_container_is_refused(
+    shape: str, source: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_chain_landed_{shape}_module"
+    (tmp_path / f"{module_name}.py").write_text(source, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key=f"chain-landed-{shape}")
+        def sized(db: Database) -> int:
+            return len(module.TABLE)
+
+        # The counterpart of the two boundary pins above: a chain landing on a
+        # mutable container is refused when the fingerprint is built, so the
+        # shapes the memo cannot follow inside are the ones the payload
+        # accepts in the first place.
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database().get(sized)
     finally:
         sys.modules.pop(module_name, None)
 
