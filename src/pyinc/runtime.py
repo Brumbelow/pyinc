@@ -3929,12 +3929,17 @@ class Database:
                 entries = sorted(state.items())
             except TypeError as exc:
                 # A handle dictionary given a name that is not a string is
-                # refused by the payload, and this walk reaches one first --
-                # the query being keyed and any query its body captures are
-                # observed before their state is folded -- so it answers with
-                # the same refusal instead of letting the sort's TypeError
-                # out. Caught rather than checked in front: this sort compares
-                # names against each other and nothing else, while a check
+                # refused by the payload, and this walk gets there first for
+                # the query being keyed and for one its body closes over --
+                # both are observed before their state is folded -- so it
+                # answers with the same refusal instead of letting the sort's
+                # TypeError out. This does not stand in for the payload's own
+                # check: a handle reached through a module attribute chain is
+                # folded without this walk ever observing it, because the walk
+                # stops at the module. Caught rather than checked in front:
+                # the sort is attempted, and a TypeError out of it -- from the
+                # names, or from the values a tuple comparison falls through
+                # to -- is answered as invalid custom state, while a check
                 # would cost every observation of every handle on the memo
                 # path this closure exists to serve.
                 raise UnsupportedValueError(

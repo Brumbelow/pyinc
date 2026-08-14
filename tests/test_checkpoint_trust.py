@@ -2022,12 +2022,13 @@ def test_query_handle_attribute_the_body_never_reads_invalidates_records() -> No
     checkpoint = saver.save_checkpoint()
 
     # This body reads nothing off its handle, so the write below cannot reach
-    # the query through the capture the test above relies on -- the handle fold
-    # is the only thing that can see it, and it reaches the whole handle rather
-    # than the part some body happens to read. The value is unchanged by
-    # construction: what is pinned is that the stored record stops answering,
-    # which is the only way a later write that *does* change the value can be
-    # trusted to miss as well.
+    # the query through the capture the test above relies on. The handle fold
+    # is what moves identity here, reaching the whole handle rather than the
+    # part some body happens to read, and the moved identity is what makes the
+    # stored record unreachable. The value is unchanged by construction: what
+    # is pinned is that the stored record stops answering, which is the only
+    # way a later write that *does* change the value can be trusted to miss as
+    # well.
     cast(Any, stamped).threshold = 2
     loaded = Database(store=store)
     loaded.load_checkpoint(checkpoint)

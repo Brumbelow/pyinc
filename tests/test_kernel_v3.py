@@ -3845,3 +3845,40 @@ def test_query_handle_with_a_non_string_attribute_name_is_refused() -> None:
             match=rf"Query handle '{key}' has invalid custom state\.",
         ):
             Database().get(handle)
+
+
+def test_module_reached_query_handle_with_a_non_string_name_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_query_handle_non_string_name"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from pyinc import Database, query\n"
+        "\n"
+        "\n"
+        '@query(key="module-handle-non-string-name-child")\n'
+        "def child(db: Database) -> int:\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="module-handle-non-string-name-parent")
+        def parent(db: Database) -> int:
+            return cast(int, module.child(db)) + 1
+
+        # The route the memo observation cannot answer for: a module is a leaf
+        # of the definition observation, so a handle reached through a module
+        # attribute chain is folded without that walk ever reaching it. The
+        # refusal here has to come out of the fold's own guard; take that guard
+        # away and the sort behind it hands the caller a raw TypeError.
+        cast(dict[Any, Any], module.child.__dict__)[7] = 1
+        with pytest.raises(
+            UnsupportedValueError,
+            match=r"Query handle 'module-handle-non-string-name-child' has invalid custom state\.",
+        ):
+            Database().get(parent)
+    finally:
+        sys.modules.pop(module_name, None)
