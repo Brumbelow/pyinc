@@ -611,6 +611,7 @@ class Database:
                 tuple[tuple[ModuleType, Any], ...],
                 tuple[tuple[Any, str], ...],
                 tuple[tuple[ModuleType, tuple[str, ...], Any], ...],
+                tuple[Any, ...],
             ],
         ] = weakref.WeakKeyDictionary()
         self._fingerprint_module_collector: ContextVar[dict[int, ModuleType] | None] = ContextVar(
@@ -3170,16 +3171,25 @@ class Database:
             cached is not None
             and cached[0] == runtime_build
             and self._definition_observation_matches(cached[1], definition_observation)
+            # Cheapest arm first: re-resolving a chain is a lookup per path
+            # segment, where a module stamp hashes a file and a resource digest
+            # re-runs identity(). Every arm is a pure read, so the order only
+            # decides what a mismatch costs before it is found.
+            and all(
+                self._resolve_module_path_target(module, path) is expected
+                for module, path, expected in cached[5]
+            )
+            # Reads the recorded targets, which the arm above has just proved
+            # are the objects those chains still name.
+            and self._definition_observation_matches(
+                cached[6], self._module_function_target_observation(cached[5])
+            )
             and all(
                 self._module_observation_stamp(module) == expected for module, expected in cached[3]
             )
             and all(
                 self._resource_identity_digest(resource) == expected
                 for resource, expected in cached[4]
-            )
-            and all(
-                self._resolve_module_path_target(module, path) is expected
-                for module, path, expected in cached[5]
             )
         ):
             return cached[2]
@@ -3229,6 +3239,7 @@ class Database:
                 (id(observed_module), observed_path),
                 (observed_module, observed_path, observed_target),
             )
+        attribute_records = tuple(deduped_attributes.values())
         if cacheable:
             self._query_fingerprint_memo[query] = (
                 runtime_build,
@@ -3236,7 +3247,8 @@ class Database:
                 result,
                 module_observations,
                 tuple(deduped_resources.values()),
-                tuple(deduped_attributes.values()),
+                attribute_records,
+                self._module_function_target_observation(attribute_records),
             )
         else:
             self._query_fingerprint_memo.pop(query, None)
@@ -3296,16 +3308,70 @@ class Database:
         metadata, captured class bodies, and captured instance and policy
         state — pinning each entry's reference where the payload folds its
         value; modules stay leaves, and so do the types the payload pins by
-        module anchor rather than by a namespace walk. A module's file content
-        is gated by `_module_observation_stamp`, and the statically accessed
-        attributes whose live values the fingerprint folds are re-resolved by
-        identity against the memo's recorded targets. Resources get no arm of
-        their own either: what a fold reads out of `identity()` is gated by the
-        recorded configuration digests the memo carries alongside this
-        observation, and every slot that reaches a resource for anything else
-        folds it as the ordinary class or instance it is, so the arms below
-        already observe it from whichever slot arrives first.
+        module anchor rather than by a namespace walk.
+
+        A module is covered by three memo arms instead, because this walk never
+        enters one: `_module_observation_stamp` re-derives its file bytes,
+        import metadata and module-level constants; each statically accessed
+        attribute chain is re-resolved and its target compared by identity; and
+        the definitions behind chain-reached functions, whose globals and
+        defaults the payload folds live, are observed by
+        `_module_function_target_observation`. What no arm follows is state
+        mutated in place behind a chain — a class body or an instance reached
+        through one. Resources get no arm of their own either: what a fold
+        reads out of `identity()` is gated by the recorded configuration
+        digests the memo carries alongside this observation, and every slot
+        that reaches a resource for anything else folds it as the ordinary
+        class or instance it is, so the arms below already observe it from
+        whichever slot arrives first.
         """
+
+        observe_value, observe_function = self._definition_observers()
+        return (
+            query.key,
+            observe_value(query.eq),
+            observe_value(query.cutoff),
+            observe_function(query.fn),
+        )
+
+    def _module_function_target_observation(
+        self, records: tuple[tuple[ModuleType, tuple[str, ...], Any], ...]
+    ) -> tuple[Any, ...]:
+        """Observe the definitions behind chain-reached module functions.
+
+        `_module_attribute_payload` folds a function target through
+        `_function_definition_payload`, which reads its defaults, closure and
+        globals live. None of that moves the function's identity, and the
+        module's constants payload carries none of it either, so the memo needs
+        the same observation the query's own function gets. One observer family
+        covers every record, in the order the memo stored them, so a value two
+        chains share is folded on first contact the same way here as it was
+        when the stored observation was built.
+        """
+
+        targets = [
+            target for _module, _path, target in records if isinstance(target, FunctionType)
+        ]
+        if not targets:
+            # Most queries reach no module function at all, and building the
+            # observer family is the expensive half of this call.
+            return ()
+        observe_value, _observe_function = self._definition_observers()
+        return tuple(observe_value(target) for target in targets)
+
+    def _definition_observers(
+        self,
+    ) -> tuple[Callable[[Any], Any], Callable[[FunctionType], Any]]:
+        """Build one observer family over a fresh shared `seen` set.
+
+        The `seen` set is what makes an observation first-contact-complete: a
+        value reached from two slots is folded once, by whichever slot arrives
+        first, and pinned by reference afterwards. Callers that must compare
+        two observations therefore have to build them from families of the same
+        shape — one family per observation, over the same slots in the same
+        order.
+        """
+
         from .core import Input, Query
 
         seen: builtins.set[int] = set()
@@ -3328,9 +3394,10 @@ class Database:
             if isinstance(value, FunctionType):
                 return observe_function(value)
             if isinstance(value, ModuleType):
-                # Modules are gated by the memoized module observations: the
-                # content stamp, plus the statically accessed attribute targets
-                # the memo re-resolves by identity.
+                # Modules are gated by three memo arms instead of a walk here:
+                # the observation stamp over file content and namespace
+                # constants, the attribute targets re-resolved by identity, and
+                # the observed definitions behind chain-reached functions.
                 return value
             if isinstance(value, type):
                 return observe_type(value)
@@ -3596,12 +3663,7 @@ class Database:
                 tuple(observe_annotation(item) for item in type_parameters or ()),
             )
 
-        return (
-            query.key,
-            observe_value(query.eq),
-            observe_value(query.cutoff),
-            observe_function(query.fn),
-        )
+        return observe_value, observe_function
 
     @classmethod
     def _definition_observation_matches(cls, expected: Any, current: Any) -> bool:
@@ -5383,15 +5445,19 @@ class Database:
         * a digest of the bytes at `module.__file__`; frozen and built-in
           modules are pinned through the runtime-build identity;
         * a sorted `__all__` tuple when declared, capturing the module's
-          publicly promised surface.
+          publicly promised surface;
+        * the module-level stable constants, read live by
+          `_module_constants_payload` — so a namespace write to one of them
+          moves this payload without any file changing.
 
-        No namespace value is carried here: the behavior behind a captured
-        module's statically accessed attribute chains is folded live by
-        `_captured_module_path_payload`, and the fingerprint memo re-resolves
-        those chains by identity before reusing a digest that folded them. That
-        recheck is by identity only: state mutated in place behind such a chain
-        moves the freshly folded payload but not the recorded target, so it
-        belongs in an `Input` or a `Resource`.
+        The behavior behind statically accessed attribute chains is folded
+        elsewhere, by `_captured_module_path_payload`. Before reusing a digest
+        that folded any of this, the memo re-derives the constants inside
+        `_module_observation_stamp`, re-resolves each chain and compares its
+        target by identity, and observes the definitions behind chain-reached
+        functions. What no arm follows is state mutated in place behind a
+        chain — a class body or an instance reached through one — which belongs
+        in an `Input` or a `Resource`.
         """
         collector = self._fingerprint_module_collector.get()
         if collector is not None:
@@ -5487,18 +5553,7 @@ class Database:
         else:
             raise UnsupportedValueError(f"Captured module {module_name!r} has an unsafe __all__.")
 
-        stable_constants: list[tuple[str, Any]] = []
-        for name, item in sorted(namespace.items()):
-            if name.startswith("__") or name in {"__all__", "__version__"}:
-                continue
-            if isinstance(item, (FunctionType, ModuleType, type)):
-                continue
-            try:
-                constant_payload = self._module_constant_payload(item, set())
-            except UnsupportedValueError:
-                continue
-            stable_constants.append((name, constant_payload))
-        constants_payload = tuple(stable_constants)
+        constants_payload = self._module_constants_payload(module)
 
         if origin in {"built-in", "frozen"}:
             return (
@@ -5552,7 +5607,13 @@ class Database:
         return current
 
     def _module_observation_stamp(self, module: ModuleType) -> Any:
-        """Return a cheap invalidation token for a memoized module identity."""
+        """Return the invalidation token for a memoized module identity.
+
+        Re-derives what `_module_identity_payload` folded: import metadata,
+        `__version__`, `__all__`, the file bytes, and the module-level
+        constants. Anything that payload reads and this does not would be a
+        change the memo could hide.
+        """
 
         namespace = vars(module)
         specification = namespace.get("__spec__")
@@ -5602,7 +5663,35 @@ class Database:
             version_payload,
             all_payload,
             source_observation,
+            # The identity payload folds these live for every captured module,
+            # including the stdlib branch, and a namespace write moves them
+            # without touching the file bytes above.
+            self._module_constants_payload(module),
         )
+
+    def _module_constants_payload(self, module: ModuleType) -> tuple[tuple[str, Any], ...]:
+        """Fold the module-level constants a captured module contributes.
+
+        The single read behind both the identity payload and the observation
+        stamp, so what a fingerprint folds and what the memo guard re-derives
+        cannot drift apart. Names whose values are not stable constants are
+        skipped rather than refused: functions, modules and types are reached
+        through their own payloads, and anything else the constant payload
+        cannot fold is left to whichever chain reaches it.
+        """
+
+        stable_constants: list[tuple[str, Any]] = []
+        for name, item in sorted(vars(module).items()):
+            if name.startswith("__") or name in {"__all__", "__version__"}:
+                continue
+            if isinstance(item, (FunctionType, ModuleType, type)):
+                continue
+            try:
+                constant_payload = self._module_constant_payload(item, set())
+            except UnsupportedValueError:
+                continue
+            stable_constants.append((name, constant_payload))
+        return tuple(stable_constants)
 
     def _module_constant_payload(self, value: Any, active_ids: builtins.set[int]) -> Any:
         if type(value) in (str, bytes, int, bool, type(None)):

@@ -5,6 +5,7 @@ import importlib
 import importlib.machinery
 import json
 import os
+import string
 import struct
 import sys
 import sysconfig
@@ -1809,17 +1810,20 @@ def test_memoized_fingerprint_tracks_rebound_module_attributes(
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     module = importlib.import_module(module_name)
+    try:
 
-    @query(key="memo-module-attribute")
-    def scaled(db: Database) -> int:
-        return cast(int, module.SCALE) * 10
+        @query(key="memo-module-attribute")
+        def scaled(db: Database) -> int:
+            return cast(int, module.SCALE) * 10
 
-    db = Database()
-    db._query_fingerprint(scaled)
-    monkeypatch.setattr(module, "SCALE", 5)
-    memoized, truth = _memo_and_truth(db, scaled)
-    assert memoized == truth
-    assert memoized == Database()._query_fingerprint(scaled)
+        db = Database()
+        db._query_fingerprint(scaled)
+        monkeypatch.setattr(module, "SCALE", 5)
+        memoized, truth = _memo_and_truth(db, scaled)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(scaled)
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -1831,19 +1835,22 @@ def test_rebound_module_attribute_matches_fresh(
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     module = importlib.import_module(module_name)
+    try:
 
-    @query(key=f"module-attribute-fsc-{mode}")
-    def scaled(db: Database) -> int:
-        return cast(int, module.SCALE) * 10
+        @query(key=f"module-attribute-fsc-{mode}")
+        def scaled(db: Database) -> int:
+            return cast(int, module.SCALE) * 10
 
-    db = Database(mode=mode)
-    assert db.get(scaled) == 10
-    monkeypatch.setattr(module, "SCALE", 5)
-    executions = db.statistics().query_executions
-    warm = db.get(scaled)
-    fresh = Database(mode=mode).get(scaled)
-    assert warm == fresh == 50
-    assert db.statistics().query_executions == executions + 1
+        db = Database(mode=mode)
+        assert db.get(scaled) == 10
+        monkeypatch.setattr(module, "SCALE", 5)
+        executions = db.statistics().query_executions
+        warm = db.get(scaled)
+        fresh = Database(mode=mode).get(scaled)
+        assert warm == fresh == 50
+        assert db.statistics().query_executions == executions + 1
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def test_memoized_fingerprint_reuses_the_memo_for_an_unchanged_module_capture(
@@ -1856,21 +1863,136 @@ def test_memoized_fingerprint_reuses_the_memo_for_an_unchanged_module_capture(
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     module = importlib.import_module(module_name)
+    try:
 
-    @query(key="memo-module-attribute-steady")
-    def scaled(db: Database) -> int:
-        return cast(int, module.SCALE) * cast(int, module.helper())
+        @query(key="memo-module-attribute-steady")
+        def scaled(db: Database) -> int:
+            return cast(int, module.SCALE) * cast(int, module.helper())
+
+        db = Database()
+        first = db._query_fingerprint(scaled)
+        entry = db._query_fingerprint_memo[scaled]
+        assert db._query_fingerprint(scaled) == first
+        # The counterpart of the coherence pins above, for the guard arms that
+        # re-resolve attribute chains, observe the function one of them reaches
+        # and re-derive the module constants: any of them answering with a
+        # fresh object every call would recompute here with every coherence pin
+        # still green. A recompute stores a newly built entry, so entry
+        # identity separates a served memo from one that rebuilt the same
+        # digest.
+        assert db._query_fingerprint_memo[scaled] is entry
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_memoized_fingerprint_tracks_constants_outside_the_captured_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_offchain_constant_module"
+    (tmp_path / f"{module_name}.py").write_text("SCALE = 1\nOTHER = 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-offchain-constant")
+        def scaled(db: Database) -> int:
+            return cast(int, module.SCALE) * 10
+
+        db = Database()
+        db._query_fingerprint(scaled)
+        # OTHER sits on no access path, so no chain re-resolves it. The module
+        # identity payload folds every stable constant the namespace holds, so
+        # the write moves the fingerprint and only the module stamp can see it.
+        monkeypatch.setattr(module, "OTHER", 9)
+        memoized, truth = _memo_and_truth(db, scaled)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(scaled)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_memoized_fingerprint_tracks_constants_on_a_captured_stdlib_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-stdlib-constant")
+    def letters(db: Database) -> int:
+        return len(string.ascii_lowercase)
 
     db = Database()
-    first = db._query_fingerprint(scaled)
-    entry = db._query_fingerprint_memo[scaled]
-    assert db._query_fingerprint(scaled) == first
-    # The counterpart of the coherence pins above, for the guard arm that
-    # re-resolves attribute chains: a re-resolution answering with a fresh
-    # object every call would recompute here with every coherence pin still
-    # green. A recompute stores a newly built entry, so entry identity
-    # separates a served memo from one that rebuilt the same digest.
-    assert db._query_fingerprint_memo[scaled] is entry
+    db._query_fingerprint(letters)
+    # A stdlib capture folds paths rather than the values behind them, but its
+    # module identity payload still carries the namespace constants.
+    monkeypatch.setattr(string, "PYINC_PROBE_CONSTANT", 5, raising=False)
+    memoized, truth = _memo_and_truth(db, letters)
+    assert memoized == truth
+    assert memoized == Database()._query_fingerprint(letters)
+
+
+def test_memoized_fingerprint_tracks_functions_a_captured_module_function_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_function_dependency"
+    replacement_name = "pyinc_module_function_replacement"
+    (tmp_path / f"{module_name}.py").write_text(
+        "def inner():\n    return 3\n\n\ndef helper():\n    return inner() * 10\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{replacement_name}.py").write_text(
+        "def inner():\n    return 4\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    replacement = importlib.import_module(replacement_name)
+    try:
+
+        @query(key="memo-module-function-global")
+        def scaled(db: Database) -> int:
+            return cast(int, module.helper())
+
+        db = Database()
+        db._query_fingerprint(scaled)
+        # The chain names helper, whose identity this rebinding leaves alone,
+        # and inner is a function rather than a constant, so neither the
+        # re-resolved target nor the module stamp moves. What the fingerprint
+        # folded is helper's globals, which is what the memo has to observe.
+        monkeypatch.setattr(module, "inner", replacement.inner)
+        memoized, truth = _memo_and_truth(db, scaled)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(scaled)
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(replacement_name, None)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_rebound_global_behind_a_captured_module_function_matches_fresh(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_module_function_limit_{mode}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "LIMIT = 2\n\n\ndef helper():\n    return LIMIT * 10\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key=f"module-function-global-fsc-{mode}")
+        def scaled(db: Database) -> int:
+            return cast(int, module.helper())
+
+        db = Database(mode=mode)
+        assert db.get(scaled) == 20
+        monkeypatch.setattr(module, "LIMIT", 7)
+        executions = db.statistics().query_executions
+        warm = db.get(scaled)
+        fresh = Database(mode=mode).get(scaled)
+        assert warm == fresh == 70
+        assert db.statistics().query_executions == executions + 1
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def test_declared_mid_span_resource_reconfiguration_reaches_the_next_request() -> None:
