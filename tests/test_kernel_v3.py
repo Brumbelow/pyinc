@@ -2629,6 +2629,48 @@ def test_state_inside_a_chain_landed_instance_keeps_the_warm_verdict(
         sys.modules.pop(module_name, None)
 
 
+def test_state_inside_a_chain_landed_container_keeps_the_warm_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_chain_landed_tuple_module"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from dataclasses import dataclass\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Holder:\n"
+        "    scale: int\n"
+        "\n"
+        "\n"
+        "TABLE = (Holder(2),)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="chain-landed-tuple-boundary")
+        def scaled(db: Database) -> int:
+            return cast(int, module.TABLE[0].scale) * 10
+
+        db = Database()
+        assert db.get(scaled) == 20
+        object.__setattr__(module.TABLE[0], "scale", 3)
+        executions = db.statistics().query_executions
+        # A tuple is an accepted landing, and the same boundary runs through
+        # it: the payload folds what the tuple holds while the memo compares
+        # the tuple by identity and follows nothing inside. So the residue is
+        # not confined to a class or an instance a chain names directly -- it
+        # reaches a frozen dataclass held in any immutable container the
+        # payload accepts.
+        assert db.get(scaled) == 20
+        assert db.statistics().query_executions == executions
+        assert Database().get(scaled) == 30
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 @pytest.mark.parametrize(
     "shape, source",
     [
@@ -2682,11 +2724,11 @@ def test_chain_landing_the_payload_cannot_pin_is_refused(
         def sized(db: Database) -> int:
             return len(str(module.TABLE))
 
-        # The counterpart of the two boundary pins above, and the bound on
-        # them: a chain landing on any of these is refused when the
-        # fingerprint is built, so the warm answers those pins document are
-        # confined to the two shapes that are accepted and then not followed
-        # inside — a class and a frozen dataclass.
+        # The counterpart of the boundary pins above: these landings are
+        # refused when the fingerprint is built rather than folded and left to
+        # a memo that cannot follow them, so no stale answer comes from any of
+        # them. The landings that are folded, and then compared only through
+        # the landed object's identity, are what those pins document.
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
             Database().get(sized)
     finally:
