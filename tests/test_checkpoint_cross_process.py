@@ -270,3 +270,205 @@ def test_cross_process_optimize_flag_reexecutes(
     out = cross_process.run_load("unchanged", optimize=True)
     assert out["recompute"] == "executed"
     assert out["result"] == cross_process.save_result
+
+
+WRAPPED_FIXTURE_SCRIPT = '''\
+"""Cross-process fixture: queries capturing a wraps-decorated callable whose
+instance state is mutated at runtime in the loading process. The same instance
+is reached both through the helper module and through a direct import."""
+
+import json
+import sys
+from pathlib import Path
+
+from pyinc import Database, FileSystemArtifactStore, query
+
+import wrapped_state_helper  # tmp_path module; byte-identical in both phases
+from wrapped_state_helper import scaler
+
+store_dir = sys.argv[1]
+phase = sys.argv[2]
+
+
+@query
+def scaled_via_module(db):
+    return wrapped_state_helper.scaler(10)
+
+
+@query
+def scaled_direct(db):
+    return scaler(10)
+
+
+def main():
+    store = FileSystemArtifactStore(store_dir)
+    if phase == "save":
+        db = Database(store=store)
+        results = [db.get(scaled_via_module), db.get(scaled_direct)]
+        key = db.save_checkpoint()
+        json.dump({"results": results, "key": key}, sys.stdout)
+        return
+
+    # Mutate the live instance before anything is loaded: the helper's source
+    # is untouched, so only the callable's state can distinguish the processes.
+    wrapped_state_helper.scaler.k = 3
+    db = Database(store=store)
+    db.load_checkpoint((Path(store_dir).parent / "wrapped.key").read_text())
+    results = [db.get(scaled_via_module), db.get(scaled_direct)]
+    recomputes = [
+        db.inspect(scaled_via_module).last_recompute,
+        db.inspect(scaled_direct).last_recompute,
+    ]
+    json.dump({"results": results, "recomputes": recomputes}, sys.stdout)
+
+
+main()
+'''
+
+WRAPPED_HELPER_SOURCE = """\
+import functools
+
+
+def base(value):
+    return value
+
+
+class Scaler:
+    def __init__(self, k):
+        self.k = k
+        functools.wraps(base)(self)
+
+    def __call__(self, value):
+        return self.k * value
+
+
+scaler = Scaler(2)
+"""
+
+
+def test_wrapped_callable_state_change_misses_across_processes(tmp_path: Path) -> None:
+    script = tmp_path / "wrapped_fixture.py"
+    script.write_text(WRAPPED_FIXTURE_SCRIPT, encoding="utf-8")
+    helper = tmp_path / "wrapped_state_helper.py"
+    helper.write_text(WRAPPED_HELPER_SOURCE, encoding="utf-8")
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([_src_dir(), str(tmp_path)]),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+    saved = _run([sys.executable, str(script), str(store_dir), "save"], env)
+    assert saved["results"] == [20, 20]
+    (tmp_path / "wrapped.key").write_text(saved["key"])
+
+    # Both phases run the same file and the helper is never rewritten, so the
+    # module stamp is identical in both processes; the factor moving from 2 to 3
+    # in the loading process is the only difference the identity can see. The
+    # checkpointed records must miss and the queries re-execute against k=3,
+    # whether the callable is reached through the module or imported directly.
+    loaded = _run([sys.executable, str(script), str(store_dir), "load"], env)
+    assert loaded["results"] == [30, 30]
+    assert loaded["recomputes"] == ["executed", "executed"]
+
+
+PINNED_FIXTURE_SCRIPT = '''\
+"""Cross-process fixture: two roots reaching the same dependency query, one
+through a captured function and one through a class that carries __wrapped__."""
+
+import json
+import sys
+from pathlib import Path
+
+from pyinc import Database, FileSystemArtifactStore
+
+import wrapped_pin_helper
+
+store_dir = sys.argv[1]
+phase = sys.argv[2]
+
+through_function = wrapped_pin_helper.through_function
+through_class = wrapped_pin_helper.through_class
+
+
+def main():
+    store = FileSystemArtifactStore(store_dir)
+    db = Database(store=store)
+    key_path = Path(store_dir).parent / "pinned.key"
+    if phase == "save":
+        results = [db.get(through_function), db.get(through_class)]
+        key_path.write_text(db.save_checkpoint())
+        json.dump({"results": results}, sys.stdout)
+        return
+
+    db.load_checkpoint(key_path.read_text())
+    function_result = db.get(through_function)
+    function_recompute = db.inspect(through_function).last_recompute
+    class_result = db.get(through_class)
+    class_recompute = db.inspect(through_class).last_recompute
+    json.dump(
+        {
+            "results": [function_result, class_result],
+            "recomputes": [function_recompute, class_recompute],
+        },
+        sys.stdout,
+    )
+
+
+main()
+'''
+
+PINNED_HELPER_SOURCE = """\
+from pyinc import query
+
+
+@query
+def leaf(db):
+    return 7
+
+
+def reach(db):
+    return leaf(db)
+
+
+class Gate:
+    __wrapped__ = reach
+
+
+@query
+def through_function(db):
+    return reach(db) + 2
+
+
+@query
+def through_class(db):
+    return Gate.__wrapped__(db) + 1
+"""
+
+
+def test_dep_query_behind_wrapped_class_reexecutes_across_processes(tmp_path: Path) -> None:
+    script = tmp_path / "pinned_fixture.py"
+    script.write_text(PINNED_FIXTURE_SCRIPT, encoding="utf-8")
+    helper = tmp_path / "wrapped_pin_helper.py"
+    helper.write_text(PINNED_HELPER_SOURCE, encoding="utf-8")
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([_src_dir(), str(tmp_path)]),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+    saved = _run([sys.executable, str(script), str(store_dir), "save"], env)
+    assert saved["results"] == [9, 8]
+
+    # Nothing changed between the processes, so both roots must answer the same
+    # values. They get there differently: the root capturing the function has
+    # `leaf` code-pinned and its checkpointed record is served, while the root
+    # reaching `leaf` only through a class is not walked into -- captured classes
+    # are uniformly skipped by the pinning walk -- so `leaf` is unpinned there,
+    # the warm refuses the record rather than serving it, and the root executes.
+    loaded = _run([sys.executable, str(script), str(store_dir), "load"], env)
+    assert loaded["results"] == [9, 8]
+    assert loaded["recomputes"] == ["reused", "executed"]

@@ -219,7 +219,9 @@ def _classify_value_capture(value: Any, seen: set[int]) -> tuple[bool, str]:
     return False, "Unsupported ambient capture."
 
 
-def _classify_capture(name: str, value: Any, origin: str) -> CaptureInfo:
+def _classify_capture(
+    name: str, value: Any, origin: str, owner: FunctionType | None = None
+) -> CaptureInfo:
     from .core import Input, Query
     from .runtime import Database
 
@@ -254,6 +256,23 @@ def _classify_capture(name: str, value: Any, origin: str) -> CaptureInfo:
         elif isinstance(value, type):
             kind = "type"
             database._type_definition_payload(value)
+        elif callable(value) and isinstance(getattr(value, "__wrapped__", None), FunctionType):
+            # Below the type branch, as the kernel orders it: a class carrying
+            # __wrapped__ is still a class. The verdict comes from the kernel's
+            # own payload builder, so the two surfaces cannot disagree about a
+            # wrapped callable in either direction. That builder reads the
+            # owning function only to resolve attribute paths for module state
+            # held by the callable and to name the query when it rejects, so a
+            # capture classified outside a query lets the wrapped one stand in.
+            kind = "callable"
+            wrapped_function = value.__wrapped__
+            database._wrapped_callable_payload(
+                name,
+                value,
+                wrapped_function,
+                set(),
+                owner=wrapped_function if owner is None else owner,
+            )
         else:
             database._freeze_static_capture(value, set())
     except Exception as exc:
@@ -286,15 +305,15 @@ def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
 
     results: list[CaptureInfo] = []
     for index, value in enumerate(target.__defaults__ or ()):
-        results.append(_classify_capture(f"default[{index}]", value, "default"))
+        results.append(_classify_capture(f"default[{index}]", value, "default", target))
     for default_name, value in sorted((target.__kwdefaults__ or {}).items()):
-        results.append(_classify_capture(f"kwdefault[{default_name}]", value, "kwdefault"))
+        results.append(_classify_capture(f"kwdefault[{default_name}]", value, "kwdefault", target))
 
     closure_vars = _inspect.getclosurevars(target)
     for capture_name, value in sorted(closure_vars.nonlocals.items()):
-        results.append(_classify_capture(capture_name, value, "closure"))
+        results.append(_classify_capture(capture_name, value, "closure", target))
     for capture_name, value in sorted(closure_vars.globals.items()):
-        results.append(_classify_capture(capture_name, value, "global"))
+        results.append(_classify_capture(capture_name, value, "global", target))
 
     try:
         annotations = target.__annotations__
@@ -318,5 +337,5 @@ def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
         for index, value in enumerate(getattr(target, "__type_params__", ()))
     )
     for metadata_name, value, origin in metadata:
-        results.append(_classify_capture(metadata_name, value, origin))
+        results.append(_classify_capture(metadata_name, value, origin, target))
     return tuple(results)

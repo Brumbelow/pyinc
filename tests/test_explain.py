@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 import sys
 from dataclasses import FrozenInstanceError, dataclass
@@ -117,6 +118,38 @@ class _MutableConfig:
 
 _FROZEN_CONFIG = _FrozenConfig(name="alpha", limit=10)
 _MUTABLE_CONFIG = _MutableConfig(name="beta")
+
+
+def _wrapped_target(value: int) -> int:
+    return value
+
+
+class _ExplainScaler:
+    def __init__(self, k: int) -> None:
+        self.k = k
+        functools.wraps(_wrapped_target)(self)
+
+    def __call__(self, value: int) -> int:
+        return self.k * value
+
+
+_explain_scaler = _ExplainScaler(2)
+
+
+class _ExplainUnsafeScaler:
+    def __init__(self) -> None:
+        self.state = {"mutable": True}
+        functools.wraps(_wrapped_target)(self)
+
+    def __call__(self) -> int:
+        return 1
+
+
+_explain_unsafe = _ExplainUnsafeScaler()
+
+
+class _ExplainWrappedClass:
+    __wrapped__ = _wrapped_target
 
 
 def test_explain_query_captures_reports_metadata_without_ambient_captures() -> None:
@@ -296,6 +329,41 @@ def test_explain_query_captures_rejects_local_type_capture() -> None:
     assert not info.accepted
     assert info.kind == "rejected"
     assert "Local type" in info.rejection_reason
+
+
+def test_wrapped_callable_capture_is_classified_as_callable() -> None:
+    @query
+    def scaled(db: Database) -> int:
+        return _explain_scaler(10)
+
+    report = {item.name: item for item in explain_query_captures(scaled)}
+    info = report["_explain_scaler"]
+    assert info.accepted is True
+    assert info.kind == "callable"
+    # The kernel accepts the same capture: parity in the accepting direction.
+    assert Database().get(scaled) == 20
+
+
+def test_unsafe_wrapped_callable_is_rejected_by_explain_and_kernel() -> None:
+    @query
+    def broken(db: Database) -> int:
+        return _explain_unsafe()
+
+    report = {item.name: item for item in explain_query_captures(broken)}
+    info = report["_explain_unsafe"]
+    assert info.accepted is False
+    assert info.kind == "rejected"
+    with pytest.raises(UnsupportedValueError):
+        Database().get(broken)
+
+
+def test_wrapped_class_capture_is_still_classified_as_type() -> None:
+    @query
+    def read_class(db: Database) -> str:
+        return _ExplainWrappedClass.__name__
+
+    report = {item.name: item for item in explain_query_captures(read_class)}
+    assert report["_ExplainWrappedClass"].kind == "type"
 
 
 def test_explain_query_captures_rejects_non_function() -> None:
