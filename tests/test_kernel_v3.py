@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import importlib
 import importlib.machinery
@@ -207,6 +208,51 @@ class _CountingEq:
 
     def __call__(self, left: Any, right: Any) -> bool:
         return abs(int(left) - int(right)) <= self.tolerance
+
+
+def _wrapped_base(value: int) -> int:
+    return value
+
+
+class _WrappedScaler:
+    def __init__(self, k: int) -> None:
+        self.k = k
+        functools.wraps(_wrapped_base)(self)
+
+    def __call__(self, value: int) -> int:
+        return self.k * value
+
+
+_wrapped_scaler = _WrappedScaler(2)
+
+
+class _WrappedClass:
+    __wrapped__ = _wrapped_base
+    compute = staticmethod(_observed_compute_one)
+
+
+class _UnsafeWrapped:
+    def __init__(self) -> None:
+        self.state = {"mutable": True}
+        functools.wraps(_wrapped_base)(self)
+
+    def __call__(self) -> int:
+        return 1
+
+
+_unsafe_wrapped = _UnsafeWrapped()
+
+
+class _CyclicWrapped:
+    def __init__(self) -> None:
+        self.cycle: Any = self
+        functools.wraps(_wrapped_base)(self)
+
+    def __call__(self) -> int:
+        return 1
+
+
+_cyclic_wrapped = _CyclicWrapped()
 
 
 def _memo_and_truth(db: Database, target: Any) -> tuple[str, str]:
@@ -3250,3 +3296,142 @@ def test_checkpoint_validation_is_complete_before_replacing_staged_state() -> No
     with pytest.raises(CheckpointVersionError, match="Unsupported checkpoint version"):
         reader.load_checkpoint(old_key)
     assert reader._checkpoint_query_records == staged_before
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_wrapped_callable_instance_state_moves_query_identity(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @query(key=f"wrapped-callable-state-{mode}")
+    def scaled(db: Database) -> int:
+        return _wrapped_scaler(10)
+
+    db = Database(mode=mode)
+    assert db.get(scaled) == 20
+    monkeypatch.setattr(_wrapped_scaler, "k", 3)
+    executions = db.statistics().query_executions
+    warm = db.get(scaled)
+    fresh = Database(mode=mode).get(scaled)
+    assert warm == fresh == 30
+    assert db.statistics().query_executions == executions + 1
+
+
+def test_wrapped_callable_fingerprint_moves_with_instance_and_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="wrapped-callable-fingerprint")
+    def scaled(db: Database) -> int:
+        return _wrapped_scaler(10)
+
+    before = Database()._query_fingerprint(scaled)
+    monkeypatch.setattr(_wrapped_scaler, "k", 3)
+    after_state = Database()._query_fingerprint(scaled)
+    assert before != after_state
+
+    def other_call(self: _WrappedScaler, value: int) -> int:
+        return self.k * value + 1
+
+    monkeypatch.setattr(_WrappedScaler, "__call__", other_call)
+    after_call = Database()._query_fingerprint(scaled)
+    assert after_call not in {before, after_state}
+
+    # Memo path: a reused database must agree with the recomputed truth.
+    db = Database()
+    db._query_fingerprint(scaled)
+    monkeypatch.setattr(_wrapped_scaler, "k", 7)
+    memoized, truth = _memo_and_truth(db, scaled)
+    assert memoized == truth
+
+
+def test_class_carrying_wrapped_attribute_is_fingerprinted_as_a_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="wrapped-class-body")
+    def computed(db: Database) -> int:
+        return _WrappedClass.compute(1)
+
+    before = Database()._query_fingerprint(computed)
+    monkeypatch.setattr(_WrappedClass, "compute", staticmethod(_observed_compute_two))
+    after = Database()._query_fingerprint(computed)
+    assert before != after
+
+
+def test_wrapped_callable_with_unsafe_state_is_rejected() -> None:
+    @query(key="wrapped-callable-unsafe")
+    def broken(db: Database) -> int:
+        return _unsafe_wrapped()
+
+    with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
+        Database().get(broken)
+
+
+def test_wrapped_callable_holding_a_reference_cycle_is_rejected() -> None:
+    # Folding the instance state is what puts a cycle within reach, and the
+    # kernel refuses cyclic ambient values rather than folding a marker for
+    # them; reaching the cycle through the callable arm must reach the same
+    # verdict instead of recursing.
+    @query(key="wrapped-callable-cycle")
+    def broken(db: Database) -> int:
+        return _cyclic_wrapped()
+
+    with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
+        Database().get(broken)
+
+
+def test_module_attribute_and_direct_capture_agree_on_wrapped_callables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_wrapped_module_attribute"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import functools\n"
+        "\n"
+        "def base(value):\n"
+        "    return value\n"
+        "\n"
+        "class Scaler:\n"
+        "    def __init__(self, k):\n"
+        "        self.k = k\n"
+        "        functools.wraps(base)(self)\n"
+        "    def __call__(self, value):\n"
+        "        return self.k * value\n"
+        "\n"
+        "scaler = Scaler(2)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+        # The same callable object reached two ways: `import m; m.f` below and
+        # the closure capture a `from m import f` produces. The two routes fold
+        # different envelopes, so their fingerprints differ; what has to agree
+        # is that both accept it and both move when its state does.
+        captured_scaler = module.scaler
+
+        @query(key="wrapped-module-attribute")
+        def scaled(db: Database) -> int:
+            return cast(int, module.scaler(10))
+
+        @query(key="wrapped-direct-capture")
+        def scaled_direct(db: Database) -> int:
+            return cast(int, captured_scaler(10))
+
+        db = Database()
+        direct_db = Database()
+        assert db.get(scaled) == 20
+        assert direct_db.get(scaled_direct) == 20
+        before = Database()._query_fingerprint(scaled)
+        before_direct = Database()._query_fingerprint(scaled_direct)
+        monkeypatch.setattr(module.scaler, "k", 3)
+        assert Database()._query_fingerprint(scaled) != before
+        assert Database()._query_fingerprint(scaled_direct) != before_direct
+
+        executions = db.statistics().query_executions
+        assert db.get(scaled) == Database().get(scaled) == 30
+        assert db.statistics().query_executions == executions + 1
+
+        direct_executions = direct_db.statistics().query_executions
+        assert direct_db.get(scaled_direct) == Database().get(scaled_direct) == 30
+        assert direct_db.statistics().query_executions == direct_executions + 1
+    finally:
+        sys.modules.pop(module_name, None)

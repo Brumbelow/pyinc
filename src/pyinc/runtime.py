@@ -587,6 +587,9 @@ class Database:
         self._module_capture_stack: ContextVar[tuple[int, ...]] = ContextVar(
             "pyinc_module_capture_stack", default=()
         )
+        self._wrapped_callable_stack: ContextVar[tuple[int, ...]] = ContextVar(
+            "pyinc_wrapped_callable_stack", default=()
+        )
         self._request_counter = 0
         self._span_epoch = 0
         self._stats: dict[str, int] = {
@@ -3314,8 +3317,9 @@ class Database:
         enters one: `_module_observation_stamp` re-derives its file bytes,
         import metadata and module-level constants; each statically accessed
         attribute chain is re-resolved and its target compared by identity; and
-        the definitions behind chain-reached functions, whose globals and
-        defaults the payload folds live, are observed by
+        the definitions behind chain-reached functions and wraps-decorated
+        callable objects, whose globals, defaults and instance state the
+        payload folds live, are observed by
         `_module_function_target_observation`. Where a chain lands on a class
         or a frozen dataclass instance instead -- named directly, or held
         inside an immutable container the payload accepts, such as a tuple, a
@@ -3324,13 +3328,14 @@ class Database:
         identity while the payload folds what is inside it, so neither a
         member written in place nor a binding one of those members reads is
         observed. Landings the payload refuses instead of folding -- a plain
-        object, a mutable dataclass, a dict, a list -- raise when the
-        fingerprint is built and carry nothing stale. Resources get no arm of
-        their own either: what a fold reads out of `identity()` is gated by
-        the recorded configuration digests the memo carries alongside this
-        observation, and every slot that reaches a resource for anything else
-        folds it as the ordinary class or instance it is, so the arms below
-        already observe it from whichever slot arrives first.
+        object that is not one of those callables, a mutable dataclass, a
+        dict, a list -- raise when the fingerprint is built and carry nothing
+        stale. Resources get no arm of their own either: what a fold reads out
+        of `identity()` is gated by the recorded configuration digests the memo
+        carries alongside this observation, and every slot that reaches a
+        resource for anything else folds it as the ordinary class or instance
+        it is, so the arms below already observe it from whichever slot arrives
+        first.
         """
 
         observe_value, observe_function = self._definition_observers()
@@ -3344,20 +3349,36 @@ class Database:
     def _module_function_target_observation(
         self, records: tuple[tuple[ModuleType, tuple[str, ...], Any], ...]
     ) -> tuple[Any, ...]:
-        """Observe the definitions behind chain-reached module functions.
+        """Observe the definitions behind chain-reached module callables.
 
         `_module_attribute_payload` folds a function target through
         `_function_definition_payload`, which reads its defaults, closure and
         globals live. None of that moves the function's identity, and the
         module's constants payload carries none of it either, so the memo needs
-        the same observation the query's own function gets. One observer family
-        covers every record, in the order the memo stored them, so a value two
-        chains share is folded on first contact the same way here as it was
-        when the stored observation was built.
+        the same observation the query's own function gets. A wraps-decorated
+        callable object is folded the same way and for the same reason -- its
+        `__call__` definition and its instance state are read live while the
+        landing object's own identity holds still -- so it is observed here
+        too, which is what makes `import m; m.f` and `from m import f` reuse a
+        stored fingerprint on the same conditions. One observer family covers
+        every record, in the order the memo stored them, so a value two chains
+        share is folded on first contact the same way here as it was when the
+        stored observation was built.
         """
 
+        # The type exclusion mirrors `_module_attribute_payload`, which routes
+        # a class to its type branch before the wrapped-callable one: a class
+        # landing is compared by identity alone, whether or not it carries a
+        # __wrapped__ attribute.
         targets = [
-            target for _module, _path, target in records if isinstance(target, FunctionType)
+            target
+            for _module, _path, target in records
+            if isinstance(target, FunctionType)
+            or (
+                not isinstance(target, type)
+                and isinstance(getattr(target, "__wrapped__", None), FunctionType)
+                and callable(target)
+            )
         ]
         if not targets:
             # Most queries reach no module function at all, and building the
@@ -4422,18 +4443,31 @@ class Database:
             )
         if isinstance(value, BuiltinFunctionType):
             return self._builtin_function_payload(value)
-        wrapped_function = getattr(value, "__wrapped__", None)
-        if isinstance(wrapped_function, FunctionType) and callable(value):
-            return (
-                "wrapped-function",
-                type(value).__module__,
-                type(value).__qualname__,
-                self._function_definition_payload(wrapped_function, seen_functions),
-            )
         if isinstance(value, type):
+            # Tested before the __wrapped__ probe: a class carrying a
+            # __wrapped__ class attribute is still a class, and the class
+            # treatment (full body payload) must win. type(value) here is the
+            # metaclass, so no callable-object payload could substitute.
             if "<locals>" in value.__qualname__ and self._type_fingerprint_stack.get():
                 return self._implementation_type_payload(value)
             return self._type_definition_payload(value)
+        wrapped_function = getattr(value, "__wrapped__", None)
+        if isinstance(wrapped_function, FunctionType) and callable(value):
+            try:
+                return self._wrapped_callable_payload(
+                    name,
+                    value,
+                    wrapped_function,
+                    seen_functions,
+                    owner=owner,
+                )
+            except UnsupportedValueError as exc:
+                raise UnsupportedValueError(
+                    f"Query {owner.__module__}:{owner.__qualname__} captures unsupported ambient value "
+                    f"{name!r} of type {type(value).__qualname__}. "
+                    "Move mutable state behind Input/Resource nodes or use an immutable value. "
+                    "Run pyinc.explain_query_captures(...) to inspect the capture set before the first db.get()."
+                ) from exc
         try:
             return (
                 "value",
@@ -4452,6 +4486,74 @@ class Database:
                 "Move mutable state behind Input/Resource nodes or use an immutable value. "
                 "Run pyinc.explain_query_captures(...) to inspect the capture set before the first db.get()."
             ) from exc
+
+    def _wrapped_callable_payload(
+        self,
+        name: str,
+        value: Any,
+        wrapped_function: FunctionType,
+        seen_functions: builtins.set[int],
+        *,
+        owner: FunctionType,
+    ) -> Any:
+        """Fingerprint a functools.wraps-style callable object by its behavior.
+
+        The wrapped function alone is not the behavior: __call__ decides what
+        runs and the instance state parameterizes it, exactly as for an
+        eq=/cutoff= policy object. __wrapped__ stays in the payload as
+        additive information, never as a substitute for the implementation.
+
+        The state fold is the ambient-capture one rather than the policy one:
+        functools.wraps writes __wrapped__ and the copied metadata into the
+        instance dictionary, and the policy fold refuses a function held there,
+        so every wraps-decorated callable would be rejected. This fold reaches
+        the same verdict on what matters -- slot state and mutable containers
+        are refused -- while folding a function-valued entry as the dependency
+        it is.
+
+        Reading instance state is also what puts a reference cycle within
+        reach, and the ambient guard that catches one is a per-walk set that
+        restarts whenever a nested value routes back through the dependency
+        digest, as a captured callable held in this one's state does. This
+        stack spans those restarts. It refuses rather than folding a marker,
+        which is what the kernel already does with a cyclic ambient value.
+        """
+
+        call = type(value).__call__
+        call_function = getattr(call, "__func__", call)
+        if not isinstance(call_function, FunctionType):
+            raise UnsupportedValueError(
+                f"Captured callable {type(value).__module__}."
+                f"{type(value).__qualname__} has a non-Python __call__ "
+                "implementation that cannot be fingerprinted safely."
+            )
+        value_id = id(value)
+        stack = self._wrapped_callable_stack.get()
+        if value_id in stack:
+            raise UnsupportedValueError(
+                f"Captured callable {type(value).__module__}."
+                f"{type(value).__qualname__} holds a reference cycle through "
+                "its instance state and cannot be fingerprinted safely."
+            )
+        token = self._wrapped_callable_stack.set(stack + (value_id,))
+        try:
+            return (
+                "wrapped-callable-v3",
+                type(value).__module__,
+                type(value).__qualname__,
+                self._implementation_type_payload(type(value)),
+                self._function_definition_payload(call_function, seen_functions),
+                self._captured_instance_dict_payload(
+                    name,
+                    value,
+                    seen_functions,
+                    owner=owner,
+                    active_ids=set(),
+                ),
+                self._function_definition_payload(wrapped_function, seen_functions),
+            )
+        finally:
+            self._wrapped_callable_stack.reset(token)
 
     def _freeze_captured_immutable(
         self,
@@ -5122,10 +5224,26 @@ class Database:
                 for state_name, item in self._static_instance_dict(value).items():
                     if state_name not in field_names:
                         walk_value(item)
+            elif isinstance(value, type):
+                # A class is not walked here, and was not before this branch
+                # existed either; the explicit test is what keeps a class
+                # carrying a __wrapped__ attribute out of the callable-object
+                # arm below, which would otherwise read its metaclass.
+                return
             else:
                 wrapped_function = getattr(value, "__wrapped__", None)
                 if isinstance(wrapped_function, FunctionType) and callable(value):
+                    value_id = id(value)
+                    if value_id in seen_values:
+                        return
+                    seen_values.add(value_id)
                     walk_function(wrapped_function)
+                    call = type(value).__call__
+                    call_function = getattr(call, "__func__", call)
+                    if isinstance(call_function, FunctionType):
+                        walk_function(call_function)
+                    for item in self._static_instance_dict(value).values():
+                        walk_value(item)
 
         walk_function(fn)
         return query_objects, resource_objects
@@ -5173,7 +5291,7 @@ class Database:
                 module.__name__,
                 base_identity,
                 tuple(
-                    self._captured_module_path_payload(module, path, seen_functions)
+                    self._captured_module_path_payload(module, path, seen_functions, owner=owner)
                     for path in paths
                 ),
             )
@@ -5221,6 +5339,8 @@ class Database:
         module: ModuleType,
         path: tuple[str, ...],
         seen_functions: builtins.set[int],
+        *,
+        owner: FunctionType,
     ) -> Any:
         current: Any = module
         steps: list[Any] = []
@@ -5229,7 +5349,7 @@ class Database:
                 self._record_module_path_target(module, path, current)
                 return (
                     tuple(steps),
-                    self._module_attribute_payload(current, seen_functions),
+                    self._module_attribute_payload(current, seen_functions, owner=owner),
                     ("remaining-attributes", path[index:]),
                 )
             namespace = vars(current)
@@ -5250,7 +5370,7 @@ class Database:
         self._record_module_path_target(module, path, current)
         return (
             tuple(steps),
-            self._module_attribute_payload(current, seen_functions),
+            self._module_attribute_payload(current, seen_functions, owner=owner),
         )
 
     def _record_module_path_target(
@@ -5268,7 +5388,13 @@ class Database:
         if collector is not None:
             collector.append((module, path, target))
 
-    def _module_attribute_payload(self, value: Any, seen_functions: builtins.set[int]) -> Any:
+    def _module_attribute_payload(
+        self,
+        value: Any,
+        seen_functions: builtins.set[int],
+        *,
+        owner: FunctionType,
+    ) -> Any:
         from .core import Input, Query
 
         if isinstance(value, Query):
@@ -5314,6 +5440,22 @@ class Database:
             return ("type", self._type_definition_payload(value))
         if self._is_resource_handle(value):
             return ("resource", self._resource_identity_payload(value))
+        wrapped_function = getattr(value, "__wrapped__", None)
+        if isinstance(wrapped_function, FunctionType) and callable(value):
+            # Same acceptance and the same implementation/state sensitivity
+            # whether captured as `from m import f` (the digest path) or
+            # `import m; m.f` (this path); this route still folds its own
+            # module-path envelope around the shared payload.
+            return (
+                "wrapped-callable",
+                self._wrapped_callable_payload(
+                    "module-attribute",
+                    value,
+                    wrapped_function,
+                    seen_functions,
+                    owner=owner,
+                ),
+            )
         try:
             return ("value", self._freeze_static_capture(value, set()))
         except UnsupportedValueError as exc:
@@ -5477,16 +5619,17 @@ class Database:
         that folded any of this, the memo re-derives the constants inside
         `_module_observation_stamp`, re-resolves each chain and compares its
         target by identity, and observes the definitions behind chain-reached
-        functions. A chain that lands on a class or a frozen dataclass
-        instance -- named directly, or held inside a tuple, a NamedTuple or a
-        frozenset the payload accepts -- is where that stops: what is inside
-        the landing is folded by the payload and compared here only through
-        the resolved target's identity, so a member written in place, and
-        equally a module binding one of those members reads, moves the fold
-        and nothing the memo checks. Shapes the payload refuses instead of
-        folding -- a plain object, a mutable dataclass, a dict, a list --
-        raise when the fingerprint is built. Such state belongs in an `Input`
-        or a `Resource`.
+        functions and wraps-decorated callable objects. A chain that lands on
+        a class or a frozen dataclass instance -- named directly, or held
+        inside a tuple, a NamedTuple or a frozenset the payload accepts -- is
+        where that stops: what is inside the landing is folded by the payload
+        and compared here only through the resolved target's identity, so a
+        member written in place, and equally a module binding one of those
+        members reads, moves the fold and nothing the memo checks. Shapes the
+        payload refuses instead of folding -- a plain object that is not one
+        of those callables, a mutable dataclass, a dict, a list -- raise when
+        the fingerprint is built. Such state belongs in an `Input` or a
+        `Resource`.
         """
         collector = self._fingerprint_module_collector.get()
         if collector is not None:
