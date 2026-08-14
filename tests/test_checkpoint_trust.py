@@ -27,6 +27,7 @@ from typing import Any, cast
 import pytest
 
 from pyinc import (
+    AdapterContractError,
     CheckpointManifestError,
     Database,
     FileResource,
@@ -1616,6 +1617,34 @@ def test_changed_adapter_instance_configuration_skips_warm() -> None:
     loaded.set(temp_in, 5.0)
     loaded.load_checkpoint(checkpoint)
 
+    assert loaded.get(read_temp) == _Temperature(5.0)
+    assert loaded.inspect(read_temp).last_recompute == "executed"
+
+
+def test_mutated_adapter_database_raises_while_a_reloaded_database_reexecutes() -> None:
+    temp_in = Input[float]("adapter_mutation_workflow")
+
+    @query
+    def read_temp(db: Database) -> _Temperature:
+        return _Temperature(temp_in.read(db))
+
+    store = InMemoryArtifactStore()
+    adapter = _ConfiguredTempAdapter(1.0)
+    saver = Database("checked", store=store, adapters={_Temperature: adapter})
+    saver.set(temp_in, 5.0)
+    assert saver.get(read_temp) == _Temperature(5.0)
+    checkpoint = saver.save_checkpoint()
+
+    # Violating the immutability law on the SAVING database is loud, not silent.
+    object.__setattr__(adapter, "offset", 2.0)
+    with pytest.raises(AdapterContractError):
+        saver.get(read_temp)
+
+    # A database built honestly with the new configuration refuses the warm
+    # record and re-executes -- the load-side half the sibling test pins.
+    loaded = Database("checked", store=store, adapters={_Temperature: _ConfiguredTempAdapter(2.0)})
+    loaded.set(temp_in, 5.0)
+    loaded.load_checkpoint(checkpoint)
     assert loaded.get(read_temp) == _Temperature(5.0)
     assert loaded.inspect(read_temp).last_recompute == "executed"
 
