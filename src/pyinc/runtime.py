@@ -3925,6 +3925,21 @@ class Database:
                         ),
                     )
             wrapped = state.get("__wrapped__")
+            try:
+                entries = sorted(state.items())
+            except TypeError as exc:
+                # A handle dictionary given a name that is not a string is
+                # refused by the payload, and this walk reaches one first --
+                # the query being keyed and any query its body captures are
+                # observed before their state is folded -- so it answers with
+                # the same refusal instead of letting the sort's TypeError
+                # out. Caught rather than checked in front: this sort compares
+                # names against each other and nothing else, while a check
+                # would cost every observation of every handle on the memo
+                # path this closure exists to serve.
+                raise UnsupportedValueError(
+                    f"Query handle {handle.key!r} has invalid custom state."
+                ) from exc
             return (
                 (annotate_observation, eager_observation),
                 (wrapped, handle.fn)
@@ -3932,7 +3947,7 @@ class Database:
                 else (wrapped, handle.fn, observe_value(wrapped)),
                 tuple(
                     (name, observe_value(item))
-                    for name, item in sorted(state.items())
+                    for name, item in entries
                     if name not in self._QUERY_HANDLE_ANNOTATION_NAMES
                     and name not in self._QUERY_HANDLE_SIBLING_NAMES
                 ),

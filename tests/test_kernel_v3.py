@@ -3812,3 +3812,36 @@ def test_query_handle_with_unsafe_attribute_is_rejected() -> None:
         match=r"Query 'handle-unsafe' holds unsupported state 'state' of type builtins.dict",
     ):
         Database().get(broken)
+
+
+def test_query_handle_with_a_non_string_attribute_name_is_refused() -> None:
+    @query(key="handle-non-string-name")
+    def direct(db: Database) -> int:
+        return 1
+
+    @query(key="handle-non-string-name-child")
+    def child(db: Database) -> int:
+        return 1
+
+    @query(key="handle-non-string-name-parent")
+    def parent(db: Database) -> int:
+        return child(db) + 1
+
+    # A handle dictionary given a name that is not a string is reached by the
+    # memo observation before it is reached by the fold -- for the query being
+    # keyed and for one its body captures alike -- so the observation has to
+    # answer the fold's refusal rather than leave it to the fold. Otherwise the
+    # observation's own sort compares that name against a string first and the
+    # caller sees a raw TypeError.
+    cast(dict[Any, Any], direct.__dict__)[7] = 1
+    cast(dict[Any, Any], child.__dict__)[7] = 1
+    routes = (
+        (direct, "handle-non-string-name"),
+        (parent, "handle-non-string-name-child"),
+    )
+    for handle, key in routes:
+        with pytest.raises(
+            UnsupportedValueError,
+            match=rf"Query handle '{key}' has invalid custom state\.",
+        ):
+            Database().get(handle)
