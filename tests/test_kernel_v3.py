@@ -265,6 +265,11 @@ class _CyclicWrapped:
 _cyclic_wrapped = _CyclicWrapped()
 
 
+@functools.cache
+def _wrapped_cache_decorated(value: int) -> int:
+    return value * 2
+
+
 def _memo_and_truth(db: Database, target: Any) -> tuple[str, str]:
     """The memoized fingerprint next to the recomputed truth for ``target``.
 
@@ -3386,6 +3391,77 @@ def test_wrapped_callable_holding_a_reference_cycle_is_rejected() -> None:
 
     with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
         Database().get(broken)
+
+
+def test_capturing_a_cache_decorated_function_is_rejected() -> None:
+    @query(key="wrapped-cache-decorated")
+    def broken(db: Database) -> int:
+        return _wrapped_cache_decorated(3)
+
+    # A cache-decorated function is a callable object carrying __wrapped__, and
+    # its cache is state no fold can read. The module-attribute route already
+    # refused the identical object; the direct capture agrees with it now
+    # instead of folding the wrapped function and calling the rest invisible.
+    with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
+        Database().get(broken)
+
+
+def test_capturing_a_local_class_carrying_wrapped_is_rejected() -> None:
+    class _LocalWrappedClass:
+        __wrapped__ = _wrapped_base
+        marker = 1
+
+    @query(key="wrapped-local-class")
+    def broken(db: Database) -> int:
+        return _LocalWrappedClass.marker
+
+    # Fingerprinted as the class it is, so the local-type refusal governs it;
+    # the __wrapped__ attribute no longer routes it past that check.
+    with pytest.raises(UnsupportedValueError, match="Captured local type"):
+        Database().get(broken)
+
+
+def test_module_attribute_wrapped_callable_refusal_names_the_attribute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_wrapped_module_refusal"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import functools\n"
+        "\n"
+        "def base(value):\n"
+        "    return value\n"
+        "\n"
+        "class Unsafe:\n"
+        "    def __init__(self):\n"
+        "        self.state = {'mutable': True}\n"
+        "        functools.wraps(base)(self)\n"
+        "    def __call__(self):\n"
+        "        return 1\n"
+        "\n"
+        "unsafe = Unsafe()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="wrapped-module-attribute-unsafe")
+        def broken(db: Database) -> int:
+            return cast(int, module.unsafe())
+
+        # The shared payload refuses in its own vocabulary; this route says
+        # which module attribute the query named, so the message identifies
+        # something the reader can go and look at.
+        with pytest.raises(UnsupportedValueError) as raised:
+            Database().get(broken)
+        message = str(raised.value)
+        assert f"captures module attribute '{module_name}.unsafe'" in message
+        assert "Unsafe" in message
+        assert "Move mutable state behind Input/Resource nodes" in message
+        assert "explain_query_captures" in message
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def test_module_attribute_and_direct_capture_agree_on_wrapped_callables(

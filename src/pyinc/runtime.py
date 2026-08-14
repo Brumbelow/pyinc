@@ -5251,10 +5251,13 @@ class Database:
                     if state_name not in field_names:
                         walk_value(item)
             elif isinstance(value, type):
-                # A class is not walked here, and was not before this branch
-                # existed either; the explicit test is what keeps a class
-                # carrying a __wrapped__ attribute out of the callable-object
-                # arm below, which would otherwise read its metaclass.
+                # A class is callable, so before this branch existed a class
+                # carrying a __wrapped__ attribute fell into the arm below and
+                # had its wrapped function walked, while every other captured
+                # class was skipped. No class is walked now, which is what
+                # makes them uniform: a dep query reachable only through such a
+                # class is no longer code-pinned, so a checkpoint warm refuses
+                # it and re-executes rather than serving it.
                 return
             else:
                 wrapped_function = getattr(value, "__wrapped__", None)
@@ -5375,7 +5378,12 @@ class Database:
                 self._record_module_path_target(module, path, current)
                 return (
                     tuple(steps),
-                    self._module_attribute_payload(current, seen_functions, owner=owner),
+                    self._module_attribute_payload(
+                        current,
+                        seen_functions,
+                        owner=owner,
+                        capture_name=".".join((module.__name__, *path[:index])),
+                    ),
                     ("remaining-attributes", path[index:]),
                 )
             namespace = vars(current)
@@ -5396,7 +5404,12 @@ class Database:
         self._record_module_path_target(module, path, current)
         return (
             tuple(steps),
-            self._module_attribute_payload(current, seen_functions, owner=owner),
+            self._module_attribute_payload(
+                current,
+                seen_functions,
+                owner=owner,
+                capture_name=".".join((module.__name__, *path)),
+            ),
         )
 
     def _record_module_path_target(
@@ -5420,6 +5433,7 @@ class Database:
         seen_functions: builtins.set[int],
         *,
         owner: FunctionType,
+        capture_name: str,
     ) -> Any:
         from .core import Input, Query
 
@@ -5472,16 +5486,31 @@ class Database:
             # whether captured as `from m import f` (the digest path) or
             # `import m; m.f` (this path); this route still folds its own
             # module-path envelope around the shared payload.
-            return (
-                "wrapped-callable",
-                self._wrapped_callable_payload(
-                    "module-attribute",
-                    value,
-                    wrapped_function,
-                    seen_functions,
-                    owner=owner,
-                ),
-            )
+            try:
+                return (
+                    "wrapped-callable",
+                    self._wrapped_callable_payload(
+                        capture_name,
+                        value,
+                        wrapped_function,
+                        seen_functions,
+                        owner=owner,
+                    ),
+                )
+            except UnsupportedValueError as exc:
+                # The shared payload refuses in its own vocabulary -- slot
+                # state, a mutable member, a non-Python __call__, a cycle --
+                # and one of those refusals is raised by a nested digest that
+                # frames the capture as a direct one. This route re-frames all
+                # of them around the module attribute the query actually named,
+                # and keeps the remedy the digest arm gives the same value.
+                raise UnsupportedValueError(
+                    f"Query {owner.__module__}:{owner.__qualname__} captures module attribute "
+                    f"{capture_name!r} of type {type(value).__module__}."
+                    f"{type(value).__qualname__}, which cannot be fingerprinted safely. "
+                    "Move mutable state behind Input/Resource nodes or use an immutable value. "
+                    "Run pyinc.explain_query_captures(...) to inspect the capture set before the first db.get()."
+                ) from exc
         try:
             return ("value", self._freeze_static_capture(value, set()))
         except UnsupportedValueError as exc:
