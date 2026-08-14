@@ -4,8 +4,8 @@ import inspect as _inspect
 import os
 import sys
 from dataclasses import dataclass, fields, is_dataclass
-from types import BuiltinFunctionType, FunctionType, ModuleType
-from typing import Any
+from types import BuiltinFunctionType, FunctionType, MethodType, ModuleType
+from typing import Any, cast
 
 from ._path_identity import is_stdlib_path
 from .value import (
@@ -219,8 +219,19 @@ def _classify_value_capture(value: Any, seen: set[int]) -> tuple[bool, str]:
     return False, "Unsupported ambient capture."
 
 
+def _unbound_capture_owner() -> None:
+    """Stand-in for the query of a capture classified on its own.
+
+    The kernel's payload builders take the owning query function to resolve
+    attribute-access paths for module state held by a capture and to name the
+    query when they reject. A capture classified outside a query has no such
+    function; this one accesses nothing, so a non-stdlib module held by such a
+    capture is reported as used dynamically.
+    """
+
+
 def _classify_capture(
-    name: str, value: Any, origin: str, owner: FunctionType | None = None
+    name: str, value: Any, origin: str, *, owner: FunctionType | None = None
 ) -> CaptureInfo:
     from .core import Input, Query
     from .runtime import Database
@@ -228,6 +239,7 @@ def _classify_capture(
     type_name = type(value).__qualname__
     database = Database()
     kind = "value"
+    owner_function = owner if owner is not None else cast(FunctionType, _unbound_capture_owner)
     try:
         if origin in {"annotation", "type_parameter"}:
             kind = "annotation"
@@ -250,6 +262,17 @@ def _classify_capture(
         elif isinstance(value, FunctionType):
             kind = "function"
             database._function_definition_payload(value, set())
+        elif isinstance(value, MethodType):
+            # The kernel dispatches a bound method here, above its __wrapped__
+            # probe, so a wraps-decorated method must be fingerprinted as the
+            # method it is rather than falling to the callable branch below.
+            kind = "method"
+            database._bound_python_method_payload(
+                value,
+                capture_name=name,
+                owner=owner_function,
+                seen_functions=set(),
+            )
         elif isinstance(value, BuiltinFunctionType):
             kind = "builtin"
             database._builtin_function_payload(value)
@@ -257,21 +280,18 @@ def _classify_capture(
             kind = "type"
             database._type_definition_payload(value)
         elif callable(value) and isinstance(getattr(value, "__wrapped__", None), FunctionType):
-            # Below the type branch, as the kernel orders it: a class carrying
-            # __wrapped__ is still a class. The verdict comes from the kernel's
-            # own payload builder, so the two surfaces cannot disagree about a
-            # wrapped callable in either direction. That builder reads the
-            # owning function only to resolve attribute paths for module state
-            # held by the callable and to name the query when it rejects, so a
-            # capture classified outside a query lets the wrapped one stand in.
+            # Last of the callable shapes, as in the kernel: functions, bound
+            # methods and classes are dispatched above, so what reaches here is
+            # a callable object whose behavior lives in __call__ and instance
+            # state. The verdict is the kernel's own payload builder's rather
+            # than a restatement of its rules.
             kind = "callable"
-            wrapped_function = value.__wrapped__
             database._wrapped_callable_payload(
                 name,
                 value,
-                wrapped_function,
+                value.__wrapped__,
                 set(),
-                owner=wrapped_function if owner is None else owner,
+                owner=owner_function,
             )
         else:
             database._freeze_static_capture(value, set())
@@ -305,15 +325,15 @@ def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
 
     results: list[CaptureInfo] = []
     for index, value in enumerate(target.__defaults__ or ()):
-        results.append(_classify_capture(f"default[{index}]", value, "default", target))
+        results.append(_classify_capture(f"default[{index}]", value, "default", owner=target))
     for default_name, value in sorted((target.__kwdefaults__ or {}).items()):
-        results.append(_classify_capture(f"kwdefault[{default_name}]", value, "kwdefault", target))
+        results.append(_classify_capture(f"kwdefault[{default_name}]", value, "kwdefault", owner=target))
 
     closure_vars = _inspect.getclosurevars(target)
     for capture_name, value in sorted(closure_vars.nonlocals.items()):
-        results.append(_classify_capture(capture_name, value, "closure", target))
+        results.append(_classify_capture(capture_name, value, "closure", owner=target))
     for capture_name, value in sorted(closure_vars.globals.items()):
-        results.append(_classify_capture(capture_name, value, "global", target))
+        results.append(_classify_capture(capture_name, value, "global", owner=target))
 
     try:
         annotations = target.__annotations__
@@ -337,5 +357,5 @@ def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
         for index, value in enumerate(getattr(target, "__type_params__", ()))
     )
     for metadata_name, value, origin in metadata:
-        results.append(_classify_capture(metadata_name, value, origin, target))
+        results.append(_classify_capture(metadata_name, value, origin, owner=target))
     return tuple(results)

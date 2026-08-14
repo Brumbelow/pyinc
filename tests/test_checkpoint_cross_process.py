@@ -311,7 +311,9 @@ def main():
 
     # Mutate the live instance before anything is loaded: the helper's source
     # is untouched, so only the callable's state can distinguish the processes.
-    wrapped_state_helper.scaler.k = 3
+    # Phase "load_unchanged" skips the mutation and must be served instead.
+    if phase == "load":
+        wrapped_state_helper.scaler.k = 3
     db = Database(store=store)
     db.load_checkpoint((Path(store_dir).parent / "wrapped.key").read_text())
     results = [db.get(scaled_via_module), db.get(scaled_direct)]
@@ -363,8 +365,15 @@ def test_wrapped_callable_state_change_misses_across_processes(tmp_path: Path) -
     assert saved["results"] == [20, 20]
     (tmp_path / "wrapped.key").write_text(saved["key"])
 
+    # A loading process that leaves the factor alone is served from the
+    # checkpoint. This is what makes the mutated run below evidence about the
+    # callable's state rather than about the harness refusing every warm.
+    unchanged = _run([sys.executable, str(script), str(store_dir), "load_unchanged"], env)
+    assert unchanged["results"] == [20, 20]
+    assert unchanged["recomputes"] == ["reused", "reused"]
+
     # Both phases run the same file and the helper is never rewritten, so the
-    # module stamp is identical in both processes; the factor moving from 2 to 3
+    # module stamp is identical in every process; the factor moving from 2 to 3
     # in the loading process is the only difference the identity can see. The
     # checkpointed records must miss and the queries re-execute against k=3,
     # whether the callable is reached through the module or imported directly.
@@ -469,6 +478,8 @@ def test_dep_query_behind_wrapped_class_reexecutes_across_processes(tmp_path: Pa
     # reaching `leaf` only through a class is not walked into -- captured classes
     # are uniformly skipped by the pinning walk -- so `leaf` is unpinned there,
     # the warm refuses the record rather than serving it, and the root executes.
+    # Should _collect_pinned_capture_objects walk captured classes again, the
+    # expectation here becomes ["reused", "reused"]; update it, do not delete it.
     loaded = _run([sys.executable, str(script), str(store_dir), "load"], env)
     assert loaded["results"] == [9, 8]
     assert loaded["recomputes"] == ["reused", "executed"]

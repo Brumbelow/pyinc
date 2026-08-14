@@ -152,6 +152,28 @@ class _ExplainWrappedClass:
     __wrapped__ = _wrapped_target
 
 
+class _ExplainMethodHolder:
+    step = 5
+    factor = 4
+
+    @classmethod
+    def scaled(cls, value: int) -> int:
+        return cls.step + value
+
+    @classmethod
+    def times(cls, value: int) -> int:
+        return cls.factor * value
+
+
+# wraps() is applied to the underlying function instead of decorating the method
+# with it: the runtime object is the same either way, but as a decorator the type
+# checker reads the result as carrying _wrapped_target's signature.
+functools.wraps(_wrapped_target)(vars(_ExplainMethodHolder)["scaled"].__func__)
+
+_explain_bound_method = _ExplainMethodHolder.scaled
+_explain_plain_method = _ExplainMethodHolder.times
+
+
 def test_explain_query_captures_reports_metadata_without_ambient_captures() -> None:
     @query
     def bare(db: Database) -> int:
@@ -355,6 +377,33 @@ def test_unsafe_wrapped_callable_is_rejected_by_explain_and_kernel() -> None:
     assert info.kind == "rejected"
     with pytest.raises(UnsupportedValueError):
         Database().get(broken)
+
+
+def test_wrapped_bound_method_capture_is_classified_as_method() -> None:
+    @query
+    def offset(db: Database) -> int:
+        return _explain_bound_method(10)
+
+    report = {item.name: item for item in explain_query_captures(offset)}
+    info = report["_explain_bound_method"]
+    # A bound method carrying __wrapped__ is dispatched as a method on both
+    # surfaces: the kernel tests for one before probing __wrapped__, so the
+    # report must not describe it as a callable object it cannot fingerprint.
+    assert info.accepted is True
+    assert info.kind == "method"
+    assert Database().get(offset) == 15
+
+
+def test_bound_method_capture_is_classified_as_method() -> None:
+    @query
+    def multiplied(db: Database) -> int:
+        return _explain_plain_method(3)
+
+    report = {item.name: item for item in explain_query_captures(multiplied)}
+    info = report["_explain_plain_method"]
+    assert info.accepted is True
+    assert info.kind == "method"
+    assert Database().get(multiplied) == 12
 
 
 def test_wrapped_class_capture_is_still_classified_as_type() -> None:
