@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import dis
+import functools
 import hashlib
 import importlib.machinery
 import inspect
@@ -150,6 +151,55 @@ def _build_runtime_build_payload() -> tuple[Any, ...]:
 
 
 _RUNTIME_BUILD_PAYLOAD = _build_runtime_build_payload()
+
+
+_REFLECTIVE_NAMESPACE_BUILTINS = frozenset({"eval", "exec", "globals", "locals", "vars"})
+_REFLECTIVE_ATTRIBUTE_BUILTINS = frozenset({"delattr", "getattr", "setattr"})
+
+
+def _walk_reflective_code(code: CodeType) -> Iterator[CodeType]:
+    yield code
+    for constant in code.co_consts:
+        if isinstance(constant, CodeType):
+            yield from _walk_reflective_code(constant)
+
+
+@functools.lru_cache(maxsize=2048)
+def _reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
+    """Builtin names through which *code* can read a namespace it never captures.
+
+    Capture fingerprinting is static: it resolves the names a code object
+    references against the function's globals. globals()['NAME'],
+    vars(module)['NAME'], getattr(module, 'NAME') and eval reach the same
+    mutable state while referencing only the builtin, so those reads must be
+    rejected rather than silently escaping identity. Only global-scope loads
+    of the builtins count -- an attribute that happens to be named "globals"
+    or "vars" is untouched -- and the getattr family (plus __dict__ attribute
+    loads) is rejected only beside a handle that can produce a module
+    namespace (an importlib reference, or sys plus a .modules access),
+    because getattr on ordinary objects is legitimate and common.
+    """
+
+    global_loads: set[str] = set()
+    attribute_loads: set[str] = set()
+    for item in _walk_reflective_code(code):
+        for instruction in dis.get_instructions(item):
+            argval = instruction.argval
+            if not isinstance(argval, str):
+                continue
+            if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}:
+                global_loads.add(argval)
+            elif instruction.opname in {"LOAD_ATTR", "LOAD_METHOD"}:
+                attribute_loads.add(argval)
+    offenses = global_loads & _REFLECTIVE_NAMESPACE_BUILTINS
+    namespace_handle = "importlib" in global_loads or (
+        "sys" in global_loads and "modules" in attribute_loads
+    )
+    if namespace_handle:
+        offenses = offenses | (global_loads & _REFLECTIVE_ATTRIBUTE_BUILTINS)
+        if "__dict__" in attribute_loads:
+            offenses = offenses | {"__dict__"}
+    return tuple(sorted(offenses))
 
 
 def _canonical_record_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -4036,9 +4086,22 @@ class Database:
 
         return _RUNTIME_BUILD_PAYLOAD
 
+    def _reject_reflective_namespace_reads(self, fn: FunctionType) -> None:
+        offenses = _reflective_namespace_offenses(fn.__code__)
+        if offenses:
+            raise UnsupportedValueError(
+                f"Function {fn.__module__}.{fn.__qualname__} reads a namespace "
+                f"reflectively ({', '.join(offenses)}). Reflective namespace "
+                "reads bypass capture fingerprinting; access module attributes "
+                "directly, or move mutable state behind Input/Resource nodes. "
+                "Run pyinc.explain_query_captures(...) to inspect the capture "
+                "set before the first db.get()."
+            )
+
     def _function_definition_payload(
         self, fn: FunctionType, seen_functions: builtins.set[int]
     ) -> Any:
+        self._reject_reflective_namespace_reads(fn)
         fn_id = id(fn)
         if fn_id in seen_functions:
             return ("recursive-function", fn.__module__, fn.__qualname__)
@@ -5891,6 +5954,7 @@ class Database:
     ) -> Any:
         """Pin a module attribute whose unrelated ambient globals are mutable."""
 
+        self._reject_reflective_namespace_reads(function)
         defining_module = sys.modules.get(function.__module__)
         if defining_module is None:
             raise UnsupportedValueError(

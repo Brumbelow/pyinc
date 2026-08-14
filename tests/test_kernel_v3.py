@@ -3882,3 +3882,88 @@ def test_module_reached_query_handle_with_a_non_string_name_is_refused(
             Database().get(parent)
     finally:
         sys.modules.pop(module_name, None)
+
+
+_REFLECTIVE_FIXTURE_SOURCE = '''\
+"""Four reflective reads of one mutable module global, plus a direct read."""
+
+import sys
+
+CONFIG_MODE = "A"
+
+
+def via_globals():
+    return globals()["CONFIG_MODE"]
+
+
+def via_vars():
+    return vars(sys.modules[__name__])["CONFIG_MODE"]
+
+
+def via_getattr():
+    return getattr(sys.modules[__name__], "CONFIG_MODE")
+
+
+def via_eval():
+    return eval("CONFIG_MODE")
+
+
+def benign_getattr(target):
+    return getattr(target, "value", None)
+'''
+
+
+@pytest.mark.parametrize("shape", ["via_globals", "via_vars", "via_getattr", "via_eval"])
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_reflective_namespace_reads_are_rejected(
+    shape: str, mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_reflective_{shape}_{mode}"
+    (tmp_path / f"{module_name}.py").write_text(_REFLECTIVE_FIXTURE_SOURCE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    reader = getattr(module, shape)
+
+    @query(key=f"reflective-{shape}-{mode}")
+    def read_config(db: Database) -> str:
+        return cast(str, reader())
+
+    with pytest.raises(UnsupportedValueError, match="reads a namespace reflectively"):
+        Database(mode=mode).get(read_config)
+
+
+def test_direct_module_attribute_reads_stay_accepted_and_consistent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_reflective_direct_control"
+    (tmp_path / f"{module_name}.py").write_text(_REFLECTIVE_FIXTURE_SOURCE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+
+    @query(key="reflective-direct-control")
+    def read_config(db: Database) -> str:
+        return cast(str, module.CONFIG_MODE)
+
+    db = Database()
+    assert db.get(read_config) == "A"
+    monkeypatch.setattr(module, "CONFIG_MODE", "B")
+    assert db.get(read_config) == Database().get(read_config) == "B"
+
+
+def test_benign_getattr_on_ordinary_objects_stays_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_reflective_benign_control"
+    (tmp_path / f"{module_name}.py").write_text(_REFLECTIVE_FIXTURE_SOURCE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    benign = module.benign_getattr
+
+    @query(key="reflective-benign-control")
+    def probed(db: Database) -> Any:
+        return benign(_ObservedBox(3))
+
+    assert Database().get(probed) is None
