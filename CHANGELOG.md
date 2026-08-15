@@ -31,8 +31,13 @@ decided at release time.
   names, type parameters), captured class bodies, captured instance and policy
   state, statically captured module attributes and the module constants beside
   them are observed before a memoized fingerprint is reused, and each captured
-  chain is re-resolved rather than assumed. Resource-folding queries stay
-  memoized: their resource identity is digested and compared per request, and
+  chain is re-resolved rather than assumed. Where a chain lands on a value
+  whose payload reads a live definition — a function, a wraps-decorated
+  callable, a query handle, an `Input`, a type alias, a type parameter or a
+  resource — that definition is observed too, so a rebinding behind such a
+  landing moves identity instead of being served from the memo.
+  Resource-folding queries stay memoized: the configuration their `identity()`
+  reports, and the type behind it, are digested and compared per request, and
   the request-scoped re-reads are cleared whenever a caller declares a
   mid-span change. A stale memoized identity previously survived into node
   keys, explain labels and checkpoint manifests.
@@ -166,23 +171,42 @@ decided at release time.
   `__wrapped__` rebound to another function is folded in full, so metadata
   behind the new target moves identity too.
 - Reflective namespace reads raise `UnsupportedValueError` when a query's
-  identity is first computed, instead of silently bypassing capture identity:
-  `globals()`, `locals()`, `vars()`, `eval` and `exec`, and
-  `getattr`/`setattr`/`delattr` or a `__dict__` load beside an `importlib`
-  reference or a `sys.modules` access. The rule is a conservative static read
-  of the bytecode of the query's own function and of every callable folded
-  into its identity, so a legitimate `getattr` beside a module-namespace
-  handle is refused too.
+  identity is first computed, instead of silently bypassing capture identity.
+  `globals()`, `locals()`, `vars()`, `eval`, `exec` and a load of a captured
+  function's `__globals__` are refused on their own — the walk that folds a
+  captured function stops at the function, so its module dictionary would
+  otherwise pass the fold untouched. `getattr`/`setattr`/`delattr` and a
+  `__dict__` load are refused beside a handle that can reach a module
+  namespace: a `modules` attribute load, which reaches the module table
+  whatever name `sys` was imported under and wherever the import sits, the
+  string `"modules"` beside one of those builtins, which is how
+  `getattr(sys, "modules")` spells the same reach without loading the
+  attribute, or a global load of the name `importlib`. The rule is a
+  conservative static read of the bytecode of the query's own function and of
+  every callable folded into its identity, including an evaluator assigned to
+  a handle's `__annotate__`, so a legitimate `getattr` beside a
+  module-namespace handle is refused too. Its edges are stated rather than
+  implied: reaching the module table is not itself an offense, so
+  `sys.modules[name]` with no reflective builtin beside it is accepted, and
+  `importlib` bound under an alias or by an import inside the body is not the
+  name the rule reads. Neither read reaches identity — the module handed back
+  at run time is not a capture, and `sys` and `importlib` are themselves
+  standard-library modules, whose captures fold the names of the paths read
+  off them rather than the behavior behind them — so such state belongs behind
+  an `Input` or a `Resource`, as the kernel contract's limitation 5 says.
 - Mutating a registered adapter's instance configuration now raises
   `AdapterContractError` at the next top-level request, naming the adapter
   key whose digest moved; an adapter whose configuration stops being
   fingerprintable raises there too, chaining the underlying refusal and naming
-  no key. Adapter implementations and configuration participate in checkpoint
-  identity and reach no query's definition fingerprint, though an adapted
-  value passed as an argument reaches that call's `args_digest` like any other
-  argument. An adapter whose configuration cannot be digested at construction
-  is exempt from the request check; checkpoints refuse to trust its records
-  instead.
+  the key whose digest can no longer be re-derived. Adapter implementations
+  and configuration participate in checkpoint identity and reach no query's
+  definition fingerprint, though an adapted value passed as an argument
+  reaches that call's `args_digest` like any other argument. The construction
+  digests are taken and re-derived one adapter at a time: an adapter whose
+  configuration cannot be digested at construction contributes no digest and
+  is skipped on its own account, without disabling the check for the other
+  adapters registered beside it, and checkpoints refuse to trust the skipped
+  adapter's records instead.
 
 ## [3.1.1] - 2026-08-03
 

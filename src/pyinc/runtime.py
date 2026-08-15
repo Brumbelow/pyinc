@@ -196,9 +196,23 @@ def _reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
     of the builtins count -- an attribute that happens to be named "globals"
     or "vars" is untouched -- and the getattr family (plus __dict__ attribute
     loads) is rejected only beside a handle that can produce a module
-    namespace (an importlib reference, or a reach for the module table under
-    whatever name sys was imported as), because getattr on ordinary objects is
-    legitimate and common.
+    namespace, because getattr on ordinary objects is legitimate and common.
+
+    Two loads mark that handle. One is a reach for the module table: a
+    "modules" attribute load, which survives whatever name sys was imported
+    under and wherever the import sits, or the string "modules" beside a
+    getattr-family builtin, which is how getattr spells the same reach
+    without loading the attribute at all. Neither is checked against sys, so
+    an attribute merely named "modules" arms the rule beside an ordinary
+    getattr too -- the over-rejection this conservative reading pays for. The
+    other is a global load of the name importlib, and it is that name only:
+    bound under an alias, or by an import inside the body, it loads something
+    else and nothing here sees it.
+
+    Reaching the module table is not itself an offense. A plain
+    sys.modules[...] subscript with no reflective builtin beside it stays
+    accepted, deliberately: the handle marks where a reflective read could
+    start, and it is the builtin beside it that is refused.
 
     A function's __globals__ is its defining module's namespace by another
     spelling, so loading that attribute is an offense on its own: the walk
@@ -3636,23 +3650,22 @@ class Database:
         type aliases, type parameters and resources, whose globals, defaults,
         policies, evaluators, instance and handle state the payload folds live
         -- are observed by `_module_function_target_observation`. Where a chain
-        lands on a class
-        or a frozen dataclass instance instead -- named directly, or held
-        inside an immutable container the payload accepts, such as a tuple, a
-        NamedTuple or a frozenset -- no arm follows anything inside that
-        landing: the memo compares the object the chain resolved to by
-        identity while the payload folds what is inside it, so neither a
+        lands on a class or a frozen dataclass instance instead -- named
+        directly, or held inside an immutable container the payload accepts,
+        such as a tuple, a NamedTuple or a frozenset -- no arm follows anything
+        inside that landing: the memo compares the object the chain resolved to
+        by identity while the payload folds what is inside it, so neither a
         member written in place nor a binding one of those members reads is
         observed. Landings the payload refuses instead of folding -- a plain
-        object that is not one of those callables, a mutable dataclass, a
-        dict, a list -- raise when the fingerprint is built and carry nothing
-        stale. What a fold reads out of a resource's `identity()` needs no
-        walk on either route: it is gated by the recorded configuration
-        digests the memo carries alongside this observation. Everything else a
-        fold reads off a resource -- its type, its probe and load and identity
-        methods, and what those read -- is observed as the ordinary instance
-        it is, by this walk where a slot reaches the resource directly and by
-        the chain-landing arm where an attribute chain lands on it.
+        object that is not one of those callables, a mutable dataclass, a dict,
+        a list -- raise when the fingerprint is built and carry nothing stale.
+        What a fold reads out of a resource's `identity()` needs no walk on
+        either route: it is gated by the recorded configuration digests the
+        memo carries alongside this observation. Everything else a fold reads
+        off a resource -- its type, its probe and load and identity methods,
+        and what those read -- is observed as the ordinary instance it is, by
+        this walk where a slot reaches the resource directly and by the
+        chain-landing arm where an attribute chain lands on it.
         """
 
         # The query arm of `observe_value` is this observation: it folds the
@@ -6178,18 +6191,18 @@ class Database:
         elsewhere, by `_captured_module_path_payload`. Before reusing a digest
         that folded any of this, the memo re-derives the constants inside
         `_module_observation_stamp`, re-resolves each chain and compares its
-        target by identity, and observes the definitions behind chain-reached
-        functions and wraps-decorated callable objects. A chain that lands on
-        a class or a frozen dataclass instance -- named directly, or held
-        inside a tuple, a NamedTuple or a frozenset the payload accepts -- is
-        where that stops: what is inside the landing is folded by the payload
-        and compared here only through the resolved target's identity, so a
-        member written in place, and equally a module binding one of those
-        members reads, moves the fold and nothing the memo checks. Shapes the
-        payload refuses instead of folding -- a plain object that is not one
-        of those callables, a mutable dataclass, a dict, a list -- raise when
-        the fingerprint is built. Such state belongs in an `Input` or a
-        `Resource`.
+        target by identity, and observes the definitions behind every landing
+        `_module_function_target_observation` keeps -- the enumeration lives
+        there, beside the filter that decides it. A chain that lands on a class
+        or a frozen dataclass instance -- named directly, or held inside a
+        tuple, a NamedTuple or a frozenset the payload accepts -- is where that
+        stops: what is inside the landing is folded by the payload and compared
+        here only through the resolved target's identity, so a member written
+        in place, and equally a module binding one of those members reads,
+        moves the fold and nothing the memo checks. Shapes the payload refuses
+        instead of folding -- a plain object that is not one of those
+        callables, a mutable dataclass, a dict, a list -- raise when the
+        fingerprint is built. Such state belongs in an `Input` or a `Resource`.
         """
         collector = self._fingerprint_module_collector.get()
         if collector is not None:

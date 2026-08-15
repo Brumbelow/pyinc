@@ -445,12 +445,15 @@ three modes. The mechanisms that earn this:
   identity pins the interpreter/build identity (see
   [Interpreter and Build Identity](#interpreter-and-build-identity)) and the
   full function-definition payload — a canonical typed code-object encoding,
-  defaults, keyword defaults, comparator policies, and the definitions of
-  transitively captured queries, functions, and modules — so a body or policy
-  edit anywhere in the captured graph, or a build-configuration change,
-  produces a different identity and the stale record simply misses. This
-  encoding never depends on object reference counts and supports nested code
-  and slice constants.
+  defaults, keyword defaults, the function's own metadata (docstring,
+  annotations, name and qualified name, type parameters, and anything else
+  written on the function object), and the definitions of transitively
+  captured queries, functions, and modules — beside the comparator policies
+  and the `Query` handle's own state, so a body, policy or handle edit
+  anywhere in the captured graph, or a build-configuration change, produces a
+  different identity and the stale record simply misses. This encoding never
+  depends on object reference counts and supports nested code and slice
+  constants.
 - **Inputs and dependency edges verify exactly.** Warmed records carry their
   real dependency edges; each input and sub-query dependency is re-checked
   against the live graph by digest before the record is trusted. Input policy
@@ -492,20 +495,30 @@ memoized fingerprint is reused the memo rechecks the runtime build, the
 observed definition objects, each captured module's file bytes and constants,
 each captured resource's configuration digest, and each statically captured
 attribute chain — re-resolving the chain and observing the definitions behind
-the functions and wraps-decorated callables it reaches. Rebinding a statically
-captured module attribute, or an entry in a directly captured class body,
-therefore moves query identity at the next request, warm or fresh alike.
+the landings whose payloads read one live: functions, wraps-decorated
+callables, `Query` handles, `Input`s, type aliases, type parameters and
+resources, whose globals, defaults, policies, evaluators, instance and handle
+state the fold reads at fingerprint time. Rebinding a statically captured
+module attribute, or an entry in a directly captured class body, therefore
+moves query identity at the next request, warm or fresh alike — and so does a
+rebinding one of those landings' definitions reads, such as the module-level
+function an `Input`'s `eq` policy calls, the class a chain-landed type alias
+resolves to, or the function a chain-landed resource's `load` calls.
 
 Two shapes stay outside that envelope by design. A chain that lands on a class
-or a frozen dataclass instance is compared by that landing's identity, so what
-its members hold or read — a plain method, `staticmethod`, `classmethod`,
-`property` and `cached_property` alike — moves a fresh fold but not a memoized
-one: `foo.Model.flag = True` is seen by a fresh `Database` and not by a warm
-one. And a captured standard-library module folds the names of the paths read
-off it rather than the behavior behind them, so patching a stdlib function or
-class it reaches (`json.dumps = other`) is not detected at all; stdlib types
-are pinned by name anchor and runtime build, never by a namespace walk. Route
-such mutable state through an `Input` or a custom `Resource`.
+or a frozen dataclass instance — named directly, or held inside an immutable
+container the payload accepts, such as a tuple, a `NamedTuple` or a
+`frozenset` — is compared by that landing's identity, so what its members hold
+or read — a plain method, `staticmethod`, `classmethod`, `property` and
+`cached_property` alike — moves a fresh fold but not a memoized one:
+`foo.Model.flag = True` is seen by a fresh `Database` and not by a warm one.
+And a captured standard-library module folds the names of the paths read off
+it rather than the behavior behind them, so patching a stdlib function or
+class it reaches (`json.dumps = other`) is not detected at all, warm or fresh;
+a stdlib type is pinned by its name anchor — its own name beside the identity
+of the module that defines it — and by the runtime build, so the type's own
+namespace is never walked. Route such mutable state through an `Input` or a
+custom `Resource`.
 
 **6. LRU eviction under active dependencies.**
 If `max_query_nodes` is set low enough that an intermediate query is evicted while
@@ -547,13 +560,18 @@ value, or route it through a `Resource`.
     the registered lifetime, and the kernel enforces the law in-process: each
     adapter's instance configuration is digested at construction, every
     top-level request re-derives those digests, and `AdapterContractError`
-    names the adapter key whose digest moved. Implementations and
-    configuration participate in checkpoint identity; neither reaches a
-    query's definition fingerprint, though an adapted value passed as an
-    argument reaches that call's `args_digest` like any other argument. An
-    adapter whose configuration cannot be digested at construction — slot
-    state, or instance state the snapshot machinery refuses — is exempt from
-    the in-process check; checkpoints refuse to trust its records instead.
+    names the adapter key it is raised for — the key whose digest moved, or,
+    when an adapter's configuration has stopped being fingerprintable, the
+    key whose digest can no longer be re-derived, with the underlying refusal
+    chained. Implementations and configuration participate in checkpoint
+    identity; neither reaches a query's definition fingerprint, though an
+    adapted value passed as an argument reaches that call's `args_digest`
+    like any other argument. An adapter whose configuration cannot be
+    digested at construction — slot state, or instance state the snapshot
+    machinery refuses — contributes no digest and is skipped by the
+    in-process check on its own account: every other adapter in the same
+    registry is still re-derived and still raises on drift, and checkpoints
+    refuse to trust the skipped adapter's records.
 
   (See: `test_adapter_freeze_of_a_query_result_runs_under_the_guard`,
   `test_adapter_thaw_of_query_arguments_runs_under_the_guard`)
@@ -609,12 +627,26 @@ a fresh `Database` into an empty directory.
   reparameterizes the query instead of changing it behind its records.
   Module-level types are pinned through their defining module identity.
 - Mutable closure/global captures and local or dynamically unbound type
-  objects are rejected, and so are reflective namespace reads — `globals()`,
-  `locals()`, `vars()`, `eval` and `exec`, and `getattr`/`setattr`/`delattr`
-  or a `__dict__` load beside an `importlib` reference or a `sys.modules`
-  access. That rule is a conservative static read of the bytecode of the
-  query's own function and of every callable folded into its identity, so a
-  legitimate `getattr` beside a module-namespace handle is rejected too. Use
+  objects are rejected, and so are reflective namespace reads. `globals()`,
+  `locals()`, `vars()`, `eval`, `exec` and a `__globals__` attribute load are
+  refused on their own; `getattr`/`setattr`/`delattr` and a `__dict__` load
+  are refused beside a handle that can reach a module namespace — a `modules`
+  attribute load, which survives whatever name `sys` was imported under, the
+  string `"modules"` beside one of those builtins, which is how `getattr`
+  spells the same reach, or a global load of the name `importlib`. That rule
+  is a conservative static read of the bytecode of the query's own function
+  and of every callable folded into its identity, including an evaluator
+  reached through a handle's `__annotate__`, so a legitimate `getattr` beside
+  a module-namespace handle is rejected too. Its edges are drawn deliberately
+  rather than left implied: reaching the module table is not itself an
+  offense, so `sys.modules[name]` with no reflective builtin beside it is
+  accepted, and `importlib` bound under another name — an alias, or an import
+  inside the body — is not the name the rule reads. Neither read reaches
+  identity: the module a table lookup or an `import_module` call hands back at
+  run time is not a capture, and `sys` and `importlib` are themselves
+  standard-library modules, whose captures fold the names of the paths read
+  off them rather than the behavior behind them (limitation 5). Route such
+  state through an `Input` or a `Resource`. Use
   `pyinc.explain_query_captures(fn)` to preview how each capture will be
   classified before the first `db.get()`; it also reports reflective namespace
   reads, and given a `Query` it covers the handle's own state.

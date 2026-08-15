@@ -47,7 +47,12 @@ implementations can perform those reads safely.
 
 Query definitions are also checked for ambient state. Immutable constants and
 explicit `Input`/resource/query handles are allowed; mutable closure or global
-data is rejected so memo reuse never depends on hidden Python object mutation.
+data is rejected, so a memo is reused against the definitions the fingerprint
+folded rather than against whatever a mutable object happens to hold now. Two
+shapes still leave a cached result depending on Python state no fold observed
+— a chain that lands on a class or a frozen dataclass instance, and a patched
+standard-library callable — and the
+[kernel contract](kernel-contract.md#explicit-limitations) states both.
 
 Query identity is based on a stable key and a canonical typed encoding of the
 complete supported function definition. It includes code objects and nested
@@ -56,7 +61,8 @@ policies, resource implementations, and relevant interpreter/build flags. It
 does not depend on marshal reference-table behavior. Registered adapters are
 not part of it: their implementations and configuration are checkpoint
 identity, and configuration drift is caught in-process by the request-scope
-check instead.
+check instead, adapter by adapter, for every adapter whose configuration could
+be digested at construction.
 
 Resource node identity includes configuration plus the implementations of
 `probe`, `load`, `probe_and_load`, and `identity`. The public generic
