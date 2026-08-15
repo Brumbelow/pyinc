@@ -164,7 +164,6 @@ def _walk_reflective_code(code: CodeType) -> Iterator[CodeType]:
             yield from _walk_reflective_code(constant)
 
 
-@functools.lru_cache(maxsize=2048)
 def _reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
     """Names whose loads let *code* read a namespace it never captures.
 
@@ -178,7 +177,25 @@ def _reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
     loads) is rejected only beside a handle that can produce a module
     namespace (an importlib reference, or sys plus a .modules access),
     because getattr on ordinary objects is legitimate and common.
+
+    Results are cached on the code object, which hashes its own constants: a
+    code object carrying a constant that is not hashable -- a slice literal on
+    interpreters before 3.12 -- is scanned uncached instead.
     """
+
+    try:
+        return _cached_reflective_namespace_offenses(code)
+    except TypeError:
+        return _scan_reflective_namespace_offenses(code)
+
+
+@functools.lru_cache(maxsize=2048)
+def _cached_reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
+    return _scan_reflective_namespace_offenses(code)
+
+
+def _scan_reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
+    """Scan *code* and its nested code objects for the offending loads."""
 
     global_loads: set[str] = set()
     attribute_loads: set[str] = set()
