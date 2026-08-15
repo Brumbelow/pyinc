@@ -4529,6 +4529,51 @@ def test_import_module_alone_stays_accepted(
         sys.modules.pop(module_name, None)
 
 
+_FROM_IMPORTED_IMPORT_MODULE_SOURCE = '''\
+"""One mutable module global, reached through a from-imported import_module."""
+
+from importlib import import_module
+
+CONFIG_MODE = "A"
+
+
+def via_from_imported_import_module():
+    return getattr(import_module(__name__), "CONFIG_MODE")
+'''
+
+
+def test_from_imported_import_module_stays_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_reflective_from_imported_import_module"
+    (tmp_path / f"{module_name}.py").write_text(
+        _FROM_IMPORTED_IMPORT_MODULE_SOURCE, encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+        reader = module.via_from_imported_import_module
+
+        @query(key="reflective-from-imported-import-module")
+        def read_config(db: Database) -> str:
+            return cast(str, reader())
+
+        # A from-import lifts the callable out of importlib, so the reading
+        # code loads neither the name importlib nor any attribute this rule
+        # reads: the call is an ordinary global load and the getattr beside it
+        # is never armed. This is the rule's documented boundary rather than an
+        # oversight. Closing it means keying on the bare global name
+        # import_module, which arms the handle for any function that loads a
+        # global of that name beside an ordinary getattr -- whatever the
+        # callable behind the name actually is, and however unrelated to a
+        # module namespace. Recorded here so a later change to the rule has to
+        # answer for it deliberately.
+        assert Database().get(read_config) == "A"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 _MODULE_TABLE_FIXTURE_SOURCE = '''\
 """One mutable module global, reached through the module table three ways."""
 
