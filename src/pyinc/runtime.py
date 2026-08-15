@@ -5279,7 +5279,41 @@ class Database:
                 ),
             )
             for state_name, item in sorted(self._static_instance_dict(value).items())
+            if not self._is_wraps_copied_annotations(value, state_name, item)
         )
+
+    @staticmethod
+    def _is_wraps_copied_annotations(value: Any, state_name: str, item: Any) -> bool:
+        """Whether an instance-dict entry is the annotations dict `wraps` copied.
+
+        Through 3.13 `functools.WRAPPER_ASSIGNMENTS` carries `__annotations__`,
+        so `functools.wraps` binds the wrapped function's own annotations
+        dictionary -- the same object, not a copy -- into the wrapper's instance
+        dictionary. The capture walk has no dictionary arm, so it met one there
+        and refused the whole callable. From 3.14 the assignment list carries
+        `__annotate__` and `__type_params__` instead, both of which the walk
+        already folds, so the entry never appears and the identical callable is
+        accepted. Skipping it makes the older interpreters agree with 3.14
+        rather than refuse for a reason that belongs to the interpreter.
+
+        Nothing leaves identity with it: the same dictionary is read back out of
+        the wrapped function by `_function_definition_payload`, which the
+        callable payload already folds, so mutating it in place still moves the
+        query. The test is `is` against that function's annotations, so a
+        wrapper whose `__annotations__` was rebound to some other dictionary
+        still meets the dictionary arm and is still refused.
+
+        The name is tested first because reading a function's `__annotations__`
+        materializes them on 3.14, and an entry that cannot be the copy must not
+        force that.
+        """
+
+        if state_name != "__annotations__":
+            return False
+        wrapped = getattr(value, "__wrapped__", None)
+        if not isinstance(wrapped, FunctionType):
+            return False
+        return item is wrapped.__annotations__
 
     def _bound_python_method_payload(
         self,

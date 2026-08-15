@@ -270,6 +270,18 @@ class _UnsafeWrapped:
 _unsafe_wrapped = _UnsafeWrapped()
 
 
+class _ReboundAnnotationsWrapped:
+    def __init__(self) -> None:
+        functools.wraps(_wrapped_base)(self)
+        self.__annotations__ = {"value": "int"}
+
+    def __call__(self) -> int:
+        return 1
+
+
+_rebound_annotations_wrapped = _ReboundAnnotationsWrapped()
+
+
 class _CyclicWrapped:
     def __init__(self) -> None:
         self.cycle: Any = self
@@ -3729,6 +3741,37 @@ def test_wrapped_callable_with_unsafe_state_is_rejected() -> None:
     @query(key="wrapped-callable-unsafe")
     def broken(db: Database) -> int:
         return _unsafe_wrapped()
+
+    with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
+        Database().get(broken)
+
+
+def test_wrapped_callable_identity_moves_with_the_wrapped_annotations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Through 3.13 functools.wraps binds the wrapped function's own annotations
+    # dictionary into the wrapper's instance dictionary; from 3.14 it leaves
+    # __annotate__ there instead. The instance-state fold skips that copy on the
+    # versions that place it, so what keeps the annotations inside identity on
+    # every interpreter is the wrapped function's own definition payload, and
+    # mutating the shared dictionary in place has to move the query.
+    @query(key="wrapped-callable-shared-annotations")
+    def scaled(db: Database) -> int:
+        return _wrapped_scaler(10)
+
+    before = Database()._query_fingerprint(scaled)
+    monkeypatch.setitem(_wrapped_base.__annotations__, "value", "float")
+    assert Database()._query_fingerprint(scaled) != before
+
+
+def test_wrapped_callable_with_rebound_annotations_is_rejected() -> None:
+    # The instance-state fold skips __annotations__ only while it is the very
+    # object functools.wraps copied off the wrapped function. A wrapper that
+    # rebinds the attribute to a dictionary of its own is holding mutable state
+    # no fold can track, and it is refused like any other captured dictionary.
+    @query(key="wrapped-callable-rebound-annotations")
+    def broken(db: Database) -> int:
+        return _rebound_annotations_wrapped()
 
     with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
         Database().get(broken)

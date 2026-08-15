@@ -161,6 +161,18 @@ decided at release time.
   as does a wraps-decorated callable carrying slot state, a mutable member, or
   a reference cycle. Records stored under the old identities are no longer
   addressed: they miss and their queries re-execute.
+- That acceptance no longer depends on the interpreter. Through 3.13
+  `functools.WRAPPER_ASSIGNMENTS` carries `__annotations__`, so
+  `functools.wraps` binds the wrapped function's own annotations dictionary —
+  the same object, not a copy — into the wrapper's instance dictionary, where
+  the capture walk met a dictionary and refused the whole callable; 3.14
+  assigns `__annotate__` instead and accepted the identical value. The
+  instance-state fold now skips that entry while it is the very object `wraps`
+  copied, so a wraps-decorated callable capture is accepted and moves identity
+  the same way on 3.11 through 3.14. Nothing leaves identity with it: those
+  annotations are folded through the wrapped function's own definition, so
+  mutating the dictionary in place still moves the query, and a wrapper whose
+  `__annotations__` is rebound to another dictionary is still refused.
 - A `Query` handle's own state is part of its identity: its docstring, the
   metadata `functools.wraps` copies onto it, and anything written on it
   afterwards are folded beside the function, so writing a handle attribute is
