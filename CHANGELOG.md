@@ -181,16 +181,17 @@ decided at release time.
   whatever name `sys` was imported under and wherever the import sits, the
   string `"modules"` beside one of those builtins, which is how
   `getattr(sys, "modules")` spells the same reach without loading the
-  attribute, or a global load of the name `importlib`. The rule is a
+  attribute, an `import_module` attribute load, which reaches the same
+  namespace whatever name `importlib` was imported under and wherever that
+  import sits, or a global load of the name `importlib`. The rule is a
   conservative static read of the bytecode of the query's own function and of
   every callable folded into its identity, including an evaluator assigned to
   a handle's `__annotate__`, so a legitimate `getattr` beside a
   module-namespace handle is refused too. Its edges are stated rather than
-  implied: reaching the module table is not itself an offense, so
-  `sys.modules[name]` with no reflective builtin beside it is accepted, and
-  `importlib` bound under an alias or by an import inside the body is not the
-  name the rule reads. Neither read reaches identity — the module handed back
-  at run time is not a capture, and `sys` and `importlib` are themselves
+  implied: reaching a module namespace is not itself an offense, so
+  `sys.modules[name]` and `import_module(name)` with no reflective builtin
+  beside them are accepted. Neither read reaches identity — the module handed
+  back at run time is not a capture, and `sys` and `importlib` are themselves
   standard-library modules, whose captures fold the names of the paths read
   off them rather than the behavior behind them — so such state belongs behind
   an `Input` or a `Resource`, as the kernel contract's limitation 5 says.

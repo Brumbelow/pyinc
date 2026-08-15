@@ -198,21 +198,26 @@ def _reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
     loads) is rejected only beside a handle that can produce a module
     namespace, because getattr on ordinary objects is legitimate and common.
 
-    Two loads mark that handle. One is a reach for the module table: a
+    Three loads mark that handle. One is a reach for the module table: a
     "modules" attribute load, which survives whatever name sys was imported
     under and wherever the import sits, or the string "modules" beside a
     getattr-family builtin, which is how getattr spells the same reach
-    without loading the attribute at all. Neither is checked against sys, so
-    an attribute merely named "modules" arms the rule beside an ordinary
-    getattr too -- the over-rejection this conservative reading pays for. The
-    other is a global load of the name importlib, and it is that name only:
-    bound under an alias, or by an import inside the body, it loads something
-    else and nothing here sees it.
+    without loading the attribute at all. The second is an "import_module"
+    attribute load, which reaches importlib's own module builder and survives
+    an alias and a body-scope import the same way. Neither is checked against
+    the module it is read off, so an attribute merely named "modules" or
+    "import_module" arms the rule beside an ordinary getattr too -- the
+    over-rejection this conservative reading pays for. The third is a global
+    load of the name importlib, which marks the module wherever that name is
+    read, whatever is done with it afterwards. A callable lifted out of the
+    module by a from-import loads neither the name nor an attribute, so it is
+    an ordinary global load and this rule does not read it.
 
-    Reaching the module table is not itself an offense. A plain
-    sys.modules[...] subscript with no reflective builtin beside it stays
-    accepted, deliberately: the handle marks where a reflective read could
-    start, and it is the builtin beside it that is refused.
+    Reaching a module namespace is not itself an offense. A plain
+    sys.modules[...] subscript, and an import_module(...) call, with no
+    reflective builtin beside them stay accepted, deliberately: the handle
+    marks where a reflective read could start, and it is the builtin beside
+    it that is refused.
 
     A function's __globals__ is its defining module's namespace by another
     spelling, so loading that attribute is an offense on its own: the walk
@@ -264,7 +269,14 @@ def _scan_reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
     module_table = "modules" in attribute_loads or (
         bool(attribute_builtins) and "modules" in string_constants
     )
-    namespace_handle = "importlib" in global_loads or module_table
+    # import_module builds the same namespace without going through the
+    # table, and its attribute load survives an aliased or body-scope
+    # importlib for the same reason the modules load survives an aliased sys.
+    namespace_handle = (
+        "importlib" in global_loads
+        or "import_module" in attribute_loads
+        or module_table
+    )
     if namespace_handle:
         offenses = offenses | attribute_builtins
         if "__dict__" in attribute_loads:

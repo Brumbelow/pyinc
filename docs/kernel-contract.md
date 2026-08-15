@@ -633,20 +633,20 @@ a fresh `Database` into an empty directory.
   are refused beside a handle that can reach a module namespace — a `modules`
   attribute load, which survives whatever name `sys` was imported under, the
   string `"modules"` beside one of those builtins, which is how `getattr`
-  spells the same reach, or a global load of the name `importlib`. That rule
-  is a conservative static read of the bytecode of the query's own function
-  and of every callable folded into its identity, including an evaluator
-  reached through a handle's `__annotate__`, so a legitimate `getattr` beside
-  a module-namespace handle is rejected too. Its edges are drawn deliberately
-  rather than left implied: reaching the module table is not itself an
-  offense, so `sys.modules[name]` with no reflective builtin beside it is
-  accepted, and `importlib` bound under another name — an alias, or an import
-  inside the body — is not the name the rule reads. Neither read reaches
-  identity: the module a table lookup or an `import_module` call hands back at
-  run time is not a capture, and `sys` and `importlib` are themselves
-  standard-library modules, whose captures fold the names of the paths read
-  off them rather than the behavior behind them (limitation 5). Route such
-  state through an `Input` or a `Resource`. Use
+  spells the same reach, an `import_module` attribute load, which survives an
+  aliased or body-scope `importlib` the same way, or a global load of the name
+  `importlib`. That rule is a conservative static read of the bytecode of the
+  query's own function and of every callable folded into its identity,
+  including an evaluator reached through a handle's `__annotate__`, so a
+  legitimate `getattr` beside a module-namespace handle is rejected too. Its
+  edges are drawn deliberately rather than left implied: reaching a module
+  namespace is not itself an offense, so `sys.modules[name]` and
+  `import_module(name)` with no reflective builtin beside them are accepted.
+  Neither read reaches identity: the module a table lookup or an
+  `import_module` call hands back at run time is not a capture, and `sys` and
+  `importlib` are themselves standard-library modules, whose captures fold the
+  names of the paths read off them rather than the behavior behind them
+  (limitation 5). Route such state through an `Input` or a `Resource`. Use
   `pyinc.explain_query_captures(fn)` to preview how each capture will be
   classified before the first `db.get()`; it also reports reflective namespace
   reads, and given a `Query` it covers the handle's own state.

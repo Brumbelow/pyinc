@@ -4433,7 +4433,7 @@ def test_function_scope_import_of_sys_is_reached_through_the_module_table_load(
         sys.modules.pop(module_name, None)
 
 
-def test_function_scope_importlib_is_outside_the_getattr_combination_rule(
+def test_function_scope_importlib_is_reached_through_the_import_module_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module_name = "pyinc_reflective_function_scope_importlib"
@@ -4448,13 +4448,82 @@ def test_function_scope_importlib_is_outside_the_getattr_combination_rule(
         def read_config(db: Database) -> str:
             return cast(str, reader())
 
-        # getattr is refused beside a handle that can produce a module
-        # namespace: an importlib reference the reading code loads globally,
-        # or a reach for the module table. An importlib imported inside the
-        # body is neither -- it is a local, and import_module builds the
-        # handle without touching the table -- so this shape is accepted and
-        # its read escapes capture identity. The boundary is recorded here so
-        # a later change to the rule has to answer for it deliberately.
+        # An import inside the body binds importlib as a local, so no global
+        # load of the name exists to key on -- but the module builder is
+        # still reached by an attribute load, and that is what the rule
+        # reads. The import's scope makes no difference to this spelling, as
+        # it makes none to the module table.
+        with pytest.raises(UnsupportedValueError, match="reads a namespace reflectively"):
+            Database().get(read_config)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+_ALIASED_IMPORTLIB_SOURCE = '''\
+"""One mutable module global, reached twice through an aliased importlib."""
+
+import importlib as _il
+
+CONFIG_MODE = "A"
+
+
+def via_aliased_importlib_getattr():
+    return getattr(_il.import_module(__name__), "CONFIG_MODE")
+
+
+def via_aliased_import_module_attribute():
+    return _il.import_module(__name__).CONFIG_MODE
+'''
+
+
+def test_getattr_through_an_aliased_importlib_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_reflective_aliased_importlib"
+    (tmp_path / f"{module_name}.py").write_text(_ALIASED_IMPORTLIB_SOURCE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+        reader = module.via_aliased_importlib_getattr
+
+        @query(key="reflective-aliased-importlib")
+        def read_config(db: Database) -> str:
+            return cast(str, reader())
+
+        # Aliasing importlib on import changes the name the reading code
+        # loads and nothing else: the call still loads import_module as an
+        # attribute, and that load is the handle the rule keys on, exactly as
+        # the modules load is for an aliased sys.
+        with pytest.raises(UnsupportedValueError, match="reads a namespace reflectively"):
+            Database().get(read_config)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_import_module_alone_stays_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_reflective_import_module_alone"
+    (tmp_path / f"{module_name}.py").write_text(_ALIASED_IMPORTLIB_SOURCE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+        reader = module.via_aliased_import_module_attribute
+
+        @query(key="reflective-import-module-alone")
+        def read_config(db: Database) -> str:
+            return cast(str, reader())
+
+        # Building a module handle marks a handle; it is the reflective
+        # builtin beside it that is refused. Calling import_module and
+        # reading an attribute off what comes back uses none of those
+        # builtins, so this shape is accepted and its read escapes capture
+        # identity -- importlib is a standard-library module, whose captured
+        # payload folds the names read off it rather than the state behind
+        # them. The boundary is recorded here so a later change to the rule
+        # has to answer for it deliberately.
         assert Database().get(read_config) == "A"
     finally:
         sys.modules.pop(module_name, None)
