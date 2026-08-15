@@ -473,25 +473,39 @@ code is not pinned into any identity), records marked untracked via
 mismatches. A tampered, truncated, wrong-version, or wrong-kernel-fingerprint
 manifest is rejected loudly with a typed `CheckpointError` subclass.
 
-Residual limitations that stay outside the envelope: the module-monkey-patch
-gap of limitation 5 applies across runs exactly as it does in-process; and a
+Residual limitations that stay outside the envelope: the stdlib-module gap of
+limitation 5 applies across runs exactly as it does in-process; and a
 checkpoint does not survive an interpreter or build-configuration change — such
 records miss safely (they re-execute) rather than being trusted.
 
 **5. Ambient module or class monkey-patching.**
 Captured modules contribute their `__version__`, a SHA-256 digest of their
-source or compiled file bytes, declared `__all__`, stable scalar constants, and
-the behavior reached through statically resolvable attribute chains. Re-exported
-functions and submodules pin their defining modules transitively; dynamic access
-to a custom module is rejected when the behavior cannot be proven. A third-party
-version bump or source-file edit invalidates cached results that capture that
-module. Query definitions are weakly memoized per `Database` for high-cardinality
-calls, with runtime-build and captured-module observations rechecked before reuse
-so the memo cannot hide those changes. An in-process
-monkey-patch of an existing module or module-owned class attribute (for example,
-`sys.modules["foo"].X = 42` or `foo.Model.flag = True` without reloading or
-touching the file) is **not** detected. Route such mutable state through an
-`Input` or a custom `Resource`.
+source or compiled file bytes, declared `__all__`, their module-level stable
+constants read live, and — outside the standard library — the behavior reached
+through statically resolvable attribute chains. Re-exported functions and
+submodules pin their defining modules transitively; dynamic access to a custom
+module is rejected when the behavior cannot be proven. A third-party version
+bump, a source-file edit, or a namespace write to a captured module's constant
+invalidates cached results that capture that module. Query definitions are
+weakly memoized per `Database` for high-cardinality calls, and before a
+memoized fingerprint is reused the memo rechecks the runtime build, the
+observed definition objects, each captured module's file bytes and constants,
+each captured resource's configuration digest, and each statically captured
+attribute chain — re-resolving the chain and observing the definitions behind
+the functions and wraps-decorated callables it reaches. Rebinding a statically
+captured module attribute, or an entry in a directly captured class body,
+therefore moves query identity at the next request, warm or fresh alike.
+
+Two shapes stay outside that envelope by design. A chain that lands on a class
+or a frozen dataclass instance is compared by that landing's identity, so what
+its members hold or read — a plain method, `staticmethod`, `classmethod`,
+`property` and `cached_property` alike — moves a fresh fold but not a memoized
+one: `foo.Model.flag = True` is seen by a fresh `Database` and not by a warm
+one. And a captured standard-library module folds the names of the paths read
+off it rather than the behavior behind them, so patching a stdlib function or
+class it reaches (`json.dumps = other`) is not detected at all; stdlib types
+are pinned by name anchor and runtime build, never by a namespace walk. Route
+such mutable state through an `Input` or a custom `Resource`.
 
 **6. LRU eviction under active dependencies.**
 If `max_query_nodes` is set low enough that an intermediate query is evicted while
@@ -584,11 +598,26 @@ a fresh `Database` into an empty directory.
   values and the full definition payloads of transitively captured queries, so
   a body edit to a dependency query moves the parent's identity — plus the
   interpreter/build identity (see
-  [Interpreter and Build Identity](#interpreter-and-build-identity)).
-  Mutable closure/global captures and local/dynamically unbound type objects
-  are rejected. Module-level types are pinned through their defining module
-  identity. Use `pyinc.explain_query_captures(fn)` to preview how each capture
-  will be classified before the first `db.get()`.
+  [Interpreter and Build Identity](#interpreter-and-build-identity)). A
+  `functools.wraps`-decorated callable object is fingerprinted by its
+  implementation type, its `__call__` definition and its instance state, with
+  `__wrapped__` folded as additive information rather than as a substitute for
+  them, and a class carrying a `__wrapped__` attribute is fingerprinted as a
+  class; acceptance and state sensitivity are the same whether such a value is
+  captured directly or reached as a module attribute. The `Query` handle's own
+  attributes and metadata are folded beside the function, so writing one
+  reparameterizes the query instead of changing it behind its records.
+  Module-level types are pinned through their defining module identity.
+- Mutable closure/global captures and local or dynamically unbound type
+  objects are rejected, and so are reflective namespace reads — `globals()`,
+  `locals()`, `vars()`, `eval` and `exec`, and `getattr`/`setattr`/`delattr`
+  or a `__dict__` load beside an `importlib` reference or a `sys.modules`
+  access. That rule is a conservative static read of the bytecode of the
+  query's own function and of every callable folded into its identity, so a
+  legitimate `getattr` beside a module-namespace handle is rejected too. Use
+  `pyinc.explain_query_captures(fn)` to preview how each capture will be
+  classified before the first `db.get()`; it also reports reflective namespace
+  reads, and given a `Query` it covers the handle's own state.
 - `Query` is public, and `@query(key=...)` accepts an explicit stable key; the
   default is `module:qualname`. Coroutine and generator queries are rejected at
   decoration time.
@@ -768,7 +797,7 @@ Core:
 | `Database` | The incremental query database: `get`, `set`, `set_many`, `inspect`, `inspect_fresh`, `explain`, `observe`, `request_span`, `request_inputs_changed`, checkpoint save/load. |
 | `Input` | A declared, keyed input whose values enter through `db.set`. |
 | `query` | Decorator declaring a pure incremental query. |
-| `Query` | The declared-query object `@query` returns; readable from other queries and from `db.get`. |
+| `Query` | The declared-query object `@query` returns; readable from other queries and from `db.get`. Handle attributes are part of query identity: writing one moves the query's identity, so records stored under the old one no longer answer. |
 | `Resource` | Base class for tracked external values; see the Resource hooks above. |
 | `FileResource` | Text-file resource: content-hash probe, decoded string value. |
 | `BinaryFileResource` | Byte-file resource: content-hash probe, raw bytes value. |
@@ -816,8 +845,8 @@ Inspection and observation:
 | `InspectionNode` | One node in an `inspect`/`explain` report: decision, reason, dependencies. |
 | `DependencyGraphNode` | One labeled node in the exported dependency graph. |
 | `QueryProfile` | Per-query execution/reuse/backdate counts from profiling. |
-| `CaptureInfo` | One captured name in an `explain_query_captures` report. |
-| `explain_query_captures` | Preview how a query's captures will be classified before first `get`. |
+| `CaptureInfo` | One entry in an `explain_query_captures` report: a captured name, a reflective namespace read, or one piece of handle state. |
+| `explain_query_captures` | Preview how a query's captures will be classified before first `get`; also reports reflective namespace reads and, given a `Query`, its handle state. |
 | `Subscription` | Handle returned by `Database.observe`; closes the subscription. |
 | `QueryChangeEvent` | Delivered to observers when a subscribed query's result changes. |
 | `ObserverCallback` | Callback type receiving `QueryChangeEvent`s. |

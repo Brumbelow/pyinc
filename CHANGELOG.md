@@ -26,6 +26,16 @@ decided at release time.
   instead of per container: mutating `__kwdefaults__` in place, rebinding a
   closure cell, or rebinding a captured global now invalidates the memo
   rather than reusing the stale fingerprint.
+- The memoized query-fingerprint fast path can no longer serve an answer the
+  memo-free path disagrees with. Function metadata (docstrings, annotations,
+  names, type parameters), captured class bodies, captured instance and policy
+  state, statically captured module attributes and the module constants beside
+  them are observed before a memoized fingerprint is reused, and each captured
+  chain is re-resolved rather than assumed. Resource-folding queries stay
+  memoized: their resource identity is digested and compared per request, and
+  the request-scoped re-reads are cleared whenever a caller declares a
+  mid-span change. A stale memoized identity previously survived into node
+  keys, explain labels and checkpoint manifests.
 - The ambient-read guard covers the whole query boundary. Adapter `thaw`
   during argument materialization and adapter `freeze` on the result ran
   outside it, so an adapter reading ambient state could smuggle untracked
@@ -60,6 +70,13 @@ decided at release time.
   `RecursionError` in `strict` as it already did in `checked` and `fast`, the
   old strict verdict having come from walking the finite envelope. A policy on
   a query that can return a cyclic result must be cycle-aware.
+- `explain_query_captures` reaches its verdicts through the kernel's own
+  payload builders, so the report no longer describes a clean capture set for
+  a query the kernel refuses. It classifies wraps-decorated callable captures
+  as the fingerprint does, agrees with the kernel on dynamic use of a captured
+  module, reports the reflective namespace reads that refuse a query before
+  any capture is folded, and — given a `Query` rather than a plain function —
+  reports the handle's own state.
 
 ### Added
 
@@ -71,6 +88,8 @@ decided at release time.
   The pull-request merge `3cf59c6` is accepted through a structural allowlist
   — a merge whose parents all verify against the release key and whose tree
   is identical to a parent's — instead of failing the released range.
+- `AdapterContractError`, raised when a registered adapter's instance
+  configuration changes after `Database` construction.
 
 ### Changed
 
@@ -125,6 +144,45 @@ decided at release time.
   payloads. A tree-shaped wrapper clones to a structurally identical,
   identically fingerprinted snapshot; wrappers that alias or cycle re-encode
   to the canonical `FrozenGraph` the equivalent raw structure produces.
+- Query identity widened in one wave. A `functools.wraps`-decorated callable
+  capture is fingerprinted by its implementation type, its `__call__`
+  definition and its instance state, with `__wrapped__` folded as additive
+  information rather than as a substitute for them, and a class carrying a
+  `__wrapped__` attribute is fingerprinted as a class; acceptance and state
+  sensitivity are now the same whether the value is captured directly or
+  reached as a module attribute. A directly captured `functools.cache` or
+  `functools.lru_cache`-decorated callable raises `UnsupportedValueError`
+  where it was silently accepted — its `__call__` is not a Python function —
+  as does a wraps-decorated callable carrying slot state, a mutable member, or
+  a reference cycle. Records stored under the old identities are no longer
+  addressed: they miss and their queries re-execute.
+- A `Query` handle's own state is part of its identity: its docstring, the
+  metadata `functools.wraps` copies onto it, and anything written on it
+  afterwards are folded beside the function, so writing a handle attribute is
+  a supported way to reparameterize a query — identity moves and the query
+  recomputes — rather than a change its stored records cannot see. Handle
+  state the snapshot boundary refuses raises `UnsupportedValueError`,
+  including a `__wrapped__` rebound to a value that is not snapshot-safe; a
+  `__wrapped__` rebound to another function is folded in full, so metadata
+  behind the new target moves identity too.
+- Reflective namespace reads raise `UnsupportedValueError` when a query's
+  identity is first computed, instead of silently bypassing capture identity:
+  `globals()`, `locals()`, `vars()`, `eval` and `exec`, and
+  `getattr`/`setattr`/`delattr` or a `__dict__` load beside an `importlib`
+  reference or a `sys.modules` access. The rule is a conservative static read
+  of the bytecode of the query's own function and of every callable folded
+  into its identity, so a legitimate `getattr` beside a module-namespace
+  handle is refused too.
+- Mutating a registered adapter's instance configuration now raises
+  `AdapterContractError` at the next top-level request, naming the adapter
+  key whose digest moved; an adapter whose configuration stops being
+  fingerprintable raises there too, chaining the underlying refusal and naming
+  no key. Adapter implementations and configuration participate in checkpoint
+  identity and reach no query's definition fingerprint, though an adapted
+  value passed as an argument reaches that call's `args_digest` like any other
+  argument. An adapter whose configuration cannot be digested at construction
+  is exempt from the request check; checkpoints refuse to trust its records
+  instead.
 
 ## [3.1.1] - 2026-08-03
 
