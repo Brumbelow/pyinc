@@ -4186,8 +4186,13 @@ def test_mutating_an_adapter_into_an_undigestable_shape_raises(shape: str) -> No
 
     assert db.get(constant) == 1
     _plant_undigestable_state_key(adapter, shape)
-    with pytest.raises(AdapterContractError, match="no longer fingerprintable"):
+    # Both raise paths say which adapter they are about: this one the adapter
+    # whose digest can no longer be computed, the drift path the keys whose
+    # digest moved. A registry holding several adapters is the case that needs
+    # it, and the caller has to be told which one to look at either way.
+    with pytest.raises(AdapterContractError, match="no longer fingerprintable") as raised:
         db.get(constant)
+    assert _adapter_key(_MutableCurrency) in str(raised.value)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

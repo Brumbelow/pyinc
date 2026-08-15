@@ -4745,7 +4745,7 @@ class Database:
                 raise AdapterContractError(
                     "A registered adapter is no longer fingerprintable, so its "
                     "configuration can no longer be checked against the digest "
-                    "taken at Database construction."
+                    f"taken at Database construction. Adapter key(s): {key}."
                 ) from exc
         if current == expected:
             return
