@@ -2191,6 +2191,149 @@ def test_memoized_fingerprint_tracks_functions_a_captured_module_function_calls(
         sys.modules.pop(replacement_name, None)
 
 
+def test_memoized_fingerprint_tracks_a_chain_landed_inputs_policy_globals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_input_policy"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from pyinc import Input\n"
+        "\n"
+        "\n"
+        "def tolerance() -> int:\n"
+        "    return 3\n"
+        "\n"
+        "\n"
+        "def wider_tolerance() -> int:\n"
+        "    return 99\n"
+        "\n"
+        "\n"
+        "def near(a: int, b: int) -> bool:\n"
+        "    return abs(a - b) <= tolerance()\n"
+        "\n"
+        "\n"
+        'READING = Input[int]("module-input-policy", eq=near)\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-input-policy")
+        def reading(db: Database) -> int:
+            return cast(int, module.READING.read(db))
+
+        db = Database()
+        db.set(module.READING, 1)
+        db._query_fingerprint(reading)
+        # The chain lands on an Input, whose eq policy is folded as a
+        # definition: the policy's globals are read live while the Input the
+        # chain resolves to holds still, and a function is not a constant the
+        # module stamp carries.
+        monkeypatch.setattr(module, "tolerance", module.wider_tolerance)
+        memoized, truth = _memo_and_truth(db, reading)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(reading)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="type-alias and type-parameter syntax require Python 3.12",
+)
+def test_memoized_fingerprint_tracks_a_chain_landed_type_alias_evaluator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_type_alias"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class First:\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "class Second:\n"
+        "    marker = 2\n"
+        "\n"
+        "\n"
+        "type ALIAS = First\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-type-alias")
+        def aliased(db: Database) -> str:
+            return cast(str, module.ALIAS.__name__)
+
+        db = Database()
+        db._query_fingerprint(aliased)
+        # The chain lands on a type alias, whose lazy evaluator resolves this
+        # global when the payload calls it. The alias object never moves, and
+        # a class is not a constant the module stamp carries.
+        monkeypatch.setattr(module, "First", module.Second)
+        memoized, truth = _memo_and_truth(db, aliased)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(aliased)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_memoized_fingerprint_tracks_a_chain_landed_resources_method_globals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_resource_methods"
+    (tmp_path / f"{module_name}.py").write_text(
+        "def factor() -> int:\n"
+        "    return 2\n"
+        "\n"
+        "\n"
+        "def larger_factor() -> int:\n"
+        "    return 5\n"
+        "\n"
+        "\n"
+        "class Scaled:\n"
+        "    def identity(self) -> str:\n"
+        '        return "scaled-resource"\n'
+        "\n"
+        "    def label(self, key: int) -> str:\n"
+        '        return f"scaled[{key}]"\n'
+        "\n"
+        "    def probe(self, key: int) -> int:\n"
+        "        return factor()\n"
+        "\n"
+        "    def load(self, db: object, key: int) -> int:\n"
+        "        return factor() * key\n"
+        "\n"
+        "\n"
+        "SCALED = Scaled()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-resource-methods")
+        def scaled(db: Database) -> Any:
+            return module.SCALED
+
+        db = Database()
+        db._query_fingerprint(scaled)
+        # The chain lands on a resource, whose probe, load and identity
+        # methods are folded as the definitions they are. The per-request
+        # configuration digest covers what identity() returns and nothing of
+        # what those method bodies read, so the rebinding moves the fresh
+        # fingerprint while the resource itself holds still.
+        monkeypatch.setattr(module, "factor", module.larger_factor)
+        memoized, truth = _memo_and_truth(db, scaled)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(scaled)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_rebound_global_behind_a_captured_module_function_matches_fresh(
     mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3718,6 +3861,24 @@ def test_query_handle_annotations_of_its_own_move_the_fingerprint() -> None:
     memoized, truth = _memo_and_truth(db, annotated)
     assert memoized == truth
     assert memoized == with_evaluator
+
+
+def test_reflective_annotation_evaluator_on_a_query_handle_is_rejected() -> None:
+    @query(key="handle-reflective-annotate")
+    def annotated(db: Database) -> int:
+        return 1
+
+    def evaluate(format: int) -> dict[str, Any]:
+        return {"return": globals()["_ObservedConsts"]}
+
+    # An annotation evaluator is folded by resolving the names its code
+    # references against its globals, exactly as any other captured function
+    # is, so a read that names none of them escapes the fold here too. The
+    # same function on any other handle attribute is refused through the
+    # function-definition route; this is the third route to that fold.
+    cast(Any, annotated).__annotate__ = evaluate
+    with pytest.raises(UnsupportedValueError, match=r"reads a namespace reflectively \(globals\)"):
+        Database()._query_fingerprint(annotated)
 
 
 def test_rebound_wrapped_function_on_a_query_handle_matches_fresh() -> None:

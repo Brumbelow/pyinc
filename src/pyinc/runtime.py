@@ -156,6 +156,27 @@ _RUNTIME_BUILD_PAYLOAD = _build_runtime_build_payload()
 _REFLECTIVE_NAMESPACE_BUILTINS = frozenset({"eval", "exec", "globals", "locals", "vars"})
 _REFLECTIVE_ATTRIBUTE_BUILTINS = frozenset({"delattr", "getattr", "setattr"})
 
+# The type-parameter classes this interpreter exposes. Named once so the memo
+# observation and the chain-landing filter recognise the same set.
+_TYPE_PARAMETER_TYPES = tuple(
+    candidate
+    for candidate in (
+        getattr(typing, "TypeVar", None),
+        getattr(typing, "ParamSpec", None),
+        getattr(typing, "TypeVarTuple", None),
+    )
+    if isinstance(candidate, type)
+)
+
+
+def _is_type_alias(value: Any) -> bool:
+    """True for a `type X = ...` alias, from typing or typing_extensions."""
+
+    return type(value).__qualname__ == "TypeAliasType" and type(value).__module__ in {
+        "typing",
+        "typing_extensions",
+    }
+
 
 def _walk_reflective_code(code: CodeType) -> Iterator[CodeType]:
     yield code
@@ -785,15 +806,15 @@ class Database:
         # Digest of each registered adapter's instance configuration, taken
         # once at construction. Mutating a registered adapter afterwards
         # violates the value-boundary law; every top-level request re-derives
-        # the map and raises AdapterContractError when it moved. None means at
-        # least one adapter's configuration cannot be digested, so in-process
-        # drift is undetectable there and enforcement falls back to the
-        # documented law (the checkpoint boundary still refuses trust there).
-        self._registered_adapter_digests: dict[str, str] | None
-        try:
-            self._registered_adapter_digests = self._current_adapter_configuration_digests()
-        except (UnsupportedValueError, TypeError, ValueError):
-            self._registered_adapter_digests = None
+        # the digest of each adapter named here and raises AdapterContractError
+        # when one moved. An adapter whose configuration cannot be digested
+        # contributes no entry: drift there is undetectable in-process and
+        # enforcement falls back to the documented law (the checkpoint boundary
+        # still refuses trust there), while every other adapter in the same
+        # registry stays checked.
+        self._registered_adapter_digests: dict[str, str] = (
+            self._digestable_adapter_configuration_digests()
+        )
         _install_guards_once()
 
     @property
@@ -3610,10 +3631,12 @@ class Database:
         enters one: `_module_observation_stamp` re-derives its file bytes,
         import metadata and module-level constants; each statically accessed
         attribute chain is re-resolved and its target compared by identity; and
-        the definitions behind chain-reached functions, wraps-decorated
-        callable objects and query handles, whose globals, defaults, instance
-        and handle state the payload folds live, are observed by
-        `_module_function_target_observation`. Where a chain lands on a class
+        the definitions behind the chain landings whose payloads read one live
+        -- functions, wraps-decorated callable objects, query handles, inputs,
+        type aliases, type parameters and resources, whose globals, defaults,
+        policies, evaluators, instance and handle state the payload folds live
+        -- are observed by `_module_function_target_observation`. Where a chain
+        lands on a class
         or a frozen dataclass instance instead -- named directly, or held
         inside an immutable container the payload accepts, such as a tuple, a
         NamedTuple or a frozenset -- no arm follows anything inside that
@@ -3623,12 +3646,13 @@ class Database:
         observed. Landings the payload refuses instead of folding -- a plain
         object that is not one of those callables, a mutable dataclass, a
         dict, a list -- raise when the fingerprint is built and carry nothing
-        stale. Resources get no arm of their own either: what a fold reads out
-        of `identity()` is gated by the recorded configuration digests the memo
-        carries alongside this observation, and every slot that reaches a
-        resource for anything else folds it as the ordinary class or instance
-        it is, so the arms below already observe it from whichever slot arrives
-        first.
+        stale. What a fold reads out of a resource's `identity()` needs no
+        walk on either route: it is gated by the recorded configuration
+        digests the memo carries alongside this observation. Everything else a
+        fold reads off a resource -- its type, its probe and load and identity
+        methods, and what those read -- is observed as the ordinary instance
+        it is, by this walk where a slot reaches the resource directly and by
+        the chain-landing arm where an attribute chain lands on it.
         """
 
         # The query arm of `observe_value` is this observation: it folds the
@@ -3641,7 +3665,7 @@ class Database:
     def _module_function_target_observation(
         self, records: tuple[tuple[ModuleType, tuple[str, ...], Any], ...]
     ) -> tuple[Any, ...]:
-        """Observe the definitions behind chain-reached module callables.
+        """Observe the definitions behind chain landings folded from live code.
 
         `_module_attribute_payload` folds a function target through
         `_function_definition_payload`, which reads its defaults, closure and
@@ -3654,33 +3678,46 @@ class Database:
         too, which is what makes `import m; m.f` and `from m import f` reuse a
         stored fingerprint on the same conditions. A Query landing is the third
         such shape: the payload folds its function, its policies and its handle
-        state live, none of which moves the handle the chain resolves to. One
-        observer family covers every record, in the order the memo stored them,
-        so a value two chains share is folded on first contact the same way
-        here as it was when the stored observation was built.
+        state live, none of which moves the handle the chain resolves to.
+
+        Four more landings are folded from live definitions and belong here for
+        exactly that reason: an Input, whose `eq` and `cutoff` policies are
+        folded as definitions; a type alias and a type parameter, whose lazy
+        evaluators resolve their globals when the payload calls them; and a
+        resource, whose `probe`, `load` and `identity` methods are folded as
+        the definitions they are. One observer family covers every record, in
+        the order the memo stored them, so a value two chains share is folded
+        on first contact the same way here as it was when the stored
+        observation was built.
         """
 
-        from .core import Query
+        from .core import Input, Query
 
-        # A Query is named before the wrapped-callable clause rather than left
-        # to it: functools.wraps does put a __wrapped__ function on every
-        # handle, so the clause would catch one by accident, and the memo would
-        # lose the handle silently if that ever stopped being true.
-        #
-        # The type exclusion mirrors `_module_attribute_payload`, which routes
-        # a class to its type branch before the wrapped-callable one: a class
-        # landing is compared by identity alone, whether or not it carries a
-        # __wrapped__ attribute.
-        targets = [
-            target
-            for _module, _path, target in records
-            if isinstance(target, (FunctionType, Query))
-            or (
-                not isinstance(target, type)
-                and isinstance(getattr(target, "__wrapped__", None), FunctionType)
-                and callable(target)
+        def observed(target: Any) -> bool:
+            # A Query is named before the wrapped-callable clause rather than
+            # left to it: functools.wraps does put a __wrapped__ function on
+            # every handle, so the clause would catch one by accident, and the
+            # memo would lose the handle silently if that ever stopped being
+            # true.
+            if isinstance(target, (FunctionType, Query, Input)):
+                return True
+            # Mirrors `_module_attribute_payload`, which routes a module and a
+            # class to their own branches before the resource and
+            # wrapped-callable ones: a module is covered by the memo's other
+            # arms, and a class landing is compared by identity alone, whether
+            # or not it carries a __wrapped__ attribute or the methods a
+            # resource is recognised by.
+            if isinstance(target, (ModuleType, type)):
+                return False
+            if _is_type_alias(target) or isinstance(target, _TYPE_PARAMETER_TYPES):
+                return True
+            if self._is_resource_handle(target):
+                return True
+            return isinstance(getattr(target, "__wrapped__", None), FunctionType) and callable(
+                target
             )
-        ]
+
+        targets = [target for _module, _path, target in records if observed(target)]
         if not targets:
             # Most queries reach no module function at all, and building the
             # observer family is the expensive half of this call.
@@ -3704,15 +3741,7 @@ class Database:
         from .core import Input, Query
 
         seen: builtins.set[int] = set()
-        parameter_types = tuple(
-            candidate
-            for candidate in (
-                getattr(typing, "TypeVar", None),
-                getattr(typing, "ParamSpec", None),
-                getattr(typing, "TypeVarTuple", None),
-            )
-            if isinstance(candidate, type)
-        )
+        parameter_types = _TYPE_PARAMETER_TYPES
 
         def observe_value(value: Any) -> Any:
             if isinstance(value, Query):
@@ -3758,7 +3787,7 @@ class Database:
                     value,
                     tuple(observe_value(item) for item in typing.get_args(value)),
                 )
-            if is_type_alias(value):
+            if _is_type_alias(value):
                 return observe_type_alias(value)
             if parameter_types and isinstance(value, parameter_types):
                 return observe_type_parameter(value)
@@ -3912,17 +3941,11 @@ class Database:
                     observe_annotation(typing.get_origin(value)),
                     tuple(observe_annotation(item) for item in typing.get_args(value)),
                 )
-            if is_type_alias(value):
+            if _is_type_alias(value):
                 return observe_type_alias(value)
             if parameter_types and isinstance(value, parameter_types):
                 return observe_type_parameter(value)
             return observe_value(value)
-
-        def is_type_alias(value: Any) -> bool:
-            return type(value).__qualname__ == "TypeAliasType" and type(value).__module__ in {
-                "typing",
-                "typing_extensions",
-            }
 
         def observe_type_alias(value: Any) -> Any:
             # One fold for both slots that reach an alias, annotation and
@@ -4262,6 +4285,11 @@ class Database:
     def _annotation_evaluator_payload(
         self, evaluator: FunctionType, active_ids: builtins.set[int]
     ) -> Any:
+        # The third route that folds a Python function's code, and it makes the
+        # same static assumption the other two do: the names below are resolved
+        # against the evaluator's globals. A reflective read reaches state none
+        # of them names, so it is refused here as well.
+        self._reject_reflective_namespace_reads(evaluator)
         evaluator_id = id(evaluator)
         if evaluator_id in active_ids:
             return ("recursive-annotation-evaluator", evaluator.__qualname__)
@@ -4667,50 +4695,61 @@ class Database:
             for value_type, adapter in self._adapters.items()
         }
 
-    def _current_adapter_configuration_digests(self) -> dict[str, str]:
-        """Configuration digest of each registered adapter, keyed by adapted type.
+    def _digestable_adapter_configuration_digests(self) -> dict[str, str]:
+        """Configuration digest of every adapter that can be digested at all.
 
         The in-process basis for the pinned-adapter-state law: an adapter's own
         instance state, digested through the same helper the implementation
         digest folds it with. Implementations stay out of this map; they are
         digested at the checkpoint boundary, where the code that froze a record
         and the code reading it come from different processes.
+
+        Built one entry at a time, so an adapter whose configuration cannot be
+        digested -- slot state, a state key that defeats the digest's sort --
+        costs the check only its own entry. Construction succeeds either way;
+        what such an adapter loses is the in-process check on itself.
         """
-        return {
-            _adapter_key(value_type): self._adapter_configuration_digest(adapter)
-            for value_type, adapter in self._adapters.items()
-        }
+        digests: dict[str, str] = {}
+        for value_type, adapter in self._adapters.items():
+            try:
+                digest = self._adapter_configuration_digest(adapter)
+            except (UnsupportedValueError, TypeError, ValueError):
+                continue
+            digests[_adapter_key(value_type)] = digest
+        return digests
 
     def _verify_registered_adapters(self) -> None:
         """Raise if a registered adapter's configuration moved since construction.
 
         Adapter instance configuration is contractually immutable for the
         registered lifetime. The configuration digests are taken once at
-        construction; re-deriving the small map at each top-level request turns
-        a silent warm-not-equal-fresh into a loud typed error without changing
-        any cache key. An adapter whose configuration could not be digested at
-        construction leaves the map unset and skips the check: drift there is
-        undetectable in-process, and the checkpoint boundary already refuses to
-        trust such adapters.
+        construction; re-deriving them at each top-level request turns a silent
+        warm-not-equal-fresh into a loud typed error without changing any cache
+        key. Only the adapters the construction-time map names are re-derived:
+        an adapter whose configuration could not be digested then is absent
+        from it and is skipped, on its own, because drift there is undetectable
+        in-process and the checkpoint boundary already refuses to trust it.
         """
 
         expected = self._registered_adapter_digests
-        if expected is None or not self._adapters:
+        if not expected:
             return
-        try:
-            current = self._current_adapter_configuration_digests()
-        except (UnsupportedValueError, TypeError, ValueError) as exc:
-            raise AdapterContractError(
-                "A registered adapter is no longer fingerprintable; its "
-                "configuration changed after Database construction."
-            ) from exc
+        current: dict[str, str] = {}
+        for value_type, adapter in self._adapters.items():
+            key = _adapter_key(value_type)
+            if key not in expected:
+                continue
+            try:
+                current[key] = self._adapter_configuration_digest(adapter)
+            except (UnsupportedValueError, TypeError, ValueError) as exc:
+                raise AdapterContractError(
+                    "A registered adapter is no longer fingerprintable, so its "
+                    "configuration can no longer be checked against the digest "
+                    "taken at Database construction."
+                ) from exc
         if current == expected:
             return
-        moved = sorted(
-            key
-            for key in expected.keys() | current.keys()
-            if expected.get(key) != current.get(key)
-        )
+        moved = sorted(key for key in expected if expected[key] != current.get(key))
         raise AdapterContractError(
             "Adapter instance configuration changed after Database construction "
             f"for adapter key(s): {', '.join(moved)}. Registered adapters are "

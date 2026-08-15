@@ -44,7 +44,7 @@ from pyinc import (
     serialize_snapshot,
 )
 from pyinc.runtime import _MISSING_SNAPSHOT
-from pyinc.value import fingerprint_snapshot
+from pyinc.value import _adapter_key, fingerprint_snapshot
 
 _GLOBAL_BOX = {"x": 1}
 
@@ -4093,6 +4093,27 @@ def test_unverifiable_adapters_construct_and_skip_the_request_check() -> None:
     assert db.get(constant) == 1
 
 
+def test_an_undigestable_adapter_does_not_exempt_its_registry() -> None:
+    adapter = _CurrencyAdapter()
+    source = Input[Any]("adapter-mixed-registry-source")
+    # The second entry is slot-stated, so its configuration cannot be digested
+    # and its own drift stays undetectable in-process. That exemption is the
+    # adapter's, not the registry's: the first adapter is digestable and stays
+    # checked beside it.
+    db = Database(adapters={_MutableCurrency: adapter, Boxed: _SlottedAdapter()})
+    assert set(db._registered_adapter_digests) == {_adapter_key(_MutableCurrency)}
+    db.set(source, _MutableCurrency(5))
+
+    @query(key="adapter-mixed-registry")
+    def read_amount(db_: Database) -> Any:
+        return source.read(db_)
+
+    db.get(read_amount)
+    adapter.scale = 100
+    with pytest.raises(AdapterContractError, match="_MutableCurrency"):
+        db.get(read_amount)
+
+
 def test_adapter_free_databases_pay_nothing_at_request_scope() -> None:
     db = Database()
 
@@ -4145,7 +4166,7 @@ def test_adapters_whose_state_keys_defeat_digesting_construct_unverified(shape: 
     adapter = _CurrencyAdapter()
     _plant_undigestable_state_key(adapter, shape)
     db = Database(adapters={_MutableCurrency: adapter})
-    assert db._registered_adapter_digests is None
+    assert db._registered_adapter_digests == {}
 
     @query(key=f"adapter-undigestable-state-{shape}")
     def constant(db_: Database) -> int:
