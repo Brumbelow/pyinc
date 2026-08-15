@@ -3976,7 +3976,7 @@ def test_benign_getattr_on_ordinary_objects_stays_accepted(
 
 
 _FUNCTION_SCOPE_IMPORT_SOURCE = '''\
-"""A getattr namespace read whose module handle is imported at function scope."""
+"""Two getattr namespace reads whose module handle is imported at function scope."""
 
 CONFIG_MODE = "A"
 
@@ -3985,10 +3985,16 @@ def via_function_scope_import():
     import sys
 
     return getattr(sys.modules[__name__], "CONFIG_MODE")
+
+
+def via_function_scope_importlib():
+    import importlib
+
+    return getattr(importlib.import_module(__name__), "CONFIG_MODE")
 '''
 
 
-def test_function_scope_import_is_outside_the_getattr_combination_rule(
+def test_function_scope_import_of_sys_is_reached_through_the_module_table_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module_name = "pyinc_reflective_function_scope_import"
@@ -3996,15 +4002,162 @@ def test_function_scope_import_is_outside_the_getattr_combination_rule(
     monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     module = importlib.import_module(module_name)
-    reader = module.via_function_scope_import
+    try:
+        reader = module.via_function_scope_import
 
-    @query(key="reflective-function-scope-import")
-    def read_config(db: Database) -> str:
-        return cast(str, reader())
+        @query(key="reflective-function-scope-import")
+        def read_config(db: Database) -> str:
+            return cast(str, reader())
 
-    # getattr is refused only beside a namespace handle the reading code loads
-    # globally -- an importlib reference, or sys with a .modules access. An
-    # import inside the body binds sys as a local, no such global load exists,
-    # and this shape is accepted. The boundary is recorded here so a later
-    # change to the rule has to answer for it deliberately.
-    assert Database().get(read_config) == "A"
+        # An import inside the body binds sys as a local, so no global load of
+        # the name exists to key on -- but the module table is still reached
+        # by an attribute load, and that is what the rule reads. The import's
+        # scope makes no difference to this spelling.
+        with pytest.raises(UnsupportedValueError, match="reads a namespace reflectively"):
+            Database().get(read_config)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_function_scope_importlib_is_outside_the_getattr_combination_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_reflective_function_scope_importlib"
+    (tmp_path / f"{module_name}.py").write_text(_FUNCTION_SCOPE_IMPORT_SOURCE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+        reader = module.via_function_scope_importlib
+
+        @query(key="reflective-function-scope-importlib")
+        def read_config(db: Database) -> str:
+            return cast(str, reader())
+
+        # getattr is refused beside a handle that can produce a module
+        # namespace: an importlib reference the reading code loads globally,
+        # or a reach for the module table. An importlib imported inside the
+        # body is neither -- it is a local, and import_module builds the
+        # handle without touching the table -- so this shape is accepted and
+        # its read escapes capture identity. The boundary is recorded here so
+        # a later change to the rule has to answer for it deliberately.
+        assert Database().get(read_config) == "A"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+_MODULE_TABLE_FIXTURE_SOURCE = '''\
+"""One mutable module global, reached through the module table three ways."""
+
+import sys
+import sys as _aliased_sys
+
+CONFIG_MODE = "A"
+
+
+def via_getattr_on_sys():
+    return getattr(sys, "modules")[__name__].CONFIG_MODE
+
+
+def via_getattr_on_aliased_sys():
+    return getattr(_aliased_sys, "modules")[__name__].CONFIG_MODE
+
+
+def via_aliased_module_table_subscript():
+    return _aliased_sys.modules[__name__].CONFIG_MODE
+'''
+
+
+@pytest.mark.parametrize("shape", ["via_getattr_on_sys", "via_getattr_on_aliased_sys"])
+def test_getattr_of_the_module_table_is_rejected(
+    shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_reflective_module_table_{shape}"
+    (tmp_path / f"{module_name}.py").write_text(_MODULE_TABLE_FIXTURE_SOURCE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+        reader = getattr(module, shape)
+
+        @query(key=f"reflective-module-table-{shape}")
+        def read_config(db: Database) -> str:
+            return cast(str, reader())
+
+        # getattr(sys, "modules") is the getattr-family spelling of the very
+        # handle the rule keys on: it loads no attribute named modules, so the
+        # string it passes instead is what marks the reach. Aliasing sys on
+        # import changes the name the reading code loads and nothing else.
+        with pytest.raises(UnsupportedValueError, match="reads a namespace reflectively"):
+            Database().get(read_config)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_module_table_subscripting_alone_stays_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_reflective_module_table_subscript"
+    (tmp_path / f"{module_name}.py").write_text(_MODULE_TABLE_FIXTURE_SOURCE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+        reader = module.via_aliased_module_table_subscript
+
+        @query(key="reflective-module-table-subscript")
+        def read_config(db: Database) -> str:
+            return cast(str, reader())
+
+        # Reaching the module table marks a handle; it is the reflective
+        # builtin beside it that is refused. Subscripting the table and
+        # reading an attribute off what comes back uses none of those
+        # builtins, so this shape is accepted and its read escapes capture
+        # identity -- sys is a standard-library module, whose captured payload
+        # folds the names read off it rather than the state behind them. The
+        # boundary is recorded here so a later change to the rule has to
+        # answer for it deliberately.
+        assert Database().get(read_config) == "A"
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+_FUNCTION_GLOBALS_FIXTURE_SOURCE = '''\
+"""A helper function beside the mutable module state its __globals__ reaches."""
+
+SECRET = {"v": 1}
+
+
+def helper():
+    return 1
+'''
+
+
+def test_reading_a_captured_functions_globals_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_reflective_function_globals"
+    (tmp_path / f"{module_name}.py").write_text(
+        _FUNCTION_GLOBALS_FIXTURE_SOURCE, encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="reflective-function-globals")
+        def read_secret(db: Database) -> int:
+            return cast(int, module.helper.__globals__["SECRET"]["v"])
+
+        # An attribute chain that lands on a function folds that function's
+        # own definition and stops there. __globals__ carries the whole
+        # defining module dictionary past the landing, so the mutable state
+        # behind it reaches the answer while moving nothing the fingerprint
+        # sees -- the same escape globals() opens from inside the module, and
+        # refused for the same reason.
+        with pytest.raises(
+            UnsupportedValueError, match=r"reads a namespace reflectively \(__globals__\)"
+        ):
+            Database().get(read_secret)
+    finally:
+        sys.modules.pop(module_name, None)

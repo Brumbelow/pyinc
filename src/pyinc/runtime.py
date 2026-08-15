@@ -175,8 +175,13 @@ def _reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
     of the builtins count -- an attribute that happens to be named "globals"
     or "vars" is untouched -- and the getattr family (plus __dict__ attribute
     loads) is rejected only beside a handle that can produce a module
-    namespace (an importlib reference, or sys plus a .modules access),
-    because getattr on ordinary objects is legitimate and common.
+    namespace (an importlib reference, or a reach for the module table under
+    whatever name sys was imported as), because getattr on ordinary objects is
+    legitimate and common.
+
+    A function's __globals__ is its defining module's namespace by another
+    spelling, so loading that attribute is an offense on its own: the walk
+    that folds a captured function stops at the function and never follows it.
 
     Results are cached on the code object, which hashes its own constants: a
     code object carrying a constant that is not hashable -- a slice literal on
@@ -199,7 +204,11 @@ def _scan_reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
 
     global_loads: set[str] = set()
     attribute_loads: set[str] = set()
+    string_constants: set[str] = set()
     for item in _walk_reflective_code(code):
+        string_constants.update(
+            constant for constant in item.co_consts if isinstance(constant, str)
+        )
         for instruction in dis.get_instructions(item):
             argval = instruction.argval
             if not isinstance(argval, str):
@@ -208,12 +217,21 @@ def _scan_reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
                 global_loads.add(argval)
             elif instruction.opname in {"LOAD_ATTR", "LOAD_METHOD"}:
                 attribute_loads.add(argval)
+    attribute_builtins = global_loads & _REFLECTIVE_ATTRIBUTE_BUILTINS
     offenses = global_loads & _REFLECTIVE_NAMESPACE_BUILTINS
-    namespace_handle = "importlib" in global_loads or (
-        "sys" in global_loads and "modules" in attribute_loads
+    if "__globals__" in attribute_loads:
+        offenses = offenses | {"__globals__"}
+    # The attribute load carries the module table under any import alias, and
+    # getattr's string argument spells the same access without loading the
+    # attribute at all -- both are the handle the rule below keys on, so
+    # aliasing sys and getattr(sys, "modules") reach it the same way a plain
+    # sys.modules access does.
+    module_table = "modules" in attribute_loads or (
+        bool(attribute_builtins) and "modules" in string_constants
     )
+    namespace_handle = "importlib" in global_loads or module_table
     if namespace_handle:
-        offenses = offenses | (global_loads & _REFLECTIVE_ATTRIBUTE_BUILTINS)
+        offenses = offenses | attribute_builtins
         if "__dict__" in attribute_loads:
             offenses = offenses | {"__dict__"}
     return tuple(sorted(offenses))
