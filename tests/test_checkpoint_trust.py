@@ -2055,10 +2055,10 @@ def test_query_handle_attribute_the_body_never_reads_invalidates_records() -> No
     # the query through the capture the test above relies on. The handle fold
     # is what moves identity here, reaching the whole handle rather than the
     # part some body happens to read, and the moved identity is what makes the
-    # stored record unreachable. The value is unchanged by construction: what
-    # is pinned is that the stored record stops answering, which is the only
-    # way a later write that *does* change the value can be trusted to miss as
-    # well.
+    # stored record unreachable. Nothing this write does can change the answer,
+    # which is what puts the assertions below on the identity and the execution
+    # counter: for a query shaped like this one, they are what a miss looks
+    # like.
     cast(Any, stamped).threshold = 2
     loaded = Database(store=store)
     loaded.load_checkpoint(checkpoint)
@@ -2091,6 +2091,40 @@ def test_unchanged_query_handle_attribute_still_warms_from_a_checkpoint() -> Non
     assert loaded.get(selfread) == 3
     assert loaded.inspect(selfread).last_recompute == "reused"
     assert loaded.statistics().query_executions == 0
+
+
+def test_reverting_a_query_handle_attribute_restores_its_records() -> None:
+    @query(key="checkpoint-handle-attr-revert")
+    def selfread(db: Database) -> int:
+        return int(cast(Any, selfread).threshold)
+
+    store = InMemoryArtifactStore()
+    cast(Any, selfread).threshold = 1
+    saver = Database(store=store)
+    assert saver.get(selfread) == 1
+    saved_identity = saver._query_key(selfread, (), {})[0].identity
+    checkpoint = saver.save_checkpoint()
+
+    cast(Any, selfread).threshold = 2
+    rebound = Database(store=store)
+    rebound.load_checkpoint(checkpoint)
+    assert rebound._query_key(selfread, (), {})[0].identity != saved_identity
+    assert rebound.get(selfread) == 2
+    assert rebound.inspect(selfread).last_recompute == "executed"
+
+    cast(Any, selfread).threshold = 1
+    reverted = Database(store=store)
+    reverted.load_checkpoint(checkpoint)
+    # What the write above did to the saved record was leave it unaddressed,
+    # not destroy it. Writing the attribute back rebuilds the same identity
+    # byte for byte, so the record the checkpoint holds is reachable again and
+    # answers without the body running -- which is what makes a handle
+    # attribute a way to reparameterize a query rather than a one-way spend of
+    # everything stored under it.
+    assert reverted._query_key(selfread, (), {})[0].identity == saved_identity
+    assert reverted.get(selfread) == 1
+    assert reverted.inspect(selfread).last_recompute == "reused"
+    assert reverted.statistics().query_executions == 0
 
 
 def test_reflective_queries_stay_rejected_after_a_checkpoint_load(

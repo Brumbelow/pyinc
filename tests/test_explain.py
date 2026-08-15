@@ -573,3 +573,44 @@ def test_rebound_wrapped_on_a_query_handle_is_rejected_by_explain_and_kernel() -
     assert "__wrapped__" in info.rejection_reason
     with pytest.raises(UnsupportedValueError):
         Database().get(rebinds_wrapped)
+
+
+def test_non_string_handle_state_key_is_rejected_by_explain_and_kernel() -> None:
+    @query
+    def keyed_by_a_number(db: Database) -> int:
+        return 1
+
+    # The second shape the per-entry walk cannot report: a name that is not a
+    # string is skipped by the walk -- it has no entry to be reported under --
+    # and the fold of the whole handle is what refuses it.
+    state: dict[Any, Any] = vars(keyed_by_a_number)
+    state[42] = 1
+
+    report = {item.name: item for item in explain_query_captures(keyed_by_a_number)}
+    info = report["handle[*]"]
+    assert info.accepted is False
+    assert info.kind == "rejected"
+    assert info.origin == "handle"
+    assert "invalid custom state" in info.rejection_reason
+    with pytest.raises(UnsupportedValueError, match="invalid custom state"):
+        Database().get(keyed_by_a_number)
+
+
+def test_invalid_type_parameters_on_a_query_handle_are_rejected_by_explain_and_kernel() -> None:
+    @query
+    def holds_type_parameters(db: Database) -> int:
+        return 1
+
+    # The third: `__type_params__` is a contract name the walk skips, and the
+    # fold refuses anything but a tuple there rather than folding whatever the
+    # handle carries.
+    cast(Any, holds_type_parameters).__type_params__ = [1]
+
+    report = {item.name: item for item in explain_query_captures(holds_type_parameters)}
+    info = report["handle[*]"]
+    assert info.accepted is False
+    assert info.kind == "rejected"
+    assert info.origin == "handle"
+    assert "invalid type parameters" in info.rejection_reason
+    with pytest.raises(UnsupportedValueError, match="invalid type parameters"):
+        Database().get(holds_type_parameters)

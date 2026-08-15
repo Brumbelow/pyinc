@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import decimal
 import functools
 import hashlib
 import importlib
@@ -180,6 +181,22 @@ class _ObservedPartsHolder:
     """Class-body slot for a resource that a query also captures directly."""
 
     nested: Any = None
+
+
+def _stdlib_dumps_replacement(*args: Any, **kwargs: Any) -> str:
+    """Stands in for json.dumps while the stdlib fold-blindness pin runs."""
+
+    return "replaced"
+
+
+class _StdlibDecimalReplacement:
+    """Stands in for decimal.Decimal while the stdlib fold-blindness pin runs."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __mul__(self, other: int) -> str:
+        return "replaced"
 
 
 def _observed_documented() -> int:
@@ -2280,6 +2297,46 @@ def test_memoized_fingerprint_tracks_a_chain_landed_type_alias_evaluator(
         sys.modules.pop(module_name, None)
 
 
+def test_memoized_fingerprint_tracks_a_chain_landed_type_parameters_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_type_parameter"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from typing import TypeVar\n"
+        "\n"
+        "\n"
+        "class Bound:\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        'PARAM = TypeVar("PARAM", bound=Bound)\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-type-parameter")
+        def named(db: Database) -> str:
+            return cast(str, module.PARAM.__name__)
+
+        db = Database()
+        db._query_fingerprint(named)
+        # The chain lands on a type parameter, beside the alias above and for
+        # the same reason: the bound is read off the parameter when the payload
+        # asks for it -- through the lazy evaluator where the interpreter has
+        # one and the resolved attribute otherwise -- and the class it names is
+        # folded by its body. The parameter itself never moves, and a class is
+        # not a constant the module stamp carries.
+        monkeypatch.setattr(module.Bound, "marker", 9)
+        memoized, truth = _memo_and_truth(db, named)
+        assert memoized == truth
+        assert memoized == Database()._query_fingerprint(named)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_memoized_fingerprint_tracks_a_chain_landed_resources_method_globals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2359,6 +2416,36 @@ def test_rebound_global_behind_a_captured_module_function_matches_fresh(
         fresh = Database(mode=mode).get(scaled)
         assert warm == fresh == 70
         assert db.statistics().query_executions == executions + 1
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_rebound_defaults_behind_a_captured_chain_matches_fresh(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_module_function_defaults_{mode}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "def helper(scale=2):\n    return scale * 10\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key=f"module-function-defaults-fsc-{mode}")
+        def scaled(db: Database) -> int:
+            return cast(int, module.helper())
+
+        db = Database(mode=mode)
+        assert db.get(scaled) == 20
+        # The other half of what a chain landing on a function carries: its
+        # defaults are read live from the same definition its globals are, so
+        # rebinding them moves identity where a write inside a class the chain
+        # lands on does not. The landing function is the same object either
+        # way, which is what the memo compares.
+        module.helper.__defaults__ = (7,)
+        _assert_warm_matches_fresh(db, mode, scaled, 70)
     finally:
         sys.modules.pop(module_name, None)
 
@@ -2803,6 +2890,41 @@ def test_rebinding_inside_a_chain_landed_class_keeps_the_warm_verdict(
         sys.modules.pop(module_name, None)
 
 
+def test_rebinding_inside_a_chain_landed_class_moves_only_a_fresh_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_chain_landed_class_split_module"
+    (tmp_path / f"{module_name}.py").write_text("class Model:\n    flag = 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="chain-landed-class-split")
+        def flagged(db: Database) -> int:
+            return cast(int, module.Model.flag) + 0
+
+        db = Database()
+        assert db.get(flagged) == 1
+        before = db._query_fingerprint(flagged)
+        monkeypatch.setattr(module.Model, "flag", 2)
+        executions = db.statistics().query_executions
+        # Both halves of the residual the boundary pin above states as
+        # behavior, told apart by the fingerprint itself. The write is folded:
+        # a database meeting this query for the first time computes a different
+        # identity for it. What the memo cannot see is that the write happened,
+        # because the class it re-resolves is the same object it recorded, so
+        # the database that already answered keeps the identity it stored and
+        # answers from the record filed under it.
+        assert db.get(flagged) == 1
+        assert db.statistics().query_executions == executions
+        assert db._query_fingerprint(flagged) == before
+        assert Database()._query_fingerprint(flagged) != before
+        assert Database().get(flagged) == 2
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_state_inside_a_chain_landed_instance_keeps_the_warm_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2947,6 +3069,55 @@ def test_chain_landing_the_payload_cannot_pin_is_refused(
         sys.modules.pop(module_name, None)
 
 
+def test_rebinding_a_stdlib_chain_target_function_moves_no_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="stdlib-chain-target-function")
+    def dumped(db: Database) -> str:
+        return json.dumps({"a": 1})
+
+    db = Database()
+    assert db.get(dumped) == '{"a": 1}'
+    before = db._query_fingerprint(dumped)
+    monkeypatch.setattr(json, "dumps", _stdlib_dumps_replacement)
+    executions = db.statistics().query_executions
+    # The other residual, and a different one in kind from the chain-landed
+    # writes above: a captured standard-library module folds the names read off
+    # it rather than the behavior behind them, so nothing here is folded that
+    # this rebinding could move. The identity holds in both directions -- the
+    # memo keeps it and a database computing it from scratch arrives at the
+    # same bytes -- which is why the last line is the cost of the limitation
+    # rather than a disagreement between the two.
+    assert db.get(dumped) == '{"a": 1}'
+    assert db.statistics().query_executions == executions
+    assert db._query_fingerprint(dumped) == before
+    assert Database()._query_fingerprint(dumped) == before
+    assert Database().get(dumped) == "replaced"
+
+
+def test_rebinding_a_stdlib_chain_target_class_moves_no_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="stdlib-chain-target-class")
+    def scaled(db: Database) -> str:
+        return str(decimal.Decimal("2") * 3)
+
+    db = Database()
+    assert db.get(scaled) == "6"
+    before = db._query_fingerprint(scaled)
+    monkeypatch.setattr(decimal, "Decimal", _StdlibDecimalReplacement)
+    executions = db.statistics().query_executions
+    # The class half of the same limitation. A class reached through a chain on
+    # a non-stdlib module is folded and only the memo cannot follow it; here
+    # the fold never reaches the class at all, so the rebinding is invisible to
+    # a fresh fingerprint too.
+    assert db.get(scaled) == "6"
+    assert db.statistics().query_executions == executions
+    assert db._query_fingerprint(scaled) == before
+    assert Database()._query_fingerprint(scaled) == before
+    assert Database().get(scaled) == "replaced"
+
+
 def test_declared_mid_span_resource_reconfiguration_reaches_the_next_request() -> None:
     class SpanResource(Resource[int, int, int]):
         def __init__(self, scale: int) -> None:
@@ -3041,6 +3212,38 @@ def test_resource_implementation_participates_in_identity() -> None:
     first = db._resource_key(make_resource(1), "key")
     second = db._resource_key(make_resource(2), "key")
     assert first.identity != second.identity
+
+
+def test_matching_resource_implementations_share_an_identity() -> None:
+    def make_resource(variant: int) -> Resource[str, int, tuple[int]]:
+        @dataclass(frozen=True)
+        class ConstantResource(Resource[str, int, tuple[int]]):
+            def probe(self, key: str) -> tuple[int]:
+                return (variant,)
+
+            def load(self, db: Database, key: str) -> int:
+                return variant
+
+            def label(self, key: str) -> str:
+                return f"constant[{key}]"
+
+        return ConstantResource()
+
+    db = Database()
+    # The control the inequality pins rest on. Each call defines its own class
+    # object, so two resources built the same way share nothing but what they
+    # are made of; an identity that folded anything unique to the class object
+    # would separate these two and still separate the differing pair below,
+    # leaving the difference in behavior unattributable -- and a stored record
+    # unreachable from the process that reads it back.
+    assert (
+        db._resource_key(make_resource(1), "key").identity
+        == db._resource_key(make_resource(1), "key").identity
+    )
+    assert (
+        db._resource_key(make_resource(1), "key").identity
+        != db._resource_key(make_resource(2), "key").identity
+    )
 
 
 def test_behavior_helper_implementations_participate_in_trust_identities() -> None:
@@ -4134,6 +4337,56 @@ def test_benign_getattr_on_ordinary_objects_stays_accepted(
         return benign(_ObservedBox(3))
 
     assert Database().get(probed) is None
+
+
+_UNCONDITIONAL_REFLECTIVE_SOURCE = '''\
+"""A locals() read and an exec call, each an offense on the builtin alone."""
+
+CONFIG_MODE = "A"
+
+
+def via_locals():
+    return locals().get("mode", CONFIG_MODE)
+
+
+def via_exec():
+    scope = {"CONFIG_MODE": CONFIG_MODE}
+    exec("value = CONFIG_MODE", scope)
+    return scope["value"]
+'''
+
+
+@pytest.mark.parametrize(
+    "shape, offense", [("via_locals", "locals"), ("via_exec", "exec")]
+)
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_locals_and_exec_reads_are_rejected(
+    shape: str, offense: str, mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = f"pyinc_unconditional_reflective_{shape}_{mode}"
+    (tmp_path / f"{module_name}.py").write_text(
+        _UNCONDITIONAL_REFLECTIVE_SOURCE, encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+        reader = getattr(module, shape)
+
+        @query(key=f"unconditional-reflective-{shape}-{mode}")
+        def read_config(db: Database) -> str:
+            return cast(str, reader())
+
+        # Neither of these needs the module-namespace handle the getattr family
+        # is judged beside: the builtin's own load is the offense. What gets
+        # read through the namespace either one hands back is chosen while the
+        # body runs, so the static walk that resolves names has nothing to
+        # resolve. Both spellings are refused in every mode, so no mode trades
+        # the refusal for a cheaper fingerprint.
+        with pytest.raises(UnsupportedValueError, match=rf"reflectively \({offense}"):
+            Database(mode=mode).get(read_config)
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 _FUNCTION_SCOPE_IMPORT_SOURCE = '''\
