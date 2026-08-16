@@ -494,11 +494,18 @@ following hold:
   for by — it does not authenticate where the key came from. A coherent
   attacker-selected key names a coherent attacker-selected manifest, so keys
   and store contents must be produced by a prior trusted `save_checkpoint`,
-  not accepted from an untrusted input (see `SECURITY.md`).
+  not accepted from an untrusted input (see `SECURITY.md`);
+- **(v)** the loading database runs in the same mode as the database that saved
+  the checkpoint. The manifest records the saving mode, and a `load_checkpoint`
+  into a database running a different mode refuses with `CheckpointModeError`
+  before staging any record.
 
 Under these conditions `load_checkpoint(key)` followed by `db.get(query)`
-returns the value a fresh recomputation on the same declared state would, in all
-three modes. The mechanisms that earn this:
+returns the value a fresh recomputation on the same declared state would in that
+same mode. The guarantee is per-mode by construction: what a query computes —
+and so what a checkpoint persists — can depend on the mode that computed it, so
+a persisted value is trusted only by a database running the mode that produced
+it. The mechanisms that earn this:
 
 - **Query identities are recomputed live in the loading process.** A query's
   identity pins the interpreter/build identity (see
@@ -532,8 +539,12 @@ Anything that cannot be verified is skipped and re-executed rather than trusted:
 query subgraphs reached only through a runtime import or dynamic dispatch (their
 code is not pinned into any identity), records marked untracked via
 `report_untracked_read()`, corrupted or missing store bytes, and adapter
-mismatches. A tampered, truncated, wrong-version, or wrong-kernel-fingerprint
-manifest is rejected loudly with a typed `CheckpointError` subclass.
+mismatches. A tampered, truncated, wrong-version, wrong-kernel-fingerprint, or
+wrong-mode manifest is rejected loudly with a typed `CheckpointError` subclass.
+The difference is what the failure is a property of: an individual record that
+cannot be verified is skipped and its query re-executes, but these are
+properties of the manifest as a whole, and there is no sound remainder to keep
+warming from — so the load is refused outright and stages nothing.
 
 Residual limitations that stay outside the envelope: the stdlib-module gap of
 limitation 5 applies across runs exactly as it does in-process; and a
@@ -1138,10 +1149,13 @@ The durable cross-run guarantee (limitation 4) is checked by the same
 fresh-recomputation equivalence, extended to the checkpoint path:
 
 - `test_checkpoint_reload_matches_fresh_recomputation` (property test in
-  `tests/test_properties.py`) — reloads a checkpoint across all three modes and
+  `tests/test_properties.py`) — reloads a checkpoint in each of the three modes,
   with/without LRU eviction, comparing `load_checkpoint` + `get()` against a
   fresh, cache-free run over the same edit sequence, and exercises the
-  dirty-graph save path directly.
+  dirty-graph save path directly. Every run is homogeneous in the mode: the
+  saving database, the reloading one and the fresh comparison all run the same
+  one. Cross-mode loads are refused by design (condition (v) of limitation 4)
+  and are pinned by the cross-mode suite in `tests/test_checkpoint_trust.py`.
 - `tests/test_checkpoint_cross_process.py` — a subprocess matrix that saves in
   one interpreter and reloads in another, checking that identities and digests
   line up across processes.

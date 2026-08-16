@@ -122,6 +122,17 @@ decided at release time.
 - The checkpoint manifest schema is v7 and records the saving database's mode;
   v6 and earlier manifests are rejected loudly because their records cannot be
   attributed to a save mode.
+- Loading a checkpoint into a database running a different mode raises
+  `CheckpointModeError` and stages nothing, where it previously succeeded and
+  could warm values the loading mode would never compute — a `strict` database
+  could serve the `list` a `checked` run persisted where it computes a
+  `FrozenList`. All six cross-mode pairings are refused: strict → checked,
+  strict → fast, checked → strict, checked → fast, fast → strict and
+  fast → checked. That includes the pairs whose answers happen to agree today,
+  because the refusal keys on the mode mismatch itself rather than on which
+  pairs are currently observed to diverge — anything narrower would encode a
+  coincidence and rot the moment it stopped holding. A checkpoint saved before
+  this change carries no mode at all and is rejected by the schema bump above.
 - The action ledger schema is v3, and orphan deletion is verified against the
   recorded bytes: an orphan that no longer carries the digest the ledger
   recorded is released, never deleted. The manifest also records the root
@@ -138,7 +149,9 @@ decided at release time.
   from a trusted channel; content addressing authenticates bytes against a
   key, not the key's provenance. The action contract and security policy
   state that an external `state_dir` must be trusted as strongly as the
-  output root.
+  output root. They gain (v) alongside it: the loading database must run the
+  mode that saved the checkpoint, so the durable guarantee is stated per mode
+  rather than as one guarantee holding in all three at once.
 - The README positions pyinc as an application of the established Salsa-style
   red-green model with prior art named, not as the first incremental engine
   for Python. Verification language, the `lru_cache` comparison, the Rust

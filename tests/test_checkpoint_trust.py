@@ -1010,6 +1010,141 @@ def test_saved_manifest_records_the_database_mode() -> None:
     }
 
 
+# ---------------------------------------------------------------------------
+# Cross-mode loads: a checkpoint warms only a database running the mode that
+# saved it.
+#
+# The value a query computes can depend on the mode that computed it, so a
+# persisted record is attributable to one mode and warms no other. The refusal
+# keys on the mode mismatch itself rather than on whether a particular pair of
+# modes is observed to disagree: all six ordered cross-mode pairs are refused,
+# including the pairs whose answers coincide today. Anything narrower would
+# encode today's coincidence and rot the moment it stops holding.
+#
+# Constructing the cases takes care. The saving mode is part of the manifest
+# bytes, so the checkpoint key differs per mode; a key re-derived under a second
+# mode is absent from the store, so the load raises a plain `KeyError` and never
+# reaches the refusal. These tests hand the loading database the exact key the
+# saving database returned, which is what a caller who carries a key between
+# runs does and the only way to put the refusal under test.
+# ---------------------------------------------------------------------------
+
+_MODES = ("strict", "checked", "fast")
+
+_CROSS_MODE_PAIRS = [
+    (save_mode, load_mode) for save_mode in _MODES for load_mode in _MODES if save_mode != load_mode
+]
+
+
+@query(key="cross-mode-argument-shape")
+def _observed_argument_shape(db: Database, xs: object) -> str:
+    """Report the type of the object the database hands this query.
+
+    Type-sensitive and argument-taking on purpose. Most queries answer the same
+    thing in every mode, and one of those could not tell a warm from the wrong
+    mode apart from a correct one -- it would pass whether or not the refusal
+    existed. This one persists a different string on either side of the strict
+    boundary, so a cross-mode warm is visible in the value itself.
+    """
+    return type(xs).__name__
+
+
+def _shape_argument() -> list[int]:
+    # A fresh list per call, so nothing is shared between databases.
+    return [1, 2, 3]
+
+
+def test_argument_shape_query_answers_differently_per_mode() -> None:
+    """The witness query the cross-mode tests use can actually tell modes apart.
+
+    Strict mode rebuilds every boundary value as a snapshot view before a query
+    sees it, while checked and fast thaw it back into a plain `list`. Pinning
+    that here is what makes the refusal tests below non-vacuous.
+    """
+    answers = {
+        mode: Database(mode=mode).get(_observed_argument_shape, _shape_argument())
+        for mode in _MODES
+    }
+    assert answers == {"strict": "FrozenList", "checked": "list", "fast": "list"}
+
+
+@pytest.mark.parametrize(("save_mode", "load_mode"), _CROSS_MODE_PAIRS)
+def test_cross_mode_checkpoint_load_refuses_loudly(save_mode: str, load_mode: str) -> None:
+    store = InMemoryArtifactStore()
+    saver = Database(mode=save_mode, store=store)
+    persisted = saver.get(_observed_argument_shape, _shape_argument())
+    checkpoint = saver.save_checkpoint()
+
+    loader = Database(mode=load_mode, store=store)
+    # Internal: the staging a load commits onto the database, which every later
+    # get consults. Held by identity so a rebind cannot hide behind equality.
+    staging_before = loader._checkpoint_query_records
+    with pytest.raises(CheckpointModeError, match="refusing to load"):
+        loader.load_checkpoint(checkpoint)
+
+    # The refusal lands before the commit, so the loader still holds the empty
+    # staging it was constructed with and never adopted the checkpoint's store.
+    assert loader._checkpoint_query_records is staging_before
+    assert loader._checkpoint_query_records == {}
+    assert loader._checkpoint_load_store is None
+
+    # And the next request computes for itself instead of serving what the
+    # other mode persisted.
+    fresh = Database(mode=load_mode).get(_observed_argument_shape, _shape_argument())
+    executions_before = loader.statistics().query_executions
+    answer = loader.get(_observed_argument_shape, _shape_argument())
+    assert loader.statistics().query_executions - executions_before == 1
+    assert answer == fresh
+    # It coincides with what the refused checkpoint holds only where the two
+    # modes agree anyway; for the four pairs that straddle the strict boundary
+    # this is an inequality with the string the saver persisted.
+    assert (answer == persisted) is (fresh == persisted)
+
+
+def test_cross_mode_refusal_is_catchable_as_the_checkpoint_family() -> None:
+    """The refusal a real cross-mode load raises is catchable by family.
+
+    The class's own bases are pinned separately; what this pins is the object
+    `load_checkpoint` actually raises, which is what a caller writing
+    `except CheckpointError` or `except ValueError` around a load depends on.
+    """
+    store = InMemoryArtifactStore()
+    saver = Database(mode="strict", store=store)
+    assert saver.get(_observed_argument_shape, _shape_argument()) == "FrozenList"
+    checkpoint = saver.save_checkpoint()
+
+    loader = Database(mode="fast", store=store)
+    with pytest.raises(CheckpointError, match="refusing to load"):
+        loader.load_checkpoint(checkpoint)
+    # Nothing was staged by the first attempt, so the second sees the same
+    # database and refuses on the same terms.
+    with pytest.raises(ValueError, match="refusing to load"):
+        loader.load_checkpoint(checkpoint)
+    assert loader._checkpoint_query_records == {}
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_same_mode_checkpoint_load_warms_and_matches_fresh(mode: str) -> None:
+    """The diagonal keeps warming, measured with the query that exposes the defect."""
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    persisted = saver.get(_observed_argument_shape, _shape_argument())
+    checkpoint = saver.save_checkpoint()
+
+    loader = Database(mode=mode, store=store)
+    loader.load_checkpoint(checkpoint)
+    before = loader.statistics()
+    warm = loader.get(_observed_argument_shape, _shape_argument())
+    after = loader.statistics()
+
+    fresh = Database(mode=mode).get(_observed_argument_shape, _shape_argument())
+    assert warm == fresh == persisted
+    # Witnesses: the warm request executed nothing and reused a record, so the
+    # equality above cannot be satisfied by a load that warmed nothing.
+    assert after.query_executions - before.query_executions == 0
+    assert after.query_reuses - before.query_reuses >= 1
+
+
 class _CheckpointConsts:
     SCALE = 2
 
