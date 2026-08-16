@@ -595,17 +595,45 @@ scratch on its next request. This is correct but may degrade performance.
 The edge a failing *resource* read publishes before its exception propagates has
 no query-side equivalent: a query's record and dependency edges publish only
 after it returns, so a query that catches an exception raised by a sub-query is
-cached with no edge to it and is not re-executed when a later change would make
-that sub-query succeed. Model a failure the caller means to handle as a returned
-value, or route it through a `Resource`.
-(See: `test_caught_query_failure_does_not_publish_a_dependency_edge`)
+left holding a value with no edge to what produced it. That value is never
+carried into a later request. The catching query is marked untracked — the same
+mark `db.report_untracked_read` records, carrying a reason that names the
+sub-query whose exception was caught — so it re-executes on every request (a
+second ask *within* one request still reuses what that request already settled)
+and never backdates, and its record is kept out of checkpoints as well, together
+with everything above it. A later change
+that makes the sub-query succeed therefore reaches the caller, matching a fresh
+`Database`; what is lost is the incrementality — that query's body runs on every
+request, and the nodes above it re-verify, backdating only where their own
+results are unchanged. Model a failure the caller means to handle as a returned
+value, or route it through a `Resource`, to keep the caller incremental.
+
+A query refused for asking for *itself* is the one exception. That `CycleError`
+is the kernel refusing a shape before any work starts: nothing was executed
+below the refusal, so nothing was read into a frame that is now gone, and the
+refused request stays pinned to the registration the outer execution of that
+same node already owns. Catching that leaves an ordinary reusable record. A
+cycle that reaches back through *another* query is not that shape — the branch
+that reached back read whatever it read before it did, and its frame is
+discarded with those reads in it — so catching one of those marks the catcher
+like any other caught failure.
+(See: `test_caught_query_failure_does_not_publish_a_dependency_edge`,
+`test_caught_sub_query_failure_marks_the_catching_parent_impure`,
+`test_caught_sub_query_failure_excludes_the_parent_from_checkpoints`,
+`test_query_catching_its_own_cycle_keeps_committed_registries`,
+`test_caught_cycle_does_not_mark_the_catcher_impure`,
+`test_cycle_caught_through_another_query_marks_the_catcher_impure`)
 
 ## Escape Hatches
 
 - **`db.report_untracked_read(reason)`** — marks the current query as impure;
   forces re-execution on every request and disables backdating for that node.
   Downstream consumers re-verify but can still backdate if their own results are
-  unchanged.
+  unchanged. The kernel applies the same mark on its own account wherever it
+  knows a value rests on something no record describes: a query that catches an
+  exception raised by a sub-query is marked with a reason naming that sub-query,
+  and — since that failure is not in the graph at all — kept out of checkpoints
+  as well (limitation 7).
   (See: `test_report_untracked_read_forces_reexecution_on_every_request`,
   `test_impure_child_prevents_parent_backdating_unless_result_unchanged`)
 

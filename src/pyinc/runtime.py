@@ -1333,9 +1333,38 @@ class Database:
                 if not had_record and self._checkpoint_query_records:
                     self._try_warm_from_checkpoint(query, key, call_snapshot)
                 self._ensure_query(query, key, call_snapshot)
-            except Exception:
+            except Exception as exc:
                 if not had_record:
                     self._discard_uncommitted_query(key)
+                frame_now = self._current_frame()
+                if not (
+                    isinstance(exc, CycleError)
+                    and frame_now is not None
+                    and frame_now.key == key
+                ):
+                    # A caller that catches this raise returns a value built
+                    # from a failure the graph does not describe: no edge to
+                    # the node that raised is published, and nothing recorded
+                    # for it describes the exception, so the caller's own
+                    # answer can neither be re-derived nor re-verified from
+                    # records. It is marked untracked instead -- re-executed
+                    # on every request, kept out of checkpoints. The mark
+                    # lands on the frame this call is unwinding into, which is
+                    # the caller's: a node's own frame, where one was pushed at
+                    # all, is popped before its exception reaches here. A
+                    # caller that re-raises writes no record, so the reason is
+                    # only ever read off a query that really did catch.
+                    #
+                    # The single exception above is a node refused for
+                    # re-entering itself: the frame that would be marked is the
+                    # very node this request names, so the refusal happened
+                    # before any work started and nothing was read into a
+                    # discarded frame -- and that request stays pinned to the
+                    # registration this execution already owns. A cycle that
+                    # reaches back through another query is not that shape:
+                    # the branch that reached back read whatever it read first,
+                    # and its frame is discarded with those reads in it.
+                    self._mark_frame_impure(f"caught exception from sub-query '{key.label}'")
                 raise
             self._record_dependency(key)
             result = cast(T, self._expose_boundary_snapshot(self._records[key].snapshot))
@@ -3590,6 +3619,22 @@ class Database:
         if frame is None:
             return
         frame.checkpointable = False
+
+    def _mark_frame_impure(self, reason: str) -> None:
+        """Mark the running execution as resting on state no record describes.
+
+        The untracked mark ``db.report_untracked_read`` records, plus the
+        checkpoint exclusion, for a failure the kernel itself could not record.
+        """
+        frame = self._current_frame()
+        if frame is None:
+            # Nothing is executing -- a top-level caller is about to see this,
+            # and it stores no answer that could be reused.
+            return
+        frame.untracked_reasons.append(reason)
+        # Both halves: the reason is what forces re-execution, while the
+        # checkpoint eligibility filter reads `checkpointable` on its own.
+        self._mark_frame_uncheckpointable()
 
     def _inspect_record(self, key: NodeKey) -> InspectionNode:
         record = self._records[key]

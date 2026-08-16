@@ -1427,6 +1427,13 @@ def test_caught_query_failure_does_not_publish_a_dependency_edge() -> None:
     assert db.inspect(catches_failure).dependencies == ()
     assert all("failing" not in key.label for key in db._call_snapshot_registry)
     assert all(query_obj is not failing for query_obj in db._query_registry.values())
+    # An answer resting on an edge that was never published is not reused: the
+    # catching query is marked untracked and re-runs on the next request.
+    assert db.inspect(catches_failure).untracked_reasons != ()
+    executions = db.statistics().query_executions
+    assert db.get(catches_failure) == 7
+    assert db.statistics().query_executions == executions + 1
+    assert db.inspect(catches_failure).last_decision == "executed"
 
 
 def test_query_catching_its_own_cycle_keeps_committed_registries() -> None:
@@ -1445,6 +1452,171 @@ def test_query_catching_its_own_cycle_keeps_committed_registries() -> None:
     assert db._query_registry[key.identity] is catches_cycle
     assert db.get(catches_cycle) == 1
     assert db.inspect(catches_cycle).last_decision == "reused"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_caught_sub_query_failure_marks_the_catching_parent_impure(mode: str) -> None:
+    gate = Input[int](f"caught-failure-gate-{mode}")
+
+    @query(key=f"caught-failure-child-{mode}")
+    def failing(db: Database) -> str:
+        value = gate.read(db)
+        if value == 0:
+            raise RuntimeError("no value yet")
+        return f"ok:{value}"
+
+    @query(key=f"caught-failure-parent-{mode}")
+    def parent(db: Database) -> str:
+        try:
+            return failing(db)
+        except RuntimeError:
+            return "fallback"
+
+    db = Database(mode=mode)
+    db.set(gate, 0)
+    assert db.get(parent) == "fallback"
+
+    # Nothing in the graph describes the exception the body handled -- the
+    # failing child left no record and no edge behind it -- so the answer
+    # above it is marked as resting on state the kernel does not track.
+    reasons = db.inspect(parent).untracked_reasons
+    assert reasons
+    assert any("failing" in reason for reason in reasons)
+
+    # Which means it is re-derived on every request rather than reused.
+    executions = db.statistics().query_executions
+    assert db.get(parent) == "fallback"
+    assert db.statistics().query_executions == executions + 1
+    assert db.inspect(parent).last_decision == "executed"
+
+    # And the change that makes the child succeed reaches it, exactly as it
+    # reaches a database that has never seen the failure.
+    db.set(gate, 42)
+    executions = db.statistics().query_executions
+    warm = db.get(parent)
+    fresh = Database(mode=mode)
+    fresh.set(gate, 42)
+    assert warm == fresh.get(parent) == "ok:42"
+    # The child the parent now reaches executes beside it.
+    assert db.statistics().query_executions == executions + 2
+    # A run that caught nothing is an ordinary run: the mark is not sticky.
+    assert db.inspect(parent).untracked_reasons == ()
+
+
+def test_caught_sub_query_failure_excludes_the_parent_from_checkpoints() -> None:
+    gate = Input[int]("caught-failure-checkpoint-gate")
+
+    @query(key="caught-failure-checkpoint-child")
+    def failing(db: Database) -> str:
+        value = gate.read(db)
+        if value == 0:
+            raise RuntimeError("no value yet")
+        return f"ok:{value}"
+
+    @query(key="caught-failure-checkpoint-parent")
+    def parent(db: Database) -> str:
+        try:
+            return failing(db)
+        except RuntimeError:
+            return "fallback"
+
+    @query(key="caught-failure-checkpoint-grandparent")
+    def grandparent(db: Database) -> str:
+        return "G:" + parent(db)
+
+    @query(key="caught-failure-checkpoint-sibling")
+    def sibling(db: Database) -> str:
+        return "S"
+
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+    db.set(gate, 0)
+    assert db.get(grandparent) == "G:fallback"
+    assert db.get(sibling) == "S"
+
+    # A handled failure is only reproducible while the load keeps failing, so
+    # the query that caught it is omitted -- and the dependency closure drops
+    # the grandparent above it too.
+    checkpoint = db.save_checkpoint()
+    manifest = json.loads(cast(bytes, store.get(checkpoint)).decode("utf-8"))
+    saved = {(entry["identity"], entry["args_digest"]) for entry in manifest["records"]}
+    parent_key, _ = db._query_key(parent, (), {})
+    grandparent_key, _ = db._query_key(grandparent, (), {})
+    sibling_key, _ = db._query_key(sibling, (), {})
+    assert (parent_key.identity, parent_key.args_digest) not in saved
+    assert (grandparent_key.identity, grandparent_key.args_digest) not in saved
+    # What the failure never touched is still persisted.
+    assert (sibling_key.identity, sibling_key.args_digest) in saved
+
+    warmed = Database(store=store)
+    warmed.load_checkpoint(checkpoint)
+    warmed.set(gate, 42)
+    fresh = Database()
+    fresh.set(gate, 42)
+    assert warmed.get(grandparent) == fresh.get(grandparent) == "G:ok:42"
+    # Nothing was warmed on that branch: all three nodes ran.
+    assert warmed.statistics().query_executions == 3
+
+
+def test_caught_cycle_does_not_mark_the_catcher_impure() -> None:
+    @query
+    def catches_cycle(db: Database) -> int:
+        try:
+            return catches_cycle(db)
+        except CycleError:
+            return 1
+
+    db = Database()
+    assert db.get(catches_cycle) == 1
+    # A query asking for itself is refused before any work starts, so nothing
+    # was read into a frame that is then discarded, and the refused request is
+    # pinned to the registration the outer execution already owns. Catching
+    # that leaves an ordinary reusable record.
+    assert db.inspect(catches_cycle).untracked_reasons == ()
+    executions = db.statistics().query_executions
+    assert db.get(catches_cycle) == 1
+    assert db.inspect(catches_cycle).last_decision == "reused"
+    assert db.statistics().query_executions == executions
+
+
+def test_cycle_caught_through_another_query_marks_the_catcher_impure() -> None:
+    gate = Input[int]("caught-cross-frame-cycle-gate")
+
+    @query(key="caught-cross-frame-cycle-child")
+    def child(db: Database) -> str:
+        if gate.read(db) == 0:
+            # Reaches back into the query already running above this one.
+            return parent(db)
+        return "ok"
+
+    @query(key="caught-cross-frame-cycle-parent")
+    def parent(db: Database) -> str:
+        try:
+            return child(db)
+        except CycleError:
+            return "fallback"
+
+    db = Database()
+    db.set(gate, 0)
+    assert db.get(parent) == "fallback"
+
+    # A cycle refused through another query is not the shape a self-cycle is:
+    # the refused branch read the gate before it reached back, and its frame is
+    # discarded with the read in it, so the catcher's answer rests on state no
+    # record describes and must be marked like any other caught failure.
+    assert db.inspect(parent).dependencies == ()
+    reasons = db.inspect(parent).untracked_reasons
+    assert reasons
+    assert any("child" in reason for reason in reasons)
+
+    db.set(gate, 1)
+    executions = db.statistics().query_executions
+    warm = db.get(parent)
+    fresh = Database()
+    fresh.set(gate, 1)
+    assert warm == fresh.get(parent) == "ok"
+    assert db.statistics().query_executions == executions + 2
+    assert db.inspect(parent).last_decision == "executed"
 
 
 def test_query_labels_do_not_call_argument_repr() -> None:

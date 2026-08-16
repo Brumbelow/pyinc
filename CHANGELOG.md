@@ -303,6 +303,22 @@ decided at release time.
   guard stays lifted for its extent. Where a resource genuinely needs a value
   the database holds, the reading query reads it — declaring its edges — and
   passes it in as part of the resource's key.
+- A query that catches an exception raised by a sub-query is marked untracked
+  instead of being cached as a pure result. A failing query publishes no record
+  and no dependency edge, so the caller that handled the failure was reused
+  unchanged afterwards: once the sub-query would have succeeded — an input set,
+  a file written — a warm database kept answering with the fallback while a
+  fresh one returned the real value. The catcher now carries the same mark
+  `db.report_untracked_read` records, naming the sub-query in its reason, so it
+  re-executes on every request, never backdates, and is left out of checkpoints
+  along with everything above it. Modelling a handled failure as a returned
+  value is still what keeps a caller incremental. One shape is unchanged: a
+  query refused for asking for itself. That refusal lands before any work
+  starts, so nothing was read into a frame that is then discarded, and the
+  refused request stays pinned to the registration the outer execution already
+  owns — catching it still leaves a reusable record. A `CycleError` that
+  reaches back through another query is marked like any other caught failure,
+  since the branch that reached back read whatever it read on the way.
 
 ## [3.1.1] - 2026-08-03
 
