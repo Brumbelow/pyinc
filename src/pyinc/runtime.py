@@ -204,18 +204,33 @@ def _live_type_binding(value: type[Any]) -> Any:
 def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
     """Live-binding leaves for every anchored type an eager value resolves.
 
-    Follows the shapes `_freeze_static_capture` resolves eagerly -- containers,
-    parameterized generics, unions, nested aliases and type parameters -- and
-    contributes one `_live_type_binding` leaf per non-builtin type reached,
-    because the payload anchors each of those types to its live module
-    binding. An alias or a type parameter recurses only where its evaluate_*
-    attribute is not a Python function: where one exists the payload folds the
-    evaluator instead of the resolved value, and observing that evaluator as a
-    definition already tracks the globals it resolves.
+    Follows the shapes `_freeze_static_capture` resolves eagerly -- containers
+    and the instance state of their subclasses, slices, scalar-subclass and
+    pathlike instance state, frozen dataclass fields and extras, parameterized
+    generics, unions, nested aliases and type parameters -- and contributes
+    one `_live_type_binding` leaf per non-builtin type reached, because the
+    payload anchors each of those types to its live module binding. An alias
+    or a type parameter recurses only where its evaluate_* attribute is not a
+    Python function: where one exists the payload folds the evaluator instead
+    of the resolved value, and observing that evaluator as a definition
+    already tracks the globals it resolves. Shapes the payload returns
+    pre-frozen or refuses outright contribute nothing, mirroring the payload,
+    which anchors no type there either.
     """
 
     leaves: list[Any] = []
     swept: builtins.set[int] = set()
+
+    def sweep_instance_state(value: Any, exclude: frozenset[str] = frozenset()) -> None:
+        try:
+            state = object.__getattribute__(value, "__dict__")
+        except (AttributeError, TypeError):
+            return
+        if not isinstance(state, dict):
+            return
+        for name, item in sorted(state.items()):
+            if name not in exclude:
+                sweep(item)
 
     def sweep(value: Any) -> None:
         if isinstance(value, type):
@@ -225,9 +240,22 @@ def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
         if id(value) in swept:
             return
         swept.add(id(value))
+        if isinstance(value, slice):
+            sweep(value.start)
+            sweep(value.stop)
+            sweep(value.step)
+            return
+        if isinstance(value, (str, bytes, int, float, complex)):
+            sweep_instance_state(value)
+            return
+        if isinstance(value, os.PathLike):
+            sweep_instance_state(value)
+            return
         if isinstance(value, (tuple, frozenset)):
             for item in value:
                 sweep(item)
+            if type(value) not in (tuple, frozenset):
+                sweep_instance_state(value)
             return
         if isinstance(value, GenericAlias):
             sweep(value.__origin__)
@@ -247,7 +275,11 @@ def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
                 return
         if _is_type_alias(value):
             if not isinstance(getattr(value, "evaluate_value", None), FunctionType):
-                sweep(getattr(value, "__value__", None))
+                try:
+                    part = getattr(value, "__value__", None)
+                except Exception:
+                    part = None
+                sweep(part)
             return
         if _TYPE_PARAMETER_TYPES and isinstance(value, _TYPE_PARAMETER_TYPES):
             for evaluator_name, value_name in (
@@ -262,6 +294,17 @@ def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
                 except Exception:
                     part = None
                 sweep(part)
+            return
+        if is_dataclass(value) and not isinstance(value, type):
+            field_names: builtins.set[str] = builtins.set()
+            for field_item in fields(value):
+                field_names.add(field_item.name)
+                try:
+                    part = object.__getattribute__(value, field_item.name)
+                except Exception:
+                    part = None
+                sweep(part)
+            sweep_instance_state(value, exclude=frozenset(field_names))
 
     sweep(root)
     return tuple(leaves)

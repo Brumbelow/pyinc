@@ -2370,6 +2370,108 @@ def test_memoized_fingerprint_refuses_with_truth_when_a_parameter_bound_is_rebou
         sys.modules.pop(module_name, None)
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="typing.TypeAliasType requires Python 3.12",
+)
+def test_memoized_fingerprint_refuses_with_truth_when_a_slice_carried_class_is_rebound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_alias_slice"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from typing import TypeAliasType\n"
+        "\n"
+        "\n"
+        "class First:\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "class Second:\n"
+        "    marker = 2\n"
+        "\n"
+        "\n"
+        'SLICED = TypeAliasType("SLICED", slice(First, None))\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-alias-slice")
+        def sliced(db: Database) -> str:
+            return cast(str, module.SLICED.__name__)
+
+        db = Database()
+        db._query_fingerprint(sliced)
+        # A runtime-constructed alias has no Python evaluator on any
+        # interpreter, so the payload resolves its value eagerly, and the
+        # slice arm carries the class to a live-binding anchor. Rebinding the
+        # global behind that anchor makes every fresh computation refuse; the
+        # memo's sweep reaches through the same slice, so it refuses too.
+        monkeypatch.setattr(module, "First", module.Second)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            db._query_fingerprint(sliced)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database()._query_fingerprint(sliced)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="typing.TypeAliasType requires Python 3.12",
+)
+def test_memoized_fingerprint_refuses_with_truth_when_a_dataclass_carried_class_is_rebound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_alias_dataclass"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from dataclasses import dataclass\n"
+        "from typing import TypeAliasType\n"
+        "\n"
+        "\n"
+        "class First:\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "class Second:\n"
+        "    marker = 2\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Box:\n"
+        "    kind: type\n"
+        "\n"
+        "\n"
+        'CARRIED = TypeAliasType("CARRIED", Box(First))\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-alias-dataclass")
+        def carried(db: Database) -> str:
+            return cast(str, module.CARRIED.__name__)
+
+        db = Database()
+        db._query_fingerprint(carried)
+        # Same anchor, reached through a frozen dataclass field: the payload
+        # folds Box(First) eagerly and anchors the field's class, so the
+        # memo's sweep has to reach the field too. Rebinding the global makes
+        # both paths refuse together instead of the memo serving the stored
+        # fingerprint past a refusal every fresh computation raises.
+        monkeypatch.setattr(module, "First", module.Second)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            db._query_fingerprint(carried)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database()._query_fingerprint(carried)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_memoized_fingerprint_tracks_a_chain_landed_type_parameters_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
