@@ -101,11 +101,12 @@ def signing_keys() -> Iterator[SigningKeys]:
             foreign = _generate_key(gnupghome, "pyinc foreign <foreign@example.invalid>")
         except (subprocess.CalledProcessError, OSError) as error:
             pytest.skip(f"gpg cannot generate keys here: {error}")
-        yield SigningKeys(
-            gnupghome=gnupghome,
-            release_fingerprint=release,
-            foreign_fingerprint=foreign,
-        )
+        else:
+            yield SigningKeys(
+                gnupghome=gnupghome,
+                release_fingerprint=release,
+                foreign_fingerprint=foreign,
+            )
     finally:
         subprocess.run(
             ["gpgconf", "--homedir", gnupghome, "--kill", "gpg-agent"],
