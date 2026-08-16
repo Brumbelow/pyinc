@@ -124,6 +124,23 @@ resource's `probe` and the probe component of its `probe_and_load` must agree
 on an unchanged world; stored probe/value pairs always originate from one
 `probe_and_load` observation.
 
+A resource hook observes the outside world and only the outside world. Raw I/O
+is what `probe`, `load` and `probe_and_load` are for, so the interception below
+is lifted for their extent — but they may not read back into the `Database`
+they are observing for. `get`, `read_input` and `read_resource` raise
+`ReentrantDatabaseError` when a hook calls them, as do the administrative and
+observational calls; the refusal is on the position, not the argument, so it
+reaches a `probe` that holds a database of its own just as it reaches a `load`
+that was handed one. What such a read would produce is invisible to the graph:
+the node records the probe and the value and never what the hook read to build
+them, so a warm request that answers from an unchanged probe reuses a value no
+fresh database would produce. Database-derived values reach a resource through
+its **key** — the reading query reads them, declaring its edges, and passes
+them in.
+(See: `test_resource_hook_reading_the_database_raises_a_typed_error`,
+`test_resource_hook_calling_set_raises_without_a_live_frame`,
+`test_rejected_hook_read_is_not_a_load_failure`)
+
 The kernel intercepts the following during query execution and raises
 `UntrackedReadError` if they are called outside a resource scope:
 
@@ -195,6 +212,19 @@ probe-comparison machinery drive invalidation:
   `test_repeated_failing_reads_within_one_query_body_load_once`,
   `test_failing_load_exception_is_reused_only_inside_its_own_request`,
   `test_failing_load_frames_are_released_when_the_request_ends`)
+- A `ReentrantDatabaseError` from a hook that read back into the database is
+  **not** one of these. It observes nothing about the outside world, so no
+  failure record is written and no probe is stored for a later read to match. A
+  node with no record still has none. A node that already held one keeps
+  exactly the record its last real observation wrote — not failed, still
+  carrying that observation's probe — and is marked *unconfirmed*, the same
+  state an unprobeable raise leaves behind and for the same reason: without it
+  a probe that came back to the recorded value would answer warm from a hook
+  that can no longer run. So the next read re-runs the hook and is refused on
+  its own account rather than answered from a record, and entering that state
+  moves the revision exactly as it does above.
+  (See: `test_rejected_hook_read_is_not_a_load_failure`,
+  `test_refused_hook_read_on_a_recorded_resource_retires_its_probe`)
 - Behaviour is identical in `strict`, `checked`, and `fast`.
 
 Optional external state is therefore from-scratch consistent: a query that
@@ -754,6 +784,17 @@ that pair into an error the caller can read. The boundary ends when the query
 does — a thread that outlives its spawning query is an ordinary thread again,
 and both its reads and its calls are allowed.
 
+A thread that a **resource hook** starts inherits the boundary the same way,
+and this holds with no query running at all: a `read_resource` made at top
+level holds the state lock across the whole hook while opening no execution, so
+a child that inherited nothing would block on that lock until its parent
+returned — never, if the parent joins it. Such a child's calls raise
+`ReentrantDatabaseError` naming the hook. One asymmetry with the query case is
+worth knowing: a hook's boundary is a depth rather than a frame, and a depth
+carries no completion flag, so a thread started inside a hook that *outlives*
+that hook keeps reporting itself inside one and stays refused, where a
+survivor of a query returns to normal.
+
 Threads that already existed when the query began — a pre-warmed pool, an
 executor built at module scope, a reused `ThreadPoolExecutor` worker — are
 outside that boundary. Their ambient reads are not intercepted, so a query
@@ -923,6 +964,13 @@ Each refusal is raised before its call does anything at all: no input is
 registered, no iterable is drained, no artifact store or lock file is touched,
 and no checkpoint is staged. The same set is refused from a thread a query body
 started, with the message naming the descent instead (Thread Safety, above).
+
+Inside a resource hook there is no open half at all: `probe`, `load` and
+`probe_and_load` observe the outside world, and every call back into the
+`Database` — the reading surface as well as the outside-only set — raises
+`ReentrantDatabaseError` naming the hook (Condition 2, above). That holds
+whether or not a query is running: a `read_resource` made at top level opens no
+execution, and its hook is refused all the same.
 
 Values and snapshots:
 

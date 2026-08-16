@@ -278,6 +278,31 @@ decided at release time.
   spawned thread still deadlocked. A body's own reads are untouched: `get`,
   `read_input`, `read_resource`, `report_untracked_read` and an inner
   `request_span` are what a query body is for.
+- A resource hook may no longer read the database it is observing for. `probe`,
+  `load` and `probe_and_load` now raise `ReentrantDatabaseError` from `get`,
+  `read_input` and `read_resource` — and from the administrative and
+  observational calls beside them — where those calls used to answer. Such a
+  read was invisible to the graph: the resource node records the probe and the
+  value and never what the hook read to build them, so a warm request that
+  answered the resource from an unchanged probe reused a value assembled from
+  state it had not re-checked, and a database that had seen the intermediate
+  values disagreed with a fresh one on the same declared inputs. The refusal is
+  on the caller's position rather than on which argument it was handed, so it
+  reaches a `probe`, which takes no database and can still hold one, and it
+  holds for a `read_resource` made at top level, where no query is running at
+  all. A refused read is not an observation of the outside world, so — unlike a
+  load that raises — it writes no failure record and stores no probe. A node
+  that already held a record keeps exactly the one its last real observation
+  wrote and is marked unconfirmed, which retires that stored probe, so the next
+  read re-runs the hook and is refused on its own account instead of being
+  answered from a record. A thread started inside a hook inherits the hook's
+  boundary too, including from a top-level `read_resource`, where it used to
+  block forever on the state lock its own parent was holding. Raw I/O inside a
+  hook is unaffected: observing files, the
+  environment and directory listings is what a hook is for, and the ambient
+  guard stays lifted for its extent. Where a resource genuinely needs a value
+  the database holds, the reading query reads it — declaring its edges — and
+  passes it in as part of the resource's key.
 
 ## [3.1.1] - 2026-08-03
 

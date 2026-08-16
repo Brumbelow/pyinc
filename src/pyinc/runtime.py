@@ -732,7 +732,7 @@ def _install_guards_once() -> None:
         original_thread_start = threading.Thread.start
 
         def guarded_thread_start(thread: threading.Thread) -> None:
-            """Start `thread` inside the spawning query's context, if there is one.
+            """Start `thread` inside the spawning boundary's context, if there is one.
 
             A thread started inside a query body belongs to that execution:
             whatever it reads flows back into the result the query stores, so
@@ -740,11 +740,22 @@ def _install_guards_once() -> None:
             start with an empty context otherwise, which is why the frame is
             invisible to them by default.
 
+            A resource hook counts too, and not only when a query is running
+            above it. A `read_resource` made at top level holds the state lock
+            across the whole hook while opening no execution at all, so a child
+            that inherited nothing passed every check and then blocked on that
+            lock until its own parent returned -- which, if the parent joins it,
+            is never. The hook depth is the only thing that says where such a
+            child stands.
+
             Threads started anywhere else -- every thread in a process that is
-            not executing a query at that instant -- are left exactly as they
-            were, at the cost of one scan of an almost always empty tuple.
+            not inside a query or a hook at that instant -- are left exactly as
+            they were, at the cost of one scan of an almost always empty tuple.
             """
-            inside = any(db._current_frame() is not None for db in _ACTIVE_GUARDS.get())
+            inside = any(
+                db._current_frame() is not None or db._resource_hook_depth.get() > 0
+                for db in _ACTIVE_GUARDS.get()
+            )
             if inside and not getattr(thread, "_pyinc_context_bound", False):
                 # A fresh snapshot per spawn: a Context may not be entered
                 # twice, and the child must not share one with a sibling.
@@ -954,6 +965,13 @@ class Database:
             default=(),
         )
         self._allow_raw_reads: ContextVar[bool] = ContextVar("pyinc_allow_raw_reads", default=False)
+        # How deep the calling context stands inside this database's resource
+        # hooks; zero means outside them. The boundary predicate reads it rather
+        # than an argument, so a probe -- which is handed no database and can
+        # still hold one -- is covered exactly as a load is.
+        self._resource_hook_depth: ContextVar[int] = ContextVar(
+            "pyinc_resource_hook_depth", default=0
+        )
         self._request_token: ContextVar[int | None] = ContextVar(
             "pyinc_request_token", default=None
         )
@@ -3009,7 +3027,7 @@ class Database:
             # combined read decide, exactly as it would have without the
             # attempt.
             try:
-                with self._allow_raw_reads_scope():
+                with self._resource_hook_scope():
                     early_probe = resource.probe(parameter)
             except Exception:
                 pass
@@ -3023,8 +3041,17 @@ class Database:
                     return
         if atomic:
             try:
-                with self._allow_raw_reads_scope():
+                with self._resource_hook_scope():
                     probe, loaded_value = resource.probe_and_load(self, parameter)
+            except ReentrantDatabaseError:
+                # A hook that read back into the database observed nothing about
+                # the outside world, so there is no failure to record. Writing a
+                # failure record would store a probe for this refusal and let a
+                # later read match on it, which would turn a hook that has to be
+                # rewritten into a value the graph quietly carries. The refresh
+                # above still marks an existing record unconfirmed, which is
+                # what retires the probe its last real observation stored.
+                raise
             except Exception as exc:
                 outcome.failure_recorded = self._record_resource_failure(
                     key,
@@ -3035,7 +3062,7 @@ class Database:
                 )
                 raise
         else:
-            with self._allow_raw_reads_scope():
+            with self._resource_hook_scope():
                 probe = resource.probe(parameter)
             loaded_value = None
         probe_snapshot = freeze(probe, adapters=self._adapters)
@@ -3045,8 +3072,12 @@ class Database:
             return
         if not atomic:
             try:
-                with self._allow_raw_reads_scope():
+                with self._resource_hook_scope():
                     loaded_value = resource.load(self, parameter)
+            except ReentrantDatabaseError:
+                # As above: a refused read is not an observation of the world,
+                # so it writes no failure record for a later read to match on.
+                raise
             except Exception as exc:
                 outcome.failure_recorded = self._record_resource_failure(
                     key, record, probe_snapshot, exc, current_request
@@ -3184,7 +3215,7 @@ class Database:
         ``probe_and_load`` to observe both from one read is what removes the gap.
         """
         try:
-            with self._allow_raw_reads_scope():
+            with self._resource_hook_scope():
                 return freeze(resource.probe(parameter), adapters=self._adapters)
         except Exception:
             return _MISSING_SNAPSHOT
@@ -3595,6 +3626,36 @@ class Database:
             self._allow_raw_reads.reset(token)
 
     @contextmanager
+    def _resource_hook_scope(self) -> Iterator[None]:
+        """Run a resource hook: raw reads permitted, reads of this database refused.
+
+        Observing the outside world is the whole job, so the raw-read allowance
+        the plain scope grants is exactly what a hook needs and is delegated to
+        unchanged. What the depth adds is the other half: a hook that reads back
+        into the database hides that read behind the resource node, where no
+        edge records it and an unchanged probe skips the hook that made it
+        entirely. The depth is what the boundary predicate sees, so the refusal
+        reaches a `probe` too -- it is handed no database and can still hold
+        one.
+
+        The hook also registers on `_ACTIVE_GUARDS` for its extent, which is how
+        `guarded_thread_start` finds it: a `read_resource` made at top level
+        opens no execution, so without this the spawn hook would scan an empty
+        tuple and a thread started from inside such a hook would inherit
+        nothing. Registering changes no raw read, whether or not a query is
+        running above: `_raise_if_guarded` refuses only where a live frame has
+        no raw-read permission, and a hook always has that permission. Under a
+        query the entry is a duplicate of one already there, which costs that
+        scan a second identical check and nothing else.
+        """
+        token = self._resource_hook_depth.set(self._resource_hook_depth.get() + 1)
+        try:
+            with self._guard_untracked_reads(), self._allow_raw_reads_scope():
+                yield
+        finally:
+            self._resource_hook_depth.reset(token)
+
+    @contextmanager
     def _guard_untracked_reads(self) -> Iterator[None]:
         stack = _ACTIVE_GUARDS.get()
         token = _ACTIVE_GUARDS.set(stack + (self,))
@@ -3611,11 +3672,13 @@ class Database:
         running that execution, which is a query body calling back into the
         database it was handed. `"descendant"` — the live execution belongs to
         another thread and this one inherited it by being spawned inside it.
-
-        (`"hook"`, for a caller inside a resource hook, is the fourth state of
-        the same vocabulary; nothing produces it until hooks carry a depth of
-        their own.)
+        `"hook"` — the caller is inside one of this database's resource hooks,
+        which is the most specific of the four and so is answered first: a hook
+        usually runs under a query frame, and it is the hook, not the frame,
+        that decides what the caller may do.
         """
+        if self._resource_hook_depth.get() > 0:
+            return "hook"
         frame = self._current_frame()
         if frame is None:
             return "outside"
@@ -3634,7 +3697,7 @@ class Database:
         raise ReentrantDatabaseError(f"{name} is not allowed {_BOUNDARY_REJECTION_REASONS[state]}.")
 
     def _reject_reentrant_read(self, name: str) -> None:
-        """Refuse `name` when the caller descends from a live execution.
+        """Refuse `name` from a descendant thread or from inside a resource hook.
 
         The in-query read surface itself stays open: a query body reading its
         own inputs and resources is the point of the frame. What cannot be
@@ -3642,9 +3705,17 @@ class Database:
         would block on the state lock the executing thread is still holding,
         and where that thread is waiting for the child, neither comes back.
         Refusing turns a hang into a diagnosable error.
+
+        A hook is refused for a different reason. It would not hang -- the lock
+        is reentrant and the call would answer -- but the answer would be
+        invisible to the graph: the resource node records the probe and the
+        value, never what the hook read to produce them, so a warm request that
+        skips the hook on an unchanged probe reuses a value no fresh database
+        would have produced. Database-derived values reach a resource through
+        its key instead, which the reading query passes in and declares.
         """
         state = self._boundary_state()
-        if state == "descendant":
+        if state in ("descendant", "hook"):
             raise ReentrantDatabaseError(
                 f"{name} is not allowed {_BOUNDARY_REJECTION_REASONS[state]}."
             )

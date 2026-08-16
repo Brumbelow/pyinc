@@ -751,9 +751,19 @@ def test_resource_reads_are_allowed_inside_query(
     assert db.get(read_tracked, str(workspace)) == ("value", ("a.txt",))
 
 
-def test_query_nested_inside_resource_hook_cannot_read_raw_environment(
+def test_resource_hook_reaching_into_the_database_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A load that calls back into the database is refused before it runs.
+
+    This shape used to be allowed and used to be pinned for a different
+    property: the nested query it started ran with raw reads revoked, so its
+    `os.getenv` raised. The nested query no longer starts at all -- the refusal
+    lands on the `get` that would have started it -- so that property is not
+    reachable through a hook any more, and what this pins now is the refusal.
+    Revoking raw reads for a nested query is still pinned for plain queries by
+    `test_condition_two_entry_points_stay_guarded`.
+    """
     variable = "PYINC_NESTED_RESOURCE_ENV"
     monkeypatch.setenv(variable, "value")
 
@@ -783,7 +793,10 @@ def test_query_nested_inside_resource_hook_cannot_read_raw_environment(
     def root(db: Database) -> str | None:
         return resource.read(db, variable)
 
-    with pytest.raises(UntrackedReadError):
+    with pytest.raises(
+        ReentrantDatabaseError,
+        match=re.escape("db.get() is not allowed inside a resource hook."),
+    ):
         Database().get(root)
 
 
@@ -3992,6 +4005,372 @@ def test_query_spawned_thread_setting_an_input_fails_fast() -> None:
     refusal = outcome[0]
     assert isinstance(refusal, ReentrantDatabaseError), refusal
     assert str(refusal) == "db.set() is not allowed from a thread spawned inside a query execution."
+
+
+@dataclass(frozen=True)
+class _ConstantResource(Resource[str, str, tuple[str, str]]):
+    """A resource with nothing to observe: probe and value both come from the key."""
+
+    def probe(self, key: str) -> tuple[str, str]:
+        return ("constant", key)
+
+    def load(self, db: Database, key: str) -> str:
+        return f"constant:{key}"
+
+    def label(self, key: str) -> str:
+        return f"constant[{key}]"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("read", ["get", "read_input", "read_resource"])
+@pytest.mark.parametrize("hook", ["probe_and_load", "load", "probe"])
+def test_resource_hook_reading_the_database_raises_a_typed_error(
+    hook: str, read: str, mode: str
+) -> None:
+    """A resource hook observes the outside world; it may not read the database.
+
+    A hook that reads the database hides that read behind the resource node.
+    The reader declares an edge to the resource and nothing declares an edge to
+    what the hook went and fetched, so a warm request that answers the resource
+    from an unchanged probe reuses a value assembled from state it never
+    re-checked -- and the answer stops matching what a fresh database produces
+    from the same declared inputs.
+
+    All three hooks are refused, including `probe`, which is handed no database
+    at all and is refused for reaching one anyway: the position is ambient, not
+    a matter of which argument the hook was given. Each cell first makes the
+    very same read from outside a hook, where it answers, so the refusal is
+    known to be about the position and not about the call.
+    """
+    counter = Input[int]("counter")
+    constant = _ConstantResource()
+
+    @query
+    def leaf(db: Database) -> int:
+        return counter.read(db) + 1
+
+    def read_the_database(db: Database) -> Any:
+        if read == "get":
+            return db.get(leaf)
+        if read == "read_input":
+            return db.read_input(counter)
+        return db.read_resource(constant, "target")
+
+    class AtomicHookResource:
+        """Reads the database from `probe_and_load`."""
+
+        def identity(self) -> tuple[str]:
+            return ("hook-read-resource",)
+
+        def label(self, name: str) -> str:
+            return f"hook-read[{name}]"
+
+        def probe(self, name: str) -> str:
+            return "probe"
+
+        def load(self, db: Database, name: str) -> Any:
+            return read_the_database(db)
+
+        def probe_and_load(self, db: Database, name: str) -> tuple[str, Any]:
+            return ("probe", read_the_database(db))
+
+    class LoadHookResource:
+        """No `probe_and_load`, so the split load hook is what reads the database."""
+
+        def identity(self) -> tuple[str]:
+            return ("hook-read-resource",)
+
+        def label(self, name: str) -> str:
+            return f"hook-read[{name}]"
+
+        def probe(self, name: str) -> str:
+            return "probe"
+
+        def load(self, db: Database, name: str) -> Any:
+            return read_the_database(db)
+
+    class ProbeHookResource:
+        """The probe takes no database and reaches one held on the resource."""
+
+        def __init__(self, database: Database) -> None:
+            self.database = database
+
+        def identity(self) -> tuple[str]:
+            return ("hook-read-resource",)
+
+        def label(self, name: str) -> str:
+            return f"hook-read[{name}]"
+
+        def probe(self, name: str) -> Any:
+            return read_the_database(self.database)
+
+        def load(self, db: Database, name: str) -> str:
+            return f"loaded:{name}"
+
+    db = Database(mode=mode)
+    db.set(counter, 1)
+
+    resource: Any
+    if hook == "probe_and_load":
+        resource = AtomicHookResource()
+    elif hook == "load":
+        resource = LoadHookResource()
+    else:
+        resource = ProbeHookResource(db)
+
+    @query
+    def root(db: Database) -> Any:
+        return db.read_resource(resource, "subject")
+
+    expected_control: Any = {"get": 2, "read_input": 1, "read_resource": "constant:target"}[read]
+    assert read_the_database(db) == expected_control
+    executions_before = db.statistics().query_executions
+
+    with pytest.raises(
+        ReentrantDatabaseError,
+        match=re.escape(f"db.{read}() is not allowed inside a resource hook."),
+    ):
+        db.get(root)
+
+    # Nothing completed: the refusal happened on the way in, so no query
+    # finished and the hook's resource left no node behind to answer from.
+    assert db.statistics().query_executions == executions_before
+    assert all(not node.label.startswith("hook-read[") for node in db.dependency_graph())
+
+
+def test_resource_hook_calling_set_raises_without_a_live_frame() -> None:
+    """A hook is inside the boundary even when no query execution is.
+
+    `db.read_resource` at top level opens no execution, so the stack says
+    nothing about where the caller stands. The hook depth does, and it has to:
+    a `set` from inside a load moves the input the observation being made is
+    about to be recorded against, which is the same defect an in-body `set`
+    is refused for.
+    """
+    newcomer = Input[int]("newcomer")
+
+    class SettingResource:
+        def identity(self) -> tuple[str]:
+            return ("setting-resource",)
+
+        def label(self, name: str) -> str:
+            return f"setting[{name}]"
+
+        def probe(self, name: str) -> str:
+            return "probe"
+
+        def load(self, db: Database, name: str) -> int:
+            db.set(newcomer, 1)
+            return 1
+
+    resource = SettingResource()
+    db = Database()
+    inputs_before = db.statistics().input_count
+
+    with pytest.raises(
+        ReentrantDatabaseError,
+        match=re.escape("db.set() is not allowed inside a resource hook."),
+    ):
+        db.read_resource(resource, "subject")
+
+    assert db.statistics().input_count == inputs_before
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("hook", ["probe_and_load", "load"])
+def test_rejected_hook_read_is_not_a_load_failure(hook: str, mode: str) -> None:
+    """A refused hook read is not an observation, so it leaves no failure record.
+
+    A load that raises is an observation the kernel records: the node keeps a
+    failure record carrying the probe seen beside it, the reader declares its
+    edge to that node, and reads that follow within the request re-raise the
+    exception the load produced. A boundary refusal observes nothing about the
+    outside world -- it says the hook is asking for something it may not have --
+    so it is passed through ahead of the recording. The second attempt is then
+    refused on its own account instead of replaying a record, which is what
+    keeps warm and fresh identical here.
+    """
+    counter = Input[int]("counter")
+
+    @query
+    def leaf(db: Database) -> int:
+        return counter.read(db) + 1
+
+    class AtomicHookResource:
+        def identity(self) -> tuple[str]:
+            return ("hook-failure-resource",)
+
+        def label(self, name: str) -> str:
+            return f"hook-failure[{name}]"
+
+        def probe(self, name: str) -> str:
+            return "probe"
+
+        def load(self, db: Database, name: str) -> int:
+            return db.get(leaf)
+
+        def probe_and_load(self, db: Database, name: str) -> tuple[str, int]:
+            return ("probe", db.get(leaf))
+
+    class LoadHookResource:
+        def identity(self) -> tuple[str]:
+            return ("hook-failure-resource",)
+
+        def label(self, name: str) -> str:
+            return f"hook-failure[{name}]"
+
+        def probe(self, name: str) -> str:
+            return "probe"
+
+        def load(self, db: Database, name: str) -> int:
+            return db.get(leaf)
+
+    resource: Any = AtomicHookResource() if hook == "probe_and_load" else LoadHookResource()
+
+    @query
+    def root(db: Database) -> Any:
+        return db.read_resource(resource, "subject")
+
+    db = Database(mode=mode)
+    db.set(counter, 1)
+    executions_before = db.statistics().query_executions
+
+    for _ in range(2):
+        with pytest.raises(
+            ReentrantDatabaseError,
+            match=re.escape("db.get() is not allowed inside a resource hook."),
+        ):
+            db.get(root)
+
+    # The second refusal cannot have been served from the first: nothing
+    # completed, nothing was recorded, and the resource has no node at all --
+    # where a recorded load failure would have left one, counted and labelled.
+    assert db.statistics().query_executions == executions_before
+    assert db.statistics().resource_count == 0
+    assert all(not node.label.startswith("hook-failure[") for node in db.dependency_graph())
+
+
+def test_refused_hook_read_on_a_recorded_resource_retires_its_probe() -> None:
+    """A node that already had a record keeps it, and stops answering from it.
+
+    Passing the refusal through the failure-record handling leaves the earlier
+    record exactly as the successful load wrote it -- which is a problem on its
+    own if nothing else happens, because a probe that came back to the recorded
+    value would answer warm from a load that can no longer run. The unconfirmed
+    mark is what closes that: the record survives, its stored probe is retired,
+    and the next read re-runs the hook and is refused on its own account.
+    """
+    counter = Input[int]("counter")
+
+    class SometimesReadingResource:
+        """Reads the database only once its instance switch is thrown."""
+
+        def __init__(self) -> None:
+            self.reads_the_database = False
+
+        def identity(self) -> tuple[str]:
+            return ("sometimes-reading-resource",)
+
+        def label(self, name: str) -> str:
+            return f"sometimes-reading[{name}]"
+
+        def probe(self, name: str) -> str:
+            # Moving with the switch, so the second read reaches the load at
+            # all: an unchanged probe would answer from the record instead.
+            return "reading" if self.reads_the_database else "quiet"
+
+        def load(self, db: Database, name: str) -> int:
+            if self.reads_the_database:
+                return db.read_input(counter)
+            return 0
+
+    resource = SometimesReadingResource()
+    db = Database()
+    db.set(counter, 1)
+
+    assert db.read_resource(resource, "subject") == 0
+    key = db._resource_key(resource, "subject")
+    record = db._records[key]
+    assert record.probe == "quiet"
+    revision_before = db.revision
+
+    resource.reads_the_database = True
+    for _ in range(2):
+        with pytest.raises(
+            ReentrantDatabaseError,
+            match=re.escape("db.read_input() is not allowed inside a resource hook."),
+        ):
+            db.read_resource(resource, "subject")
+
+    # The record is the one the successful load wrote -- no failure recorded,
+    # and no probe stored for the refusal -- but it is marked unconfirmed, and
+    # entering that state moved the revision as any other graph change does.
+    assert db._records[key] is record
+    assert not record.is_failed
+    assert record.failure is None
+    assert record.probe == "quiet"
+    assert record.probe_unconfirmed
+    assert db.revision > revision_before
+    assert db.statistics().resource_count == 1
+    node = next(n for n in db.dependency_graph() if n.label == "sometimes-reading[subject]")
+    assert node.last_decision == "executed"
+
+
+def test_thread_spawned_inside_a_hook_outside_a_query_is_refused() -> None:
+    """A hook's boundary has to reach the threads it starts, frame or no frame.
+
+    `read_resource` at top level opens no execution, so nothing about the
+    spawning context said the child was inside anything -- and the child then
+    blocked forever on the state lock its own parent was holding for the whole
+    of the hook, with the parent waiting on the join. That is the deadlock the
+    descendant refusal exists to turn into an error; it just was not reachable
+    through the frame, because there is no frame here. The hook depth is what
+    the child inherits instead.
+    """
+    counter = Input[int]("counter")
+
+    class SpawningResource:
+        def __init__(self) -> None:
+            self.outcome: list[Any] = []
+            self.thread: threading.Thread | None = None
+
+        def identity(self) -> tuple[str]:
+            return ("hook-spawning-resource",)
+
+        def label(self, name: str) -> str:
+            return f"hook-spawn[{name}]"
+
+        def probe(self, name: str) -> str:
+            return "probe"
+
+        def load(self, db: Database, name: str) -> int:
+            def child() -> None:
+                try:
+                    self.outcome.append(db.read_input(counter))
+                except Exception as exc:  # noqa: BLE001
+                    self.outcome.append(exc)
+
+            # A daemon so that a regression fails this test rather than
+            # stranding a blocked thread at interpreter exit.
+            thread = threading.Thread(target=child, daemon=True)
+            self.thread = thread
+            thread.start()
+            thread.join(timeout=10)
+            return 1
+
+    resource = SpawningResource()
+    db = Database()
+    db.set(counter, 1)
+
+    assert db.read_resource(resource, "subject") == 1
+
+    thread = resource.thread
+    assert thread is not None
+    assert not thread.is_alive(), "db.read_input() never came back to the child"
+    assert len(resource.outcome) == 1
+    refusal = resource.outcome[0]
+    assert isinstance(refusal, ReentrantDatabaseError), refusal
+    assert str(refusal) == "db.read_input() is not allowed inside a resource hook."
 
 
 def test_module_capture_invalidates_on_source_change(
