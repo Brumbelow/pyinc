@@ -18,6 +18,7 @@ import pytest
 from pyinc import (
     CheckpointIntegrityError,
     CheckpointManifestError,
+    CheckpointModeError,
     CheckpointVersionError,
     Database,
     FileResource,
@@ -401,6 +402,10 @@ def _manifest(
     return {
         "pyinc_ckpt_version": _CHECKPOINT_MANIFEST_VERSION,
         "kernel_fingerprint_version": 2,
+        # Every consumer validates against a default-constructed Database, so
+        # the manifest has to name that database's mode to reach the checks
+        # each of them is actually about.
+        "mode": "strict",
         "adapters": adapters or {},
         "records": records or [],
     }
@@ -1087,6 +1092,27 @@ def test_checkpoint_manifest_root_and_record_validation_errors() -> None:
     wrong_kernel = _manifest()
     wrong_kernel["kernel_fingerprint_version"] = 1
     rejects(wrong_kernel, "kernel fingerprint version")
+
+    missing_mode = _manifest()
+    del missing_mode["mode"]
+    rejects(missing_mode, "fields must be exactly")
+
+    unknown_mode = _manifest()
+    unknown_mode["mode"] = "turbo"
+    rejects(unknown_mode, "field 'mode'")
+
+    non_string_mode = _manifest()
+    non_string_mode["mode"] = 7
+    rejects(non_string_mode, "field 'mode'")
+
+    # A manifest from another mode is well-formed, so it is refused by its own
+    # error rather than reported as malformed: re-saving under this mode is the
+    # fix, and that must not read like corruption. Asserted outside `rejects`,
+    # whose expected types deliberately stay the malformed/version pair.
+    other_mode = _manifest()
+    other_mode["mode"] = "checked"
+    with pytest.raises(CheckpointModeError, match="refusing to load"):
+        db._validate_checkpoint_manifest("checkpoint", other_mode, store)
 
     adapters_not_object = _manifest()
     adapters_not_object["adapters"] = []

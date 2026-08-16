@@ -43,6 +43,7 @@ from .errors import (
     AdapterContractError,
     CheckpointIntegrityError,
     CheckpointManifestError,
+    CheckpointModeError,
     CheckpointVersionError,
     CycleError,
     InputKeyError,
@@ -90,13 +91,13 @@ ResourceProbeT = TypeVar("ResourceProbeT")
 
 # Durable checkpoint manifest schema version. Bumped whenever the identity, the
 # record layout, or the meaning of a recorded field changes, so stale manifests
-# are rejected loudly rather than silently reused. Version 6 marks two
-# soundness repairs a version-5 record can predate: captured-module identity
-# was derived from a stat tuple a same-size rewrite can preserve, and a stat
-# probe raising NotADirectoryError published no resource edge, so a version-5
-# record can carry a stale identity or claim no dependencies for a reader a
-# fresh database re-derives.
-_CHECKPOINT_MANIFEST_VERSION = 6
+# are rejected loudly rather than silently reused. Version 7 adds the saving
+# database's mode to the manifest root. The value a query computes and persists
+# depends on that mode -- strict exposes frozen views and frozen call arguments
+# where checked and fast thaw -- so a record saved under one mode can carry a
+# value another mode would never compute; a version-6-or-earlier manifest names
+# no mode at all and so cannot be attributed to one.
+_CHECKPOINT_MANIFEST_VERSION = 7
 # Version of the snapshot/fingerprint encoding this kernel emits, mirrored from
 # value._KERNEL_FINGERPRINT_PREFIX (b"K2;"). Recorded in the manifest and checked
 # at load so a checkpoint from a differently-encoded kernel is never trusted.
@@ -1595,6 +1596,9 @@ class Database:
         Inputs must be set before saving so that input digests are captured in
         the checkpoint's dependency records.
 
+        The manifest records this database's mode, and only a database running
+        that same mode can load the resulting checkpoint.
+
         Raises ``ValueError`` if no ``ArtifactStore`` is available (either
         passed directly or configured via ``Database(store=...)``).
         """
@@ -1634,6 +1638,8 @@ class Database:
 
         Raises ``ValueError`` if no ``ArtifactStore`` is available.
         Raises ``KeyError`` if *key* is not found in the store.
+        Raises ``CheckpointModeError`` if the checkpoint was saved by a database
+        running a different mode.
         """
         self._reject_inside_query("db.load_checkpoint()")
         _store = store if store is not None else self._store
@@ -1822,6 +1828,7 @@ class Database:
         manifest = {
             "pyinc_ckpt_version": _CHECKPOINT_MANIFEST_VERSION,
             "kernel_fingerprint_version": _KERNEL_FINGERPRINT_VERSION,
+            "mode": self.mode,
             "adapters": adapters_manifest,
             "records": records_list,
         }
@@ -1917,6 +1924,7 @@ class Database:
         required_root = {
             "pyinc_ckpt_version",
             "kernel_fingerprint_version",
+            "mode",
             "adapters",
             "records",
         }
@@ -1928,6 +1936,17 @@ class Database:
                 f"Checkpoint {key!r} was written by kernel fingerprint version "
                 f"{kernel_version!r}, but this kernel emits version "
                 f"{_KERNEL_FINGERPRINT_VERSION}; refusing to load."
+            )
+        # Mode is a bare str alias, so the range is checked explicitly here, the
+        # same way Database.__init__ checks the constructor argument.
+        manifest_mode = manifest["mode"]
+        if manifest_mode not in ("strict", "checked", "fast"):
+            raise malformed("field 'mode' must be one of 'strict', 'checked', 'fast'.")
+        if manifest_mode != self.mode:
+            raise CheckpointModeError(
+                f"Checkpoint {key!r} was saved in mode {manifest_mode!r}, but this "
+                f"database runs in mode {self.mode!r}; refusing to load. A checkpoint "
+                f"warms only a database running in the mode that saved it."
             )
 
         raw_adapters = manifest["adapters"]

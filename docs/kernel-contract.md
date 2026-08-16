@@ -885,7 +885,7 @@ Snapshot bytes use the encoding described in
 On top of this, `Database.save_checkpoint(store=None) -> str` serialises the
 current query and resource records — their snapshot bytes, call snapshots,
 resource parameters, dependency edges, and per-adapter implementation digests —
-into a content-addressed manifest (schema v6), returning a key prefixed with
+into a content-addressed manifest (schema v7), returning a key prefixed with
 `"ck"`. Adapter digests include `freeze`/`thaw` code, snapshot-safe instance
 configuration, and the interpreter/build identity. Saving rejects an adapter
 whose captures or state cannot be pinned; loading under such an adapter safely
@@ -906,7 +906,7 @@ injection; the store passed to `load_checkpoint` is also used for subsequent
 snapshot loading if the `Database` was not constructed with a `store=`
 argument.
 
-Manifest schema v6 rejects v1-v5 manifests with `CheckpointVersionError`; stale
+Manifest schema v7 rejects v1-v6 manifests with `CheckpointVersionError`; stale
 checkpoints are re-saved, never migrated.
 
 ## FileSystemArtifactStore

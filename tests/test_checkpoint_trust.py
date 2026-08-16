@@ -963,6 +963,53 @@ def test_v5_manifest_rejected_loudly() -> None:
         db.load_checkpoint(key)
 
 
+def test_v6_manifest_rejected_loudly() -> None:
+    """A version-6 manifest predates the manifest's save-mode field.
+
+    The value a query computes and persists depends on the database mode, so a
+    record carries a value only a database in the saving mode would produce.
+    Version 6 records no mode, so such a record cannot be attributed to one at
+    all, and the manifest version has to carry the difference.
+    """
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+
+    manifest = {
+        "pyinc_ckpt_version": 6,
+        "kernel_fingerprint_version": 2,
+        "records": [],
+    }
+    manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    key = "ck" + hashlib.sha256(manifest_bytes).hexdigest()
+    store.put(key, manifest_bytes)
+
+    with pytest.raises(ValueError, match="Unsupported checkpoint version"):
+        db.load_checkpoint(key)
+
+
+def test_saved_manifest_records_the_database_mode() -> None:
+    """The save side writes the mode the load side refuses to disagree with."""
+
+    @query(key="manifest-records-mode")
+    def moded(db: Database) -> int:
+        return 11
+
+    store = InMemoryArtifactStore()
+    db = Database("checked", store=store)
+    assert db.get(moded) == 11
+    checkpoint = db.save_checkpoint()
+
+    manifest = json.loads(cast(bytes, store.get(checkpoint)).decode("utf-8"))
+    assert manifest["mode"] == "checked"
+    assert set(manifest) == {
+        "pyinc_ckpt_version",
+        "kernel_fingerprint_version",
+        "mode",
+        "adapters",
+        "records",
+    }
+
+
 class _CheckpointConsts:
     SCALE = 2
 

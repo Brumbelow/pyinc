@@ -119,9 +119,9 @@ decided at release time.
 
 ### Changed
 
-- The checkpoint manifest schema is v6; v5 manifests are rejected loudly
-  because their records can predate the module-identity and stat-probe
-  repairs above.
+- The checkpoint manifest schema is v7 and records the saving database's mode;
+  v6 and earlier manifests are rejected loudly because their records cannot be
+  attributed to a save mode.
 - The action ledger schema is v3, and orphan deletion is verified against the
   recorded bytes: an orphan that no longer carries the digest the ledger
   recorded is released, never deleted. The manifest also records the root
