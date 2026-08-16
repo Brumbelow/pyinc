@@ -5,6 +5,7 @@ import math
 import mmap
 import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -3460,6 +3461,179 @@ def test_thread_outliving_its_spawning_query_reads_freely_afterward(tmp_path: Pa
     thread.join(timeout=10)
     assert not thread.is_alive()
     assert after == ["outside", "ok"]
+
+
+@pytest.mark.parametrize(
+    "surface",
+    ["get", "read_input", "read_resource", "request_span", "report_untracked_read"],
+)
+def test_query_spawned_thread_calling_into_the_database_fails_fast(
+    surface: str, tmp_path: Path
+) -> None:
+    """The whole read surface refuses a descendant thread instead of hanging on it.
+
+    A query body that starts a thread and waits for it holds the state lock
+    the whole time. Every one of these calls wants that lock, so the child
+    waits for the parent and the parent waits for the child. The refusal is
+    what turns that pair into an error the caller can read.
+    """
+    path = tmp_path / "resource.txt"
+    path.write_text("ok", encoding="utf-8")
+    counter = Input[int]("counter")
+    contents = FileResource()
+
+    @query
+    def leaf(db: Database) -> int:
+        return 1
+
+    @query
+    def spawn_caller(db: Database) -> str:
+        outcome: list[Any] = []
+
+        def child() -> None:
+            try:
+                if surface == "get":
+                    db.get(leaf)
+                elif surface == "read_input":
+                    db.read_input(counter)
+                elif surface == "read_resource":
+                    db.read_resource(contents, str(path))
+                elif surface == "request_span":
+                    with db.request_span():
+                        pass
+                else:
+                    db.report_untracked_read("something the child looked at")
+            except Exception as exc:  # noqa: BLE001
+                outcome.append(exc)
+            else:
+                outcome.append("the call returned instead of refusing")
+
+        thread = threading.Thread(target=child)
+        # Both have to outlive this call, and a query may not capture a
+        # container the test could have handed it.
+        db.spawned = (thread, outcome)  # type: ignore[attr-defined]
+        thread.start()
+        thread.join(timeout=10)
+        return "joined"
+
+    db = Database()
+    db.set(counter, 7)
+    assert db.get(spawn_caller) == "joined"
+
+    thread, outcome = db.spawned  # type: ignore[attr-defined]
+    assert not thread.is_alive(), f"db.{surface}() never came back to the child"
+    assert len(outcome) == 1
+    refusal = outcome[0]
+    assert isinstance(refusal, ReentrantDatabaseError), refusal
+    assert "is not allowed from a thread spawned inside a query execution" in str(refusal)
+
+
+def test_query_spawned_thread_unsubscribing_fails_fast() -> None:
+    """A subscription handle refuses a descendant thread for the same reason.
+
+    `unsubscribe` reaches for the state lock of the database it detaches from,
+    so a thread a query spawned would be waiting on a lock its own parent is
+    holding while the parent waits on the thread.
+    """
+    counter = Input[int]("counter")
+
+    @query
+    def doubled(db: Database) -> int:
+        return counter.read(db) * 2
+
+    @query
+    def spawn_unsubscriber(db: Database) -> str:
+        subscription = db.subscription  # type: ignore[attr-defined]
+        outcome: list[Any] = []
+
+        def child() -> None:
+            try:
+                subscription.unsubscribe()
+            except Exception as exc:  # noqa: BLE001
+                outcome.append(exc)
+            else:
+                outcome.append("unsubscribe returned instead of refusing")
+
+        thread = threading.Thread(target=child)
+        db.spawned = (thread, outcome)  # type: ignore[attr-defined]
+        thread.start()
+        thread.join(timeout=10)
+        return "joined"
+
+    db = Database()
+    db.set(counter, 1)
+    # The handle rides on the database for the same reason the events do.
+    db.subscription = db.observe(lambda event: None, doubled)  # type: ignore[attr-defined]
+    assert db.get(spawn_unsubscriber) == "joined"
+
+    thread, outcome = db.spawned  # type: ignore[attr-defined]
+    assert not thread.is_alive(), "Subscription.unsubscribe() never came back to the child"
+    assert len(outcome) == 1
+    refusal = outcome[0]
+    assert isinstance(refusal, ReentrantDatabaseError), refusal
+    assert str(refusal) == (
+        "Subscription.unsubscribe() is not allowed from a thread spawned "
+        "inside a query execution."
+    )
+
+
+def test_unrelated_thread_call_serializes_while_a_query_runs() -> None:
+    """A thread the query did not start still waits its turn rather than being refused.
+
+    The refusal is scoped to descent. A worker that already existed when the
+    query began is outside its boundary, so it blocks on the state lock and
+    lands the moment the query releases it -- the shared-instance promise,
+    unchanged.
+    """
+    value = Input[int]("value")
+
+    @query
+    def read_value(db: Database) -> tuple[int, int]:
+        observed = value.read(db)
+        running, attempted = db.handshake  # type: ignore[attr-defined]
+        running.set()
+        attempted.wait(timeout=10)
+        # Stay in the body a beat past the worker's flag, then read again. The
+        # second read is the overlap witness: the worker's set cannot have
+        # landed while this body holds the lock, so both reads agree.
+        time.sleep(0.05)
+        return observed, value.read(db)
+
+    started = threading.Event()
+    attempt_made = threading.Event()
+    db = Database()
+    # The events ride on the database: a query body may not capture mutable
+    # ambient state, so it cannot close over them.
+    db.handshake = (started, attempt_made)  # type: ignore[attr-defined]
+    db.set(value, 1)
+
+    errors: list[Exception] = []
+    read_from_outside: list[int] = []
+
+    def worker() -> None:
+        started.wait(timeout=10)
+        attempt_made.set()
+        try:
+            # A refused surface first, and the flag above says the query body
+            # is still in flight: a rule that keyed on "some thread of this
+            # process is executing" rather than on descent would raise here,
+            # because the check runs before the lock is even asked for.
+            read_from_outside.append(db.read_input(value))
+            db.set(value, 2)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert db.get(read_value) == (1, 1)
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert not errors, f"unrelated thread was refused: {errors}"
+    assert read_from_outside == [1]
+
+    executions = db.statistics().query_executions
+    assert db.get(read_value) == (2, 2)
+    assert db.statistics().query_executions == executions + 1
 
 
 def test_module_capture_invalidates_on_source_change(

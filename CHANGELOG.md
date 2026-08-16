@@ -248,6 +248,17 @@ decided at release time.
   again. Threads created before the query began — pre-warmed pools, module
   scope executors, reused worker threads — never pass through this boundary
   and stay outside it.
+- Calls into a `Database` from a thread spawned inside one of its running
+  queries now raise `ReentrantDatabaseError` instead of deadlocking. `get`,
+  `read_input`, `read_resource`, `request_span`, `report_untracked_read` and
+  `Subscription.unsubscribe` all want the state lock the executing query body
+  is holding, so a body that started a thread and waited for it never came
+  back — the child waited for the lock and the parent waited for the child.
+  The refusal is checked before the lock is taken and before anything else the
+  call would do, so the deadlock is now a typed error raised in the child,
+  where the code that made the call can see it. Threads outside the boundary
+  are unaffected: they still block until the running work releases the lock,
+  and a shared `Database` serialises across threads exactly as before.
 
 ## [3.1.1] - 2026-08-03
 

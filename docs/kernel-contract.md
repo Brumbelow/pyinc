@@ -370,7 +370,7 @@ calls, `ctypes` memory access, and similar.
 (See: `test_os_open_bypasses_untracked_read_guard`,
 `test_condition_two_entry_points_stay_guarded`)
 
-Three of those gaps sit close enough to the guarded set to be named individually.
+Four of those gaps sit close enough to the guarded set to be named individually.
 
 - **File metadata.** The guard sees file *contents* and directory *listings*; it
   does not see `stat`. `os.stat`, `os.lstat`, `os.access`, `Path.stat`,
@@ -398,6 +398,22 @@ Three of those gaps sit close enough to the guarded set to be named individually
   a query whose result varies with the process working directory is untracked.
   Pass absolute paths as query arguments instead.
   (See: `test_working_directory_reads_bypass_untracked_read_guard`)
+- **Threads the query did not start.** The guard reaches a thread by running it
+  in the context that started it, so it covers threads a query body starts, at
+  any depth of descent, and nothing else. A thread that already existed when
+  the query began — a pre-warmed pool, an executor built at module scope, a
+  reused `ThreadPoolExecutor` worker — never passes through that boundary, so a
+  query that hands its file or environment reads to one of them is untracked
+  just as if it had called `os.open` directly, and a query that waits on such
+  a worker while the worker waits on the state lock deadlocks rather than being
+  refused. Hand the work to a thread the query starts, or declare it. The
+  threads that are covered hold the context they inherited on the thread object
+  itself, so what bounds that retention is the lifetime of the thread object,
+  not the lifetime of the query.
+  (See: `test_untracked_read_still_enforced_per_thread`,
+  `test_query_spawned_thread_raw_reads_stay_guarded`,
+  `test_query_spawned_thread_calling_into_the_database_fails_fast`,
+  `test_thread_outliving_its_spawning_query_reads_freely_afterward`)
 
 **2. Custom `eq=`/`cutoff=` with side effects.**
 If `eq=` or `cutoff=` callbacks perform ambient reads or mutations, the
@@ -710,7 +726,9 @@ Within a process, `Database` is thread-safe for concurrent use both across
 independent instances and on a single shared instance. Each `Database` holds
 a `threading.RLock` that serialises every public state read and mutation,
 including queries, resources, inputs, statistics, profiles, dependency graphs,
-resets, checkpoint operations, and subscriptions.
+resets, checkpoint operations, and subscriptions. A thread that is outside
+every query of that instance waits its turn on that lock and lands as soon as
+the running work releases it, whatever that work is.
 
 The ambient-read guard is installed globally exactly once and dispatches
 per-context via a `ContextVar` stack of active databases — two threads inside
@@ -719,6 +737,28 @@ enforcement, and raw I/O from a thread that is *not* inside any query continues
 to work unaffected. If many threads share a single `Database`, work serialises
 on the per-instance lock; if they hold separate `Database` instances they run
 in parallel.
+
+A thread that a query body **starts** is the one case that does not simply
+wait: it inherits the boundary of the query that started it. Its undeclared
+ambient reads raise `UntrackedReadError` exactly as they would on the
+executing thread, and its calls back into that same `Database` — `get`,
+`read_input`, `read_resource`, `request_span`, `report_untracked_read`,
+`Subscription.unsubscribe` — raise `ReentrantDatabaseError` instead of
+waiting for the lock. Waiting is what they must not do: the query body holds
+the lock for the whole of its execution, so a child that blocks on it while
+the body waits for the child is a deadlock, and the refusal is what turns
+that pair into an error the caller can read. The boundary ends when the query
+does — a thread that outlives its spawning query is an ordinary thread again,
+and both its reads and its calls are allowed.
+
+Threads that already existed when the query began — a pre-warmed pool, an
+executor built at module scope, a reused `ThreadPoolExecutor` worker — are
+outside that boundary. Their ambient reads are not intercepted, so a query
+that farms one out to such a worker records no dependency for it (Explicit
+Limitation 1), and their calls into the database are not refused, so a query
+that waits on such a worker while the worker waits on the lock still
+deadlocks. Hand the work to a thread the query itself starts, or keep the
+I/O in a declared read.
 
 ## Snapshot Serialization and Store Keys
 

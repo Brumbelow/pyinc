@@ -881,6 +881,7 @@ class Subscription:
         self._active = True
 
     def unsubscribe(self) -> None:
+        self._database._reject_reentrant_read("Subscription.unsubscribe()")
         with self._database._state_lock:
             if not self._active:
                 return
@@ -1288,6 +1289,9 @@ class Database:
             self._roll_span_request()
 
     def get(self, query: _core.Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        # Before the lock, always: a thread spawned inside a query cannot be
+        # told to wait for a lock its own parent is holding.
+        self._reject_reentrant_read("db.get()")
         from .core import Query
 
         if not isinstance(query, Query):
@@ -1374,6 +1378,7 @@ class Database:
         inner span, or one opened inside a ``get``, joins the enclosing
         request and its close does nothing.
         """
+        self._reject_reentrant_read("db.request_span()")
         scope = self._request_scope()
         with self._state_lock:
             pending = scope.__enter__()
@@ -1490,6 +1495,11 @@ class Database:
         return Subscription(self, key, callback)
 
     def report_untracked_read(self, reason: str) -> None:
+        # Before the lock, which this method takes ahead of everything else: a
+        # spawned thread blocks there and never reaches the frame check below.
+        # That check would let it through in any case -- a descendant inherits
+        # its parent's frame.
+        self._reject_reentrant_read("db.report_untracked_read()")
         with self._state_lock:
             frame = self._current_frame()
             if frame is None:
@@ -2551,6 +2561,7 @@ class Database:
         return key.identity.rsplit(":", 1)[0]
 
     def read_input(self, input_key: _core.Input[T]) -> T:
+        self._reject_reentrant_read("db.read_input()")
         from .core import Input
 
         if not isinstance(input_key, Input):
@@ -2574,6 +2585,7 @@ class Database:
     def read_resource(self, resource: Any, parameter: Any) -> Any: ...
 
     def read_resource(self, resource: Any, parameter: Any) -> Any:
+        self._reject_reentrant_read("db.read_resource()")
         with self._state_lock, self._request_scope() as pending:
             key = self._resource_key(resource, parameter)
             outcome = _RefreshOutcome()
