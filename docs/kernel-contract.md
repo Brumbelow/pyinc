@@ -503,7 +503,13 @@ module attribute, or an entry in a directly captured class body, therefore
 moves query identity at the next request, warm or fresh alike — and so does a
 rebinding one of those landings' definitions reads, such as the module-level
 function an `Input`'s `eq` policy calls, the class a chain-landed type alias
-resolves to, or the function a chain-landed resource's `load` calls.
+resolves to, or the function a chain-landed resource's `load` calls. Where the
+interpreter exposes no Python evaluator to observe — a `type` alias before
+3.14, or a runtime-constructed `TypeVar`'s bound on every interpreter — the
+payload resolves the value eagerly and anchors each class it reaches to its
+live module binding, and the warm path carries the same anchors: rebinding
+that binding then refuses loudly, warm and fresh alike, instead of moving
+identity.
 
 Two shapes stay outside that envelope by design. A chain that lands on a class
 or a frozen dataclass instance — named directly, or held inside an immutable

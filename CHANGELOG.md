@@ -35,7 +35,13 @@ decided at release time.
   whose payload reads a live definition — a function, a wraps-decorated
   callable, a query handle, an `Input`, a type alias, a type parameter or a
   resource — that definition is observed too, so a rebinding behind such a
-  landing moves identity instead of being served from the memo.
+  landing moves identity instead of being served from the memo. Where no
+  Python evaluator exists to observe — a `type` alias before 3.14, or a
+  runtime-constructed `TypeVar`'s bound on every interpreter — the eagerly
+  resolved value is anchored to its live module binding on the warm path
+  exactly as the payload anchors it on the fresh one, so rebinding that
+  binding refuses loudly on both paths rather than being served from the
+  memo.
   Resource-folding queries stay memoized: the configuration their `identity()`
   reports, and the type behind it, are digested and compared per request, and
   the request-scoped re-reads are cleared whenever a caller declares a

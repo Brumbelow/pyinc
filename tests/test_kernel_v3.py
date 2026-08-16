@@ -2271,7 +2271,7 @@ def test_memoized_fingerprint_tracks_a_chain_landed_inputs_policy_globals(
     sys.version_info < (3, 12),
     reason="type-alias and type-parameter syntax require Python 3.12",
 )
-def test_memoized_fingerprint_tracks_a_chain_landed_type_alias_evaluator(
+def test_memoized_fingerprint_agrees_with_truth_when_an_alias_target_is_rebound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module_name = "pyinc_module_type_alias"
@@ -2298,13 +2298,74 @@ def test_memoized_fingerprint_tracks_a_chain_landed_type_alias_evaluator(
 
         db = Database()
         db._query_fingerprint(aliased)
-        # The chain lands on a type alias, whose lazy evaluator resolves this
-        # global when the payload calls it. The alias object never moves, and
-        # a class is not a constant the module stamp carries.
+        # The chain lands on a type alias. The alias object never moves, and a
+        # class is not a constant the module stamp carries, so what the memo
+        # owes after this rebinding depends on what the interpreter exposes.
         monkeypatch.setattr(module, "First", module.Second)
-        memoized, truth = _memo_and_truth(db, aliased)
-        assert memoized == truth
-        assert memoized == Database()._query_fingerprint(aliased)
+        if isinstance(getattr(module.ALIAS, "evaluate_value", None), FunctionType):
+            # The payload folds the lazy evaluator as a definition, and its
+            # observation resolves the same global -- identity tracks the
+            # rebinding.
+            memoized, truth = _memo_and_truth(db, aliased)
+            assert memoized == truth
+            assert memoized == Database()._query_fingerprint(aliased)
+        else:
+            # Through 3.13 there is no evaluator to fold: the payload resolved
+            # and cached __value__ at prime time, and the rebinding kills the
+            # live module binding its anchor requires. A fresh computation
+            # refuses, so the memo must refuse with it -- serving past the
+            # refusal is the staleness the anchor exists to prevent.
+            with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+                db._query_fingerprint(aliased)
+            with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+                db.get(aliased)
+            with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+                Database()._query_fingerprint(aliased)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_memoized_fingerprint_refuses_with_truth_when_a_parameter_bound_is_rebound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_type_parameter_rebound"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from typing import TypeVar\n"
+        "\n"
+        "\n"
+        "class Bound:\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "class Second:\n"
+        "    marker = 2\n"
+        "\n"
+        "\n"
+        'PARAM = TypeVar("PARAM", bound=Bound)\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-type-parameter-rebound")
+        def named(db: Database) -> str:
+            return cast(str, module.PARAM.__name__)
+
+        db = Database()
+        db._query_fingerprint(named)
+        # A runtime-constructed TypeVar stores its bound eagerly on every
+        # interpreter -- evaluate_bound, where it exists at all, is not a
+        # Python function -- so the payload anchors the bound class to its
+        # live module binding. Rebinding that global makes every fresh
+        # computation refuse; the memo must refuse with it rather than keep
+        # serving the fingerprint it stored while the binding held.
+        monkeypatch.setattr(module, "Bound", module.Second)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            db._query_fingerprint(named)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database()._query_fingerprint(named)
     finally:
         sys.modules.pop(module_name, None)
 

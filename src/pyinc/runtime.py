@@ -178,6 +178,95 @@ def _is_type_alias(value: Any) -> bool:
     }
 
 
+def _live_type_binding(value: type[Any]) -> Any:
+    """The object the type's defining module currently binds under its name.
+
+    Mirrors `_module_type_anchor_payload`'s resolution without its refusal.
+    The payload refuses a type whose defining module no longer binds it, so an
+    observation that pinned the type by identity alone would keep a stored
+    fingerprint serving after the binding moved while every fresh computation
+    refuses. Folded as an identity leaf, this is the type itself while the
+    binding holds and whatever replaced it -- or None -- once it does not,
+    which is exactly when the memo must stop answering.
+    """
+
+    module = sys.modules.get(value.__module__)
+    if module is None:
+        return None
+    current: Any = vars(module).get(value.__qualname__.split(".", 1)[0])
+    for part in value.__qualname__.split(".")[1:]:
+        if not isinstance(current, type):
+            return None
+        current = vars(current).get(part)
+    return current
+
+
+def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
+    """Live-binding leaves for every anchored type an eager value resolves.
+
+    Follows the shapes `_freeze_static_capture` resolves eagerly -- containers,
+    parameterized generics, unions, nested aliases and type parameters -- and
+    contributes one `_live_type_binding` leaf per non-builtin type reached,
+    because the payload anchors each of those types to its live module
+    binding. An alias or a type parameter recurses only where its evaluate_*
+    attribute is not a Python function: where one exists the payload folds the
+    evaluator instead of the resolved value, and observing that evaluator as a
+    definition already tracks the globals it resolves.
+    """
+
+    leaves: list[Any] = []
+    swept: builtins.set[int] = set()
+
+    def sweep(value: Any) -> None:
+        if isinstance(value, type):
+            if value.__module__ != "builtins":
+                leaves.append(_live_type_binding(value))
+            return
+        if id(value) in swept:
+            return
+        swept.add(id(value))
+        if isinstance(value, (tuple, frozenset)):
+            for item in value:
+                sweep(item)
+            return
+        if isinstance(value, GenericAlias):
+            sweep(value.__origin__)
+            for item in value.__args__:
+                sweep(item)
+            return
+        if isinstance(value, UnionType):
+            for item in typing.get_args(value):
+                sweep(item)
+            return
+        if type(value).__module__ in {"typing", "types"}:
+            origin = typing.get_origin(value)
+            if origin is not None:
+                sweep(origin)
+                for item in typing.get_args(value):
+                    sweep(item)
+                return
+        if _is_type_alias(value):
+            if not isinstance(getattr(value, "evaluate_value", None), FunctionType):
+                sweep(getattr(value, "__value__", None))
+            return
+        if _TYPE_PARAMETER_TYPES and isinstance(value, _TYPE_PARAMETER_TYPES):
+            for evaluator_name, value_name in (
+                ("evaluate_bound", "__bound__"),
+                ("evaluate_constraints", "__constraints__"),
+                ("evaluate_default", "__default__"),
+            ):
+                if isinstance(getattr(value, evaluator_name, None), FunctionType):
+                    continue
+                try:
+                    part = getattr(value, value_name, None)
+                except Exception:
+                    part = None
+                sweep(part)
+
+    sweep(root)
+    return tuple(leaves)
+
+
 def _walk_reflective_code(code: CodeType) -> Iterator[CodeType]:
     yield code
     for constant in code.co_consts:
@@ -3987,11 +4076,19 @@ class Database:
                 return value
             seen.add(id(value))
             evaluator = getattr(value, "evaluate_value", None)
+            if isinstance(evaluator, FunctionType):
+                content: Any = observe_function(evaluator)
+            else:
+                # Without a Python evaluator the payload resolved __value__
+                # eagerly and anchored every type it reached to its live
+                # module binding; the leaves keep this observation exactly as
+                # binding-sensitive, so the memo refuses when a fresh
+                # computation would.
+                resolved = getattr(value, "__value__", None)
+                content = (observe_value(resolved), _type_anchor_leaves(resolved))
             return (
                 value,
-                observe_function(evaluator)
-                if isinstance(evaluator, FunctionType)
-                else observe_value(getattr(value, "__value__", None)),
+                content,
                 tuple(
                     observe_value(item) for item in getattr(value, "__type_params__", None) or ()
                 ),
@@ -4019,10 +4116,16 @@ class Database:
                     part = getattr(value, value_name, None)
                 except Exception:
                     part = None
+                # Same reason as the alias arm: an eagerly resolved bound,
+                # constraint set or default was anchored by the payload, so
+                # the observation carries the live-binding leaves beside it.
                 parts.append(
-                    tuple(observe_value(item) for item in part)
-                    if isinstance(part, tuple)
-                    else observe_value(part)
+                    (
+                        tuple(observe_value(item) for item in part)
+                        if isinstance(part, tuple)
+                        else observe_value(part),
+                        _type_anchor_leaves(part),
+                    )
                 )
             return (value, tuple(parts))
 
