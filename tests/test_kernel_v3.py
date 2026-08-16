@@ -2549,6 +2549,208 @@ def test_memoized_fingerprint_refuses_with_truth_when_a_carrier_type_is_rebound(
         sys.modules.pop(module_name, None)
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="typing.TypeAliasType requires Python 3.12",
+)
+def test_memoized_fingerprint_refuses_with_truth_when_an_anchored_types_base_is_rebound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_alias_anchored_base"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from typing import TypeAliasType\n"
+        "\n"
+        "\n"
+        "class Base:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class Payload(Base):\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "class Other:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        'ALIAS = TypeAliasType("ALIAS", Payload)\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-alias-anchored-base")
+        def anchored(db: Database) -> str:
+            return cast(str, module.ALIAS.__name__)
+
+        db = Database()
+        db._query_fingerprint(anchored)
+        # The alias resolves Payload eagerly, and Payload's definition payload
+        # anchors its base to the base's live module binding -- so rebinding
+        # Base makes every fresh computation refuse. The sweep follows the same
+        # definition closure, which is what stops the memo serving the
+        # fingerprint it stored while the binding held.
+        monkeypatch.setattr(module, "Base", module.Other)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            db._query_fingerprint(anchored)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database()._query_fingerprint(anchored)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="typing.TypeAliasType requires Python 3.12",
+)
+def test_memoized_fingerprint_refuses_with_truth_when_an_anchored_types_metaclass_is_rebound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_alias_anchored_metaclass"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from typing import TypeAliasType\n"
+        "\n"
+        "\n"
+        "class Meta(type):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class Payload(metaclass=Meta):\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "class Other:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        'ALIAS = TypeAliasType("ALIAS", Payload)\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-alias-anchored-metaclass")
+        def anchored(db: Database) -> str:
+            return cast(str, module.ALIAS.__name__)
+
+        db = Database()
+        db._query_fingerprint(anchored)
+        # Same closure, reached through the metaclass slot: the payload anchors
+        # type(Payload) exactly as it anchors a base, so rebinding Meta refuses
+        # freshly and the sweep has to reach the metaclass to refuse warm.
+        monkeypatch.setattr(module, "Meta", module.Other)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            db._query_fingerprint(anchored)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database()._query_fingerprint(anchored)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="typing.TypeAliasType requires Python 3.12",
+)
+def test_memoized_fingerprint_refuses_with_truth_when_a_class_body_type_is_rebound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_alias_anchored_body"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from typing import TypeAliasType\n"
+        "\n"
+        "\n"
+        "class Inner:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class Payload:\n"
+        "    marker = 1\n"
+        "    Partner = Inner\n"
+        "\n"
+        "\n"
+        "class Other:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        'ALIAS = TypeAliasType("ALIAS", Payload)\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-alias-anchored-body")
+        def anchored(db: Database) -> str:
+            return cast(str, module.ALIAS.__name__)
+
+        db = Database()
+        db._query_fingerprint(anchored)
+        # The third closure slot: a class the body names. The payload walks
+        # Payload's namespace and anchors Partner's class to Inner's live
+        # module binding, so rebinding Inner refuses freshly -- and the sweep
+        # walks the same namespace so the memo refuses with it.
+        monkeypatch.setattr(module, "Inner", module.Other)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            db._query_fingerprint(anchored)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database()._query_fingerprint(anchored)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_memoized_fingerprint_refuses_with_truth_when_an_anchored_types_base_is_rebound_via_parameter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_parameter_anchored_base"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from typing import TypeVar\n"
+        "\n"
+        "\n"
+        "class Base:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class Payload(Base):\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "class Other:\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        'ANCHOR = TypeVar("ANCHOR", bound=Payload)\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-parameter-anchored-base")
+        def anchored(db: Database) -> str:
+            return cast(str, module.ANCHOR.__name__)
+
+        db = Database()
+        db._query_fingerprint(anchored)
+        # The same definition closure reached through the landing that needs no
+        # 3.12 alias: a runtime-constructed TypeVar stores its bound eagerly on
+        # every supported interpreter. Rebinding the bound class's base makes a
+        # fresh computation refuse, and the sweep follows the bound's closure so
+        # the memo refuses with it.
+        monkeypatch.setattr(module, "Base", module.Other)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            db._query_fingerprint(anchored)
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database()._query_fingerprint(anchored)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_memoized_fingerprint_tracks_a_chain_landed_type_parameters_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -42,8 +42,9 @@ decided at release time.
   module binding on the warm path as the payload anchors it on the fresh
   one, so rebinding such a binding refuses loudly on both paths rather than
   being served from the memo. The anchors a class's own definition adds —
-  its bases, its metaclass, its body's classes — are not yet carried on the
-  warm path, where the memo still answers while a fresh computation refuses.
+  its bases, its metaclass, its body's classes — are carried warm as well as
+  fresh: the warm path follows each anchored class's definition closure, so
+  rebinding a base, a metaclass or a body class refuses on both paths too.
   Resource-folding queries stay memoized: the configuration their `identity()`
   reports, and the type behind it, are digested and compared per request, and
   the request-scoped re-reads are cleared whenever a caller declares a

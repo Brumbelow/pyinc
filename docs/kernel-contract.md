@@ -511,8 +511,14 @@ live module binding, and the warm path carries the anchors for every class
 and carrier type the value names: rebinding such a binding then refuses
 loudly, warm and fresh alike, instead of moving identity. The further
 anchors a class's own definition contributes — its bases, its metaclass, the
-classes its body names — are not yet carried on the warm path: rebinding one
-of those still answers from the memo while a fresh computation refuses.
+classes its body binds directly — are carried warm as well as fresh, because
+the warm path follows each anchored class's definition closure: rebinding a
+base, a metaclass or a directly bound body class refuses on both paths too. A
+class the body holds inside a container rather than binding directly stays
+outside that closure, and rebinding it leaves the memo answering with the
+stored fingerprint while a fresh computation moves or refuses. That descent
+stops at builtin and stdlib-rooted types, which are pinned by name anchor and
+runtime build rather than by a walk of their contents.
 
 Two shapes stay outside that envelope by design. A chain that lands on a class
 or a frozen dataclass instance — named directly, or held inside an immutable

@@ -217,16 +217,25 @@ def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
     pre-frozen or refuses outright contribute nothing, mirroring the payload,
     which anchors no type there either.
 
-    Each swept class and carrier type contributes its own leaf. The anchors a
-    type's definition payload adds beyond that -- its bases, its metaclass,
-    the classes its body names -- are not mirrored here: rebinding one of
-    those still answers from the memo where a fresh computation refuses. That
-    residual is recorded with the chain-landed-container shape for its own
-    decision.
+    Each swept class and carrier type contributes its own leaf, and the sweep
+    then follows that type's own definition closure -- its metaclass, its
+    bases, the classes its body binds directly. Without that descent,
+    rebinding one of those still answered from the memo where a fresh
+    computation refuses. A class the body holds inside a container rather than
+    binding directly is not followed here: the payload folds that attribute
+    through the eager capture instead, so rebinding such a class leaves the
+    memo answering with the stored fingerprint while a fresh computation
+    either moves to a new one or refuses. Descent stops without a namespace
+    walk at builtin and stdlib-rooted types, which the payload pins by name
+    anchor and runtime build rather than by walking their contents.
     """
 
     leaves: list[Any] = []
     swept: builtins.set[int] = set()
+    # Types need their own visited set: the arm below contributes a leaf on
+    # every contact and returns before `swept` is ever consulted, so the id set
+    # that stops the value walk repeating never receives a type.
+    swept_types: builtins.set[int] = set()
 
     def sweep_instance_state(value: Any, exclude: frozenset[str] = frozenset()) -> None:
         try:
@@ -239,10 +248,28 @@ def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
             if name not in exclude:
                 sweep(item)
 
+    def sweep_type(cls: type[Any]) -> None:
+        if cls.__module__ == "builtins":
+            return
+        leaves.append(_live_type_binding(cls))
+        if cls.__module__.partition(".")[0] in sys.stdlib_module_names:
+            return
+        if id(cls) in swept_types:
+            return
+        swept_types.add(id(cls))
+        # Mirrors _local_implementation_type_payload: the metaclass, then each
+        # base, then the type-valued entries of the namespace, each of which
+        # that payload anchors to its own live module binding.
+        sweep(type(cls))
+        for base in cls.__bases__:
+            sweep(base)
+        for _name, item in sorted(vars(cls).items()):
+            if isinstance(item, type):
+                sweep(item)
+
     def sweep(value: Any) -> None:
         if isinstance(value, type):
-            if value.__module__ != "builtins":
-                leaves.append(_live_type_binding(value))
+            sweep_type(value)
             return
         if id(value) in swept:
             return
@@ -4136,9 +4163,9 @@ class Database:
                 # Without a Python evaluator the payload resolved __value__
                 # eagerly and anchored the types it reached to their live
                 # module bindings; the leaves carry the same sensitivity for
-                # every swept class and carrier type, so the memo refuses
-                # when a fresh computation would. The type payload's own
-                # closure anchors are the sweep's recorded residual.
+                # every swept class and carrier type, and for the definition
+                # closure each of those types anchors in turn, so the memo
+                # refuses when a fresh computation would.
                 resolved = getattr(value, "__value__", None)
                 content = (observe_value(resolved), _type_anchor_leaves(resolved))
             return (
