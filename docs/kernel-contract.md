@@ -741,10 +741,13 @@ in parallel.
 A thread that a query body **starts** is the one case that does not simply
 wait: it inherits the boundary of the query that started it. Its undeclared
 ambient reads raise `UntrackedReadError` exactly as they would on the
-executing thread, and its calls back into that same `Database` — `get`,
-`read_input`, `read_resource`, `request_span`, `report_untracked_read`,
-`Subscription.unsubscribe` — raise `ReentrantDatabaseError` instead of
-waiting for the lock. Waiting is what they must not do: the query body holds
+executing thread, and its calls back into that same `Database` raise
+`ReentrantDatabaseError` instead of waiting for the lock — the reading surface
+`get`, `read_input`, `read_resource`, `request_span`,
+`report_untracked_read` and `Subscription.unsubscribe`, and every
+administrative and observational call beside them (the outside-only set,
+enumerated under Public Surface below). Nothing a descendant can reach waits
+on the lock. Waiting is what they must not do: the query body holds
 the lock for the whole of its execution, so a child that blocks on it while
 the body waits for the child is a deadlock, and the refusal is what turns
 that pair into an error the caller can read. The boundary ends when the query
@@ -885,7 +888,7 @@ Core:
 
 | Name | What it is |
 |---|---|
-| `Database` | The incremental query database: `get`, `set`, `set_many`, `inspect`, `inspect_fresh`, `explain`, `observe`, `request_span`, `request_inputs_changed`, checkpoint save/load. |
+| `Database` | The incremental query database: `get`, `set`, `set_many`, `inspect`, `inspect_fresh`, `explain`, `observe`, `request_span`, `request_inputs_changed`, checkpoint save/load. Administration and inspection are outside-only: called from a query body they raise `ReentrantDatabaseError` instead of answering (see below). |
 | `Input` | A declared, keyed input whose values enter through `db.set`. |
 | `query` | Decorator declaring a pure incremental query. |
 | `Query` | The declared-query object `@query` returns; readable from other queries and from `db.get`. Handle attributes are part of query identity: writing one moves the query's identity, so records stored under the old one no longer answer. |
@@ -897,6 +900,29 @@ Core:
 | `EnvResource` | Environment-variable resource. |
 | `DirectoryResource` | Directory-listing resource. |
 | `ResolvedPathResource` | Symlink-aware path canonicalization as a tracked value. |
+
+`Database` splits in two at the query boundary. Inside a query body the reading
+surface is open, and only that: `get`, `read_input`, `read_resource`,
+`report_untracked_read`, and a `request_span` that joins the request the
+execution already opened. Everything else is outside-only and raises
+`ReentrantDatabaseError` when a body calls it — the administrative calls `set`,
+`set_many`, `save_checkpoint`, `load_checkpoint`, `reset_statistics`,
+`request_inputs_changed` and `observe`, and the observational ones `revision`,
+`statistics`, `query_profile`, `dependency_graph`, `explain`, `inspect` and
+`inspect_fresh`.
+
+The two halves are refused for related reasons. An administrative call moves
+state the running execution is deriving from, so the body reads back a world
+its own caller never declared and the warm answer stops matching what a fresh
+database produces from the same inputs. An observational call answers with a
+function of cache history — how many executions have run, what was reused,
+which decision a node last took — which is exactly what a query result may not
+depend on; `inspect` and `inspect_fresh` also publish no dependency edge for
+the node they report on, so a body reading one would depend on it undeclaredly.
+Each refusal is raised before its call does anything at all: no input is
+registered, no iterable is drained, no artifact store or lock file is touched,
+and no checkpoint is staged. The same set is refused from a thread a query body
+started, with the message naming the descent instead (Thread Safety, above).
 
 Values and snapshots:
 

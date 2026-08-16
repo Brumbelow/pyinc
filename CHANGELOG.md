@@ -259,6 +259,25 @@ decided at release time.
   where the code that made the call can see it. Threads outside the boundary
   are unaffected: they still block until the running work releases the lock,
   and a shared `Database` serialises across threads exactly as before.
+- Administrative and inspection calls on a `Database` are outside-only.
+  `set`, `set_many`, `save_checkpoint`, `load_checkpoint`,
+  `reset_statistics`, `request_inputs_changed`, `observe`, `revision`,
+  `statistics`, `query_profile`, `dependency_graph`, `explain`, `inspect` and
+  `inspect_fresh` now raise `ReentrantDatabaseError` when a query body calls
+  them, where they used to answer. The administrative half moved state the
+  running execution was deriving from: a body that set its own input read the
+  new value straight back, and the warm answer stopped matching what a fresh
+  database produces from the same declared inputs. The observational half
+  answers with functions of cache history, and `inspect` / `inspect_fresh`
+  publish no dependency edge for the node they report on, so a body reading
+  one depended on it without declaring it. Each refusal is raised before its
+  call does anything: no input registered, no iterable drained, no artifact
+  store or lock file touched, no checkpoint staged. The same set is refused
+  from a thread a query body started — which the entry above did not cover,
+  since it reached the read surface only, so an administrative call from a
+  spawned thread still deadlocked. A body's own reads are untouched: `get`,
+  `read_input`, `read_resource`, `report_untracked_read` and an inner
+  `request_span` are what a query body is for.
 
 ## [3.1.1] - 2026-08-03
 

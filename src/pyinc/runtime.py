@@ -1068,10 +1068,12 @@ class Database:
 
     @property
     def revision(self) -> int:
+        self._reject_inside_query("db.revision")
         with self._state_lock:
             return self._revision
 
     def statistics(self) -> DatabaseStatistics:
+        self._reject_inside_query("db.statistics()")
         with self._state_lock:
             resource_count = sum(1 for k in self._records if k.kind == "resource")
             return DatabaseStatistics(
@@ -1091,12 +1093,14 @@ class Database:
             )
 
     def reset_statistics(self) -> None:
+        self._reject_inside_query("db.reset_statistics()")
         with self._state_lock:
             for key in self._stats:
                 self._stats[key] = 0
             self._query_timings.clear()
 
     def query_profile(self) -> tuple[QueryProfile, ...]:
+        self._reject_inside_query("db.query_profile()")
         with self._state_lock:
             profiles: list[QueryProfile] = []
             for key, timing in sorted(self._query_timings.items(), key=lambda item: item[0].label):
@@ -1114,6 +1118,7 @@ class Database:
             return tuple(profiles)
 
     def dependency_graph(self) -> tuple[DependencyGraphNode, ...]:
+        self._reject_inside_query("db.dependency_graph()")
         with self._state_lock:
             nodes: list[DependencyGraphNode] = []
             for key, record in self._records.items():
@@ -1138,6 +1143,10 @@ class Database:
             return tuple(sorted(nodes, key=lambda n: n.label))
 
     def set(self, input_key: Any, value: Any) -> None:
+        # Ahead of the type check as well as the lock: a refusal that ran after
+        # the key was resolved could leave a registration behind for an input
+        # the caller was never allowed to declare here.
+        self._reject_inside_query("db.set()")
         from .core import Input
 
         if not isinstance(input_key, Input):
@@ -1189,6 +1198,9 @@ class Database:
             self._roll_span_request()
 
     def set_many(self, updates: Iterable[tuple[Any, Any]]) -> None:
+        # Ahead of the materialization below: draining the caller's iterable is
+        # itself observable, and a refused call must leave it unpulled.
+        self._reject_inside_query("db.set_many()")
         from .core import Input
 
         with self._state_lock:
@@ -1313,6 +1325,9 @@ class Database:
         return result
 
     def explain(self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> str:
+        # Checked here rather than left to the inspect below, so the refusal
+        # names the call the caller actually made.
+        self._reject_inside_query("db.explain()")
         from .core import Query
 
         if not isinstance(query, Query):
@@ -1322,6 +1337,7 @@ class Database:
     def inspect(
         self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs
     ) -> InspectionNode:
+        self._reject_inside_query("db.inspect()")
         from .core import Query
 
         if not isinstance(query, Query):
@@ -1343,6 +1359,7 @@ class Database:
     def inspect_fresh(
         self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs
     ) -> InspectionNode:
+        self._reject_inside_query("db.inspect_fresh()")
         from .core import Query
 
         if not isinstance(query, Query):
@@ -1424,6 +1441,7 @@ class Database:
         forwards here, whereas this method alone leaves the integrations memo
         answering from the old world.
         """
+        self._reject_inside_query("db.request_inputs_changed()")
         with self._state_lock:
             self._roll_span_request()
 
@@ -1483,6 +1501,10 @@ class Database:
         (default: a one-line stderr log) and do not suppress sibling callbacks
         or corrupt kernel state.
         """
+        # Registration is per call, and a query body runs only when the kernel
+        # decides to execute it, so registering from one would make the
+        # subscriber list a function of cache history.
+        self._reject_inside_query("db.observe()")
         from .core import Query
 
         if not isinstance(query, Query):
@@ -1529,6 +1551,9 @@ class Database:
         Raises ``ValueError`` if no ``ArtifactStore`` is available (either
         passed directly or configured via ``Database(store=...)``).
         """
+        # Ahead of resolving the store, which is the first step towards the
+        # cross-process lock a filesystem store takes to publish an object.
+        self._reject_inside_query("db.save_checkpoint()")
         _store = store if store is not None else self._store
         if _store is None:
             raise ValueError(
@@ -1555,6 +1580,7 @@ class Database:
         Raises ``ValueError`` if no ``ArtifactStore`` is available.
         Raises ``KeyError`` if *key* is not found in the store.
         """
+        self._reject_inside_query("db.load_checkpoint()")
         _store = store if store is not None else self._store
         if _store is None:
             raise ValueError(

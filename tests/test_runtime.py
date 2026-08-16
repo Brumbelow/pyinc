@@ -4,9 +4,10 @@ import hashlib
 import math
 import mmap
 import os
+import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -25,6 +26,7 @@ from pyinc import (
     EnvResource,
     FileResource,
     FileStatResource,
+    FileSystemArtifactStore,
     FrozenAdapterValue,
     FrozenDict,
     FrozenGraph,
@@ -3634,6 +3636,362 @@ def test_unrelated_thread_call_serializes_while_a_query_runs() -> None:
     executions = db.statistics().query_executions
     assert db.get(read_value) == (2, 2)
     assert db.statistics().query_executions == executions + 1
+
+
+_OUTSIDE_ONLY_CALLS = (
+    "set",
+    "set_many",
+    "save_checkpoint",
+    "load_checkpoint",
+    "reset_statistics",
+    "request_inputs_changed",
+    "observe",
+    "statistics",
+    "query_profile",
+    "dependency_graph",
+    "explain",
+    "inspect",
+    "inspect_fresh",
+    "revision",
+)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("call", _OUTSIDE_ONLY_CALLS)
+def test_administrative_calls_raise_inside_a_query_body(call: str, mode: str) -> None:
+    """A query body may read the database; it may not administer or inspect it.
+
+    Each of these either moves state the running execution is deriving from or
+    answers with a function of cache history, so a body that calls one turns
+    its own result into a function of how the caller got here. The refusal is
+    the one the boundary predicate already defines, with the message that says
+    which side of the boundary the caller stands on.
+    """
+    counter = Input[int]("counter")
+
+    @query
+    def leaf(db: Database) -> int:
+        return counter.read(db) + 1
+
+    @query
+    def administers(db: Database) -> str:
+        if call == "set":
+            db.set(counter, 99)
+        elif call == "set_many":
+            db.set_many([(counter, 99)])
+        elif call == "save_checkpoint":
+            db.save_checkpoint(db.checkpoint_store)  # type: ignore[attr-defined]
+        elif call == "load_checkpoint":
+            db.load_checkpoint(
+                db.checkpoint_key,  # type: ignore[attr-defined]
+                db.checkpoint_store,  # type: ignore[attr-defined]
+            )
+        elif call == "reset_statistics":
+            db.reset_statistics()
+        elif call == "request_inputs_changed":
+            db.request_inputs_changed()
+        elif call == "observe":
+            db.observe(lambda event: None, leaf)
+        elif call == "statistics":
+            db.statistics()
+        elif call == "query_profile":
+            db.query_profile()
+        elif call == "dependency_graph":
+            db.dependency_graph()
+        elif call == "explain":
+            db.explain(leaf)
+        elif call == "inspect":
+            db.inspect(leaf)
+        elif call == "inspect_fresh":
+            db.inspect_fresh(leaf)
+        else:
+            return f"db.revision answered {db.revision} instead of refusing"
+        return f"db.{call}() returned instead of refusing"
+
+    db = Database(mode=mode)
+    db.set(counter, 1)
+    # The store and the key reach the body on the database: a query may not
+    # capture ambient state the test could rebind under it.
+    db.checkpoint_store = InMemoryArtifactStore()  # type: ignore[attr-defined]
+    db.checkpoint_key = db.save_checkpoint(db.checkpoint_store)  # type: ignore[attr-defined]
+
+    # The whole message, not just its tail: the name is the half that says
+    # which entry point refused, so a wiring carrying the wrong literal -- or
+    # one deleted in favour of a refusal further in, which would answer for a
+    # call the caller never made -- has to fail here.
+    subject = "db.revision" if call == "revision" else f"db.{call}()"
+    with pytest.raises(
+        ReentrantDatabaseError,
+        match=re.escape(f"{subject} is not allowed inside a query body."),
+    ):
+        db.get(administers)
+
+
+def test_rejected_in_query_set_leaves_no_registration() -> None:
+    """The refused `set` registers nothing, because it refuses before it looks.
+
+    A rejection that landed after the input was keyed would leave a node the
+    caller never declared, so the check has to come ahead of everything `set`
+    does -- including the isinstance guard it opens with.
+    """
+    counter = Input[int]("counter")
+    newcomer = Input[int]("newcomer")
+
+    @query
+    def tries_to_set(db: Database) -> str:
+        try:
+            db.set(newcomer, 1)
+        except ReentrantDatabaseError:
+            return f"refused at {counter.read(db)}"
+        return "the set landed"
+
+    db = Database()
+    db.set(counter, 1)
+    inputs_before = db.statistics().input_count
+    revision_before = db.revision
+    executions_before = db.statistics().query_executions
+
+    assert db.get(tries_to_set) == "refused at 1"
+
+    assert db.statistics().query_executions == executions_before + 1
+    assert db.statistics().input_count == inputs_before
+    assert db.revision == revision_before
+
+
+def test_rejected_in_query_set_many_does_not_consume_the_iterator() -> None:
+    """The refused `set_many` never pulls from the caller's iterable.
+
+    `set_many` materializes its updates as the first thing it does under the
+    lock, and materializing is observable: a generator that has been advanced
+    cannot be handed to a second call. The refusal precedes it.
+    """
+    counter = Input[int]("counter")
+    newcomer = Input[int]("newcomer")
+    advanced: list[str] = []
+
+    def updates() -> Iterator[tuple[Any, Any]]:
+        advanced.append("pulled")
+        yield (newcomer, 1)
+
+    @query
+    def tries_to_set_many(db: Database) -> str:
+        try:
+            db.set_many(db.pending_updates)  # type: ignore[attr-defined]
+        except ReentrantDatabaseError:
+            return f"refused at {counter.read(db)}"
+        return "the set_many landed"
+
+    db = Database()
+    db.set(counter, 1)
+    db.pending_updates = updates()  # type: ignore[attr-defined]
+    inputs_before = db.statistics().input_count
+    executions_before = db.statistics().query_executions
+
+    assert db.get(tries_to_set_many) == "refused at 1"
+
+    assert db.statistics().query_executions == executions_before + 1
+    assert advanced == []
+    assert db.statistics().input_count == inputs_before
+
+
+def test_rejected_in_query_save_checkpoint_writes_nothing(tmp_path: Path) -> None:
+    """The refused `save_checkpoint` leaves the store exactly as it found it.
+
+    The first thing a save touches on a filesystem store is a cross-process
+    lock file, taken while the query body still holds the state lock. Nothing
+    on disk may move, lock files included.
+    """
+    counter = Input[int]("counter")
+
+    @query
+    def tries_to_save(db: Database) -> str:
+        try:
+            db.save_checkpoint(db.checkpoint_store)  # type: ignore[attr-defined]
+        except ReentrantDatabaseError:
+            return f"refused at {counter.read(db)}"
+        return "the save landed"
+
+    root = tmp_path / "store"
+    db = Database()
+    db.set(counter, 1)
+    db.checkpoint_store = FileSystemArtifactStore(root)  # type: ignore[attr-defined]
+    before = sorted(str(entry.relative_to(root)) for entry in root.rglob("*"))
+    executions_before = db.statistics().query_executions
+
+    assert db.get(tries_to_save) == "refused at 1"
+
+    assert db.statistics().query_executions == executions_before + 1
+    assert sorted(str(entry.relative_to(root)) for entry in root.rglob("*")) == before
+    assert [entry for entry in root.rglob("*") if entry.is_file()] == []
+
+
+def test_rejected_in_query_load_checkpoint_leaves_staging_untouched() -> None:
+    """The refused `load_checkpoint` stages nothing for later gets to warm from.
+
+    A load commits its validated records onto the database by rebinding the
+    staging dictionaries, and every later `get` consults them. The rejection
+    has to land before the manifest is even fetched, so the dictionary the
+    database started with is still the one it holds.
+    """
+    counter = Input[int]("counter")
+
+    @query
+    def doubled(db: Database) -> int:
+        return counter.read(db) * 2
+
+    @query
+    def tries_to_load(db: Database) -> str:
+        try:
+            db.load_checkpoint(
+                db.checkpoint_key,  # type: ignore[attr-defined]
+                db.checkpoint_store,  # type: ignore[attr-defined]
+            )
+        except ReentrantDatabaseError:
+            return f"refused at {counter.read(db)}"
+        return "the load landed"
+
+    store = InMemoryArtifactStore()
+    source = Database()
+    source.set(counter, 1)
+    assert source.get(doubled) == 2
+    key = source.save_checkpoint(store)
+
+    db = Database()
+    db.set(counter, 1)
+    db.checkpoint_store = store  # type: ignore[attr-defined]
+    db.checkpoint_key = key  # type: ignore[attr-defined]
+    staging_before = db._checkpoint_query_records
+    executions_before = db.statistics().query_executions
+
+    assert db.get(tries_to_load) == "refused at 1"
+
+    assert db.statistics().query_executions == executions_before + 1
+    assert db._checkpoint_query_records is staging_before
+    assert db._checkpoint_query_records == {}
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_query_catching_the_administrative_rejection_matches_fresh(mode: str) -> None:
+    """A body that tries to set its own input and takes the refusal stays deterministic.
+
+    This is the shape the refusal exists for: the query that administers the
+    database it is deriving from used to answer from the state it had just
+    corrupted, so a warm database and a fresh one on the same declared inputs
+    disagreed. With the set refused, the body derives only from what it read
+    and the two agree.
+    """
+    counter = Input[int]("counter")
+
+    @query
+    def self_administering(db: Database) -> str:
+        observed = counter.read(db)
+        try:
+            db.set(counter, observed + 1)
+        except ReentrantDatabaseError:
+            return f"declined at {observed}"
+        return f"set to {observed + 1}"
+
+    warm = Database(mode=mode)
+    warm.set(counter, 1)
+    executions = warm.statistics().query_executions
+    first = warm.get(self_administering)
+    assert warm.statistics().query_executions == executions + 1
+    warm.set(counter, 2)
+    second = warm.get(self_administering)
+    assert warm.statistics().query_executions == executions + 2
+
+    fresh = Database(mode=mode)
+    fresh.set(counter, 2)
+    assert fresh.get(self_administering) == second
+    assert fresh.statistics().query_executions == 1
+    assert (first, second) == ("declined at 1", "declined at 2")
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_reads_and_spans_remain_legal_inside_a_query_body(mode: str, tmp_path: Path) -> None:
+    """What a query body is for stays open, and each read still lands its edge.
+
+    Only the administrative and inspection surface is outside-only. Reading
+    another query, an input or a resource, declaring an untracked read, and
+    opening a span that joins the enclosing request are the body's own
+    vocabulary and are unaffected.
+    """
+    path = tmp_path / "resource.txt"
+    path.write_text("ok", encoding="utf-8")
+    counter = Input[int]("counter")
+    contents = FileResource()
+
+    @query
+    def child(db: Database) -> int:
+        return counter.read(db) + 1
+
+    @query
+    def root(db: Database) -> str:
+        seen = [
+            str(db.get(child)),
+            str(db.read_input(counter)),
+            db.read_resource(contents, str(path)),
+        ]
+        with db.request_span():
+            # An inner span joins the request this execution already opened,
+            # so the reads inside it answer from the same observation.
+            seen.append(str(db.get(child)))
+        db.report_untracked_read("the wall clock, deliberately")
+        return "|".join(seen)
+
+    db = Database(mode=mode)
+    db.set(counter, 1)
+    executions_before = db.statistics().query_executions
+
+    assert db.get(root) == "2|1|ok|2"
+    assert db.statistics().query_executions > executions_before
+
+    node = db.inspect(root)
+    assert {dependency.kind for dependency in node.dependencies} == {"query", "input", "resource"}
+    assert db.inspect(child).label in {dependency.label for dependency in node.dependencies}
+    assert node.untracked_reasons == ("the wall clock, deliberately",)
+
+
+def test_query_spawned_thread_setting_an_input_fails_fast() -> None:
+    """The administrative refusal names the other side of the boundary too.
+
+    One predicate decides both: the same `db.set`, refused as inside a query
+    when the body makes it and as a descendant when a thread the body started
+    makes it -- and in the second case ahead of the state lock the body is
+    still holding, which is what keeps the join from hanging.
+    """
+    counter = Input[int]("counter")
+
+    @query
+    def spawn_setter(db: Database) -> str:
+        outcome: list[Any] = []
+
+        def child() -> None:
+            try:
+                db.set(counter, 99)
+            except Exception as exc:  # noqa: BLE001
+                outcome.append(exc)
+            else:
+                outcome.append("db.set() returned instead of refusing")
+
+        thread = threading.Thread(target=child)
+        # Both have to outlive this call, and a query may not capture a
+        # container the test could have handed it.
+        db.spawned = (thread, outcome)  # type: ignore[attr-defined]
+        thread.start()
+        thread.join(timeout=10)
+        return "joined"
+
+    db = Database()
+    db.set(counter, 1)
+    assert db.get(spawn_setter) == "joined"
+
+    thread, outcome = db.spawned  # type: ignore[attr-defined]
+    assert not thread.is_alive(), "db.set() never came back to the child"
+    assert len(outcome) == 1
+    refusal = outcome[0]
+    assert isinstance(refusal, ReentrantDatabaseError), refusal
+    assert str(refusal) == "db.set() is not allowed from a thread spawned inside a query execution."
 
 
 def test_module_capture_invalidates_on_source_change(
