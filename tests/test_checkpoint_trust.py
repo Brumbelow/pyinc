@@ -674,8 +674,6 @@ def test_duplicate_input_keys_are_rejected_before_checkpointing() -> None:
 def test_runtime_imported_dep_query_refuses_warm_and_recomputes(
     tmp_path: Path,
 ) -> None:
-    import importlib
-
     mod_name = "pyinc_ckpt_runtime_child"
     child_path = tmp_path / f"{mod_name}.py"
 
