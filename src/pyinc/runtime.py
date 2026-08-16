@@ -216,6 +216,13 @@ def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
     already tracks the globals it resolves. Shapes the payload returns
     pre-frozen or refuses outright contribute nothing, mirroring the payload,
     which anchors no type there either.
+
+    Each swept class and carrier type contributes its own leaf. The anchors a
+    type's definition payload adds beyond that -- its bases, its metaclass,
+    the classes its body names -- are not mirrored here: rebinding one of
+    those still answers from the memo where a fresh computation refuses. That
+    residual is recorded with the chain-landed-container shape for its own
+    decision.
     """
 
     leaves: list[Any] = []
@@ -246,15 +253,18 @@ def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
             sweep(value.step)
             return
         if isinstance(value, (str, bytes, int, float, complex)):
+            sweep(type(value))
             sweep_instance_state(value)
             return
         if isinstance(value, os.PathLike):
+            sweep(type(value))
             sweep_instance_state(value)
             return
         if isinstance(value, (tuple, frozenset)):
             for item in value:
                 sweep(item)
             if type(value) not in (tuple, frozenset):
+                sweep(type(value))
                 sweep_instance_state(value)
             return
         if isinstance(value, GenericAlias):
@@ -296,6 +306,7 @@ def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
                 sweep(part)
             return
         if is_dataclass(value) and not isinstance(value, type):
+            sweep(type(value))
             field_names: builtins.set[str] = builtins.set()
             for field_item in fields(value):
                 field_names.add(field_item.name)
@@ -4123,10 +4134,11 @@ class Database:
                 content: Any = observe_function(evaluator)
             else:
                 # Without a Python evaluator the payload resolved __value__
-                # eagerly and anchored every type it reached to its live
-                # module binding; the leaves keep this observation exactly as
-                # binding-sensitive, so the memo refuses when a fresh
-                # computation would.
+                # eagerly and anchored the types it reached to their live
+                # module bindings; the leaves carry the same sensitivity for
+                # every swept class and carrier type, so the memo refuses
+                # when a fresh computation would. The type payload's own
+                # closure anchors are the sweep's recorded residual.
                 resolved = getattr(value, "__value__", None)
                 content = (observe_value(resolved), _type_anchor_leaves(resolved))
             return (

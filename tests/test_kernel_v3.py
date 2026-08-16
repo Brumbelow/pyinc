@@ -2472,6 +2472,83 @@ def test_memoized_fingerprint_refuses_with_truth_when_a_dataclass_carried_class_
         sys.modules.pop(module_name, None)
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="typing.TypeAliasType requires Python 3.12",
+)
+def test_memoized_fingerprint_refuses_with_truth_when_a_carrier_type_is_rebound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_module_alias_carriers"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from dataclasses import dataclass\n"
+        "from typing import TypeAliasType\n"
+        "\n"
+        "\n"
+        "class Tag(str):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class Pair(tuple):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "class Payload:\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Box:\n"
+        "    kind: type\n"
+        "\n"
+        "\n"
+        "class Second:\n"
+        "    marker = 2\n"
+        "\n"
+        "\n"
+        'TAGGED = TypeAliasType("TAGGED", Tag("t"))\n'
+        'PAIRED = TypeAliasType("PAIRED", Pair((1, 2)))\n'
+        'BOXED = TypeAliasType("BOXED", Box(Payload))\n',
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="memo-module-alias-carrier-tag")
+        def tagged(db: Database) -> str:
+            return cast(str, module.TAGGED.__name__)
+
+        @query(key="memo-module-alias-carrier-pair")
+        def paired(db: Database) -> str:
+            return cast(str, module.PAIRED.__name__)
+
+        @query(key="memo-module-alias-carrier-box")
+        def boxed(db: Database) -> str:
+            return cast(str, module.BOXED.__name__)
+
+        db = Database()
+        db._query_fingerprint(tagged)
+        db._query_fingerprint(paired)
+        db._query_fingerprint(boxed)
+        # The payload folds the carrier's own type -- the str subclass, the
+        # tuple subclass, the dataclass -- through the same anchor as the
+        # classes the carried state names, so the sweep has to contribute a
+        # leaf for the carrier too. Rebinding any of the three makes every
+        # fresh computation refuse; the memo must refuse with it.
+        monkeypatch.setattr(module, "Tag", module.Second)
+        monkeypatch.setattr(module, "Pair", module.Second)
+        monkeypatch.setattr(module, "Box", module.Second)
+        for rebound in (tagged, paired, boxed):
+            with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+                db._query_fingerprint(rebound)
+            with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+                Database()._query_fingerprint(rebound)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_memoized_fingerprint_tracks_a_chain_landed_type_parameters_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

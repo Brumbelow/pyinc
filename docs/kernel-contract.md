@@ -507,9 +507,12 @@ resolves to, or the function a chain-landed resource's `load` calls. Where the
 interpreter exposes no Python evaluator to observe — a `type` alias before
 3.14, or a runtime-constructed `TypeVar`'s bound on every interpreter — the
 payload resolves the value eagerly and anchors each class it reaches to its
-live module binding, and the warm path carries the same anchors: rebinding
-that binding then refuses loudly, warm and fresh alike, instead of moving
-identity.
+live module binding, and the warm path carries the anchors for every class
+and carrier type the value names: rebinding such a binding then refuses
+loudly, warm and fresh alike, instead of moving identity. The further
+anchors a class's own definition contributes — its bases, its metaclass, the
+classes its body names — are not yet carried on the warm path: rebinding one
+of those still answers from the memo while a fresh computation refuses.
 
 Two shapes stay outside that envelope by design. A chain that lands on a class
 or a frozen dataclass instance — named directly, or held inside an immutable

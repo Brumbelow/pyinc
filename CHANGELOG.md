@@ -37,11 +37,13 @@ decided at release time.
   resource — that definition is observed too, so a rebinding behind such a
   landing moves identity instead of being served from the memo. Where no
   Python evaluator exists to observe — a `type` alias before 3.14, or a
-  runtime-constructed `TypeVar`'s bound on every interpreter — the eagerly
-  resolved value is anchored to its live module binding on the warm path
-  exactly as the payload anchors it on the fresh one, so rebinding that
-  binding refuses loudly on both paths rather than being served from the
-  memo.
+  runtime-constructed `TypeVar`'s bound on every interpreter — every class
+  and carrier type the eagerly resolved value names is anchored to its live
+  module binding on the warm path as the payload anchors it on the fresh
+  one, so rebinding such a binding refuses loudly on both paths rather than
+  being served from the memo. The anchors a class's own definition adds —
+  its bases, its metaclass, its body's classes — are not yet carried on the
+  warm path, where the memo still answers while a fresh computation refuses.
   Resource-folding queries stay memoized: the configuration their `identity()`
   reports, and the type behind it, are digested and compared per request, and
   the request-scoped re-reads are cleared whenever a caller declares a
