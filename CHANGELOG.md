@@ -235,6 +235,19 @@ decided at release time.
   is skipped on its own account, without disabling the check for the other
   adapters registered beside it, and checkpoints refuse to trust the skipped
   adapter's records instead.
+- The ambient-read guard follows threads started inside a query. A thread a
+  query body spawns runs in the spawning context, so every entry point
+  condition 2 lists — `open`, `io.open`, `os.getenv`, `os.environ`,
+  `os.listdir`, `os.scandir` and `Path.iterdir` — raises `UntrackedReadError`
+  there, and so does every generation below it. Reads that used to reach the
+  filesystem or the environment from a helper thread and flow back into the
+  stored result now fail loudly instead of leaving a dependency-free answer
+  behind. A thread that outlives the query that spawned it returns to normal
+  the moment that query ends: the frame it inherited records that its
+  execution finished, and raw reads from the survivor are ordinary reads
+  again. Threads created before the query began — pre-warmed pools, module
+  scope executors, reused worker threads — never pass through this boundary
+  and stay outside it.
 
 ## [3.1.1] - 2026-08-03
 

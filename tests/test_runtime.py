@@ -3314,6 +3314,12 @@ def test_untracked_read_still_enforced_per_thread(tmp_path: Path) -> None:
 
     @query
     def raw_open(db: Database) -> int:
+        started_event, may_finish_event = db.handshake  # type: ignore[attr-defined]
+        # Hold this frame open until the unrelated thread has taken its turn,
+        # so its free read provably overlaps a live query instead of racing
+        # one, then make the read that must be refused here.
+        started_event.set()
+        may_finish_event.wait(timeout=5)
         with open(str(path), encoding="utf-8"):
             pass
         return 1
@@ -3323,6 +3329,9 @@ def test_untracked_read_still_enforced_per_thread(tmp_path: Path) -> None:
 
     started = threading.Event()
     may_finish = threading.Event()
+    # The events ride on the database the query is handed: a query body may
+    # not capture mutable ambient state, so it cannot close over them.
+    db_a.handshake = (started, may_finish)  # type: ignore[attr-defined]
     outside_reads_ok: list[bool] = []
 
     def worker_a() -> None:
@@ -3332,7 +3341,7 @@ def test_untracked_read_still_enforced_per_thread(tmp_path: Path) -> None:
             errors_a.append(UntrackedReadError("raised as expected"))
 
     def worker_b() -> None:
-        started.wait()
+        started.wait(timeout=5)
         try:
             with open(str(path), encoding="utf-8") as fh:
                 outside_reads_ok.append(fh.read() == "ok")
@@ -3345,13 +3354,112 @@ def test_untracked_read_still_enforced_per_thread(tmp_path: Path) -> None:
     t_a = threading.Thread(target=worker_a)
     t_b = threading.Thread(target=worker_b)
     t_a.start()
-    started.set()
     t_b.start()
-    t_a.join()
-    t_b.join()
+    t_a.join(timeout=10)
+    t_b.join(timeout=10)
+    assert not t_a.is_alive()
+    assert not t_b.is_alive()
 
     assert errors_a, "query that called raw open must raise UntrackedReadError"
     assert outside_reads_ok == [True]
+
+
+def _raw_read_outcome(path: Path) -> str:
+    """What a bare `open()` of `path` does here: the text, or the refusal's name."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except UntrackedReadError as exc:
+        return type(exc).__name__
+
+
+def test_grandchild_thread_of_a_query_is_still_guarded(tmp_path: Path) -> None:
+    """Descent, not depth: every generation below a query is inside its boundary.
+
+    The grandchild never touched the query itself — it inherited the spawning
+    context from a thread that inherited it — and its read feeds the same
+    result, so it has to be seen.
+    """
+    path = tmp_path / "f.txt"
+    path.write_text("ok", encoding="utf-8")
+
+    @query
+    def spawn_chain(db: Database) -> str:
+        outcome: list[str] = []
+
+        def grandchild() -> None:
+            try:
+                with open(str(path), encoding="utf-8") as handle:
+                    outcome.append(f"read allowed: {handle.read()}")
+            except Exception as exc:  # noqa: BLE001
+                outcome.append(f"{type(exc).__name__}: {exc}")
+
+        def child() -> None:
+            lower = threading.Thread(target=grandchild)
+            lower.start()
+            lower.join(timeout=10)
+            if lower.is_alive():
+                outcome.append("grandchild still running")
+
+        thread = threading.Thread(target=child)
+        thread.start()
+        thread.join(timeout=10)
+        if thread.is_alive():
+            return "child still running"
+        return outcome[0] if outcome else "nothing recorded"
+
+    reported = Database().get(spawn_chain)
+    assert reported.startswith("UntrackedReadError:"), reported
+    assert "untracked" in reported
+
+
+def test_thread_outliving_its_spawning_query_reads_freely_afterward(tmp_path: Path) -> None:
+    """Liveness belongs to the frame, not to the stack a thread inherited.
+
+    A thread spawned inside a query keeps its spawning context for as long as
+    it runs, so the inherited stack never shrinks. What ends the boundary is
+    the frame itself recording that its execution finished: once the spawning
+    query returns, the survivor is an ordinary thread again and reads freely.
+    """
+    path = tmp_path / "f.txt"
+    path.write_text("ok", encoding="utf-8")
+
+    @query
+    def spawn_survivor(db: Database) -> str:
+        during: list[str] = []
+        after: list[str] = []
+        observed = threading.Event()
+        released = threading.Event()
+
+        def child() -> None:
+            during.append(db._boundary_state())
+            during.append(_raw_read_outcome(path))
+            observed.set()
+            released.wait(timeout=10)
+            after.append(db._boundary_state())
+            after.append(_raw_read_outcome(path))
+
+        thread = threading.Thread(target=child)
+        # Hand the survivor and its records back on the database itself: they
+        # have to outlive this call, and a query may not capture a container
+        # the test could have passed in.
+        db.survivor = (thread, released, during, after)  # type: ignore[attr-defined]
+        thread.start()
+        # Hold this frame open until the child has looked at it from inside.
+        observed.wait(timeout=10)
+        return "done"
+
+    db = Database()
+    assert db.get(spawn_survivor) == "done"
+
+    thread, released, during, after = db.survivor  # type: ignore[attr-defined]
+    assert during == ["descendant", "UntrackedReadError"]
+
+    # The spawning query is over; the survivor must fall back outside.
+    released.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert after == ["outside", "ok"]
 
 
 def test_module_capture_invalidates_on_source_change(

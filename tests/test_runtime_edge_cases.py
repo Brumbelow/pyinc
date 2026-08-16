@@ -24,8 +24,8 @@ from pyinc import (
     InMemoryArtifactStore,
     Input,
     InputKeyError,
+    ReentrantDatabaseError,
     UnsupportedValueError,
-    UntrackedReadError,
     freeze,
     query,
     serialize_snapshot,
@@ -1381,15 +1381,61 @@ def test_runtime_internal_cleanup_and_missing_registration_branches() -> None:
     db._persist_snapshot(freeze(1))
 
 
-def test_ensure_tracked_read_honors_query_frames_and_raw_read_scope() -> None:
+def test_boundary_state_reflects_frames_threads_and_completion() -> None:
+    """The three axes of the boundary predicate, one at a time.
+
+    Whether a caller is inside a query is a question about a frame, about the
+    thread that owns it, and about whether that execution is still running —
+    and the last two only ever disagree with the first for a thread the query
+    spawned.
+    """
     db = Database()
     key = NodeKey("query", "identity", _DIGEST, "query")
-    token = db._execution_stack.set((ExecutionFrame(key),))
+    frame = ExecutionFrame(key)
+    assert db._boundary_state() == "outside"
+
+    token = db._execution_stack.set((frame,))
     try:
-        with pytest.raises(UntrackedReadError, match="untracked"):
-            db._ensure_tracked_read("untracked read")
-        with db._allow_raw_reads_scope():
-            db._ensure_tracked_read("allowed")
+        assert db._boundary_state() == "inside"
+
+        # No thread ever has this ident, so the frame now belongs to some
+        # other thread and this one can only be below it.
+        frame.thread_ident = -1
+        assert db._boundary_state() == "descendant"
+
+        # A frame left behind by a finished execution binds nobody, however
+        # long the thread that inherited it keeps holding the stack.
+        frame.completed = True
+        assert db._boundary_state() == "outside"
+    finally:
+        db._execution_stack.reset(token)
+
+
+def test_boundary_rejections_name_the_position_the_call_was_made_from() -> None:
+    """The refusals a later caller relies on, from hand-built frames."""
+    db = Database()
+    key = NodeKey("query", "identity", _DIGEST, "query")
+    frame = ExecutionFrame(key)
+
+    # Outside every execution: both surfaces are open.
+    db._reject_inside_query("db.set()")
+    db._reject_reentrant_read("db.get()")
+
+    token = db._execution_stack.set((frame,))
+    try:
+        with pytest.raises(
+            ReentrantDatabaseError, match=r"^db\.set\(\) is not allowed inside a query body\.$"
+        ):
+            db._reject_inside_query("db.set()")
+        # A query body reading its own database is the point of the frame.
+        db._reject_reentrant_read("db.get()")
+
+        frame.thread_ident = -1
+        spawned = r" is not allowed from a thread spawned inside a query execution\.$"
+        with pytest.raises(ReentrantDatabaseError, match=r"^db\.set\(\)" + spawned):
+            db._reject_inside_query("db.set()")
+        with pytest.raises(ReentrantDatabaseError, match=r"^db\.get\(\)" + spawned):
+            db._reject_reentrant_read("db.get()")
     finally:
         db._execution_stack.reset(token)
 

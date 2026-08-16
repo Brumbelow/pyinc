@@ -18,7 +18,7 @@ import typing
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager, suppress
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from functools import cached_property
 from pathlib import Path
@@ -36,7 +36,7 @@ from types import (
     UnionType,
     WrapperDescriptorType,
 )
-from typing import TYPE_CHECKING, Any, ClassVar, ParamSpec, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, ParamSpec, TypeVar, cast, overload
 
 from ._path_identity import is_stdlib_path
 from .errors import (
@@ -46,6 +46,7 @@ from .errors import (
     CheckpointVersionError,
     CycleError,
     InputKeyError,
+    ReentrantDatabaseError,
     UnsupportedValueError,
     UntrackedReadError,
 )
@@ -552,6 +553,14 @@ class ExecutionFrame:
     boundary_values: list[Any] = field(default_factory=list)
     untracked_reasons: list[str] = field(default_factory=list)
     checkpointable: bool = True
+    # The thread the execution runs on, bound where the frame is built. A
+    # thread spawned inside the body inherits the frame but not the ident, so
+    # this is what tells a descendant apart from the executing thread itself.
+    thread_ident: int = field(default_factory=threading.get_ident)
+    # Set when the execution leaves. A spawned thread keeps the stack it
+    # inherited for as long as it runs, so whether an execution is still live
+    # has to be the frame's own property rather than the stack's shape.
+    completed: bool = False
 
 
 @dataclass(frozen=True)
@@ -641,6 +650,15 @@ _ACTIVE_GUARDS: ContextVar[tuple[Database, ...]] = ContextVar("pyinc_active_guar
 _GUARD_INSTALLED = False
 _GUARD_INSTALL_LOCK = threading.Lock()
 
+# How a refused call names the position it was made from. Keyed by the
+# boundary states that are not "outside", which is the only state that allows
+# everything.
+_BOUNDARY_REJECTION_REASONS: Mapping[str, str] = {
+    "inside": "inside a query body",
+    "hook": "inside a resource hook",
+    "descendant": "from a thread spawned inside a query execution",
+}
+
 
 def _raise_if_guarded(message: str) -> None:
     """Raise `UntrackedReadError` if any active Database has a running query without raw-read permission."""
@@ -711,6 +729,38 @@ def _install_guards_once() -> None:
             ),
         )
 
+        original_thread_start = threading.Thread.start
+
+        def guarded_thread_start(thread: threading.Thread) -> None:
+            """Start `thread` inside the spawning query's context, if there is one.
+
+            A thread started inside a query body belongs to that execution:
+            whatever it reads flows back into the result the query stores, so
+            the frame the guard consults has to be visible from it. Threads
+            start with an empty context otherwise, which is why the frame is
+            invisible to them by default.
+
+            Threads started anywhere else -- every thread in a process that is
+            not executing a query at that instant -- are left exactly as they
+            were, at the cost of one scan of an almost always empty tuple.
+            """
+            inside = any(db._current_frame() is not None for db in _ACTIVE_GUARDS.get())
+            if inside and not getattr(thread, "_pyinc_context_bound", False):
+                # A fresh snapshot per spawn: a Context may not be entered
+                # twice, and the child must not share one with a sibling.
+                spawning_context = copy_context()
+                original_run = thread.run
+
+                def run_in_spawning_context() -> None:
+                    spawning_context.run(original_run)
+
+                # Rebound on the instance, so Thread subclasses and Timer --
+                # which define their own run() -- are covered without touching
+                # the class.
+                thread.run = run_in_spawning_context  # type: ignore[method-assign]
+                thread._pyinc_context_bound = True  # type: ignore[attr-defined]
+            original_thread_start(thread)
+
         builtins.open = guarded_open
         io.open = guarded_io_open
         os.getenv = guarded_getenv  # type: ignore[assignment]
@@ -718,6 +768,7 @@ def _install_guards_once() -> None:
         os.scandir = guarded_scandir
         os.environ = guarded_environ  # type: ignore[assignment]  # noqa: B003
         Path.iterdir = guarded_path_iterdir  # type: ignore[assignment, method-assign]
+        threading.Thread.start = guarded_thread_start  # type: ignore[assignment, method-assign]
         _GUARD_INSTALLED = True
 
 
@@ -2727,6 +2778,11 @@ class Database:
                 self._enqueue_observer_event(query, key, record)
             self._query_timings.setdefault(key, _TimingAggregate()).add(elapsed)
         finally:
+            # First, before the tokens go back: a thread spawned inside this
+            # execution holds a snapshot of the stack that still contains this
+            # frame, and the flag is the only thing that tells it the
+            # execution it descended from is over.
+            frame.completed = True
             self._allow_raw_reads.reset(raw_reads_token)
             self._execution_stack.reset(token)
 
@@ -3509,9 +3565,51 @@ class Database:
         finally:
             _ACTIVE_GUARDS.reset(token)
 
-    def _ensure_tracked_read(self, message: str) -> None:
-        if self._current_frame() is not None and not self._allow_raw_reads.get():
-            raise UntrackedReadError(message)
+    def _boundary_state(self) -> Literal["outside", "inside", "hook", "descendant"]:
+        """Where the calling thread stands relative to this database's executions.
+
+        `"outside"` — no execution of this database is live on the calling
+        context, so every entry point is open. `"inside"` — this very thread is
+        running that execution, which is a query body calling back into the
+        database it was handed. `"descendant"` — the live execution belongs to
+        another thread and this one inherited it by being spawned inside it.
+
+        (`"hook"`, for a caller inside a resource hook, is the fourth state of
+        the same vocabulary; nothing produces it until hooks carry a depth of
+        their own.)
+        """
+        frame = self._current_frame()
+        if frame is None:
+            return "outside"
+        if frame.thread_ident == threading.get_ident():
+            return "inside"
+        return "descendant"
+
+    def _reject_inside_query(self, name: str) -> None:
+        """Refuse `name` unless the caller is outside every execution of this database.
+
+        `name` is the public spelling of the entry point, e.g. `"db.set()"`.
+        """
+        state = self._boundary_state()
+        if state == "outside":
+            return
+        raise ReentrantDatabaseError(f"{name} is not allowed {_BOUNDARY_REJECTION_REASONS[state]}.")
+
+    def _reject_reentrant_read(self, name: str) -> None:
+        """Refuse `name` when the caller descends from a live execution.
+
+        The in-query read surface itself stays open: a query body reading its
+        own inputs and resources is the point of the frame. What cannot be
+        served is the same call from a thread spawned inside that body: it
+        would block on the state lock the executing thread is still holding,
+        and where that thread is waiting for the child, neither comes back.
+        Refusing turns a hang into a diagnosable error.
+        """
+        state = self._boundary_state()
+        if state == "descendant":
+            raise ReentrantDatabaseError(
+                f"{name} is not allowed {_BOUNDARY_REJECTION_REASONS[state]}."
+            )
 
     def _query_fingerprint(self, query: Any) -> str:
         cached = self._query_fingerprint_memo.get(query)
@@ -7413,10 +7511,15 @@ class Database:
         return current
 
     def _current_frame(self) -> ExecutionFrame | None:
-        stack = self._execution_stack.get()
-        if not stack:
-            return None
-        return stack[-1]
+        # The innermost execution still running. On the thread that owns the
+        # stack this is its top: a frame is marked completed in the same
+        # finally that pops it. A thread spawned inside a query keeps the
+        # stack it inherited for its whole life, so completed frames are what
+        # it has to look past.
+        for frame in reversed(self._execution_stack.get()):
+            if not frame.completed:
+                return frame
+        return None
 
     def _freeze_value(self, value: Any) -> Snapshot:
         snapshot = freeze(value, adapters=self._adapters)

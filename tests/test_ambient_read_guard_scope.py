@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -167,10 +168,41 @@ def test_report_untracked_read_restores_consistency_for_a_stat_only_query(
     assert db.inspect(declared_size).is_untracked
 
 
-@pytest.mark.parametrize(
-    "reader",
-    ["builtins.open", "io.open", "os.getenv", "os.environ", "os.listdir", "os.scandir", "iterdir"],
+_GUARDED_ENTRY_POINTS = (
+    "builtins.open",
+    "io.open",
+    "os.getenv",
+    "os.environ",
+    "os.listdir",
+    "os.scandir",
+    "iterdir",
 )
+
+
+def _guarded_read(reader: str, path: Path, directory: Path) -> object:
+    """Perform the named condition 2 read; whether it raises is the guard's call.
+
+    Shared by the in-query and in-child-thread cases so the two exercise
+    provably the same entry-point list.
+    """
+    if reader == "builtins.open":
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    if reader == "io.open":
+        with io.open(path, encoding="utf-8") as handle:  # noqa: UP020
+            return handle.read()
+    if reader == "os.getenv":
+        return os.getenv("PYINC_GUARDED_ENV")
+    if reader == "os.environ":
+        return os.environ["PYINC_GUARDED_ENV"]
+    if reader == "os.listdir":
+        return tuple(sorted(os.listdir(directory)))
+    if reader == "os.scandir":
+        return tuple(sorted(entry.name for entry in os.scandir(directory)))
+    return tuple(sorted(child.name for child in directory.iterdir()))
+
+
+@pytest.mark.parametrize("reader", _GUARDED_ENTRY_POINTS)
 def test_condition_two_entry_points_stay_guarded(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reader: str
 ) -> None:
@@ -181,24 +213,129 @@ def test_condition_two_entry_points_stay_guarded(
 
     @query(key=f"guarded-read:{reader}")
     def observe(db: Database) -> object:
-        if reader == "builtins.open":
-            with open(path, encoding="utf-8") as handle:
-                return handle.read()
-        if reader == "io.open":
-            with io.open(path, encoding="utf-8") as handle:  # noqa: UP020
-                return handle.read()
-        if reader == "os.getenv":
-            return os.getenv("PYINC_GUARDED_ENV")
-        if reader == "os.environ":
-            return os.environ["PYINC_GUARDED_ENV"]
-        if reader == "os.listdir":
-            return tuple(sorted(os.listdir(tmp_path)))
-        if reader == "os.scandir":
-            return tuple(sorted(entry.name for entry in os.scandir(tmp_path)))
-        return tuple(sorted(child.name for child in tmp_path.iterdir()))
+        return _guarded_read(reader, path, tmp_path)
 
     with pytest.raises(UntrackedReadError, match="untracked"):
         Database().get(observe)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("reader", _GUARDED_ENTRY_POINTS)
+def test_query_spawned_thread_raw_reads_stay_guarded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reader: str, mode: str
+) -> None:
+    """A thread started inside a query body is inside the query boundary too.
+
+    Whatever such a thread reads flows back into the query's result, so a child
+    that read ambient state freely would record no dependency for it and the
+    warm answer would drift from a fresh one. The whole condition 2 list has to
+    hold on the child, in every mode.
+    """
+    monkeypatch.setenv("PYINC_GUARDED_ENV", "value")
+    path = tmp_path / "sample.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    @query(key=f"child-thread-read:{mode}:{reader}")
+    def observe_in_child(db: Database) -> str:
+        # The child's outcome comes back as the query's own result: a query may
+        # not capture mutable ambient state, so there is no shared list to
+        # append to from out here.
+        outcome: list[str] = []
+
+        def child() -> None:
+            try:
+                _guarded_read(reader, path, tmp_path)
+            except Exception as exc:  # noqa: BLE001
+                outcome.append(f"{type(exc).__name__}: {exc}")
+            else:
+                outcome.append("read allowed")
+
+        thread = threading.Thread(target=child)
+        thread.start()
+        thread.join(timeout=10)
+        if thread.is_alive():
+            # Report a stuck child to the main thread rather than blocking on it.
+            return "child still running"
+        return outcome[0] if outcome else "child recorded nothing"
+
+    reported = Database(mode=mode).get(observe_in_child)
+    assert reported.startswith("UntrackedReadError:"), reported
+    assert "untracked" in reported
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_query_spawning_a_file_reading_thread_raises_instead_of_caching(
+    tmp_path: Path, mode: str
+) -> None:
+    """The read a spawned thread used to make freely is refused, not stored.
+
+    A query that farmed its file read out to a thread recorded no dependency
+    on that file, so the answer it stored outlived every later edit while a
+    fresh database read the new bytes. Now the child is refused, and a query
+    that lets the refusal out fails instead of caching a wrong answer. A query
+    that handles the refusal and answers something of its own is deterministic
+    again: the same value warm and fresh, with no dependency on a file it
+    never managed to read.
+    """
+    path = tmp_path / "data.txt"
+    path.write_text("one", encoding="utf-8")
+
+    @query(key=f"child-read-propagated:{mode}")
+    def read_through_child(db: Database) -> str:
+        box: list[object] = []
+
+        def child() -> None:
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    box.append(handle.read())
+            except Exception as exc:  # noqa: BLE001
+                box.append(exc)
+
+        thread = threading.Thread(target=child)
+        thread.start()
+        thread.join(timeout=10)
+        if thread.is_alive():
+            raise RuntimeError("child thread did not finish")
+        outcome = box[0]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return str(outcome)
+
+    with pytest.raises(UntrackedReadError, match="untracked"):
+        Database(mode=mode).get(read_through_child)
+
+    @query(key=f"child-read-handled:{mode}")
+    def constant_despite_child(db: Database) -> str:
+        box: list[str] = []
+
+        def child() -> None:
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    box.append(f"read allowed: {handle.read()}")
+            except UntrackedReadError:
+                box.append("refused")
+
+        thread = threading.Thread(target=child)
+        thread.start()
+        thread.join(timeout=10)
+        if thread.is_alive():
+            raise RuntimeError("child thread did not finish")
+        return box[0]
+
+    warm = Database(mode=mode)
+    assert warm.get(constant_despite_child) == "refused"
+    assert warm.statistics().query_executions == 1
+
+    path.write_text("two", encoding="utf-8")
+
+    assert warm.get(constant_despite_child) == "refused"
+    # Witness: the second answer is the stored one, not a re-execution that
+    # happened to agree.
+    assert warm.statistics().query_executions == 1
+
+    fresh = Database(mode=mode)
+    assert fresh.get(constant_despite_child) == warm.get(constant_despite_child)
+    assert fresh.statistics().query_executions == 1
 
 
 @pytest.mark.parametrize("direction", ["environ | dict", "dict | environ"])
