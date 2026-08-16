@@ -3459,6 +3459,141 @@ def test_state_inside_a_chain_landed_container_keeps_the_warm_verdict(
         sys.modules.pop(module_name, None)
 
 
+def test_rebinding_a_tuple_carried_class_keeps_the_warm_answer_while_fresh_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_chain_landed_tuple_carrier_module"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class First:\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "class Second:\n"
+        "    marker = 2\n"
+        "\n"
+        "\n"
+        "PAIR = (First, 5)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="chain-landed-tuple-carried-class")
+        def carried(db: Database) -> int:
+            return cast(int, module.PAIR[0].marker) + 0
+
+        db = Database()
+        assert db.get(carried) == 1
+        monkeypatch.setattr(module, "First", module.Second)
+        executions = db.statistics().query_executions
+        # The two halves of the chain-landed boundary told apart by a rebinding
+        # rather than by a write. The payload reaches the class the tuple
+        # carries and pins it to the name its defining module binds, so once
+        # that name moves every first-time fingerprint refuses outright instead
+        # of answering. The memo does not reach it: the tuple is the object the
+        # chain resolved to, it is compared by identity, and nothing inside it
+        # is followed -- so a database that already answered keeps serving the
+        # answer filed under the fingerprint it stored. Both halves are pinned
+        # deliberately: the refusal is the verdict a fresh computation owes, and
+        # the stored answer is what a warm one is documented to keep.
+        assert db.get(carried) == 1
+        assert db.statistics().query_executions == executions
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database().get(carried)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_rebinding_a_frozenset_carried_class_keeps_the_warm_answer_while_fresh_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_chain_landed_frozenset_carrier_module"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class First:\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "class Second:\n"
+        "    marker = 2\n"
+        "\n"
+        "\n"
+        "PAIR = frozenset({First, 5})\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="chain-landed-frozenset-carried-class")
+        def carried(db: Database) -> int:
+            return len(module.PAIR) + 0
+
+        db = Database()
+        assert db.get(carried) == 2
+        monkeypatch.setattr(module, "First", module.Second)
+        executions = db.statistics().query_executions
+        # The same boundary through an unordered carrier: a frozenset offers no
+        # index for the query to read through, and it still holds the class the
+        # payload anchors, so the rebinding lands on exactly the same split.
+        assert db.get(carried) == 2
+        assert db.statistics().query_executions == executions
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database().get(carried)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_rebinding_a_named_tuple_carried_class_keeps_the_warm_answer_while_fresh_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_chain_landed_named_tuple_carrier_module"
+    (tmp_path / f"{module_name}.py").write_text(
+        "from typing import NamedTuple\n"
+        "\n"
+        "\n"
+        "class First:\n"
+        "    marker = 1\n"
+        "\n"
+        "\n"
+        "class Second:\n"
+        "    marker = 2\n"
+        "\n"
+        "\n"
+        "class Pair(NamedTuple):\n"
+        "    kind: type\n"
+        "    count: int\n"
+        "\n"
+        "\n"
+        "PAIR = Pair(First, 5)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    try:
+
+        @query(key="chain-landed-named-tuple-carried-class")
+        def carried(db: Database) -> int:
+            return cast(int, module.PAIR[0].marker) + 0
+
+        db = Database()
+        assert db.get(carried) == 1
+        monkeypatch.setattr(module, "First", module.Second)
+        executions = db.statistics().query_executions
+        # And through a named carrier, whose own class the payload anchors
+        # beside the one it holds: naming the fields buys the landing no
+        # descent from the memo either, so the split is the same one again.
+        assert db.get(carried) == 1
+        assert db.statistics().query_executions == executions
+        with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
+            Database().get(carried)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 @pytest.mark.parametrize(
     "shape, source",
     [
