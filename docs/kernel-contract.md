@@ -514,11 +514,12 @@ anchors a class's own definition contributes — its bases, its metaclass, the
 classes its body binds directly — are carried warm as well as fresh, because
 the warm path follows each anchored class's definition closure: rebinding a
 base, a metaclass or a directly bound body class refuses on both paths too. A
-class the body holds inside a container rather than binding directly stays
-outside that closure, and rebinding it leaves the memo answering with the
-stored fingerprint while a fresh computation moves or refuses. That descent
-stops at builtin and stdlib-rooted types, which are pinned by name anchor and
-runtime build rather than by a walk of their contents.
+class the body holds inside one of the immutable containers the payload
+accepts, rather than binding directly, stays outside that closure, and
+rebinding it leaves the memo answering with the stored fingerprint while a
+fresh computation moves or refuses. That descent stops at builtin and
+stdlib-rooted types, which are pinned by name anchor and runtime build rather
+than by a walk of their contents.
 
 Two shapes stay outside that envelope by design. A chain that lands on a class
 or a frozen dataclass instance — named directly, or held inside an immutable
@@ -527,13 +528,16 @@ container the payload accepts, such as a tuple, a `NamedTuple` or a
 or read — a plain method, `staticmethod`, `classmethod`, `property` and
 `cached_property` alike — moves a fresh fold but not a memoized one:
 `foo.Model.flag = True` is seen by a fresh `Database` and not by a warm one.
-And a captured standard-library module folds the names of the paths read off
-it rather than the behavior behind them, so patching a stdlib function or
-class it reaches (`json.dumps = other`) is not detected at all, warm or fresh;
-a stdlib type is pinned by its name anchor — its own name beside the identity
-of the module that defines it — and by the runtime build, so the type's own
-namespace is never walked. Route such mutable state through an `Input` or a
-custom `Resource`.
+Rebinding is the other half of that landing: when a class such a container
+carries stops being its defining module's live binding, a warm database still
+serves the stored answer while a fresh computation refuses loudly instead of
+moving identity. And a captured standard-library module folds the names of the
+paths read off it rather than the behavior behind them, so patching a stdlib
+function or class it reaches (`json.dumps = other`) is not detected at all,
+warm or fresh; a stdlib type is pinned by its name anchor — its own name
+beside the identity of the module that defines it — and by the runtime build,
+so the type's own namespace is never walked. Route such mutable state through
+an `Input` or a custom `Resource`.
 
 **6. LRU eviction under active dependencies.**
 If `max_query_nodes` is set low enough that an intermediate query is evicted while

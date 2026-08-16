@@ -221,13 +221,14 @@ def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
     then follows that type's own definition closure -- its metaclass, its
     bases, the classes its body binds directly. Without that descent,
     rebinding one of those still answered from the memo where a fresh
-    computation refuses. A class the body holds inside a container rather than
-    binding directly is not followed here: the payload folds that attribute
-    through the eager capture instead, so rebinding such a class leaves the
-    memo answering with the stored fingerprint while a fresh computation
-    either moves to a new one or refuses. Descent stops without a namespace
-    walk at builtin and stdlib-rooted types, which the payload pins by name
-    anchor and runtime build rather than by walking their contents.
+    computation refuses. A class the body holds inside one of the immutable
+    containers the payload accepts, rather than binding directly, is not
+    followed here: the payload folds that attribute through the eager capture
+    instead, so rebinding such a class leaves the memo answering with the
+    stored fingerprint while a fresh computation either moves to a new one or
+    refuses. Descent stops without a namespace walk at builtin and
+    stdlib-rooted types, which the payload pins by name anchor and runtime
+    build rather than by walking their contents.
     """
 
     leaves: list[Any] = []
@@ -3838,9 +3839,13 @@ class Database:
         inside that landing: the memo compares the object the chain resolved to
         by identity while the payload folds what is inside it, so neither a
         member written in place nor a binding one of those members reads is
-        observed. Landings the payload refuses instead of folding -- a plain
-        object that is not one of those callables, a mutable dataclass, a dict,
-        a list -- raise when the fingerprint is built and carry nothing stale.
+        observed. Where such a container carries a class, the rebinding this
+        walk misses is one the payload refuses outright once the class stops
+        being its module's live binding, so the memo answers on while a fresh
+        computation raises. Landings the payload refuses from the start instead
+        of folding -- a plain object that is not one of those callables, a
+        mutable dataclass, a dict, a list -- raise when the fingerprint is
+        built and carry nothing stale.
         What a fold reads out of a resource's `identity()` needs no walk on
         either route: it is gated by the recorded configuration digests the
         memo carries alongside this observation. Everything else a fold reads

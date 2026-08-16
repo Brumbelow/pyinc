@@ -27,29 +27,35 @@ decided at release time.
   closure cell, or rebinding a captured global now invalidates the memo
   rather than reusing the stale fingerprint.
 - The memoized query-fingerprint fast path can no longer serve an answer the
-  memo-free path disagrees with. Function metadata (docstrings, annotations,
-  names, type parameters), captured class bodies, captured instance and policy
-  state, statically captured module attributes and the module constants beside
-  them are observed before a memoized fingerprint is reused, and each captured
-  chain is re-resolved rather than assumed. Where a chain lands on a value
-  whose payload reads a live definition — a function, a wraps-decorated
-  callable, a query handle, an `Input`, a type alias, a type parameter or a
-  resource — that definition is observed too, so a rebinding behind such a
-  landing moves identity instead of being served from the memo. Where no
-  Python evaluator exists to observe — a `type` alias before 3.14, or a
-  runtime-constructed `TypeVar`'s bound on every interpreter — every class
-  and carrier type the eagerly resolved value names is anchored to its live
-  module binding on the warm path as the payload anchors it on the fresh
-  one, so rebinding such a binding refuses loudly on both paths rather than
-  being served from the memo. The anchors a class's own definition adds —
-  its bases, its metaclass, its body's classes — are carried warm as well as
-  fresh: the warm path follows each anchored class's definition closure, so
-  rebinding a base, a metaclass or a body class refuses on both paths too.
-  Resource-folding queries stay memoized: the configuration their `identity()`
-  reports, and the type behind it, are digested and compared per request, and
-  the request-scoped re-reads are cleared whenever a caller declares a
-  mid-span change. A stale memoized identity previously survived into node
-  keys, explain labels and checkpoint manifests.
+  memo-free path disagrees with inside the envelope stated below. Function
+  metadata (docstrings, annotations, names, type parameters), captured class
+  bodies, captured instance and policy state, statically captured module
+  attributes and the module constants beside them are observed before a
+  memoized fingerprint is reused, and each captured chain is re-resolved
+  rather than assumed. Where a chain lands on a value whose payload reads a
+  live definition — a function, a wraps-decorated callable, a query handle, an
+  `Input`, a type alias, a type parameter or a resource — that definition is
+  observed too, so a rebinding behind such a landing moves identity instead of
+  being served from the memo. Where no Python evaluator exists to observe — a
+  `type` alias before 3.14, or a runtime-constructed `TypeVar`'s bound on
+  every interpreter — every class and carrier type the eagerly resolved value
+  names is anchored to its live module binding on the warm path as the payload
+  anchors it on the fresh one, so rebinding such a binding refuses loudly on
+  both paths rather than being served from the memo. The anchors a class's own
+  definition adds — its bases, its metaclass, its body's directly bound
+  classes — are carried warm as well as fresh: the warm path follows each
+  anchored class's definition closure, so rebinding a base, a metaclass or a
+  directly bound body class refuses on both paths too. Where a chain lands
+  directly on an immutable container the payload accepts — a tuple, a
+  `NamedTuple`, a `frozenset` — the memo compares that container by identity
+  and by design does not follow what is inside it, so rebinding a class it
+  carries leaves a warm database serving the stored answer while a fresh
+  computation refuses. Resource-folding queries stay memoized: the
+  configuration their `identity()` reports, and the type behind it, are
+  digested and compared per request, and the request-scoped re-reads are
+  cleared whenever a caller declares a mid-span change. A stale memoized
+  identity previously survived into node keys, explain labels and checkpoint
+  manifests.
 - The ambient-read guard covers the whole query boundary. Adapter `thaw`
   during argument materialization and adapter `freeze` on the result ran
   outside it, so an adapter reading ambient state could smuggle untracked
