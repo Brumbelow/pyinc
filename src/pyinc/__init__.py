@@ -17,6 +17,7 @@ from .errors import (
     InputKeyError,
     MutationError,
     PyIncError,
+    ReentrantDatabaseError,
     UnsupportedValueError,
     UntrackedReadError,
 )
@@ -109,6 +110,7 @@ __all__ = [
     "Query",
     "QueryProfile",
     "ReconcileResult",
+    "ReentrantDatabaseError",
     "ResolvedPathResource",
     "Resource",
     "Subscription",

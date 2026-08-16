@@ -25,6 +25,10 @@ class CycleError(PyIncError):
     """Raised when query evaluation encounters a dependency cycle."""
 
 
+class ReentrantDatabaseError(PyIncError):
+    """Raised when a call re-enters the database from inside its own execution."""
+
+
 class InputKeyError(PyIncError, ValueError):
     """Raised when an input key is invalid or conflicts within a database."""
 

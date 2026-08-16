@@ -913,6 +913,7 @@ Errors:
 | `UnsupportedValueError` | A value cannot cross a cached boundary safely. |
 | `AdapterContractError` | A registered adapter's instance configuration changed after `Database` construction. |
 | `CycleError` | Query evaluation encountered a dependency cycle. |
+| `ReentrantDatabaseError` | A call re-entered the database from inside its own execution — a query body, a resource hook, or a thread spawned inside a running query. |
 | `InputKeyError` | An input key is invalid or conflicts within a database. |
 | `CheckpointError` | Base error for durable-checkpoint failures. |
 | `CheckpointVersionError` | A checkpoint uses an unsupported manifest or kernel version. |

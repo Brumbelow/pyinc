@@ -12,6 +12,7 @@ from typing import Any, ClassVar, cast
 
 import pytest
 
+import pyinc
 from pyinc import (
     AdapterContractError,
     BinaryFileResource,
@@ -31,8 +32,10 @@ from pyinc import (
     Input,
     InspectionNode,
     MutationError,
+    PyIncError,
     QueryChangeEvent,
     QueryProfile,
+    ReentrantDatabaseError,
     ResolvedPathResource,
     Resource,
     Subscription,
@@ -6108,3 +6111,10 @@ def test_store_bytes_carrying_a_thaw_collision_are_not_warmed_into_a_database() 
     control_digest = hashlib.sha256(control).hexdigest()
     store.put(control_digest, control)
     assert db._read_validated_snapshot(store, control_digest) == FrozenDict(((1, "a"),))
+
+
+def test_reentrant_database_error_is_public_and_catchable_as_pyinc_error() -> None:
+    assert issubclass(ReentrantDatabaseError, PyIncError)
+    assert "ReentrantDatabaseError" in pyinc.__all__
+    with pytest.raises(PyIncError):
+        raise ReentrantDatabaseError("re-entered")
