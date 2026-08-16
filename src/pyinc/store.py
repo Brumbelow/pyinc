@@ -15,6 +15,7 @@ import re
 import stat
 from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from ._locking import FileLock, _validate_lock_timeout
@@ -52,12 +53,15 @@ class ArtifactStore(Protocol):
 
     def get(self, digest: str) -> bytes | None:
         """Return the bytes previously stored under ``digest``, or ``None``."""
+        raise NotImplementedError("ArtifactStore implementations must define get().")
 
     def put(self, digest: str, payload: bytes) -> None:
         """Persist ``payload`` under ``digest``. Idempotent on equal bytes."""
+        raise NotImplementedError("ArtifactStore implementations must define put().")
 
     def contains(self, digest: str) -> bool:
         """Return ``True`` if ``digest`` is present. Default: ``get(...) is not None``."""
+        return self.get(digest) is not None
 
 
 class InMemoryArtifactStore:
@@ -87,7 +91,7 @@ class InMemoryArtifactStore:
         return digest in self._items
 
     def keys(self) -> Mapping[str, bytes]:
-        return self._items
+        return MappingProxyType(self._items)
 
 
 class FileSystemArtifactStore:

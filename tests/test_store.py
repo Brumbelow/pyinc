@@ -187,6 +187,81 @@ def test_in_memory_store_satisfies_artifact_store_protocol() -> None:
     assert hasattr(store, "contains")
 
 
+class _MinimalProtocolStore(ArtifactStore):
+    """Explicit protocol subclass implementing only `get` and `put`.
+
+    `contains` is deliberately left inherited so the protocol's documented
+    default is what gets exercised, here and through a real database.
+    """
+
+    def __init__(self) -> None:
+        self._items: dict[str, bytes] = {}
+
+    def get(self, digest: str) -> bytes | None:
+        return self._items.get(digest)
+
+    def put(self, digest: str, payload: bytes) -> None:
+        existing = self._items.get(digest)
+        if existing is not None:
+            if existing != payload:
+                raise ValueError(f"Digest collision for {digest!r}.")
+            return
+        self._items[digest] = payload
+
+
+class _ContainsOnlyStore(ArtifactStore):
+    """Explicit protocol subclass that overrides only `contains`.
+
+    Stands in for an implementation whose author read the protocol as a set
+    of optional hooks: it answers presence questions and never defines the
+    two methods that would make an answer of `True` mean anything.
+    """
+
+    def contains(self, digest: str) -> bool:
+        return False
+
+
+def test_protocol_contains_default_matches_get() -> None:
+    store = _MinimalProtocolStore()
+    payload = serialize_snapshot(freeze({"a": 1}))
+    digest = fingerprint_snapshot(freeze({"a": 1}))
+
+    store.put(digest, payload)
+
+    assert store.contains(digest) is True
+    assert store.contains("0" * 64) is False
+
+
+def test_protocol_stub_get_raises_instead_of_returning_none() -> None:
+    store = _ContainsOnlyStore()  # type: ignore[abstract]
+
+    # A subclass that skips `get`/`put` is broken, not empty: reading has to
+    # fail where the omission is, not hand back a plausible `None`.
+    with pytest.raises(NotImplementedError):
+        store.get("0" * 64)
+    with pytest.raises(NotImplementedError):
+        store.put("0" * 64, b"x")
+
+
+def test_in_memory_store_keys_view_is_read_only() -> None:
+    store = InMemoryArtifactStore()
+    payload = serialize_snapshot(freeze({"a": 1}))
+    digest = fingerprint_snapshot(freeze({"a": 1}))
+    store.put(digest, payload)
+
+    assert store.keys() is not store._items
+    with pytest.raises(TypeError):
+        store.keys()["x"] = b"y"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        del store.keys()[digest]  # type: ignore[attr-defined]
+
+    # Neither attempt reached the backing map, so the collision guard still
+    # compares against the original bytes instead of whatever was smuggled in.
+    with pytest.raises(ValueError, match="collision"):
+        store.put(digest, b"different")
+    assert store.get(digest) == payload
+
+
 # ---------------------------------------------------------------------------
 # Group B: FileSystemArtifactStore
 # ---------------------------------------------------------------------------
