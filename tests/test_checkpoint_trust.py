@@ -1,12 +1,19 @@
-"""Store-read integrity for the durable checkpoint path.
+"""Store integrity for the durable checkpoint path.
 
 The checkpoint API (`Database.save_checkpoint` / `Database.load_checkpoint`)
 trusts an `ArtifactStore` to return, for a given content-address, exactly the
 bytes that were written under it. These tests simulate a store that breaks
 that contract (bit-flipped bytes, truncation, a foreign kernel version, a
-tampered manifest) and pin the kernel's response: snapshot-level corruption
-is silently skipped and the affected query re-executes; manifest-level
-corruption raises a loud `ValueError`.
+tampered manifest) and pin the kernel's response on both sides of the store.
+
+Reading: snapshot-level corruption is silently skipped and the affected query
+re-executes; manifest-level corruption raises a loud `ValueError`.
+
+Writing: a digest whose stored bytes disagree with what is being persisted
+raises the store's collision error rather than being trusted because it is
+present, so a save never reports success against a store it could not warm
+from -- and a value re-executed after a skipped load raises on the way back
+in rather than recomputing around the corruption on every run.
 """
 
 from __future__ import annotations
@@ -75,9 +82,15 @@ def test_bitflipped_snapshot_bytes_are_skipped_and_reexecuted() -> None:
     digest = fingerprint_snapshot(freeze(11))
     store._items[digest] = serialize_snapshot(freeze(99))
 
-    db2 = Database(store=store)
+    # The loader gets the store for reading only, never as its own write-back
+    # store: what this test pins is the load side -- verification refuses the
+    # planted bytes and the query re-executes. Persisting that recomputed value
+    # into a store still holding different bytes under the same digest raises
+    # the store's collision error, which is pinned separately. Passing the store
+    # to load_checkpoint keeps every snapshot read verifying against it.
+    db2 = Database()
     db2.set(p, 0)
-    db2.load_checkpoint(ck_key)
+    db2.load_checkpoint(ck_key, store=store)
     assert db2.get(trust_bitflip_query) == 11
     assert db2.inspect(trust_bitflip_query).last_recompute == "executed"
 
@@ -99,9 +112,13 @@ def test_truncated_snapshot_bytes_are_skipped() -> None:
     original = store._items[digest]
     store._items[digest] = original[:-1]
 
-    db2 = Database(store=store)
+    # Read-only loader, as above: truncated bytes must be refused at load and
+    # the query re-executed. The recomputed value is not written back, because
+    # publishing it over the truncated bytes is the store's collision error --
+    # a separate behaviour with its own test.
+    db2 = Database()
     db2.set(p, 0)
-    db2.load_checkpoint(ck_key)
+    db2.load_checkpoint(ck_key, store=store)
     assert db2.get(trust_trunc_query) == 22
     assert db2.inspect(trust_trunc_query).last_recompute == "executed"
 
@@ -123,9 +140,13 @@ def test_wrong_kernel_prefix_snapshot_is_skipped() -> None:
     original = store._items[digest]
     store._items[digest] = b"K9;" + original[3:]
 
-    db2 = Database(store=store)
+    # Read-only loader, as above: the foreign kernel prefix must be refused at
+    # load and the query re-executed. No write-back store, so the re-executed
+    # value never meets the planted bytes at `put` -- that refusal is pinned by
+    # its own test rather than here.
+    db2 = Database()
     db2.set(p, 0)
-    db2.load_checkpoint(ck_key)
+    db2.load_checkpoint(ck_key, store=store)
     assert db2.get(trust_prefix_query) == 33
     assert db2.inspect(trust_prefix_query).last_recompute == "executed"
 
@@ -151,6 +172,144 @@ def test_missing_snapshot_key_reexecutes() -> None:
     db2.load_checkpoint(ck_key)
     assert db2.get(trust_missing_query) == 44
     assert db2.inspect(trust_missing_query).last_recompute == "executed"
+
+
+def test_reexecuted_value_refuses_to_overwrite_wrong_stored_bytes() -> None:
+    """The composed case the tests above hold apart, on one store that both
+    serves the load and takes the write-back."""
+    p = Input[int]("trust_writeback")
+
+    @query
+    def trust_writeback_query(db: Database) -> int:
+        return p.read(db) + 88
+
+    store = InMemoryArtifactStore()
+    db1 = Database(store=store)
+    db1.set(p, 0)
+    assert db1.get(trust_writeback_query) == 88
+    ck_key = db1.save_checkpoint()
+
+    digest = fingerprint_snapshot(freeze(88))
+    planted = serialize_snapshot(freeze(99))
+    store._items[digest] = planted
+
+    db2 = Database(store=store)
+    db2.set(p, 0)
+    # The load itself succeeds -- it is called outside the raises block so a
+    # refusal here would surface as an error rather than satisfy the test.
+    db2.load_checkpoint(ck_key)
+
+    # Naming the victim digest in the match is the execution witness: only a
+    # re-execution that produced 88 can attempt to publish under that address,
+    # so the test cannot pass unless the record was skipped at load, the query
+    # body ran, and the persist of its result was attempted. Were the persist
+    # ever exempted for load-skipped digests, nothing would raise and this
+    # fails. (`query_executions` cannot serve as the witness: the counter is
+    # incremented after the persist, so the raise arrives before it moves.)
+    with pytest.raises(ValueError, match=f"Digest collision.*{digest}"):
+        db2.get(trust_writeback_query)
+
+    # Refused, not overwritten.
+    assert store._items[digest] == planted
+
+
+# ---------------------------------------------------------------------------
+# Save-side store trust: a digest that is already present but holds the wrong
+# bytes must make the save fail loudly. Reporting success here would hand back
+# a key naming a store the database provably cannot warm from.
+# ---------------------------------------------------------------------------
+
+
+def _single_record_snapshot_digest(store: InMemoryArtifactStore, ck_key: str) -> str:
+    manifest_bytes = store.get(ck_key)
+    assert manifest_bytes is not None
+    records = json.loads(manifest_bytes)["records"]
+    assert len(records) == 1
+    return cast(str, records[0]["snapshot_digest"])
+
+
+def test_save_checkpoint_raises_on_preseeded_wrong_bytes_in_memory() -> None:
+    p = Input[int]("preseed_mem")
+
+    @query
+    def preseed_mem_query(db: Database) -> int:
+        return p.read(db) + 55
+
+    clean = InMemoryArtifactStore()
+    db = Database(store=clean)
+    db.set(p, 0)
+    assert db.get(preseed_mem_query) == 55
+    # A clean save teaches us the digest the record is content-addressed by.
+    victim = _single_record_snapshot_digest(clean, db.save_checkpoint())
+
+    hostile = InMemoryArtifactStore()
+    hostile.put(victim, b"wrong bytes")
+
+    with pytest.raises(ValueError, match="Digest collision"):
+        db.save_checkpoint(store=hostile)
+
+    # The refusal never overwrites: the corrupt bytes are still exactly there.
+    assert hostile.get(victim) == b"wrong bytes"
+
+
+def test_save_checkpoint_raises_on_preseeded_wrong_bytes_on_disk(tmp_path: Path) -> None:
+    p = Input[int]("preseed_disk")
+
+    @query
+    def preseed_disk_query(db: Database) -> int:
+        return p.read(db) + 66
+
+    clean = InMemoryArtifactStore()
+    db = Database(store=clean)
+    db.set(p, 0)
+    assert db.get(preseed_disk_query) == 66
+    victim = _single_record_snapshot_digest(clean, db.save_checkpoint())
+
+    hostile = FileSystemArtifactStore(tmp_path / "hostile")
+    object_path = hostile.root / "objects" / victim[:2] / victim[2:]
+    object_path.parent.mkdir(parents=True, exist_ok=True)
+    object_path.write_bytes(b"wrong bytes")
+
+    with pytest.raises(ValueError, match="Digest collision"):
+        db.save_checkpoint(store=hostile)
+
+    assert object_path.read_bytes() == b"wrong bytes"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_clean_save_and_load_warm_matches_fresh_per_mode(mode: str) -> None:
+    p = Input[int]("roundtrip_seed")
+
+    @query
+    def roundtrip_child(db: Database) -> int:
+        return p.read(db) + 1
+
+    @query
+    def roundtrip_parent(db: Database) -> int:
+        return roundtrip_child(db) * 10
+
+    store = InMemoryArtifactStore()
+    saver = Database(store=store, mode=mode)
+    saver.set(p, 4)
+    fresh = saver.get(roundtrip_parent)
+    assert fresh == 50
+    ck_key = saver.save_checkpoint()
+
+    warm_db = Database(store=store, mode=mode)
+    warm_db.set(p, 4)
+    warm_db.load_checkpoint(ck_key)
+    before = warm_db.statistics()
+    warm = warm_db.get(roundtrip_parent)
+    after = warm_db.statistics()
+
+    assert warm == fresh
+    # Witnesses, so a vacuous pass is impossible: the warm request executed
+    # nothing and reused at least one record.
+    executions_during_warm = after.query_executions - before.query_executions
+    assert executions_during_warm == 0
+    assert after.query_reuses - before.query_reuses >= 1
+    assert warm_db.inspect(roundtrip_parent).last_recompute == "reused"
+    assert warm_db.inspect(roundtrip_child).last_recompute == "reused"
 
 
 # ---------------------------------------------------------------------------
@@ -1861,10 +2020,14 @@ def test_partial_object_write_never_visible(tmp_path: Path) -> None:
     #     query re-executes to a correct value -- partial bytes are never served.
     object_path.write_bytes(full_payload[:-1])
 
+    #     The loader reads through this store but does not write back to it:
+    #     the point here is that torn bytes are refused and the query
+    #     re-executes. Publishing the recomputed value over those torn bytes is
+    #     the store's collision error, pinned by its own test.
     loader = FileSystemArtifactStore(tmp_path)
-    db2 = Database(store=loader)
+    db2 = Database()
     db2.set(p, 0)
-    db2.load_checkpoint(ck_key)
+    db2.load_checkpoint(ck_key, store=loader)
     assert db2.get(dur_partial_query) == 100
     assert db2.inspect(dur_partial_query).last_recompute == "executed"
 

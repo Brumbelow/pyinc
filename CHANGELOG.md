@@ -97,6 +97,12 @@ decided at release time.
   module, reports the reflective namespace reads that refuse a query before
   any capture is folded, and — given a `Query` rather than a plain function —
   reports the handle's own state.
+- Persisting a snapshot verifies the bytes already stored under its content
+  address instead of trusting that the address is present. Saving a checkpoint
+  and the write-through store path both now raise on a mismatch; previously a
+  save could report success — and hand back a checkpoint key — against a store
+  holding bytes the database could never warm from. Bytes that already match
+  are left alone, so a healthy store still sees one write per distinct digest.
 
 ### Added
 

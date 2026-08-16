@@ -1624,6 +1624,14 @@ class Database:
         A warmed record joins the loading database's own revision timeline, so
         the usual invalidation machinery governs it from then on.
 
+        Where a record was skipped because the store holds *different* bytes
+        under its digest, persisting the re-executed value back into that store
+        raises the store's collision error rather than writing over it: the
+        content address is already bound to bytes that disagree, and corruption
+        surfaces loudly instead of being silently recomputed around on every
+        run. A database with no store of its own -- one handed a store here and
+        nowhere else -- reads through it without writing back.
+
         Raises ``ValueError`` if no ``ArtifactStore`` is available.
         Raises ``KeyError`` if *key* is not found in the store.
         """
@@ -2608,12 +2616,28 @@ class Database:
         return self._read_validated_snapshot(store, digest)
 
     def _persist_snapshot_to(self, snapshot: Snapshot, store: ArtifactStore) -> None:
+        """Publish the snapshot's serialized bytes under its content address.
+
+        The single verifying persist: every path that writes a snapshot goes
+        through here. Presence is never evidence -- a digest already in the
+        store is compared byte for byte against what this snapshot serializes
+        to, so a save can no longer report success against a store holding
+        bytes the database could never warm from.
+
+        Raw filesystem I/O runs under the raw-read allow scope so a
+        `FileSystemArtifactStore` used while a query frame is active is not
+        rejected by the global guard.
+        """
         digest = fingerprint_snapshot(snapshot)
+        payload = serialize_snapshot(snapshot)
         with self._allow_raw_reads_scope():
-            if store.contains(digest):
-                return
-            payload = serialize_snapshot(snapshot)
-            store.put(digest, payload)
+            if store.get(digest) != payload:
+                # Missing (None) or present-but-different: put either publishes
+                # the bytes or raises the store's own collision error. The
+                # authoritative comparison is the one put makes, so this read is
+                # a filter rather than a trust decision -- a stale answer here
+                # costs a redundant put and changes no outcome.
+                store.put(digest, payload)
 
     def _find_input_node_by_key(self, input_key: str) -> NodeKey | None:
         input_obj = self._inputs_by_key.get(input_key)
@@ -7694,17 +7718,13 @@ class Database:
 
     def _persist_snapshot(self, snapshot: Snapshot) -> None:
         """Write the snapshot's serialized bytes to the configured ArtifactStore.
-        Raw filesystem I/O runs under the raw-read allow scope so a `FileSystemArtifactStore`
-        used while a query frame is active is not rejected by the global guard."""
+        The write-through path resolves the database's own store and hands it to
+        `_persist_snapshot_to`, so it verifies present bytes exactly as the
+        checkpoint save path does -- one body, one behaviour."""
         store = self._store
         if store is None:
             return
-        digest = fingerprint_snapshot(snapshot)
-        with self._allow_raw_reads_scope():
-            if store.contains(digest):
-                return
-            payload = serialize_snapshot(snapshot)
-            store.put(digest, payload)
+        self._persist_snapshot_to(snapshot, store)
 
     def _thaw_value(self, value: Any) -> Any:
         return thaw(value, adapters=self._adapters)

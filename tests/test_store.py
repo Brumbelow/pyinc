@@ -946,6 +946,65 @@ def test_checkpoint_chain_of_queries() -> None:
     assert db2.inspect(ckp_step1).last_recompute == "reused"
 
 
+class _PutCountingStore(InMemoryArtifactStore):
+    """In-memory store that records the digest of every `put` it is handed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.put_log: list[str] = []
+
+    def put(self, digest: str, payload: bytes) -> None:
+        self.put_log.append(digest)
+        super().put(digest, payload)
+
+
+def test_write_through_store_raises_on_preseeded_wrong_bytes() -> None:
+    @query
+    def write_through_constant(db: Database) -> int:
+        return 4242
+
+    digest = fingerprint_snapshot(freeze(4242))
+    store = InMemoryArtifactStore()
+    store.put(digest, b"wrong bytes")
+
+    # The write-through path persists a query's result as it is produced, so
+    # the store's refusal has to surface out of `get` rather than being
+    # swallowed by a presence check on bytes that would never decode.
+    db = Database(store=store)
+    with pytest.raises(ValueError, match="Digest collision"):
+        db.get(write_through_constant)
+
+    assert store.get(digest) == b"wrong bytes"
+
+
+def test_correct_preseed_is_accepted_without_a_new_put() -> None:
+    p = Input[int]("preseed_correct")
+
+    @query
+    def preseed_correct_query(db: Database) -> int:
+        return p.read(db) + 77
+
+    victim = fingerprint_snapshot(freeze(77))
+    store = _PutCountingStore()
+    store.put(victim, serialize_snapshot(freeze(77)))
+    store.put_log.clear()
+
+    db = Database(store=store)
+    db.set(p, 0)
+    assert db.get(preseed_correct_query) == 77
+    ck_key = db.save_checkpoint()
+
+    # Bytes that already match are left alone: the digest is never re-`put`.
+    assert victim not in store.put_log
+
+    # A second identical save republishes no snapshot. The manifest key is
+    # written unconditionally and is idempotent on equal bytes, so it is not
+    # part of the count.
+    snapshot_puts = [d for d in store.put_log if not d.startswith("ck")]
+    assert db.save_checkpoint() == ck_key
+    assert [d for d in store.put_log if not d.startswith("ck")] == snapshot_puts
+
+
 def test_checkpoint_store_passed_to_save_and_load_directly() -> None:
     p = Input[int]("ckp_direct")
 
