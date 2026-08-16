@@ -35,7 +35,7 @@ _CHECKPOINT_VERSION_PROSE = (
         re.compile(r"accepts manifest schema v(?P<version>\d+) only"),
     ),
     (
-        Path("docs/migration-v3.md"),
+        Path("docs/kernel-contract.md"),
         re.compile(r"Manifest schema v(?P<version>\d+) rejects"),
     ),
 )

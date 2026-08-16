@@ -906,6 +906,9 @@ injection; the store passed to `load_checkpoint` is also used for subsequent
 snapshot loading if the `Database` was not constructed with a `store=`
 argument.
 
+Manifest schema v6 rejects v1-v5 manifests with `CheckpointVersionError`; stale
+checkpoints are re-saved, never migrated.
+
 ## FileSystemArtifactStore
 
 `FileSystemArtifactStore` accepts only digest-shaped keys, serializes each
