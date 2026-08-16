@@ -216,7 +216,14 @@ probe-comparison machinery drive invalidation:
 - A `ReentrantDatabaseError` from a hook that read back into the database is
   **not** one of these. It observes nothing about the outside world, so no
   failure record is written and no probe is stored for a later read to match. A
-  node with no record still has none. A node that already held one keeps
+  node with no record still has none, so there is no edge for a reader to
+  publish either: a query body that catches the refusal is marked untracked
+  instead, carrying a reason that names the resource, so it re-executes on
+  every request and is kept out of checkpoints along with everything above it.
+  Without that it would commit a fallback resting on nothing the graph
+  describes and go on serving it once the hook was rewritten to stop reading
+  the database, where a fresh `Database` returns the value. A node that already
+  held one keeps
   exactly the record its last real observation wrote — not failed, still
   carrying that observation's probe — and is marked *unconfirmed*: the state a
   `probe` that raises leaves behind (Two boundaries apply, below), and left for
@@ -226,6 +233,7 @@ probe-comparison machinery drive invalidation:
   a record, and entering that state moves the revision exactly as it does for a
   raising probe.
   (See: `test_rejected_hook_read_is_not_a_load_failure`,
+  `test_query_catching_a_refused_hook_read_is_marked_impure`,
   `test_refused_hook_read_on_a_recorded_resource_retires_its_probe`)
 - Behaviour is identical in `strict`, `checked`, and `fast`.
 
@@ -618,16 +626,20 @@ A query refused for asking for *itself* is the one exception. That `CycleError`
 is the kernel refusing a shape before any work starts: nothing was executed
 below the refusal, so nothing was read into a frame that is now gone, and the
 refused request stays pinned to the registration the outer execution of that
-same node already owns. Catching that leaves an ordinary reusable record. A
-cycle that reaches back through *another* query is not that shape — the branch
-that reached back read whatever it read before it did, and its frame is
-discarded with those reads in it — so catching one of those marks the catcher
-like any other caught failure.
+same node already owns. Catching that **in the query that asked for itself**
+leaves an ordinary reusable record; the exemption goes no further than that
+query, and a *parent* that catches a child's self-cycle is marked like any
+other caught failure, because the child read whatever it read before it asked
+for itself and its frame is discarded with those reads in it. A cycle that
+reaches back through *another* query is not that shape either — the branch
+that reached back read whatever it read before it did — so catching one of
+those marks the catcher too.
 (See: `test_caught_query_failure_does_not_publish_a_dependency_edge`,
 `test_caught_sub_query_failure_marks_the_catching_parent_impure`,
 `test_caught_sub_query_failure_excludes_the_parent_from_checkpoints`,
 `test_query_catching_its_own_cycle_keeps_committed_registries`,
 `test_caught_cycle_does_not_mark_the_catcher_impure`,
+`test_self_cycle_caught_by_the_parent_marks_the_parent_impure`,
 `test_cycle_caught_through_another_query_marks_the_catcher_impure`)
 
 ## Escape Hatches
@@ -639,7 +651,9 @@ like any other caught failure.
   knows a value rests on something no record describes: a query that catches an
   exception raised by a sub-query is marked with a reason naming that sub-query,
   and — since that failure is not in the graph at all — kept out of checkpoints
-  as well. Limitation 7 states the one refusal that mark does not follow.
+  as well; a query that catches a hook refusal from a resource this `Database`
+  has never loaded is marked the same way, with a reason naming the resource.
+  Limitation 7 states the one refusal that mark does not follow.
   (See: `test_report_untracked_read_forces_reexecution_on_every_request`,
   `test_impure_child_prevents_parent_backdating_unless_result_unchanged`)
 
@@ -802,7 +816,7 @@ to work unaffected. If many threads share a single `Database`, work serialises
 on the per-instance lock; if they hold separate `Database` instances they run
 in parallel.
 
-A thread that a query body **starts** is the one case that does not simply
+A thread that a query body **starts** is one case that does not simply
 wait: it inherits the boundary of the query that started it. Its undeclared
 ambient reads raise `UntrackedReadError` exactly as they would on the
 executing thread, and its calls back into that same `Database` raise

@@ -294,12 +294,17 @@ decided at release time.
   reaches a `probe`, which takes no database and can still hold one, and it
   holds for a `read_resource` made at top level, where no query is running at
   all. A refused read is not an observation of the outside world, so — unlike a
-  load that raises — it writes no failure record and stores no probe. A node
-  that already held a record keeps exactly the one its last real observation
-  wrote and is marked unconfirmed, which retires that stored probe, so the next
-  read re-runs the hook and is refused on its own account instead of being
-  answered from a record. A thread started inside a hook inherits the hook's
-  standing too — its database calls refuse, its raw reads do not — including
+  load that raises — it writes no failure record and stores no probe. A
+  resource this database has never loaded therefore leaves nothing behind at
+  all, not even an edge, so a query body that catches the refusal is marked
+  untracked with a reason naming the resource: it used to commit its fallback
+  as an ordinary cached result and go on serving it once the hook was rewritten
+  to stop reading the database, while a fresh database returned the value. A
+  node that already held a record keeps exactly the one its last real
+  observation wrote and is marked unconfirmed, which retires that stored probe,
+  so the next read re-runs the hook and is refused on its own account instead
+  of being answered from a record. A thread started inside a hook inherits the
+  hook's standing too — its database calls refuse, its raw reads do not — including
   from a top-level `read_resource`, where it used to block forever on the state
   lock its own parent was holding. Raw I/O inside a hook is unaffected:
   observing files, the environment and directory listings is what a hook is
@@ -316,12 +321,14 @@ decided at release time.
   re-executes on every request, never backdates, and is left out of checkpoints
   along with everything above it. Modelling a handled failure as a returned
   value is still what keeps a caller incremental. One shape is unchanged: a
-  query refused for asking for itself. That refusal lands before any work
-  starts, so nothing was read into a frame that is then discarded, and the
-  refused request stays pinned to the registration the outer execution already
-  owns — catching it still leaves a reusable record. A `CycleError` that
-  reaches back through another query is marked like any other caught failure,
-  since the branch that reached back read whatever it read on the way.
+  query refused for asking for itself, catching that refusal itself. It lands
+  before any work starts, so nothing was read into a frame that is then
+  discarded, and the refused request stays pinned to the registration the outer
+  execution already owns — catching it still leaves a reusable record. A parent
+  that catches its child's self-cycle is not that shape and is marked, since
+  the child read whatever it read before it asked for itself and its frame goes
+  with those reads in it; nor is a `CycleError` that reaches back through
+  another query, which is marked for the same reason.
 
 ## [3.1.1] - 2026-08-03
 

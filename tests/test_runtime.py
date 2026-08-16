@@ -3540,7 +3540,15 @@ def test_query_spawned_thread_calling_into_the_database_fails_fast(
     assert len(outcome) == 1
     refusal = outcome[0]
     assert isinstance(refusal, ReentrantDatabaseError), refusal
-    assert "is not allowed from a thread spawned inside a query execution" in str(refusal)
+    # The whole message, not just the tail the five share: the name is the half
+    # that says which entry point refused, so a wiring carrying the wrong
+    # literal -- or one deleted in favour of a refusal further in, which would
+    # answer for a call the child never made -- has to fail here. For
+    # `db.request_span()` and `db.report_untracked_read()` this is the only
+    # place either literal is pinned exactly.
+    assert str(refusal) == (
+        f"db.{surface}() is not allowed from a thread spawned inside a query execution."
+    )
 
 
 def test_query_spawned_thread_unsubscribing_fails_fast() -> None:
@@ -4314,6 +4322,84 @@ def test_refused_hook_read_on_a_recorded_resource_retires_its_probe() -> None:
     assert db.statistics().resource_count == 1
     node = next(n for n in db.dependency_graph() if n.label == "sometimes-reading[subject]")
     assert node.last_decision == "executed"
+
+
+def test_query_catching_a_refused_hook_read_is_marked_impure() -> None:
+    """A body that survives the refusal rests on it, and may not be reused.
+
+    Where the resource already held a record, the refusal reaches the reader
+    through the graph: the edge to that node is published on the way out and
+    the unconfirmed mark makes it report as changed. A resource this database
+    has never loaded offers none of that -- no record to depend on, no probe to
+    retire -- so a body that catches the refusal used to commit an answer with
+    no edge to anything and be reused from then on. Once the hook was rewritten
+    to stop reading the database, the warm database went on serving the
+    fallback while a fresh one returned the value. The untracked mark is what
+    is left to force the body to derive its answer again.
+    """
+    counter = Input[int]("counter")
+
+    class SometimesRefusingResource:
+        """Reads the database until its instance switch is thrown."""
+
+        def __init__(self) -> None:
+            self.reads_the_database = True
+
+        def identity(self) -> tuple[str]:
+            # Constant across the switch: the query captured this resource, so
+            # a configuration that moved with the hook would re-key the query
+            # and hide the reuse this test is about behind a cold execution.
+            return ("sometimes-refusing-resource",)
+
+        def label(self, name: str) -> str:
+            return f"sometimes-refusing[{name}]"
+
+        def probe(self, name: str) -> str:
+            return "probe"
+
+        def load(self, db: Database, name: str) -> str:
+            if self.reads_the_database:
+                return f"value:{db.read_input(counter)}"
+            return "value:quiet"
+
+    resource = SometimesRefusingResource()
+
+    @query
+    def catcher(db: Database) -> str:
+        try:
+            return str(db.read_resource(resource, "subject"))
+        except ReentrantDatabaseError:
+            return "fallback"
+
+    db = Database()
+    db.set(counter, 1)
+    assert db.get(catcher) == "fallback"
+
+    # Nothing was recorded for the resource, so the answer above it rests on no
+    # edge at all -- only on the mark naming what was caught.
+    assert db.statistics().resource_count == 0
+    assert db.inspect(catcher).dependencies == ()
+    reasons = db.inspect(catcher).untracked_reasons
+    assert reasons
+    assert any("sometimes-refusing[subject]" in reason for reason in reasons)
+
+    # Which means the next request derives it again rather than reusing it.
+    executions = db.statistics().query_executions
+    assert db.get(catcher) == "fallback"
+    assert db.statistics().query_executions == executions + 1
+    assert db.inspect(catcher).last_decision == "executed"
+
+    # And a hook that stops reading the database reaches the catcher, exactly
+    # as it reaches a database that never saw the refusal.
+    resource.reads_the_database = False
+    executions = db.statistics().query_executions
+    warm = db.get(catcher)
+    fresh = Database()
+    fresh.set(counter, 1)
+    assert warm == fresh.get(catcher) == "value:quiet"
+    assert db.statistics().query_executions == executions + 1
+    # A run that caught nothing is an ordinary run: the mark is not sticky.
+    assert db.inspect(catcher).untracked_reasons == ()
 
 
 def test_thread_spawned_inside_a_hook_outside_a_query_is_refused() -> None:

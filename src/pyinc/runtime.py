@@ -2666,7 +2666,7 @@ class Database:
                 self._refresh_resource(resource, parameter, key, outcome)
                 self._record_dependency(key)
                 result = self._expose_boundary_snapshot(self._records[key].snapshot)
-            except Exception:
+            except Exception as exc:
                 # A load that raised is still an observation: when it left a
                 # failure record behind, the reader depends on it exactly as it
                 # would on a value, so the edge is recorded before unwinding.
@@ -2674,6 +2674,17 @@ class Database:
                     self._record_dependency(key)
                 else:
                     self._resource_objects().pop(key, None)
+                    if isinstance(exc, ReentrantDatabaseError):
+                        # A hook refused on a resource this database has never
+                        # loaded leaves nothing at all: no record to depend on
+                        # and no stored probe to retire. A body that catches
+                        # the refusal would otherwise commit an answer with no
+                        # edge to anything and be reused from then on -- still
+                        # answering with its fallback once the hook is rewritten
+                        # to stop reading the database, where a fresh database
+                        # returns the value. The untracked mark is what is left
+                        # to force it to derive its answer again.
+                        self._mark_frame_impure(f"caught refusal from resource '{key.label}'")
                 if not outcome.failure_recorded:
                     # Nothing in the graph describes the exception this reader is
                     # about to see, so whatever it returns cannot be re-derived

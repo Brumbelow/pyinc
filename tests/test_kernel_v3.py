@@ -1619,6 +1619,55 @@ def test_cycle_caught_through_another_query_marks_the_catcher_impure() -> None:
     assert db.inspect(parent).last_decision == "executed"
 
 
+def test_self_cycle_caught_by_the_parent_marks_the_parent_impure() -> None:
+    gate = Input[int]("caught-child-self-cycle-gate")
+
+    @query(key="caught-child-self-cycle-child")
+    def child(db: Database) -> str:
+        if gate.read(db) == 0:
+            # Asks for itself, and leaves the refusal to whoever called it.
+            return child(db)
+        return "ok"
+
+    @query(key="caught-child-self-cycle-parent")
+    def parent(db: Database) -> str:
+        try:
+            return child(db)
+        except CycleError:
+            return "fallback"
+
+    db = Database()
+    db.set(gate, 0)
+    assert db.get(parent) == "fallback"
+
+    # The exemption belongs to the query that asked for itself and caught its
+    # own refusal, where nothing was executed below the refusal. Here the
+    # refusal is caught a frame higher: the child read the gate before it asked
+    # for itself, and its frame is discarded with that read in it, so the
+    # parent's answer rests on state no record describes and is marked like any
+    # other caught failure.
+    assert db.inspect(parent).dependencies == ()
+    reasons = db.inspect(parent).untracked_reasons
+    assert reasons
+    assert any("caught-child-self-cycle-child" in reason for reason in reasons)
+
+    executions = db.statistics().query_executions
+    assert db.get(parent) == "fallback"
+    assert db.statistics().query_executions == executions + 1
+
+    # And the change that stops the child recursing reaches the parent, exactly
+    # as it reaches a database that never saw the cycle.
+    db.set(gate, 1)
+    executions = db.statistics().query_executions
+    warm = db.get(parent)
+    fresh = Database()
+    fresh.set(gate, 1)
+    assert warm == fresh.get(parent) == "ok"
+    assert db.statistics().query_executions == executions + 2
+    assert db.inspect(parent).last_decision == "executed"
+    assert db.inspect(parent).untracked_reasons == ()
+
+
 def test_query_labels_do_not_call_argument_repr() -> None:
     @dataclass(frozen=True)
     class HostileRepr:
