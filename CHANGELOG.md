@@ -245,43 +245,46 @@ decided at release time.
   behind. A thread that outlives the query that spawned it returns to normal
   the moment that query ends: the frame it inherited records that its
   execution finished, and raw reads from the survivor are ordinary reads
-  again. Threads created before the query began — pre-warmed pools, module
-  scope executors, reused worker threads — never pass through this boundary
-  and stay outside it.
+  again. Threads created before the query began — pre-warmed pools, executors
+  built at module scope, reused worker threads — never pass through this
+  boundary and stay outside it.
 - Calls into a `Database` from a thread spawned inside one of its running
-  queries now raise `ReentrantDatabaseError` instead of deadlocking. `get`,
-  `read_input`, `read_resource`, `request_span`, `report_untracked_read` and
-  `Subscription.unsubscribe` all want the state lock the executing query body
-  is holding, so a body that started a thread and waited for it never came
-  back — the child waited for the lock and the parent waited for the child.
-  The refusal is checked before the lock is taken and before anything else the
-  call would do, so the deadlock is now a typed error raised in the child,
-  where the code that made the call can see it. Threads outside the boundary
-  are unaffected: they still block until the running work releases the lock,
-  and a shared `Database` serialises across threads exactly as before.
-- Administrative and inspection calls on a `Database` are outside-only.
-  `set`, `set_many`, `save_checkpoint`, `load_checkpoint`,
-  `reset_statistics`, `request_inputs_changed`, `observe`, `revision`,
-  `statistics`, `query_profile`, `dependency_graph`, `explain`, `inspect` and
-  `inspect_fresh` now raise `ReentrantDatabaseError` when a query body calls
-  them, where they used to answer. The administrative half moved state the
-  running execution was deriving from: a body that set its own input read the
-  new value straight back, and the warm answer stopped matching what a fresh
-  database produces from the same declared inputs. The observational half
-  answers with functions of cache history, and `inspect` / `inspect_fresh`
-  publish no dependency edge for the node they report on, so a body reading
-  one depended on it without declaring it. Each refusal is raised before its
-  call does anything: no input registered, no iterable drained, no artifact
-  store or lock file touched, no checkpoint staged. The same set is refused
-  from a thread a query body started — which the entry above did not cover,
-  since it reached the read surface only, so an administrative call from a
-  spawned thread still deadlocked. A body's own reads are untouched: `get`,
-  `read_input`, `read_resource`, `report_untracked_read` and an inner
-  `request_span` are what a query body is for.
+  queries now raise `ReentrantDatabaseError` instead of deadlocking. The
+  reading surface — `get`, `read_input`, `read_resource`, `request_span`,
+  `report_untracked_read` and `Subscription.unsubscribe` — and every
+  administrative and observational entry point beside it all want the state
+  lock the executing query body is holding, so a body that started a thread
+  and waited for it never came back: the child waited for the lock and the
+  parent waited for the child. The refusal is checked before the lock is taken
+  and before anything else the call would do, so the deadlock is now a typed
+  error raised in the child, where the code that made the call can see it.
+  Threads outside the boundary are unaffected: they still block until the
+  running work releases the lock, and a shared `Database` serialises across
+  threads exactly as before.
+- Administrative and observational entry points on a `Database` are
+  outside-only. `set`, `set_many`, `save_checkpoint`, `load_checkpoint`,
+  `reset_statistics`, `request_inputs_changed`, `observe`, `statistics`,
+  `query_profile`, `dependency_graph`, `explain`, `inspect`, `inspect_fresh`
+  and the `revision` property now raise `ReentrantDatabaseError` when a query
+  body reaches them, where they used to answer. The administrative ones moved
+  state the running execution was deriving from: a body that set its own input
+  read the new value straight back, and the warm answer stopped matching what a
+  fresh database produces from the same declared inputs. The observational ones
+  answer with a function of the database's own history rather than of the
+  query's declared inputs — `observe` included, since registration is per call
+  and a body runs only when the kernel decides to execute it, so subscribing
+  from one made the subscriber list a function of cache history — and `inspect`
+  / `inspect_fresh` publish no dependency edge for the node they report on, so
+  a body reading one depended on it without declaring it. Each refusal is
+  raised before its call does anything: no input registered, no iterable
+  drained, no artifact store or lock file touched, no checkpoint staged. A
+  body's own reads are untouched: `get`, `read_input`, `read_resource`,
+  `report_untracked_read` and an inner `request_span` are what a query body is
+  for.
 - A resource hook may no longer read the database it is observing for. `probe`,
   `load` and `probe_and_load` now raise `ReentrantDatabaseError` from `get`,
-  `read_input` and `read_resource` — and from the administrative and
-  observational calls beside them — where those calls used to answer. Such a
+  `read_input` and `read_resource` — and from every administrative and
+  observational entry point beside them — where they used to answer. Such a
   read was invisible to the graph: the resource node records the probe and the
   value and never what the hook read to build them, so a warm request that
   answered the resource from an unchanged probe reused a value assembled from
@@ -296,13 +299,13 @@ decided at release time.
   wrote and is marked unconfirmed, which retires that stored probe, so the next
   read re-runs the hook and is refused on its own account instead of being
   answered from a record. A thread started inside a hook inherits the hook's
-  boundary too, including from a top-level `read_resource`, where it used to
-  block forever on the state lock its own parent was holding. Raw I/O inside a
-  hook is unaffected: observing files, the
-  environment and directory listings is what a hook is for, and the ambient
-  guard stays lifted for its extent. Where a resource genuinely needs a value
-  the database holds, the reading query reads it — declaring its edges — and
-  passes it in as part of the resource's key.
+  standing too — its database calls refuse, its raw reads do not — including
+  from a top-level `read_resource`, where it used to block forever on the state
+  lock its own parent was holding. Raw I/O inside a hook is unaffected:
+  observing files, the environment and directory listings is what a hook is
+  for, and the ambient guard stays lifted for its extent. Where a resource
+  genuinely needs a value the database holds, the reading query reads it —
+  declaring its edges — and passes it in as part of the resource's key.
 - A query that catches an exception raised by a sub-query is marked untracked
   instead of being cached as a pure result. A failing query publishes no record
   and no dependency edge, so the caller that handled the failure was reused

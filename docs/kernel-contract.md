@@ -128,18 +128,19 @@ A resource hook observes the outside world and only the outside world. Raw I/O
 is what `probe`, `load` and `probe_and_load` are for, so the interception below
 is lifted for their extent — but they may not read back into the `Database`
 they are observing for. `get`, `read_input` and `read_resource` raise
-`ReentrantDatabaseError` when a hook calls them, as do the administrative and
-observational calls; the refusal is on the position, not the argument, so it
-reaches a `probe` that holds a database of its own just as it reaches a `load`
-that was handed one. What such a read would produce is invisible to the graph:
-the node records the probe and the value and never what the hook read to build
-them, so a warm request that answers from an unchanged probe reuses a value no
-fresh database would produce. Database-derived values reach a resource through
-its **key** — the reading query reads them, declaring its edges, and passes
-them in.
+`ReentrantDatabaseError` when a hook calls them, as does every administrative
+and observational entry point; the refusal is on the position, not the
+argument, so it reaches a `probe` that holds a database of its own just as it
+reaches a `load` that was handed one. What such a read would produce is
+invisible to the graph: the node records the probe and the value and never what
+the hook read to build them, so a warm request that answers from an unchanged
+probe reuses a value no fresh database would produce. Database-derived values
+reach a resource through its **key** — the reading query reads them, declaring
+its edges, and passes them in.
 (See: `test_resource_hook_reading_the_database_raises_a_typed_error`,
 `test_resource_hook_calling_set_raises_without_a_live_frame`,
-`test_rejected_hook_read_is_not_a_load_failure`)
+`test_rejected_hook_read_is_not_a_load_failure`,
+`test_thread_spawned_inside_a_hook_reads_raw_files_freely`)
 
 The kernel intercepts the following during query execution and raises
 `UntrackedReadError` if they are called outside a resource scope:
@@ -217,12 +218,13 @@ probe-comparison machinery drive invalidation:
   failure record is written and no probe is stored for a later read to match. A
   node with no record still has none. A node that already held one keeps
   exactly the record its last real observation wrote — not failed, still
-  carrying that observation's probe — and is marked *unconfirmed*, the same
-  state an unprobeable raise leaves behind and for the same reason: without it
-  a probe that came back to the recorded value would answer warm from a hook
-  that can no longer run. So the next read re-runs the hook and is refused on
-  its own account rather than answered from a record, and entering that state
-  moves the revision exactly as it does above.
+  carrying that observation's probe — and is marked *unconfirmed*: the state a
+  `probe` that raises leaves behind (Two boundaries apply, below), and left for
+  the same reason, since without it a probe that came back to the recorded
+  value would answer warm from a hook that can no longer run. So the next read
+  re-runs the hook and is refused on its own account rather than answered from
+  a record, and entering that state moves the revision exactly as it does for a
+  raising probe.
   (See: `test_rejected_hook_read_is_not_a_load_failure`,
   `test_refused_hook_read_on_a_recorded_resource_retires_its_probe`)
 - Behaviour is identical in `strict`, `checked`, and `fast`.
@@ -389,7 +391,10 @@ file on three of them.
 ## Explicit Limitations
 
 These fall **outside** the soundness envelope. The kernel does not guarantee
-from-scratch consistency when any of these apply.
+from-scratch consistency when any of these apply, except where the entry itself
+says otherwise: the durable-cache entry states the conditions under which the
+guarantee survives into a later process, and the eviction and caught-failure
+entries hold it in-process at the cost of incrementality.
 
 **1. Unintercepted ambient reads.**
 The condition 2 guard covers an enumerated set of entry points, not a category of
@@ -595,18 +600,19 @@ scratch on its next request. This is correct but may degrade performance.
 The edge a failing *resource* read publishes before its exception propagates has
 no query-side equivalent: a query's record and dependency edges publish only
 after it returns, so a query that catches an exception raised by a sub-query is
-left holding a value with no edge to what produced it. That value is never
-carried into a later request. The catching query is marked untracked — the same
-mark `db.report_untracked_read` records, carrying a reason that names the
-sub-query whose exception was caught — so it re-executes on every request (a
-second ask *within* one request still reuses what that request already settled)
-and never backdates, and its record is kept out of checkpoints as well, together
-with everything above it. A later change
-that makes the sub-query succeed therefore reaches the caller, matching a fresh
-`Database`; what is lost is the incrementality — that query's body runs on every
-request, and the nodes above it re-verify, backdating only where their own
-results are unchanged. Model a failure the caller means to handle as a returned
-value, or route it through a `Resource`, to keep the caller incremental.
+left holding a value with no edge to what produced it. Except for the one shape
+the next paragraph names, that value is not carried into a later request. The
+catching query is marked untracked — the same mark `db.report_untracked_read`
+records, carrying a reason that names the sub-query whose exception was caught
+— so it re-executes on every request (a second ask *within* one request still
+reuses what that request already settled) and never backdates, and its record
+is kept out of checkpoints as well, together with everything above it. A later
+change that makes the sub-query succeed therefore reaches the caller, matching
+a fresh `Database`; what is lost is the incrementality — that query's body runs
+on every request, and the nodes above it re-verify, backdating only where their
+own results are unchanged. Model a failure the caller means to handle as a
+returned value, or route it through a `Resource`, to keep the caller
+incremental.
 
 A query refused for asking for *itself* is the one exception. That `CycleError`
 is the kernel refusing a shape before any work starts: nothing was executed
@@ -633,7 +639,7 @@ like any other caught failure.
   knows a value rests on something no record describes: a query that catches an
   exception raised by a sub-query is marked with a reason naming that sub-query,
   and — since that failure is not in the graph at all — kept out of checkpoints
-  as well (limitation 7).
+  as well. Limitation 7 states the one refusal that mark does not follow.
   (See: `test_report_untracked_read_forces_reexecution_on_every_request`,
   `test_impure_child_prevents_parent_backdating_unless_result_unchanged`)
 
@@ -803,31 +809,37 @@ executing thread, and its calls back into that same `Database` raise
 `ReentrantDatabaseError` instead of waiting for the lock — the reading surface
 `get`, `read_input`, `read_resource`, `request_span`,
 `report_untracked_read` and `Subscription.unsubscribe`, and every
-administrative and observational call beside them (the outside-only set,
-enumerated under Public Surface below). Nothing a descendant can reach waits
-on the lock. Waiting is what they must not do: the query body holds
+administrative and observational entry point beside them (the outside-only
+set, enumerated under Public Surface below). Nothing a descendant can reach
+waits on the lock. Waiting is what they must not do: the query body holds
 the lock for the whole of its execution, so a child that blocks on it while
 the body waits for the child is a deadlock, and the refusal is what turns
 that pair into an error the caller can read. The boundary ends when the query
 does — a thread that outlives its spawning query is an ordinary thread again,
 and both its reads and its calls are allowed.
 
-A thread that a **resource hook** starts inherits the boundary the same way,
-and this holds with no query running at all: a `read_resource` made at top
-level holds the state lock across the whole hook while opening no execution, so
-a child that inherited nothing would block on that lock until its parent
-returned — never, if the parent joins it. Such a child's calls raise
-`ReentrantDatabaseError` naming the hook. One asymmetry with the query case is
-worth knowing: a hook's boundary is a depth rather than a frame, and a depth
-carries no completion flag, so a thread started inside a hook that *outlives*
-that hook keeps reporting itself inside one and stays refused, where a
-survivor of a query returns to normal.
+A thread that a **resource hook** starts is covered too, and this holds with no
+query running at all: a `read_resource` made at top level holds the state lock
+across the whole hook while opening no execution, so a child that inherited
+nothing would block on that lock until its parent returned — never, if the
+parent joins it. Such a child's calls raise `ReentrantDatabaseError` naming the
+hook. What it inherits is a hook's standing and not a query's, and the two
+differ in both directions. Its raw reads are **allowed**: a hook carries
+raw-read permission for its extent and the child inherits that with the rest,
+so observing files, the environment and directory listings is what such a child
+is for, exactly as it is for the hook itself — only its calls back into the
+`Database` refuse. In the other direction, a hook's boundary is a depth rather
+than a frame, and a depth carries no completion flag, so a thread started
+inside a hook that *outlives* that hook keeps reporting itself inside one and
+stays refused, where a survivor of a query returns to normal. Either survivor's
+context holds the `Database` itself for as long as the thread object lives, and
+a thread the survivor starts in turn stands where the survivor does.
 
 Threads that already existed when the query began — a pre-warmed pool, an
 executor built at module scope, a reused `ThreadPoolExecutor` worker — are
 outside that boundary. Their ambient reads are not intercepted, so a query
-that farms one out to such a worker records no dependency for it (Explicit
-Limitation 1), and their calls into the database are not refused, so a query
+that farms one out to such a worker records no dependency for it
+(limitation 1), and their calls into the database are not refused, so a query
 that waits on such a worker while the worker waits on the lock still
 deadlocks. Hand the work to a thread the query itself starts, or keep the
 I/O in a declared read.
@@ -957,7 +969,7 @@ Core:
 
 | Name | What it is |
 |---|---|
-| `Database` | The incremental query database: `get`, `set`, `set_many`, `inspect`, `inspect_fresh`, `explain`, `observe`, `request_span`, `request_inputs_changed`, checkpoint save/load. Administration and inspection are outside-only: called from a query body they raise `ReentrantDatabaseError` instead of answering (see below). |
+| `Database` | The incremental query database: `get`, `set`, `set_many`, `inspect`, `inspect_fresh`, `explain`, `observe`, `request_span`, `request_inputs_changed`, checkpoint save/load. Its administrative and observational entry points are outside-only: reached from a query body they raise `ReentrantDatabaseError` instead of answering (see below). |
 | `Input` | A declared, keyed input whose values enter through `db.set`. |
 | `query` | Decorator declaring a pure incremental query. |
 | `Query` | The declared-query object `@query` returns; readable from other queries and from `db.get`. Handle attributes are part of query identity: writing one moves the query's identity, so records stored under the old one no longer answer. |
@@ -973,25 +985,34 @@ Core:
 `Database` splits in two at the query boundary. Inside a query body the reading
 surface is open, and only that: `get`, `read_input`, `read_resource`,
 `report_untracked_read`, and a `request_span` that joins the request the
-execution already opened. Everything else is outside-only and raises
-`ReentrantDatabaseError` when a body calls it — the administrative calls `set`,
-`set_many`, `save_checkpoint`, `load_checkpoint`, `reset_statistics`,
-`request_inputs_changed` and `observe`, and the observational ones `revision`,
-`statistics`, `query_profile`, `dependency_graph`, `explain`, `inspect` and
-`inspect_fresh`.
+execution already opened — together with `Subscription.unsubscribe`, which
+Thread Safety counts with the reading surface although it is a `Subscription`
+method rather than one of `Database`'s own entry points. Everything else on
+`Database` is outside-only and raises `ReentrantDatabaseError` when a body
+reaches it — the administrative calls `set`, `set_many`, `save_checkpoint`,
+`load_checkpoint`, `reset_statistics`, `request_inputs_changed` and `observe`,
+and the observational `statistics`, `query_profile`, `dependency_graph`,
+`explain`, `inspect`, `inspect_fresh` and the `revision` property.
 
 The two halves are refused for related reasons. An administrative call moves
 state the running execution is deriving from, so the body reads back a world
 its own caller never declared and the warm answer stops matching what a fresh
-database produces from the same inputs. An observational call answers with a
-function of cache history — how many executions have run, what was reused,
-which decision a node last took — which is exactly what a query result may not
-depend on; `inspect` and `inspect_fresh` also publish no dependency edge for
-the node they report on, so a body reading one would depend on it undeclaredly.
-Each refusal is raised before its call does anything at all: no input is
-registered, no iterable is drained, no artifact store or lock file is touched,
-and no checkpoint is staged. The same set is refused from a thread a query body
-started, with the message naming the descent instead (Thread Safety, above).
+database produces from the same inputs. `observe` is administrative because it
+writes, but what it writes is not state any execution derives from; its ground
+is the observational one instead — registration is per call and a body runs
+only when the kernel decides to execute it, so subscribing from one would make
+the subscriber list a function of cache history. That is what the observational
+half rests on throughout: each of those entry points answers with a function of
+the database's own history rather than of the query's declared inputs — how
+many executions have run, what was reused, which decision a node last took,
+and, for `revision`, every change the database has recorded since it was built
+— which is exactly what a query result may not depend on. `inspect` and
+`inspect_fresh` also publish no dependency edge for the node they report on, so
+a body reading one would depend on it undeclaredly. Each refusal is raised
+before its call does anything at all: no input is registered, no iterable is
+drained, no artifact store or lock file is touched, and no checkpoint is
+staged. The same set is refused from a thread a query body started, with the
+message naming the descent instead (Thread Safety, above).
 
 Inside a resource hook there is no open half at all: `probe`, `load` and
 `probe_and_load` observe the outside world, and every call back into the
@@ -1055,7 +1076,7 @@ Errors:
 | `UnsupportedValueError` | A value cannot cross a cached boundary safely. |
 | `AdapterContractError` | A registered adapter's instance configuration changed after `Database` construction. |
 | `CycleError` | Query evaluation encountered a dependency cycle. |
-| `ReentrantDatabaseError` | A call re-entered the database from inside its own execution — a query body, a resource hook, or a thread spawned inside a running query. |
+| `ReentrantDatabaseError` | A call re-entered the database from inside its own execution — from inside a query body, from inside a resource hook, or from a thread spawned inside a query execution. |
 | `InputKeyError` | An input key is invalid or conflicts within a database. |
 | `CheckpointError` | Base error for durable-checkpoint failures. |
 | `CheckpointVersionError` | A checkpoint uses an unsupported manifest or kernel version. |

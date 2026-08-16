@@ -4373,6 +4373,78 @@ def test_thread_spawned_inside_a_hook_outside_a_query_is_refused() -> None:
     assert str(refusal) == "db.read_input() is not allowed inside a resource hook."
 
 
+def test_thread_spawned_inside_a_hook_reads_raw_files_freely(tmp_path: Path) -> None:
+    """A hook's child inherits the hook's raw-read permission, not a query's ban.
+
+    The two halves of the boundary part company here. A thread a query body
+    starts is refused its ambient reads, because whatever it reads flows into a
+    result no edge describes. A thread a hook starts is doing the very thing a
+    hook is for, and the permission that lifts the guard for the hook's extent
+    sits in the context the child copies -- so its raw reads are allowed and
+    only its calls back into the database refuse, with the query frame above it
+    still live throughout.
+    """
+    observed = tmp_path / "observed.txt"
+    observed.write_text("payload", encoding="utf-8")
+
+    class RawReadingChildResource:
+        def identity(self) -> tuple[str]:
+            return ("hook-raw-read-resource",)
+
+        def label(self, name: str) -> str:
+            return f"hook-raw-read[{name}]"
+
+        def probe(self, name: str) -> str:
+            return "probe"
+
+        def load(self, db: Database, name: str) -> str:
+            # The child's outcome comes back as the hook's own value: a query
+            # may not capture mutable ambient state, so there is no shared list
+            # for it to append to from outside.
+            outcome: list[str] = []
+
+            def child() -> None:
+                try:
+                    with open(observed, encoding="utf-8") as handle:
+                        outcome.append(f"read allowed: {handle.read()}")
+                except Exception as exc:  # noqa: BLE001
+                    outcome.append(f"read refused: {type(exc).__name__}")
+                try:
+                    _ = db.revision
+                except Exception as exc:  # noqa: BLE001
+                    outcome.append(f"{type(exc).__name__}: {exc}")
+                else:
+                    outcome.append("db.revision allowed")
+
+            # A daemon so that a regression fails this test rather than
+            # stranding a blocked thread at interpreter exit.
+            thread = threading.Thread(target=child, daemon=True)
+            thread.start()
+            thread.join(timeout=10)
+            if thread.is_alive():
+                return "child still running"
+            return " | ".join(outcome)
+
+    resource = RawReadingChildResource()
+
+    @query
+    def reads_through_the_hook(db: Database) -> str:
+        return cast(str, db.read_resource(resource, "subject"))
+
+    db = Database()
+    executions_before = db.statistics().query_executions
+
+    reported = db.get(reads_through_the_hook)
+
+    # Witness: the query really executed, so the string below was assembled by
+    # a live hook under a live frame rather than served from a record.
+    assert db.statistics().query_executions - executions_before == 1
+    assert reported == (
+        "read allowed: payload | "
+        "ReentrantDatabaseError: db.revision is not allowed inside a resource hook."
+    )
+
+
 def test_module_capture_invalidates_on_source_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
