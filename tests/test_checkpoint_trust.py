@@ -34,15 +34,19 @@ from typing import Any, cast
 
 import pytest
 
+import pyinc
 from pyinc import (
     AdapterContractError,
+    CheckpointError,
     CheckpointManifestError,
+    CheckpointModeError,
     Database,
     FileResource,
     FileSystemArtifactStore,
     InMemoryArtifactStore,
     Input,
     InputKeyError,
+    PyIncError,
     UnsupportedValueError,
     freeze,
     query,
@@ -2322,3 +2326,20 @@ def test_reflective_queries_stay_rejected_after_a_checkpoint_load(
     loaded.load_checkpoint(checkpoint)
     with pytest.raises(UnsupportedValueError):
         loaded.get(read_config)
+
+
+# ---------------------------------------------------------------------------
+# The checkpoint error taxonomy. Each cause a load can fail for is its own
+# class, so a caller can catch one without catching the rest; a mode mismatch
+# is a cause of its own, and like its siblings it is catchable as a checkpoint
+# failure, as a pyinc error, and as a ValueError.
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_mode_error_is_public_and_catchable() -> None:
+    assert issubclass(CheckpointModeError, CheckpointError)
+    assert issubclass(CheckpointModeError, PyIncError)
+    assert issubclass(CheckpointModeError, ValueError)
+    assert "CheckpointModeError" in pyinc.__all__
+    with pytest.raises(CheckpointError):
+        raise CheckpointModeError("mode mismatch")

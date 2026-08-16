@@ -49,6 +49,10 @@ class CheckpointIntegrityError(CheckpointManifestError):
     """Raised when checkpoint bytes do not match their content address."""
 
 
+class CheckpointModeError(CheckpointError, ValueError):
+    """Raised when a checkpoint saved in one database mode is loaded into another."""
+
+
 class ActionError(PyIncError):
     """Base error for output reconciliation failures."""
 

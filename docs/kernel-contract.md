@@ -1096,6 +1096,7 @@ Errors:
 | `CheckpointVersionError` | A checkpoint uses an unsupported manifest or kernel version. |
 | `CheckpointManifestError` | A checkpoint manifest is malformed or internally inconsistent. |
 | `CheckpointIntegrityError` | Checkpoint bytes do not match their content address. |
+| `CheckpointModeError` | A checkpoint saved in one database mode was loaded into a database running another; refused before anything is staged. |
 | `ActionError` | Base error for output reconciliation failures. |
 | `ActionPathError` | An action output path is unsafe or ambiguous. |
 | `ActionManifestError` | An action ownership manifest is malformed or untrusted. |
