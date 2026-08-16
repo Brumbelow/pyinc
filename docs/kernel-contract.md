@@ -893,6 +893,18 @@ freezes, keyed by its internally derived content digest, via `Database(store=...
 Snapshot bytes use the encoding described in
 [Snapshot Serialization and Store Keys](#snapshot-serialization-and-store-keys).
 
+An implementation owes three things. `get` returns `None` for a digest the
+store does not hold and never raises for a missing one. `put` is idempotent for
+equal bytes under the same digest and raises `ValueError` when a digest would
+be rebound to different bytes, because silently keeping either value would mask
+corruption. `contains` reports whether a digest is present, defaulting to
+`get(...) is not None`. Every store handed to `Database(store=...)`,
+`save_checkpoint(store=...)` or `load_checkpoint(..., store=...)` is validated
+against the protocol at that call: one missing `get`, `put` or `contains`, or
+one that explicitly subclasses the protocol without implementing `get` and
+`put`, raises `TypeError` at injection rather than failing further downstream.
+A store validated at construction is not re-validated per call.
+
 On top of this, `Database.save_checkpoint(store=None) -> str` serialises the
 current query and resource records — their snapshot bytes, call snapshots,
 resource parameters, dependency edges, and per-adapter implementation digests —

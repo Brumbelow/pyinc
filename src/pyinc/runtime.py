@@ -115,6 +115,32 @@ _MISSING_MODULE_ATTRIBUTE = object()
 _UNREADABLE_RESOURCE_DIGEST = "unreadable-resource"
 
 
+def _validated_store(store: Any, parameter: str) -> ArtifactStore:
+    """Check an injected store against both halves of the store contract.
+
+    A store reaches deep into the persistence path before it is first used,
+    so an unusable one has to be refused where it is handed over rather than
+    surfacing as an ``AttributeError`` or a silent no-op several calls later.
+    The two checks catch different failures: the shape check rejects an object
+    that is missing a method outright, and the identity check rejects a
+    subclass that passes the shape check because it inherited the protocol's
+    own unimplemented ``get``/``put``. Inheriting the ``contains`` default is
+    intended and stays legal.
+    """
+    if not isinstance(store, ArtifactStore):
+        raise TypeError(
+            f"{parameter} must implement the ArtifactStore protocol "
+            f"(get, put, contains); got {type(store).__name__}."
+        )
+    for name in ("get", "put"):
+        if getattr(type(store), name, None) is getattr(ArtifactStore, name):
+            raise TypeError(
+                f"{parameter} inherits ArtifactStore.{name}() without "
+                f"implementing it; implement get() and put()."
+            )
+    return store
+
+
 def _build_runtime_build_payload() -> tuple[Any, ...]:
     return (
         "runtime-build-v3",
@@ -953,7 +979,11 @@ class Database:
         # Per-adapter-key implementation digests read from a loaded checkpoint's
         # manifest; the warm gate compares these against the live registry.
         self._checkpoint_adapter_digests: dict[str, str] = {}
-        self._store = store
+        self._store = (
+            _validated_store(store, "The store passed to Database(...)")
+            if store is not None
+            else None
+        )
         self._revision = 0
         self._records: dict[NodeKey, NodeRecord] = {}
         self._input_records: dict[Any, NodeKey] = {}
@@ -1605,7 +1635,13 @@ class Database:
         # Ahead of resolving the store, which is the first step towards the
         # cross-process lock a filesystem store takes to publish an object.
         self._reject_inside_query("db.save_checkpoint()")
-        _store = store if store is not None else self._store
+        # A store configured at construction was validated there; one handed
+        # over here is a fresh injection and gets the same check.
+        _store = (
+            _validated_store(store, "The store passed to save_checkpoint()")
+            if store is not None
+            else self._store
+        )
         if _store is None:
             raise ValueError(
                 "save_checkpoint() requires an ArtifactStore. "
@@ -1642,7 +1678,13 @@ class Database:
         running a different mode.
         """
         self._reject_inside_query("db.load_checkpoint()")
-        _store = store if store is not None else self._store
+        # A store handed over here outlives the call -- it serves every later
+        # snapshot read -- so it is checked before the key is even looked up.
+        _store = (
+            _validated_store(store, "The store passed to load_checkpoint()")
+            if store is not None
+            else self._store
+        )
         if _store is None:
             raise ValueError(
                 "load_checkpoint() requires an ArtifactStore. "

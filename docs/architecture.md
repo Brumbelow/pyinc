@@ -79,13 +79,19 @@ the boundary.
 
 `Database(store=...)` accepts any object satisfying the `ArtifactStore`
 protocol (`InMemoryArtifactStore` and `FileSystemArtifactStore` ship in
-`pyinc.store`). The kernel writes serialized snapshot bytes for every value
-crossing the membrane, keyed by an internally derived content digest. Bytes are
-produced by the public `serialize_snapshot` and consumed by
-`deserialize_snapshot`; the encoding is byte-stable and both round-trip the
-full snapshot grammar including `FrozenGraph` / `FrozenRef`. The digest helper
-is not public API: callers use the artifact-store and checkpoint operations
-instead of manufacturing kernel store keys.
+`pyinc.store`). Satisfying it is checked rather than assumed: the protocol
+shape is validated at the boundary, so a store missing `get`, `put` or
+`contains` — or one that explicitly subclasses the protocol without
+implementing `get` and `put` — raises `TypeError` at injection instead of
+failing later. Inheritance is still not required; any object carrying the three
+methods qualifies. The same check guards the `store=` arguments of
+`save_checkpoint` and `load_checkpoint`. The kernel writes serialized snapshot
+bytes for every value crossing the membrane, keyed by an internally derived
+content digest. Bytes are produced by the public `serialize_snapshot` and
+consumed by `deserialize_snapshot`; the encoding is byte-stable and both
+round-trip the full snapshot grammar including `FrozenGraph` / `FrozenRef`.
+The digest helper is not public API: callers use the artifact-store and
+checkpoint operations instead of manufacturing kernel store keys.
 
 `Database.save_checkpoint(store=None) -> str` serializes current node records,
 snapshot addresses, and dependency edges to a content-addressed key prefixed

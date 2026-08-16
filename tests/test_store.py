@@ -7,7 +7,7 @@ import struct
 import subprocess
 from pathlib import Path
 from queue import Empty
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 import pytest
 
@@ -1098,6 +1098,116 @@ def test_checkpoint_store_passed_to_save_and_load_directly() -> None:
     db2.load_checkpoint(ck_key, store=store)
     assert db2.get(ckp_sq) == 36
     assert db2.inspect(ckp_sq).last_recompute == "reused"
+
+
+class _DuckStore:
+    """Store-shaped object missing `contains` entirely.
+
+    Not a protocol subclass and not structurally complete, so it is the case
+    the shape check has to catch before the kernel reaches for the method
+    that is not there.
+    """
+
+    def __init__(self) -> None:
+        self._items: dict[str, bytes] = {}
+
+    def get(self, digest: str) -> bytes | None:
+        return self._items.get(digest)
+
+    def put(self, digest: str, payload: bytes) -> None:
+        self._items[digest] = payload
+
+
+@pytest.mark.parametrize("door", ["constructor", "save", "load"])
+def test_database_rejects_a_store_missing_required_methods(door: str) -> None:
+    assert not isinstance(_DuckStore(), ArtifactStore)
+
+    if door == "constructor":
+        with pytest.raises(TypeError, match="must implement the ArtifactStore protocol"):
+            Database(store=cast(Any, _DuckStore()))
+        return
+
+    db = Database()
+    if door == "save":
+        with pytest.raises(TypeError, match="must implement the ArtifactStore protocol"):
+            db.save_checkpoint(store=cast(Any, _DuckStore()))
+    else:
+        # A well-formed key that is simply absent: the shape check has to fire
+        # ahead of the lookup, or the caller learns about the missing key
+        # instead of the unusable store.
+        with pytest.raises(TypeError, match="must implement the ArtifactStore protocol"):
+            db.load_checkpoint("ck" + "0" * 64, store=cast(Any, _DuckStore()))
+
+
+def test_database_rejects_a_store_inheriting_the_protocol_stubs() -> None:
+    store = _ContainsOnlyStore()  # type: ignore[abstract]
+
+    # It has all three attributes, so the shape check alone waves it through:
+    # the two halves of the gate catch different failures.
+    assert isinstance(store, ArtifactStore)
+
+    with pytest.raises(TypeError, match="without implementing it"):
+        Database(store=store)
+
+
+class _LoggingMinimalStore(_MinimalProtocolStore):
+    """Minimal protocol store that records the digest of every `put`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.put_log: list[str] = []
+
+    def put(self, digest: str, payload: bytes) -> None:
+        self.put_log.append(digest)
+        super().put(digest, payload)
+
+
+def test_minimal_protocol_store_puts_once_per_distinct_digest() -> None:
+    seed = Input[int]("minimal_store_seed")
+
+    @query
+    def minimal_store_child(db: Database) -> int:
+        return seed.read(db) + 1
+
+    @query
+    def minimal_store_parent(db: Database) -> int:
+        return minimal_store_child(db) * 10
+
+    # Only `get` and `put` are defined; `contains` is the inherited default,
+    # which the boundary check has to keep admitting.
+    store = _LoggingMinimalStore()
+    db = Database(store=store)
+    db.set(seed, 4)
+    assert db.get(minimal_store_parent) == 50
+
+    ck_key = db.save_checkpoint()
+    assert db.save_checkpoint() == ck_key
+    assert db.save_checkpoint() == ck_key
+
+    manifest_puts = [d for d in store.put_log if d.startswith("ck")]
+    snapshot_puts = [d for d in store.put_log if not d.startswith("ck")]
+
+    # The manifest is written unconditionally and is idempotent on equal
+    # bytes, so it repeats once per save under a single key.
+    assert manifest_puts == [ck_key, ck_key, ck_key]
+
+    # Every other digest is content-addressed: three identical saves write
+    # each of them exactly once, not once per save.
+    assert snapshot_puts, "no snapshot was persisted; the count below would be vacuous"
+    assert sorted(snapshot_puts) == sorted(set(snapshot_puts))
+
+    warm = Database(store=store)
+    warm.set(seed, 4)
+    warm.load_checkpoint(ck_key)
+    before = warm.statistics()
+    assert warm.get(minimal_store_parent) == 50
+    after = warm.statistics()
+
+    # Witness: the warm request read the checkpoint through the same minimal
+    # store and executed nothing.
+    executions_during_warm = after.query_executions - before.query_executions
+    assert executions_during_warm == 0
+    assert after.query_reuses - before.query_reuses >= 1
 
 
 def test_filesystem_store_reports_exhausted_open_retries_as_lock_timeout(

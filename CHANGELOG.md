@@ -103,6 +103,17 @@ decided at release time.
   save could report success — and hand back a checkpoint key — against a store
   holding bytes the database could never warm from. Bytes that already match
   are left alone, so a healthy store still sees one write per distinct digest.
+- `ArtifactStore.contains` has the default its docstring has always promised —
+  `get(...) is not None` — instead of a body-less stub that returned `None`
+  for every digest, present or not. `get` and `put` raise `NotImplementedError`
+  rather than returning `None`, so an explicit subclass that skips them fails
+  at first use instead of behaving as a store that accepts every write and
+  holds nothing. Structural conformance is unchanged: any object with the
+  three methods still satisfies the protocol.
+- `InMemoryArtifactStore.keys()` returns a read-only view of its contents, as
+  its `Mapping` annotation already claimed. It previously handed back the
+  backing dictionary itself, so a caller could rebind or delete a stored
+  payload through it and walk straight past the collision guard.
 
 ### Added
 
@@ -119,6 +130,15 @@ decided at release time.
 
 ### Changed
 
+- Breaking: `Database(store=...)`, `save_checkpoint(store=...)` and
+  `load_checkpoint(store=...)` validate the store against the `ArtifactStore`
+  protocol and raise `TypeError` at the call. A store missing `get`, `put` or
+  `contains`, or one explicitly subclassing the protocol without implementing
+  `get` and `put`, was previously accepted and failed later — with a bare
+  `AttributeError` out of the persist path, or by quietly accepting every write
+  and reading nothing back. Duck-typed stores carrying the three methods are
+  still accepted, and a store validated at construction is not re-validated on
+  every call.
 - The checkpoint manifest schema is v7 and records the saving database's mode;
   v6 and earlier manifests are rejected loudly because their records cannot be
   attributed to a save mode.
