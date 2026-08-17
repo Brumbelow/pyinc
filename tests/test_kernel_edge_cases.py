@@ -20,7 +20,7 @@ from pyinc import (
     Query,
     query,
 )
-from pyinc.errors import InputKeyError, UnsupportedValueError
+from pyinc.errors import InputKeyError
 from pyinc.resources import Resource
 from pyinc.runtime import _default_observer_error_hook, _GuardedEnviron
 
@@ -240,43 +240,6 @@ def test_query_rejects_invalid_keys_and_policies() -> None:
     for key in ("", 0):
         with pytest.raises(ValueError, match="non-empty string"):
             Query(calculate, key=cast(Any, key))
-
-
-def test_query_comparison_supports_default_custom_and_cutoff_policies() -> None:
-    def calculate(db: Database) -> object:
-        return None
-
-    default = Query(calculate)
-    assert default.compare([1, 2], [1, 2])
-    assert not default.compare([1, 2], [2, 1])
-
-    custom = Query(calculate, eq=lambda left, right: len(left) == len(right))
-    assert custom.compare([1], [2])
-    assert not custom.compare([1], [2, 3])
-
-    cutoff = Query(calculate, cutoff=lambda value: value["stable"])
-    assert cutoff.compare({"stable": 1, "noise": 2}, {"stable": 1, "noise": 3})
-    assert not cutoff.compare({"stable": 1}, {"stable": 2})
-
-    # The default policy is the canonical relation: the numeric tower does
-    # not unify and NaN is reflexive. Query.compare is registry-free by
-    # contract -- adapted values need the Database's registry and go through
-    # the runtime's own comparison, never through this helper.
-    assert not default.compare(1, 1.0)
-    assert not default.compare(True, 1)
-    assert default.compare(float("nan"), float("nan"))
-    assert cutoff.compare({"stable": float("nan")}, {"stable": float("nan"), "noise": 1})
-
-    # Registry-free is visible in the cutoff arm's failures: a token that
-    # would need a ValueAdapter is rejected with freeze's own message, where
-    # the Database -- holding the registry -- either compares it or reports
-    # the failure as "Cutoff functions must return snapshot-safe values."
-    class Unadapted:
-        pass
-
-    unadapted = Query(calculate, cutoff=lambda value: Unadapted())
-    with pytest.raises(UnsupportedValueError, match="register an adapter"):
-        unadapted.compare(1, 1)
 
 
 def test_query_decorator_forms_and_query_call_delegate_to_database() -> None:

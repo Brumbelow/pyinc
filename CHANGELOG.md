@@ -34,6 +34,13 @@ decided at release time.
   `Database` now registers a built-in adapter for the kernel's own snapshot
   type, which also moves the stored encoding of such a reading — see the
   manifest schema note below.
+- `Query.compare` is removed. The runtime never called it — it compares stored
+  snapshots under the query's policy itself — and its cutoff arm froze tokens
+  without a `Database`, so it could reject a value the kernel's own comparison
+  accepts and report the failure in freeze's words rather than the kernel's.
+  Deciding equivalence under a query's policy is the kernel's job at the
+  boundary, not a public helper's; a caller who wants the default relation on
+  two values in hand has `semantic_equal`.
 
 ### Fixed
 
