@@ -5166,8 +5166,9 @@ class BoxedAdapter(ValueAdapter):
 
 @dataclass(frozen=True)
 class Point:
-    # Optional because the adapter below reports what it was actually handed:
-    # inside a shared graph the payload is not filled yet when thaw runs.
+    # Optional because the adapter below reports what it was actually handed,
+    # and in the graph shapes these cells build the payload is not filled yet
+    # when thaw runs.
     x: int | None
     y: int | None
 
@@ -5178,8 +5179,10 @@ class PointAdapter(ValueAdapter):
     Reading the payload instead of aliasing it is deliberate. An adapter that
     only stores what it is handed hides what the payload held at the moment
     `thaw` was called -- under `checked` and `fast` it is holding a container
-    the kernel fills afterwards, while under `strict` it is holding a rebuilt
-    view that never fills.
+    the kernel fills afterwards, and under `strict` a rebuilt shell the kernel
+    fills in node order. Whether either has been filled by then depends on
+    where the adapted value sits relative to its payload's node, so the cells
+    below fix the shape and assert what that shape yields.
     """
 
     def freeze(self, value: Point, freeze: Any) -> Any:
@@ -5460,10 +5463,13 @@ def test_strict_mode_reconstructs_adapted_values_inside_shared_graphs() -> None:
     # The adapter ran on this arm -- the leaf is the reconstructed type, not
     # the kernel's internal adapted-value wrapper.
     assert isinstance(exposed[0][0], Point)
-    # Known limitation: inside a graph encoding, an adapted value whose payload
-    # is itself a container is handed that payload before the kernel has filled
-    # it, so the reconstruction reads an empty payload. This is not a strict
-    # quirk -- see the mode-uniformity pin below.
+    # Known limitation: a container payload becomes its own graph node, and what
+    # the adapter is handed then depends on where the adapted value sits
+    # relative to that node -- strict fills nodes in an internal order, so the
+    # payload can be empty or already filled by the time `thaw` reads it. This
+    # shape orders the node holding the adapted value before its payload's node,
+    # so the payload is still empty here and the reconstruction reads nothing.
+    # This is not a strict quirk -- see the mode-uniformity pin below.
     assert (exposed[0][0].x, exposed[0][0].y) == (None, None)
 
 

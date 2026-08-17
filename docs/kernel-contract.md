@@ -745,7 +745,7 @@ those marks the catcher too.
     a node, an adapter cannot rely on the payload's contents while `thaw`
     runs. `checked` and `fast` pass the payload argument exactly as stored, so
     `thaw` receives the unresolved `FrozenRef` rather than the payload in
-    every such shape, and an adapter that reads it as a container raises.
+    every such shape, and an adapter that subscripts it raises `TypeError`.
     `strict` does resolve that reference, to a container of the right type, but
     what the container holds at the moment `thaw` sees it depends on where the
     adapted value sits relative to its payload's node: the kernel fills nodes
