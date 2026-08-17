@@ -5504,8 +5504,8 @@ class Database:
         instance state, so those digests are recomputed at each checkpoint trust
         boundary. The kernel's own fixed adapters are exempt: they carry no
         instance state and their implementations ship in this package, so their
-        digests -- taken once at construction -- cannot have moved, and this
-        serves them from that memo. Every registered key still appears, so the
+        digests -- taken once per process -- cannot have moved, and this serves
+        them from that memo. Every registered key still appears, so the
         map a checkpoint manifest is written from is unchanged.
         """
         digests = dict(self._static_adapter_digests)

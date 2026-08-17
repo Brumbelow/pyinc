@@ -228,7 +228,9 @@ def freeze(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None)
     key's snapshot digest -- deterministic across processes and platforms, but
     neither insertion order nor sorted order -- and `thaw` and every mode's
     boundary exposure preserve that canonical order. `FrozenSet` members are
-    ordered by the same digest rule applied to the members themselves.
+    ordered by the same digest rule applied to the members themselves, an order
+    the snapshot and `strict`'s view of it carry and a thawed `set` does not:
+    `thaw` rebuilds an ordinary `set` or `frozenset`, which holds no order.
     Sequences are not reordered: a `FrozenList` keeps its element order and a
     `FrozenRecord` its field declaration order.
 

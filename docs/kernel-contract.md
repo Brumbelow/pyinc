@@ -40,7 +40,9 @@ Frozen mappings hold their entries in a canonical order derived from each key's
 snapshot digest — deterministic across processes and platforms, but neither
 insertion order nor sorted order — and `thaw` and every mode's boundary
 exposure preserve that canonical order. `FrozenSet` members are ordered by the
-same digest rule applied to the members themselves. Sequences are not
+same digest rule applied to the members themselves, with the narrower reach the
+mode exposures below state: that order belongs to the snapshot and to `strict`'s
+view of it, and a thawed `set` carries none of it. Sequences are not
 reordered: a `FrozenList` keeps its element order and a `FrozenRecord` its field
 declaration order. The canonical order is part of this contract and does not
 move: every digest, store key and checkpoint is derived from an encoding that
@@ -137,7 +139,10 @@ back-edge: `freeze` rejects such a graph with `UnsupportedValueError` rather
 than emitting a node, and `FrozenAdapterValue` is not a legal `FrozenGraph`
 node. A cyclic adapted object (for example `obj.child.parent is obj`) must
 therefore route its cycle through a `list`, `dict`, `set`, or dataclass — or be
-decomposed by the adapter into one.
+decomposed by the adapter into one. A payload routed that way meets the
+reconstruction limit the adapter laws below record: once the graph encoding
+holds the payload as a node of its own, `thaw` reaches the adapter before that
+node is filled.
 
 **2. Tracked ambient reads.**
 All reads of external state within a query must go through the Resource API
@@ -725,15 +730,25 @@ those marks the catcher too.
     semantically equal to `x` wherever the adapted type is consumed.
   - **Mode-shaped payloads.** `thaw` runs at every boundary in every mode. Its
     first argument is the payload as the snapshot holds it — a rebuilt view of
-    that payload under `strict`, the raw `Frozen*` payload under `checked` and
+    that payload under `strict`, the raw stored payload under `checked` and
     `fast` — so a mapping payload arrives as a `Mapping` and a tuple payload as
     a tuple whichever mode is in force. What is mode-shaped is the second
     argument, the recursive callable: it yields values the way that mode
     exposes values, `Frozen*` views under `strict` and thawed containers under
     `checked` and `fast`. One implementation therefore serves all three modes.
-    The one exception is a payload the graph encoding hoisted into a node of
-    its own: `checked` and `fast` hand `thaw` a `FrozenRef` there rather than
-    the payload itself.
+
+    The exception is a payload the graph encoding holds as a node of its own,
+    which is what happens when the payload freezes to a `list`, `dict`, `set`
+    or dataclass inside a shared or cyclic value. No mode reconstructs such a
+    payload faithfully, and this is a known limitation of the value boundary
+    rather than a rule to design against: `checked` and `fast` hand `thaw` a
+    `FrozenRef` rather than the payload, and `strict` resolves that reference
+    to a container of the right type whose contents the kernel has not
+    finished filling, so an adapter reading its payload while `thaw` runs sees
+    it empty — an adapter that subscripts the payload raises, and one that
+    reads it defensively rebuilds its value out of nothing. A payload that
+    freezes to a tuple or a scalar is written inline and is never held as a
+    node, which is why the kernel's own adapters take positional payloads.
   - **Pinned adapter state.** Adapter instance configuration is immutable for
     the registered lifetime, and the kernel enforces the law in-process: each
     adapter's instance configuration is digested at construction, every
@@ -949,9 +964,9 @@ snapshots contain data only; adapted values still require the matching adapter
 registry when they are thawed. A byte-grammar change is a cache-key break, so
 older persisted records are rejected rather than silently reused.
 
-The grammar requires the canonical entry order rather than recording whatever
-order it is given: a hand-assembled `FrozenDict` or `FrozenSet` whose entries
-are in any other order is rejected with `UnsupportedValueError` by
+The grammar requires the canonical order rather than recording whatever order
+it is given: a hand-assembled `FrozenDict` whose entries or `FrozenSet` whose
+members sit in any other order is rejected with `UnsupportedValueError` by
 `freeze`, `thaw`, `serialize_snapshot` and `deserialize_snapshot` alike. Two
 snapshots that a caller means to be the same value therefore cannot encode to
 different bytes through an ordering difference — the alternative would let one

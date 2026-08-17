@@ -1687,8 +1687,20 @@ def test_the_builtin_file_stat_machinery_carries_no_instance_state() -> None:
     assert dataclasses.fields(resource) == ()
     assert resource == FileStatResource()
     assert vars(adapter) == {}
+    # `hasattr` reads the class through its MRO, which is the whole of the
+    # question only while the adapter subclasses `object` directly, as this one
+    # does: given a base class the same call answers for the hierarchy, so it
+    # would report a base's `__slots__` -- including an empty one carrying no
+    # state -- without saying which class declared it. `vars()` above is the
+    # complement, and refuses outright on a class with no instance dictionary.
+    assert type(adapter).__mro__ == (type(adapter), object)
     assert not hasattr(type(adapter), "__slots__")
     assert type(adapter).__module__ == "pyinc.resources"
+    # One adapter because the built-in map holds one. A second entry wants the
+    # adapter assertions above run over `BUILTIN_ADAPTERS.values()`: naming the
+    # file-stat entry alone would leave the new one unpinned while the test
+    # still read as covering the built-ins.
+    assert set(BUILTIN_ADAPTERS) == {FileStatSnapshot}
 
 
 def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) -> None:

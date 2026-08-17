@@ -29,11 +29,11 @@ decided at release time.
   inside a query body, as a query's return value, and from
   `db.read_resource`. It previously handed back a frozen record view in
   `strict` and a plain dictionary in `checked` and `fast`, so code reading a
-  stat reading out of the kernel subscripted it (`stat["exists"]`); such code
-  switches to attribute access (`stat.exists`). What changed is that every
-  `Database` now registers a built-in adapter for the kernel's own snapshot
-  type, which also moves the stored encoding of such a reading — see the
-  manifest schema note below.
+  stat out of the kernel subscripted it (`stat["exists"]`); such code switches
+  to attribute access (`stat.exists`). What changed is that every `Database`
+  now registers a built-in adapter for the kernel's own snapshot type, which
+  also moves the stored encoding of such a reading — see the manifest schema
+  note below.
 - `Query.compare` is removed. The runtime never called it — it compares stored
   snapshots under the query's policy itself — and its cutoff arm froze tokens
   without a `Database`, so it could reject a value the kernel's own comparison
@@ -198,7 +198,11 @@ decided at release time.
   replaces the built-in rather than colliding with it, and the map is the
   registry to hand the module-level `freeze`/`thaw` when reconstructing such a
   snapshot outside a database:
-  `thaw(snapshot, adapters=dict(BUILTIN_ADAPTERS))`.
+  `thaw(snapshot, adapters=dict(BUILTIN_ADAPTERS))`. A built-in entry holds no
+  instance configuration and its implementation ships with the kernel, so it is
+  fingerprinted once per process and stays outside the request-scope
+  configuration check; a replacement of your own is verified in full, like any
+  other registered adapter.
 
 ### Changed
 

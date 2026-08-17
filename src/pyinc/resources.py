@@ -187,9 +187,9 @@ class FileStatAdapter:
 
     Stateless by construction: no instance attributes, no slot state, no
     captured objects. That is what lets the kernel treat it as fixed --
-    fingerprinting it once when a database is built rather than at every trust
-    boundary, and leaving it out of the request-scope configuration check, which
-    exists for state this adapter does not have.
+    fingerprinting it once per process rather than at every trust boundary, and
+    leaving it out of the request-scope configuration check, which exists for
+    state this adapter does not have.
     """
 
     def freeze(self, value: FileStatSnapshot, freeze: FreezeFn) -> Any:
