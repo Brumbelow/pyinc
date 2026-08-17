@@ -68,7 +68,7 @@ decided at release time.
   the first `Input` registered under a key stays as the comparand the
   conflicting-policy check measures against.
 - `strict` mode runs a registered adapter's `thaw` at every boundary — query
-  arguments, query results, and `eq=`/`cutoff=` policy operands, including
+  arguments, results, input and resource reads, and policy operands, including
   results that carry shared or cyclic containers — where it previously handed
   back the kernel's internal adapted-value wrapper. Strict now matches
   `checked` and `fast`, and an exposure naming an adapter key the live
@@ -288,7 +288,7 @@ decided at release time.
   to the canonical `FrozenGraph` the equivalent raw structure produces.
 - The canonical entry order of frozen mappings and sets is stated where it
   holds instead of being left to be inferred from a digest. The kernel
-  contract, the `freeze`, `FrozenDict` and `FrozenSet` API documentation, the
+  contract, the `freeze` and `FrozenDict` API documentation, the
   getting-started walkthrough and the FAQ all say that a frozen mapping holds
   its entries in an order derived from each key's snapshot digest —
   deterministic across processes and platforms, but neither insertion order nor

@@ -5735,7 +5735,7 @@ def test_the_builtin_file_stat_adapter_round_trips_through_the_public_helpers() 
     assert snapshot.adapter_key == _adapter_key(FileStatSnapshot)
     # The payload is the positional triple, written inline -- not hoisted into a
     # graph node behind a FrozenRef. That is what makes the adapter safe inside
-    # a shared-structure snapshot, where a hoisted payload would reach `thaw` as
+    # a shared-structure snapshot, where a hoisted payload can reach `thaw` as
     # an unfilled shell.
     assert snapshot.payload == (True, 12, 345)
     assert pyinc.thaw(snapshot, adapters=adapters) == value

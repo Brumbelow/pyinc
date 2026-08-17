@@ -1359,7 +1359,7 @@ class Database:
             # Frozen but not published: the bytes reach the store on commit, so
             # a comparator that raises after a successful freeze cannot strand
             # an object nothing references.
-            snapshot = freeze(value, adapters=self._adapters)
+            snapshot = freeze(value, adapters=self._view_adapter_registry)
             digest = fingerprint_snapshot(snapshot)
             # Resolved, not registered: an already-declared key comes back from
             # the registry and an undeclared one is built without being stored,
@@ -1448,7 +1448,7 @@ class Database:
             # so a comparator that raises leaves no unreferenced bytes behind.
             pending: list[tuple[Any, NodeKey, Any, str]] = []
             for input_key, value in raw_pairs:
-                snapshot = freeze(value, adapters=self._adapters)
+                snapshot = freeze(value, adapters=self._view_adapter_registry)
                 digest = fingerprint_snapshot(snapshot)
                 node_key = self._input_node_key(input_key)
                 pending.append((input_key, node_key, snapshot, digest))
