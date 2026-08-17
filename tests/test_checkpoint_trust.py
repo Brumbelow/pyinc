@@ -29,6 +29,7 @@ import textwrap
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, cast
 
@@ -2528,3 +2529,60 @@ def test_checkpoint_mode_error_is_public_and_catchable() -> None:
     assert "CheckpointModeError" in pyinc.__all__
     with pytest.raises(CheckpointError):
         raise CheckpointModeError("mode mismatch")
+
+
+# ---------------------------------------------------------------------------
+# Input keys and the durability of what they write. A key that renders one way
+# as node identity and another way as a node label writes a checkpoint whose
+# input dependency labels can never satisfy the load-side invariant, so the
+# save reports success and every load of it fails. The key boundary refuses
+# such a key outright, and the plain-string spelling it names is what a caller
+# writes instead.
+# ---------------------------------------------------------------------------
+
+
+class _CheckpointKey(str, Enum):  # noqa: UP042 - the pre-StrEnum mixin idiom is under test
+    SEED = "checkpoint_enum_seed"
+
+
+def test_enum_keys_cannot_write_checkpoints_and_value_spelling_round_trips() -> None:
+    """The unloadable-checkpoint shape is unconstructible, and `.value` warms.
+
+    A `str`-mixin Enum member is stored as node identity unchanged while the
+    node label is formatted from it, and the two render differently, so the
+    saved manifest carries an input dependency label the loader rejects. That
+    made a successful save produce state no database could ever read back.
+    The key is now refused where it is written; the `member.value` spelling the
+    refusal names is a plain string and round-trips through a checkpoint.
+    """
+    with pytest.raises(InputKeyError, match="exactly str") as raised:
+        Input[int](cast(Any, _CheckpointKey.SEED))
+    assert "key.value" in str(raised.value)
+
+    seed = Input[int](_CheckpointKey.SEED.value)
+    assert type(seed.key) is str
+
+    @query
+    def enum_value_keyed(db: Database) -> int:
+        return seed.read(db) + 1
+
+    store = InMemoryArtifactStore()
+    saver = Database(store=store)
+    saver.set(seed, 4)
+    fresh = saver.get(enum_value_keyed)
+    assert fresh == 5
+    checkpoint = saver.save_checkpoint()
+
+    loader = Database(store=store)
+    loader.set(seed, 4)
+    loader.load_checkpoint(checkpoint)
+    before = loader.statistics()
+    warm = loader.get(enum_value_keyed)
+    after = loader.statistics()
+
+    # Witnesses, so the load cannot pass by having warmed nothing: the warm
+    # request executed no query and reused at least one record.
+    assert warm == fresh
+    assert after.query_executions - before.query_executions == 0
+    assert after.query_reuses - before.query_reuses >= 1
+    assert loader.inspect(enum_value_keyed).last_recompute == "reused"

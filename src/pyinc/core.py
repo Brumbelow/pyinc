@@ -34,7 +34,19 @@ class Input(Generic[T]):
     cutoff: CutoffFn | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.key, str) or not self.key:
+        # Exactness is decided before emptiness: the key is stored as node
+        # identity and formatted into node labels, so a subclass would let its
+        # own equality, formatting and truthiness decide what the kernel
+        # records -- including whether `not self.key` sees an empty key at all.
+        if type(self.key) is not str:
+            if isinstance(self.key, str):
+                raise InputKeyError(
+                    "Input key must be exactly str; got str subclass "
+                    f"{type(self.key).__qualname__}. Pass the plain string "
+                    "(for Enum keys, use key.value)."
+                )
+            raise InputKeyError("Input key must be a non-empty string.")
+        if not self.key:
             raise InputKeyError("Input key must be a non-empty string.")
         if self.eq is not None and self.cutoff is not None:
             raise ValueError("Input() accepts either eq= or cutoff=, but not both.")
@@ -67,7 +79,19 @@ class Query(Generic[P, T]):
         if cutoff is not None and not callable(cutoff):
             raise TypeError("@query cutoff= must be callable.")
         query_key = key if key is not None else f"{fn.__module__}:{fn.__qualname__}"
-        if not isinstance(query_key, str) or not query_key:
+        # Same exactness-then-emptiness order as `Input`, for the same reason:
+        # the key is formatted into query identities, node labels and the
+        # checkpoint manifest's query ids. The derived default is a plain
+        # string by construction, so only an explicit `key=` reaches the guard.
+        if type(query_key) is not str:
+            if isinstance(query_key, str):
+                raise ValueError(
+                    "Query key must be exactly str; got str subclass "
+                    f"{type(query_key).__qualname__}. Pass the plain string "
+                    "(for Enum keys, use key.value)."
+                )
+            raise ValueError("Query key must be a non-empty string.")
+        if not query_key:
             raise ValueError("Query key must be a non-empty string.")
         self.fn = fn
         self.eq = eq

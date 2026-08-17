@@ -791,6 +791,16 @@ a fresh `Database` into an empty directory.
 - `Query` is public, and `@query(key=...)` accepts an explicit stable key; the
   default is `module:qualname`. Coroutine and generator queries are rejected at
   decoration time.
+- `Input` keys and `@query`/`Query` keys are exactly `str` and non-empty. A
+  `str` subclass — including a `StrEnum` member and a `str`-mixin `Enum`
+  member — is rejected at construction, and the refusal names the plain string
+  to pass instead (`member.value` for an Enum key). A key is stored as node
+  identity and formatted into node labels, query identities and the checkpoint
+  manifest, so a subclass would let its own equality, formatting and
+  truthiness decide what the kernel records. `Resource.label()` must likewise
+  return exactly `str`, because its return value becomes the node's label.
+  Exactness is decided before emptiness at all three boundaries, so no value's
+  own dunders answer the non-empty check.
 - `Resource[KeyT, ValueT, ProbeT]` and `Database.read_resource(...)` are public.
   Resource identity includes the resource's configuration, the implementations
   of every state-observation hook (`probe`, `load`, `probe_and_load`, and

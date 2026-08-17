@@ -524,6 +524,19 @@ class NodeKey:
     args_digest: str
     label: str = field(compare=False)
 
+    def __post_init__(self) -> None:
+        # The public key boundaries already refuse `str` subclasses, but node
+        # identity decides record equality, manifest validation and every
+        # rendered label, so the node table refuses one itself rather than
+        # trusting every internal path that builds a key.
+        if (
+            type(self.kind) is not str
+            or type(self.identity) is not str
+            or type(self.args_digest) is not str
+            or type(self.label) is not str
+        ):
+            raise TypeError("NodeKey fields must be exactly str.")
+
 
 @dataclass
 class NodeRecord:
@@ -3534,7 +3547,15 @@ class Database:
             )
         )
         label = resource.label(parameter)
-        if not isinstance(label, str):
+        # Exactness before emptiness, as at the input and query key boundaries:
+        # this label becomes the node's label, so a subclass would decide the
+        # rendering and the emptiness check for it.
+        if type(label) is not str:
+            if isinstance(label, str):
+                raise TypeError(
+                    "Resource.label() must return exactly str; got str subclass "
+                    f"{type(label).__qualname__}."
+                )
             raise TypeError("Resource.label() must return a string.")
         if not label:
             raise ValueError("Resource.label() must return a non-empty string.")

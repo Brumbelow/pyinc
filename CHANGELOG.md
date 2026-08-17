@@ -11,6 +11,20 @@ external audit surfaced the consistency issues fixed below. The v3.1.1 tag
 remains in history and should not be used; the next published version will be
 decided at release time.
 
+### Breaking
+
+- `Input` and `@query`/`Query` keys must now be exactly `str`. A `str`
+  subclass — including a `StrEnum` member and a `str`-mixin `Enum` member — is
+  rejected at construction, with the plain-string spelling named in the message
+  (`member.value` for an Enum key), where previously a subclass could silently
+  collapse distinct inputs onto one node, bypass the conflicting-policy guard,
+  bypass the non-empty key guard through its own `__bool__`/`__len__`, drift a
+  query's identity through `__format__`, or write a checkpoint that could never
+  be reloaded. `Resource.label()` must return exactly `str` for the same reason
+  — its return value becomes the node's label — and says so in its own message
+  rather than deferring to the node table. `NodeKey` requires exactly `str` in
+  all four of its fields as the backstop behind all three boundaries.
+
 ### Fixed
 
 - `strict` mode runs a registered adapter's `thaw` at every boundary — query

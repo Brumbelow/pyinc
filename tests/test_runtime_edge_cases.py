@@ -240,6 +240,39 @@ class _InvalidLabelResource(Resource[str, str, str]):
         return self.label_value
 
 
+class _TaggedLabel(str):
+    pass
+
+
+class _TrappedLabel(str):
+    def __len__(self) -> int:
+        raise AssertionError("no user dunder runs before the exactness check")
+
+    def __bool__(self) -> bool:
+        raise AssertionError("no user dunder runs before the exactness check")
+
+
+@dataclass(frozen=True)
+class _SubclassLabelResource(Resource[str, str, str]):
+    """Builds its label rather than storing one, so the label check is reached.
+
+    A `str` subclass held as resource *configuration* is refused earlier, by the
+    resource-identity freeze; only a label computed inside `label()` reaches the
+    label boundary.
+    """
+
+    def probe(self, key: str) -> str:
+        return key
+
+    def load(self, db: Database, key: str) -> str:
+        return key
+
+    def label(self, key: str) -> Any:
+        if key == "trapped":
+            return _TrappedLabel("")
+        return _TaggedLabel(f"tagged[{key}]")
+
+
 @dataclass(frozen=True)
 class _UnloadableResource(Resource[str, str, str]):
     def probe(self, key: str) -> str:
@@ -447,12 +480,21 @@ def test_set_many_rejects_malformed_pairs_and_duplicate_keys_transactionally() -
     assert db.revision == 0
 
 
-def test_resource_labels_must_be_nonempty_strings() -> None:
+def test_resource_labels_must_be_exact_nonempty_strings() -> None:
     db = Database()
     with pytest.raises(TypeError, match="must return a string"):
         _InvalidLabelResource(1).read(db, "value")
     with pytest.raises(ValueError, match="non-empty string"):
         _InvalidLabelResource("").read(db, "value")
+    # A label becomes a node label, so it carries the same exactness rule as an
+    # input or query key -- and the resource boundary answers for it by name,
+    # rather than letting the node table's generic refusal surface instead.
+    with pytest.raises(TypeError, match=r"Resource\.label\(\) must return exactly str"):
+        _SubclassLabelResource().read(db, "value")
+    # Exactness is decided before emptiness here too, so a label lying about
+    # its own emptiness is refused as a subclass without its dunders running.
+    with pytest.raises(TypeError, match=r"Resource\.label\(\) must return exactly str"):
+        _SubclassLabelResource().read(db, "trapped")
 
 
 def test_failed_resource_loads_are_recorded_only_when_the_probe_is_total() -> None:
@@ -642,6 +684,33 @@ def test_checkpoints_omit_readers_of_an_unrecordable_failure(tmp_path: Path) -> 
     warmed.load_checkpoint(checkpoint)
     assert warmed.get(contents, str(path)) == Database().get(contents, str(path)) == "text"
     assert warmed.statistics().query_executions == 1
+
+
+def test_node_key_fields_must_be_exactly_str() -> None:
+    """The node table's own backstop against a smuggled `str` subclass.
+
+    The public boundaries refuse subclass keys, but node identity and labels
+    decide record equality, manifest validation and every rendered graph, so
+    the key type itself refuses rather than trusting every path that builds
+    one.
+    """
+
+    class _TaggedField(str):
+        pass
+
+    plain = NodeKey("query", "identity", _DIGEST, "label")
+    assert (plain.kind, plain.identity, plain.args_digest, plain.label) == (
+        "query",
+        "identity",
+        _DIGEST,
+        "label",
+    )
+
+    for position in range(4):
+        arguments: list[Any] = ["query", "identity", _DIGEST, "label"]
+        arguments[position] = _TaggedField(arguments[position])
+        with pytest.raises(TypeError, match="exactly str"):
+            NodeKey(*arguments)
 
 
 def test_materialized_call_validation_covers_strict_and_checked_modes() -> None:

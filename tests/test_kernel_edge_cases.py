@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import dataclass
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, cast
 
@@ -66,6 +67,125 @@ class _UnprobeableResource(Resource[str, str, str]):
 def test_input_rejects_invalid_keys(key: object) -> None:
     with pytest.raises(InputKeyError, match="non-empty string"):
         Input[object](cast(Any, key))
+
+
+class _TaggedKey(str):
+    """A plain `str` subclass, whose instances can carry arbitrary attributes.
+
+    Storing one as node identity would make the kernel hold that state for the
+    lifetime of the database.
+    """
+
+
+class _ModernKey(StrEnum):
+    A = "a"
+
+
+class _LegacyKey(str, Enum):  # noqa: UP042 - the pre-StrEnum mixin idiom is under test
+    A = "a"
+
+
+class _TrappedKey(str):
+    """Every dunder a key guard could consult is a trap; reaching one is the defect.
+
+    The refusal is decided from `type(key)` alone and reports the offending type
+    by name, so it never touches the value: not its emptiness (`__bool__`,
+    `__len__`), not its rendering (`__str__`, `__repr__`, `__format__`) and not
+    its equality (`__eq__`). `__hash__` stays `str`'s so the instance is still
+    usable right up to the guard.
+    """
+
+    __hash__ = str.__hash__
+
+    def __len__(self) -> int:
+        raise AssertionError("no user dunder runs before the exactness check")
+
+    def __bool__(self) -> bool:
+        raise AssertionError("no user dunder runs before the exactness check")
+
+    def __str__(self) -> str:
+        raise AssertionError("no user dunder runs before the exactness check")
+
+    def __repr__(self) -> str:
+        raise AssertionError("no user dunder runs before the exactness check")
+
+    def __format__(self, spec: str) -> str:
+        raise AssertionError("no user dunder runs before the exactness check")
+
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError("no user dunder runs before the exactness check")
+
+
+def test_input_rejects_str_subclasses_and_names_the_plain_spelling() -> None:
+    """Input keys are exactly `str`, and the refusal says what to pass instead.
+
+    A subclass reaches the record table as node identity, so its own equality,
+    formatting and emptiness behaviour decide what the kernel stores. Enum
+    members are the common accidental case, which is why the message names
+    `key.value` rather than only describing the rule.
+    """
+    for key in (_TaggedKey("a"), _ModernKey.A, _LegacyKey.A):
+        with pytest.raises(InputKeyError, match="exactly str") as raised:
+            Input[int](cast(Any, key))
+        message = str(raised.value)
+        assert "key.value" in message
+        assert type(key).__name__ in message
+
+    # The spelling the message names constructs, and so does any plain string.
+    assert Input[int](_ModernKey.A.value).key == "a"
+    assert type(Input[int]("a").key) is str
+
+
+def test_query_rejects_str_subclass_keys_and_names_the_plain_spelling() -> None:
+    """`@query(key=...)` and `Query(key=...)` share Input's exactness rule.
+
+    A subclass key drifts query identity through `__format__` and reaches the
+    checkpoint manifest as a recorded query id, so it is refused where it is
+    written rather than where it is later rendered.
+    """
+
+    def calculate(db: Database) -> int:
+        return 1
+
+    for key in (_TaggedKey("a"), _ModernKey.A, _LegacyKey.A):
+        with pytest.raises(ValueError, match="exactly str") as raised:
+            Query(calculate, key=cast(Any, key))
+        assert "key.value" in str(raised.value)
+
+        with pytest.raises(ValueError, match="exactly str") as decorated:
+            query(key=cast(Any, key))(calculate)
+        assert "key.value" in str(decorated.value)
+
+    # Exactness is decided before emptiness here too, so no user dunder runs on
+    # the way to the refusal.
+    with pytest.raises(ValueError, match="exactly str"):
+        Query(calculate, key=cast(Any, _TrappedKey("")))
+
+    # The derived default key and an explicit plain-string key both construct.
+    assert Query(calculate).key == f"{calculate.__module__}:{calculate.__qualname__}"
+    assert Query(calculate, key=_ModernKey.A.value).key == "a"
+    assert type(Query(calculate, key="a").key) is str
+
+
+def test_input_empty_key_guard_cannot_be_bypassed_by_a_subclass() -> None:
+    """Emptiness is decided only after the key is known to be exactly `str`.
+
+    `not key` consults `__bool__` and `__len__`, so a subclass lying about its
+    own emptiness used to pass the non-empty guard and register a node labelled
+    `input[]`. Ordering the exactness check first means no user dunder runs on
+    the way to a refusal.
+    """
+
+    with pytest.raises(InputKeyError, match="non-empty string"):
+        Input[int]("")
+    with pytest.raises(InputKeyError, match="exactly str"):
+        Input[int](cast(Any, _TrappedKey("")))
+
+    # Only well-formed keys reach the record table, so a node can no longer be
+    # labelled for a key the guard was supposed to have refused.
+    db = Database()
+    db.set(Input[int]("present"), 1)
+    assert [key.label for key in db._records] == ["input[present]"]
 
 
 def test_input_rejects_conflicting_and_noncallable_policies() -> None:
