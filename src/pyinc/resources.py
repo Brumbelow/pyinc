@@ -4,10 +4,15 @@ import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     import pyinc.runtime as _runtime
+
+    from .value import FreezeFn, ThawFn, ValueAdapter
 
 
 KeyT = TypeVar("KeyT")
@@ -159,6 +164,50 @@ class FileStatSnapshot:
 
 
 FileStatProbe = tuple[bool, int | None, int | None]
+
+
+class FileStatAdapter:
+    """Rebuilds a :class:`FileStatSnapshot` at every cached value boundary.
+
+    Without an adapter the kernel freezes a file-stat reading field by field
+    into a record and hands that record back, so a caller reading one out of the
+    cache gets a mapping of the three fields -- a frozen record view in strict
+    mode, a plain dict in the others -- where a fresh read gave the dataclass.
+    This closes that gap: the stored payload is the positional triple
+    ``(exists, size, mtime_ns)`` and every exposure reconstructs the dataclass
+    from it.
+
+    The payload is positional rather than named on purpose. A tuple is written
+    inline into the frozen value, while a mapping, list, set or dataclass
+    payload is hoisted into a node of the shared-structure envelope and reaches
+    ``thaw`` as a reference into that envelope -- a reference that resolves, at
+    best, to a container the kernel has not finished filling. Reading by
+    position keeps this adapter correct in every mode and in every snapshot
+    shape.
+
+    Stateless by construction: no instance attributes, no slot state, no
+    captured objects. That is what lets the kernel treat it as fixed --
+    fingerprinting it once when a database is built rather than at every trust
+    boundary, and leaving it out of the request-scope configuration check, which
+    exists for state this adapter does not have.
+    """
+
+    def freeze(self, value: FileStatSnapshot, freeze: FreezeFn) -> Any:
+        return (value.exists, value.size, value.mtime_ns)
+
+    def thaw(self, snapshot: Any, thaw: ThawFn) -> FileStatSnapshot:
+        exists, size, mtime_ns = snapshot
+        return FileStatSnapshot(exists=exists, size=size, mtime_ns=mtime_ns)
+
+
+# The adapters every database carries for the kernel's own value types, as
+# single fixed instances. A database's registry is these entries updated with
+# the caller's, so a caller who registers their own adapter for one of these
+# types replaces the entry rather than colliding with it -- and the replacement
+# is a caller adapter in every respect, including the configuration check.
+BUILTIN_ADAPTERS: Mapping[type[Any], ValueAdapter] = MappingProxyType(
+    {FileStatSnapshot: FileStatAdapter()}
+)
 
 
 @dataclass(frozen=True)

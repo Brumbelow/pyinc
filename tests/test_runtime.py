@@ -26,6 +26,7 @@ from pyinc import (
     EnvResource,
     FileResource,
     FileStatResource,
+    FileStatSnapshot,
     FileSystemArtifactStore,
     FrozenAdapterValue,
     FrozenDict,
@@ -49,8 +50,11 @@ from pyinc import (
     query,
     serialize_snapshot,
 )
+from pyinc.resources import BUILTIN_ADAPTERS
 from pyinc.runtime import _MISSING_SNAPSHOT
-from pyinc.value import _adapter_key, fingerprint_snapshot
+from pyinc.value import _adapter_key, _AdapterRegistry, fingerprint_snapshot
+from pyinc.value import fingerprint as _value_fingerprint
+from pyinc.value import thaw as _value_thaw
 
 _GLOBAL_BOX = {"x": 1}
 
@@ -5530,6 +5534,273 @@ def test_mutating_an_adapter_into_an_undigestable_shape_raises(shape: str) -> No
     with pytest.raises(AdapterContractError, match="no longer fingerprintable") as raised:
         db.get(constant)
     assert _adapter_key(_MutableCurrency) in str(raised.value)
+
+
+def _builtin_file_stat_registry() -> dict[type[Any], Any]:
+    """The built-in file-stat entry, as the exact object the kernel registers.
+
+    The cheap path is keyed on membership -- same adapted type AND same adapter
+    object -- so a test that built its own `FileStatAdapter()` would be testing
+    the caller-adapter path instead. Every cell below that means to exercise the
+    cheap path registers through this helper.
+    """
+
+    return {FileStatSnapshot: BUILTIN_ADAPTERS[FileStatSnapshot]}
+
+
+class _OffsetFileStatAdapter:
+    """A caller's own adapter for the built-in's type, with instance state."""
+
+    def __init__(self, offset: int) -> None:
+        self.offset = offset
+
+    def freeze(self, value: Any, recurse: Callable[[Any], Any]) -> Any:
+        return (value.exists, value.size, value.mtime_ns, self.offset)
+
+    def thaw(self, snapshot: Any, recurse: Callable[[Any], Any]) -> Any:
+        exists, size, mtime_ns, _offset = snapshot
+        return FileStatSnapshot(exists=exists, size=size, mtime_ns=mtime_ns)
+
+
+def test_the_builtin_file_stat_adapter_round_trips_through_the_public_helpers() -> None:
+    adapters = _builtin_file_stat_registry()
+    value = FileStatSnapshot(exists=True, size=12, mtime_ns=345)
+
+    snapshot = freeze(value, adapters=adapters)
+    assert isinstance(snapshot, FrozenAdapterValue)
+    assert snapshot.adapter_key == _adapter_key(FileStatSnapshot)
+    # The payload is the positional triple, written inline -- not hoisted into a
+    # graph node behind a FrozenRef. That is what makes the adapter safe inside
+    # a shared-structure snapshot, where a hoisted payload would reach `thaw` as
+    # an unfilled shell.
+    assert snapshot.payload == (True, 12, 345)
+    assert pyinc.thaw(snapshot, adapters=adapters) == value
+
+
+def test_the_builtin_file_stat_adapter_reconstructs_inside_a_shared_graph() -> None:
+    adapters = _builtin_file_stat_registry()
+    value = FileStatSnapshot(exists=False, size=None, mtime_ns=None)
+    shared = {"seen": 1}
+
+    # The aliased dict forces the whole snapshot into a FrozenGraph, which is
+    # the shape that breaks a container-payload adapter: the shell-fill order
+    # can hand `thaw` an empty payload. An inline positional payload never
+    # becomes a node, so it survives.
+    snapshot = freeze({"alias": [shared, shared], "stat": value}, adapters=adapters)
+    assert isinstance(snapshot, FrozenGraph)
+    assert pyinc.thaw(snapshot, adapters=adapters)["stat"] == value
+
+
+def test_the_builtin_file_stat_adapter_digests_cleanly() -> None:
+    db = Database(adapters=_builtin_file_stat_registry())
+    adapter = BUILTIN_ADAPTERS[FileStatSnapshot]
+
+    # A real module, no instance state, no slots, no captures -- so both the
+    # implementation and the configuration digest succeed rather than raising
+    # the way a slotted or capture-carrying adapter does.
+    assert len(db._adapter_implementation_digest(adapter)) == 64
+    assert len(db._adapter_configuration_digest(adapter)) == 64
+
+
+def test_a_builtin_only_registry_expects_no_configuration_digests() -> None:
+    db = Database(adapters=_builtin_file_stat_registry())
+
+    @query(key="builtin-adapter-no-expected-digests")
+    def constant(db_: Database) -> int:
+        return 1
+
+    # The request-scope check exists for adapter instance configuration, and a
+    # stateless adapter the kernel registered has none to move -- so it names no
+    # expected digest and `_verify_registered_adapters` short-circuits.
+    assert db._registered_adapter_digests == {}
+    assert db.get(constant) == 1
+
+
+def test_builtin_adapter_implementation_digests_are_taken_once_at_construction() -> None:
+    calls: list[str] = []
+    original = Database._adapter_implementation_digest
+
+    def counting(self: Database, adapter: Any) -> str:
+        calls.append(type(adapter).__qualname__)
+        return original(self, adapter)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Database, "_adapter_implementation_digest", counting)
+        db = Database(adapters=_builtin_file_stat_registry())
+        during_init = list(calls)
+        calls.clear()
+        digests = db._current_adapter_digests()
+
+    key = _adapter_key(FileStatSnapshot)
+    assert during_init == ["FileStatAdapter"]
+    # Served from the construction-time memo: the trust boundary re-derives
+    # nothing for a fixed adapter, and what it serves is what construction
+    # recorded rather than a second digest that merely happens to agree.
+    assert calls == []
+    assert set(digests) == {key}
+    assert digests[key] == db._static_adapter_digests[key]
+    assert len(digests[key]) == 64
+
+
+def test_a_caller_adapter_beside_the_builtin_is_still_re_derived() -> None:
+    calls: list[str] = []
+    original = Database._adapter_implementation_digest
+
+    def counting(self: Database, adapter: Any) -> str:
+        calls.append(type(adapter).__qualname__)
+        return original(self, adapter)
+
+    registry: dict[type[Any], Any] = dict(_builtin_file_stat_registry())
+    registry[_MutableCurrency] = _CurrencyAdapter()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Database, "_adapter_implementation_digest", counting)
+        db = Database(adapters=registry)
+        calls.clear()
+        digests = db._current_adapter_digests()
+
+    # Only the caller's adapter is re-derived; the built-in's digest comes from
+    # the memo, and both keys still reach the manifest.
+    assert calls == ["_CurrencyAdapter"]
+    assert set(digests) == {_adapter_key(FileStatSnapshot), _adapter_key(_MutableCurrency)}
+
+
+def test_a_builtin_only_registry_keeps_the_trusted_fast_path() -> None:
+    calls: list[str] = []
+    original = Database._current_adapter_digests
+
+    def counting(self: Database) -> dict[str, str]:
+        calls.append("called")
+        return original(self)
+
+    db = Database(adapters=_builtin_file_stat_registry())
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Database, "_current_adapter_digests", counting)
+        assert db._adapter_keys_trusted(())
+        assert db._adapter_keys_trusted((_adapter_key(FileStatSnapshot),))
+
+    # No checkpoint digests and no caller adapters, so every key handed to the
+    # gate came from a record this process froze through this very registry.
+    assert calls == []
+    assert db._non_static_adapters == {}
+
+
+def test_a_caller_adapter_takes_the_trust_gate_off_the_fast_path() -> None:
+    calls: list[str] = []
+    original = Database._current_adapter_digests
+
+    def counting(self: Database) -> dict[str, str]:
+        calls.append("called")
+        return original(self)
+
+    registry: dict[type[Any], Any] = dict(_builtin_file_stat_registry())
+    registry[_MutableCurrency] = _CurrencyAdapter()
+    db = Database(adapters=registry)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Database, "_current_adapter_digests", counting)
+        assert db._adapter_keys_trusted(())
+
+    assert calls == ["called"]
+    assert set(db._non_static_adapters) == {_MutableCurrency}
+
+
+def test_a_caller_override_of_the_builtin_type_keeps_full_verification() -> None:
+    adapter = _OffsetFileStatAdapter(1)
+    source = Input[Any]("builtin-adapter-override-source")
+    # Same adapted type, a different adapter object: membership fails, so this
+    # registration is a caller adapter in every respect.
+    db = Database(mode="checked", adapters={FileStatSnapshot: adapter})
+    db.set(source, FileStatSnapshot(exists=True, size=1, mtime_ns=2))
+
+    @query(key="builtin-adapter-override")
+    def read_stat(db_: Database) -> Any:
+        return source.read(db_)
+
+    assert db._static_adapter_digests == {}
+    assert set(db._registered_adapter_digests) == {_adapter_key(FileStatSnapshot)}
+    assert db.get(read_stat) == FileStatSnapshot(exists=True, size=1, mtime_ns=2)
+    adapter.offset = 2
+    with pytest.raises(AdapterContractError, match="FileStatSnapshot"):
+        db.get(read_stat)
+
+
+def test_boundary_exposure_reuses_the_databases_own_adapter_registry() -> None:
+    source = Input[Any]("registry-reuse-source")
+    value = FileStatSnapshot(exists=True, size=4, mtime_ns=9)
+    db = Database(mode="checked", adapters=_builtin_file_stat_registry())
+    db.set(source, value)
+
+    @query(key="registry-reuse")
+    def read_stat(db_: Database) -> Any:
+        return source.read(db_)
+
+    assert db.get(read_stat) == value
+
+    # The runtime module binds these two names from the value layer, so patching
+    # them in the runtime namespace is what the boundary actually calls.
+    handed: list[Any] = []
+
+    def recording_thaw(snapshot: Any, *, adapters: Any = None) -> Any:
+        handed.append(adapters)
+        return _value_thaw(snapshot, adapters=adapters)
+
+    def recording_fingerprint(item: Any, *, adapters: Any = None) -> str:
+        handed.append(adapters)
+        return _value_fingerprint(item, adapters=adapters)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(pyinc.runtime, "thaw", recording_thaw)
+        patch.setattr(pyinc.runtime, "fingerprint", recording_fingerprint)
+        before = db.statistics()
+        assert db.get(read_stat) == value
+        after = db.statistics()
+
+    # Witness, so the assertion below cannot pass by having exposed nothing:
+    # this was a warm request that reused a record rather than executing.
+    assert after.query_executions - before.query_executions == 0
+    assert after.query_reuses - before.query_reuses >= 1
+    # A boundary exposure is handed the registry this database built once, not
+    # the raw map -- which the value layer would rebuild into a fresh registry on
+    # every call, for a table that cannot change.
+    assert handed
+    assert all(entry is db._view_adapter_registry for entry in handed)
+
+    # The same fact stated as a count, which is what makes it exact rather than a
+    # claim about two named call sites: a warm request builds NO adapter registry.
+    # Freezing a query key, exposing a value and fingerprinting one all used to
+    # build their own.
+    built = 0
+    original_init = _AdapterRegistry.__init__
+
+    def counting_init(self: Any, adapters: Any = None) -> None:
+        nonlocal built
+        built += 1
+        original_init(self, adapters)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_AdapterRegistry, "__init__", counting_init)
+        assert db.get(read_stat) == value
+
+    assert built == 0
+
+
+def test_a_mutated_caller_adapter_still_raises_beside_the_builtin() -> None:
+    adapter = _CurrencyAdapter()
+    source = Input[Any]("builtin-adapter-sibling-source")
+    registry: dict[type[Any], Any] = dict(_builtin_file_stat_registry())
+    registry[_MutableCurrency] = adapter
+    db = Database(mode="checked", adapters=registry)
+    db.set(source, _MutableCurrency(5))
+
+    @query(key="builtin-adapter-sibling")
+    def read_amount(db_: Database) -> Any:
+        return source.read(db_)
+
+    db.get(read_amount)
+    adapter.scale = 100
+    # The built-in's exemption is its own. Its presence in the same registry
+    # does not buy the caller's adapter out of the pinned-state law.
+    with pytest.raises(AdapterContractError, match="_MutableCurrency"):
+        db.get(read_amount)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

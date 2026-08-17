@@ -43,6 +43,8 @@ from pyinc import (
     CheckpointModeError,
     Database,
     FileResource,
+    FileStatResource,
+    FileStatSnapshot,
     FileSystemArtifactStore,
     InMemoryArtifactStore,
     Input,
@@ -54,6 +56,7 @@ from pyinc import (
     serialize_snapshot,
 )
 from pyinc.core import Query  # internal: introspecting query identities
+from pyinc.resources import BUILTIN_ADAPTERS  # not re-exported from pyinc yet
 from pyinc.runtime import _CHECKPOINT_MANIFEST_VERSION  # internal: manifest schema
 from pyinc.value import fingerprint_snapshot  # not re-exported from pyinc
 
@@ -1992,6 +1995,46 @@ def test_mutated_adapter_database_raises_while_a_reloaded_database_reexecutes() 
     loaded.load_checkpoint(checkpoint)
     assert loaded.get(read_temp) == _Temperature(5.0)
     assert loaded.inspect(read_temp).last_recompute == "executed"
+
+
+def test_the_builtin_file_stat_adapter_checkpoints_cleanly(tmp_path: Path) -> None:
+    target = tmp_path / "watched.txt"
+    target.write_text("hello", encoding="utf-8")
+    stat_resource = FileStatResource()
+
+    @query
+    def watched_size(db: Database) -> Any:
+        return stat_resource.read(db, target).size
+
+    store = InMemoryArtifactStore()
+    db = Database(
+        "checked",
+        store=store,
+        adapters={FileStatSnapshot: BUILTIN_ADAPTERS[FileStatSnapshot]},
+    )
+    assert db.get(watched_size) == 5
+
+    # A stateless adapter defined in a real module fingerprints cleanly, so the
+    # save succeeds and the manifest carries the adapter key the warm gate will
+    # compare against. An adapter carrying slot state or an unpinnable capture
+    # raises here instead -- the sibling tests above pin both.
+    key = db.save_checkpoint()
+    manifest = json.loads(cast(bytes, store.get(key)).decode("utf-8"))
+    assert list(manifest["adapters"]) == ["pyinc.resources:FileStatSnapshot"]
+
+    loader = Database(
+        "checked",
+        store=store,
+        adapters={FileStatSnapshot: BUILTIN_ADAPTERS[FileStatSnapshot]},
+    )
+    loader.load_checkpoint(key)
+    before = loader.statistics()
+    warm = loader.get(watched_size)
+    after = loader.statistics()
+
+    assert warm == 5
+    assert after.query_executions - before.query_executions == 0
+    assert after.query_reuses - before.query_reuses >= 1
 
 
 def test_missing_adapter_errors_match_fresh_database() -> None:

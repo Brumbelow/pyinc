@@ -1134,6 +1134,13 @@ class Database:
         # probe-hint restoration). Set at the warm root, consulted transitively.
         self._checkpoint_root_pinned_query_objects: dict[str, Any] | None = None
         self._checkpoint_root_pinned_resources: dict[str, Any] | None = None
+        # Which registered adapters this database treats as fixed, and the
+        # implementation digests it can therefore take once instead of at every
+        # trust boundary. Runs here rather than beside the registry itself
+        # because it fingerprints, and the fingerprint walk reads the request
+        # slots above -- moved up beside `_adapters` it raises on
+        # `_type_fingerprint_stack`.
+        self._partition_adapters_by_kernel_membership()
         # Digest of each registered adapter's instance configuration, taken
         # once at construction. Mutating a registered adapter afterwards
         # violates the value-boundary law; every top-level request re-derives
@@ -1147,6 +1154,41 @@ class Database:
             self._digestable_adapter_configuration_digests()
         )
         _install_guards_once()
+
+    def _partition_adapters_by_kernel_membership(self) -> None:
+        """Split the registry into the kernel's own fixed adapters and the rest.
+
+        Fixed means one of the kernel's own entries, still the object the kernel
+        put there -- decided by membership, same adapted type AND same adapter
+        object, never by inspecting an adapter for signs of statelessness. A
+        caller who registers their own adapter for one of those types replaces
+        the entry, so their adapter lands on the non-fixed side and is treated
+        exactly like any other caller adapter: full configuration verification
+        at request scope, implementation digest re-derived at every trust
+        boundary.
+
+        A fixed adapter carries no instance state and its implementation lives
+        in this package, so nothing an in-contract process can do moves its
+        implementation digest. Those digests are therefore taken once, here, and
+        the trust boundary reads them back instead of re-deriving them at each
+        of its call sites -- the difference between a dict lookup and a
+        fingerprint walk over two method bodies per boundary crossing.
+        """
+
+        # Function-scope so this module keeps importing nothing from the
+        # resource module at import time.
+        from .resources import BUILTIN_ADAPTERS
+
+        self._non_static_adapters: dict[type[Any], ValueAdapter] = {
+            value_type: adapter
+            for value_type, adapter in self._adapters.items()
+            if BUILTIN_ADAPTERS.get(value_type) is not adapter
+        }
+        self._static_adapter_digests: dict[str, str] = {
+            _adapter_key(value_type): self._adapter_implementation_digest(adapter)
+            for value_type, adapter in self._adapters.items()
+            if value_type not in self._non_static_adapters
+        }
 
     @property
     def revision(self) -> int:
@@ -5385,13 +5427,18 @@ class Database:
     def _current_adapter_digests(self) -> dict[str, str]:
         """Implementation digest of each registered adapter, keyed by adapted type.
 
-        The registry is fixed, but adapter configuration may be instance state,
-        so recompute the small digest map at each checkpoint trust boundary.
+        The registry is fixed, but a caller's adapter configuration may be
+        instance state, so those digests are recomputed at each checkpoint trust
+        boundary. The kernel's own fixed adapters are exempt: they carry no
+        instance state and their implementations ship in this package, so their
+        digests -- taken once at construction -- cannot have moved, and this
+        serves them from that memo. Every registered key still appears, so the
+        map a checkpoint manifest is written from is unchanged.
         """
-        return {
-            _adapter_key(value_type): self._adapter_implementation_digest(adapter)
-            for value_type, adapter in self._adapters.items()
-        }
+        digests = dict(self._static_adapter_digests)
+        for value_type, adapter in self._non_static_adapters.items():
+            digests[_adapter_key(value_type)] = self._adapter_implementation_digest(adapter)
+        return digests
 
     def _digestable_adapter_configuration_digests(self) -> dict[str, str]:
         """Configuration digest of every adapter that can be digested at all.
@@ -5406,9 +5453,16 @@ class Database:
         digested -- slot state, a state key that defeats the digest's sort --
         costs the check only its own entry. Construction succeeds either way;
         what such an adapter loses is the in-process check on itself.
+
+        The kernel's own fixed adapters contribute nothing here. They hold no
+        instance state, so there is no configuration for the check to catch
+        moving; naming them would only make every top-level request re-derive a
+        digest that cannot change. A registry holding nothing else therefore
+        leaves this map empty, and the request-scope check returns on its first
+        line.
         """
         digests: dict[str, str] = {}
-        for value_type, adapter in self._adapters.items():
+        for value_type, adapter in self._non_static_adapters.items():
             try:
                 digest = self._adapter_configuration_digest(adapter)
             except (UnsupportedValueError, TypeError, ValueError):
@@ -5558,8 +5612,17 @@ class Database:
         warm so the record re-executes and any adapted payload is re-frozen and
         re-thawed under the live adapter.
         """
-        if not self._checkpoint_adapter_digests and not self._adapters:
-            # Fast path: no adapters anywhere means nothing to distrust.
+        if not self._checkpoint_adapter_digests and not self._non_static_adapters:
+            # Fast path: nothing to distrust. With no checkpoint digests loaded,
+            # every key reaching here belongs to a record this process froze
+            # through this very registry -- a loaded checkpoint that had adapted
+            # values would have brought their digests with it. So the only
+            # question left is whether a live adapter has moved since it froze
+            # those records, and the kernel's own fixed adapters cannot: they
+            # hold no state and their code ships with this module. A caller's
+            # adapter takes the full comparison below, because its configuration
+            # is state the law asks the caller to leave alone rather than
+            # something this process can vouch for.
             return True
         try:
             current = self._current_adapter_digests()
@@ -7907,7 +7970,10 @@ class Database:
         return None
 
     def _freeze_value(self, value: Any) -> Snapshot:
-        snapshot = freeze(value, adapters=self._adapters)
+        # The database's own registry, not the raw map -- see the note on the
+        # sibling helpers below. This one is on the warm request path too: every
+        # query key freezes its arguments through here.
+        snapshot = freeze(value, adapters=self._view_adapter_registry)
         if self._store is not None:
             self._persist_snapshot(snapshot)
         return snapshot
@@ -7922,14 +7988,23 @@ class Database:
             return
         self._persist_snapshot_to(snapshot, store)
 
+    # These helpers hand the value layer the key-indexed registry this database
+    # built once, not the raw map. Handed a map, the value layer builds a fresh
+    # registry per call -- deriving an adapter key per entry -- and freezing,
+    # exposing and fingerprinting all run on the warm request path, so a registry
+    # that merely stopped being empty was costing every warm request repeated
+    # rebuilds of a table that cannot change. The registry is fixed for the
+    # database's lifetime, which is what makes reusing it identical rather than
+    # merely cheaper: `_adapters` is assigned once at construction and nothing
+    # writes to it afterwards.
     def _thaw_value(self, value: Any) -> Any:
-        return thaw(value, adapters=self._adapters)
+        return thaw(value, adapters=self._view_adapter_registry)
 
     def _fingerprint_value(self, value: Any) -> str:
-        return fingerprint(value, adapters=self._adapters)
+        return fingerprint(value, adapters=self._view_adapter_registry)
 
     def _semantic_equal(self, left: Any, right: Any) -> bool:
-        return semantic_equal(left, right, adapters=self._adapters)
+        return semantic_equal(left, right, adapters=self._view_adapter_registry)
 
     def _compare_input_snapshots(
         self, input_key: Any, previous: Snapshot, snapshot: Snapshot
