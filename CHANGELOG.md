@@ -275,6 +275,21 @@ decided at release time.
   payloads. A tree-shaped wrapper clones to a structurally identical,
   identically fingerprinted snapshot; wrappers that alias or cycle re-encode
   to the canonical `FrozenGraph` the equivalent raw structure produces.
+- The canonical entry order of frozen mappings and sets is stated where it
+  holds instead of being left to be inferred from a digest. The kernel
+  contract, the `freeze`, `FrozenDict` and `FrozenSet` API documentation, the
+  getting-started walkthrough and the FAQ all say that a frozen mapping holds
+  its entries in an order derived from each key's snapshot digest —
+  deterministic across processes and platforms, but neither insertion order nor
+  sorted order — and that `thaw` and every mode's boundary exposure preserve
+  it. `FrozenSet` members are ordered by the same rule, with the scope it
+  actually has now stated too: the order belongs to the snapshot and to
+  `strict`'s view of it, while a thawed `set` is an ordinary unordered Python
+  set whose iteration order is Python's and varies between processes. The order
+  itself has not moved and will not: every digest, store key and checkpoint is
+  derived from an encoding that reads entries in the order they are stored, so
+  the sequences are now pinned by regression rather than recomputed from the
+  digest the tests are meant to be checking.
 - Query identity widened in one wave. A `functools.wraps`-decorated callable
   capture is fingerprinted by its implementation type, its `__call__`
   definition and its instance state, with `__wrapped__` folded as additive

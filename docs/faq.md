@@ -25,7 +25,12 @@ runtime:
   `FrozenList`, `dict` → `FrozenDict`, `set` → `FrozenSet`, and dataclasses →
   `FrozenRecord`, with registered `ValueAdapter`s for everything else. That is
   condition 1 of the guarantee, and it exists because the language does not
-  provide it.
+  provide it. One visible consequence: a mapping that crosses a boundary comes
+  back in a canonical order derived from each key's snapshot digest —
+  deterministic, but neither insertion order nor sorted order — because the
+  order is what makes one value one cache key. Sets are ordered by the same
+  rule inside the snapshot, but a thawed `set` is an ordinary unordered Python
+  set and carries no order back out.
 - **Ambient reads.** Reading a file or an environment variable directly inside
   a query, rather than through a declared input, silently breaks any
   incremental engine in any language. pyinc does not only document the rule:

@@ -36,6 +36,16 @@ handled by registered `ValueAdapter` instances. `freeze` converts
 dataclasses → `FrozenRecord`; tuples are a native member of the `Snapshot`
 union and are frozen element-wise.
 
+Frozen mappings hold their entries in a canonical order derived from each key's
+snapshot digest — deterministic across processes and platforms, but neither
+insertion order nor sorted order — and `thaw` and every mode's boundary
+exposure preserve that canonical order. `FrozenSet` members are ordered by the
+same digest rule applied to the members themselves. Sequences are not
+reordered: a `FrozenList` keeps its element order and a `FrozenRecord` its field
+declaration order. The canonical order is part of this contract and does not
+move: every digest, store key and checkpoint is derived from an encoding that
+reads entries in the order they are stored.
+
 Dataclasses thaw to dictionaries because the kernel does not import and
 reconstruct arbitrary user classes. Its own resource snapshot types are the
 exception: a `Database` registers built-in adapters for them, so
@@ -92,9 +102,15 @@ naming the adapter key rather than returning a mapping.
 The kernel stores frozen snapshots internally. `strict` exposes the immutable
 `Frozen*` views themselves (a query receives, for example, a `FrozenDict` where
 the other modes hand it a `dict`); `checked` and `fast` expose owned thawed
-values. A value with a registered adapter is the exception in every mode: it is
-reconstructed through that adapter, so a query argument, a query result and an
-`eq=`/`cutoff=` policy operand carry the adapted type whichever mode is in
+values (the exposed shape differs, a mapping's canonical entry order described
+above does not — all three modes iterate a mapping in the stored snapshot's
+order). A set's canonical member order is carried by the snapshot and by
+`strict`'s `FrozenSet` view; a thawed `set` or `frozenset` is an ordinary
+unordered Python container, so `checked` and `fast` carry no member order out
+of the boundary, and their iteration order is Python's, which varies between
+processes. A value with a registered adapter is the exception in every mode: it
+is reconstructed through that adapter, so a query argument, a query result and
+an `eq=`/`cutoff=` policy operand carry the adapted type whichever mode is in
 force. No external alias to a value that crossed the boundary can influence
 the stored snapshot. This holds in both directions: `freeze` returns a
 snapshot the kernel owns outright — an already-frozen wrapper is cloned rather
@@ -932,6 +948,14 @@ the full snapshot grammar, including `FrozenGraph` / `FrozenRef`. Serialized
 snapshots contain data only; adapted values still require the matching adapter
 registry when they are thawed. A byte-grammar change is a cache-key break, so
 older persisted records are rejected rather than silently reused.
+
+The grammar requires the canonical entry order rather than recording whatever
+order it is given: a hand-assembled `FrozenDict` or `FrozenSet` whose entries
+are in any other order is rejected with `UnsupportedValueError` by
+`freeze`, `thaw`, `serialize_snapshot` and `deserialize_snapshot` alike. Two
+snapshots that a caller means to be the same value therefore cannot encode to
+different bytes through an ordering difference — the alternative would let one
+value hold two store keys.
 
 ## Checkpoint Save and Load
 

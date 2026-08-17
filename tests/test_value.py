@@ -150,6 +150,70 @@ def test_freeze_thaw_round_trip_dict() -> None:
     assert thawed == value
 
 
+def test_frozen_mapping_order_is_canonical_and_stable() -> None:
+    """Pin the canonical entry order literally, not by recomputing the digest.
+
+    The order is documented as fixed for the byte grammar's lifetime, so these
+    sequences are the contract rather than an observation: a failure here means
+    the order moved, which invalidates every stored record and checkpoint.
+    Neither insertion nor sorted order is what the rule produces, and both
+    refutations are asserted so a change to either could not pass unnoticed.
+    """
+
+    frozen = cast(FrozenDict, freeze({"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}))
+    canonical = ["two", "three", "one", "four", "five"]
+    assert [key for key, _ in frozen.entries] == canonical
+    assert list(thaw(frozen)) == canonical
+
+    # Not insertion order.
+    assert list(thaw(freeze({"b": 1, "a": 2}))) == ["a", "b"]
+
+    # Not sorted order either.
+    assert list(thaw(freeze({letter: index for index, letter in enumerate("abcdefgh")}))) == [
+        "a",
+        "h",
+        "e",
+        "d",
+        "c",
+        "f",
+        "g",
+        "b",
+    ]
+
+
+def test_frozen_set_member_order_is_canonical_and_stable() -> None:
+    """Pin the canonical member order literally, on the snapshot that holds it.
+
+    Sets order members by the same digest rule mappings order keys by, so a set
+    of the mapping pin's five keys stores the identical sequence -- asserted here
+    so the two sides of one rule cannot drift apart on one of them only. A
+    failure means the order moved: STOP rather than re-pin, as above.
+
+    The thawed value deliberately carries no order assertion. `thaw` rebuilds an
+    ordinary `set`, whose iteration order is Python's and varies between
+    processes, so there is no sequence there to pin -- the snapshot and
+    `strict`'s view of it are the only places this order exists.
+    """
+
+    words = ("one", "two", "three", "four", "five")
+    canonical = ("two", "three", "one", "four", "five")
+
+    frozen = cast(FrozenSet, freeze(set(words)))
+    assert frozen.kind == "set"
+    assert frozen.items == canonical
+
+    frozen_immutable = cast(FrozenSet, freeze(frozenset(words)))
+    assert frozen_immutable.kind == "frozenset"
+    assert frozen_immutable.items == canonical
+
+    # The same rule, on the same five strings, through the mapping path.
+    mapping = cast(FrozenDict, freeze(dict.fromkeys(words, 1)))
+    assert tuple(key for key, _ in mapping.entries) == canonical
+
+    # Content survives thaw; order is not part of what a set carries.
+    assert thaw(frozen) == set(words)
+
+
 def test_freeze_thaw_round_trip_set() -> None:
     value = {3, 1, 2}
     frozen = freeze(value)

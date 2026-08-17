@@ -63,6 +63,16 @@ class FrozenList(Sequence[Any]):
 
 @dataclass(frozen=True)
 class FrozenDict(Mapping[Any, Any]):
+    """Owned snapshot of a mapping, entries in canonical order.
+
+    `entries` is ordered by each key's snapshot digest -- deterministic across
+    processes and platforms, but neither insertion order nor sorted order --
+    and iteration, `thaw`, and every mode's boundary exposure preserve that
+    order. Any other order is outside the snapshot grammar: the validator every
+    entry point runs refuses it with `UnsupportedValueError` rather than
+    digesting a hand-assembled mapping the kernel would never have produced.
+    """
+
     entries: tuple[tuple[Any, Any], ...]
 
     def __getitem__(self, key: Any) -> Any:
@@ -80,6 +90,16 @@ class FrozenDict(Mapping[Any, Any]):
 
 @dataclass(frozen=True)
 class FrozenSet:
+    """Owned snapshot of a set or frozenset, members in canonical order.
+
+    `items` is ordered by each member's snapshot digest, the same rule
+    `FrozenDict` orders keys by, and the validator every entry point runs
+    refuses any other order. That order reaches a query only through `strict`,
+    which exposes this view: `thaw` rebuilds an ordinary `set` or `frozenset`,
+    which holds no order at all, so `checked` and `fast` iterate in Python's
+    order rather than this one.
+    """
+
     kind: str
     items: tuple[Any, ...]
 
@@ -202,6 +222,23 @@ class _FreezeState:
 
 
 def freeze(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -> Snapshot:
+    """Convert a live value into a snapshot the kernel owns outright.
+
+    Frozen mappings hold their entries in a canonical order derived from each
+    key's snapshot digest -- deterministic across processes and platforms, but
+    neither insertion order nor sorted order -- and `thaw` and every mode's
+    boundary exposure preserve that canonical order. `FrozenSet` members are
+    ordered by the same digest rule applied to the members themselves.
+    Sequences are not reordered: a `FrozenList` keeps its element order and a
+    `FrozenRecord` its field declaration order.
+
+    That order is load-bearing rather than incidental. The canonical encoding
+    every digest is derived from reads entries in the order they are stored, so
+    the order is fixed for the byte grammar's lifetime; a mapping or set
+    assembled by hand in any other order is refused with
+    `UnsupportedValueError` instead of digesting to something else.
+    """
+
     registry = _coerce_registry(adapters)
     result = _freeze_root(value, registry)
     _validate_snapshot(result)

@@ -35,6 +35,7 @@ from pyinc import (
     FrozenDict,
     FrozenGraph,
     FrozenList,
+    FrozenSet,
     InMemoryArtifactStore,
     Input,
     InspectionNode,
@@ -383,6 +384,65 @@ def test_modes_expose_expected_boundary_shapes(mode: str, expected_type: type[ob
     db.set(payload, {"x": 1})
     result = db.get(echo)
     assert isinstance(result, expected_type)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_boundary_exposure_preserves_canonical_order(mode: str) -> None:
+    """The exposed shape differs per mode; the entry order does not.
+
+    `strict` hands out the `FrozenDict` itself and the other two hand out a
+    thawed `dict`, so this pins the same canonical sequence through both paths:
+    the order is a property of the stored snapshot, not of the exposure.
+    """
+
+    payload = Input[dict[str, int]](f"canonical.order.{mode}")
+
+    @query
+    def echo(db: Database) -> object:
+        return payload.read(db)
+
+    db = Database(mode=mode)
+    db.set(payload, {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5})
+    result = db.get(echo)
+    canonical = ["two", "three", "one", "four", "five"]
+
+    if isinstance(result, FrozenDict):
+        assert [key for key, _ in result.entries] == canonical
+    else:
+        assert list(cast(dict[str, int], result)) == canonical
+    assert db.statistics().query_executions == 1
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_boundary_exposure_carries_set_order_only_in_strict(mode: str) -> None:
+    """Canonical member order reaches a query through `strict` and no further.
+
+    `strict` exposes the `FrozenSet` itself, so the stored member sequence is
+    visible and pinned here; a failure of that arm means the order moved, and the
+    answer is STOP rather than re-pin, as for the mapping sequences. `checked`
+    and `fast` thaw to an ordinary `set`, which holds no order at all — its
+    iteration order is Python's and varies between processes — so those arms
+    assert content and deliberately assert nothing about order.
+    """
+
+    payload = Input[set[str]](f"canonical.members.{mode}")
+
+    @query
+    def echo(db: Database) -> object:
+        return payload.read(db)
+
+    db = Database(mode=mode)
+    db.set(payload, {"one", "two", "three", "four", "five"})
+    result = db.get(echo)
+
+    if mode == "strict":
+        assert isinstance(result, FrozenSet)
+        assert result.kind == "set"
+        assert result.items == ("two", "three", "one", "four", "five")
+    else:
+        assert type(result) is set
+        assert result == {"one", "two", "three", "four", "five"}
+    assert db.statistics().query_executions == 1
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

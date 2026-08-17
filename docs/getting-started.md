@@ -113,7 +113,12 @@ Start with `Database(mode="strict")`. Move a measured workload to `checked` or
 
 `freeze()` is a snapshot conversion, not a general object serializer. Lists,
 mappings, sets, and dataclass instances become their corresponding `Frozen*`
-records; tuples stay tuples. Shared or cyclic mutable graphs use
+records; tuples stay tuples. A frozen mapping's entries are held in a canonical
+order derived from each key's snapshot digest — deterministic across processes
+and platforms, but neither insertion order nor sorted order — and `thaw()` and
+every mode's boundary exposure preserve it, so a dict that round-trips through
+a boundary comes back equal without necessarily iterating in the order you
+built it in. Shared or cyclic mutable graphs use
 `FrozenGraph`/`FrozenRef`. `thaw()` reconstructs ordinary containers and graph
 identity, but a dataclass becomes a dictionary unless a matching
 `ValueAdapter` explicitly reconstructs its type. The kernel's own resource
