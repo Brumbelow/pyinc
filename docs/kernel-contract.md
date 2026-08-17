@@ -141,8 +141,9 @@ node. A cyclic adapted object (for example `obj.child.parent is obj`) must
 therefore route its cycle through a `list`, `dict`, `set`, or dataclass — or be
 decomposed by the adapter into one. A payload routed that way meets the
 reconstruction limit the adapter laws below record: once the graph encoding
-holds the payload as a node of its own, `thaw` reaches the adapter before that
-node is filled.
+holds the payload as a node of its own, an adapter cannot rely on that
+payload's contents while `thaw` runs. The mode-shaped-payloads law states what
+each mode hands the adapter instead.
 
 **2. Tracked ambient reads.**
 All reads of external state within a query must go through the Resource API
@@ -739,16 +740,24 @@ those marks the catcher too.
 
     The exception is a payload the graph encoding holds as a node of its own,
     which is what happens when the payload freezes to a `list`, `dict`, `set`
-    or dataclass inside a shared or cyclic value. No mode reconstructs such a
-    payload faithfully, and this is a known limitation of the value boundary
-    rather than a rule to design against: `checked` and `fast` hand `thaw` a
-    `FrozenRef` rather than the payload, and `strict` resolves that reference
-    to a container of the right type whose contents the kernel has not
-    finished filling, so an adapter reading its payload while `thaw` runs sees
-    it empty — an adapter that subscripts the payload raises, and one that
-    reads it defensively rebuilds its value out of nothing. A payload that
-    freezes to a tuple or a scalar is written inline and is never held as a
-    node, which is why the kernel's own adapters take positional payloads.
+    or dataclass inside a shared or cyclic value. A tree-shaped adapted value
+    is unaffected, because its payload is written inline; once the payload is
+    a node, an adapter cannot rely on the payload's contents while `thaw`
+    runs. `checked` and `fast` pass the payload argument exactly as stored, so
+    `thaw` receives the unresolved `FrozenRef` rather than the payload in
+    every such shape, and an adapter that reads it as a container raises.
+    `strict` does resolve that reference, to a container of the right type, but
+    what the container holds at the moment `thaw` sees it depends on where the
+    adapted value sits relative to its payload's node: the kernel fills nodes
+    in an internal order and resolves the root last, so the payload may be
+    empty, may be complete, or may carry its own entries while containers
+    reachable through it are still empty. That order is not part of this
+    contract, and the difference is observable — one adapter rebuilds its
+    value faithfully in one position and raises in another — so treat a
+    hoisted payload's contents as unavailable rather than reading them
+    defensively. A payload that freezes to a tuple or a scalar is written
+    inline and is never held as a node, which is why the kernel's own adapters
+    take positional payloads.
   - **Pinned adapter state.** Adapter instance configuration is immutable for
     the registered lifetime, and the kernel enforces the law in-process: each
     adapter's instance configuration is digested at construction, every

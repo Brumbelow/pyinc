@@ -179,11 +179,14 @@ class FileStatAdapter:
 
     The payload is positional rather than named on purpose. A tuple is written
     inline into the frozen value, while a mapping, list, set or dataclass
-    payload is hoisted into a node of the shared-structure envelope and reaches
-    ``thaw`` as a reference into that envelope -- a reference that resolves, at
-    best, to a container the kernel has not finished filling. Reading by
-    position keeps this adapter correct in every mode and in every snapshot
-    shape.
+    payload is hoisted into a node of the shared-structure envelope. Checked
+    and fast mode then hand ``thaw`` that unresolved reference rather than the
+    payload, and strict mode hands it a container whose contents at that
+    moment follow the envelope's internal node order -- empty, complete, or
+    holding shells that are not filled yet -- so nothing about a hoisted
+    payload's contents can be relied on. An inline positional payload is never
+    hoisted, which keeps this adapter correct in every mode and in every
+    snapshot shape.
 
     Stateless by construction: no instance attributes, no slot state, no
     captured objects. That is what lets the kernel treat it as fixed --
