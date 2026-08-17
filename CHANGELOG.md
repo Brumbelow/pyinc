@@ -27,6 +27,20 @@ decided at release time.
 
 ### Fixed
 
+- A failed `db.set` or `db.read_input` no longer leaves a half-registered
+  input behind. Every step that can fail — the conflicting-policy check, the
+  freeze, the caller's `eq=`/`cutoff=` comparator, the store write — now runs
+  before the input is declared, so a raising freeze, a raising comparator or a
+  read of a key nothing has set leaves the counters, the registries and the
+  revision exactly as the call found them, and leaves the key free for
+  whatever `set` eventually declares it. Previously any of those failures
+  registered the key and then refused every later `set` that named it under a
+  different equality policy. A comparator that raises no longer strands
+  unreferenced bytes in a configured artifact store either, on the
+  single-input or the batch path: frozen values reach the store when the write
+  commits rather than as they are frozen. Reading an input now resolves an
+  existing registration instead of creating one, so repeated reads no longer
+  grow the input registry.
 - `strict` mode runs a registered adapter's `thaw` at every boundary — query
   arguments, query results, and `eq=`/`cutoff=` policy operands, including
   results that carry shared or cyclic containers — where it previously handed

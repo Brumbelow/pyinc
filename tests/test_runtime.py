@@ -6679,7 +6679,7 @@ def test_input_boundary_owns_prefrozen_wrappers(mode: str, entry_point: str) -> 
     first = db.get(echoed)
     assert list(cast(Any, first)) == [1, 2, 3]
 
-    record = db._records[db._input_key(payload)]
+    record = db._records[db._prospective_input_key(payload)]
     assert record.snapshot is not held
     _corrupt(held)
     assert fingerprint_snapshot(record.snapshot) == record.digest
@@ -6826,7 +6826,7 @@ def test_adapter_payload_boundary_owns_prefrozen_wrappers(mode: str) -> None:
     db = Database(mode=mode, adapters={Boxed: _HeldPayloadAdapter()})
     db.set(boxed, Boxed(0))
 
-    record = db._records[db._input_key(boxed)]
+    record = db._records[db._prospective_input_key(boxed)]
     payload = cast(FrozenAdapterValue, record.snapshot).payload
     assert payload is not held
     _corrupt(held)

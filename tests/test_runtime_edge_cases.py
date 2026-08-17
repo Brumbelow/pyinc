@@ -1511,7 +1511,7 @@ def test_runtime_internal_cleanup_and_missing_registration_branches() -> None:
     assert key.identity not in db._query_objects()
 
     value = Input[int]("register-twice")
-    assert db._register_input(value) == db._register_input(value)
+    assert db._commit_input_registration(value) == db._commit_input_registration(value)
 
     query_record = NodeRecord(key, "query", 1, _DIGEST, 1, 1)
     db._records[key] = query_record

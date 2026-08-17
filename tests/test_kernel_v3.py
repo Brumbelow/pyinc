@@ -21,6 +21,7 @@ import pytest
 
 import pyinc.runtime as runtime_module
 from pyinc import (
+    ArtifactStoreError,
     BinaryFileResource,
     CheckpointManifestError,
     CheckpointVersionError,
@@ -32,8 +33,10 @@ from pyinc import (
     Query,
     Resource,
     UnsupportedValueError,
+    freeze,
     query,
 )
+from pyinc.value import fingerprint_snapshot
 
 
 @dataclass(frozen=True)
@@ -1399,6 +1402,289 @@ def test_set_many_failure_leaves_all_database_state_unchanged() -> None:
     assert second.read(db) == 2
     assert db.revision == before_revision
     assert db.statistics() == before_statistics
+
+
+class _PutLoggingStore(InMemoryArtifactStore):
+    """An in-memory store that records every digest handed to `put`.
+
+    The log is what makes a "no orphan bytes" assertion non-vacuous: it shows
+    the store was wired and receiving writes for the values that committed, so
+    the absence of the refused value's digest is a decision rather than an
+    accident of a store nothing ever reached.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.puts: list[str] = []
+
+    def put(self, digest: str, payload: bytes) -> None:
+        self.puts.append(digest)
+        super().put(digest, payload)
+
+
+class _RefusingStore(InMemoryArtifactStore):
+    """An in-memory store that refuses to publish one caller-named payload.
+
+    Refusing selectively rather than wholesale is what lets a test show both
+    halves at once: that the refused write left nothing behind, and that the
+    store is otherwise working, so "nothing landed" is not just a store no
+    write ever reached.
+    """
+
+    def __init__(self, refused: bytes) -> None:
+        super().__init__()
+        self._refused = refused
+        self.puts: list[str] = []
+
+    def put(self, digest: str, payload: bytes) -> None:
+        if self._refused in payload:
+            raise ArtifactStoreError("the store refused this payload")
+        self.puts.append(digest)
+        super().put(digest, payload)
+
+
+class _Unfreezable:
+    """A plain object with no adapter, so `freeze` refuses it."""
+
+
+def test_failed_set_leaves_all_database_state_unchanged() -> None:
+    """A `set` whose value cannot be frozen declares nothing.
+
+    Every fallible step runs before anything is committed, so the counters,
+    the registry and the revision are exactly where the call found them -- and
+    in particular the key is still unclaimed, so a later `set` naming it under
+    a different equality policy is a first registration and not a conflict.
+    """
+    db = Database()
+    with pytest.raises(UnsupportedValueError):
+        db.set(Input[Any]("x", cutoff=lambda value: value), _Unfreezable())
+
+    statistics = db.statistics()
+    assert statistics.input_count == 0
+    assert statistics.node_count == 0
+    assert db.revision == 0
+    assert db._input_records == {}
+    assert [key for key in db._records if key.kind == "input"] == []
+    assert db.dependency_graph() == ()
+
+    plain = Input[int]("x")
+    db.set(plain, 1)
+    assert plain.read(db) == 1
+    assert db.statistics().input_count == 1
+    assert db.revision == 1
+
+
+def test_failed_comparator_persists_nothing() -> None:
+    """A raising comparator strands no bytes in the configured store.
+
+    Freezing succeeds here and the comparator fails after it, which is the
+    only shape that can orphan anything: the snapshot is written through on
+    commit, so a value the database refused to record is never published.
+    """
+
+    def explode(left: str, right: str) -> bool:
+        raise RuntimeError("comparator failed")
+
+    store = _PutLoggingStore()
+    db = Database(store=store)
+    key = Input[str]("k", eq=explode)
+    db.set(key, "first")
+    before_revision = db.revision
+    before_puts = list(store.puts)
+    refused_digest = fingerprint_snapshot(freeze("second"))
+
+    with pytest.raises(RuntimeError, match="comparator failed"):
+        db.set(key, "second")
+
+    assert db.revision == before_revision
+    assert key.read(db) == "first"
+    assert store.get(refused_digest) is None
+    assert store.puts == before_puts
+    # The store really is wired: the committed value did reach it.
+    assert store.get(fingerprint_snapshot(freeze("first"))) is not None
+
+
+def test_set_many_failed_comparator_persists_nothing() -> None:
+    """The batch path strands nothing either.
+
+    `set_many` already commits its registrations in one phase; the bytes were
+    the half that escaped, because each value reached the store as it was
+    frozen rather than when the batch was accepted.
+
+    Scope: this is the guarantee for a batch the DATABASE refuses. A batch the
+    STORE refuses part way through is a different matter and unchanged -- a
+    content-addressed store has no rollback, so bytes already published before
+    the refusal stay published while the batch as a whole does not apply. The
+    revision, the counters and the registries are still untouched; only the
+    store keeps the accepted prefix.
+    """
+
+    def explode(left: int, right: int) -> bool:
+        raise RuntimeError("comparator failed")
+
+    store = _PutLoggingStore()
+    db = Database(store=store)
+    first = Input[int]("first")
+    second = Input[int]("second", eq=explode)
+    db.set(first, 1)
+    db.set(second, 2)
+    before_revision = db.revision
+    before_puts = list(store.puts)
+    refused_digests = [fingerprint_snapshot(freeze(99)), fingerprint_snapshot(freeze(100))]
+
+    with pytest.raises(RuntimeError, match="comparator failed"):
+        db.set_many(((first, 99), (second, 100)))
+
+    assert db.revision == before_revision
+    assert first.read(db) == 1
+    assert second.read(db) == 2
+    assert [digest for digest in refused_digests if store.get(digest) is not None] == []
+    assert store.puts == before_puts
+    assert store.get(fingerprint_snapshot(freeze(1))) is not None
+
+
+def test_store_failure_in_set_leaves_key_free() -> None:
+    """A store that refuses the write leaves the key undeclared.
+
+    Publishing the frozen bytes is the last step of a `set` that can fail, so
+    it runs BEFORE the input is registered rather than after. Ordered the other
+    way round, a store failure would leave a registration with no record --
+    the same phantom a raising freeze used to leave, and just as unreclaimable
+    under a different equality policy. This pins the ordering, not the store.
+    """
+    store = _RefusingStore(b"REFUSED")
+    db = Database(store=store)
+
+    with pytest.raises(ArtifactStoreError, match="refused"):
+        db.set(Input[str]("k", cutoff=lambda value: value), "REFUSED")
+
+    statistics = db.statistics()
+    assert statistics.input_count == 0
+    assert statistics.node_count == 0
+    assert db.revision == 0
+    assert db._input_records == {}
+    assert db._inputs_by_key == {}
+    assert db.dependency_graph() == ()
+
+    # The key is still free, under a policy the refused `set` never named.
+    plain = Input[str]("k")
+    db.set(plain, "accepted")
+    assert plain.read(db) == "accepted"
+    assert db.revision == 1
+    # And the store was working all along: it took the value it did not refuse.
+    assert store.puts == [fingerprint_snapshot(freeze("accepted"))]
+
+
+def test_store_failure_in_set_leaves_earlier_inputs_intact() -> None:
+    """A refused write does not disturb the inputs already committed.
+
+    The commit phase publishes bytes and only then declares the input, so the
+    input the store refused leaves no trace next to the one it accepted -- and
+    that refused key, too, is still free for a later differently-policied
+    `set`.
+    """
+    store = _RefusingStore(b"REFUSED")
+    db = Database(store=store)
+    first = Input[str]("first")
+    db.set(first, "committed")
+    before_revision = db.revision
+    before_statistics = db.statistics()
+    before_puts = list(store.puts)
+
+    with pytest.raises(ArtifactStoreError, match="refused"):
+        db.set(Input[str]("second", cutoff=lambda value: value), "REFUSED")
+
+    assert db.revision == before_revision
+    assert db.statistics() == before_statistics
+    assert first.read(db) == "committed"
+    assert db._inputs_by_key == {"first": first}
+    assert store.puts == before_puts
+    assert store.get(fingerprint_snapshot(freeze("committed"))) is not None
+
+    plain_second = Input[str]("second")
+    db.set(plain_second, "accepted")
+    assert plain_second.read(db) == "accepted"
+    assert first.read(db) == "committed"
+
+
+def test_read_input_of_unset_key_registers_nothing() -> None:
+    """Reading an input nothing has set declares nothing.
+
+    The read path resolves an existing registration; it never creates one. A
+    read mutates nothing by contract, so it has to leave the key free for a
+    later `set` to claim under whatever equality policy that `set` names.
+    """
+    db = Database()
+    with pytest.raises(KeyError, match="has not been set"):
+        db.read_input(Input[int]("z"))
+
+    statistics = db.statistics()
+    assert statistics.input_count == 0
+    assert statistics.node_count == 0
+    assert db.revision == 0
+    assert db._input_records == {}
+    assert db.dependency_graph() == ()
+
+    policied = Input[int]("z", cutoff=lambda value: value)
+    db.set(policied, 1)
+    assert policied.read(db) == 1
+    assert db.revision == 1
+
+
+def test_input_read_of_unset_key_registers_nothing() -> None:
+    """`Input.read` funnels through the same resolution, so it inherits it."""
+    db = Database()
+    with pytest.raises(KeyError, match="has not been set"):
+        Input[int]("z").read(db)
+
+    assert db.statistics().input_count == 0
+    assert db._input_records == {}
+
+    policied = Input[int]("z", cutoff=lambda value: value)
+    db.set(policied, 1)
+    assert policied.read(db) == 1
+    assert db.revision == 1
+
+
+def test_read_input_with_conflicting_policy_still_raises() -> None:
+    """Resolving without registering does not cost the conflict diagnostic.
+
+    Two `Input` objects naming one key under different equality policies mean
+    two different notions of "changed" for one node, which is a programming
+    error wherever it surfaces. The read path validates; it just no longer
+    mutates on the way past.
+    """
+
+    def other_cutoff(value: int) -> int:
+        return value
+
+    db = Database()
+    db.set(Input[int]("c", cutoff=lambda value: value), 1)
+    before_statistics = db.statistics()
+
+    with pytest.raises(InputKeyError, match="conflicting"):
+        db.read_input(Input[int]("c", cutoff=other_cutoff))
+
+    assert db.statistics() == before_statistics
+    assert db.revision == 1
+
+
+def test_repeated_reads_with_fresh_input_objects_do_not_grow_state() -> None:
+    """Reads resolve against the registry instead of adding to it.
+
+    Every `Input('x')` is a distinct object, so a read path that registered
+    would retain one entry per call for the lifetime of the database.
+    """
+    db = Database()
+    db.set(Input[int]("x"), 1)
+    registered = len(db._input_records)
+
+    for _ in range(500):
+        assert db.read_input(Input[int]("x")) == 1
+
+    assert len(db._input_records) == registered
+    assert db.statistics().input_count == 1
+    assert db.revision == 1
 
 
 def test_set_many_rejects_duplicate_keys_before_mutating() -> None:

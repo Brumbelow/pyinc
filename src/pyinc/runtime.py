@@ -1223,20 +1223,38 @@ class Database:
     def set(self, input_key: Any, value: Any) -> None:
         # Ahead of the type check as well as the lock: a refusal that ran after
         # the key was resolved could leave a registration behind for an input
-        # the caller was never allowed to declare here.
+        # the caller was never allowed to declare here. The body extends the
+        # same rule to the whole call. Every step that can fail -- the policy
+        # check, the freeze, the caller's comparator, the store write -- runs
+        # before the input is registered, so a `set` that raises for any reason
+        # leaves the registry, the records, the counters and the revision
+        # exactly as it found them, and the key stays free for whatever `set`
+        # eventually declares it.
         self._reject_inside_query("db.set()")
         from .core import Input
 
         if not isinstance(input_key, Input):
             raise TypeError("db.set() expects an Input instance.")
         with self._state_lock:
-            node_key = self._input_key(input_key)
-            snapshot = self._freeze_value(value)
+            self._validate_input_registration(input_key)
+            # Frozen but not published: the bytes reach the store on commit, so
+            # a comparator that raises after a successful freeze cannot strand
+            # an object nothing references.
+            snapshot = freeze(value, adapters=self._adapters)
             digest = fingerprint_snapshot(snapshot)
+            # A prospective key, built rather than registered: `NodeKey` hashes
+            # by value, so this finds an already-committed node without
+            # declaring anything for a call that may still fail.
+            node_key = self._prospective_input_key(input_key)
             record = self._records.get(node_key)
-            if record is not None and self._compare_input_snapshots(
+            equal = record is not None and self._compare_input_snapshots(
                 input_key, record.snapshot, snapshot
-            ):
+            )
+            # Commit, store first: publishing the bytes is the last step that
+            # can fail, and it fails before the registration exists.
+            self._persist_snapshot(snapshot)
+            self._commit_input_registration(input_key)
+            if record is not None and equal:
                 record.snapshot = snapshot
                 record.digest = digest
                 record.verified_at = self._revision
@@ -1306,10 +1324,12 @@ class Database:
                 raw_pairs.append((input_key, value))
 
             # Freeze every value before running any user comparator. Neither
-            # phase mutates database records, revisions, or statistics.
+            # phase mutates database records, revisions, or statistics, and
+            # nothing reaches the store until the whole batch is accepted --
+            # so a comparator that raises leaves no unreferenced bytes behind.
             pending: list[tuple[Any, NodeKey, Any, str]] = []
             for input_key, value in raw_pairs:
-                snapshot = self._freeze_value(value)
+                snapshot = freeze(value, adapters=self._adapters)
                 digest = fingerprint_snapshot(snapshot)
                 node_key = self._prospective_input_key(input_key)
                 pending.append((input_key, node_key, snapshot, digest))
@@ -1324,7 +1344,11 @@ class Database:
                 decisions.append((equal, input_key, node_key, snapshot, digest))
 
             # Commit registrations and record changes only after every freeze
-            # and comparator has succeeded.
+            # and comparator has succeeded. The store writes lead, being the
+            # last step that can fail: a store that refuses one of the frozen
+            # values leaves the batch entirely undeclared.
+            for _input_key, _node_key, pending_snapshot, _digest in pending:
+                self._persist_snapshot(pending_snapshot)
             for input_key, _value in raw_pairs:
                 self._commit_input_registration(input_key)
 
@@ -2760,9 +2784,15 @@ class Database:
         if not isinstance(input_key, Input):
             raise TypeError("db.read_input() expects an Input instance.")
         with self._state_lock:
-            key = self._input_key(input_key)
-            record = self._records.get(key)
-            if record is None:
+            # A read resolves; it never declares. The policy check still runs,
+            # because two Inputs naming one key under different notions of
+            # "changed" is a programming error wherever it surfaces -- but it
+            # validates without mutating, so a read of a key nothing has set
+            # leaves that key free for the `set` that eventually declares it.
+            self._validate_input_registration(input_key)
+            key = self._find_input_node_by_key(input_key.key)
+            record = self._records.get(key) if key is not None else None
+            if key is None or record is None:
                 raise KeyError(f"Input {input_key.key!r} has not been set.")
             self._record_dependency(key)
             return cast(T, self._expose_boundary_snapshot(record.snapshot))
@@ -3487,21 +3517,23 @@ class Database:
         self._call_snapshots()[key] = call_snapshot
         return key, call_snapshot
 
-    def _input_key(self, input_key: Any) -> NodeKey:
-        key = self._input_records.get(input_key)
-        if key is None:
-            self._validate_input_registration(input_key)
-            key = self._register_input(input_key)
-        return key
-
     def _validate_input_registration(self, input_key: Any) -> None:
-        policy_digest = self._input_policy_digest(input_key)
+        """Refuse a key already declared under a different equality policy.
+
+        The registration family's one validation, called once per call by
+        every path that can declare or resolve an input -- so
+        `_commit_input_registration` is the pure mutation it reads as, and the
+        read path can run the check without registering anything.
+        """
         existing = self._inputs_by_key.get(input_key.key)
-        if (
-            existing is not None
-            and existing is not input_key
-            and self._input_policy_digest(existing) != policy_digest
-        ):
+        if existing is input_key:
+            # The registered object measured against itself: there is no second
+            # policy here to disagree with, so the two digests below could only
+            # ever agree. Skipping them keeps a repeated `set` of a long-lived
+            # `Input` off the policy-fingerprinting path entirely.
+            return
+        policy_digest = self._input_policy_digest(input_key)
+        if existing is not None and self._input_policy_digest(existing) != policy_digest:
             raise InputKeyError(
                 f"Input key {input_key.key!r} is already registered with a conflicting "
                 "equality/cutoff policy."
@@ -3515,14 +3547,13 @@ class Database:
             label=f"input[{input_key.key}]",
         )
 
-    def _register_input(self, input_key: Any) -> NodeKey:
-        key = self._input_records.get(input_key)
-        if key is not None:
-            return key
-        self._validate_input_registration(input_key)
-        return self._commit_input_registration(input_key)
-
     def _commit_input_registration(self, input_key: Any) -> NodeKey:
+        """Declare the input. Called only once a write has already succeeded.
+
+        Idempotent and unconditional: validation happened before the caller
+        committed to the write, so nothing here refuses and nothing here can
+        fail part way.
+        """
         key = self._input_records.get(input_key)
         if key is not None:
             return key
