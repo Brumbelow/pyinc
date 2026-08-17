@@ -904,19 +904,25 @@ against the protocol at that call: one missing `get`, `put` or `contains`, or
 one that explicitly subclasses the protocol without implementing `get` and
 `put`, raises `TypeError` at injection rather than failing further downstream.
 A store validated at construction is not re-validated per call.
+`InMemoryArtifactStore` adds a `keys()` accessor outside the protocol; it
+returns a read-only mapping view of the store's contents rather than the
+backing dictionary, so a stored payload cannot be rebound or dropped through it
+behind the collision guard.
 
 On top of this, `Database.save_checkpoint(store=None) -> str` serialises the
 current query and resource records — their snapshot bytes, call snapshots,
 resource parameters, dependency edges, and per-adapter implementation digests —
 into a content-addressed manifest (schema v7), returning a key prefixed with
-`"ck"`. Adapter digests include `freeze`/`thaw` code, snapshot-safe instance
-configuration, and the interpreter/build identity. Saving rejects an adapter
-whose captures or state cannot be pinned; loading under such an adapter safely
-misses and re-executes instead of thawing checkpoint bytes across an
-unverifiable implementation boundary. Records whose cached value no longer
-matches the live graph (a "dirty" save with no intervening `get`) are omitted
-rather than persisted stale, so a reload never warms a value a fresh run would
-not produce.
+`"ck"`. The manifest also records the mode the saving database ran in, so a
+checkpoint is attributable to exactly one mode; loading it into a database
+running another is refused under condition (v) of limitation 4. Adapter digests
+include `freeze`/`thaw` code, snapshot-safe instance configuration, and the
+interpreter/build identity. Saving rejects an adapter whose captures or state
+cannot be pinned; loading under such an adapter safely misses and re-executes
+instead of thawing checkpoint bytes across an unverifiable implementation
+boundary. Records whose cached value no longer matches the live graph (a
+"dirty" save with no intervening `get`) are omitted rather than persisted
+stale, so a reload never warms a value a fresh run would not produce.
 
 `Database.load_checkpoint(key, store=None)` validates every record, dependency,
 input policy, probe, and referenced content address before atomically staging
@@ -928,6 +934,13 @@ otherwise. Both methods accept an optional `store=` kwarg for call-site store
 injection; the store passed to `load_checkpoint` is also used for subsequent
 snapshot loading if the `Database` was not constructed with a `store=`
 argument.
+
+A store found holding different bytes under a digest the kernel is publishing
+is a real integrity fault rather than a condition to route around:
+`save_checkpoint` raises, and a value re-executed because the load skipped
+those same bytes meets the same refusal when a database writing through that
+store persists it. Recovery is removing the corrupt object or supplying a clean
+store; the kernel never silently recomputes around one.
 
 Manifest schema v7 rejects v1-v6 manifests with `CheckpointVersionError`; stale
 checkpoints are re-saved, never migrated.
@@ -1169,10 +1182,11 @@ fresh-recomputation equivalence, extended to the checkpoint path:
   one. Cross-mode loads are refused by design (condition (v) of limitation 4)
   and are pinned by the cross-mode suite in `tests/test_checkpoint_trust.py`.
 - `tests/test_checkpoint_cross_process.py` — a subprocess matrix that saves in
-  one interpreter and reloads in another, checking that identities and digests
+  one process and reloads in another, checking that identities and digests
   line up across processes.
 - `tests/test_checkpoint_trust.py` — the adversarial store and trust suite:
   bit-flipped and truncated snapshot bytes, tampered and wrong-version
-  manifests, changed query/adapter/resource implementations, and
-  runtime-import-reached dependencies each fall back to safe re-execution or a
-  loud `ValueError` rather than serving a stale or tampered value.
+  manifests, all six ordered cross-mode load pairings, changed
+  query/adapter/resource implementations, and runtime-import-reached
+  dependencies each fall back to safe re-execution or a loud `ValueError`
+  rather than serving a stale or tampered value.

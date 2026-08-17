@@ -83,8 +83,8 @@ protocol (`InMemoryArtifactStore` and `FileSystemArtifactStore` ship in
 shape is validated at the boundary, so a store missing `get`, `put` or
 `contains` — or one that explicitly subclasses the protocol without
 implementing `get` and `put` — raises `TypeError` at injection instead of
-failing later. Inheritance is still not required; any object carrying the three
-methods qualifies. The same check guards the `store=` arguments of
+failing later. Inheritance is still not required; any object that defines the
+three methods qualifies. The same check guards the `store=` arguments of
 `save_checkpoint` and `load_checkpoint`. The kernel writes serialized snapshot
 bytes for every value crossing the membrane, keyed by an internally derived
 content digest. Bytes are produced by the public `serialize_snapshot` and
@@ -97,10 +97,12 @@ checkpoint operations instead of manufacturing kernel store keys.
 snapshot addresses, and dependency edges to a content-addressed key prefixed
 with `"ck"`. `Database.load_checkpoint(key, store=None)` accepts manifest
 schema v7 only and validates the entire manifest before staging any record:
-kernel version, identities, input keys, dependency references, duplicates,
-types, and content addresses. Records whose live code/resources no longer
-match miss safely; structurally malformed or foreign manifests raise a typed
-checkpoint error without partially warming the database.
+kernel version, the saving database's mode, identities, input keys, dependency
+references, duplicates, types, and content addresses. Records whose live
+code/resources no longer match miss safely; structurally malformed or foreign
+manifests raise a typed checkpoint error without partially warming the
+database. A checkpoint saved in another database mode is refused with
+`CheckpointModeError`.
 
 `FileSystemArtifactStore` accepts only digest-shaped keys and serializes each
 digest across processes. It flushes a same-directory temporary file before

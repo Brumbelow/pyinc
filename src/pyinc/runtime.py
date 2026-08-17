@@ -96,7 +96,13 @@ ResourceProbeT = TypeVar("ResourceProbeT")
 # depends on that mode -- strict exposes frozen views and frozen call arguments
 # where checked and fast thaw -- so a record saved under one mode can carry a
 # value another mode would never compute; a version-6-or-earlier manifest names
-# no mode at all and so cannot be attributed to one.
+# no mode at all and so cannot be attributed to one. Version 5 and earlier are
+# refused for a second reason that still stands: their records can predate the
+# two soundness repairs version 6 marked -- captured-module identity was
+# derived from a stat tuple a same-size rewrite can preserve, and a stat probe
+# raising NotADirectoryError published no resource edge -- so such a record can
+# carry a stale identity, or claim no dependencies for a read a fresh database
+# re-derives.
 _CHECKPOINT_MANIFEST_VERSION = 7
 # Version of the snapshot/fingerprint encoding this kernel emits, mirrored from
 # value._KERNEL_FINGERPRINT_PREFIX (b"K2;"). Recorded in the manifest and checked
@@ -126,6 +132,11 @@ def _validated_store(store: Any, parameter: str) -> ArtifactStore:
     subclass that passes the shape check because it inherited the protocol's
     own unimplemented ``get``/``put``. Inheriting the ``contains`` default is
     intended and stays legal.
+
+    ``parameter`` identifies the door the store came through rather than naming
+    an argument -- call sites pass a phrase such as "The store passed to
+    save_checkpoint()" -- so the raised message reads as a sentence about the
+    call that was actually made.
     """
     if not isinstance(store, ArtifactStore):
         raise TypeError(
@@ -1629,6 +1640,8 @@ class Database:
         The manifest records this database's mode, and only a database running
         that same mode can load the resulting checkpoint.
 
+        Raises ``TypeError`` if a store passed here does not implement the
+        ``ArtifactStore`` protocol.
         Raises ``ValueError`` if no ``ArtifactStore`` is available (either
         passed directly or configured via ``Database(store=...)``).
         """
@@ -1672,6 +1685,8 @@ class Database:
         run. A database with no store of its own -- one handed a store here and
         nowhere else -- reads through it without writing back.
 
+        Raises ``TypeError`` if a store passed here does not implement the
+        ``ArtifactStore`` protocol.
         Raises ``ValueError`` if no ``ArtifactStore`` is available.
         Raises ``KeyError`` if *key* is not found in the store.
         Raises ``CheckpointModeError`` if the checkpoint was saved by a database

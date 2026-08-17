@@ -127,10 +127,12 @@ decided at release time.
   is identical to a parent's — instead of failing the released range.
 - `AdapterContractError`, raised when a registered adapter's instance
   configuration changes after `Database` construction.
+- `CheckpointModeError`, raised when a checkpoint saved in one database mode is
+  loaded into a database running another.
 
 ### Changed
 
-- Breaking: `Database(store=...)`, `save_checkpoint(store=...)` and
+- `Database(store=...)`, `save_checkpoint(store=...)` and
   `load_checkpoint(store=...)` validate the store against the `ArtifactStore`
   protocol and raise `TypeError` at the call. A store missing `get`, `put` or
   `contains`, or one explicitly subclassing the protocol without implementing
@@ -141,7 +143,8 @@ decided at release time.
   every call.
 - The checkpoint manifest schema is v7 and records the saving database's mode;
   v6 and earlier manifests are rejected loudly because their records cannot be
-  attributed to a save mode.
+  attributed to a save mode and, for v5 and earlier, because their records can
+  predate the module-identity and stat-probe repairs above.
 - Loading a checkpoint into a database running a different mode raises
   `CheckpointModeError` and stages nothing, where it previously succeeded and
   could warm values the loading mode would never compute — a `strict` database

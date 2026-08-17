@@ -2512,9 +2512,12 @@ def test_reflective_queries_stay_rejected_after_a_checkpoint_load(
 
 # ---------------------------------------------------------------------------
 # The checkpoint error taxonomy. Each cause a load can fail for is its own
-# class, so a caller can catch one without catching the rest; a mode mismatch
-# is a cause of its own, and like its siblings it is catchable as a checkpoint
-# failure, as a pyinc error, and as a ValueError.
+# class, so a caller can catch that cause specifically instead of every
+# checkpoint failure at once -- though the classes nest where the causes do,
+# and catching CheckpointManifestError still catches CheckpointIntegrityError,
+# which is one of its subclasses. A mode mismatch is a cause of its own, and
+# like its siblings it is catchable as a checkpoint failure, as a pyinc error,
+# and as a ValueError.
 # ---------------------------------------------------------------------------
 
 
