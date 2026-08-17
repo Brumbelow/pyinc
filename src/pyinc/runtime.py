@@ -3053,6 +3053,7 @@ class Database:
                 self._records[key] = record
                 self._query_records.add(key)
                 decision = "executed"
+                value_moved = True
             else:
                 record = previous
                 previous_changed_at = previous.changed_at
@@ -3099,6 +3100,7 @@ class Database:
                 if equal:
                     record.changed_at = previous_changed_at
                     decision = "backdated"
+                    value_moved = False
                 elif impure and digest == previous_digest:
                     # `equal` was forced above, not observed: an untracked
                     # read skips the comparison entirely. When the re-run
@@ -3112,6 +3114,7 @@ class Database:
                     # the bump below stands.
                     record.changed_at = previous_changed_at
                     decision = "executed"
+                    value_moved = False
                 else:
                     # A recompute that lands a new value is a change in the
                     # graph exactly as an input set or a resource reload is,
@@ -3124,6 +3127,7 @@ class Database:
                     self._revision += 1
                     record.changed_at = self._revision
                     decision = "executed"
+                    value_moved = True
             self._query_records.add(key)
             record.verified_at = self._revision
             record.dependencies = frame.dependencies
@@ -3137,7 +3141,11 @@ class Database:
                 self._stats["query_backdates"] += 1
             else:
                 self._stats["query_executions"] += 1
-                self._enqueue_observer_event(query, key, record)
+                # Delivery follows the value, not the decision: a re-run
+                # that kept the previous changed_at landed nothing new to
+                # announce, while a cold execution always did.
+                if value_moved:
+                    self._enqueue_observer_event(query, key, record)
             self._query_timings.setdefault(key, _TimingAggregate()).add(elapsed)
         finally:
             # First, before the tokens go back: a thread spawned inside this

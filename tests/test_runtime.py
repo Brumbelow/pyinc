@@ -5150,9 +5150,6 @@ class _EqualRecorder:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@pytest.mark.xfail(
-    strict=True, reason="an impure re-run that lands the stored value still fires"
-)
 def test_observer_does_not_fire_when_an_impure_rerun_lands_an_identical_value(
     mode: str,
 ) -> None:
@@ -5182,10 +5179,6 @@ def test_observer_does_not_fire_when_an_impure_rerun_lands_an_identical_value(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="the event stream grows with every executed get of an untracked constant",
-)
 def test_observer_events_do_not_scale_with_how_often_a_caller_asks(mode: str) -> None:
     db = Database(mode)
 
@@ -5206,10 +5199,6 @@ def test_observer_events_do_not_scale_with_how_often_a_caller_asks(mode: str) ->
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="a callback re-getting its untracked node is re-entered on every delivery",
-)
 def test_a_callback_regetting_its_untracked_node_is_entered_once(mode: str) -> None:
     db = Database(mode)
 

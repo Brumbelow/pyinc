@@ -177,6 +177,13 @@ decided at release time.
   its `Mapping` annotation already claimed. It previously handed back the
   backing dictionary itself, so a caller could rebind or delete a stored
   payload through it and walk straight past the collision guard.
+- Observers no longer fire when a re-execution lands a value identical to the
+  one already stored. A node carrying an untracked read re-runs on every
+  request, and each re-run used to deliver a change event even though nothing
+  moved — so the event stream scaled with how often a caller asked, and a
+  callback that re-read its own node could be re-entered without bound. An
+  event now means the node's stored value moved: a cold execution, or a
+  re-execution that advanced the node's `changed_at`.
 
 ### Added
 
