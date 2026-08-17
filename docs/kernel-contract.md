@@ -920,8 +920,8 @@ wait: it inherits the boundary of the query that started it. Its undeclared
 ambient reads raise `UntrackedReadError` exactly as they would on the
 executing thread, and its calls back into that same `Database` raise
 `ReentrantDatabaseError` instead of waiting for the lock — the reading surface
-`get`, `read_input`, `read_resource`, `request_span`,
-`report_untracked_read` and `Subscription.unsubscribe`, and every
+`get`, `read_input`, `read_resource`, `request_span` and
+`report_untracked_read`, `Subscription.unsubscribe`, and every
 administrative and observational entry point beside them (the outside-only
 set, enumerated under Public Surface below). Nothing a descendant can reach
 waits on the lock. Waiting is what they must not do: the query body holds
@@ -1135,10 +1135,8 @@ Core:
 
 `Database` splits in two at the query boundary. Inside a query body the reading
 surface is open, and only that: `get`, `read_input`, `read_resource`,
-`report_untracked_read`, and a `request_span` that joins the request the
-execution already opened — together with `Subscription.unsubscribe`, which
-Thread Safety counts with the reading surface although it is a `Subscription`
-method rather than one of `Database`'s own entry points. Everything else on
+`report_untracked_read`, and a `request_span` that joins the
+request the execution already opened. Everything else on
 `Database` is outside-only and raises `ReentrantDatabaseError` when a body
 reaches it — the administrative calls `set`, `set_many`, `save_checkpoint`,
 `load_checkpoint`, `reset_statistics`, `request_inputs_changed` and `observe`,
@@ -1152,7 +1150,11 @@ database produces from the same inputs. `observe` is administrative because it
 writes, but what it writes is not state any execution derives from; its ground
 is the observational one instead — registration is per call and a body runs
 only when the kernel decides to execute it, so subscribing from one would make
-the subscriber list a function of cache history. That is what the observational
+the subscriber list a function of cache history. `Subscription.unsubscribe` —
+a `Subscription` method rather than one of `Database`'s own entry points — is
+refused on the same ground in the other direction: an in-body teardown would
+land zero or one time per request, decided by the kernel's reuse decisions
+rather than by its caller. That is what the observational
 half rests on throughout: each of those entry points answers with a function of
 the database's own history rather than of the query's declared inputs — how
 many executions have run, what was reused, which decision a node last took,

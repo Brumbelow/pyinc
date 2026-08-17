@@ -993,7 +993,7 @@ class Subscription:
         self._active = True
 
     def unsubscribe(self) -> None:
-        self._database._reject_reentrant_read("Subscription.unsubscribe()")
+        self._database._reject_inside_query("Subscription.unsubscribe()")
         with self._database._state_lock:
             if not self._active:
                 return

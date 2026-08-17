@@ -41,6 +41,12 @@ decided at release time.
   Deciding equivalence under a query's policy is the kernel's job at the
   boundary, not a public helper's; a caller who wants the default relation on
   two values in hand has `semantic_equal`.
+- `Subscription.unsubscribe()` is now outside-only, matching `db.observe()`:
+  called from a query body it raises `ReentrantDatabaseError`, as it already
+  did from a resource hook or a thread spawned inside an execution. A query
+  body runs only when the kernel decides to execute it, so a teardown placed
+  inside one landed zero or one time per request depending on cache history —
+  the same ground on which registering from a body is refused.
 
 ### Fixed
 

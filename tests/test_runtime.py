@@ -3758,6 +3758,37 @@ def test_query_spawned_thread_unsubscribing_fails_fast() -> None:
     )
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_subscription_unsubscribe_raises_inside_a_query_body(mode: str) -> None:
+    counter = Input[int]("counter")
+
+    @query
+    def watched(db: Database) -> int:
+        return counter.read(db) * 2
+
+    @query
+    def tears_down(db: Database) -> str:
+        db.subscription.unsubscribe()  # type: ignore[attr-defined]
+        return "unsubscribed"
+
+    db = Database(mode=mode)
+    db.set(counter, 1)
+    sink: list[QueryChangeEvent] = []
+    # The handle rides on the database: a query may not capture ambient
+    # state the test could rebind under it.
+    db.subscription = db.observe(sink.append, watched)  # type: ignore[attr-defined]
+    with pytest.raises(
+        ReentrantDatabaseError,
+        match=re.escape("Subscription.unsubscribe() is not allowed inside a query body."),
+    ):
+        db.get(tears_down)
+    # The refusal left the subscription untouched and live.
+    assert db.subscription._active is True  # type: ignore[attr-defined]
+    assert _live_observer_entries(db) == 1
+    assert db.get(watched) == 2
+    assert len(sink) == 1
+
+
 def test_unrelated_thread_call_serializes_while_a_query_runs() -> None:
     """A thread the query did not start still waits its turn rather than being refused.
 
