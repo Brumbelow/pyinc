@@ -47,6 +47,8 @@ from pyinc.value import (
     FrozenRecord,
     FrozenRef,
     FrozenSet,
+    _adapter_key,
+    _AdapterRegistry,
     fingerprint_snapshot,
 )
 
@@ -717,6 +719,53 @@ def test_strict_snapshot_view_resolves_every_graph_wrapper() -> None:
         FrozenSet,
         FrozenRecord,
     ]
+
+
+@dataclass(frozen=True)
+class _AdaptedPair:
+    left: int
+    right: int
+
+
+class _PairAdapter:
+    def freeze(self, value: _AdaptedPair, freeze: Any) -> Any:
+        return (value.left, value.right)
+
+    def thaw(self, snapshot: Any, thaw: Any) -> Any:
+        left, right = thaw(snapshot)
+        return _AdaptedPair(left, right)
+
+
+def test_strict_snapshot_view_thaws_adapted_values_only_with_a_registry() -> None:
+    pair_key = _adapter_key(_AdaptedPair)
+    registry = _AdapterRegistry({_AdaptedPair: _PairAdapter()})
+    empty_registry = _AdapterRegistry({})
+    adapted = FrozenAdapterValue(pair_key, (1, 2))
+
+    # The non-graph arm.
+    assert Database._detached_snapshot_view(adapted, adapters=registry) == _AdaptedPair(1, 2)
+    with pytest.raises(UnsupportedValueError, match="Cannot thaw adapted snapshot for"):
+        Database._detached_snapshot_view(adapted, adapters=empty_registry)
+
+    # The graph arm: the adapted value rides inside a shared container, which
+    # is what puts it on the resolve() path rather than the detach path.
+    graph = FrozenGraph(
+        nodes=(
+            FrozenList((FrozenRef(1), FrozenRef(1))),
+            FrozenList((adapted,)),
+        ),
+        root=FrozenRef(0),
+    )
+    resolved = Database._strict_snapshot_view(graph, adapters=registry)
+    assert resolved[0] is resolved[1]
+    assert resolved[0][0] == _AdaptedPair(1, 2)
+    with pytest.raises(UnsupportedValueError, match="Cannot thaw adapted snapshot for"):
+        Database._strict_snapshot_view(graph, adapters=empty_registry)
+
+    # Without a registry at all, both arms keep handing the wrapper back -- the
+    # structural checkpoint-load validator depends on that.
+    assert Database._detached_snapshot_view(adapted) == adapted
+    assert Database._strict_snapshot_view(graph)[0][0] == adapted
 
 
 def test_static_capture_covers_supported_scalar_typing_and_container_shapes() -> None:

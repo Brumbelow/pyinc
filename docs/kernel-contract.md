@@ -84,7 +84,10 @@ reconstructed.
 The kernel stores frozen snapshots internally. `strict` exposes the immutable
 `Frozen*` views themselves (a query receives, for example, a `FrozenDict` where
 the other modes hand it a `dict`); `checked` and `fast` expose owned thawed
-values. No external alias to a value that crossed the boundary can influence
+values. A value with a registered adapter is the exception in every mode: it is
+reconstructed through that adapter, so a query argument, a query result and an
+`eq=`/`cutoff=` policy operand carry the adapted type whichever mode is in
+force. No external alias to a value that crossed the boundary can influence
 the stored snapshot. This holds in both directions: `freeze` returns a
 snapshot the kernel owns outright — an already-frozen wrapper is cloned rather
 than passed through by identity, a tree-shaped one into a structurally
@@ -680,6 +683,17 @@ those marks the catcher too.
     with the live value; `thaw` returns a value the caller owns outright.
   - **Semantic round-trip.** For any accepted value, `thaw(freeze(x))` is
     semantically equal to `x` wherever the adapted type is consumed.
+  - **Mode-shaped payloads.** `thaw` runs at every boundary in every mode. Its
+    first argument is the payload as the snapshot holds it — a rebuilt view of
+    that payload under `strict`, the raw `Frozen*` payload under `checked` and
+    `fast` — so a mapping payload arrives as a `Mapping` and a tuple payload as
+    a tuple whichever mode is in force. What is mode-shaped is the second
+    argument, the recursive callable: it yields values the way that mode
+    exposes values, `Frozen*` views under `strict` and thawed containers under
+    `checked` and `fast`. One implementation therefore serves all three modes.
+    The one exception is a payload the graph encoding hoisted into a node of
+    its own: `checked` and `fast` hand `thaw` a `FrozenRef` there rather than
+    the payload itself.
   - **Pinned adapter state.** Adapter instance configuration is immutable for
     the registered lifetime, and the kernel enforces the law in-process: each
     adapter's instance configuration is digested at construction, every

@@ -9,7 +9,14 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from pyinc import UnsupportedValueError, deserialize_snapshot, freeze, serialize_snapshot, thaw
+from pyinc import (
+    Database,
+    UnsupportedValueError,
+    deserialize_snapshot,
+    freeze,
+    serialize_snapshot,
+    thaw,
+)
 from pyinc.value import (
     _KERNEL_FINGERPRINT_PREFIX,
     FrozenAdapterValue,
@@ -68,6 +75,11 @@ def test_adapter_registry_rejects_duplicate_type_identifiers() -> None:
     adapter = _AdaptedValueAdapter()
     with pytest.raises(ValueError, match="duplicate type identifiers"):
         _AdapterRegistry({first: adapter, second: adapter})
+    # A Database builds the same key-indexed registry once, up front, so the
+    # collision is reported where the registry was written rather than at the
+    # first value boundary that happens to need it.
+    with pytest.raises(ValueError, match="duplicate type identifiers"):
+        Database(adapters={first: adapter, second: adapter})
 
 
 def test_freeze_rejects_snapshot_wrapper_subclasses_and_iterable_only_values() -> None:

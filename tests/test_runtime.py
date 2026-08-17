@@ -5006,6 +5006,33 @@ class BoxedAdapter(ValueAdapter):
         return Boxed(thaw(data["payload"]))
 
 
+@dataclass(frozen=True)
+class Point:
+    # Optional because the adapter below reports what it was actually handed:
+    # inside a shared graph the payload is not filled yet when thaw runs.
+    x: int | None
+    y: int | None
+
+
+class PointAdapter(ValueAdapter):
+    """Rebuilds a Point from a mapping payload, read while `thaw` runs.
+
+    Reading the payload instead of aliasing it is deliberate. An adapter that
+    only stores what it is handed hides what the payload held at the moment
+    `thaw` was called -- under `checked` and `fast` it is holding a container
+    the kernel fills afterwards, while under `strict` it is holding a rebuilt
+    view that never fills.
+    """
+
+    def freeze(self, value: Point, freeze: Any) -> Any:
+        assert callable(freeze)
+        return {"x": value.x, "y": value.y}
+
+    def thaw(self, snapshot: Any, thaw: Any) -> Point:
+        payload = thaw(snapshot)
+        return Point(x=payload.get("x"), y=payload.get("y"))
+
+
 class _MutableCurrency:
     def __init__(self, amount: int) -> None:
         self.amount = amount
@@ -5194,7 +5221,7 @@ def test_equal_input_set_does_not_run_adapter_hooks(mode: str) -> None:
     assert db.statistics().input_equal_ignores == 1
 
 
-@pytest.mark.parametrize("mode", ["checked", "fast"])
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_backdate_compare_does_not_thaw_adapted_values(mode: str) -> None:
     stage = Input[int]("stage")
 
@@ -5219,6 +5246,136 @@ def test_backdate_compare_does_not_thaw_adapted_values(mode: str) -> None:
     # The only thaw on the warm request is the caller-boundary exposure; the
     # equality decision runs on the stored snapshots directly.
     assert BoxedAdapter.thaw_calls == 1
+
+
+def test_strict_mode_reconstructs_adapted_return_values() -> None:
+    stage = Input[int]("strict-adapted-return-stage")
+
+    @query
+    def make_point(db: Database) -> Point:
+        stage.read(db)
+        return Point(4, 9)
+
+    db = Database(mode="strict", adapters={Point: PointAdapter()})
+    db.set(stage, 0)
+    result = db.get(make_point)
+    assert db.statistics().query_executions == 1
+    assert isinstance(result, Point)
+    assert (result.x, result.y) == (4, 9)
+
+
+def test_strict_mode_reconstructs_adapted_query_arguments() -> None:
+    @query
+    def observed_argument(db: Database, point: object) -> str:
+        # The observation leaves through the return value: a query may not
+        # write to an ambient sink.
+        return f"{type(point).__name__}:{getattr(point, 'x', None)}"
+
+    db = Database(mode="strict", adapters={Point: PointAdapter()})
+    assert db.get(observed_argument, Point(4, 9)) == "Point:4"
+    assert db.statistics().query_executions == 1
+
+
+def test_strict_mode_reconstructs_adapted_values_inside_shared_graphs() -> None:
+    stage = Input[int]("strict-adapted-graph-stage")
+
+    @query
+    def shared_points(db: Database) -> object:
+        stage.read(db)
+        inner = [Point(4, 9)]
+        # A shared CONTAINER, not a shared leaf: an adapted value is inlined
+        # rather than memoized, so only the container drives the snapshot into
+        # the graph encoding this arm is about.
+        return [inner, inner]
+
+    db = Database(mode="strict", adapters={Point: PointAdapter()})
+    db.set(stage, 0)
+    exposed = db.get(shared_points)
+    assert db.statistics().query_executions == 1
+    key, _ = db._query_key(shared_points, (), {})
+    assert isinstance(db._records[key].snapshot, FrozenGraph)
+
+    assert isinstance(exposed, FrozenList)
+    assert isinstance(exposed[0], FrozenList)
+    # Sharing survives the rebuild: both slots resolve to one view.
+    assert exposed[0] is exposed[1]
+    # The adapter ran on this arm -- the leaf is the reconstructed type, not
+    # the kernel's internal adapted-value wrapper.
+    assert isinstance(exposed[0][0], Point)
+    # Known limitation: inside a graph encoding, an adapted value whose payload
+    # is itself a container is handed that payload before the kernel has filled
+    # it, so the reconstruction reads an empty payload. This is not a strict
+    # quirk -- see the mode-uniformity pin below.
+    assert (exposed[0][0].x, exposed[0][0].y) == (None, None)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_adapted_values_inside_shared_graphs_read_alike_in_every_mode(mode: str) -> None:
+    stage = Input[int]("adapted-graph-parity-stage")
+
+    @query
+    def shared_points(db: Database) -> object:
+        stage.read(db)
+        inner = [Point(4, 9)]
+        return [inner, inner]
+
+    db = Database(mode=mode, adapters={Point: PointAdapter()})
+    db.set(stage, 0)
+    exposed = db.get(shared_points)
+    assert db.statistics().query_executions == 1
+    key, _ = db._query_key(shared_points, (), {})
+    assert isinstance(db._records[key].snapshot, FrozenGraph)
+
+    leaf = exposed[0][0]  # type: ignore[index]
+    assert isinstance(leaf, Point)
+    # Known limitation, pinned rather than papered over: a container payload is
+    # stored as its own graph node and the node holding the adapted value is
+    # filled first, so every mode hands the adapter an empty payload here. The
+    # mode boundary is what this cell protects -- the three modes must not
+    # drift apart while the limitation stands.
+    assert (leaf.x, leaf.y) == (None, None)
+
+
+def test_strict_mode_policies_receive_adapted_types(capsys: pytest.CaptureFixture[str]) -> None:
+    stage = Input[int]("strict-adapted-policy-stage")
+
+    def typed_eq(left: object, right: object) -> bool:
+        print(f"eq-operands:{type(left).__name__}:{type(right).__name__}")
+        return left == right
+
+    @query(eq=typed_eq)
+    def constant_point(db: Database) -> Point:
+        stage.read(db)
+        return Point(4, 9)
+
+    db = Database(mode="strict", adapters={Point: PointAdapter()})
+    db.set(stage, 0)
+    db.get(constant_point)
+    assert capsys.readouterr().out == ""
+
+    db.set(stage, 1)
+    db.get(constant_point)
+    assert capsys.readouterr().out == "eq-operands:Point:Point\n"
+    assert _inspect_node(db, constant_point).last_decision == "backdated"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_exposing_an_adapted_value_without_its_adapter_refuses_in_every_mode(mode: str) -> None:
+    prefrozen = freeze(Point(4, 9), adapters={Point: PointAdapter()})
+    assert isinstance(prefrozen, FrozenAdapterValue)
+
+    source = Input[object]("adapter-less-source")
+    # The database that stores the payload holds no adapter for it, which a
+    # caller can reach by handing a pre-frozen snapshot to a second database.
+    db = Database(mode=mode)
+    db.set(source, prefrozen)
+
+    @query(key=f"adapter-less-read-{mode}")
+    def read_source(db_: Database) -> object:
+        return source.read(db_)
+
+    with pytest.raises(UnsupportedValueError, match="Cannot thaw adapted snapshot for"):
+        db.get(read_source)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -5706,7 +5863,7 @@ def test_custom_eq_receives_mode_exposed_operands(
     assert _inspect_node(db, mapping).last_decision == "backdated"
 
 
-@pytest.mark.parametrize("mode", ["checked", "fast"])
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_impure_custom_eq_skips_policy_but_still_exposes(mode: str) -> None:
     stage = Input[int]("stage")
 

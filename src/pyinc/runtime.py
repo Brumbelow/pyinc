@@ -64,6 +64,7 @@ from .value import (
     Snapshot,
     ValueAdapter,
     _adapter_key,
+    _AdapterRegistry,
     assert_not_mutated,
     collect_adapter_keys,
     deserialize_snapshot,
@@ -987,6 +988,10 @@ class Database:
         self.mode = mode
         self.max_query_nodes = max_query_nodes
         self._adapters = dict(adapters or {})
+        # The registry is fixed for this database's lifetime, so the key-indexed
+        # view every boundary exposure needs is built once here rather than per
+        # exposure.
+        self._view_adapter_registry = _AdapterRegistry(self._adapters)
         # Per-adapter-key implementation digests read from a loaded checkpoint's
         # manifest; the warm gate compares these against the live registry.
         self._checkpoint_adapter_digests: dict[str, str] = {}
@@ -2329,9 +2334,11 @@ class Database:
             return False
         if ckpt.get("is_untracked"):
             return False
-        # The root call snapshot is thawed to obtain the arguments passed to
-        # the query. A changed adapter can therefore alter a fresh execution's
-        # inputs even when the saved result itself uses only native values.
+        # The root call snapshot is materialized per mode to obtain the
+        # arguments passed to the query, and an adapted value is reconstructed
+        # through its adapter on every one of those paths. A changed adapter
+        # can therefore alter a fresh execution's inputs even when the saved
+        # result itself uses only native values.
         if not self._adapter_keys_trusted(collect_adapter_keys(call_snapshot)):
             return False
         # An adapter whose implementation changed (or vanished) since the save
@@ -3547,7 +3554,9 @@ class Database:
         self, call_snapshot: Any, *, record_boundaries: bool, frame: ExecutionFrame
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         if self.mode == "strict":
-            envelope = self._strict_snapshot_view(call_snapshot)
+            envelope = self._strict_snapshot_view(
+                call_snapshot, adapters=self._view_adapter_registry
+            )
             if not self._is_materialized_call_envelope(envelope, kwargs_type=FrozenDict):
                 raise UnsupportedValueError("Invalid query call snapshot.")
             frozen_args, frozen_kwargs = envelope
@@ -3581,7 +3590,9 @@ class Database:
         return all(type(key) is str for key in envelope[1])
 
     @classmethod
-    def _strict_snapshot_view(cls, snapshot: Any) -> Any:
+    def _strict_snapshot_view(
+        cls, snapshot: Any, *, adapters: _AdapterRegistry | None = None
+    ) -> Any:
         """Expose a snapshot through rebuilt immutable container interfaces.
 
         Every `Frozen*` shell is rebuilt, graph or not: frozen dataclass
@@ -3589,10 +3600,18 @@ class Database:
         so a view aliasing the stored snapshot would let a caller corrupt the
         record it came from. Leaf values and all-leaf tuples are shared —
         nothing reflective can rebind their contents.
+
+        With *adapters* supplied, an adapted value is reconstructed through
+        its registered adapter, so a caller boundary hands back the type the
+        adapter builds rather than the kernel's internal wrapper. The adapter
+        is handed the already-rebuilt payload and the rebuild callable, never
+        the stored snapshot: the no-aliasing invariant above must not depend
+        on an adapter cooperating. Callers with no registry — the structural
+        validators — keep the wrapper.
         """
 
         if type(snapshot) is not FrozenGraph:
-            return cls._detached_snapshot_view(snapshot)
+            return cls._detached_snapshot_view(snapshot, adapters=adapters)
 
         shells: list[Any] = []
         for node in snapshot.nodes:
@@ -3624,7 +3643,15 @@ class Database:
                     tuple((key, resolve(item)) for key, item in value.entries),
                 )
             if type(value) is FrozenAdapterValue:
-                return FrozenAdapterValue(value.adapter_key, resolve(value.payload))
+                if adapters is None:
+                    return FrozenAdapterValue(value.adapter_key, resolve(value.payload))
+                adapter = adapters.for_key(value.adapter_key)
+                if adapter is None:
+                    raise UnsupportedValueError(
+                        f"Cannot thaw adapted snapshot for {value.adapter_key!r} "
+                        "without the matching adapter registry."
+                    )
+                return adapter.thaw(resolve(value.payload), resolve)
             if type(value) is tuple:
                 return tuple(resolve(item) for item in value)
             return value
@@ -3649,27 +3676,47 @@ class Database:
         return resolve(snapshot.root)
 
     @classmethod
-    def _detached_snapshot_view(cls, value: Any) -> Any:
+    def _detached_snapshot_view(
+        cls, value: Any, *, adapters: _AdapterRegistry | None = None
+    ) -> Any:
         detach = cls._detached_snapshot_view
         if type(value) is FrozenList:
-            return FrozenList(tuple(detach(item) for item in value.items))
+            return FrozenList(tuple(detach(item, adapters=adapters) for item in value.items))
         if type(value) is FrozenDict:
             return FrozenDict(
-                tuple((detach(key), detach(item)) for key, item in value.entries)
+                tuple(
+                    (detach(key, adapters=adapters), detach(item, adapters=adapters))
+                    for key, item in value.entries
+                )
             )
         if type(value) is FrozenSet:
-            return FrozenSet(value.kind, tuple(detach(item) for item in value.items))
+            return FrozenSet(
+                value.kind, tuple(detach(item, adapters=adapters) for item in value.items)
+            )
         if type(value) is FrozenRecord:
             return FrozenRecord(
                 value.type_name,
-                tuple((key, detach(item)) for key, item in value.entries),
+                tuple((key, detach(item, adapters=adapters)) for key, item in value.entries),
             )
         if type(value) is FrozenAdapterValue:
-            return FrozenAdapterValue(value.adapter_key, detach(value.payload))
+            if adapters is None:
+                return FrozenAdapterValue(
+                    value.adapter_key, detach(value.payload, adapters=adapters)
+                )
+            adapter = adapters.for_key(value.adapter_key)
+            if adapter is None:
+                raise UnsupportedValueError(
+                    f"Cannot thaw adapted snapshot for {value.adapter_key!r} "
+                    "without the matching adapter registry."
+                )
+            return adapter.thaw(
+                detach(value.payload, adapters=adapters),
+                lambda item: detach(item, adapters=adapters),
+            )
         if type(value) is FrozenGraph:
-            return cls._strict_snapshot_view(value)
+            return cls._strict_snapshot_view(value, adapters=adapters)
         if type(value) is tuple:
-            detached = tuple(detach(item) for item in value)
+            detached = tuple(detach(item, adapters=adapters) for item in value)
             if all(item is original for item, original in zip(detached, value, strict=True)):
                 return value
             return detached
@@ -3688,7 +3735,7 @@ class Database:
         # rebuilt into shared/cyclic Frozen* views, exactly as _materialize_call
         # does for call arguments.
         if self.mode == "strict":
-            exposed = self._strict_snapshot_view(snapshot)
+            exposed = self._strict_snapshot_view(snapshot, adapters=self._view_adapter_registry)
         else:
             exposed = self._thaw_value(snapshot)
         if record_boundaries and frame is not None:
@@ -3706,7 +3753,9 @@ class Database:
         FrozenGraph cycles, so a cyclic result is comparable without
         re-freezing -- while checked and fast thaw, which already allocates
         fresh containers. Either way the operand shares no mutable shell with
-        the record it came from.
+        the record it came from, and either way an adapted value reaches the
+        policy as the type its adapter rebuilds rather than as the kernel's
+        internal wrapper.
         """
 
         return self._expose_snapshot(snapshot)

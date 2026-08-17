@@ -108,7 +108,8 @@ def test_adapter_round_trip_works_for_freeze_and_thaw() -> None:
     assert thaw(snapshot, adapters=adapters) == Point(1, 2)
 
 
-def test_database_uses_adapters_for_boundary_values() -> None:
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_database_uses_adapters_for_boundary_values(mode: str) -> None:
     adapters = {Point: PointAdapter()}
     payload = Input[Point]("payload")
 
@@ -118,7 +119,7 @@ def test_database_uses_adapters_for_boundary_values() -> None:
         assert isinstance(point, Point)
         return point.x + point.y
 
-    db = Database(mode="checked", adapters=adapters)
+    db = Database(mode=mode, adapters=adapters)
     db.set(payload, Point(2, 3))
     assert db.get(total) == 5
     key, _ = db._query_key(total, (), {})

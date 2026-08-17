@@ -13,6 +13,15 @@ decided at release time.
 
 ### Fixed
 
+- `strict` mode runs a registered adapter's `thaw` at every boundary — query
+  arguments, query results, and `eq=`/`cutoff=` policy operands, including
+  results that carry shared or cyclic containers — where it previously handed
+  back the kernel's internal adapted-value wrapper. Strict now matches
+  `checked` and `fast`, and an exposure naming an adapter key the live
+  registry lacks refuses with the same message the other modes raise. Two
+  registered types that share an adapter key are now refused while the
+  `Database` is being constructed rather than at its first value boundary —
+  same error, raised where the registry was written.
 - Captured-module identity is derived from the file's bytes on every
   observation. The POSIX path cached the digest under a stat tuple (size,
   mtime, ctime, device, inode) that a same-size rewrite inside one timestamp
