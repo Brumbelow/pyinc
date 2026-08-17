@@ -184,6 +184,13 @@ decided at release time.
   callback that re-read its own node could be re-entered without bound. An
   event now means the node's stored value moved: a cold execution, or a
   re-execution that advanced the node's `changed_at`.
+- `Subscription.unsubscribe()` now detaches exactly the registration that
+  created it. Subscriptions are tracked by a per-registration token rather
+  than by callback equality, so two distinct callbacks that happen to compare
+  equal — an ordinary dataclass callable, for instance — no longer race for
+  one slot, a handle's active flag stays truthful, and registering one
+  callback several times delivers once per registration, each handle
+  detaching only its own.
 
 ### Added
 

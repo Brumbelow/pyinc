@@ -5095,6 +5095,11 @@ def test_observers_thread_safe_under_contention() -> None:
     for t in threads:
         t.join(timeout=5.0)
         assert not t.is_alive()
+    # Churners each added and removed their own registration, so exactly
+    # the twenty pre-registered slots survive the churn.
+    with db._state_lock:
+        (entries,) = db._observers.values()
+        assert len(entries) == 20
     # Just verify no deadlock/crash and that events did get delivered.
     assert len(events) > 0
     for s in subs:
@@ -5245,10 +5250,6 @@ def test_a_callback_regetting_a_pure_node_is_entered_once() -> None:
     assert len(sibling) == 1  # delivery was live; the single entry is real
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="unsubscribing removes whichever registration compares equal first",
-)
 def test_unsubscribe_removes_only_its_own_subscription() -> None:
     db = Database()
     inp = Input[int]("x")
@@ -5281,10 +5282,6 @@ def test_unsubscribe_removes_only_its_own_subscription() -> None:
     assert _live_observer_entries(db) == 0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="unsubscribing removes whichever registration compares equal first",
-)
 def test_equal_dataclass_callbacks_keep_their_own_subscriptions() -> None:
     @dataclass
     class Notifier:
@@ -5315,10 +5312,6 @@ def test_equal_dataclass_callbacks_keep_their_own_subscriptions() -> None:
     assert len(notifier_b.seen) == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="unsubscribing removes whichever registration compares equal first",
-)
 def test_unsubscribing_the_middle_of_three_equal_callbacks_removes_only_it() -> None:
     db = Database()
     inp = Input[int]("x")

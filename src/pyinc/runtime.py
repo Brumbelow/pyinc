@@ -976,12 +976,19 @@ class Subscription:
     evicted and later re-executed, the callback fires as normal.
     """
 
-    __slots__ = ("_database", "_key", "_callback", "_active")
+    __slots__ = ("_database", "_key", "_callback", "_token", "_active")
 
-    def __init__(self, database: Database, key: NodeKey, callback: ObserverCallback) -> None:
+    def __init__(
+        self,
+        database: Database,
+        key: NodeKey,
+        callback: ObserverCallback,
+        token: int,
+    ) -> None:
         self._database = database
         self._key = key
         self._callback = callback
+        self._token = token
         self._active = True
 
     def unsubscribe(self) -> None:
@@ -990,7 +997,7 @@ class Subscription:
             if not self._active:
                 return
             self._active = False
-            self._database._unregister_observer(self._key, self._callback)
+            self._database._unregister_observer(self._key, self._token)
 
 
 class Database:
@@ -1167,7 +1174,10 @@ class Database:
         )
         self._resource_registry: dict[NodeKey, tuple[Any, Any]] = {}
         self._call_snapshot_registry: dict[NodeKey, Any] = {}
-        self._observers: dict[NodeKey, list[ObserverCallback]] = {}
+        # Token-keyed so equal callbacks and duplicate
+        # registrations each own one slot; insertion order is delivery order.
+        self._observers: dict[NodeKey, dict[int, ObserverCallback]] = {}
+        self._observer_token_counter = 0
         self._observer_error_hook: ObserverErrorHook = (
             observer_error_hook if observer_error_hook is not None else _default_observer_error_hook
         )
@@ -1763,8 +1773,10 @@ class Database:
             raise TypeError("db.observe() expects a callable as its first argument.")
         with self._state_lock:
             key, _ = self._query_key(query, args, kwargs)
-            self._observers.setdefault(key, []).append(callback)
-        return Subscription(self, key, callback)
+            self._observer_token_counter += 1
+            token = self._observer_token_counter
+            self._observers.setdefault(key, {})[token] = callback
+        return Subscription(self, key, callback, token)
 
     def report_untracked_read(self, reason: str) -> None:
         # Before the lock, which this method takes ahead of everything else: a
@@ -3175,14 +3187,12 @@ class Database:
             )
         )
 
-    def _unregister_observer(self, key: NodeKey, callback: ObserverCallback) -> None:
+    def _unregister_observer(self, key: NodeKey, token: int) -> None:
         with self._state_lock:
             callbacks = self._observers.get(key)
             if callbacks is None:
                 return
-            try:
-                callbacks.remove(callback)
-            except ValueError:
+            if callbacks.pop(token, None) is None:
                 return
             if not callbacks:
                 del self._observers[key]
@@ -3198,7 +3208,9 @@ class Database:
         if not events:
             return
         with self._state_lock:
-            snapshots = [(event, tuple(self._observers.get(key, ()))) for key, event in events]
+            snapshots = [
+                (event, tuple(self._observers.get(key, {}).values())) for key, event in events
+            ]
         for event, callbacks in snapshots:
             for callback in callbacks:
                 try:

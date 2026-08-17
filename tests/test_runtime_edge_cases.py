@@ -1497,19 +1497,16 @@ def test_runtime_internal_cleanup_and_missing_registration_branches() -> None:
     def callback(event: object) -> None:
         return None
 
-    def other_callback(event: object) -> None:
-        return None
-
-    db._observers[key] = [callback]
+    db._observers[key] = {7: callback}
     db._enqueue_observer_event(cast(Any, type("Q", (), {"key": "query"})()), key, record)
 
     missing_key = NodeKey("query", "missing", _DIGEST, "missing")
-    db._unregister_observer(missing_key, callback)
-    db._unregister_observer(key, other_callback)
+    db._unregister_observer(missing_key, 7)
+    db._unregister_observer(key, 8)
 
     db._query_objects()[key.identity] = object()
     db._call_snapshots()[key] = ((), FrozenDict(()))
-    db._unregister_observer(key, callback)
+    db._unregister_observer(key, 7)
     assert key.identity not in db._query_objects()
 
     value = Input[int]("register-twice")
