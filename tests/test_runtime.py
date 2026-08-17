@@ -5120,6 +5120,418 @@ def test_observe_evicted_node_does_not_raise_and_refires_after_reload() -> None:
     # a is no longer a record, but observer is still registered
     db.get(a)  # re-executes a from scratch → event 2 fires
     assert len(events) == 2
+    # The refire is a cold execution of a node whose revision never moved,
+    # so both events carry the same changed_at -- the event stream does not
+    # promise strictly climbing changed_at values.
+    assert events[0].changed_at == events[1].changed_at == 0
+    assert db.revision == 0
+
+
+# --- Push observers: delivery follows the value -------------------------------
+
+
+def _live_observer_entries(db: Database) -> int:
+    with db._state_lock:
+        return sum(len(entry) for entry in db._observers.values())
+
+
+class _EqualRecorder:
+    """Callable that compares equal to every other instance of its type."""
+
+    def __init__(self, name: str, log: list[str]) -> None:
+        self.name = name
+        self.log = log
+
+    def __call__(self, event: QueryChangeEvent) -> None:
+        self.log.append(self.name)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _EqualRecorder)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.xfail(
+    strict=True, reason="an impure re-run that lands the stored value still fires"
+)
+def test_observer_does_not_fire_when_an_impure_rerun_lands_an_identical_value(
+    mode: str,
+) -> None:
+    db = Database(mode)
+    tick = Input[int]("tick")
+    db.set(tick, 1)
+
+    @query
+    def constant(db: Database) -> int:
+        tick.read(db)
+        db.report_untracked_read("stable external reading")
+        return 42
+
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, constant)
+    before = db.statistics().query_executions
+    assert db.get(constant) == 42
+    db.set(tick, 2)
+    assert db.get(constant) == 42
+    assert db.get(constant) == 42
+    # Execution witness: the untracked mark forced all three bodies to run.
+    assert db.statistics().query_executions - before == 3
+    # The delivery gate must not leak into decision semantics.
+    assert db.inspect(constant).last_recompute == "executed"
+    assert len(events) == 1
+    assert events[0].changed_at == events[0].verified_at
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.xfail(
+    strict=True,
+    reason="the event stream grows with every executed get of an untracked constant",
+)
+def test_observer_events_do_not_scale_with_how_often_a_caller_asks(mode: str) -> None:
+    db = Database(mode)
+
+    @query
+    def reading(db: Database) -> int:
+        db.report_untracked_read("stable external reading")
+        return 7
+
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, reading)
+    before = db.statistics().query_executions
+    for _ in range(4):
+        assert db.get(reading) == 7
+    assert db.statistics().query_executions - before == 4
+    assert db.revision == 0
+    assert len(events) == 1
+    assert [event.changed_at for event in events] == [0]
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.xfail(
+    strict=True,
+    reason="a callback re-getting its untracked node is re-entered on every delivery",
+)
+def test_a_callback_regetting_its_untracked_node_is_entered_once(mode: str) -> None:
+    db = Database(mode)
+
+    @query
+    def reading(db: Database) -> int:
+        db.report_untracked_read("stable external reading")
+        return 7
+
+    entries: list[int] = []
+
+    def chase(event: QueryChangeEvent) -> None:
+        entries.append(event.changed_at)
+        if len(entries) < 50:  # cap: without the delivery gate this recurses
+            db.get(reading)
+
+    db.observe(chase, reading)
+    before = db.statistics().query_executions
+    assert db.get(reading) == 7
+    assert len(entries) == 1
+    assert db.statistics().query_executions - before == 2
+
+
+def test_a_callback_regetting_a_pure_node_is_entered_once() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    entries: list[int] = []
+    sibling: list[QueryChangeEvent] = []
+
+    def chase(event: QueryChangeEvent) -> None:
+        entries.append(event.changed_at)
+        if len(entries) < 50:
+            db.get(doubled)
+
+    db.observe(chase, doubled)
+    db.observe(sibling.append, doubled)
+    assert db.get(doubled) == 2
+    assert len(entries) == 1
+    assert len(sibling) == 1  # delivery was live; the single entry is real
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="unsubscribing removes whichever registration compares equal first",
+)
+def test_unsubscribe_removes_only_its_own_subscription() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    log: list[str] = []
+    recorder_a = _EqualRecorder("a", log)
+    recorder_b = _EqualRecorder("b", log)
+    assert recorder_a == recorder_b and recorder_a is not recorder_b
+    sub_a = db.observe(recorder_a, doubled)
+    sub_b = db.observe(recorder_b, doubled)
+    db.get(doubled)
+    assert log == ["a", "b"]
+
+    sub_b.unsubscribe()
+    db.set(inp, 5)
+    db.get(doubled)
+    assert log == ["a", "b", "a"]
+    assert sub_a._active is True
+    assert sub_b._active is False
+
+    sub_a.unsubscribe()
+    db.set(inp, 9)
+    db.get(doubled)
+    assert log == ["a", "b", "a"]
+    assert _live_observer_entries(db) == 0
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="unsubscribing removes whichever registration compares equal first",
+)
+def test_equal_dataclass_callbacks_keep_their_own_subscriptions() -> None:
+    @dataclass
+    class Notifier:
+        channel: str
+        seen: list[QueryChangeEvent] = dataclasses.field(default_factory=list, compare=False)
+
+        def __call__(self, event: QueryChangeEvent) -> None:
+            self.seen.append(event)
+
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    notifier_a = Notifier("alerts")
+    notifier_b = Notifier("alerts")
+    assert notifier_a == notifier_b and notifier_a is not notifier_b
+    db.observe(notifier_a, doubled)
+    sub_b = db.observe(notifier_b, doubled)
+    db.get(doubled)
+    sub_b.unsubscribe()
+    db.set(inp, 5)
+    db.get(doubled)
+    assert len(notifier_a.seen) == 2
+    assert len(notifier_b.seen) == 1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="unsubscribing removes whichever registration compares equal first",
+)
+def test_unsubscribing_the_middle_of_three_equal_callbacks_removes_only_it() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    log: list[str] = []
+    first = _EqualRecorder("first", log)
+    second = _EqualRecorder("second", log)
+    third = _EqualRecorder("third", log)
+    db.observe(first, doubled)
+    sub_second = db.observe(second, doubled)
+    db.observe(third, doubled)
+    db.get(doubled)
+    assert log == ["first", "second", "third"]
+
+    sub_second.unsubscribe()
+    db.set(inp, 5)
+    db.get(doubled)
+    assert log == ["first", "second", "third", "first", "third"]
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.xfail(
+    strict=True,
+    reason="recipients are resolved at delivery time, so a late subscriber receives earlier events",
+)
+def test_a_subscriber_added_after_the_change_does_not_receive_the_earlier_event(
+    mode: str,
+) -> None:
+    db = Database(mode)
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    early: list[QueryChangeEvent] = []
+    late: list[QueryChangeEvent] = []
+    db.observe(early.append, doubled)
+    before = db.statistics().query_executions
+    with db.request_span():
+        assert db.get(doubled) == 2
+        assert early == [] and late == []  # nothing delivered inside the span
+        db.observe(late.append, doubled)  # subscribes AFTER the change committed
+    assert db.statistics().query_executions - before == 1
+    assert len(early) == 1
+    assert late == []
+    # The late subscriber is live for changes that postdate it.
+    db.set(inp, 5)
+    assert db.get(doubled) == 10
+    assert len(early) == 2
+    assert len(late) == 1
+
+
+def test_unsubscribing_between_the_change_and_delivery_stops_the_event() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    dropped: list[QueryChangeEvent] = []
+    sibling: list[QueryChangeEvent] = []
+    sub = db.observe(dropped.append, doubled)
+    db.observe(sibling.append, doubled)
+    with db.request_span():
+        assert db.get(doubled) == 2
+        sub.unsubscribe()  # after the change committed, before delivery
+    assert dropped == []
+    assert len(sibling) == 1  # the batch was live; the silence above is real
+
+
+def test_duplicate_registration_of_one_callback_delivers_per_registration() -> None:
+    db = Database()
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    hits: list[str] = []
+
+    def record(event: QueryChangeEvent) -> None:
+        hits.append("hit")
+
+    sub_one = db.observe(record, doubled)
+    db.observe(record, doubled)
+    assert _live_observer_entries(db) == 2
+    db.get(doubled)
+    assert hits == ["hit", "hit"]
+    sub_one.unsubscribe()
+    assert _live_observer_entries(db) == 1
+    db.set(inp, 5)
+    db.get(doubled)
+    assert hits == ["hit", "hit", "hit"]
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_untracked_nodes_forfeit_their_cutoff_for_observer_events(mode: str) -> None:
+    db = Database(mode)
+    text = Input[str]("text")
+    db.set(text, "alpha\n")
+
+    @query(cutoff=lambda value: value.strip())
+    def untracked_trimmed(db: Database) -> str:
+        db.report_untracked_read("environment consulted")
+        return text.read(db)
+
+    @query(cutoff=lambda value: value.strip())
+    def tracked_trimmed(db: Database) -> str:
+        return text.read(db)
+
+    untracked_events: list[QueryChangeEvent] = []
+    tracked_events: list[QueryChangeEvent] = []
+    db.observe(untracked_events.append, untracked_trimmed)
+    db.observe(tracked_events.append, tracked_trimmed)
+    assert db.get(untracked_trimmed) == "alpha\n"
+    assert db.get(tracked_trimmed) == "alpha\n"
+    db.set(text, "alpha\n\n")  # cutoff-equal, byte-different
+    assert db.get(untracked_trimmed) == "alpha\n\n"
+    assert db.get(tracked_trimmed) == "alpha\n\n"
+    # The untracked twin skipped its own cutoff: the value moved and fired.
+    assert len(untracked_events) == 2
+    assert untracked_events[1].changed_at > untracked_events[0].changed_at
+    # The tracked twin's cutoff held: backdated, nothing fired.
+    assert len(tracked_events) == 1
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_untracked_cutoff_node_warm_matches_fresh(mode: str) -> None:
+    warm = Database(mode)
+    text = Input[str]("text")
+    warm.set(text, "alpha\n")
+
+    @query(cutoff=lambda value: value.strip())
+    def trimmed(db: Database) -> str:
+        db.report_untracked_read("environment consulted")
+        return text.read(db)
+
+    assert warm.get(trimmed) == "alpha\n"
+    warm.set(text, "alpha\n\n")
+    fresh = Database(mode)
+    fresh.set(text, "alpha\n\n")
+    assert warm.get(trimmed) == fresh.get(trimmed) == "alpha\n\n"
+
+
+def test_unsubscribe_reclaims_bookkeeping_for_a_never_executed_node() -> None:
+    db = Database()
+
+    @query
+    def never_run(db: Database) -> int:
+        return 1
+
+    sub = db.observe(lambda event: None, never_run)
+    with db._state_lock:
+        assert len(db._call_snapshots()) == 1
+        assert len(db._query_objects()) == 1
+    sub.unsubscribe()
+    with db._state_lock:
+        assert db._call_snapshots() == {}
+        assert db._query_objects() == {}
+        assert db._query_timings == {}
+        assert db._observers == {}
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_checkpoint_load_does_not_replay_events_for_earlier_changes(mode: str) -> None:
+    store = InMemoryArtifactStore()
+    first = Database(mode, store=store)
+    inp = Input[int]("x")
+    first.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    first_events: list[QueryChangeEvent] = []
+    first.observe(first_events.append, doubled)
+    assert first.get(doubled) == 2
+    assert len(first_events) == 1
+    key = first.save_checkpoint()
+
+    second = Database(mode, store=store)
+    second.set(inp, 1)
+    second.load_checkpoint(key)
+    events: list[QueryChangeEvent] = []
+    second.observe(events.append, doubled)
+    before = second.statistics().query_executions
+    assert second.get(doubled) == 2
+    assert second.statistics().query_executions - before == 0
+    assert events == []  # a warm reuse is not a change
+    second.set(inp, 5)
+    assert second.get(doubled) == 10
+    assert len(events) == 1  # a real change after the load still fires
 
 
 # ---------------------------------------------------------------------------
