@@ -43,10 +43,10 @@ decided at release time.
   two values in hand has `semantic_equal`.
 - `Subscription.unsubscribe()` is now outside-only, matching `db.observe()`:
   called from a query body it raises `ReentrantDatabaseError`, as it already
-  did from a resource hook or a thread spawned inside an execution. A query
-  body runs only when the kernel decides to execute it, so a teardown placed
-  inside one landed zero or one time per request depending on cache history —
-  the same ground on which registering from a body is refused.
+  did from a resource hook or a thread spawned inside a running execution. A
+  query body runs only when the kernel decides to execute it, so a teardown
+  placed inside one landed zero or one time per request depending on cache
+  history — the same ground on which registering from a body is refused.
 
 ### Fixed
 
@@ -183,13 +183,18 @@ decided at release time.
   its `Mapping` annotation already claimed. It previously handed back the
   backing dictionary itself, so a caller could rebind or delete a stored
   payload through it and walk straight past the collision guard.
-- Observers no longer fire when a re-execution lands a value identical to the
-  one already stored. A node carrying an untracked read re-runs on every
-  request, and each re-run used to deliver a change event even though nothing
-  moved — so the event stream scaled with how often a caller asked, and a
-  callback that re-read its own node could be re-entered without bound. An
-  event now means the node's stored value moved: a cold execution, or a
-  re-execution that advanced the node's `changed_at`.
+- Observers no longer fire when a re-execution on a node marked untracked
+  re-lands a value byte-identical to the one already stored. Such a node
+  re-runs on every request, and each re-run used to deliver a change event
+  even though nothing moved — so the event stream scaled with how often a
+  caller asked, and a callback that re-read its own node could be re-entered
+  without bound. An event now means the node's stored value moved: a cold
+  execution, or a re-execution that advanced the node's `changed_at`. An
+  untracked node still forfeits its `eq=` / `cutoff=` policy for events
+  exactly as it does for backdating — a re-run that lands a byte-different
+  value the policy would call equal still moves the value and still fires —
+  and a tracked node whose `eq=` calls the identical re-land unequal moves
+  and fires on that account.
 - `Subscription.unsubscribe()` now detaches exactly the registration that
   created it. Subscriptions are tracked by a per-registration token rather
   than by callback equality, so two distinct callbacks that happen to compare
@@ -198,11 +203,11 @@ decided at release time.
   callback several times delivers once per registration, each handle
   detaching only its own.
 - An observer subscribed after a change committed no longer receives that
-  change's event. Recipients are captured when the change commits and checked
-  against the live subscription set once as delivery begins: a subscription
-  removed before delivery hears nothing further, one removed mid-delivery
-  still receives the batch it was captured in, and a late subscriber starts
-  with the first change that postdates it.
+  change's event. Recipients are fixed at event time — when the change commits
+  — and checked against the live subscription set once as delivery begins: a
+  subscription removed before delivery hears nothing further, one removed
+  mid-delivery still receives the batch it was captured in, and a late
+  subscriber starts with the first change that postdates it.
 
 ### Added
 

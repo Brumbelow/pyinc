@@ -3789,6 +3789,118 @@ def test_subscription_unsubscribe_raises_inside_a_query_body(mode: str) -> None:
     assert len(sink) == 1
 
 
+@dataclass(frozen=True)
+class _ThreadSpawningResource(Resource[str, str, str]):
+    """Starts the worker the database carries; the test joins it."""
+
+    def probe(self, key: str) -> str:
+        return f"probe:{key}"
+
+    def load(self, db: Database, key: str) -> str:
+        thread = threading.Thread(target=db.survivor_body, daemon=True)  # type: ignore[attr-defined]
+        db.survivor_threads.append(thread)  # type: ignore[attr-defined]
+        thread.start()
+        return f"value:{key}"
+
+    def label(self, key: str) -> str:
+        return f"spawning[{key}]"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_hook_survivor_stays_refused_where_a_query_survivor_recovers(mode: str) -> None:
+    """A thread that outlives what spawned it is judged by what it inherited.
+
+    A query frame is marked completed as it is popped, so a survivor of a query
+    body looks past it and finds itself outside again. A resource hook's depth
+    carries no such mark: the child inherited a snapshot of it and the parent's
+    reset is invisible there, so a survivor of a hook stays refused for the rest
+    of its life. Both halves are pinned here because the difference is the
+    behaviour, not an accident of either half.
+    """
+    inp = Input[int]("x")
+
+    @query
+    def watched(db: Database) -> int:
+        return inp.read(db)
+
+    @query
+    def sibling(db: Database) -> int:
+        return inp.read(db) + 1
+
+    @query
+    def spawning(db: Database) -> str:
+        thread = threading.Thread(target=db.survivor_body, daemon=True)  # type: ignore[attr-defined]
+        db.survivor_threads.append(thread)  # type: ignore[attr-defined]
+        thread.start()
+        return "spawned"
+
+    def drive(db: Database, start: Callable[[], object], parent_result: object) -> list[str]:
+        outcomes: list[str] = []
+        errors: list[BaseException] = []
+        gate = threading.Event()
+        done = threading.Event()
+        sink: list[QueryChangeEvent] = []
+        handle = db.observe(sink.append, watched)
+
+        def survivor_body() -> None:
+            try:
+                gate.wait(10.0)
+                surfaces: tuple[tuple[str, Callable[[], object]], ...] = (
+                    ("observe", lambda: db.observe(sink.append, sibling)),
+                    ("unsubscribe", handle.unsubscribe),
+                    ("revision", lambda: db.revision),
+                )
+                for name, call in surfaces:
+                    try:
+                        call()
+                    except ReentrantDatabaseError as exc:
+                        outcomes.append(f"{name}: {exc}")
+                    else:
+                        outcomes.append(f"{name}: allowed")
+            except BaseException as exc:  # noqa: BLE001 -- collected for the main thread
+                errors.append(exc)
+            finally:
+                done.set()
+
+        db.survivor_body = survivor_body  # type: ignore[attr-defined]
+        db.survivor_threads = []  # type: ignore[attr-defined]
+        assert start() == parent_result  # the parent really ran and returned
+        (worker,) = db.survivor_threads  # type: ignore[attr-defined]
+        assert worker.is_alive()  # the survivor outlived what started it
+        gate.set()
+        assert done.wait(10.0)
+        worker.join(timeout=10.0)
+        assert not worker.is_alive()
+        assert errors == []
+        return outcomes
+
+    hook_db = Database(mode)
+    hook_db.set(inp, 1)
+    hook_outcomes = drive(
+        hook_db,
+        lambda: hook_db.read_resource(_ThreadSpawningResource(), "k"),
+        "value:k",
+    )
+    assert hook_outcomes == [
+        "observe: db.observe() is not allowed inside a resource hook.",
+        "unsubscribe: Subscription.unsubscribe() is not allowed inside a resource hook.",
+        "revision: db.revision is not allowed inside a resource hook.",
+    ]
+    # The refused unsubscribe changed nothing: the original handle survives.
+    assert _live_observer_entries(hook_db) == 1
+
+    query_db = Database(mode)
+    query_db.set(inp, 1)
+    query_outcomes = drive(query_db, lambda: query_db.get(spawning), "spawned")
+    assert query_outcomes == [
+        "observe: allowed",
+        "unsubscribe: allowed",
+        "revision: allowed",
+    ]
+    # The allowed calls landed: watched detached, sibling registered.
+    assert _live_observer_entries(query_db) == 1
+
+
 def test_unrelated_thread_call_serializes_while_a_query_runs() -> None:
     """A thread the query did not start still waits its turn rather than being refused.
 
@@ -5234,6 +5346,63 @@ def test_observer_events_do_not_scale_with_how_often_a_caller_asks(mode: str) ->
     assert [event.changed_at for event in events] == [0]
 
 
+def test_inspect_explain_and_inspect_fresh_deliver_the_moves_they_commit() -> None:
+    """Every top-level call that can commit a move announces the one it commits.
+
+    `get` is not the only entry point that executes: `inspect` runs a node it
+    has no record of, `explain` answers through the same path, and
+    `inspect_fresh` re-verifies unconditionally. Each is read here beside its
+    own execution witness, so a call that stopped executing -- or stopped
+    delivering what it executed -- fails rather than passing quietly.
+    """
+    inp = Input[int]("x")
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    inspecting = Database()
+    inspecting.set(inp, 1)
+    inspected: list[QueryChangeEvent] = []
+    inspecting.observe(inspected.append, doubled)
+    before = inspecting.statistics().query_executions
+    assert inspecting.inspect(doubled).last_recompute == "executed"
+    assert inspecting.statistics().query_executions - before == 1
+    assert len(inspected) == 1
+    # The node has a record now, so a second inspect reads it back instead of
+    # executing, and there is no move to announce.
+    inspecting.inspect(doubled)
+    assert inspecting.statistics().query_executions - before == 1
+    assert len(inspected) == 1
+
+    explaining = Database()
+    explaining.set(inp, 1)
+    explained: list[QueryChangeEvent] = []
+    explaining.observe(explained.append, doubled)
+    before = explaining.statistics().query_executions
+    explaining.explain(doubled)
+    assert explaining.statistics().query_executions - before == 1
+    assert len(explained) == 1
+
+    freshening = Database()
+    freshening.set(inp, 1)
+    freshened: list[QueryChangeEvent] = []
+    freshening.observe(freshened.append, doubled)
+    assert freshening.get(doubled) == 2
+    assert len(freshened) == 1
+    freshening.set(inp, 5)
+    before = freshening.statistics().query_executions
+    assert freshening.inspect_fresh(doubled).last_recompute == "executed"
+    assert freshening.statistics().query_executions - before == 1
+    assert len(freshened) == 2
+    assert freshened[1].changed_at > freshened[0].changed_at
+    # Nothing has changed under it, so the re-verification moves nothing.
+    before = freshening.statistics().query_executions
+    freshening.inspect_fresh(doubled)
+    assert freshening.statistics().query_executions - before == 0
+    assert len(freshened) == 2
+
+
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_callback_regetting_its_untracked_node_is_entered_once(mode: str) -> None:
     db = Database(mode)
@@ -5416,6 +5585,49 @@ def test_unsubscribing_between_the_change_and_delivery_stops_the_event() -> None
         sub.unsubscribe()  # after the change committed, before delivery
     assert dropped == []
     assert len(sibling) == 1  # the batch was live; the silence above is real
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_callback_removing_a_later_subscriber_does_not_steal_its_batch(mode: str) -> None:
+    db = Database(mode)
+    inp = Input[int]("x")
+    db.set(inp, 1)
+
+    @query
+    def doubled(db: Database) -> int:
+        return inp.read(db) * 2
+
+    remover_events: list[QueryChangeEvent] = []
+    victim_events: list[QueryChangeEvent] = []
+    victim_handle: list[Subscription] = []
+
+    def remove_the_later_one(event: QueryChangeEvent) -> None:
+        remover_events.append(event)
+        victim_handle[0].unsubscribe()
+
+    db.observe(remove_the_later_one, doubled)
+    victim_handle.append(db.observe(victim_events.append, doubled))
+    before = db.statistics().query_executions
+    assert db.get(doubled) == 2
+    # Registration order is delivery order, so the remover takes its turn
+    # first and the victim is off the live set before its own turn comes.
+    # Recipients were resolved once, ahead of the whole loop, so the batch
+    # the victim was captured in still reaches it.
+    assert len(remover_events) == 1
+    assert len(victim_events) == 1
+    assert victim_handle[0]._active is False
+    assert _live_observer_entries(db) == 1
+
+    db.set(inp, 7)
+    # The set alone executes nothing, so it announces nothing either.
+    assert db.statistics().query_executions - before == 1
+    assert len(remover_events) == 1
+    assert db.get(doubled) == 14
+    # The next change finds the remover alone: the mid-dispatch removal did
+    # take effect for everything that commits after it.
+    assert db.statistics().query_executions - before == 2
+    assert len(remover_events) == 2
+    assert len(victim_events) == 1
 
 
 def test_duplicate_registration_of_one_callback_delivers_per_registration() -> None:

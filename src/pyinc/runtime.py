@@ -717,11 +717,13 @@ class _TimingAggregate:
 
 @dataclass(frozen=True)
 class QueryChangeEvent:
-    """Delivered to observers when a subscribed query's result changes.
+    """Delivered to observers when a subscribed query's stored value moves.
 
-    Fires only on the `"executed"` decision (cold execute or true recompute
-    that produced a new value). `"reused"` and `"backdated"` decisions do
-    not fire — the stored value did not move.
+    Fires on a cold execution and on a re-execution that advanced the node's
+    `changed_at`. `"reused"` and `"backdated"` decisions do not fire, and
+    neither does a re-execution on a node marked untracked that re-landed a
+    byte-identical value -- it keeps the `changed_at` it had. So `decision` is
+    always `"executed"`.
     """
 
     query_id: str
@@ -971,10 +973,14 @@ class _GuardedEnviron(MutableMapping[str, str]):
 class Subscription:
     """Handle returned by `Database.observe(...)`.
 
-    Calling `unsubscribe()` detaches the callback from the subscribed
-    query node. Repeated unsubscribes are no-ops. Subscriptions do not
-    keep the observed node alive under LRU eviction; if the node is
-    evicted and later re-executed, the callback fires as normal.
+    Calling `unsubscribe()` detaches exactly the registration that produced
+    this handle -- equal callbacks and duplicate registrations each hold their
+    own -- and no change committed after it returns reaches that registration.
+    Repeated unsubscribes are no-ops. Like `observe`, `unsubscribe` is
+    outside-only: called from a query body, a resource hook, or a thread
+    spawned inside a running execution it raises `ReentrantDatabaseError`.
+    Subscriptions do not keep the observed node alive under LRU eviction; if
+    the node is evicted and later re-executed, the callback fires as normal.
     """
 
     __slots__ = ("_database", "_key", "_callback", "_token", "_active")
@@ -1749,18 +1755,29 @@ class Database:
         *args: P.args,
         **kwargs: P.kwargs,
     ) -> Subscription:
-        """Register `callback` to fire whenever the query node's value changes.
+        """Register `callback` to fire whenever the query node's value moves.
 
-        Observer callbacks fire once per top-level `get` / `inspect` /
-        `inspect_fresh` call in which the node was re-executed and produced a
-        new value (decision `"executed"`). Backdated and reused decisions do
-        not fire — by definition the stored value did not move.
+        Observer callbacks fire once per value move committed by a top-level
+        `get` / `inspect` / `inspect_fresh` / `explain` call or by the calls
+        inside a `request_span`: a cold execution, or a re-execution that
+        advanced the node's `changed_at`. Backdated and reused decisions do not
+        fire, and neither does a re-execution on a node marked untracked that
+        re-landed a byte-identical value: such a node re-runs on every request
+        and keeps the `changed_at` it had, so it announces nothing new.
+
+        Each call to `observe` is its own registration with its own
+        `Subscription` handle: registering the same callable twice delivers
+        twice, and each handle detaches only its own registration. An event's
+        recipients are the subscriptions that existed when the change committed
+        and still exist when delivery begins.
 
         Callbacks run after the request scope completes and the kernel lock is
         released, so a callback may safely call back into the database.
         Exceptions from a callback are routed to the `observer_error_hook`
         (default: a one-line stderr log) and do not suppress sibling callbacks
-        or corrupt kernel state.
+        or corrupt kernel state. Both `observe` and `Subscription.unsubscribe`
+        are outside-only and raise `ReentrantDatabaseError` from a query body, a
+        resource hook, or a thread spawned inside a running execution.
         """
         # Registration is per call, and a query body runs only when the kernel
         # decides to execute it, so registering from one would make the

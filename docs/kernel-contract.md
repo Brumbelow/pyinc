@@ -1064,26 +1064,41 @@ lock timeouts surface `ArtifactStoreLockError`.
 ## Push Observers
 
 `Database.observe(callback, query, *args, **kwargs)` registers a callback that
-fires when the identified query node's stored value changes. It returns a
-`Subscription` whose `unsubscribe()` method detaches the callback; repeated
-unsubscribes are no-ops.
+fires when the identified query node's stored value moves. It returns a
+`Subscription` whose `unsubscribe()` method detaches exactly the registration
+that produced it; repeated unsubscribes are no-ops, and no change committed
+after `unsubscribe()` returns reaches that registration. Each `observe` call is
+its own registration: registering the same callable twice delivers twice, and
+each handle detaches only its own. Both `observe` and
+`Subscription.unsubscribe` are outside-only — reached from a query body, a
+resource hook, or a thread spawned inside a running execution they raise
+`ReentrantDatabaseError` (Thread Safety, above): a subscriber list must not be
+a function of which executions the kernel happened to run.
 
-Fires exactly when:
+Fires exactly when the node's stored value **moved** during a top-level
+`get` / `inspect` / `inspect_fresh` / `explain` call, or during the calls
+inside a `request_span`:
 
-- the node was (re-)executed during a top-level `get` / `inspect` /
-  `inspect_fresh` call, **and**
-- the resulting decision was `"executed"` — either a cold execution (no
-  prior record) or a true recompute where the new value did not match the
-  previous one under `eq=` / `cutoff=` / semantic equality.
+- a cold execution (no prior record), or
+- a re-execution that advanced the node's `changed_at` — it landed a value
+  the kernel did not equate with the previous one.
 
 Does **not** fire on:
 
 - `"backdated"` — the recomputation was backdated (see
   [The Guarantee](#the-guarantee));
 - `"reused"` — dependencies were unchanged so no recomputation happened;
+- a re-execution that landed a byte-identical value on a node marked
+  untracked: the node re-ran — `last_recompute` stays `"executed"` — but
+  there is no new value to deliver;
 - `db.set(...)` / `db.set_many(...)` — input mutation alone does not
   execute any query. Observers fire on the next `get` that triggers
   dependent re-execution.
+
+A node marked untracked forfeits its `eq=` / `cutoff=` policy for events
+exactly as it does for backdating: a re-execution that lands a byte-different
+value its policy would call equal still moves the value and still fires. Only
+the byte-identical case above stays silent.
 
 Dispatch model:
 
@@ -1091,22 +1106,29 @@ Dispatch model:
   the kernel lock is released. A callback may therefore re-enter the
   database (e.g. call `db.get(...)`) without risk of deadlock. Inside a
   `request_span` the outermost request scope is the span itself: events
-  buffered by gets inside the span are delivered when the outermost span
+  buffered by the calls inside the span are delivered when the outermost span
   closes — on a clean close and when the span body raises — and an inner
   span's close delivers nothing.
 - For each event, the callback list for that node is snapshotted once at
-  dispatch time under the state lock, then dispatched lock-free. A
-  subscription added during dispatch will not see the current batch; one
-  removed during dispatch will still receive events already snapshotted.
+  event time — when the change commits, under the state lock — and checked
+  once against live membership as delivery begins, then dispatched
+  lock-free. A subscription added after the change, even inside the same
+  request, does not receive it; one removed before delivery begins receives
+  nothing; one removed during dispatch will still receive events already
+  snapshotted.
 - Exceptions raised by a callback are routed to the
   `observer_error_hook` passed to `Database(...)` (default: a one-line
   stderr log) and do not suppress sibling callbacks for the same event.
 - Subscriptions survive LRU eviction of their node: if the evicted node is
-  later re-executed, the callback fires normally.
+  later re-executed, the callback fires normally — as a cold execution,
+  whose event can carry the same `changed_at` as one delivered before the
+  eviction; the stream does not promise strictly climbing `changed_at`
+  values.
 
 `QueryChangeEvent` is a frozen dataclass carrying the node's `query_id`,
-`args_digest`, decision (`"executed"`), and the `changed_at` / `verified_at`
-revisions at the time of execution.
+`args_digest`, the decision that produced the move — always `"executed"`,
+since backdates and reuses never fire — and the `changed_at` /
+`verified_at` revisions at the time of execution.
 
 ## Public Surface
 
