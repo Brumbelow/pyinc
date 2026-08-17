@@ -116,7 +116,12 @@ mappings, sets, and dataclass instances become their corresponding `Frozen*`
 records; tuples stay tuples. Shared or cyclic mutable graphs use
 `FrozenGraph`/`FrozenRef`. `thaw()` reconstructs ordinary containers and graph
 identity, but a dataclass becomes a dictionary unless a matching
-`ValueAdapter` explicitly reconstructs its type.
+`ValueAdapter` explicitly reconstructs its type. The kernel's own resource
+snapshot types are the exception: every `Database` registers `BUILTIN_ADAPTERS`,
+so a `FileStatResource` reading is a `FileStatSnapshot` in all three modes. The
+module-level `freeze()`/`thaw()` take only the registry you hand them, so
+reconstructing one of those outside a database means
+`thaw(snapshot, adapters=dict(BUILTIN_ADAPTERS))`.
 
 ## 4. Inspect what happened
 

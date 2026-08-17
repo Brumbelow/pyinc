@@ -358,11 +358,20 @@ def test_capture_classifier_uses_exception_type_when_message_is_empty(
         def __str__(self) -> str:
             return ""
 
-    def fail(self: RuntimeDatabase, value: object, active: set[int]) -> tuple[object, ...]:
-        raise EmptyError
+    subject = object()
+    original = RuntimeDatabase._freeze_static_capture
+
+    def fail(self: RuntimeDatabase, value: object, active: set[int]) -> Any:
+        # Only the capture under test raises. Building a database fingerprints
+        # the kernel's own adapters, which freezes static captures of its own
+        # before the classifier is reached, so a blanket failure here would
+        # break the construction instead of being classified.
+        if value is subject:
+            raise EmptyError
+        return original(self, value, active)
 
     monkeypatch.setattr(RuntimeDatabase, "_freeze_static_capture", fail)
-    info = _classify_capture("value", object(), "attribute")
+    info = _classify_capture("value", subject, "attribute")
     assert not info.accepted
     assert info.rejection_reason.endswith("EmptyError")
 

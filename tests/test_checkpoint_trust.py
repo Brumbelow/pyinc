@@ -37,10 +37,12 @@ import pytest
 
 import pyinc
 from pyinc import (
+    BUILTIN_ADAPTERS,
     AdapterContractError,
     CheckpointError,
     CheckpointManifestError,
     CheckpointModeError,
+    CheckpointVersionError,
     Database,
     FileResource,
     FileStatResource,
@@ -56,7 +58,6 @@ from pyinc import (
     serialize_snapshot,
 )
 from pyinc.core import Query  # internal: introspecting query identities
-from pyinc.resources import BUILTIN_ADAPTERS  # not re-exported from pyinc yet
 from pyinc.runtime import _CHECKPOINT_MANIFEST_VERSION  # internal: manifest schema
 from pyinc.value import fingerprint_snapshot  # not re-exported from pyinc
 
@@ -989,6 +990,164 @@ def test_v6_manifest_rejected_loudly() -> None:
 
     with pytest.raises(ValueError, match="Unsupported checkpoint version"):
         db.load_checkpoint(key)
+
+
+def test_v7_manifest_rejected_loudly() -> None:
+    """A version-7 record predates the kernel's built-in file-stat adapter.
+
+    Such a record froze a stat reading field by field into a plain record, where
+    this kernel freezes it through an adapter. Nothing in the record says so --
+    the adapter gate reads the keys a record used, and a record written before
+    the adapter exists names none -- so a database holding the built-in would
+    warm that encoding without re-freezing it and hand back a shape no fresh
+    execution produces. The manifest version has to carry the difference.
+    """
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+
+    manifest = {
+        "pyinc_ckpt_version": 7,
+        "kernel_fingerprint_version": 2,
+        "records": [],
+    }
+    manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    key = "ck" + hashlib.sha256(manifest_bytes).hexdigest()
+    store.put(key, manifest_bytes)
+
+    with pytest.raises(ValueError, match="Unsupported checkpoint version"):
+        db.load_checkpoint(key)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_pre_adapter_checkpoints_are_refused_not_warmed(mode: str, tmp_path: Path) -> None:
+    """A manifest from before the built-in adapter is refused, not reused.
+
+    The manifest is built the way the kernel that predates the adapter built it:
+    schema version 7, and an `adapters` map that does not name the file-stat
+    key, because that kernel had no such adapter to name. Its records are this
+    kernel's own, which is the point -- the record layout never moved, so
+    nothing below the version field could tell the two apart, and the load would
+    otherwise warm a stat reading whose encoding this kernel no longer produces.
+
+    The refusal has to be complete: the loader raises, stages nothing, and the
+    request that follows executes for itself.
+    """
+    target = tmp_path / "watched.txt"
+    target.write_text("hello", encoding="utf-8")
+    stats = FileStatResource()
+
+    @query(key=f"pre-adapter-refusal-{mode}")
+    def watched_size(db: Database) -> Any:
+        return stats.read(db, str(target)).size
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode, store=store)
+    assert saver.get(watched_size) == 5
+    manifest = json.loads(cast(bytes, store.get(saver.save_checkpoint())).decode("utf-8"))
+
+    manifest["pyinc_ckpt_version"] = 7
+    manifest["adapters"] = {}
+    pre_adapter_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    pre_adapter_key = "ck" + hashlib.sha256(pre_adapter_bytes).hexdigest()
+    store.put(pre_adapter_key, pre_adapter_bytes)
+
+    loader = Database(mode, store=store)
+    with pytest.raises(CheckpointVersionError, match="Unsupported checkpoint version"):
+        loader.load_checkpoint(pre_adapter_key)
+
+    assert loader._checkpoint_query_records == {}
+    assert loader._checkpoint_adapter_digests == {}
+    before = loader.statistics()
+    assert loader.get(watched_size) == 5
+    after = loader.statistics()
+    # The witness that the refusal cost a real execution rather than falling
+    # through to a warm the raise was supposed to have prevented.
+    assert after.query_executions - before.query_executions == 1
+    assert after.query_reuses - before.query_reuses == 0
+
+
+def test_a_manifest_hiding_a_records_adapter_keys_is_refused(tmp_path: Path) -> None:
+    """A record may not name an adapter key its own manifest leaves undeclared.
+
+    This is what keeps the warm gate's cheap path honest. That path trusts every
+    key handed to it when no checkpoint digests are loaded and the registry
+    holds only the kernel's own fixed adapters, on the ground that such a key
+    can only have come from a record this process froze. A manifest declaring an
+    empty `adapters` map while its records still name a key would break that
+    ground, so the manifest validator refuses the shape before any record is
+    staged -- and the save path cannot write it, since it writes the map from
+    the whole registry.
+    """
+    target = tmp_path / "watched.txt"
+    target.write_text("hello", encoding="utf-8")
+    stats = FileStatResource()
+
+    @query(key="undeclared-adapter-keys")
+    def watched_size(db: Database) -> Any:
+        return stats.read(db, str(target)).size
+
+    store = InMemoryArtifactStore()
+    saver = Database("checked", store=store)
+    assert saver.get(watched_size) == 5
+    manifest = json.loads(cast(bytes, store.get(saver.save_checkpoint())).decode("utf-8"))
+    assert [record["adapter_keys"] for record in manifest["records"]].count(
+        ["pyinc.resources:FileStatSnapshot"]
+    ) == 1
+
+    manifest["adapters"] = {}
+    hidden_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    hidden_key = "ck" + hashlib.sha256(hidden_bytes).hexdigest()
+    store.put(hidden_key, hidden_bytes)
+
+    loader = Database("checked", store=store)
+    with pytest.raises(CheckpointManifestError, match="invalid adapter keys"):
+        loader.load_checkpoint(hidden_key)
+    assert loader._checkpoint_query_records == {}
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_file_stat_records_round_trip_through_a_checkpoint_per_mode(
+    mode: str, tmp_path: Path
+) -> None:
+    """The adapted stat reading warms, and warms to what a fresh run computes.
+
+    The guard on the sibling refusal above: a checkpoint this kernel writes must
+    still warm in a database of the same mode, through the adapter, with the
+    reading itself in the dependency graph rather than only in the returned
+    value.
+    """
+    target = tmp_path / "watched.txt"
+    target.write_text("hello", encoding="utf-8")
+    stats = FileStatResource()
+
+    @query(key=f"filestat-round-trip-child-{mode}")
+    def observed(db: Database) -> Any:
+        return stats.read(db, str(target))
+
+    @query(key=f"filestat-round-trip-parent-{mode}")
+    def described(db: Database) -> Any:
+        snapshot = observed(db)
+        return (type(snapshot) is FileStatSnapshot, snapshot.exists, snapshot.size)
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode, store=store)
+    fresh = saver.get(described)
+    assert fresh == (True, True, 5)
+    ck_key = saver.save_checkpoint()
+
+    warm_db = Database(mode, store=store)
+    warm_db.load_checkpoint(ck_key)
+    before = warm_db.statistics()
+    warm = warm_db.get(described)
+    after = warm_db.statistics()
+
+    assert warm == fresh
+    executions_during_warm = after.query_executions - before.query_executions
+    assert executions_during_warm == 0
+    assert after.query_reuses - before.query_reuses >= 1
+    # The reading survives the round trip as the declared type on the warm side
+    # too, not only inside the query that computed the tuple above.
+    assert type(warm_db.get(observed)) is FileStatSnapshot
 
 
 def test_saved_manifest_records_the_database_mode() -> None:

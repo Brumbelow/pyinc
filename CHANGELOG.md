@@ -24,6 +24,16 @@ decided at release time.
   — its return value becomes the node's label — and says so in its own message
   rather than deferring to the node table. `NodeKey` requires exactly `str` in
   all four of its fields as the backstop behind all three boundaries.
+- `FileStatResource` now delivers the `FileStatSnapshot` it has always
+  declared, in every mode and at every path a value leaves the kernel by:
+  inside a query body, as a query's return value, and from
+  `db.read_resource`. It previously handed back a frozen record view in
+  `strict` and a plain dictionary in `checked` and `fast`, so code reading a
+  stat reading out of the kernel subscripted it (`stat["exists"]`); such code
+  switches to attribute access (`stat.exists`). What changed is that every
+  `Database` now registers a built-in adapter for the kernel's own snapshot
+  type, which also moves the stored encoding of such a reading — see the
+  manifest schema note below.
 
 ### Fixed
 
@@ -175,6 +185,13 @@ decided at release time.
   configuration changes after `Database` construction.
 - `CheckpointModeError`, raised when a checkpoint saved in one database mode is
   loaded into a database running another.
+- `FileStatAdapter` and `BUILTIN_ADAPTERS`: the stateless adapter every
+  `Database` registers for `FileStatSnapshot`, and the read-only map naming the
+  kernel's own adapter entries. Registering an adapter for one of those types
+  replaces the built-in rather than colliding with it, and the map is the
+  registry to hand the module-level `freeze`/`thaw` when reconstructing such a
+  snapshot outside a database:
+  `thaw(snapshot, adapters=dict(BUILTIN_ADAPTERS))`.
 
 ### Changed
 
@@ -187,10 +204,16 @@ decided at release time.
   and reading nothing back. Duck-typed stores carrying the three methods are
   still accepted, and a store validated at construction is not re-validated on
   every call.
-- The checkpoint manifest schema is v7 and records the saving database's mode;
-  v6 and earlier manifests are rejected loudly because their records cannot be
-  attributed to a save mode and, for v5 and earlier, because their records can
-  predate the module-identity and stat-probe repairs above.
+- The checkpoint manifest schema is v8. v7 and earlier manifests are rejected
+  loudly with `CheckpointVersionError`, and stale checkpoints are re-saved
+  rather than migrated. The bump to v8 marks the built-in file-stat adapter: a
+  v7 record froze a stat reading field by field into a plain record, and the
+  record layout around it never moved, so nothing below the version field
+  distinguishes the two encodings — a database holding the built-in would warm
+  the stored one without re-freezing it and answer with a shape no fresh
+  execution produces. v6 and earlier are refused because their records cannot
+  be attributed to a save mode, and v5 and earlier additionally because their
+  records can predate the module-identity and stat-probe repairs above.
 - Loading a checkpoint into a database running a different mode raises
   `CheckpointModeError` and stages nothing, where it previously succeeded and
   could warm values the loading mode would never compute — a `strict` database

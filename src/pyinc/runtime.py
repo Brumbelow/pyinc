@@ -92,19 +92,30 @@ ResourceProbeT = TypeVar("ResourceProbeT")
 
 # Durable checkpoint manifest schema version. Bumped whenever the identity, the
 # record layout, or the meaning of a recorded field changes, so stale manifests
-# are rejected loudly rather than silently reused. Version 7 adds the saving
-# database's mode to the manifest root. The value a query computes and persists
-# depends on that mode -- strict exposes frozen views and frozen call arguments
-# where checked and fast thaw -- so a record saved under one mode can carry a
-# value another mode would never compute; a version-6-or-earlier manifest names
-# no mode at all and so cannot be attributed to one. Version 5 and earlier are
-# refused for a second reason that still stands: their records can predate the
-# two soundness repairs version 6 marked -- captured-module identity was
-# derived from a stat tuple a same-size rewrite can preserve, and a stat probe
-# raising NotADirectoryError published no resource edge -- so such a record can
-# carry a stale identity, or claim no dependencies for a read a fresh database
-# re-derives.
-_CHECKPOINT_MANIFEST_VERSION = 7
+# are rejected loudly rather than silently reused. Version 8 marks the kernel
+# rebuilding its own file-stat readings through a built-in adapter. A record
+# saved by an earlier version froze such a reading field by field into a plain
+# record instead, and the layout of the record holding it is otherwise
+# identical, so nothing below this field distinguishes the two: a database
+# holding the built-in would warm that stored encoding without re-freezing it
+# and hand back a mapping where a fresh execution now produces the snapshot
+# type. Registration also changes how a shared reading is stored, from a node
+# of the shared-structure envelope to a value written inline, so the stored
+# bytes of an unchanged value differ across the boundary as well. The adapter
+# gate cannot catch either: it compares the adapter keys a record used, and a
+# record written before the adapter existed names none. Version 7 adds the
+# saving database's mode to the manifest root. The value a query computes and
+# persists depends on that mode -- strict exposes frozen views and frozen call
+# arguments where checked and fast thaw -- so a record saved under one mode can
+# carry a value another mode would never compute; a version-6-or-earlier
+# manifest names no mode at all and so cannot be attributed to one. Version 5
+# and earlier are refused for a second reason that still stands: their records
+# can predate the two soundness repairs version 6 marked -- captured-module
+# identity was derived from a stat tuple a same-size rewrite can preserve, and a
+# stat probe raising NotADirectoryError published no resource edge -- so such a
+# record can carry a stale identity, or claim no dependencies for a read a fresh
+# database re-derives.
+_CHECKPOINT_MANIFEST_VERSION = 8
 # Version of the snapshot/fingerprint encoding this kernel emits, mirrored from
 # value._KERNEL_FINGERPRINT_PREFIX (b"K2;"). Recorded in the manifest and checked
 # at load so a checkpoint from a differently-encoded kernel is never trusted.
@@ -120,6 +131,36 @@ _MISSING_MODULE_ATTRIBUTE = object()
 # Not a hexadecimal digest, so it can never equal a stored one and always
 # forces the memo guard to fall through to a full recompute.
 _UNREADABLE_RESOURCE_DIGEST = "unreadable-resource"
+# Implementation digests of the kernel's own fixed adapters, held for the
+# process. Such a digest folds only the adapter's class -- its two method
+# bodies, its type payload, the bytes of the module they ship in -- and the
+# interpreter build, none of which an in-contract process can move, so it cannot
+# differ between two databases here. Re-deriving it per construction made every
+# `Database()` walk two method bodies and hash a source file, which is a cost the
+# design already decided to pay once rather than repeatedly.
+#
+# The key is the adapter key paired with the adapter's TYPE, deliberately not
+# `id(adapter)`. An identity key would be sound only under an argument about
+# lifetimes -- that no id recorded here can be recycled, which holds only
+# because the kernel's registry is a module-level mapping keeping each singleton
+# alive for the whole process -- and a key that needs that argument is a key
+# whose soundness a later edit can silently remove. A type object is kept alive
+# by the module that defines it, so the question does not arise. The pair is no
+# coarser than identity would be for this set: an entry reaches this memo only
+# when it IS the kernel's own entry for that key, and a fixed adapter holds no
+# instance state, so two instances of one such class digest identically by
+# construction.
+#
+# What this does NOT cover: a caller's adapter, including one registered for a
+# type the kernel also adapts. Those are re-derived at every construction and at
+# every trust boundary, because a caller's implementation and configuration are
+# theirs to change between one database and the next.
+#
+# One consequence, stated because it is a widening: an out-of-contract in-process
+# rewrite of a fixed adapter's own methods was already invisible to every
+# database already built; it is now invisible to databases built afterwards too.
+# A source-level change still moves the digest, because it needs a new process.
+_FIXED_ADAPTER_IMPLEMENTATION_DIGESTS: dict[tuple[str, type[Any]], str] = {}
 
 
 def _validated_store(store: Any, parameter: str) -> ArtifactStore:
@@ -1000,7 +1041,26 @@ class Database:
             raise ValueError("max_query_nodes must be a positive integer or None.")
         self.mode = mode
         self.max_query_nodes = max_query_nodes
-        self._adapters = dict(adapters or {})
+        # Function-scope so this module keeps importing nothing from the
+        # resource module at import time -- that module imports this one.
+        from .resources import BUILTIN_ADAPTERS
+
+        # The kernel's adapters for its own value types come first, so a caller
+        # registering their own adapter for one of those types replaces the
+        # entry instead of colliding with it. The replacement is a caller
+        # adapter in every respect; `_partition_adapters_by_kernel_membership`
+        # decides that by membership, below.
+        #
+        # Because the built-in entries are always present, that partition needs
+        # their implementation digests at every construction -- derived on the
+        # first construction in the process and read back after it, see
+        # `_FIXED_ADAPTER_IMPLEMENTATION_DIGESTS`. That derivation is un-guarded
+        # on purpose: a built-in that stopped fingerprinting cleanly would raise
+        # out of `Database(...)` itself rather than be demoted to a caller
+        # adapter and pay the full per-boundary cost silently. What keeps that
+        # honest is a test, not a guard --
+        # `test_the_builtin_file_stat_adapter_digests_cleanly`.
+        self._adapters = {**BUILTIN_ADAPTERS, **dict(adapters or {})}
         # The registry is fixed for this database's lifetime, so the key-indexed
         # view every boundary exposure needs is built once here rather than per
         # exposure.
@@ -1169,10 +1229,13 @@ class Database:
 
         A fixed adapter carries no instance state and its implementation lives
         in this package, so nothing an in-contract process can do moves its
-        implementation digest. Those digests are therefore taken once, here, and
-        the trust boundary reads them back instead of re-deriving them at each
-        of its call sites -- the difference between a dict lookup and a
-        fingerprint walk over two method bodies per boundary crossing.
+        implementation digest. Those digests are therefore taken once per
+        process, and the trust boundary reads them back instead of re-deriving
+        them at each of its call sites -- the difference between a dict lookup
+        and a fingerprint walk over two method bodies per boundary crossing.
+        The same argument is why the derivation is memoized across databases
+        rather than repeated per construction; see
+        `_FIXED_ADAPTER_IMPLEMENTATION_DIGESTS`.
         """
 
         # Function-scope so this module keeps importing nothing from the
@@ -1184,11 +1247,21 @@ class Database:
             for value_type, adapter in self._adapters.items()
             if BUILTIN_ADAPTERS.get(value_type) is not adapter
         }
-        self._static_adapter_digests: dict[str, str] = {
-            _adapter_key(value_type): self._adapter_implementation_digest(adapter)
-            for value_type, adapter in self._adapters.items()
-            if value_type not in self._non_static_adapters
-        }
+        self._static_adapter_digests: dict[str, str] = {}
+        for value_type, adapter in self._adapters.items():
+            if value_type in self._non_static_adapters:
+                continue
+            key = _adapter_key(value_type)
+            memo_key = (key, type(adapter))
+            digest = _FIXED_ADAPTER_IMPLEMENTATION_DIGESTS.get(memo_key)
+            if digest is None:
+                # Still un-guarded, and still for the reason the merge states: a
+                # fixed adapter that stopped fingerprinting cleanly raises out of
+                # every construction in a fresh process, because nothing is
+                # memoized until a derivation succeeds.
+                digest = self._adapter_implementation_digest(adapter)
+                _FIXED_ADAPTER_IMPLEMENTATION_DIGESTS[memo_key] = digest
+            self._static_adapter_digests[key] = digest
 
     @property
     def revision(self) -> int:
@@ -5616,7 +5689,9 @@ class Database:
             # Fast path: nothing to distrust. With no checkpoint digests loaded,
             # every key reaching here belongs to a record this process froze
             # through this very registry -- a loaded checkpoint that had adapted
-            # values would have brought their digests with it. So the only
+            # values would have brought their digests with it, and the manifest
+            # validator refuses a record naming a key its manifest does not
+            # declare, so no loaded record can reach here. So the only
             # question left is whether a live adapter has moved since it froze
             # those records, and the kernel's own fixed adapters cannot: they
             # hold no state and their code ships with this module. A caller's

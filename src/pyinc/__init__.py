@@ -24,10 +24,12 @@ from .errors import (
 )
 from .explain import CaptureInfo, InspectionNode, explain_query_captures
 from .resources import (
+    BUILTIN_ADAPTERS,
     BinaryFileResource,
     DirectoryResource,
     EnvResource,
     FileResource,
+    FileStatAdapter,
     FileStatResource,
     FileStatSnapshot,
     ResolvedPathResource,
@@ -75,6 +77,7 @@ __all__ = [
     "ArtifactStoreError",
     "ArtifactStoreKeyError",
     "ArtifactStoreLockError",
+    "BUILTIN_ADAPTERS",
     "BinaryFileResource",
     "CaptureInfo",
     "CheckpointError",
@@ -89,6 +92,7 @@ __all__ = [
     "DirectoryResource",
     "EnvResource",
     "FileResource",
+    "FileStatAdapter",
     "FileStatResource",
     "FileStatSnapshot",
     "FileSystemArtifactStore",

@@ -37,21 +37,25 @@ dataclasses → `FrozenRecord`; tuples are a native member of the `Snapshot`
 union and are frozen element-wise.
 
 Dataclasses thaw to dictionaries because the kernel does not import and
-reconstruct arbitrary user classes. A dataclass, a wrapper that thaws to a
-mutable container, or a composite containing one cannot therefore be used as a
-mapping key or set member; `freeze` rejects such positions before they can
-produce a snapshot that later fails to thaw. A `ValueAdapter` that
-reconstructs a hashable value is necessary to carry such a value into a hash
-position, but it is not sufficient, for two independent reasons. First, an
-adapted value whose payload contains a `FrozenGraph` is refused, registered
-adapter or not: the shared or cyclic state such a payload rebuilds stays
-mutable after the value is inserted, so nothing at the boundary can establish
-that its hash is stable. (That refusal reuses the general message and asks for
-a `ValueAdapter` even where one is registered; the fix is to keep the cycle out
-of the payload, not to register another adapter.) That check runs where
-`freeze` builds a hash position out of a live mapping or set, so it is the
-live route that is closed; a snapshot already carrying such a key is not
-refused — `freeze`, `serialize_snapshot`, and `deserialize_snapshot` all
+reconstruct arbitrary user classes. Its own resource snapshot types are the
+exception: a `Database` registers built-in adapters for them, so
+`FileStatSnapshot` is rebuilt as itself at every boundary in every mode.
+`BUILTIN_ADAPTERS` names those entries, and registering an adapter for one of
+those types replaces the built-in rather than colliding with it. A dataclass, a
+wrapper that thaws to a mutable container, or a composite containing one cannot
+therefore be used as a mapping key or set member; `freeze` rejects such
+positions before they can produce a snapshot that later fails to thaw. A
+`ValueAdapter` that reconstructs a hashable value is necessary to carry such a
+value into a hash position, but it is not sufficient, for two independent
+reasons. First, an adapted value whose payload contains a `FrozenGraph` is
+refused, registered adapter or not: the shared or cyclic state such a payload
+rebuilds stays mutable after the value is inserted, so nothing at the boundary
+can establish that its hash is stable. (That refusal reuses the general
+message and asks for a `ValueAdapter` even where one is registered; the fix is
+to keep the cycle out of the payload, not to register another adapter.) That
+check runs where `freeze` builds a hash position out of a live mapping or set,
+so it is the live route that is closed; a snapshot already carrying such a key
+is not refused — `freeze`, `serialize_snapshot`, and `deserialize_snapshot` all
 accept a hand-assembled or byte-decoded one. Second, an independent gate —
 the snapshot validator every entry point runs — rejects hash positions that
 are distinct under the snapshot encoding but collapse under Python `==`/`hash`
@@ -79,7 +83,11 @@ encodings rather than running the adapter, cannot see it coming.
 serializer. Passing an adapter registry to `freeze()` does not embed executable
 reconstruction logic in the snapshot; the matching registry must also be
 available to `thaw()`. Without an adapter, a dataclass's class identity is not
-reconstructed.
+reconstructed. The built-in registry is a `Database`'s, not the helpers': these
+two take the registry they are handed and nothing else, so thawing a
+database-produced `FileStatSnapshot` outside a database means passing
+`adapters=dict(BUILTIN_ADAPTERS)`. Omitting it raises `UnsupportedValueError`
+naming the adapter key rather than returning a mapping.
 
 The kernel stores frozen snapshots internally. `strict` exposes the immutable
 `Frozen*` views themselves (a query receives, for example, a `FrozenDict` where
@@ -673,7 +681,23 @@ those marks the catcher too.
 
 - **`ValueAdapter`** — allows custom types to participate in freeze/thaw by
   implementing `freeze` and `thaw`. Adapters extend the condition 1 value
-  boundary, so the boundary's obligations extend to them as laws:
+  boundary, so the boundary's obligations extend to them as laws.
+
+  Every `Database` starts from the kernel's own adapters for its own value
+  types, published as `BUILTIN_ADAPTERS`: a stateless `FileStatAdapter`
+  registered for `FileStatSnapshot`, so a stat reading crosses every boundary
+  as the type the resource declares. Registering an adapter for one of those
+  types replaces the built-in entry rather than colliding with it, and the
+  replacement is a caller adapter in every respect the laws below describe.
+  The built-ins themselves are exempt from one: they hold no instance
+  configuration for the pinned-state check to watch, and their
+  implementations ship with the kernel and so cannot move while it runs. Their
+  implementation digests are therefore derived once per process rather than at
+  every trust boundary, and a second `Database` reads back what the first
+  derived. A registered adapter of your own is digested at every boundary
+  crossing, as before.
+
+  The laws:
 
   - **Deterministic, side-effect-free hooks.** `freeze` and `thaw` are pure
     functions of their arguments; neither reads ambient state. Adapter work
@@ -936,7 +960,7 @@ behind the collision guard.
 On top of this, `Database.save_checkpoint(store=None) -> str` serialises the
 current query and resource records — their snapshot bytes, call snapshots,
 resource parameters, dependency edges, and per-adapter implementation digests —
-into a content-addressed manifest (schema v7), returning a key prefixed with
+into a content-addressed manifest (schema v8), returning a key prefixed with
 `"ck"`. The manifest also records the mode the saving database ran in, so a
 checkpoint is attributable to exactly one mode; loading it into a database
 running another is refused under condition (v) of limitation 4. Adapter digests
@@ -966,7 +990,7 @@ those same bytes meets the same refusal when a database writing through that
 store persists it. Recovery is removing the corrupt object or supplying a clean
 store; the kernel never silently recomputes around one.
 
-Manifest schema v7 rejects v1-v6 manifests with `CheckpointVersionError`; stale
+Manifest schema v8 rejects v1-v7 manifests with `CheckpointVersionError`; stale
 checkpoints are re-saved, never migrated.
 
 ## FileSystemArtifactStore
@@ -1055,6 +1079,8 @@ Core:
 | `BinaryFileResource` | Byte-file resource: content-hash probe, raw bytes value. |
 | `FileStatResource` | Stat-signature resource for existence/shape checks without content reads. |
 | `FileStatSnapshot` | The frozen stat observation `FileStatResource` produces. |
+| `FileStatAdapter` | The stateless built-in `ValueAdapter` rebuilding `FileStatSnapshot` at every cached boundary. |
+| `BUILTIN_ADAPTERS` | Read-only map of the adapters every `Database` registers for the kernel's own value types; also the registry to hand `freeze`/`thaw` outside a database. |
 | `EnvResource` | Environment-variable resource. |
 | `DirectoryResource` | Directory-listing resource. |
 | `ResolvedPathResource` | Symlink-aware path canonicalization as a tracked value. |

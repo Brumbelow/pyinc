@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias, cast
@@ -181,8 +180,7 @@ def _get_sys_path_entries() -> tuple[str, ...]:
 
 
 def _path_exists(db: Database, path: str) -> bool:
-    stat = cast(Mapping[str, object], _FILESTAT.read(db, path))
-    return bool(stat["exists"])
+    return _FILESTAT.read(db, path).exists
 
 
 def _directory_exists(db: Database, path: str) -> bool:

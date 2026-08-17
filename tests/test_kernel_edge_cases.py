@@ -382,7 +382,10 @@ def test_file_stat_resource_covers_present_and_missing_paths(tmp_path: Path) -> 
         (True, 4, snapshot.mtime_ns),
         snapshot,
     )
-    assert cast(Any, resource.read(db, present))["exists"] is True
+    # Read through the database, in the mode that hands values back as frozen
+    # views: the reading is still the resource's own snapshot type, because the
+    # kernel rebuilds it through a built-in adapter at every boundary.
+    assert resource.read(db, present).exists is True
 
     absent = resource.load(db, missing)
     assert (absent.exists, absent.size, absent.mtime_ns) == (False, None, None)

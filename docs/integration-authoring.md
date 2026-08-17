@@ -50,7 +50,10 @@ cached tuple payload. Their frozen shape gives callers an immutable, typed
 result without making arbitrary classes part of the snapshot contract. If a
 dataclass itself crosses a cached boundary, `freeze` stores it as a
 `FrozenRecord` and ordinary `thaw` returns a dictionary; preserving the
-original class requires a matching `ValueAdapter`.
+original class requires a matching `ValueAdapter`. The kernel ships such
+adapters for its own resource snapshot types — a `FileStatResource` reading
+arrives as a `FileStatSnapshot` in every mode — but an integration's own
+dataclasses are ordinary user classes and follow the rule above.
 
 ## Payload Type Aliases
 

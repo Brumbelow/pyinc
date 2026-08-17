@@ -627,13 +627,18 @@ def test_shipped_file_resources_read_a_denied_directory_as_missing(
     regular = tmp_path / "thing.txt"
     regular.write_text("hello", encoding="utf-8")
 
+    # Built before the denial: constructing a database fingerprints the kernel's
+    # own adapters, which reads the kernel's own source, and these hooks deny
+    # every read there is. The database is only the argument the hooks take --
+    # none of them reaches it -- so building it first changes nothing under test.
+    db = Database()
     monkeypatch.setattr(Path, "read_bytes", _denied)
     monkeypatch.setattr(Path, "read_text", _denied)
 
     assert resource.probe(str(directory)) == ("missing",)
-    assert resource.probe_and_load(Database(), str(directory))[0] == ("missing",)
+    assert resource.probe_and_load(db, str(directory))[0] == ("missing",)
 
     with pytest.raises(PermissionError):
         resource.probe(str(regular))
     with pytest.raises(PermissionError):
-        resource.load(Database(), str(regular))
+        resource.load(db, str(regular))

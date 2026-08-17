@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import math
 import mmap
@@ -16,6 +17,7 @@ import pytest
 
 import pyinc
 from pyinc import (
+    BUILTIN_ADAPTERS,
     AdapterContractError,
     BinaryFileResource,
     CycleError,
@@ -25,6 +27,7 @@ from pyinc import (
     DirectoryResource,
     EnvResource,
     FileResource,
+    FileStatAdapter,
     FileStatResource,
     FileStatSnapshot,
     FileSystemArtifactStore,
@@ -50,7 +53,6 @@ from pyinc import (
     query,
     serialize_snapshot,
 )
-from pyinc.resources import BUILTIN_ADAPTERS
 from pyinc.runtime import _MISSING_SNAPSHOT
 from pyinc.value import _adapter_key, _AdapterRegistry, fingerprint_snapshot
 from pyinc.value import fingerprint as _value_fingerprint
@@ -1176,6 +1178,11 @@ def test_file_resources_read_a_denied_directory_as_a_missing_file(
     regular = tmp_path / "thing.txt"
     regular.write_text("hello", encoding="utf-8")
 
+    # Built before the denial: constructing a database fingerprints the kernel's
+    # own adapters, which reads this package's own source, and these hooks deny
+    # every read there is. The database is only the argument the hooks take --
+    # nothing below reaches it -- so building it first changes nothing under test.
+    db = Database()
     monkeypatch.setattr(Path, "read_bytes", _denied)
     monkeypatch.setattr(Path, "read_text", _denied)
 
@@ -1185,17 +1192,17 @@ def test_file_resources_read_a_denied_directory_as_a_missing_file(
     assert files.probe(str(directory)) == ("missing",)
     assert binaries.probe(str(directory)) == ("missing",)
     with pytest.raises(FileNotFoundError):
-        files.load(Database(), str(directory))
+        files.load(db, str(directory))
     with pytest.raises(FileNotFoundError):
-        binaries.load(Database(), str(directory))
+        binaries.load(db, str(directory))
 
     # A denial on a regular file is a genuine failure and keeps propagating.
     for call in (
         lambda: files.probe(str(regular)),
         lambda: binaries.probe(str(regular)),
-        lambda: files.load(Database(), str(regular)),
-        lambda: binaries.load(Database(), str(regular)),
-        lambda: files.probe_and_load(Database(), str(regular)),
+        lambda: files.load(db, str(regular)),
+        lambda: binaries.load(db, str(regular)),
+        lambda: files.probe_and_load(db, str(regular)),
     ):
         with pytest.raises(PermissionError):
             call()
@@ -1510,18 +1517,18 @@ def test_file_stat_resource_tracks_metadata_changes(tmp_path: Path) -> None:
     path.write_text("alpha", encoding="utf-8")
 
     @query
-    def read_stat(db: Database, filename: str) -> object:
+    def read_stat(db: Database, filename: str) -> FileStatSnapshot:
         return stats.read(db, filename)
 
     db = Database(mode="checked")
-    first = cast(dict[str, object], db.get(read_stat, str(path)))
-    assert first["exists"] is True
-    assert first["size"] == 5
+    first = db.get(read_stat, str(path))
+    assert first.exists is True
+    assert first.size == 5
 
     path.write_text("bravo!", encoding="utf-8")
-    second = cast(dict[str, object], db.get(read_stat, str(path)))
-    assert second["exists"] is True
-    assert second["size"] == 6
+    second = db.get(read_stat, str(path))
+    assert second.exists is True
+    assert second.size == 6
     assert _inspect_node(db, read_stat, str(path)).last_decision == "executed"
 
 
@@ -1535,8 +1542,7 @@ def test_file_stat_resource_is_total_when_a_parent_path_component_is_a_file(
 
     @query
     def child_exists(db: Database, filename: str) -> bool:
-        snapshot = cast(dict[str, object], stats.read(db, filename))
-        return snapshot["exists"] is True
+        return stats.read(db, filename).exists is True
 
     db = Database(mode="checked")
     assert db.get(child_exists, str(child)) is False
@@ -1547,6 +1553,82 @@ def test_file_stat_resource_is_total_when_a_parent_path_component_is_a_file(
     assert db.get(child_exists, str(child)) is True
     fresh = Database(mode="checked")
     assert fresh.get(child_exists, str(child)) is True
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_file_stat_resource_delivers_declared_type_in_every_mode(mode: str, tmp_path: Path) -> None:
+    """A stat reading is the snapshot type the resource declares, at every path.
+
+    Three observation points, because each crosses the value boundary
+    differently: what a query body reads, what a query returns to its caller,
+    and what a top-level `read_resource` hands back. Three worlds, because a
+    caller branches on all three: a file that is there, a path that is absent,
+    and a path reached *through* a file -- which reads exactly as the absent one
+    does, so the last two cells must agree.
+    """
+
+    stats = FileStatResource()
+    present = tmp_path / "present.txt"
+    present.write_text("alpha", encoding="utf-8")
+    missing = tmp_path / "missing.txt"
+    parent = tmp_path / "parent"
+    parent.write_text("plain file", encoding="utf-8")
+    under_a_file = parent / "child"
+
+    @query(key=f"filestat-declared-type-inside-{mode}")
+    def observed_inside(db: Database, filename: str) -> tuple[bool, bool, int | None, bool]:
+        snapshot = stats.read(db, filename)
+        return (
+            type(snapshot) is FileStatSnapshot,
+            snapshot.exists,
+            snapshot.size,
+            snapshot.mtime_ns is None,
+        )
+
+    @query(key=f"filestat-declared-type-returned-{mode}")
+    def returned(db: Database, filename: str) -> FileStatSnapshot:
+        return stats.read(db, filename)
+
+    db = Database(mode=mode)
+    readings: dict[str, FileStatSnapshot] = {}
+    for label, path, exists, size in (
+        ("present", present, True, 5),
+        ("missing", missing, False, None),
+        ("under-a-file", under_a_file, False, None),
+    ):
+        filename = str(path)
+        assert db.get(observed_inside, filename) == (True, exists, size, not exists)
+
+        from_query = db.get(returned, filename)
+        outside = stats.read(db, filename)
+        for observed in (from_query, outside):
+            assert type(observed) is FileStatSnapshot
+            assert observed.exists is exists
+            assert observed.size == size
+            assert (observed.mtime_ns is None) is not exists
+        readings[label] = from_query
+
+    assert readings["under-a-file"] == readings["missing"]
+
+
+def test_the_builtin_file_stat_machinery_carries_no_instance_state() -> None:
+    """The resource and its adapter are singletons a database may share freely.
+
+    Both are reachable as module-level values a caller can register, read
+    through and fingerprint, and both are folded into cache identity. State on
+    either would make that identity a function of which instance answered, so
+    the shapes that could carry state are pinned absent: no dataclass field on
+    the resource, no instance dictionary entry and no slot on the adapter.
+    """
+
+    resource = FileStatResource()
+    adapter = BUILTIN_ADAPTERS[FileStatSnapshot]
+
+    assert dataclasses.fields(resource) == ()
+    assert resource == FileStatResource()
+    assert vars(adapter) == {}
+    assert not hasattr(type(adapter), "__slots__")
+    assert type(adapter).__module__ == "pyinc.resources"
 
 
 def test_directory_resource_tracks_listing_not_child_contents(tmp_path: Path) -> None:
@@ -5455,7 +5537,11 @@ def test_an_undigestable_adapter_does_not_exempt_its_registry() -> None:
         db.get(read_amount)
 
 
-def test_adapter_free_databases_pay_nothing_at_request_scope() -> None:
+def test_databases_without_caller_adapters_pay_nothing_at_request_scope() -> None:
+    # The request-scope check watches adapter instance configuration. A database
+    # nobody registered anything with still carries the kernel's own fixed
+    # adapters, and those have no configuration to watch, so the check names
+    # nothing and returns on its first line.
     db = Database()
 
     @query(key="adapter-free")
@@ -5616,7 +5702,7 @@ def test_a_builtin_only_registry_expects_no_configuration_digests() -> None:
     assert db.get(constant) == 1
 
 
-def test_builtin_adapter_implementation_digests_are_taken_once_at_construction() -> None:
+def test_builtin_adapter_implementation_digests_are_taken_once_per_process() -> None:
     calls: list[str] = []
     original = Database._adapter_implementation_digest
 
@@ -5626,20 +5712,107 @@ def test_builtin_adapter_implementation_digests_are_taken_once_at_construction()
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(Database, "_adapter_implementation_digest", counting)
-        db = Database(adapters=_builtin_file_stat_registry())
-        during_init = list(calls)
+        # Emptied rather than observed as found, so the cell reads the same
+        # whether or not another test built a database first.
+        patch.setattr("pyinc.runtime._FIXED_ADAPTER_IMPLEMENTATION_DIGESTS", {})
+        first = Database(adapters=_builtin_file_stat_registry())
+        during_first = list(calls)
         calls.clear()
-        digests = db._current_adapter_digests()
+        second = Database(adapters=_builtin_file_stat_registry())
+        during_second = list(calls)
+        calls.clear()
+        digests = first._current_adapter_digests()
 
     key = _adapter_key(FileStatSnapshot)
-    assert during_init == ["FileStatAdapter"]
-    # Served from the construction-time memo: the trust boundary re-derives
-    # nothing for a fixed adapter, and what it serves is what construction
-    # recorded rather than a second digest that merely happens to agree.
+    # Derived once, for the first database in the process, and then read back:
+    # a fixed adapter's digest folds its class and the interpreter build, so a
+    # second database in the same process cannot compute a different one.
+    assert during_first == ["FileStatAdapter"]
+    assert during_second == []
+    assert second._static_adapter_digests == first._static_adapter_digests
+    # Served from the memo at the trust boundary too, and what it serves is what
+    # construction recorded rather than a second digest that happens to agree.
     assert calls == []
     assert set(digests) == {key}
-    assert digests[key] == db._static_adapter_digests[key]
+    assert digests[key] == first._static_adapter_digests[key]
     assert len(digests[key]) == 64
+
+
+def test_the_memo_covers_the_kernel_entries_and_stops_there() -> None:
+    """A caller's adapter is never carried, at construction or at the boundary.
+
+    Construction derives implementation digests for the fixed set only, which is
+    what the memo shortens. A caller's implementation is theirs to change, so its
+    digest is taken fresh at every trust boundary crossing, memo or no memo --
+    which is also what keeps the pinned-adapter-state law's basis intact.
+    """
+
+    calls: list[str] = []
+    original = Database._adapter_implementation_digest
+    memo: dict[tuple[str, type[Any]], str] = {}
+
+    def counting(self: Database, adapter: Any) -> str:
+        calls.append(type(adapter).__qualname__)
+        return original(self, adapter)
+
+    registry: dict[type[Any], Any] = dict(_builtin_file_stat_registry())
+    registry[_MutableCurrency] = _CurrencyAdapter()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Database, "_adapter_implementation_digest", counting)
+        patch.setattr("pyinc.runtime._FIXED_ADAPTER_IMPLEMENTATION_DIGESTS", memo)
+        first = Database(adapters=registry)
+        during_first = list(calls)
+        calls.clear()
+        second = Database(adapters=registry)
+        during_second = list(calls)
+        calls.clear()
+        first._current_adapter_digests()
+        second._current_adapter_digests()
+        at_boundaries = list(calls)
+
+    # Only the built-in is derived at construction, and only for the first
+    # database in the process.
+    assert during_first == ["FileStatAdapter"]
+    assert during_second == []
+    assert set(memo) == {(_adapter_key(FileStatSnapshot), FileStatAdapter)}
+    # Each boundary crossing re-derives the caller's adapter and only ever the
+    # caller's, on both databases.
+    assert at_boundaries == ["_CurrencyAdapter", "_CurrencyAdapter"]
+
+
+def test_a_caller_override_of_a_builtin_type_is_never_memoized() -> None:
+    """Same adapted type, a different adapter object: membership fails.
+
+    The memo is reached only from the fixed side of the partition, so an
+    override cannot land in it -- and could not be served from it either, since
+    the key pairs the adapter key with the adapter's own type.
+    """
+
+    calls: list[str] = []
+    original = Database._adapter_implementation_digest
+    memo: dict[tuple[str, type[Any]], str] = {}
+
+    def counting(self: Database, adapter: Any) -> str:
+        calls.append(type(adapter).__qualname__)
+        return original(self, adapter)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Database, "_adapter_implementation_digest", counting)
+        patch.setattr("pyinc.runtime._FIXED_ADAPTER_IMPLEMENTATION_DIGESTS", memo)
+        first = Database(adapters={FileStatSnapshot: _OffsetFileStatAdapter(1)})
+        during_first = list(calls)
+        calls.clear()
+        second = Database(adapters={FileStatSnapshot: _OffsetFileStatAdapter(2)})
+        during_second = list(calls)
+
+    assert first._static_adapter_digests == {}
+    assert second._static_adapter_digests == {}
+    assert set(first._non_static_adapters) == {FileStatSnapshot}
+    # Nothing was derived at construction on either side, because the override
+    # is a caller adapter and caller digests are taken at the trust boundary.
+    assert during_first == []
+    assert during_second == []
+    assert memo == {}
 
 
 def test_a_caller_adapter_beside_the_builtin_is_still_re_derived() -> None:
@@ -5662,6 +5835,48 @@ def test_a_caller_adapter_beside_the_builtin_is_still_re_derived() -> None:
     # the memo, and both keys still reach the manifest.
     assert calls == ["_CurrencyAdapter"]
     assert set(digests) == {_adapter_key(FileStatSnapshot), _adapter_key(_MutableCurrency)}
+
+
+def test_a_default_database_holds_the_builtin_on_the_cheap_path() -> None:
+    """What a caller who registers nothing gets, which is now every caller.
+
+    The sibling tests below register the built-in explicitly, because they were
+    written to distinguish the fixed set from a caller's registration. This one
+    pins the shape a bare `Database()` has: the built-in entry, on the fixed
+    side, expecting no configuration digest, and on the trust gate's cheap path
+    -- so registering it for everyone costs no re-derivation per boundary.
+    """
+
+    calls: list[str] = []
+    original = Database._current_adapter_digests
+
+    def counting(self: Database) -> dict[str, str]:
+        calls.append("called")
+        return original(self)
+
+    db = Database()
+
+    assert set(db._adapters) == {FileStatSnapshot}
+    assert db._adapters[FileStatSnapshot] is BUILTIN_ADAPTERS[FileStatSnapshot]
+    assert db._non_static_adapters == {}
+    assert set(db._static_adapter_digests) == {_adapter_key(FileStatSnapshot)}
+    assert db._registered_adapter_digests == {}
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Database, "_current_adapter_digests", counting)
+        assert db._adapter_keys_trusted((_adapter_key(FileStatSnapshot),))
+    assert calls == []
+
+
+def test_a_caller_registration_of_the_builtin_entry_is_still_the_builtin() -> None:
+    """Passing the kernel's own entry back in changes nothing about it."""
+
+    explicit = Database(adapters=_builtin_file_stat_registry())
+    default = Database()
+
+    assert explicit._adapters == default._adapters
+    assert explicit._non_static_adapters == {}
+    assert explicit._static_adapter_digests == default._static_adapter_digests
 
 
 def test_a_builtin_only_registry_keeps_the_trusted_fast_path() -> None:

@@ -1056,8 +1056,10 @@ def test_adapter_fingerprints_cover_state_methods_and_trust_failures() -> None:
     adapter = _RuntimeAdapter(offset=2)
     db = Database(adapters={_RuntimeType: adapter})
     digest = db._adapter_implementation_digest(adapter)
-    adapter_key = next(iter(db._current_adapter_digests()))
-    assert db._current_adapter_digests() == {adapter_key: digest}
+    adapter_key = _adapter_key(_RuntimeType)
+    # Every registry also carries the kernel's own built-in entries, so this
+    # asserts the caller's key rather than the size of the map.
+    assert db._current_adapter_digests()[adapter_key] == digest
 
     db._checkpoint_adapter_digests = {adapter_key: digest}
     assert db._adapter_keys_trusted([adapter_key])
