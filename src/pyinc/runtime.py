@@ -1015,7 +1015,11 @@ class Database:
         )
         self._revision = 0
         self._records: dict[NodeKey, NodeRecord] = {}
-        self._input_records: dict[Any, NodeKey] = {}
+        # Both registries are keyed by the input's key string, which is the
+        # whole of an input's identity: one entry per distinct key, however many
+        # `Input` objects name it. `_inputs_by_key` holds the first object
+        # registered under each key, as the comparand for the policy check.
+        self._input_records: dict[str, NodeKey] = {}
         self._inputs_by_key: dict[str, Any] = {}
         self._query_records: set[NodeKey] = set()
         self._query_last_used: dict[NodeKey, int] = {}
@@ -1242,10 +1246,10 @@ class Database:
             # an object nothing references.
             snapshot = freeze(value, adapters=self._adapters)
             digest = fingerprint_snapshot(snapshot)
-            # A prospective key, built rather than registered: `NodeKey` hashes
-            # by value, so this finds an already-committed node without
-            # declaring anything for a call that may still fail.
-            node_key = self._prospective_input_key(input_key)
+            # Resolved, not registered: an already-declared key comes back from
+            # the registry and an undeclared one is built without being stored,
+            # so a call that still fails has claimed nothing.
+            node_key = self._input_node_key(input_key)
             record = self._records.get(node_key)
             equal = record is not None and self._compare_input_snapshots(
                 input_key, record.snapshot, snapshot
@@ -1331,7 +1335,7 @@ class Database:
             for input_key, value in raw_pairs:
                 snapshot = freeze(value, adapters=self._adapters)
                 digest = fingerprint_snapshot(snapshot)
-                node_key = self._prospective_input_key(input_key)
+                node_key = self._input_node_key(input_key)
                 pending.append((input_key, node_key, snapshot, digest))
 
             decisions: list[tuple[bool, Any, NodeKey, Any, str]] = []
@@ -2760,10 +2764,7 @@ class Database:
                 store.put(digest, payload)
 
     def _find_input_node_by_key(self, input_key: str) -> NodeKey | None:
-        input_obj = self._inputs_by_key.get(input_key)
-        if input_obj is None:
-            return None
-        return self._input_records.get(input_obj)
+        return self._input_records.get(input_key)
 
     def _input_ident_for_key(self, key: NodeKey) -> str:
         return key.identity
@@ -3540,30 +3541,48 @@ class Database:
             )
 
     def _prospective_input_key(self, input_key: Any) -> NodeKey:
+        """The node key the input would take, built without declaring anything.
+
+        A pure function of one read of the key string, so the identity the node
+        is addressed by and the identity its label spells are the same string by
+        construction -- which is what lets the registry hold a single node per
+        key however many `Input` objects name it.
+        """
+        identity = input_key.key
         return NodeKey(
             kind="input",
-            identity=input_key.key,
+            identity=identity,
             args_digest="",
-            label=f"input[{input_key.key}]",
+            label=f"input[{identity}]",
         )
+
+    def _input_node_key(self, input_key: Any) -> NodeKey:
+        """The registered node key for this input, or the one it would take.
+
+        A key already in the registry is served from it rather than rebuilt, so
+        setting an input a second time costs a lookup. An unregistered key is
+        constructed and not stored, leaving it free for whatever `set` finally
+        declares it.
+        """
+        registered = self._input_records.get(input_key.key)
+        if registered is not None:
+            return registered
+        return self._prospective_input_key(input_key)
 
     def _commit_input_registration(self, input_key: Any) -> NodeKey:
         """Declare the input. Called only once a write has already succeeded.
 
         Idempotent and unconditional: validation happened before the caller
         committed to the write, so nothing here refuses and nothing here can
-        fail part way.
+        fail part way. Re-declaring a key already registered keeps the first
+        `Input` object as the comparand and adds nothing, so the registry is
+        sized by distinct keys rather than by how often they are set.
         """
-        key = self._input_records.get(input_key)
+        key = self._input_records.get(input_key.key)
         if key is not None:
             return key
-        existing = self._inputs_by_key.get(input_key.key)
-        if existing is not None:
-            key = self._input_records[existing]
-            self._input_records[input_key] = key
-            return key
         key = self._prospective_input_key(input_key)
-        self._input_records[input_key] = key
+        self._input_records[input_key.key] = key
         self._inputs_by_key[input_key.key] = input_key
         return key
 

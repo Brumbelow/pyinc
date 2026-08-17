@@ -1687,6 +1687,80 @@ def test_repeated_reads_with_fresh_input_objects_do_not_grow_state() -> None:
     assert db.revision == 1
 
 
+def test_repeated_sets_with_fresh_input_objects_do_not_grow_the_registry() -> None:
+    """The registry is sized by distinct keys, not by how often they are set.
+
+    `Input` compares by identity, so a registry keyed by the object retained one
+    entry per call and never released it. Keyed by the key string, a thousand
+    sets of one key are one entry.
+    """
+    db = Database()
+    for value in range(1000):
+        db.set(Input[int]("x"), value)
+
+    assert db.statistics().input_count == 1
+    assert len(db._input_records) == 1
+    assert len(db._inputs_by_key) == 1
+    assert db.read_input(Input[int]("x")) == 999
+    assert db.revision == 1000
+
+
+def test_the_input_registry_is_keyed_by_the_input_key_string() -> None:
+    """A second `Input` naming a set key resolves by that string, not by object.
+
+    The key string is the whole of an input's identity, so the registry holds
+    one entry per distinct key and the first `Input` registered under it stays
+    as the comparand every later policy check measures against.
+    """
+    db = Database()
+    first = Input[int]("x")
+    db.set(first, 1)
+
+    assert set(db._input_records) == {"x"}
+    node_key = db._input_records["x"]
+    assert node_key.identity == "x"
+    assert node_key.label == "input[x]"
+    assert db._inputs_by_key["x"] is first
+
+    # A distinct object naming the same key resolves to the same node without
+    # adding anything, and leaves the first registration as the comparand.
+    second = Input[int]("x")
+    db.set(second, 2)
+    assert db._find_input_node_by_key("x") == node_key
+    assert set(db._input_records) == {"x"}
+    assert db._inputs_by_key["x"] is first
+
+    # Distinct keys still get distinct entries.
+    db.set(Input[int]("y"), 3)
+    assert set(db._input_records) == {"x", "y"}
+    assert db._input_records["y"] != node_key
+    assert db.statistics().input_count == 2
+    assert db._find_input_node_by_key("absent") is None
+
+
+def test_policy_conflicts_are_refused_across_input_object_generations() -> None:
+    """One key under two notions of "changed" stays a programming error.
+
+    The registry keeps the first `Input` per key precisely so this check has
+    something to measure a later, differently-policied object against.
+    """
+
+    def cutoff(value: int) -> int:
+        return value
+
+    db = Database()
+    db.set(Input[int]("k"), 1)
+    with pytest.raises(InputKeyError, match="conflicting"):
+        db.set(Input[int]("k", cutoff=cutoff), 2)
+    with pytest.raises(InputKeyError, match="conflicting"):
+        db.read_input(Input[int]("k", eq=lambda left, right: left == right))
+
+    # Refused, and nothing about the committed registration moved.
+    assert db.revision == 1
+    assert db.read_input(Input[int]("k")) == 1
+    assert set(db._input_records) == {"k"}
+
+
 def test_set_many_rejects_duplicate_keys_before_mutating() -> None:
     value = Input[int]("value")
     db = Database()

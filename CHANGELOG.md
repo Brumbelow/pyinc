@@ -41,6 +41,15 @@ decided at release time.
   commits rather than as they are frozen. Reading an input now resolves an
   existing registration instead of creating one, so repeated reads no longer
   grow the input registry.
+- The input registry is sized by the number of distinct input keys, not by how
+  many `Input` objects have named them. `Input` compares by identity, so every
+  `db.set(Input("x"), value)` used to retain one more registry entry — and the
+  `Input` object with it — for the lifetime of the `Database`, never released: a
+  thousand sets of one key left a thousand entries all describing a single node.
+  Input keys are exactly `str` now, which makes the key string the whole of an
+  input's identity, so there is one entry per key whichever object names it, and
+  the first `Input` registered under a key stays as the comparand the
+  conflicting-policy check measures against.
 - `strict` mode runs a registered adapter's `thaw` at every boundary — query
   arguments, query results, and `eq=`/`cutoff=` policy operands, including
   results that carry shared or cyclic containers — where it previously handed
