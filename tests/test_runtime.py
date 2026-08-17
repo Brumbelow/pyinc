@@ -5338,10 +5338,6 @@ def test_unsubscribing_the_middle_of_three_equal_callbacks_removes_only_it() -> 
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="recipients are resolved at delivery time, so a late subscriber receives earlier events",
-)
 def test_a_subscriber_added_after_the_change_does_not_receive_the_earlier_event(
     mode: str,
 ) -> None:

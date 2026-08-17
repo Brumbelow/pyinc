@@ -733,6 +733,7 @@ class QueryChangeEvent:
 
 ObserverCallback = Callable[[QueryChangeEvent], None]
 ObserverErrorHook = Callable[[Exception], None]
+_PendingObserverEvent = tuple[NodeKey, tuple[int, ...], QueryChangeEvent]
 
 
 def _default_observer_error_hook(exc: Exception) -> None:
@@ -1181,8 +1182,8 @@ class Database:
         self._observer_error_hook: ObserverErrorHook = (
             observer_error_hook if observer_error_hook is not None else _default_observer_error_hook
         )
-        self._pending_events: ContextVar[list[tuple[NodeKey, QueryChangeEvent]] | None] = (
-            ContextVar("pyinc_pending_events", default=None)
+        self._pending_events: ContextVar[list[_PendingObserverEvent] | None] = ContextVar(
+            "pyinc_pending_events", default=None
         )
         # Resource nodes whose failure record holds this request's exception, so
         # the request scope can drop it (and the frames it pins) on the way out.
@@ -3169,14 +3170,19 @@ class Database:
             self._execution_stack.reset(token)
 
     def _enqueue_observer_event(self, query: Any, key: NodeKey, record: NodeRecord) -> None:
-        if key not in self._observers:
+        subscribed = self._observers.get(key)
+        if not subscribed:
             return
         pending = self._pending_events.get()
         if pending is None:
             return
+        # The recipients of an event are the subscriptions that existed
+        # when the change committed, minus any that end before delivery
+        # starts -- membership is re-checked once at dispatch entry.
         pending.append(
             (
                 key,
+                tuple(subscribed),
                 QueryChangeEvent(
                     query_id=query.key,
                     args_digest=key.args_digest,
@@ -3204,13 +3210,19 @@ class Database:
                     ) and not any(item.identity == key.identity for item in self._query_records):
                         self._query_objects().pop(key.identity, None)
 
-    def _dispatch_events(self, events: list[tuple[NodeKey, QueryChangeEvent]] | None) -> None:
+    def _dispatch_events(self, events: list[_PendingObserverEvent] | None) -> None:
         if not events:
             return
+        # Filtered once, before the delivery loop: a subscription removed
+        # during dispatch still receives events already snapshotted here,
+        # and one added after a change never receives that change.
         with self._state_lock:
-            snapshots = [
-                (event, tuple(self._observers.get(key, {}).values())) for key, event in events
-            ]
+            snapshots: list[tuple[QueryChangeEvent, tuple[ObserverCallback, ...]]] = []
+            for key, tokens, event in events:
+                live = self._observers.get(key, {})
+                snapshots.append(
+                    (event, tuple(live[token] for token in tokens if token in live))
+                )
         for event, callbacks in snapshots:
             for callback in callbacks:
                 try:
@@ -7973,7 +7985,7 @@ class Database:
     @contextmanager
     def _request_scope(
         self,
-    ) -> Iterator[list[tuple[NodeKey, QueryChangeEvent]] | None]:
+    ) -> Iterator[list[_PendingObserverEvent] | None]:
         current = self._request_token.get()
         if current is not None:
             # A span's request id must reflect every change committed while
@@ -7986,7 +7998,7 @@ class Database:
         self._verify_registered_adapters()
         self._request_counter += 1
         token = self._request_token.set(self._request_counter)
-        pending: list[tuple[NodeKey, QueryChangeEvent]] = []
+        pending: list[_PendingObserverEvent] = []
         events_token = self._pending_events.set(pending)
         failures: list[NodeKey] = []
         failures_token = self._request_failures.set(failures)

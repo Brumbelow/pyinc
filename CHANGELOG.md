@@ -191,6 +191,12 @@ decided at release time.
   one slot, a handle's active flag stays truthful, and registering one
   callback several times delivers once per registration, each handle
   detaching only its own.
+- An observer subscribed after a change committed no longer receives that
+  change's event. Recipients are captured when the change commits and checked
+  against the live subscription set once as delivery begins: a subscription
+  removed before delivery hears nothing further, one removed mid-delivery
+  still receives the batch it was captured in, and a late subscriber starts
+  with the first change that postdates it.
 
 ### Added
 
