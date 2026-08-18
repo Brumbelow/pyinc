@@ -168,7 +168,9 @@ its recorded digest is the user's file now: the claim is released and the file
 survives. The same rule holds at the instant of deletion: the unlink is pinned
 to the file identity the last-moment verification read, so an entry replaced
 under the same name after verification — even by a byte-identical file — is a
-file this action never wrote, and it survives. A drifted orphan standing where
+file this action never wrote, and it survives (subject to the final-instant
+limit stated in [Locking, publication, and
+recovery](#locking-publication-and-recovery)). A drifted orphan standing where
 the desired layout needs a parent directory is a refusal (`ActionPathError`)
 rather than a deletion. The manifest is left byte-identical on a no-op
 reconcile — except when the recorded root incarnation no longer matches the

@@ -808,9 +808,10 @@ writes, content-hash change/tamper detection, ownership-ledger orphan deletion,
 and dry-run planning. Reconciliation runs at top level only — never inside a
 query — so it does not change query semantics, the value membrane,
 untracked-read enforcement, or the `strict`/`checked`/`fast` modes. The
-kernel's from-scratch guarantee lifts to the filesystem: an incremental
-sequence of reconciles yields the same output files as a single reconcile from
-a fresh `Database` into an empty directory.
+kernel's from-scratch guarantee lifts to owned output files under the
+conditions the action contract's Soundness boundary states: for successfully
+completing reconciles, an incremental sequence yields the same owned output
+files as a single reconcile from a fresh `Database` into an empty directory.
 
 ## Additional Kernel Properties
 
