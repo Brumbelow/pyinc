@@ -20,6 +20,7 @@ from pyinc import (
     ActionPathError,
     Database,
     FileResource,
+    InMemoryArtifactStore,
     Input,
     query,
 )
@@ -1919,6 +1920,122 @@ def test_convergence_after_a_surviving_drift(
     assert second.unchanged == ("keep.txt",)
     assert manifest_bytes(root, "drift-convergence") == ledger
     assert target.read_bytes() == b"user edited this"
+
+
+def test_unowned_files_survive_and_owned_outputs_match_a_fresh_root(
+    tmp_path: Path,
+) -> None:
+    incremental_root = tmp_path / "incremental"
+    fresh_root = tmp_path / "fresh"
+    wanted: dict[str, str] = {"out/a.txt": "alpha", "out/b.txt": "beta"}
+
+    @action(tool="foreign-file-boundary")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    emit.reconcile(Database(), root=incremental_root)
+    foreign = incremental_root / "README-written-by-a-human.md"
+    foreign.write_text("hands off", encoding="utf-8")
+    wanted["out/a.txt"] = "alpha edited"
+    emit.reconcile(Database(), root=incremental_root)
+    emit.reconcile(Database(), root=fresh_root)
+
+    # The owned set converges to the fresh result...
+    for path in wanted:
+        assert (incremental_root / path).read_bytes() == (fresh_root / path).read_bytes()
+    # ...the foreign file is untouched...
+    assert foreign.read_text(encoding="utf-8") == "hands off"
+    # ...and precisely because of it the roots as a whole differ: the
+    # guarantee is scoped to the paths the action declares and owns.
+    incremental_names = {
+        p.relative_to(incremental_root).as_posix() for p in incremental_root.rglob("*")
+    }
+    fresh_names = {p.relative_to(fresh_root).as_posix() for p in fresh_root.rglob("*")}
+    assert incremental_names - fresh_names == {"README-written-by-a-human.md"}
+
+
+def test_owned_outputs_match_fresh_after_a_drifted_orphan_is_released(
+    tmp_path: Path,
+) -> None:
+    incremental_root = tmp_path / "incremental"
+    fresh_root = tmp_path / "fresh"
+    wanted: dict[str, str] = {"kept.txt": "kept", "dropped.txt": "generated"}
+
+    @action(tool="drift-boundary")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    emit.reconcile(Database(), root=incremental_root)
+    edited = incremental_root / "dropped.txt"
+    edited.write_text("hand edited", encoding="utf-8")
+    del wanted["dropped.txt"]
+    result = emit.reconcile(Database(), root=incremental_root)
+    emit.reconcile(Database(), root=fresh_root)
+
+    assert "dropped.txt" not in result.deleted
+    assert edited.read_text(encoding="utf-8") == "hand edited"
+    assert (incremental_root / "kept.txt").read_bytes() == (fresh_root / "kept.txt").read_bytes()
+
+
+def test_a_refused_reconcile_leaves_the_root_unchanged_and_plan_reports_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    wanted: dict[str, str] = {"pkg/model.py": "directory layout"}
+
+    @action(tool="refusal-boundary")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    emit.reconcile(Database(), root=root)
+    (root / "pkg" / "unowned.txt").write_text("keep", encoding="utf-8")
+    wanted.clear()
+    wanted["pkg"] = "now a file"
+
+    before = tree_witness(root)
+    with pytest.raises(ActionPathError, match="prune"):
+        emit.plan(Database(), root=root)
+    with pytest.raises(ActionPathError, match="prune"):
+        emit.reconcile(Database(), root=root)
+    assert tree_witness(root) == before
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_checkpoint_rebuilt_database_reconciles_to_the_fresh_result(
+    mode: str, tmp_path: Path
+) -> None:
+    store = InMemoryArtifactStore()
+    source = Input[str]("action.checkpoint.source")
+
+    @query
+    def rendered(db: Database) -> str:
+        return source.read(db).upper()
+
+    @action(tool="checkpoint-warm-reconcile")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text("out.txt", rendered(db))]
+
+    first = Database(mode, store=store)
+    first.set(source, "alpha")
+    warm_root = tmp_path / "warm"
+    emit.reconcile(first, root=warm_root)
+    key = first.save_checkpoint()
+
+    second = Database(mode, store=store)
+    second.set(source, "alpha")
+    second.load_checkpoint(key)
+    ledger = manifest_bytes(warm_root, "checkpoint-warm-reconcile")
+    result = emit.reconcile(second, root=warm_root)
+
+    # The rebuilt database reconciles the warm root as a byte-identical
+    # no-op (the root was never recreated, so the ledger is not rewritten)
+    # and produces the fresh result in an empty root.
+    assert result.created == result.updated == result.repaired == result.deleted == ()
+    assert result.unchanged == ("out.txt",)
+    assert manifest_bytes(warm_root, "checkpoint-warm-reconcile") == ledger
+    fresh_root = tmp_path / "fresh"
+    emit.reconcile(second, root=fresh_root)
+    assert (warm_root / "out.txt").read_bytes() == (fresh_root / "out.txt").read_bytes()
 
 
 def test_a_drifted_orphan_is_released_but_never_deleted(tmp_path: Path) -> None:
