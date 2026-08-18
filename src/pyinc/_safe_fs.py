@@ -390,6 +390,20 @@ def read_regular_file(path: Path) -> bytes | None:
     """Read a regular file without following symbolic links; return None if missing."""
     if os.name == "nt":
         return _read_regular_file_windows(path)
+    result = read_regular_file_with_identity(path)
+    return None if result is None else result[0]
+
+
+def read_regular_file_with_identity(path: Path) -> tuple[bytes, tuple[int, int]] | None:
+    """Read a regular file and report the identity of the file that was read.
+
+    The ``(st_dev, st_ino)`` pair names the file the bytes came from, taken
+    from the open descriptor, so a later ``unlink_regular_file(...,
+    expected_identity=...)`` can refuse an entry that was replaced under the
+    same name after this read.
+    """
+    if os.name == "nt":
+        return _read_regular_file_with_identity_windows(path)
     try:
         parent_fd = _open_directory(path.parent, create=False)
     except FileNotFoundError:
@@ -404,11 +418,12 @@ def read_regular_file(path: Path) -> bytes | None:
         except OSError as error:
             raise UnsafeFilesystemPathError(f"Cannot safely open regular file: {path}") from error
         try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
                 raise UnsafeFilesystemPathError(f"Path is not a regular file: {path}")
             with os.fdopen(descriptor, "rb") as handle:
                 descriptor = -1
-                return handle.read()
+                return handle.read(), (metadata.st_dev, metadata.st_ino)
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -459,10 +474,19 @@ def atomic_write(path: Path, data: bytes) -> None:
         os.close(parent_fd)
 
 
-def unlink_regular_file(path: Path) -> bool:
-    """Unlink a regular file through a no-follow parent handle and sync the directory."""
+def unlink_regular_file(
+    path: Path, *, expected_identity: tuple[int, int] | None = None
+) -> bool:
+    """Unlink a regular file through a no-follow parent handle and sync the directory.
+
+    With ``expected_identity``, the entry is unlinked only while it is still
+    the file that identity names; a replacement that arrived under the same
+    name is left in place and False is returned. POSIX has no
+    unlink-by-inode, so the final instant between this check and the unlink
+    stays open by construction.
+    """
     if os.name == "nt":
-        return _unlink_regular_file_windows(path)
+        return _unlink_regular_file_windows(path, expected_identity=expected_identity)
     try:
         parent_fd = _open_directory(path.parent, create=False)
     except FileNotFoundError:
@@ -474,6 +498,10 @@ def unlink_regular_file(path: Path) -> bool:
             return False
         if not stat.S_ISREG(metadata.st_mode):
             raise UnsafeFilesystemPathError(f"Refusing to delete non-regular file: {path}")
+        if expected_identity is not None and (
+            (metadata.st_dev, metadata.st_ino) != expected_identity
+        ):
+            return False
         _require_directory_identity(parent_fd, path.parent)
         os.unlink(path.name, dir_fd=parent_fd)
         os.fsync(parent_fd)
@@ -613,6 +641,39 @@ def _read_regular_file_windows(path: Path) -> bytes | None:
                 api.close(handle)
 
 
+def _read_regular_file_with_identity_windows(path: Path) -> tuple[bytes, tuple[int, int]] | None:
+    api = _windows_api()
+    try:
+        directories = _WindowsDirectoryHandles.open(api, os.fspath(path.parent), create=False)
+    except FileNotFoundError:
+        return None
+    with directories:
+        try:
+            handle = api.open_handle(
+                os.fspath(path),
+                access=_WIN_GENERIC_READ | _WIN_FILE_READ_ATTRIBUTES,
+                creation=_WIN_OPEN_EXISTING,
+                flags=_WIN_FILE_FLAG_OPEN_REPARSE_POINT | _WIN_FILE_FLAG_BACKUP_SEMANTICS,
+            )
+        except OSError as error:
+            if _windows_error_code(error) in _WIN_MISSING_ERRORS:
+                return None
+            raise
+        owned_by_stream = False
+        try:
+            api.require_regular(handle, os.fspath(path))
+            stream = _windows_file_from_handle(handle, os.O_RDONLY, "rb")
+            owned_by_stream = True
+            with stream:
+                # The volume serial and file index come from the open handle,
+                # so they name the object the bytes are being read from.
+                metadata = os.fstat(stream.fileno())
+                return stream.read(), (metadata.st_dev, metadata.st_ino)
+        finally:
+            if not owned_by_stream:
+                api.close(handle)
+
+
 def _atomic_write_windows(path: Path, data: bytes) -> None:
     api = _windows_api()
     with _WindowsDirectoryHandles.open(api, os.fspath(path.parent), create=True):
@@ -657,7 +718,9 @@ def _atomic_write_windows(path: Path, data: bytes) -> None:
                 api.close(handle)
 
 
-def _unlink_regular_file_windows(path: Path) -> bool:
+def _unlink_regular_file_windows(
+    path: Path, expected_identity: tuple[int, int] | None = None
+) -> bool:
     api = _windows_api()
     try:
         directories = _WindowsDirectoryHandles.open(api, os.fspath(path.parent), create=False)
@@ -677,6 +740,12 @@ def _unlink_regular_file_windows(path: Path) -> bool:
             raise
         try:
             api.require_regular(handle, os.fspath(path))
+            if expected_identity is not None:
+                # Deletion acts on the held handle, so this decides whether the
+                # object the name now resolves to is still the verified one.
+                metadata = os.stat(path, follow_symlinks=False)
+                if (metadata.st_dev, metadata.st_ino) != expected_identity:
+                    return False
             api.delete_handle(handle, os.fspath(path))
         finally:
             api.close(handle)

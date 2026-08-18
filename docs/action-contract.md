@@ -29,6 +29,12 @@ from pyinc import (
   `unchanged` path tuples plus `dry_run`. There is no aggregate `written` field
   in v3.
 
+For a completed `reconcile`, `deleted` names the orphans the run actually
+removed: a last-moment re-check that leaves an entry in place — it vanished,
+its bytes no longer match the recorded digest, or it is no longer the file
+whose bytes were verified — leaves it out of `deleted`. Under `dry_run=True`
+(`plan()`), `deleted` is the prediction.
+
 `created` means the action claimed a previously absent output. `updated` means
 an existing file was intentionally changed to a new desired value. `repaired`
 means a previously owned output was missing or no longer matched its recorded
@@ -100,17 +106,22 @@ publication or deletion, rejecting a parent that was renamed after traversal.
 POSIX has no portable mechanism that prevents a hostile process from renaming a
 directory in the final interval between that identity check and the mutation;
 action roots must therefore not be concurrently renamed by non-cooperating
-processes. Validated orphans are deleted first, directories that the previous
-layout's outputs left empty are pruned second, desired files are published
-third, and the new ledger is published last. Each file is atomic, but the set
-is deliberately not transactional. If a process stops mid-run — after
-deletions, after a prune, or after publication but before the ledger is
-written — the next locked reconcile of the desired set that run was publishing
-converges it, recognizing the recorded outputs the stopped run released.
-Recovery never deletes to repair: files the stopped run published but did not
-record are unowned, so a desired set that would have to remove them — a
-rollback to the recorded layout, or a teardown — is refused under the tamper
-policy until a reconcile of the published layout records them.
+processes. The same limit bounds orphan deletion: the unlink refuses an entry
+that is no longer the file whose bytes were verified, but POSIX has no
+unlink-by-inode, so the final instant between that identity re-check and the
+unlink cannot be closed — files under an action root must likewise not be
+concurrently replaced by non-cooperating processes. Validated orphans are
+deleted first, directories that the previous layout's outputs left empty are
+pruned second, desired files are published third, and the new ledger is
+published last. Each file is atomic, but the set is deliberately not
+transactional. If a process stops mid-run — after deletions, after a prune, or
+after publication but before the ledger is written — the next locked reconcile
+of the desired set that run was publishing converges it, recognizing the
+recorded outputs the stopped run released. Recovery never deletes to repair:
+files the stopped run published but did not record are unowned, so a desired
+set that would have to remove them — a rollback to the recorded layout, or a
+teardown — is refused under the tamper policy until a reconcile of the
+published layout records them.
 
 Rollback of already-published files and transactional directory swaps remain
 out of scope. Directory pruning is limited to layout migration: only
@@ -135,12 +146,13 @@ write time — detects a root that was deleted and recreated at the same path:
 the recorded claims name files in a directory that no longer exists, so they
 are treated as void and the current directory is adopted fresh, deleting
 nothing. Detection is best-effort — a filesystem can hand the recreated
-directory its old inode straight back — which is why deletion is additionally
-verified byte-for-byte below. Every output digest must be 64 lowercase
-hexadecimal characters. Unknown fields, duplicate JSON keys, wrong types,
-foreign identities, old schema versions, malformed paths, and malformed hashes
-raise `ActionManifestError` before mutation. v1 and v2 manifests are
-intentionally not compatible with v3's ledger semantics and may be discarded.
+directory its old inode straight back — which is why deletion additionally
+requires that the file's current SHA-256 digest still matches the digest the
+ledger recorded. Every output digest must be 64 lowercase hexadecimal
+characters. Unknown fields, duplicate JSON keys, wrong types, foreign
+identities, old schema versions, malformed paths, and malformed hashes raise
+`ActionManifestError` before mutation. v1 and v2 manifests are intentionally
+not compatible with v3's ledger semantics and may be discarded.
 
 The ledger is validated, not authenticated: nothing in it proves who wrote
 it. A forged manifest under a writable `state_dir` can claim a regular
@@ -152,14 +164,18 @@ An action deletes only files recorded by its own validated ledger, only while
 they still carry the exact bytes the ledger recorded, and subject to the
 regular-file-only constraint described in [Preflight and portable
 paths](#preflight-and-portable-paths). An orphan whose content drifted from
-its recorded digest is the user's file now: the claim is released and the
-file survives. A drifted orphan standing where the desired layout needs a
-parent directory is a refusal (`ActionPathError`) rather than a deletion. The
-manifest is left byte-identical on a no-op reconcile — except when the recorded
-root incarnation no longer matches the root, in which case the voided claims are
-replaced by a fresh adoption of the current directory even though no output
-changed. A `plan()` under a mismatched incarnation reports the post-adoption
-prediction; the adoption itself is not surfaced in the result.
+its recorded digest is the user's file now: the claim is released and the file
+survives. The same rule holds at the instant of deletion: the unlink is pinned
+to the file identity the last-moment verification read, so an entry replaced
+under the same name after verification — even by a byte-identical file — is a
+file this action never wrote, and it survives. A drifted orphan standing where
+the desired layout needs a parent directory is a refusal (`ActionPathError`)
+rather than a deletion. The manifest is left byte-identical on a no-op
+reconcile — except when the recorded root incarnation no longer matches the
+root, in which case the voided claims are replaced by a fresh adoption of the
+current directory even though no output changed. A `plan()` under a mismatched
+incarnation reports the post-adoption prediction; the adoption itself is not
+surfaced in the result.
 
 ## Soundness boundary
 

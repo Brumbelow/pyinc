@@ -20,6 +20,7 @@ from ._safe_fs import (
     UnsafeFilesystemPathError,
     atomic_write,
     read_regular_file,
+    read_regular_file_with_identity,
     remove_empty_directory,
     unlink_regular_file,
 )
@@ -623,8 +624,8 @@ class Action:
             targets[relative] = (target, metadata)
             if metadata is not None:
                 # An orphan is this action's to delete only while it still
-                # carries the exact bytes the ledger recorded. Byte comparison
-                # decides ownership because nothing stat-shaped can: a
+                # carries the exact bytes the ledger recorded. The recorded
+                # digest decides ownership because nothing stat-shaped can: a
                 # recreated directory can reuse its inode, and a drifted file
                 # is the user's now either way.
                 try:
@@ -728,20 +729,19 @@ class Action:
             else:
                 updated.append(relative)
 
-        deleted: list[str] = []
-        delete_paths: list[str] = []
+        predicted_deletions: list[str] = []
         for relative in previous_only:
             _, metadata = targets[relative]
             if metadata is not None and relative in deletable_orphans:
-                deleted.append(relative)
-                delete_paths.append(relative)
+                predicted_deletions.append(relative)
 
+        performed_deletions: list[str] = []
         if not dry_run:
             # Orphans are deleted and their emptied directories pruned before
             # any write so a path can change between file and directory forms.
             # Each step is individually atomic; if the run stops early, the
             # prior ledger lets the next locked reconcile finish the set.
-            for relative in delete_paths:
+            for relative in predicted_deletions:
                 target, metadata = _safe_target(root, relative)
                 if metadata is None:
                     continue
@@ -751,12 +751,18 @@ class Action:
                     )
                 try:
                     # Ownership is re-verified against the recorded bytes at
-                    # the last moment, the same way the stat is: a file that
-                    # changed since preflight is not this action's anymore.
-                    current = read_regular_file(target)
-                    if current is None or _content_hash(current) != previous[relative]:
+                    # the last moment, and the unlink is pinned to the file
+                    # the verification read: an entry that changed since
+                    # preflight -- or was replaced under the same name, even
+                    # by identical bytes -- is not this action's anymore.
+                    read = read_regular_file_with_identity(target)
+                    if read is None:
                         continue
-                    unlink_regular_file(target)
+                    current, identity = read
+                    if _content_hash(current) != previous[relative]:
+                        continue
+                    if unlink_regular_file(target, expected_identity=identity):
+                        performed_deletions.append(relative)
                 except UnsafeFilesystemPathError as error:
                     raise ActionPathError(str(error)) from error
 
@@ -794,7 +800,7 @@ class Action:
             created=tuple(created),
             updated=tuple(updated),
             repaired=tuple(repaired),
-            deleted=tuple(deleted),
+            deleted=tuple(predicted_deletions if dry_run else performed_deletions),
             unchanged=tuple(unchanged),
             dry_run=dry_run,
         )

@@ -268,6 +268,32 @@ def test_posix_safe_fs_handles_missing_and_nonregular_targets(tmp_path: Path) ->
         safe_fs.open_lock_file(directory)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow behavior")
+def test_identity_read_and_identity_checked_unlink(tmp_path: Path) -> None:
+    target = tmp_path / "file.bin"
+    target.write_bytes(b"payload")
+    read = safe_fs.read_regular_file_with_identity(target)
+    assert read is not None
+    data, identity = read
+    metadata = target.stat()
+    assert data == b"payload"
+    assert identity == (metadata.st_dev, metadata.st_ino)
+    assert safe_fs.read_regular_file_with_identity(tmp_path / "absent") is None
+
+    # A stale identity refuses and leaves the file in place.
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(b"payload")
+    os.replace(replacement, target)
+    assert safe_fs.unlink_regular_file(target, expected_identity=identity) is False
+    assert target.read_bytes() == b"payload"
+
+    # The current identity unlinks.
+    fresh = safe_fs.read_regular_file_with_identity(target)
+    assert fresh is not None
+    assert safe_fs.unlink_regular_file(target, expected_identity=fresh[1]) is True
+    assert not target.exists()
+
+
 @pytest.mark.skipif(
     os.name == "nt" or not getattr(os, "O_NOFOLLOW", 0),
     reason="requires POSIX O_NOFOLLOW",
@@ -812,7 +838,9 @@ def test_public_safe_fs_functions_dispatch_to_windows_boundaries(
     def write_windows(candidate: Path, data: bytes) -> None:
         calls.append(("write", (candidate, data)))
 
-    def unlink_windows(candidate: Path) -> bool:
+    def unlink_windows(
+        candidate: Path, expected_identity: tuple[int, int] | None = None
+    ) -> bool:
         calls.append(("unlink", candidate))
         return True
 

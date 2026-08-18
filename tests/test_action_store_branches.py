@@ -489,7 +489,9 @@ def test_action_rechecks_orphan_before_deleting(
 
     if outcome == "missing":
         result = declared._reconcile_locked({}, root=root, state_dir=root, dry_run=False)
-        assert result.deleted == ("owned",)
+        # The re-stat said the path was gone, so this run deleted nothing --
+        # and the file is in fact still here.
+        assert result.deleted == ()
         assert regular.read_bytes() == b"owned"
     else:
         with pytest.raises(ActionPathError, match="non-regular owned target"):

@@ -1442,9 +1442,9 @@ def test_orphan_deletion_precedes_manifest_publication(
     original_unlink = action_module.unlink_regular_file
     original_manifest = action_module._write_manifest
 
-    def record_unlink(path: Path) -> bool:
+    def record_unlink(path: Path, **kwargs: object) -> bool:
         events.append("delete")
-        return bool(original_unlink(path))
+        return bool(original_unlink(path, **kwargs))
 
     def record_manifest(*args: object, **kwargs: object) -> None:
         events.append("manifest")
@@ -1714,10 +1714,6 @@ def test_plan_refuses_an_unlistable_migration_directory(tmp_path: Path) -> None:
     assert tree_witness(root) == before
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the unlink acts on the name, so a file replaced after verification is deleted and reported",
-)
 def test_a_replacement_landing_in_the_deletion_window_survives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1757,10 +1753,6 @@ def test_a_replacement_landing_in_the_deletion_window_survives(
     assert_deleted_equals_removed(result, before, after)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a byte-identical replacement is a different file, but the name-based unlink deletes it",
-)
 def test_a_byte_identical_replacement_in_the_deletion_window_survives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1801,10 +1793,6 @@ def test_a_byte_identical_replacement_in_the_deletion_window_survives(
     assert_deleted_equals_removed(result, before, after)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="deleted reports the preflight prediction, so a drifted orphan is reported deleted while it survives",
-)
 def test_deleted_excludes_an_orphan_that_survived_the_last_moment_digest_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

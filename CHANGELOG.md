@@ -231,6 +231,18 @@ decided at release time.
   answers only what it can read: a genuinely missing path is a complete, benign
   answer; any other failure raises `ActionPathError` during preflight, from
   `plan()` and `reconcile()` alike.
+- Orphan deletion is now pinned to the file it verified. The last-moment
+  ownership read returns the file's identity alongside its bytes, and the
+  unlink refuses an entry that is no longer that file — so a replacement
+  landing under the same name in the final interval survives, byte-identical
+  replacements included: a file this action never wrote is never its to delete.
+  POSIX offers no unlink-by-inode, so the residual instant between the identity
+  re-check and the unlink is documented rather than claimed closed.
+- `ReconcileResult.deleted` now reports the orphans a reconcile actually
+  removed. It previously reported the preflight prediction, naming files whose
+  deletion the last-moment re-checks had skipped — a drifted orphan could be
+  reported deleted while sitting on disk. A dry run still reports the
+  prediction; that is what `plan()` means.
 
 ### Added
 
