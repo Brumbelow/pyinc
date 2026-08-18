@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _action_witness import manifest_bytes, tree_witness
+from _action_witness import assert_deleted_equals_removed, manifest_bytes, tree_witness
 
 import pyinc
 from pyinc import (
@@ -352,12 +352,15 @@ def test_removing_declaration_deletes_only_that_output(tmp_path: Path) -> None: 
     assert (out / "alpha.txt").exists() and (out / "beta.txt").exists()
 
     db.set(EMIT_SET, ("alpha",))  # beta removed
+    before = tree_witness(out)
     res = _emit_named.reconcile(db, root=out)
+    after = tree_witness(out)
     assert res.deleted == ("beta.txt",)
     assert res.created == res.updated == res.repaired == ()
     assert res.unchanged == ("alpha.txt",)
     assert not (out / "beta.txt").exists()
     assert (out / "alpha.txt").read_text() == "alpha"
+    assert_deleted_equals_removed(res, before, after)
 
 
 @action(tool="boom-tool/1")
@@ -527,11 +530,14 @@ def test_file_to_directory_output_migration_converges_like_a_fresh_root(tmp_path
     _emit_layout.reconcile(db, root=inc_root)
 
     db.set(LAYOUT_KIND, "directory")
+    before = tree_witness(inc_root)
     result = _emit_layout.reconcile(db, root=inc_root)
+    after = tree_witness(inc_root)
 
     assert result.created == ("pkg/model.py",)
     assert result.deleted == ("pkg",)
     assert result.updated == result.repaired == result.unchanged == ()
+    assert_deleted_equals_removed(result, before, after)
 
     fresh_root = tmp_path / "fresh"
     fresh_db = Database(mode="strict")
@@ -548,11 +554,14 @@ def test_directory_to_file_output_migration_converges_like_a_fresh_root(tmp_path
     _emit_layout.reconcile(db, root=inc_root)
 
     db.set(LAYOUT_KIND, "file")
+    before = tree_witness(inc_root)
     result = _emit_layout.reconcile(db, root=inc_root)
+    after = tree_witness(inc_root)
 
     assert result.created == ("pkg",)
     assert result.deleted == ("pkg/model.py",)
     assert result.updated == result.repaired == result.unchanged == ()
+    assert_deleted_equals_removed(result, before, after)
 
     fresh_root = tmp_path / "fresh"
     fresh_db = Database(mode="strict")
@@ -783,10 +792,13 @@ def test_teardown_after_a_file_to_directory_crash_follows_tamper_policy(tmp_path
     db.set(LAYOUT_KIND, "directory")
     _emit_layout.reconcile(db, root=inc_root)
     db.set(LAYOUT_KIND, "none")
+    before = tree_witness(inc_root)
     result = _emit_layout.reconcile(db, root=inc_root)
+    after = tree_witness(inc_root)
 
     assert result.deleted == ("pkg/model.py",)
     assert not (inc_root / "pkg" / "model.py").exists()
+    assert_deleted_equals_removed(result, before, after)
 
 
 def test_rollback_before_the_ledger_is_repaired_keeps_unrecorded_files(tmp_path: Path) -> None:
@@ -887,10 +899,13 @@ def test_nested_layout_crash_before_the_ledger_write_converges(tmp_path: Path) -
     assert result.deleted == ()
 
     db.set(NESTED_LAYOUT_KIND, "file")
+    before = tree_witness(inc_root)
     rolled_back = _emit_nested_layout.reconcile(db, root=inc_root)
+    after = tree_witness(inc_root)
     assert rolled_back.created == ("pkg",)
     assert rolled_back.deleted == ("pkg/inner/model.py",)
     assert (inc_root / "pkg").read_text(encoding="utf-8") == "file layout"
+    assert_deleted_equals_removed(rolled_back, before, after)
 
 
 def test_nested_prune_refusal_names_the_directory_that_still_holds_an_entry(
@@ -903,7 +918,10 @@ def test_nested_prune_refusal_names_the_directory_that_still_holds_an_entry(
     unowned.write_text("keep", encoding="utf-8")
 
     db.set(NESTED_LAYOUT_KIND, "file")
-    with pytest.raises(ActionPathError, match="'pkg/inner'"):
+    with pytest.raises(
+        ActionPathError,
+        match="Cannot prune directory 'pkg/inner' left by the previous layout: it still holds",
+    ):
         _emit_nested_layout.plan(db, root=tmp_path)
     assert unowned.read_text(encoding="utf-8") == "keep"
     assert (tmp_path / "pkg" / "inner" / "model.py").exists()
@@ -1696,6 +1714,225 @@ def test_plan_refuses_an_unlistable_migration_directory(tmp_path: Path) -> None:
     assert tree_witness(root) == before
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="the unlink acts on the name, so a file replaced after verification is deleted and reported",
+)
+def test_a_replacement_landing_in_the_deletion_window_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    wanted: dict[str, str] = {"gen.txt": "generated", "keep.txt": "kept"}
+
+    @action(tool="deletion-window")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    emit.reconcile(Database(), root=root)
+    target = root / "gen.txt"
+    verified = target.stat()
+    del wanted["gen.txt"]
+
+    action_module = importlib.import_module("pyinc.action")
+    original_unlink = action_module.unlink_regular_file
+
+    def replace_inside_the_window(path: Path, **kwargs: object) -> bool:
+        # Fires between the ownership read and the unlink -- the window.
+        if path.name == "gen.txt":
+            replacement = tmp_path / "replacement"
+            replacement.write_bytes(b"BRAND NEW FILE FROM ANOTHER PROCESS")
+            os.replace(replacement, target)
+        return bool(original_unlink(path, **kwargs))
+
+    monkeypatch.setattr(action_module, "unlink_regular_file", replace_inside_the_window)
+    before = tree_witness(root)
+    result = emit.reconcile(Database(), root=root)
+    after = tree_witness(root)
+
+    # The entry under the verified name is now a different file.
+    assert target.read_bytes() == b"BRAND NEW FILE FROM ANOTHER PROCESS"
+    installed = target.stat()
+    assert (installed.st_dev, installed.st_ino) != (verified.st_dev, verified.st_ino)
+    assert "gen.txt" not in result.deleted
+    assert_deleted_equals_removed(result, before, after)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="a byte-identical replacement is a different file, but the name-based unlink deletes it",
+)
+def test_a_byte_identical_replacement_in_the_deletion_window_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    wanted: dict[str, str] = {"gen.txt": "generated", "keep.txt": "kept"}
+
+    @action(tool="deletion-window-identical")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    emit.reconcile(Database(), root=root)
+    target = root / "gen.txt"
+    verified = target.stat()
+    del wanted["gen.txt"]
+
+    action_module = importlib.import_module("pyinc.action")
+    original_unlink = action_module.unlink_regular_file
+
+    def replace_inside_the_window(path: Path, **kwargs: object) -> bool:
+        # Fires between the ownership read and the unlink -- the window.
+        if path.name == "gen.txt":
+            replacement = tmp_path / "replacement"
+            replacement.write_bytes(b"generated")
+            os.replace(replacement, target)
+        return bool(original_unlink(path, **kwargs))
+
+    monkeypatch.setattr(action_module, "unlink_regular_file", replace_inside_the_window)
+    before = tree_witness(root)
+    result = emit.reconcile(Database(), root=root)
+    after = tree_witness(root)
+
+    # Identity decides ownership, not bytes: the replacement carries the
+    # recorded bytes but is a file this action never wrote.
+    assert target.read_bytes() == b"generated"
+    installed = target.stat()
+    assert (installed.st_dev, installed.st_ino) != (verified.st_dev, verified.st_ino)
+    assert "gen.txt" not in result.deleted
+    assert_deleted_equals_removed(result, before, after)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="deleted reports the preflight prediction, so a drifted orphan is reported deleted while it survives",
+)
+def test_deleted_excludes_an_orphan_that_survived_the_last_moment_digest_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    wanted: dict[str, str] = {"orphan.txt": "generated", "keep.txt": "kept"}
+
+    @action(tool="drift-report")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    emit.reconcile(Database(), root=root)
+    del wanted["orphan.txt"]
+    target = root / "orphan.txt"
+
+    action_module = importlib.import_module("pyinc.action")
+    original_read = action_module.read_regular_file
+    drifted = False
+
+    def drift_after_the_preflight_read(path: Path) -> bytes | None:
+        # The preflight read sees the recorded bytes and classifies the
+        # orphan deletable; the drift lands immediately after, so the
+        # last-moment re-check meets different bytes.
+        nonlocal drifted
+        data: bytes | None = original_read(path)
+        if path.name == "orphan.txt" and not drifted:
+            drifted = True
+            target.write_bytes(b"user edited this")
+        return data
+
+    monkeypatch.setattr(action_module, "read_regular_file", drift_after_the_preflight_read)
+    before = tree_witness(root)
+    result = emit.reconcile(Database(), root=root)
+    after = tree_witness(root)
+
+    assert target.read_bytes() == b"user edited this"
+    assert result.deleted == ()
+    assert result.unchanged == ("keep.txt",)
+    assert_deleted_equals_removed(result, before, after)
+    # The claim is released even though the file survives.
+    ledger = manifest_bytes(root, "drift-report")
+    assert ledger is not None and b"orphan.txt" not in ledger
+
+
+def test_plan_still_predicts_deletions_it_cannot_perform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    wanted: dict[str, str] = {"orphan.txt": "generated", "keep.txt": "kept"}
+
+    @action(tool="drift-plan")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    emit.reconcile(Database(), root=root)
+    del wanted["orphan.txt"]
+    target = root / "orphan.txt"
+
+    action_module = importlib.import_module("pyinc.action")
+    original_read = action_module.read_regular_file
+    drifted = False
+
+    def drift_after_the_preflight_read(path: Path) -> bytes | None:
+        # The preflight read sees the recorded bytes and classifies the
+        # orphan deletable; the drift lands immediately after, so a
+        # deletion would meet different bytes and be skipped.
+        nonlocal drifted
+        data: bytes | None = original_read(path)
+        if path.name == "orphan.txt" and not drifted:
+            drifted = True
+            target.write_bytes(b"user edited this")
+        return data
+
+    monkeypatch.setattr(action_module, "read_regular_file", drift_after_the_preflight_read)
+    ledger_before = manifest_bytes(root, "drift-plan")
+    result = emit.plan(Database(), root=root)
+
+    # The preflight read saw the recorded bytes, so the prediction names
+    # the orphan -- and the drift that landed right after guarantees the
+    # deletion could not actually be performed.
+    assert result.dry_run is True
+    assert result.deleted == ("orphan.txt",)
+    assert target.read_bytes() == b"user edited this"
+    assert manifest_bytes(root, "drift-plan") == ledger_before
+
+
+def test_convergence_after_a_surviving_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    wanted: dict[str, str] = {"orphan.txt": "generated", "keep.txt": "kept"}
+
+    @action(tool="drift-convergence")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    emit.reconcile(Database(), root=root)
+    del wanted["orphan.txt"]
+    target = root / "orphan.txt"
+
+    action_module = importlib.import_module("pyinc.action")
+    original_read = action_module.read_regular_file
+    drifted = False
+
+    def drift_after_the_preflight_read(path: Path) -> bytes | None:
+        # The preflight read sees the recorded bytes and classifies the
+        # orphan deletable; the drift lands immediately after, so the
+        # last-moment re-check meets different bytes. It fires once, so the
+        # reconcile that follows runs against a settled tree.
+        nonlocal drifted
+        data: bytes | None = original_read(path)
+        if path.name == "orphan.txt" and not drifted:
+            drifted = True
+            target.write_bytes(b"user edited this")
+        return data
+
+    monkeypatch.setattr(action_module, "read_regular_file", drift_after_the_preflight_read)
+    emit.reconcile(Database(), root=root)
+
+    # The released orphan is the user's file now: the next run neither
+    # touches it nor rewrites the ledger that already dropped the claim.
+    ledger = manifest_bytes(root, "drift-convergence")
+    second = emit.reconcile(Database(), root=root)
+    assert second.created == second.updated == second.repaired == second.deleted == ()
+    assert second.unchanged == ("keep.txt",)
+    assert manifest_bytes(root, "drift-convergence") == ledger
+    assert target.read_bytes() == b"user edited this"
+
+
 def test_a_drifted_orphan_is_released_but_never_deleted(tmp_path: Path) -> None:
     root = tmp_path / "root"
     wanted = {"kept.txt": "kept", "dropped.txt": "generated"}
@@ -1720,9 +1957,12 @@ def test_a_drifted_orphan_is_released_but_never_deleted(tmp_path: Path) -> None:
     wanted["transient.txt"] = "generated"
     drift_action.reconcile(Database(), root=root)
     del wanted["transient.txt"]
+    before = tree_witness(root)
     result = drift_action.reconcile(Database(), root=root)
+    after = tree_witness(root)
     assert result.deleted == ("transient.txt",)
     assert not (root / "transient.txt").exists()
+    assert_deleted_equals_removed(result, before, after)
 
 
 @pytest.mark.parametrize("timeout", (float("nan"), float("inf"), -float("inf")))
