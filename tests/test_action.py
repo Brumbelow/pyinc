@@ -1539,6 +1539,105 @@ def test_stale_external_ledger_never_deletes_in_a_recreated_output_root(
     assert "owned.txt" not in manifest_text
 
 
+def _live_incarnation(path: Path) -> list[int]:
+    metadata = path.stat()
+    return [metadata.st_dev, metadata.st_ino]
+
+
+@pytest.mark.parametrize(
+    "second_desired",
+    (
+        pytest.param(
+            "empty",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="a voiding reconcile with no desired outputs leaves the voided claims on disk",
+            ),
+        ),
+        "non-empty",
+    ),
+)
+def test_a_voiding_reconcile_persists_the_adoption(
+    tmp_path: Path, second_desired: str
+) -> None:
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    stash = tmp_path / "stash"
+    wanted: dict[str, str] = {"out.txt": "generated"}
+
+    @action(tool="incarnation-adoption")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    manifest = _manifest_path(state, "incarnation-adoption")
+
+    emit.reconcile(Database(), root=root, state_dir=state)
+    assert json.loads(manifest.read_bytes())["root_incarnation"] == _live_incarnation(root)
+
+    # The root is renamed aside and recreated: same path, different directory.
+    os.rename(root, stash)
+    root.mkdir()
+    assert _live_incarnation(root) != json.loads(manifest.read_bytes())["root_incarnation"]
+
+    wanted.clear()
+    if second_desired == "non-empty":
+        wanted["other.txt"] = "new output"
+    first_void = emit.reconcile(Database(), root=root, state_dir=state)
+    assert "out.txt" not in first_void.deleted
+
+    # The voiding decision is durable: the ledger no longer claims out.txt
+    # and records the directory the root now names.
+    persisted = json.loads(manifest.read_bytes())
+    assert "out.txt" not in persisted["outputs"]
+    assert persisted["root_incarnation"] == _live_incarnation(root)
+
+    # The chain: renaming the old directory back re-creates the mismatch
+    # against the incarnation just recorded, so the next reconcile voids
+    # again -- and must persist again.
+    os.rename(root, tmp_path / "displaced")
+    os.rename(stash, root)
+    assert _live_incarnation(root) != persisted["root_incarnation"]
+    second_void = emit.reconcile(Database(), root=root, state_dir=state)
+    persisted = json.loads(manifest.read_bytes())
+    assert "out.txt" not in persisted["outputs"]
+    assert persisted["root_incarnation"] == _live_incarnation(root)
+
+    # The rename-back directory still holds the bytes the first run wrote.
+    # With the claims durably void, nothing owns them and nothing deletes
+    # them -- this is the victim the resurrected ledger used to destroy.
+    assert second_void.deleted == ()
+    assert (root / "out.txt").read_bytes() == b"generated"
+
+
+def test_a_dry_run_reports_the_post_adoption_prediction_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    wanted: dict[str, str] = {"out.txt": "generated"}
+
+    @action(tool="incarnation-dry-run")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    manifest = _manifest_path(state, "incarnation-dry-run")
+    emit.reconcile(Database(), root=root, state_dir=state)
+    os.rename(root, tmp_path / "stash")
+    root.mkdir()
+    ledger_before = manifest.read_bytes()
+
+    wanted["other.txt"] = "new output"
+    del wanted["out.txt"]
+    result = emit.plan(Database(), root=root, state_dir=state)
+
+    # The prediction is post-adoption: the voided claim is not a deletion,
+    # the new output is a creation, and the ledger is untouched.
+    assert result.dry_run is True
+    assert result.deleted == ()
+    assert result.created == ("other.txt",)
+    assert manifest.read_bytes() == ledger_before
+
+
 def test_a_drifted_orphan_is_released_but_never_deleted(tmp_path: Path) -> None:
     root = tmp_path / "root"
     wanted = {"kept.txt": "kept", "dropped.txt": "generated"}
