@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _action_witness import tree_witness
 
 import pyinc
 from pyinc import (
@@ -938,7 +939,24 @@ def test_tracked_missing_output_is_repaired(tmp_path: Path) -> None:
     assert result.unchanged == ("out/b.txt",)
 
 
-def test_malformed_manifest_fails_before_mutating_outputs(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "incarnation",
+    (
+        "matches",
+        pytest.param(
+            "mismatch",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "a malformed ledger is silently adopted when the root incarnation mismatches"
+                ),
+            ),
+        ),
+    ),
+)
+def test_malformed_manifest_fails_before_mutating_outputs(
+    tmp_path: Path, incarnation: str
+) -> None:
     db, src, out = _setup(tmp_path)
     _emit.reconcile(db, str(src), root=out)
     before = (out / "out/a.txt").read_bytes()
@@ -946,34 +964,77 @@ def test_malformed_manifest_fails_before_mutating_outputs(tmp_path: Path) -> Non
     manifest = _manifest_path(out, _emit.tool)
     payload = json.loads(manifest.read_text())
     payload["outputs"] = {"../escape": "0" * 64}
+    if incarnation == "mismatch":
+        recorded = payload["root_incarnation"]
+        payload["root_incarnation"] = [recorded[0] + 1, recorded[1] + 1]
     manifest.write_text(json.dumps(payload), encoding="utf-8")
+    ledger_before = manifest.read_bytes()
+    tree_before = tree_witness(out)
 
     with pytest.raises(ActionManifestError):
         _emit.reconcile(db, str(src), root=out)
 
     assert (out / "out/a.txt").read_bytes() == before
+    assert manifest.read_bytes() == ledger_before
+    assert tree_witness(out) == tree_before
 
 
-@pytest.mark.parametrize(
-    "case",
-    (
-        "non-object",
-        "missing-field",
-        "unknown-field",
-        "duplicate-root-field",
-        "duplicate-output-path",
-        "boolean-version",
-        "old-version",
-        "foreign-tool",
-        "foreign-root",
+_SCHEMA_CASES = (
+    "non-object",
+    "missing-field",
+    "unknown-field",
+    "duplicate-root-field",
+    "duplicate-output-path",
+    "boolean-version",
+    "old-version",
+    "foreign-tool",
+    "foreign-root",
+    "non-object-outputs",
+    "non-string-digest",
+    "malformed-digest",
+    "absolute-path",
+    "case-collision",
+    "file-directory-collision",
+)
+# Cases whose invalidity lives in the outputs block, which the incarnation
+# comparison currently short-circuits past.
+_OUTPUTS_BLOCK_CASES = frozenset(
+    {
         "non-object-outputs",
         "non-string-digest",
         "malformed-digest",
+        "absolute-path",
         "case-collision",
         "file-directory-collision",
-    ),
+    }
 )
-def test_manifest_schema_is_strict_and_failure_is_premutation(tmp_path: Path, case: str) -> None:
+
+
+def _schema_cells() -> tuple[object, ...]:
+    cells: list[object] = []
+    for case in _SCHEMA_CASES:
+        cells.append(pytest.param(case, "matches", id=f"{case}-matches"))
+        marks = (
+            (
+                pytest.mark.xfail(
+                    strict=True,
+                    reason=(
+                        "an invalid outputs block is silently adopted when the root "
+                        "incarnation mismatches"
+                    ),
+                ),
+            )
+            if case in _OUTPUTS_BLOCK_CASES
+            else ()
+        )
+        cells.append(pytest.param(case, "mismatch", marks=marks, id=f"{case}-mismatch"))
+    return tuple(cells)
+
+
+@pytest.mark.parametrize(("case", "incarnation"), _schema_cells())
+def test_manifest_schema_is_strict_and_failure_is_premutation(
+    tmp_path: Path, case: str, incarnation: str
+) -> None:
     db, src, out = _setup(tmp_path)
     _emit.reconcile(db, str(src), root=out)
     output = out / "out/a.txt"
@@ -996,6 +1057,12 @@ def test_manifest_schema_is_strict_and_failure_is_premutation(tmp_path: Path, ca
             f'"version":2,"outputs":{{"a":"{zero}","a":"{zero}"}}}}'
         ).encode()
     else:
+        # The raw-bytes cases above carry no incarnation field to falsify: parsing
+        # and the field-set check precede the comparison, so their mismatch cells
+        # are identical to their matching ones.
+        if incarnation == "mismatch":
+            recorded = valid["root_incarnation"]
+            valid["root_incarnation"] = [recorded[0] + 1, recorded[1] + 1]
         if case == "missing-field":
             del valid["root"]
         elif case == "unknown-field":
@@ -1014,17 +1081,23 @@ def test_manifest_schema_is_strict_and_failure_is_premutation(tmp_path: Path, ca
             valid["outputs"] = {"a": False}
         elif case == "malformed-digest":
             valid["outputs"] = {"a": "ABCDEF"}
+        elif case == "absolute-path":
+            valid["outputs"] = {"/etc/passwd": zero}
         elif case == "case-collision":
             valid["outputs"] = {"A": zero, "a": zero}
         elif case == "file-directory-collision":
             valid["outputs"] = {"a": zero, "a/b": zero}
         manifest_bytes = json.dumps(valid).encode()
     manifest.write_bytes(manifest_bytes)
+    ledger_before = manifest.read_bytes()
+    tree_before = tree_witness(out)
 
     with pytest.raises(ActionManifestError):
         _emit.reconcile(db, str(src), root=out)
 
     assert output.read_bytes() == before
+    assert manifest.read_bytes() == ledger_before
+    assert tree_witness(out) == tree_before
 
 
 @pytest.mark.parametrize(
@@ -1050,8 +1123,24 @@ def test_deep_or_huge_numeric_manifest_raises_typed_error_before_mutation(
     assert output.read_bytes() == before
 
 
+@pytest.mark.parametrize(
+    "incarnation",
+    (
+        "matches",
+        pytest.param(
+            "mismatch",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "a ledger naming an invalid path is silently adopted when the root "
+                    "incarnation mismatches"
+                ),
+            ),
+        ),
+    ),
+)
 def test_manifest_surrogate_path_raises_typed_error_before_mutation(
-    tmp_path: Path,
+    tmp_path: Path, incarnation: str
 ) -> None:
     db, src, out = _setup(tmp_path)
     _emit.reconcile(db, str(src), root=out)
@@ -1061,11 +1150,18 @@ def test_manifest_surrogate_path_raises_typed_error_before_mutation(
     manifest = _manifest_path(out, _emit.tool)
     payload = json.loads(manifest.read_text())
     payload["outputs"] = {"bad-\ud800.py": "0" * 64}
+    if incarnation == "mismatch":
+        recorded = payload["root_incarnation"]
+        payload["root_incarnation"] = [recorded[0] + 1, recorded[1] + 1]
     manifest.write_text(json.dumps(payload), encoding="utf-8")
+    ledger_before = manifest.read_bytes()
+    tree_before = tree_witness(out)
 
     with pytest.raises(ActionManifestError, match="invalid path"):
         _emit.reconcile(db, str(src), root=out)
     assert output.read_bytes() == before
+    assert manifest.read_bytes() == ledger_before
+    assert tree_witness(out) == tree_before
 
 
 @pytest.mark.parametrize("manifest_kind", ("symlink", "directory", "fifo"))
