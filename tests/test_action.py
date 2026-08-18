@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _action_witness import tree_witness
+from _action_witness import manifest_bytes, tree_witness
 
 import pyinc
 from pyinc import (
@@ -1627,6 +1627,81 @@ def test_a_dry_run_reports_the_post_adoption_prediction_and_writes_nothing(
     assert result.deleted == ()
     assert result.created == ("other.txt",)
     assert manifest.read_bytes() == ledger_before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+@pytest.mark.xfail(
+    strict=True,
+    reason="an unlistable migration directory is read as prunable, so deletion runs before the refusal",
+)
+def test_reconcile_refuses_an_unlistable_migration_directory_before_deleting(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("EACCES does not bite as root")
+    root = tmp_path / "root"
+    wanted: dict[str, str] = {"a/x.txt": "owned a", "b/y.txt": "owned b"}
+
+    @action(tool="unlistable-migration")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    emit.reconcile(Database(), root=root)
+    # The user removed one owned file and left an unowned one behind.
+    (root / "b" / "y.txt").unlink()
+    (root / "b" / "unowned.txt").write_text("keep", encoding="utf-8")
+    # The new layout turns both directories into plain files.
+    wanted.clear()
+    wanted.update({"a": "now a file", "b": "now a file"})
+
+    ledger_before = manifest_bytes(root, "unlistable-migration")
+    before = tree_witness(root)
+    (root / "b").chmod(0o300)  # traversable, not listable
+    try:
+        with pytest.raises(ActionPathError, match="Cannot safely inspect directory 'b'"):
+            emit.reconcile(Database(), root=root)
+    finally:
+        (root / "b").chmod(0o700)
+    # The refusal is pre-mutation: every owned file, the unowned file, both
+    # directories, and the ledger are untouched. The witness is taken with
+    # the mode restored -- an unlistable directory hides its children.
+    assert tree_witness(root) == before
+    assert manifest_bytes(root, "unlistable-migration") == ledger_before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+@pytest.mark.xfail(
+    strict=True,
+    reason="plan() reports a clean converge on a fixture the next reconcile deletes from and then rejects",
+)
+def test_plan_refuses_an_unlistable_migration_directory(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("EACCES does not bite as root")
+    root = tmp_path / "root"
+    wanted: dict[str, str] = {"a/x.txt": "owned a", "b/y.txt": "owned b"}
+
+    @action(tool="unlistable-migration-plan")
+    def emit(db: Database) -> list[Output]:
+        return [Output.text(path, text) for path, text in sorted(wanted.items())]
+
+    emit.reconcile(Database(), root=root)
+    # The user removed one owned file and left an unowned one behind.
+    (root / "b" / "y.txt").unlink()
+    (root / "b" / "unowned.txt").write_text("keep", encoding="utf-8")
+    # The new layout turns both directories into plain files.
+    wanted.clear()
+    wanted.update({"a": "now a file", "b": "now a file"})
+
+    before = tree_witness(root)
+    (root / "b").chmod(0o300)
+    try:
+        with pytest.raises(ActionPathError, match="Cannot safely inspect directory 'b'"):
+            emit.plan(Database(), root=root)
+    finally:
+        (root / "b").chmod(0o700)
+    # A refusal decided in preflight is reported by plan(); the dry run
+    # leaves the tree and the ledger it holds exactly as they were.
+    assert tree_witness(root) == before
 
 
 def test_a_drifted_orphan_is_released_but_never_deleted(tmp_path: Path) -> None:

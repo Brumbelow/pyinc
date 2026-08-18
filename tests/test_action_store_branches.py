@@ -16,6 +16,7 @@ from pyinc.action import (
     Output,
     _action_lock_directory,
     _holds_only_desired_outputs,
+    _orphan_cannot_exist,
     _safe_target,
     _unprunable_entry,
     _validate_path_set,
@@ -503,6 +504,66 @@ def test_unreadable_migration_directories_are_left_to_the_write_and_prune_steps(
 
     assert _holds_only_desired_outputs(missing, "missing", {"missing/model.py"}) is False
     assert _unprunable_entry(missing, "missing", set(), {}) is None
+
+
+_UNANSWERABLE_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason="an unanswerable directory is read as a clean answer instead of refusing",
+)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+@pytest.mark.parametrize(
+    ("probe", "condition"),
+    (
+        ("unprunable-entry", "missing"),
+        pytest.param("unprunable-entry", "unlistable", marks=_UNANSWERABLE_XFAIL),
+        ("holds-only-desired", "missing"),
+        pytest.param("holds-only-desired", "unlistable", marks=_UNANSWERABLE_XFAIL),
+        ("orphan-cannot-exist", "missing"),
+        pytest.param("orphan-cannot-exist", "unsearchable-parent", marks=_UNANSWERABLE_XFAIL),
+    ),
+)
+def test_preflight_probes_answer_missing_and_refuse_unanswerable(
+    tmp_path: Path, probe: str, condition: str
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("EACCES does not bite as root")
+    if condition == "missing":
+        # A genuinely missing path is a benign, complete answer.
+        missing = tmp_path / "missing"
+        if probe == "unprunable-entry":
+            assert _unprunable_entry(missing, "missing", set(), {}) is None
+        elif probe == "holds-only-desired":
+            assert _holds_only_desired_outputs(missing, "missing", {"missing/model.py"}) is False
+        else:
+            assert _orphan_cannot_exist(tmp_path, "missing/file.txt") is False
+        return
+    if condition == "unlistable":
+        # scandir needs read permission; --wx removes exactly that.
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        (blocked / "entry.txt").write_text("held", encoding="utf-8")
+        blocked.chmod(0o300)
+        try:
+            with pytest.raises(PermissionError):
+                if probe == "unprunable-entry":
+                    _unprunable_entry(blocked, "blocked", set(), {})
+                else:
+                    _holds_only_desired_outputs(blocked, "blocked", {"blocked/entry.txt"})
+        finally:
+            blocked.chmod(0o700)
+        return
+    # lstat needs search permission on the parent: an 0o600 ancestor makes
+    # a component two levels down unanswerable.
+    outer = tmp_path / "outer"
+    (outer / "d").mkdir(parents=True)
+    outer.chmod(0o600)
+    try:
+        with pytest.raises(PermissionError):
+            _orphan_cannot_exist(tmp_path, "outer/d/f.txt")
+    finally:
+        outer.chmod(0o700)
 
 
 def test_action_supports_direct_decorator_form() -> None:
