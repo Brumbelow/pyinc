@@ -179,8 +179,15 @@ surfaced in the result.
 
 ## Soundness boundary
 
-The kernel's from-scratch consistency guarantee lifts to owned output files:
-given the same desired set, an incremental reconcile converges to the same file
-paths and bytes as a fresh reconcile into an empty root. This does not imply
-rollback across a set or ownership coordination between different tools that
-declare the same path.
+The kernel's from-scratch consistency guarantee lifts to owned output files,
+under the conditions the rest of this contract establishes. For a reconcile
+that completes successfully — over the paths this action declares and its
+validated ledger records, with a trusted `state_dir`, no unowned or drifted
+blocker refusing the run, and no non-cooperating process concurrently
+writing, replacing, or renaming under the root — the owned output paths and
+their bytes equal those a fresh reconcile of the same desired set into an
+empty root produces. Files the action neither declares nor owns are never
+touched, so the guarantee is scoped to the owned set: a root that holds
+anything else is not, as a whole, equal to a fresh empty-root reconcile.
+This does not imply rollback across a set or ownership coordination between
+different tools that declare the same path.

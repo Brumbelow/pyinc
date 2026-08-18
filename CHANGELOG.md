@@ -228,9 +228,9 @@ decided at release time.
   an unlistable directory let the deletions run and surfaced only afterwards as
   a failed prune — with the tree mutated, the ledger still claiming deleted
   files, and `plan()` reporting a clean converge. Every preflight probe now
-  answers only what it can read: a genuinely missing path is a complete, benign
-  answer; any other failure raises `ActionPathError` during preflight, from
-  `plan()` and `reconcile()` alike.
+  answers only what it can read: a missing path or a non-directory component
+  is a complete, benign answer; any other failure raises `ActionPathError`
+  during preflight, from `plan()` and `reconcile()` alike.
 - Orphan deletion is now pinned to the file it verified. The last-moment
   ownership read returns the file's identity alongside its bytes, and the
   unlink refuses an entry that is no longer that file — so a replacement
@@ -321,6 +321,14 @@ decided at release time.
   output root. They gain (v) alongside it: the loading database must run the
   mode that saved the checkpoint, so the durable guarantee is stated per mode
   rather than as one guarantee holding in all three at once.
+- The action contract's Soundness boundary now states its conditions. The
+  guarantee is scoped to a successfully completing reconcile over the paths
+  the action declares and its validated ledger records, with a trusted state
+  directory, no unowned or drifted blocker, and no non-cooperating concurrent
+  writer of the root — and it is explicit that unowned files are never
+  touched, so a root holding anything else is not claimed equal, as a whole,
+  to a fresh empty-root reconcile. The previous wording promised the equality
+  unconditionally.
 - The README positions pyinc as an application of the established Salsa-style
   red-green model with prior art named, not as the first incremental engine
   for Python. Verification language, the `lru_cache` comparison, the Rust

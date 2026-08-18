@@ -2033,6 +2033,7 @@ def test_a_checkpoint_rebuilt_database_reconciles_to_the_fresh_result(
     assert result.created == result.updated == result.repaired == result.deleted == ()
     assert result.unchanged == ("out.txt",)
     assert manifest_bytes(warm_root, "checkpoint-warm-reconcile") == ledger
+    assert second.statistics().query_executions == 0
     fresh_root = tmp_path / "fresh"
     emit.reconcile(second, root=fresh_root)
     assert (warm_root / "out.txt").read_bytes() == (fresh_root / "out.txt").read_bytes()
