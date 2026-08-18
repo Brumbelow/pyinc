@@ -939,21 +939,7 @@ def test_tracked_missing_output_is_repaired(tmp_path: Path) -> None:
     assert result.unchanged == ("out/b.txt",)
 
 
-@pytest.mark.parametrize(
-    "incarnation",
-    (
-        "matches",
-        pytest.param(
-            "mismatch",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "a malformed ledger is silently adopted when the root incarnation mismatches"
-                ),
-            ),
-        ),
-    ),
-)
+@pytest.mark.parametrize("incarnation", ("matches", "mismatch"))
 def test_malformed_manifest_fails_before_mutating_outputs(
     tmp_path: Path, incarnation: str
 ) -> None:
@@ -996,38 +982,13 @@ _SCHEMA_CASES = (
     "case-collision",
     "file-directory-collision",
 )
-# Cases whose invalidity lives in the outputs block, which the incarnation
-# comparison currently short-circuits past.
-_OUTPUTS_BLOCK_CASES = frozenset(
-    {
-        "non-object-outputs",
-        "non-string-digest",
-        "malformed-digest",
-        "absolute-path",
-        "case-collision",
-        "file-directory-collision",
-    }
-)
 
 
 def _schema_cells() -> tuple[object, ...]:
     cells: list[object] = []
     for case in _SCHEMA_CASES:
         cells.append(pytest.param(case, "matches", id=f"{case}-matches"))
-        marks = (
-            (
-                pytest.mark.xfail(
-                    strict=True,
-                    reason=(
-                        "an invalid outputs block is silently adopted when the root "
-                        "incarnation mismatches"
-                    ),
-                ),
-            )
-            if case in _OUTPUTS_BLOCK_CASES
-            else ()
-        )
-        cells.append(pytest.param(case, "mismatch", marks=marks, id=f"{case}-mismatch"))
+        cells.append(pytest.param(case, "mismatch", id=f"{case}-mismatch"))
     return tuple(cells)
 
 
@@ -1123,22 +1084,7 @@ def test_deep_or_huge_numeric_manifest_raises_typed_error_before_mutation(
     assert output.read_bytes() == before
 
 
-@pytest.mark.parametrize(
-    "incarnation",
-    (
-        "matches",
-        pytest.param(
-            "mismatch",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "a ledger naming an invalid path is silently adopted when the root "
-                    "incarnation mismatches"
-                ),
-            ),
-        ),
-    ),
-)
+@pytest.mark.parametrize("incarnation", ("matches", "mismatch"))
 def test_manifest_surrogate_path_raises_typed_error_before_mutation(
     tmp_path: Path, incarnation: str
 ) -> None:

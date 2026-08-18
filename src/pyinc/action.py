@@ -218,19 +218,6 @@ def _read_manifest(
         or any(type(item) is not int for item in recorded_incarnation)
     ):
         raise ActionManifestError("Action manifest root incarnation is malformed.")
-    current_incarnation = _root_incarnation(root)
-    if (
-        recorded_incarnation is not None
-        and current_incarnation is not None
-        and recorded_incarnation != current_incarnation
-    ):
-        # The root was deleted and recreated at this path. The recorded claims
-        # name files in a directory that no longer exists, so they are void
-        # and the current directory is adopted fresh, deleting nothing.
-        # Detection is best-effort -- a filesystem can hand the recreated
-        # directory its old inode straight back -- which is why deletion is
-        # additionally digest-verified where the claims are consumed.
-        return True, {}
     raw_outputs = data["outputs"]
     if not isinstance(raw_outputs, dict):
         raise ActionManifestError("Action manifest outputs must be an object.")
@@ -253,6 +240,19 @@ def _read_manifest(
                 f"Action manifest contains an invalid SHA-256 digest for {path_key!r}."
             )
         outputs[path_key] = raw_digest
+    current_incarnation = _root_incarnation(root)
+    if (
+        recorded_incarnation is not None
+        and current_incarnation is not None
+        and recorded_incarnation != current_incarnation
+    ):
+        # The root was deleted and recreated at this path. The recorded claims
+        # name files in a directory that no longer exists, so they are void
+        # and the current directory is adopted fresh, deleting nothing.
+        # Detection is best-effort -- a filesystem can hand the recreated
+        # directory its old inode straight back -- which is why deletion is
+        # additionally digest-verified where the claims are consumed.
+        return True, {}
     return True, outputs
 
 

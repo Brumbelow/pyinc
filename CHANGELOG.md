@@ -208,6 +208,12 @@ decided at release time.
   subscription removed before delivery hears nothing further, one removed
   mid-delivery still receives the batch it was captured in, and a late
   subscriber starts with the first change that postdates it.
+- A malformed action ledger now raises `ActionManifestError` regardless of
+  whether the root was recreated. The outputs payload — schema, path safety,
+  and digest format — is validated before the root-incarnation comparison,
+  where it was previously skipped whenever the comparison decided the recorded
+  claims were void, so whether a corrupt ledger was reported at all depended on
+  a stat of the root.
 
 ### Added
 
