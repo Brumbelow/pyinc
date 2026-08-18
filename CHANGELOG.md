@@ -214,6 +214,14 @@ decided at release time.
   where it was previously skipped whenever the comparison decided the recorded
   claims were void, so whether a corrupt ledger was reported at all depended on
   a stat of the root.
+- A reconcile that voids a stale ledger now persists that decision. When the
+  recorded root incarnation no longer matches the directory at the root path,
+  the recorded claims are void — but with an empty desired set the ledger was
+  left byte-identical, so the dead claims and the dead incarnation survived to
+  the next run, and a rename that re-established the old directory could
+  resurrect them against files this action never wrote. The voided ledger is
+  now rewritten with the adopted incarnation even when no output changed; a dry
+  run still writes nothing.
 
 ### Added
 

@@ -1544,19 +1544,7 @@ def _live_incarnation(path: Path) -> list[int]:
     return [metadata.st_dev, metadata.st_ino]
 
 
-@pytest.mark.parametrize(
-    "second_desired",
-    (
-        pytest.param(
-            "empty",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="a voiding reconcile with no desired outputs leaves the voided claims on disk",
-            ),
-        ),
-        "non-empty",
-    ),
-)
+@pytest.mark.parametrize("second_desired", ("empty", "non-empty"))
 def test_a_voiding_reconcile_persists_the_adoption(
     tmp_path: Path, second_desired: str
 ) -> None:
@@ -1624,6 +1612,9 @@ def test_a_dry_run_reports_the_post_adoption_prediction_and_writes_nothing(
     emit.reconcile(Database(), root=root, state_dir=state)
     os.rename(root, tmp_path / "stash")
     root.mkdir()
+    # The recreated root holds a file at the claimed path carrying exactly the
+    # recorded bytes, so only the void keeps it out of the prediction.
+    (root / "out.txt").write_bytes(b"generated")
     ledger_before = manifest.read_bytes()
 
     wanted["other.txt"] = "new output"

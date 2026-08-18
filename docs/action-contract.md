@@ -155,8 +155,11 @@ paths](#preflight-and-portable-paths). An orphan whose content drifted from
 its recorded digest is the user's file now: the claim is released and the
 file survives. A drifted orphan standing where the desired layout needs a
 parent directory is a refusal (`ActionPathError`) rather than a deletion. The
-manifest is left byte-identical on a no-op reconcile, so no-op operation does
-not rewrite user-visible outputs or state.
+manifest is left byte-identical on a no-op reconcile — except when the recorded
+root incarnation no longer matches the root, in which case the voided claims are
+replaced by a fresh adoption of the current directory even though no output
+changed. A `plan()` under a mismatched incarnation reports the post-adoption
+prediction; the adoption itself is not surfaced in the result.
 
 ## Soundness boundary
 

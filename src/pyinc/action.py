@@ -186,12 +186,12 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _read_manifest(
     state_dir: Path, tool: str, root_digest: str, root: Path
-) -> tuple[bool, dict[str, str]]:
+) -> tuple[bool, dict[str, str], bool]:
     path = _manifest_path(state_dir, tool)
     try:
         raw = read_regular_file(path)
         if raw is None:
-            return False, {}
+            return False, {}, False
         data = json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
     except ActionManifestError:
         raise
@@ -252,8 +252,8 @@ def _read_manifest(
         # Detection is best-effort -- a filesystem can hand the recreated
         # directory its old inode straight back -- which is why deletion is
         # additionally digest-verified where the claims are consumed.
-        return True, {}
-    return True, outputs
+        return True, {}, True
+    return True, outputs, False
 
 
 def _write_manifest(
@@ -531,7 +531,9 @@ class Action:
         dry_run: bool,
     ) -> ReconcileResult:
         root_identity = _manifest_root_digest(root)
-        manifest_exists, previous = _read_manifest(state_dir, self.tool, root_identity, root)
+        manifest_exists, previous, claims_voided = _read_manifest(
+            state_dir, self.tool, root_identity, root
+        )
         _validate_path_set(desired, source="owned output")
 
         # A ledger entry that conflicts with the new desired layout is just an
@@ -758,7 +760,11 @@ class Action:
                     )
                 _atomic_write(target, desired[relative])
 
-            if desired_hashes != previous or (desired_hashes and not manifest_exists):
+            if (
+                desired_hashes != previous
+                or (desired_hashes and not manifest_exists)
+                or claims_voided
+            ):
                 _write_manifest(state_dir, self.tool, root_identity, root, desired_hashes)
 
         return ReconcileResult(
