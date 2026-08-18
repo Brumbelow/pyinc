@@ -222,6 +222,15 @@ decided at release time.
   resurrect them against files this action never wrote. The voided ledger is
   now rewritten with the adopted incarnation even when no output changed; a dry
   run still writes nothing.
+- A migration directory that cannot be inspected now refuses the reconcile
+  before anything is deleted. The prune preflight treated any filesystem error
+  while listing a previous layout's directory as "nothing blocks pruning", so
+  an unlistable directory let the deletions run and surfaced only afterwards as
+  a failed prune — with the tree mutated, the ledger still claiming deleted
+  files, and `plan()` reporting a clean converge. Every preflight probe now
+  answers only what it can read: a genuinely missing path is a complete, benign
+  answer; any other failure raises `ActionPathError` during preflight, from
+  `plan()` and `reconcile()` alike.
 
 ### Added
 

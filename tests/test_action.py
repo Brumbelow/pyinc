@@ -1630,10 +1630,6 @@ def test_a_dry_run_reports_the_post_adoption_prediction_and_writes_nothing(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
-@pytest.mark.xfail(
-    strict=True,
-    reason="an unlistable migration directory is read as prunable, so deletion runs before the refusal",
-)
 def test_reconcile_refuses_an_unlistable_migration_directory_before_deleting(
     tmp_path: Path,
 ) -> None:
@@ -1670,10 +1666,6 @@ def test_reconcile_refuses_an_unlistable_migration_directory_before_deleting(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
-@pytest.mark.xfail(
-    strict=True,
-    reason="plan() reports a clean converge on a fixture the next reconcile deletes from and then rejects",
-)
 def test_plan_refuses_an_unlistable_migration_directory(tmp_path: Path) -> None:
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")

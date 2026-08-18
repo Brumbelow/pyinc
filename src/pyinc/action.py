@@ -355,7 +355,7 @@ def _orphan_cannot_exist(root: Path, relative: str) -> bool:
         current = current / part
         try:
             metadata = current.lstat()
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             return False
         if stat.S_ISLNK(metadata.st_mode):
             return False
@@ -372,7 +372,7 @@ def _holds_only_desired_outputs(target: Path, relative: str, desired: Collection
         try:
             with os.scandir(directory) as entries:
                 listing = list(entries)
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             return False
         for entry in listing:
             path = f"{prefix}/{entry.name}"
@@ -393,7 +393,8 @@ def _unprunable_entry(
     try:
         with os.scandir(target) as entries:
             listing = sorted(entries, key=lambda entry: entry.name)
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
+        # Nothing is here to block pruning; the prune step re-checks anyway.
         return None
     for entry in listing:
         path = f"{relative}/{entry.name}"
@@ -585,7 +586,13 @@ class Action:
         targets: dict[str, tuple[Path, os.stat_result | None]] = {}
         orphan_owned: dict[str, bool] = {}
         for relative in previous_only:
-            if _orphan_cannot_exist(root, relative):
+            try:
+                unreachable = _orphan_cannot_exist(root, relative)
+            except OSError as error:
+                raise ActionPathError(
+                    f"Cannot safely inspect owned output path {relative!r}: {error}"
+                ) from error
+            if unreachable:
                 # A run that stopped before publishing its ledger left a file
                 # where this orphan's parent directory stood. No file can exist
                 # at the recorded path, so it is already released.
@@ -596,14 +603,21 @@ class Action:
                 metadata is not None
                 and stat.S_ISDIR(metadata.st_mode)
                 and any(path.startswith(f"{relative}/") for path in desired)
-                and _holds_only_desired_outputs(target, relative, desired)
             ):
-                # The desired layout nests outputs strictly beneath this path
-                # and the directory holds nothing else, so a run that stopped
-                # before publishing its ledger already released the orphan.
-                # Nothing here is deleted; the nested outputs are reconciled
-                # exactly as they would be under an unrecorded directory.
-                metadata = None
+                try:
+                    already_released = _holds_only_desired_outputs(target, relative, desired)
+                except OSError as error:
+                    raise ActionPathError(
+                        f"Cannot safely inspect directory {relative!r} left by the "
+                        f"previous layout: {error}"
+                    ) from error
+                if already_released:
+                    # The desired layout nests outputs strictly beneath this path
+                    # and the directory holds nothing else, so a run that stopped
+                    # before publishing its ledger already released the orphan.
+                    # Nothing here is deleted; the nested outputs are reconciled
+                    # exactly as they would be under an unrecorded directory.
+                    metadata = None
             if metadata is not None and not stat.S_ISREG(metadata.st_mode):
                 raise ActionPathError(f"Owned output target is not a regular file: {relative!r}")
             targets[relative] = (target, metadata)
@@ -673,7 +687,16 @@ class Action:
             target, metadata = _safe_target(root, relative)
             if metadata is None or not stat.S_ISDIR(metadata.st_mode):
                 continue
-            blocking = _unprunable_entry(target, relative, deletable_orphans, prune_map)
+            try:
+                blocking = _unprunable_entry(target, relative, deletable_orphans, prune_map)
+            except OSError as error:
+                # An unanswerable directory refuses the run before anything is
+                # deleted; failing open here would let the deletions run and
+                # surface the refusal only after them.
+                raise ActionPathError(
+                    f"Cannot safely inspect directory {relative!r} left by the "
+                    f"previous layout: {error}"
+                ) from error
             if blocking is not None:
                 raise ActionPathError(
                     f"Cannot prune directory {relative!r} left by the previous layout: "

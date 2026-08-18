@@ -497,7 +497,7 @@ def test_action_rechecks_orphan_before_deleting(
         assert directory.is_dir()
 
 
-def test_unreadable_migration_directories_are_left_to_the_write_and_prune_steps(
+def test_missing_migration_directories_are_left_to_the_write_and_prune_steps(
     tmp_path: Path,
 ) -> None:
     missing = tmp_path / "missing"
@@ -506,22 +506,16 @@ def test_unreadable_migration_directories_are_left_to_the_write_and_prune_steps(
     assert _unprunable_entry(missing, "missing", set(), {}) is None
 
 
-_UNANSWERABLE_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="an unanswerable directory is read as a clean answer instead of refusing",
-)
-
-
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
 @pytest.mark.parametrize(
     ("probe", "condition"),
     (
         ("unprunable-entry", "missing"),
-        pytest.param("unprunable-entry", "unlistable", marks=_UNANSWERABLE_XFAIL),
+        ("unprunable-entry", "unlistable"),
         ("holds-only-desired", "missing"),
-        pytest.param("holds-only-desired", "unlistable", marks=_UNANSWERABLE_XFAIL),
+        ("holds-only-desired", "unlistable"),
         ("orphan-cannot-exist", "missing"),
-        pytest.param("orphan-cannot-exist", "unsearchable-parent", marks=_UNANSWERABLE_XFAIL),
+        ("orphan-cannot-exist", "unsearchable-parent"),
     ),
 )
 def test_preflight_probes_answer_missing_and_refuse_unanswerable(
