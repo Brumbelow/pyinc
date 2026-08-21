@@ -47,7 +47,7 @@ action_module = importlib.import_module("pyinc.action")
 RAW_OR_TYPED: tuple[type[BaseException], ...] = (OSError, ActionPathError)
 
 #: The injected OSError families. CPython maps a multi-argument OSError to
-#: its errno-keyed subclass (EACCES -> PermissionError, ENOTDIR ->
+#: its errno-keyed subclass (EACCES/EPERM -> PermissionError, ENOTDIR ->
 #: NotADirectoryError, EINTR -> InterruptedError; ENOSPC/EIO/ELOOP stay
 #: OSError), so an injected fault carries exactly the type a real syscall
 #: failure would. Real EINTR is retried inside os.* by the interpreter and
@@ -216,7 +216,11 @@ def assert_refusal_replays_after_checkpoint(
     reloaded = Database("strict", store=store)
     reloaded.set(source, spec)
     reloaded.load_checkpoint(key)
-    assert refuse(reloaded) == warm_text
+    reloaded_text = refuse(reloaded)
+    assert reloaded_text == warm_text, (
+        "the refusal changed across the checkpoint: "
+        f"warm={warm_text!r} reloaded={reloaded_text!r}"
+    )
 
 
 def assert_tree_and_ledger_unchanged(
@@ -227,8 +231,19 @@ def assert_tree_and_ledger_unchanged(
     before_ledger: bytes | None,
 ) -> None:
     """The preflight-refusal invariant: nothing moved, on disk or in the ledger."""
-    assert tree_witness(root) == before_tree
-    assert manifest_bytes(state_dir, tool) == before_ledger
+    after_tree = tree_witness(root)
+    differing = sorted(
+        path
+        for path in before_tree.keys() | after_tree.keys()
+        if before_tree.get(path) != after_tree.get(path)
+    )
+    assert after_tree == before_tree, f"the tree changed at {differing}"
+    after_ledger = manifest_bytes(state_dir, tool)
+    before_size = "absent" if before_ledger is None else f"{len(before_ledger)} bytes"
+    after_size = "absent" if after_ledger is None else f"{len(after_ledger)} bytes"
+    assert after_ledger == before_ledger, (
+        f"the ledger changed: before={before_size} after={after_size}"
+    )
 
 
 def assert_no_tmp_residue(*directories: Path) -> None:
@@ -236,7 +251,7 @@ def assert_no_tmp_residue(*directories: Path) -> None:
     for directory in directories:
         if directory.is_dir():
             leftovers = sorted(str(path) for path in directory.rglob(".tmp-*"))
-            assert leftovers == []
+            assert leftovers == [], f"temporary files survived: {leftovers}"
 
 
 def assert_mutation_fault_invariants(
@@ -249,7 +264,13 @@ def assert_mutation_fault_invariants(
     here: each completed step stays completed by design, and the caller
     pins the exact steps its fixture performed.
     """
-    assert manifest_bytes(state_dir, tool) == before_ledger
+    after_ledger = manifest_bytes(state_dir, tool)
+    before_size = "absent" if before_ledger is None else f"{len(before_ledger)} bytes"
+    after_size = "absent" if after_ledger is None else f"{len(after_ledger)} bytes"
+    assert after_ledger == before_ledger, (
+        "the ledger changed under a mutation fault: "
+        f"before={before_size} after={after_size}"
+    )
     assert_no_tmp_residue(root, state_dir)
 
 
