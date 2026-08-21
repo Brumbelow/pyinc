@@ -1166,9 +1166,12 @@ def test_a_window_replacement_inside_a_pruned_directory_aborts_then_refuses_pref
 
     # Stage 1: the unlink declines the replaced entry, the directory is
     # not empty at the prune, and the run aborts typed mid-mutation.
+    # The match stops at the bracket opening the OS error: this refusal
+    # wraps a real OSError, which spells itself [Errno N] on POSIX and
+    # [WinError N] on Windows.
     with pytest.raises(
         ActionPathError,
-        match="Cannot prune directory 'pkg' left by the previous layout: \\[Errno",
+        match="Cannot prune directory 'pkg' left by the previous layout: \\[",
     ):
         emit.reconcile(db, root=root)
 
@@ -1219,10 +1222,11 @@ def test_a_byte_identical_window_survivor_inside_a_pruned_directory_is_deleted_n
 
     # The abort is the same as the drifted replacement's: the unlink
     # declines the replaced entry and the directory is not empty at the
-    # prune.
+    # prune, and the match stops at the OS error's opening bracket for the
+    # same reason.
     with pytest.raises(
         ActionPathError,
-        match="Cannot prune directory 'pkg' left by the previous layout: \\[Errno",
+        match="Cannot prune directory 'pkg' left by the previous layout: \\[",
     ):
         emit.reconcile(db, root=root)
 
