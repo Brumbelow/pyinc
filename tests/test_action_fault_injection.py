@@ -128,7 +128,7 @@ def test_a_root_resolution_fault_is_typed_and_touches_nothing(
             emit.reconcile(active, root=root)
         return str(caught.value)
 
-    refuse(db)
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     disarm()
     # Entry faults precede everything: the root was never even created.
     assert not root.exists()
@@ -158,7 +158,7 @@ def test_a_root_inspection_fault_is_typed_and_touches_nothing(
             emit.reconcile(active, root=root)
         return str(caught.value)
 
-    refuse(db)
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     disarm()
     # The inspection refused before any write, so the root is still empty.
     # Read it back only with the hook disarmed: the patch is class-wide.
@@ -279,7 +279,7 @@ def test_a_lock_acquisition_fault_is_typed_and_touches_nothing(
             emit.reconcile(active, root=root)
         return str(caught.value)
 
-    refuse(db)
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     disarm()
     assert_tree_and_ledger_unchanged(
         root, root, f"fault-lock-acquire-{code}", before, None
@@ -314,7 +314,7 @@ def test_a_ledger_read_fault_refuses_typed_with_the_tree_and_ledger_intact(
             emit.reconcile(active, root=root)
         return str(caught.value)
 
-    refuse(db)
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     with pytest.raises(ActionManifestError, match="Cannot read action manifest"):
         emit.plan(db, root=root)
     disarm()
@@ -381,7 +381,7 @@ def test_an_unsearchable_orphan_parent_refuses_during_preflight(
         return str(caught.value)
 
     try:
-        refuse(db)
+        assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
         with pytest.raises(
             ActionPathError,
             match="Cannot safely inspect owned output path 'outer/d/f\\.txt'",
@@ -433,7 +433,7 @@ def test_an_unlistable_released_directory_refuses_during_preflight(
         return str(caught.value)
 
     try:
-        refuse(db)
+        assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
         with pytest.raises(
             ActionPathError,
             match="Cannot safely inspect directory 'pkg' left by the previous layout",
@@ -476,7 +476,7 @@ def test_a_target_inspection_fault_refuses_typed_before_any_write(
             emit.reconcile(active, root=root)
         return str(caught.value)
 
-    refuse(db)
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     with pytest.raises(
         ActionPathError, match="Cannot safely inspect owned output path 'sub/out\\.txt'"
     ):
@@ -522,7 +522,7 @@ def test_an_unreadable_orphan_refuses_typed_during_preflight(
         return str(caught.value)
 
     try:
-        refuse(db)
+        assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
         with pytest.raises(ActionPathError, match="Cannot safely open regular file"):
             emit.plan(db, root=root)
     finally:
@@ -560,7 +560,7 @@ def test_an_orphan_ownership_read_fault_refuses_with_nothing_mutated(
             emit.reconcile(active, root=root)
         return str(caught.value)
 
-    refuse(db)
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     with pytest.raises(RAW_OR_TYPED):
         emit.plan(db, root=root)
     disarm()
@@ -600,7 +600,7 @@ def test_an_unreadable_output_refuses_typed_during_preflight(
         return str(caught.value)
 
     try:
-        refuse(db)
+        assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
         with pytest.raises(ActionPathError, match="Cannot safely open regular file"):
             emit.plan(db, root=root)
     finally:
@@ -639,7 +639,7 @@ def test_a_desired_state_read_fault_refuses_with_nothing_mutated(
             emit.reconcile(active, root=root)
         return str(caught.value)
 
-    refuse(db)
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     with pytest.raises(RAW_OR_TYPED):
         emit.plan(db, root=root)
     disarm()
@@ -692,10 +692,12 @@ def test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touche
     root = tmp_path / "root"
     tool = f"fault-window-read-{code}"
     emit, source = input_driven_action(tool)
-    db = Database("strict", store=InMemoryArtifactStore())
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
     db.set(source, desired_spec({"orphan.txt": "recorded", "keep.txt": "kept"}))
     emit.reconcile(db, root=root)
-    db.set(source, desired_spec({"keep.txt": "kept"}))
+    spec = desired_spec({"keep.txt": "kept"})
+    db.set(source, spec)
 
     ledger_before = manifest_bytes(root, tool)
     before = tree_witness(root)
@@ -708,8 +710,12 @@ def test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touche
 
     # Only an unsafe-path error is caught around the deletion, so every
     # injected family escapes raw today; the union survives a retyping.
-    with pytest.raises(RAW_OR_TYPED):
-        emit.reconcile(db, root=root)
+    def refuse(active: Database) -> str:
+        with pytest.raises(RAW_OR_TYPED) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
 
     # The verification is the first mutation step, so this single-orphan
     # fixture is byte-identical too: nothing was deleted, pruned, or written.
@@ -765,10 +771,12 @@ def test_an_unlink_fault_stops_the_run_with_the_orphan_and_ledger_intact(
     root = tmp_path / "root"
     tool = f"fault-unlink-{code}"
     emit, source = input_driven_action(tool)
-    db = Database("strict", store=InMemoryArtifactStore())
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
     db.set(source, desired_spec({"orphan.txt": "recorded", "keep.txt": "kept"}))
     emit.reconcile(db, root=root)
-    db.set(source, desired_spec({"keep.txt": "kept"}))
+    spec = desired_spec({"keep.txt": "kept"})
+    db.set(source, spec)
 
     ledger_before = manifest_bytes(root, tool)
     before = tree_witness(root)
@@ -776,8 +784,14 @@ def test_an_unlink_fault_stops_the_run_with_the_orphan_and_ledger_intact(
         monkeypatch, "unlink_regular_file", code, gate=named_gate("orphan.txt")
     )
 
-    with pytest.raises(RAW_OR_TYPED):
-        emit.reconcile(db, root=root)
+    # The removal sits outside the typed wrap, so every injected family
+    # escapes raw today; the union survives a retyping.
+    def refuse(active: Database) -> str:
+        with pytest.raises(RAW_OR_TYPED) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
 
     # The verification read completed but the removal never ran, so the
     # single-orphan fixture is still byte-identical.
@@ -1131,7 +1145,7 @@ def test_a_window_replacement_inside_a_pruned_directory_aborts_then_refuses_pref
 
     with pytest.raises(ActionPathError, match="it still holds 'pkg/inner\\.txt'"):
         emit.plan(db, root=root)
-    refuse(db)
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     assert tree_witness(root) == stage2
     assert manifest_bytes(root, tool) == ledger_stage2
 
@@ -1251,7 +1265,7 @@ def test_a_non_regular_node_at_an_orphan_path_refuses_and_survives(
             emit.reconcile(active, root=root)
         return str(caught.value)
 
-    refuse(db)
+    assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     with pytest.raises(
         ActionPathError, match="Owned output target is not a regular file"
     ):
