@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -28,8 +29,8 @@ from _action_fault_injection import (
 )
 from _action_witness import assert_deleted_equals_removed, manifest_bytes, tree_witness
 
-from pyinc import Database, InMemoryArtifactStore
-from pyinc.action import _manifest_path
+from pyinc import Database, InMemoryArtifactStore, Input
+from pyinc.action import Action, _manifest_path
 from pyinc.errors import ActionManifestError, ActionPathError
 
 # ``pyinc`` re-exports the action decorator under the submodule's own name,
@@ -1033,3 +1034,187 @@ def test_a_ledger_write_fault_during_a_voiding_run_leaves_the_void_unpersisted(
     live = root.stat()
     assert persisted["root_incarnation"] == [live.st_dev, live.st_ino]
     assert (stash / "out.txt").read_bytes() == b"generated"
+
+
+def _window_replacement_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    replacement: bytes,
+) -> tuple[Action, Path, Database, Input[str], str, InMemoryArtifactStore, Callable[[], None]]:
+    """Directory-to-file migration with a replacement landing in the window.
+
+    Returns the action, the root, the warm database (its desired set
+    already switched to the migrating layout), the input/spec/store the
+    replay wrapper needs, and a disarm callable that restores the real
+    unlink for the staged follow-up runs.
+    """
+    root = tmp_path / "root"
+    emit, source = input_driven_action(tool)
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
+    db.set(source, desired_spec({"pkg/inner.txt": "nested"}))
+    emit.reconcile(db, root=root)
+    target = root / "pkg" / "inner.txt"
+    # The new layout turns the directory into a file: pkg enters the
+    # prune map, and the orphan beneath it is deleted first.
+    spec = desired_spec({"pkg": "now a file"})
+    db.set(source, spec)
+
+    original_unlink = action_module.unlink_regular_file
+
+    def replace_inside_the_window(path: Path, **kwargs: object) -> bool:
+        # Fires between the ownership read and the unlink -- the window.
+        if path.name == "inner.txt":
+            foreign = tmp_path / "replacement"
+            foreign.write_bytes(replacement)
+            os.replace(foreign, target)
+        return bool(original_unlink(path, **kwargs))
+
+    monkeypatch.setattr(action_module, "unlink_regular_file", replace_inside_the_window)
+
+    def disarm() -> None:
+        monkeypatch.setattr(action_module, "unlink_regular_file", original_unlink)
+
+    return emit, root, db, source, spec, store, disarm
+
+
+def test_a_window_replacement_inside_a_pruned_directory_aborts_then_refuses_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tool = "prune-window-drift"
+    emit, root, db, source, spec, store, disarm = _window_replacement_run(
+        tmp_path, monkeypatch, tool, b"BRAND NEW FILE FROM ANOTHER PROCESS"
+    )
+    target = root / "pkg" / "inner.txt"
+    verified = target.stat()
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+
+    # Stage 1: the unlink declines the replaced entry, the directory is
+    # not empty at the prune, and the run aborts typed mid-mutation.
+    with pytest.raises(
+        ActionPathError,
+        match="Cannot prune directory 'pkg' left by the previous layout: \\[Errno",
+    ):
+        emit.reconcile(db, root=root)
+
+    after = tree_witness(root)
+    installed = target.stat()
+    # The only difference against the pre-call tree is the replacement
+    # itself; the desired file was never written (deletions and prunes
+    # precede writes), and the ledger is byte-unchanged.
+    assert {k: v for k, v in after.items() if k != "pkg/inner.txt"} == {
+        k: v for k, v in before.items() if k != "pkg/inner.txt"
+    }
+    assert target.read_bytes() == b"BRAND NEW FILE FROM ANOTHER PROCESS"
+    assert (installed.st_dev, installed.st_ino) != (verified.st_dev, verified.st_ino)
+    assert manifest_bytes(root, tool) == ledger_before
+    assert (root / "pkg").is_dir()
+
+    # Stage 2: with no injection, the next run refuses during preflight --
+    # the survivor's bytes drifted from the recorded digest, so it is not
+    # deletable and the prune preflight names it; plan() and reconcile()
+    # agree, pre-mutation.
+    disarm()
+    ledger_stage2 = manifest_bytes(root, tool)
+    stage2 = tree_witness(root)
+
+    def refuse(active: Database) -> str:
+        with pytest.raises(
+            ActionPathError, match="it still holds 'pkg/inner\\.txt'"
+        ) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    with pytest.raises(ActionPathError, match="it still holds 'pkg/inner\\.txt'"):
+        emit.plan(db, root=root)
+    refuse(db)
+    assert tree_witness(root) == stage2
+    assert manifest_bytes(root, tool) == ledger_stage2
+
+
+def test_a_byte_identical_window_replacement_aborts_then_the_next_run_deletes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tool = "prune-window-identical"
+    emit, root, db, source, spec, store, disarm = _window_replacement_run(
+        tmp_path, monkeypatch, tool, b"nested"
+    )
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+
+    # The abort is the drifted replacement's abort: the unlink declines the
+    # replaced entry and the directory is not empty at the prune.
+    with pytest.raises(
+        ActionPathError,
+        match="Cannot prune directory 'pkg' left by the previous layout: \\[Errno",
+    ):
+        emit.reconcile(db, root=root)
+
+    after = tree_witness(root)
+    assert {k: v for k, v in after.items() if k != "pkg/inner.txt"} == {
+        k: v for k, v in before.items() if k != "pkg/inner.txt"
+    }
+    # Identity is compared DELIBERATELY: the replacement carries the same
+    # bytes, so a bytes-only witness cannot see it at all.
+    assert after["pkg/inner.txt"][3] == before["pkg/inner.txt"][3] == b"nested"
+    assert after["pkg/inner.txt"][1:3] != before["pkg/inner.txt"][1:3]
+    assert manifest_bytes(root, tool) == ledger_before
+    assert (root / "pkg").is_dir()
+
+    disarm()
+    result = emit.reconcile(db, root=root)
+    # Across runs the recorded digest decides ownership; the intra-run
+    # identity protection ended with the aborted run, whose claim was
+    # never released. The byte-identical survivor is therefore deleted
+    # and the migration completes.
+    assert result.deleted == ("pkg/inner.txt",)
+    assert result.created == ("pkg",)
+    assert (root / "pkg").read_bytes() == b"now a file"
+    ledger = json.loads(manifest_bytes(root, tool) or b"{}")
+    assert set(ledger["outputs"]) == {"pkg"}
+
+
+def test_a_byte_identical_window_survivor_in_a_plain_deletion_is_durably_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    tool = "plain-window-identical"
+    emit, source = input_driven_action(tool)
+    db = Database("strict", store=InMemoryArtifactStore())
+    db.set(source, desired_spec({"gen.txt": "generated", "keep.txt": "kept"}))
+    emit.reconcile(db, root=root)
+    target = root / "gen.txt"
+    verified = target.stat()
+    db.set(source, desired_spec({"keep.txt": "kept"}))
+
+    original_unlink = action_module.unlink_regular_file
+
+    def replace_inside_the_window(path: Path, **kwargs: object) -> bool:
+        if path.name == "gen.txt":
+            foreign = tmp_path / "replacement"
+            foreign.write_bytes(b"generated")
+            os.replace(foreign, target)
+        return bool(original_unlink(path, **kwargs))
+
+    monkeypatch.setattr(action_module, "unlink_regular_file", replace_inside_the_window)
+    first = emit.reconcile(db, root=root)
+    monkeypatch.setattr(action_module, "unlink_regular_file", original_unlink)
+
+    # No prune is involved, so the run COMPLETES: the ledger write
+    # releases the claim, and the survivor is nobody's to delete --
+    # durably, unlike the same survivor inside a pruned directory, where
+    # the aborted run keeps the claim and the next run deletes it.
+    assert first.deleted == ()
+    survivor = target.stat()
+    assert (survivor.st_dev, survivor.st_ino) != (verified.st_dev, verified.st_ino)
+    ledger = manifest_bytes(root, tool)
+    assert ledger is not None and b"gen.txt" not in ledger
+
+    second = emit.reconcile(db, root=root)
+    assert second.deleted == ()
+    assert second.unchanged == ("keep.txt",)
+    assert target.read_bytes() == b"generated"
+    final = target.stat()
+    assert (final.st_dev, final.st_ino) == (survivor.st_dev, survivor.st_ino)
