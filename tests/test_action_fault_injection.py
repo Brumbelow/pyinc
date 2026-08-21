@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import stat
 import tempfile
@@ -276,3 +277,363 @@ def test_a_lock_acquisition_fault_is_typed_and_touches_nothing(
     )
     result = emit.reconcile(db, root=root)
     assert result.created == ("out.txt",)
+
+
+# An injected EINTR behaves as any other OSError at these preflight seams;
+# the interpreter retries a real EINTR below them, where it is unobservable.
+@pytest.mark.parametrize("code", FAULT_FAMILIES)
+def test_a_ledger_read_fault_refuses_typed_with_the_tree_and_ledger_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    root = tmp_path / "root"
+    tool = f"fault-ledger-read-{code}"
+    emit, source = input_driven_action(tool)
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
+    spec = desired_spec({"out.txt": "fresh"})
+    db.set(source, spec)
+    emit.reconcile(db, root=root)
+
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+    disarm = inject_fault(monkeypatch, "read_regular_file", code, gate=manifest_gate)
+
+    def refuse(active: Database) -> str:
+        with pytest.raises(
+            ActionManifestError, match="Cannot read action manifest"
+        ) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    refuse(db)
+    with pytest.raises(ActionManifestError, match="Cannot read action manifest"):
+        emit.plan(db, root=root)
+    disarm()
+    assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
+    result = emit.reconcile(db, root=root)
+    assert result.unchanged == ("out.txt",)
+
+
+@pytest.mark.parametrize("code", FAULT_FAMILIES)
+def test_a_root_identity_fault_is_tolerated_and_the_run_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    root = tmp_path / "fault-root"
+    tool = f"fault-root-identity-{code}"
+    emit, source = input_driven_action(tool)
+    db = Database("strict", store=InMemoryArtifactStore())
+    db.set(source, desired_spec({"out.txt": "fresh"}))
+    emit.reconcile(db, root=root)
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+    disarm = inject_path_method_fault(
+        monkeypatch, "stat", code, gate=named_gate("fault-root")
+    )
+
+    # An unanswerable root identity is tolerated by design: the recorded
+    # claims stay in force (voiding needs BOTH incarnations answerable),
+    # and a no-op reconcile stays a byte-identical no-op.
+    result = emit.reconcile(db, root=root)
+    disarm()
+    assert result.unchanged == ("out.txt",)
+    assert result.deleted == ()
+    assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+def test_an_unsearchable_orphan_parent_refuses_during_preflight(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("EACCES does not bite as root")
+    root = tmp_path / "root"
+    tool = "fault-orphan-parent-search"
+    emit, source = input_driven_action(tool)
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
+    db.set(source, desired_spec({"outer/d/f.txt": "recorded", "keep.txt": "kept"}))
+    emit.reconcile(db, root=root)
+    spec = desired_spec({"keep.txt": "kept"})
+    db.set(source, spec)
+
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+    # lstat needs search permission on the ancestor; the recorded path is
+    # two levels below it, so the probe meets EACCES rather than a benign
+    # missing answer.
+    (root / "outer").chmod(0o600)
+
+    def refuse(active: Database) -> str:
+        with pytest.raises(
+            ActionPathError,
+            match="Cannot safely inspect owned output path 'outer/d/f\\.txt'",
+        ) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    try:
+        refuse(db)
+        with pytest.raises(
+            ActionPathError,
+            match="Cannot safely inspect owned output path 'outer/d/f\\.txt'",
+        ):
+            emit.plan(db, root=root)
+    finally:
+        (root / "outer").chmod(0o700)
+
+    assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
+    result = emit.reconcile(db, root=root)
+    assert result.deleted == ("outer/d/f.txt",)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+def test_an_unlistable_released_directory_refuses_during_preflight(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("EACCES does not bite as root")
+    root = tmp_path / "root"
+    tool = "fault-released-dir-listing"
+    emit, source = input_driven_action(tool)
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
+    db.set(source, desired_spec({"pkg": "was a file", "keep.txt": "kept"}))
+    emit.reconcile(db, root=root)
+
+    # A run that stopped before publishing its ledger: the file recorded at
+    # 'pkg' is gone and a directory holding the newly nested output stands
+    # in its place.
+    (root / "pkg").unlink()
+    (root / "pkg").mkdir()
+    (root / "pkg" / "inner.txt").write_text("nested", encoding="utf-8")
+    spec = desired_spec({"pkg/inner.txt": "nested", "keep.txt": "kept"})
+    db.set(source, spec)
+
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+    # Deciding whether the directory holds nothing but desired outputs needs
+    # a listing, and scandir needs read permission.
+    (root / "pkg").chmod(0o300)
+
+    def refuse(active: Database) -> str:
+        with pytest.raises(
+            ActionPathError,
+            match="Cannot safely inspect directory 'pkg' left by the previous layout",
+        ) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    try:
+        refuse(db)
+        with pytest.raises(
+            ActionPathError,
+            match="Cannot safely inspect directory 'pkg' left by the previous layout",
+        ):
+            emit.plan(db, root=root)
+    finally:
+        (root / "pkg").chmod(0o700)
+
+    assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
+    result = emit.reconcile(db, root=root)
+    # With the listing answerable the orphan reads as already released:
+    # nothing is deleted, both files already carry the desired bytes, and
+    # the fresh ledger records exactly the new layout.
+    assert result.deleted == ()
+    assert result.unchanged == ("keep.txt", "pkg/inner.txt")
+    ledger_after = manifest_bytes(root, tool)
+    assert ledger_after is not None
+    assert set(json.loads(ledger_after)["outputs"]) == {"keep.txt", "pkg/inner.txt"}
+
+
+@pytest.mark.parametrize("code", FAULT_FAMILIES)
+def test_a_target_inspection_fault_refuses_typed_before_any_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    tool = f"fault-target-lstat-{code}"
+    emit, source = input_driven_action(tool)
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
+    spec = desired_spec({"sub/out.txt": "fresh"})
+    db.set(source, spec)
+    disarm = inject_path_method_fault(monkeypatch, "lstat", code, gate=named_gate("sub"))
+
+    def refuse(active: Database) -> str:
+        with pytest.raises(
+            ActionPathError,
+            match="Cannot safely inspect owned output path 'sub/out\\.txt'",
+        ) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    refuse(db)
+    with pytest.raises(
+        ActionPathError, match="Cannot safely inspect owned output path 'sub/out\\.txt'"
+    ):
+        emit.plan(db, root=root)
+    disarm()
+    # An unanswerable component is fatal for every family but a plain
+    # missing answer, so nothing was written and no ledger was published.
+    # Read the tree back only with the class-wide hook disarmed.
+    assert list(root.iterdir()) == []
+    assert manifest_bytes(root, tool) is None
+    result = emit.reconcile(db, root=root)
+    assert result.created == ("sub/out.txt",)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+def test_an_unreadable_orphan_refuses_typed_during_preflight(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("EACCES does not bite as root")
+    root = tmp_path / "root"
+    tool = "fault-orphan-unreadable"
+    emit, source = input_driven_action(tool)
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
+    db.set(source, desired_spec({"orphan.txt": "recorded", "keep.txt": "kept"}))
+    emit.reconcile(db, root=root)
+    spec = desired_spec({"keep.txt": "kept"})
+    db.set(source, spec)
+
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+    # Ownership is decided by the orphan's current bytes, so the run must
+    # read it. Witness the tree first: the witness reads those bytes too.
+    orphan = root / "orphan.txt"
+    orphan.chmod(0o000)
+
+    def refuse(active: Database) -> str:
+        with pytest.raises(
+            ActionPathError, match="Cannot safely open regular file"
+        ) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    try:
+        refuse(db)
+        with pytest.raises(ActionPathError, match="Cannot safely open regular file"):
+            emit.plan(db, root=root)
+    finally:
+        orphan.chmod(0o644)
+
+    assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
+    result = emit.reconcile(db, root=root)
+    assert result.deleted == ("orphan.txt",)
+
+
+@pytest.mark.parametrize("code", FAULT_FAMILIES)
+def test_an_orphan_ownership_read_fault_refuses_with_nothing_mutated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    root = tmp_path / "root"
+    tool = f"fault-orphan-read-{code}"
+    emit, source = input_driven_action(tool)
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
+    db.set(source, desired_spec({"orphan.txt": "recorded", "keep.txt": "kept"}))
+    emit.reconcile(db, root=root)
+    spec = desired_spec({"keep.txt": "kept"})
+    db.set(source, spec)
+
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+    disarm = inject_fault(
+        monkeypatch, "read_regular_file", code, gate=named_gate("orphan.txt")
+    )
+
+    # Only an unsafe-path error is caught at the ownership read, so every
+    # injected family escapes raw today; the union survives a retyping.
+    def refuse(active: Database) -> str:
+        with pytest.raises(RAW_OR_TYPED) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    refuse(db)
+    with pytest.raises(RAW_OR_TYPED):
+        emit.plan(db, root=root)
+    disarm()
+    assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
+    result = emit.reconcile(db, root=root)
+    assert result.deleted == ("orphan.txt",)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+def test_an_unreadable_output_refuses_typed_during_preflight(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("EACCES does not bite as root")
+    root = tmp_path / "root"
+    tool = "fault-output-unreadable"
+    emit, source = input_driven_action(tool)
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
+    db.set(source, desired_spec({"out.txt": "old"}))
+    emit.reconcile(db, root=root)
+    spec = desired_spec({"out.txt": "new"})
+    db.set(source, spec)
+
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+    # Classifying the target needs its current bytes, so an unreadable
+    # output refuses before the replacement is written.
+    output = root / "out.txt"
+    output.chmod(0o000)
+
+    def refuse(active: Database) -> str:
+        with pytest.raises(
+            ActionPathError, match="Cannot safely open regular file"
+        ) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    try:
+        refuse(db)
+        with pytest.raises(ActionPathError, match="Cannot safely open regular file"):
+            emit.plan(db, root=root)
+    finally:
+        output.chmod(0o644)
+
+    assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
+    result = emit.reconcile(db, root=root)
+    assert result.updated == ("out.txt",)
+    assert output.read_bytes() == b"new"
+
+
+@pytest.mark.parametrize("code", FAULT_FAMILIES)
+def test_a_desired_state_read_fault_refuses_with_nothing_mutated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    root = tmp_path / "root"
+    tool = f"fault-output-read-{code}"
+    emit, source = input_driven_action(tool)
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
+    db.set(source, desired_spec({"out.txt": "old"}))
+    emit.reconcile(db, root=root)
+    spec = desired_spec({"out.txt": "new"})
+    db.set(source, spec)
+
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+    disarm = inject_fault(
+        monkeypatch, "read_regular_file", code, gate=named_gate("out.txt")
+    )
+
+    # The desired-state read catches only an unsafe-path error, so every
+    # injected family escapes raw today; the union survives a retyping.
+    def refuse(active: Database) -> str:
+        with pytest.raises(RAW_OR_TYPED) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    refuse(db)
+    with pytest.raises(RAW_OR_TYPED):
+        emit.plan(db, root=root)
+    disarm()
+    assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
+    result = emit.reconcile(db, root=root)
+    assert result.updated == ("out.txt",)
