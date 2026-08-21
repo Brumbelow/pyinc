@@ -1134,7 +1134,7 @@ def test_a_window_replacement_inside_a_pruned_directory_aborts_then_refuses_pref
     assert manifest_bytes(root, tool) == ledger_stage2
 
 
-def test_a_byte_identical_window_replacement_aborts_then_the_next_run_deletes_it(
+def test_a_byte_identical_window_survivor_inside_a_pruned_directory_is_deleted_next_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tool = "prune-window-identical"
@@ -1144,8 +1144,9 @@ def test_a_byte_identical_window_replacement_aborts_then_the_next_run_deletes_it
     ledger_before = manifest_bytes(root, tool)
     before = tree_witness(root)
 
-    # The abort is the drifted replacement's abort: the unlink declines the
-    # replaced entry and the directory is not empty at the prune.
+    # The abort is the same as the drifted replacement's: the unlink
+    # declines the replaced entry and the directory is not empty at the
+    # prune.
     with pytest.raises(
         ActionPathError,
         match="Cannot prune directory 'pkg' left by the previous layout: \\[Errno",
