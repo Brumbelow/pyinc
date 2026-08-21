@@ -24,6 +24,7 @@ from _action_fault_injection import (
     inject_lock_acquire_fault,
     inject_path_method_fault,
     input_driven_action,
+    make_nonregular_node,
     manifest_gate,
     named_gate,
 )
@@ -1219,3 +1220,62 @@ def test_a_byte_identical_window_survivor_in_a_plain_deletion_is_durably_safe(
     assert target.read_bytes() == b"generated"
     final = target.stat()
     assert (final.st_dev, final.st_ino) == (survivor.st_dev, survivor.st_ino)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX node types")
+@pytest.mark.parametrize("kind", ("fifo", "socket", "char-device", "block-device"))
+def test_a_non_regular_node_at_an_orphan_path_refuses_and_survives(
+    tmp_path: Path, kind: str
+) -> None:
+    root = tmp_path / "root"
+    tool = f"fault-node-orphan-{kind}"
+    emit, source = input_driven_action(tool)
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
+    db.set(source, desired_spec({"sub/gone.txt": "recorded", "keep.txt": "kept"}))
+    emit.reconcile(db, root=root)
+    target = root / "sub" / "gone.txt"
+    target.unlink()
+    make_nonregular_node(target, kind)  # may skip: capability-gated
+    spec = desired_spec({"keep.txt": "kept"})
+    db.set(source, spec)
+
+    ledger_before = manifest_bytes(root, tool)
+    before = tree_witness(root)
+
+    def refuse(active: Database) -> str:
+        with pytest.raises(
+            ActionPathError, match="Owned output target is not a regular file"
+        ) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
+    refuse(db)
+    with pytest.raises(
+        ActionPathError, match="Owned output target is not a regular file"
+    ):
+        emit.plan(db, root=root)
+    # The node survives, whatever it is, and nothing else moved.
+    assert not stat.S_ISREG(target.lstat().st_mode)
+    assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX node types")
+@pytest.mark.parametrize("kind", ("fifo", "socket", "char-device", "block-device"))
+def test_a_non_regular_lock_path_refuses_with_a_typed_error(
+    tmp_path: Path, kind: str
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    tool = f"fault-node-lock-{kind}"
+    emit, source = input_driven_action(tool)
+    db = Database("strict", store=InMemoryArtifactStore())
+    db.set(source, desired_spec({"out.txt": "fresh"}))
+    lock_path = action_module._lock_path(root.resolve(), tool)
+    make_nonregular_node(lock_path, kind)  # may skip: capability-gated
+    try:
+        with pytest.raises(ActionPathError, match="reconciliation lock"):
+            emit.reconcile(db, root=root)
+        assert list(root.iterdir()) == []
+    finally:
+        lock_path.unlink()  # the lock directory is shared; leave it clean
