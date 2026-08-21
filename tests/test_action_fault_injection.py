@@ -736,22 +736,29 @@ def test_an_undeletable_orphan_stops_the_run_and_the_next_run_deletes_it(
     root = tmp_path / "root"
     tool = "fault-unlink-parent"
     emit, source = input_driven_action(tool)
-    db = Database("strict", store=InMemoryArtifactStore())
+    store = InMemoryArtifactStore()
+    db = Database("strict", store=store)
     db.set(source, desired_spec({"sub/orphan.txt": "recorded", "keep.txt": "kept"}))
     emit.reconcile(db, root=root)
-    db.set(source, desired_spec({"keep.txt": "kept"}))
+    spec = desired_spec({"keep.txt": "kept"})
+    db.set(source, spec)
 
     ledger_before = manifest_bytes(root, tool)
     before = tree_witness(root)
     # Removing an entry needs write permission on its parent directory,
     # while the last-moment verification read above it still succeeds.
     (root / "sub").chmod(0o555)
+
+    # The unlink sits outside the typed wrap, so this escapes raw today
+    # carrying the parent-relative name; the union survives a future
+    # retyping and no message is pinned here.
+    def refuse(active: Database) -> str:
+        with pytest.raises(RAW_OR_TYPED) as caught:
+            emit.reconcile(active, root=root)
+        return str(caught.value)
+
     try:
-        # The unlink sits outside the typed wrap, so this escapes raw today
-        # carrying the parent-relative name; the union survives a future
-        # retyping and no message is pinned here.
-        with pytest.raises(RAW_OR_TYPED):
-            emit.reconcile(db, root=root)
+        assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     finally:
         (root / "sub").chmod(0o755)
 
