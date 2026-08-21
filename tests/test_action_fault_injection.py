@@ -21,6 +21,7 @@ from _action_fault_injection import (
     assert_refusal_replays_after_checkpoint,
     assert_tree_and_ledger_unchanged,
     desired_spec,
+    fault,
     inject_fault,
     inject_lock_acquire_fault,
     inject_path_method_fault,
@@ -323,6 +324,52 @@ def test_a_ledger_read_fault_refuses_typed_with_the_tree_and_ledger_intact(
     assert result.unchanged == ("out.txt",)
 
 
+def inject_root_incarnation_stat_fault(
+    monkeypatch: pytest.MonkeyPatch,
+    code: int,
+    *,
+    gate: Callable[[Path], bool],
+) -> Callable[[], None]:
+    """Arm a ``Path.stat`` fault confined to the ``_root_incarnation`` probe.
+
+    ``Path.lstat`` delegates to ``Path.stat`` through CPython 3.13, and
+    ``Path.resolve`` ends in a ``stat`` on older ones, so a class-wide
+    ``stat`` patch would also fault the reconcile entry's inspection of the
+    root -- a different seam, with a typed refusal of its own. Swapping
+    ``Path.stat`` in only for the dynamic extent of ``_root_incarnation``
+    keeps the fault at the identity probe and leaves every other seam
+    reading real pathlib. The module attribute is the seam ``_read_manifest``
+    and ``_write_manifest`` both call the probe through; the original
+    function runs underneath, so its own tolerating arm is what answers.
+    """
+    original_incarnation: Callable[[Path], list[int] | None] = (
+        action_module._root_incarnation
+    )
+    original_stat: Callable[..., object] = Path.stat
+    armed = [True]
+
+    def hook(self: Path, *args: object, **kwargs: object) -> object:
+        if gate(self):
+            raise fault(code, self)
+        return original_stat(self, *args, **kwargs)
+
+    def scoped(root: Path) -> list[int] | None:
+        if not armed[0] or not gate(root):
+            return original_incarnation(root)
+        Path.stat = hook  # type: ignore[method-assign, assignment]
+        try:
+            return original_incarnation(root)
+        finally:
+            Path.stat = original_stat  # type: ignore[method-assign, assignment]
+
+    monkeypatch.setattr(action_module, "_root_incarnation", scoped)
+
+    def disarm() -> None:
+        armed[0] = False
+
+    return disarm
+
+
 @pytest.mark.parametrize("code", FAULT_FAMILIES)
 def test_a_root_identity_fault_is_tolerated_and_the_run_converges(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
@@ -335,8 +382,11 @@ def test_a_root_identity_fault_is_tolerated_and_the_run_converges(
     emit.reconcile(db, root=root)
     ledger_before = manifest_bytes(root, tool)
     before = tree_witness(root)
-    disarm = inject_path_method_fault(
-        monkeypatch, "stat", code, gate=named_gate("fault-root")
+    # Scoped to the incarnation probe rather than armed class-wide: the
+    # helper's docstring records why the root's stat is the only one that
+    # may fault here.
+    disarm = inject_root_incarnation_stat_fault(
+        monkeypatch, code, gate=named_gate("fault-root")
     )
 
     # An unanswerable root identity is tolerated by design: the recorded
