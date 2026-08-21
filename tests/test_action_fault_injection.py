@@ -1026,7 +1026,7 @@ def test_a_ledger_write_fault_during_a_voiding_run_leaves_the_void_unpersisted(
 
     disarm()
     # The next run voids again -- and this time persists: fresh adoption,
-    # live incarnation, no claims, and the renamed-back bytes stay safe.
+    # live incarnation, no claims, and the renamed-aside bytes stay safe.
     emit.reconcile(db, root=root, state_dir=state)
     persisted = json.loads(manifest_bytes(state, tool) or b"{}")
     assert persisted["outputs"] == {}
