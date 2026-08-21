@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import errno
 import importlib
 import json
@@ -1279,3 +1280,348 @@ def test_a_non_regular_lock_path_refuses_with_a_typed_error(
         assert list(root.iterdir()) == []
     finally:
         lock_path.unlink()  # the lock directory is shared; leave it clean
+
+
+_FS_CALLEES = frozenset({
+    "read_regular_file", "read_regular_file_with_identity",
+    "unlink_regular_file", "remove_empty_directory", "atomic_write",
+    "_atomic_write", "_write_manifest", "_read_manifest", "_safe_target",
+    "_orphan_cannot_exist", "_holds_only_desired_outputs",
+    "_unprunable_entry", "_root_incarnation", "_action_lock_directory",
+    "_lock_path", "FileLock", "acquire",
+    "lstat", "stat", "resolve", "mkdir", "chmod", "scandir",
+})
+
+#: Non-filesystem os/os.path calls the action module is allowed to make.
+#: os.scandir is the only filesystem toucher and is covered by the pairs.
+OS_CALLS = frozenset({
+    "os.fsencode", "os.fspath", "os.path.commonpath",
+    "os.path.normcase", "os.scandir",
+})
+
+#: Every attribute-call name in the module, frozen. A new method call of
+#: ANY name fails here first: if it touches the filesystem, register a
+#: fault cell and add the callee to _FS_CALLEES; either way, extend this
+#: inventory deliberately.
+METHOD_CALL_NAMES = frozenset({
+    "S_IMODE", "S_ISDIR", "S_ISLNK", "S_ISREG", "_desired_map",
+    "_reconcile_locked", "acquire", "append", "as_posix", "casefold",
+    "chmod", "commonpath", "count", "dumps", "encode", "fn", "fsencode",
+    "fspath", "get", "gettempdir", "hexdigest", "home", "is_absolute",
+    "is_dir", "is_file", "items", "join", "joinpath", "loads", "lstat",
+    "mkdir", "monotonic", "normalize", "normcase", "outputs", "pop",
+    "reconcile", "relative_to", "release", "resolve", "scandir",
+    "setdefault", "sha256", "split", "startswith", "stat", "suppress",
+    "values",
+})
+
+
+def _action_ast() -> ast.Module:
+    # Fetching the module by path types it as a plain module object, whose
+    # ``__file__`` is optional; the action layer is always file-backed.
+    source = action_module.__file__
+    assert source is not None
+    return ast.parse(Path(source).read_text(encoding="utf-8"))
+
+
+def _callee_name(node: ast.Call) -> str | None:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _pair_counts() -> dict[tuple[str, str], int]:
+    counts: dict[tuple[str, str], int] = {}
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.scope = ["<module>"]
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            name = _callee_name(node)
+            if name in _FS_CALLEES:
+                pair = (self.scope[-1], name)
+                counts[pair] = counts.get(pair, 0) + 1
+            self.generic_visit(node)
+
+    Visitor().visit(_action_ast())
+    return counts
+
+
+def _os_calls() -> frozenset[str]:
+    found: set[str] = set()
+    for node in ast.walk(_action_ast()):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            value = node.func.value
+            if isinstance(value, ast.Name) and value.id == "os":
+                found.add(f"os.{node.func.attr}")
+            elif (
+                isinstance(value, ast.Attribute)
+                and value.attr == "path"
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "os"
+            ):
+                found.add(f"os.path.{node.func.attr}")
+    return frozenset(found)
+
+
+def _method_call_names() -> frozenset[str]:
+    return frozenset(
+        node.func.attr
+        for node in ast.walk(_action_ast())
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    )
+
+
+def _safe_fs_imports() -> frozenset[str]:
+    names: set[str] = set()
+    for node in ast.walk(_action_ast()):
+        if isinstance(node, ast.ImportFrom) and node.module == "_safe_fs":
+            names.update(alias.name for alias in node.names)
+    return frozenset(names) - {"UnsafeFilesystemPathError"}
+
+
+def _resolve_cell(reference: str) -> object:
+    module_name, separator, test_name = reference.partition("::")
+    if not separator:
+        return globals()[reference]
+    module = importlib.import_module(module_name.removesuffix(".py"))
+    return getattr(module, test_name)
+
+
+#: Every filesystem call site in pyinc.action, keyed
+#: (enclosing function, callee) -> (call count, fault cells).
+#: Cells named bare live in this module; "file.py::name" cells live in the
+#: named suite. A new fs call site -- a new pair OR a changed count --
+#: fails the inventory test until a cell is registered here.
+FAULT_REGISTRY: dict[tuple[str, str], tuple[int, tuple[str, ...]]] = {
+    ("reconcile", "resolve"): (2, (
+        "test_a_root_resolution_fault_is_typed_and_touches_nothing",
+        "test_action.py::test_action_wraps_invalid_root_paths_as_typed_errors",
+    )),
+    ("reconcile", "lstat"): (1, (
+        "test_a_root_inspection_fault_is_typed_and_touches_nothing",
+        "test_action.py::test_action_wraps_non_directory_root_as_typed_path_error",
+        "test_action.py::test_action_wraps_root_inspection_failure_as_typed_path_error",
+    )),
+    ("reconcile", "_lock_path"): (2, (
+        "test_an_unwritable_lock_directory_base_fails_before_any_root_work",
+        "test_a_lock_directory_creation_fault_fails_before_any_root_work",
+    )),
+    ("reconcile", "FileLock"): (1, (
+        "test_a_lock_acquisition_fault_is_typed_and_touches_nothing",
+        "test_action.py::test_action_lock_timeout_is_typed",
+    )),
+    ("reconcile", "acquire"): (1, (
+        "test_a_lock_acquisition_fault_is_typed_and_touches_nothing",
+        "test_a_non_regular_lock_path_refuses_with_a_typed_error",
+        "test_action.py::test_action_rejects_nonregular_lock_path_with_typed_error",
+    )),
+    ("_lock_path", "_action_lock_directory"): (1, (
+        "test_an_unwritable_lock_directory_base_fails_before_any_root_work",
+        "test_a_lock_directory_creation_fault_fails_before_any_root_work",
+        "test_a_lock_directory_mode_repair_fault_fails_before_any_root_work",
+    )),
+    ("_action_lock_directory", "resolve"): (1, (
+        "test_an_unwritable_lock_directory_base_fails_before_any_root_work",
+        "test_action_store_branches.py::test_action_lock_directory_resolves_a_symlinked_temporary_base",
+    )),
+    ("_action_lock_directory", "mkdir"): (1, (
+        "test_an_unwritable_lock_directory_base_fails_before_any_root_work",
+        "test_a_lock_directory_creation_fault_fails_before_any_root_work",
+    )),
+    ("_action_lock_directory", "lstat"): (1, (
+        "test_action_store_branches.py::test_action_lock_directory_rejects_a_non_directory",
+        "test_action_store_branches.py::test_action_lock_directory_rejects_a_symlinked_private_directory",
+        "test_action_store_branches.py::test_action_lock_directory_rejects_foreign_owner",
+    )),
+    ("_action_lock_directory", "chmod"): (1, (
+        "test_a_lock_directory_mode_repair_fault_fails_before_any_root_work",
+        "test_action_store_branches.py::test_action_lock_directory_repairs_permissive_mode",
+    )),
+    ("_read_manifest", "read_regular_file"): (1, (
+        "test_an_unreadable_ledger_refuses_before_mutation_warm_and_reloaded",
+        "test_a_ledger_read_fault_refuses_typed_with_the_tree_and_ledger_intact",
+        "test_action.py::test_manifest_schema_is_strict_and_failure_is_premutation",
+    )),
+    ("_read_manifest", "_root_incarnation"): (1, (
+        "test_a_root_identity_fault_is_tolerated_and_the_run_converges",
+        "test_action.py::test_a_voiding_reconcile_persists_the_adoption",
+    )),
+    ("_root_incarnation", "stat"): (1, (
+        "test_a_root_identity_fault_is_tolerated_and_the_run_converges",
+    )),
+    ("_write_manifest", "_root_incarnation"): (1, (
+        "test_a_ledger_write_fault_during_a_voiding_run_leaves_the_void_unpersisted",
+        "test_action.py::test_a_voiding_reconcile_persists_the_adoption",
+    )),
+    ("_write_manifest", "_atomic_write"): (1, (
+        "test_a_ledger_write_fault_leaves_outputs_published_and_the_next_run_converges",
+        "test_a_read_only_state_directory_leaves_outputs_published_and_the_ledger_old",
+        "test_a_ledger_write_fault_during_a_voiding_run_leaves_the_void_unpersisted",
+    )),
+    ("_reconcile_locked", "_read_manifest"): (1, (
+        "test_an_unreadable_ledger_refuses_before_mutation_warm_and_reloaded",
+        "test_a_ledger_read_fault_refuses_typed_with_the_tree_and_ledger_intact",
+    )),
+    ("_reconcile_locked", "_orphan_cannot_exist"): (1, (
+        "test_an_unsearchable_orphan_parent_refuses_during_preflight",
+        "test_action_store_branches.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
+    )),
+    ("_orphan_cannot_exist", "lstat"): (1, (
+        "test_an_unsearchable_orphan_parent_refuses_during_preflight",
+        "test_action_store_branches.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
+    )),
+    ("_reconcile_locked", "_holds_only_desired_outputs"): (1, (
+        "test_an_unlistable_released_directory_refuses_during_preflight",
+        "test_action_store_branches.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
+    )),
+    ("_holds_only_desired_outputs", "scandir"): (1, (
+        "test_an_unlistable_released_directory_refuses_during_preflight",
+        "test_action_store_branches.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
+    )),
+    ("_reconcile_locked", "_safe_target"): (6, (
+        "test_a_target_inspection_fault_refuses_typed_before_any_write",
+        "test_a_non_regular_node_at_an_orphan_path_refuses_and_survives",
+        "test_action_store_branches.py::test_action_rechecks_target_type_before_writing",
+    )),
+    ("_safe_target", "lstat"): (1, (
+        "test_a_target_inspection_fault_refuses_typed_before_any_write",
+    )),
+    ("_safe_target", "resolve"): (1, (
+        "test_action_store_branches.py::test_safe_target_rejects_resolved_parent_escape",
+    )),
+    ("_reconcile_locked", "read_regular_file"): (2, (
+        # Two sites share this pair: the orphan-ownership read and the
+        # desired-state read.
+        "test_an_unreadable_orphan_refuses_typed_during_preflight",
+        "test_an_orphan_ownership_read_fault_refuses_with_nothing_mutated",
+        "test_an_unreadable_output_refuses_typed_during_preflight",
+        "test_a_desired_state_read_fault_refuses_with_nothing_mutated",
+    )),
+    ("_reconcile_locked", "_unprunable_entry"): (1, (
+        "test_a_window_replacement_inside_a_pruned_directory_aborts_then_refuses_preflight",
+        "test_action.py::test_reconcile_refuses_an_unlistable_migration_directory_before_deleting",
+        "test_action.py::test_plan_refuses_an_unlistable_migration_directory",
+    )),
+    ("_unprunable_entry", "scandir"): (1, (
+        "test_action.py::test_reconcile_refuses_an_unlistable_migration_directory_before_deleting",
+        "test_action_store_branches.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
+    )),
+    ("_reconcile_locked", "read_regular_file_with_identity"): (1, (
+        "test_an_orphan_that_vanishes_in_the_deletion_window_is_not_reported_deleted",
+        "test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touched",
+        "test_action.py::test_a_replacement_landing_in_the_deletion_window_survives",
+    )),
+    ("_reconcile_locked", "unlink_regular_file"): (1, (
+        "test_an_undeletable_orphan_stops_the_run_and_the_next_run_deletes_it",
+        "test_an_unlink_fault_stops_the_run_with_the_orphan_and_ledger_intact",
+        "test_a_mid_set_deletion_fault_preserves_the_performed_order_across_runs",
+        "test_a_byte_identical_window_survivor_inside_a_pruned_directory_is_deleted_next_run",
+        "test_a_byte_identical_window_survivor_in_a_plain_deletion_is_durably_safe",
+        "test_action.py::test_a_byte_identical_replacement_in_the_deletion_window_survives",
+    )),
+    ("_reconcile_locked", "remove_empty_directory"): (1, (
+        "test_a_prune_fault_after_deletions_is_typed_and_the_next_run_converges",
+        "test_a_window_replacement_inside_a_pruned_directory_aborts_then_refuses_preflight",
+        "test_a_byte_identical_window_survivor_inside_a_pruned_directory_is_deleted_next_run",
+    )),
+    ("_reconcile_locked", "_atomic_write"): (1, (
+        "test_an_unwritable_root_stops_publication_with_the_stale_bytes_intact",
+        "test_an_unwritable_root_stops_parent_creation_with_nothing_created",
+        "test_a_publication_fault_leaves_no_temporary_and_the_next_run_converges",
+    )),
+    ("_atomic_write", "atomic_write"): (1, (
+        "test_a_publication_fault_leaves_no_temporary_and_the_next_run_converges",
+        "test_a_ledger_write_fault_leaves_outputs_published_and_the_next_run_converges",
+    )),
+    ("_reconcile_locked", "_write_manifest"): (1, (
+        "test_a_ledger_write_fault_leaves_outputs_published_and_the_next_run_converges",
+        "test_a_read_only_state_directory_leaves_outputs_published_and_the_ledger_old",
+        "test_a_ledger_write_fault_during_a_voiding_run_leaves_the_void_unpersisted",
+    )),
+}
+
+#: The public _safe_fs seams the action layer reaches: the five
+#: functions action.py imports plus open_lock_file, which it reaches
+#: through the lock machinery. ensure_directory is store-only and stays
+#: with the store suite. _safe_fs INTERNAL windows stay with the existing
+#: unit suite.
+SAFE_FS_SEAMS: dict[str, tuple[str, ...]] = {
+    "read_regular_file": (
+        "test_a_ledger_read_fault_refuses_typed_with_the_tree_and_ledger_intact",
+        "test_an_orphan_ownership_read_fault_refuses_with_nothing_mutated",
+        "test_a_desired_state_read_fault_refuses_with_nothing_mutated",
+        "test_safe_fs_locking_branches.py::test_posix_safe_fs_handles_missing_and_nonregular_targets",
+    ),
+    "read_regular_file_with_identity": (
+        "test_an_orphan_that_vanishes_in_the_deletion_window_is_not_reported_deleted",
+        "test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touched",
+        "test_safe_fs_locking_branches.py::test_identity_read_and_identity_checked_unlink",
+    ),
+    "unlink_regular_file": (
+        "test_an_undeletable_orphan_stops_the_run_and_the_next_run_deletes_it",
+        "test_an_unlink_fault_stops_the_run_with_the_orphan_and_ledger_intact",
+        "test_a_byte_identical_window_survivor_in_a_plain_deletion_is_durably_safe",
+        "test_safe_fs_locking_branches.py::test_identity_read_and_identity_checked_unlink",
+    ),
+    "remove_empty_directory": (
+        "test_a_prune_fault_after_deletions_is_typed_and_the_next_run_converges",
+        "test_safe_fs_locking_branches.py::test_remove_empty_directory_branches_on_missing_nondirectory_and_populated",
+    ),
+    "atomic_write": (
+        "test_a_publication_fault_leaves_no_temporary_and_the_next_run_converges",
+        "test_a_ledger_write_fault_leaves_outputs_published_and_the_next_run_converges",
+        "test_safe_fs_locking_branches.py::test_posix_atomic_write_reports_exhausted_temporary_names",
+    ),
+    "open_lock_file": (
+        "test_a_lock_acquisition_fault_is_typed_and_touches_nothing",
+        "test_a_non_regular_lock_path_refuses_with_a_typed_error",
+        "test_action.py::test_action_rejects_nonregular_lock_path_with_typed_error",
+    ),
+}
+
+
+def test_every_filesystem_call_site_in_the_action_layer_is_registered() -> None:
+    counted = _pair_counts()
+    registered = {pair: count for pair, (count, _cells) in FAULT_REGISTRY.items()}
+    assert counted == registered, (
+        "the action layer's filesystem call sites changed; register a fault "
+        f"cell for the difference: {set(counted.items()) ^ set(registered.items())}"
+    )
+
+
+def test_no_unlisted_os_call_enters_the_action_layer() -> None:
+    assert _os_calls() == OS_CALLS
+
+
+def test_no_unlisted_method_call_enters_the_action_layer() -> None:
+    assert _method_call_names() == METHOD_CALL_NAMES
+
+
+def test_every_public_safe_fs_seam_reached_by_actions_is_registered() -> None:
+    # open_lock_file is reached through the lock machinery rather than an
+    # action.py import; a new _safe_fs import lands here first.
+    assert set(SAFE_FS_SEAMS) == _safe_fs_imports() | {"open_lock_file"}
+
+
+def test_every_registered_fault_cell_exists() -> None:
+    for _count, cells in FAULT_REGISTRY.values():
+        for reference in cells:
+            assert callable(_resolve_cell(reference)), reference
+    for seam_cells in SAFE_FS_SEAMS.values():
+        for reference in seam_cells:
+            assert callable(_resolve_cell(reference)), reference
+
+
+def test_every_registered_site_has_at_least_one_fault_cell() -> None:
+    assert all(cells for _count, cells in FAULT_REGISTRY.values())
+    assert all(SAFE_FS_SEAMS.values())
