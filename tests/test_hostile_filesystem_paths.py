@@ -429,8 +429,8 @@ def test_a_pipe_that_becomes_a_regular_file_is_re_read(tmp_path: Path) -> None:
 #: not an inconsistency: an unresolvable path is already a member of that
 #: probe's value domain, so a looping path is something it answers rather than
 #: refuses. The one shape it does not yet answer -- a path string holding a NUL,
-#: which still leaves it as the error the platform raised -- is closed where its
-#: own pin lives, beside the other resolved-path cells rather than here.
+#: which still leaves it as the error the platform raised -- belongs beside the
+#: other resolved-path cells rather than here.
 _REFUSING_PROBE_NAMES: tuple[str, ...] = ("file", "binary-file", "stat", "directory")
 
 #: The two shapes every one of those probes must refuse.
@@ -491,11 +491,12 @@ def _expected_refusal(probe_name: str, shape: str) -> str:
     """The words the refusal composes, which are always this library's own.
 
     A file read refuses a path holding a NUL inside the read primitive it
-    calls, so that refusal reaches a caller in the primitive's sentence; the
-    three metadata seams compose theirs for themselves. Neither phrase belongs
-    to the platform on purpose: what a symlink loop and a NUL path draw out of
-    the operating system is spelled differently by interpreter version and by
-    platform, so no cell here pins one.
+    calls, so that one refusal reaches a caller in the primitive's sentence;
+    every other cell here meets a sentence the file, listing or stat seam
+    composed for itself. Neither phrase belongs to the platform on purpose:
+    what a symlink loop and a NUL path draw out of the operating system is
+    spelled differently by interpreter version and by platform, so no cell
+    here pins one.
     """
 
     if shape == "embedded-null" and probe_name in {"file", "binary-file"}:
