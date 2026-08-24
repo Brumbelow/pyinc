@@ -1066,6 +1066,33 @@ def test_windows_read_regular_file_transfers_or_closes_handle(
     assert failed_api.closed == [55]
 
 
+def test_an_embedded_null_is_refused_on_the_following_read_windows_path(
+    tmp_path: Path,
+) -> None:
+    # This arm asks the path its kind before reading it, and the standard
+    # library refuses an embedded null identically on either platform, so the
+    # refusal built on top of it is exercised wherever this suite runs.
+    with pytest.raises(safe_fs.UnsafeFilesystemPathError, match="Cannot safely open regular file"):
+        safe_fs._read_regular_file_following_links_windows(Path(nul_path(tmp_path)))
+
+
+def test_an_embedded_null_is_refused_on_the_identity_read_windows_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The path reaches the platform call as a string with the null still in
+    # it, and the conversion refuses it there. Standing in for that refusal
+    # pins the typed answer without a runner of that platform.
+    context = _DirectoryContext()
+    _install_directory_context(monkeypatch, context)
+    api = _ReadWindowsApi(ValueError("embedded null character"))
+    monkeypatch.setattr(safe_fs, "_windows_api", lambda: api)
+
+    with pytest.raises(safe_fs.UnsafeFilesystemPathError, match="Cannot safely open regular file"):
+        safe_fs._read_regular_file_with_identity_windows(Path(nul_path(tmp_path)))
+    assert context.close_calls == 1
+    assert api.closed == []
+
+
 class _AtomicWindowsApi:
     def __init__(self) -> None:
         self.collisions = 0
