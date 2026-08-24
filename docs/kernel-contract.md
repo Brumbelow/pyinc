@@ -282,8 +282,10 @@ Two boundaries apply:
 
 - **The probe must be total.** This rests on `probe()` modelling failure instead
   of raising — `FileResource.probe` returns `("missing",)` for an absent file. A
-  resource whose `probe` *also* raises is outside the contract, and what the
-  kernel does then depends on what it already knows about that node.
+  path that names a pipe, a socket or a device answers the way an absent path
+  does, so a read of one is bounded in time and gives the same answer warm and
+  fresh. A resource whose `probe` *also* raises is outside the contract, and
+  what the kernel does then depends on what it already knows about that node.
 
   - **No record yet:** the read is the node's first, nothing is recorded, the
     exception propagates unchanged, and a query that catches it is cached as if

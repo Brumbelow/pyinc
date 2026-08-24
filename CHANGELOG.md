@@ -243,6 +243,17 @@ decided at release time.
   deletion the last-moment re-checks had skipped — a drifted orphan could be
   reported deleted while sitting on disk. A dry run still reports the
   prediction; that is what `plan()` means.
+- A tracked file read of a path that names a pipe, a socket or a device now
+  answers the way it answers an absent path, instead of waiting for bytes that
+  never arrive. Every file-reading entry point is bounded: the file and binary
+  file resources, their probes and atomic probe-and-loads, and the integration
+  file reads behind them. A pipe with no writer, or a device whose read never
+  ends, previously held the database's own lock for as long as it blocked, so a
+  single such path handed to one query stalled every thread using that database.
+  The answer is now identical warm and fresh, so a run that meets one of these
+  paths stays reproducible. Sources reached through symbolic links keep reading
+  exactly as before — one link or several — and a permission denial on an
+  ordinary file still propagates rather than being reported as absent.
 
 ### Added
 

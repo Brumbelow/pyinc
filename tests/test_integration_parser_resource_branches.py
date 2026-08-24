@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import json
 import os
+from collections.abc import Callable
 from datetime import date, datetime, time
 from pathlib import Path
 from types import SimpleNamespace
@@ -559,6 +560,24 @@ def _denied(self: Path, *args: Any, **kwargs: Any) -> Any:
     raise PermissionError(13, "Permission denied", str(self))
 
 
+def _denying_open(*targets: str) -> Callable[..., int]:
+    """Refuse to open exactly ``targets``, the way an ACL denial does.
+
+    A tracked read opens a descriptor and asks it what kind of thing it got, so
+    a denial has to arrive at the open to be the denial the read meets. Every
+    other path opens normally, including the ones pytest itself needs.
+    """
+
+    real_open = os.open
+
+    def opener(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if str(path) in targets:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    return opener
+
+
 def test_shared_file_helpers_read_a_denied_directory_as_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -574,6 +593,7 @@ def test_shared_file_helpers_read_a_denied_directory_as_missing(
 
     monkeypatch.setattr(Path, "read_bytes", _denied)
     monkeypatch.setattr(Path, "read_text", _denied)
+    monkeypatch.setattr(os, "open", _denying_open(str(directory), str(regular)))
 
     assert resources.file_bytes(str(directory)) is None
     assert resources.file_probe(str(directory)) == ("missing",)
@@ -634,6 +654,7 @@ def test_shipped_file_resources_read_a_denied_directory_as_missing(
     db = Database()
     monkeypatch.setattr(Path, "read_bytes", _denied)
     monkeypatch.setattr(Path, "read_text", _denied)
+    monkeypatch.setattr(os, "open", _denying_open(str(directory), str(regular)))
 
     assert resource.probe(str(directory)) == ("missing",)
     assert resource.probe_and_load(db, str(directory))[0] == ("missing",)

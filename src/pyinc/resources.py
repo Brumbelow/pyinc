@@ -7,6 +7,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from ._safe_fs import _read_error_means_missing, read_regular_file_following_links
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -22,10 +24,13 @@ ProbeT = TypeVar("ProbeT")
 # The ways a path stops naming the thing a file or listing resource reads. A
 # probe has to be total -- it answers for every key it is handed -- and none of
 # these is a transient failure a later read could survive: the path is absent,
-# it is a directory, or something in its parent chain is a file. They answer the
-# way an absent path does. Every other OSError is a genuine failure and keeps
+# it is a directory, something in its parent chain is a file, or it names a
+# pipe, a socket or a device rather than a file at all. They answer the way an
+# absent path does. Every other OSError is a genuine failure and keeps
 # propagating, where the kernel's failure records handle it identically warm and
-# fresh.
+# fresh -- with one carve-out the last three kinds force: opening a bound socket
+# reports an errno CPython gives no subclass of its own, so the file read names
+# that errno explicitly instead of deciding by type alone.
 #
 # Which error carries which of those is the platform's business, and the two
 # disagree. POSIX raises IsADirectoryError for a directory opened as a file and
@@ -33,6 +38,10 @@ ProbeT = TypeVar("ProbeT")
 # PermissionError for the directory and FileNotFoundError for the path under a
 # file. So this tuple does not decide a permission denial on its own -- see
 # `_reads_as_missing`.
+#
+# The tuple itself is what the listing and stat probes match directly. A file
+# read has the wider question, because it can also be handed a kind no read of
+# it can ever answer, and asks `_reads_as_missing` instead.
 _MISSING_FILE_ERRORS = (FileNotFoundError, IsADirectoryError, NotADirectoryError)
 
 
@@ -45,14 +54,21 @@ def _reads_as_missing(path: str, exc: OSError) -> bool:
     keep propagating into a failure record. Only the kind of the path separates
     them, so that is what is asked.
 
+    A bound socket is the other answer a type cannot carry: opening one reports
+    an errno CPython gives no subclass, so it is named by errno beside the three
+    types. A pipe and a device raise nothing to classify: the read answers those
+    from the kind it observed rather than from a failure, so only a failed open
+    arrives here.
+
     The question races the read it is explaining. Either answer was true at some
     instant inside this call, and the probe the caller goes on to record
     observed one of them, so a race costs a re-read and never a wrong answer.
+
+    The classification lives beside the read that raises these, so the two
+    cannot drift apart.
     """
 
-    if isinstance(exc, _MISSING_FILE_ERRORS):
-        return True
-    return isinstance(exc, PermissionError) and os.path.isdir(path)
+    return _read_error_means_missing(path, exc)
 
 
 class Resource(Generic[KeyT, ValueT, ProbeT]):
@@ -317,8 +333,14 @@ class DirectoryResource(Resource[str | os.PathLike[str], tuple[str, ...], Direct
 
 
 def _read_file(path: str) -> bytes | None:
+    # A FIFO, a socket and a device file are paths a caller handed us that
+    # name no readable file: reading one either never returns or fails in a
+    # way re-reading cannot fix. They answer the way an absent path does --
+    # identically warm and fresh, and reproducible by a fresh run, which is
+    # what keeps the probe built on this total. A symlink is followed: a
+    # source file reached through one is an ordinary source file.
     try:
-        return Path(path).read_bytes()
+        return read_regular_file_following_links(Path(path))
     except OSError as exc:
         if _reads_as_missing(path, exc):
             return None

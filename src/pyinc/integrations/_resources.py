@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 from pyinc.resources import _read_file, _reads_as_missing
@@ -35,9 +36,19 @@ def file_text(path: str, encoding: str) -> str | None:
     """Read a text resource, reporting an unreadable kind as absent.
 
     Decoding is left to ``Path.read_text`` so a load keeps the newline handling
-    it has always had; ``file_read_snapshot`` decodes the bytes it hashed.
+    it has always had; ``file_read_snapshot`` decodes the bytes it hashed. The
+    two are not interchangeable -- a text read translates CRLF and a lone CR
+    into a newline where decoding the bytes keeps them -- so the kind check runs
+    as a separate read in front, on the same terms the byte read uses, and a
+    pipe, a socket or a device answers absent here too instead of never
+    returning. An ordinary file is therefore read twice, which is what keeping
+    the newline handling unchanged costs; the second read is skipped only when
+    the kind check found nothing readable and the path is no file either, since
+    a path that became one between the two reads has a text answer to give.
     """
 
+    if file_bytes(path) is None and not os.path.isfile(path):
+        return None
     try:
         return Path(path).read_text(encoding=encoding)
     except OSError as exc:

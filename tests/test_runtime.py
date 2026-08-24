@@ -1225,6 +1225,24 @@ def _denied(self: Path, *args: Any, **kwargs: Any) -> Any:
     raise PermissionError(13, "Permission denied", str(self))
 
 
+def _denying_open(*targets: str) -> Callable[..., int]:
+    """Refuse to open exactly ``targets``, the way an ACL denial does.
+
+    A tracked read opens a descriptor and asks it what kind of thing it got, so
+    a denial has to arrive at the open to be the denial the read meets. Every
+    other path opens normally, including the ones pytest itself needs.
+    """
+
+    real_open = os.open
+
+    def opener(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if str(path) in targets:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    return opener
+
+
 def test_file_resources_read_a_denied_directory_as_a_missing_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1245,6 +1263,7 @@ def test_file_resources_read_a_denied_directory_as_a_missing_file(
     db = Database()
     monkeypatch.setattr(Path, "read_bytes", _denied)
     monkeypatch.setattr(Path, "read_text", _denied)
+    monkeypatch.setattr(os, "open", _denying_open(str(directory), str(regular)))
 
     files = FileResource()
     binaries = BinaryFileResource()
