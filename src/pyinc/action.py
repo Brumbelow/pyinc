@@ -339,7 +339,12 @@ def _safe_target(root: Path, relative: str) -> tuple[Path, os.stat_result | None
         elif not stat.S_ISDIR(metadata.st_mode):
             raise ActionPathError(f"Owned output parent is not a directory: {relative!r}")
 
-    resolved_parent = target.parent.resolve(strict=False)
+    try:
+        resolved_parent = target.parent.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ActionPathError(
+            f"Cannot safely inspect owned output path {relative!r}: {error}"
+        ) from error
     try:
         resolved_common = os.path.commonpath((os.fspath(root), os.fspath(resolved_parent)))
     except ValueError as error:
@@ -457,7 +462,7 @@ class Action:
             state_path = (
                 Path(state_text).resolve(strict=False) if state_dir is not None else root_path
             )
-        except (OSError, TypeError, ValueError) as error:
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
             raise ActionPathError(f"Action root or state directory is invalid: {error}") from error
 
         for path, label in ((root_path, "owned output path"), (state_path, "action state path")):

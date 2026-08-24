@@ -109,7 +109,7 @@ class FileSystemArtifactStore:
             if "\0" in root_text:
                 raise ValueError("embedded null character in path")
             self._root = Path(root_text).resolve(strict=False)
-        except (OSError, TypeError, ValueError) as error:
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
             raise ArtifactStoreError(f"Artifact-store root path is invalid: {error}") from error
         self._objects = self._root / "objects"
         self._locks = self._root / "locks"

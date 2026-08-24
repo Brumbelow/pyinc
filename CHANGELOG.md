@@ -281,6 +281,18 @@ decided at release time.
   running the same interpreter; now they agree either way. Every other path
   canonicalizes exactly as before, including one whose parent directory cannot
   be searched.
+- An action root, an action state directory, an owned output's parent and an
+  artifact-store root whose resolution fails are now refused as typed path
+  errors rather than escaping as a bare `RuntimeError`. `Action.reconcile`,
+  `Action.plan` and `FileSystemArtifactStore(...)` each canonicalize the path
+  they are handed before doing anything with it, and a path that leads through
+  a symbolic link back to itself makes that step raise on the interpreters this
+  library still supports — so the caller received a failure from the standard
+  library naming its own internals instead of a refusal naming the path it
+  passed. The owned-output check now reports such a failure in the same words
+  it already uses when it cannot inspect a component of that path. Every
+  refusal keeps the original failure as its cause, and no path that resolved
+  before is treated differently.
 
 ### Added
 

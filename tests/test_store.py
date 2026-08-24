@@ -20,6 +20,7 @@ from pyinc import (
     FileSystemArtifactStore,
     InMemoryArtifactStore,
     Input,
+    PyIncError,
     deserialize_snapshot,
     freeze,
     query,
@@ -521,6 +522,34 @@ def test_filesystem_store_rejects_digest_string_subclasses(tmp_path: Path) -> No
 def test_filesystem_store_wraps_invalid_root_as_typed_error() -> None:
     with pytest.raises(ArtifactStoreError, match="root path is invalid"):
         FileSystemArtifactStore("bad\0root")
+
+
+def test_a_resolve_that_fails_still_produces_a_typed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Resolving a looping path raised on the interpreters this library still
+    # supports and stopped raising on the newer ones, so the handler is driven
+    # directly rather than through a shape only some interpreters produce.
+    # Patching resolve is class-wide, so every witness is taken before it is
+    # armed and the arming lasts exactly as long as the call under test.
+    root = tmp_path / "store"
+    before = sorted(entry.name for entry in tmp_path.iterdir())
+
+    def raising_resolve(self: Path, strict: bool = False) -> Path:
+        raise RuntimeError("Symlink loop from " + str(self))
+
+    monkeypatch.setattr(Path, "resolve", raising_resolve)
+    try:
+        with pytest.raises(
+            ArtifactStoreError, match="Artifact-store root path is invalid"
+        ) as caught:
+            FileSystemArtifactStore(root)
+    finally:
+        monkeypatch.undo()
+
+    assert isinstance(caught.value, PyIncError)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == before
 
 
 def test_windows_trusted_path_plan_uses_extended_component_prefixes() -> None:

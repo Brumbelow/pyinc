@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import queue
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from pyinc import (
     FileResource,
     InMemoryArtifactStore,
     Input,
+    PyIncError,
     query,
 )
 from pyinc import (
@@ -199,6 +201,94 @@ def test_action_wraps_invalid_root_paths_as_typed_errors(
     with pytest.raises(ActionPathError, match="root or state directory"):
         invalid_root_action.reconcile(Database(), root=root_path, state_dir=state_path)
     assert tuple(tmp_path.iterdir()) == ()
+
+
+#: The caller-facing shapes that resolve a root or a state directory before
+#: anything else happens.
+_RESOLVING_ENTRY_POINTS: tuple[tuple[str, Callable[[Any, Database, Path], object]], ...] = (
+    ("reconcile-root", lambda act, db, root: act.reconcile(db, root=root)),
+    ("plan-root", lambda act, db, root: act.plan(db, root=root)),
+    (
+        "reconcile-state-dir",
+        lambda act, db, root: act.reconcile(db, root=root, state_dir=root / "state"),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    [pytest.param(call, id=name) for name, call in _RESOLVING_ENTRY_POINTS],
+)
+def test_a_resolve_that_fails_still_produces_a_typed_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_point: Callable[[Any, Database, Path], object],
+) -> None:
+    # Resolving a looping path raised on the interpreters this library still
+    # supports and stopped raising on the newer ones, so the handler is driven
+    # directly rather than through a shape only some interpreters produce.
+    # Patching resolve is class-wide, so every witness is taken before it is
+    # armed and the arming lasts exactly as long as the call under test.
+    @action(tool="unresolvable-root")
+    def unresolvable_root_action(db: Database) -> list[Output]:
+        return [Output("result.txt", b"content")]
+
+    root = tmp_path / "root"
+    root.mkdir()
+    db = Database()
+    before = tree_witness(tmp_path)
+
+    def raising_resolve(self: Path, strict: bool = False) -> Path:
+        raise RuntimeError("Symlink loop from " + str(self))
+
+    monkeypatch.setattr(Path, "resolve", raising_resolve)
+    try:
+        with pytest.raises(
+            ActionPathError, match="Action root or state directory is invalid"
+        ) as caught:
+            entry_point(unresolvable_root_action, db, root)
+    finally:
+        monkeypatch.undo()
+
+    assert isinstance(caught.value, PyIncError)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert tree_witness(tmp_path) == before
+
+
+def test_a_resolve_that_fails_under_an_owned_output_path_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The owned-path check resolves an output's parent outside the reconcile
+    # head's handler, so the same failure has to be typed there too. Only that
+    # one parent is made unresolvable: the head resolves first, so a class-wide
+    # failure would refuse there and never reach this seam.
+    @action(tool="unresolvable-output-parent")
+    def unresolvable_parent_action(db: Database) -> list[Output]:
+        return [Output("nested/result.txt", b"content")]
+
+    root = tmp_path / "root"
+    root.mkdir()
+    db = Database()
+    before = tree_witness(tmp_path)
+    original_resolve = Path.resolve
+
+    def raising_resolve(self: Path, strict: bool = False) -> Path:
+        if self.name == "nested":
+            raise RuntimeError("Symlink loop from " + str(self))
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", raising_resolve)
+    try:
+        with pytest.raises(
+            ActionPathError, match="Cannot safely inspect owned output path"
+        ) as caught:
+            unresolvable_parent_action.reconcile(db, root=root)
+    finally:
+        monkeypatch.undo()
+
+    assert isinstance(caught.value, PyIncError)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert tree_witness(tmp_path) == before
 
 
 def test_action_rejects_surrogate_tool_identity_at_decoration() -> None:
