@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.resources import DirectoryResource
+from pyinc.errors import UnsupportedValueError
+from pyinc.resources import DirectoryResource, ResolvedPathResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
@@ -107,6 +108,7 @@ class _RequirementsFileResource:
 
 _FILES = _RequirementsFileResource()
 _DIRECTORIES = DirectoryResource()
+_RESOLVED_PATHS = ResolvedPathResource()
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +535,20 @@ def deep_requirements_analysis(db: Database, path: str | os.PathLike[str]) -> Re
     file in the chain, merges results.  Cycle detection via canonical path set.
     Constraint files (-c) are noted as file references but not followed.
     """
-    root = Path(os.fspath(path)).resolve()
+    # Every canonicalization below runs through the tracked path, so each one
+    # declares an edge: retargeting a link anywhere in the chain of files this
+    # walk reaches invalidates the analysis, which a bare `Path.resolve` could
+    # not report because it reaches the live filesystem untracked.
+    #
+    # The root is the one the caller named. A root that cannot be canonicalized
+    # names no file, and there is no analysis to answer with -- not even a
+    # containment root to judge references against -- so it is refused. A path
+    # the walk finds *inside* a file is content rather than a request, and is
+    # reported as a missing reference below, the way an absent one already is.
+    normalized_root = _RESOLVED_PATHS.read(db, os.fspath(path))
+    if normalized_root is None:
+        raise UnsupportedValueError(f"Path cannot be resolved: {os.fspath(path)}")
+    root = Path(normalized_root)
     project_root = root.parent
     all_requirements: dict[str, RequirementRef] = {}
     all_file_references: list[FileReference] = []
@@ -543,7 +558,15 @@ def deep_requirements_analysis(db: Database, path: str | os.PathLike[str]) -> Re
     active: set[str] = set()
 
     def _walk(file_path: Path) -> None:
-        canonical = str(file_path.resolve())
+        canonical = _RESOLVED_PATHS.read(db, os.fspath(file_path))
+        if canonical is None:
+            all_diagnostics.append(
+                (
+                    "missing-requirements-file",
+                    f"referenced requirements file is missing: {file_path}",
+                )
+            )
+            return
         if canonical in visited:
             return
         if canonical in active:
@@ -573,7 +596,16 @@ def deep_requirements_analysis(db: Database, path: str | os.PathLike[str]) -> Re
                 ref_path = Path(ref.path)
                 if not ref_path.is_absolute():
                     ref_path = file_path.parent / ref_path
-                ref_path = ref_path.resolve()
+                resolved_reference = _RESOLVED_PATHS.read(db, os.fspath(ref_path))
+                if resolved_reference is None:
+                    all_diagnostics.append(
+                        (
+                            "missing-requirements-file",
+                            f"referenced requirements file is missing: {ref_path}",
+                        )
+                    )
+                    continue
+                ref_path = Path(resolved_reference)
                 try:
                     ref_path.relative_to(project_root)
                 except ValueError:

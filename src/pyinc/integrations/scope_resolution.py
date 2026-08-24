@@ -4,13 +4,14 @@ import ast
 import os
 import unicodedata
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal, TypeAlias, overload
 
 from pyinc._python_lexing import identifier_tokens
 from pyinc.core import query
+from pyinc.errors import UnsupportedValueError
 from pyinc.integrations.python_source import source_text
 from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
+from pyinc.resources import ResolvedPathResource
 from pyinc.runtime import Database
 
 from ._decoding import decoded, once_per_request
@@ -44,6 +45,8 @@ ScopeTreePayload: TypeAlias = tuple[
     tuple[BindingPayload, ...],
     tuple[OccurrencePayload, ...],
 ]
+
+_RESOLVED_PATHS = ResolvedPathResource()
 
 
 @dataclass(frozen=True)
@@ -1067,7 +1070,16 @@ def _decode_scope_tree(payload: ScopeTreePayload) -> ScopeTree:
 
 
 def scope_tree(db: Database, path: str | os.PathLike[str]) -> ScopeTree:
-    normalized = str(Path(path).resolve(strict=False))
+    # Canonicalizing through the tracked path declares the edge, so retargeting
+    # any link along the chain invalidates what was answered from the old
+    # target -- a bare `Path.resolve` reaches the live filesystem untracked. It
+    # also makes the answer for a path that cannot be canonicalized the same on
+    # every interpreter, where the bare call raises on some and hands back a
+    # path that is still a link on others. Such a path names no source file, so
+    # it is refused here in this layer's own voice.
+    normalized = _RESOLVED_PATHS.read(db, os.fspath(path))
+    if normalized is None:
+        raise UnsupportedValueError(f"Path cannot be resolved: {os.fspath(path)}")
     return once_per_request(
         db, "scope_tree", (normalized,), lambda: _scope_tree(db, normalized)
     )

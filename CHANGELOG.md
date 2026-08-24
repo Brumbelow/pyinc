@@ -293,6 +293,21 @@ decided at release time.
   it already uses when it cannot inspect a component of that path. Every
   refusal keeps the original failure as its cause, and no path that resolved
   before is treated differently.
+- `scope_tree()` and `deep_requirements_analysis()` now canonicalize the paths
+  they work with through the tracked path resource instead of reaching the
+  filesystem directly, so retargeting a symbolic link anywhere along a chain
+  they followed invalidates what was answered from the old target — including
+  every file the requirements walk reaches through an `-r` reference, which was
+  previously followed without declaring the step. A path either entry point is
+  handed that cannot be canonicalized is now refused as an unsupported value
+  naming that path. Previously a link leading back to itself escaped as a bare
+  `RuntimeError` on the interpreters that refuse such a path outright, and on
+  the rest was carried past the canonicalization — far enough for a deep
+  requirements analysis to answer with an empty analysis of a file nobody could
+  name — while a path string holding an embedded null character escaped as a
+  bare `ValueError` on every interpreter. A reference *inside* a requirements
+  file that cannot be canonicalized is reported as a missing referenced file,
+  as an absent one already was.
 
 ### Added
 

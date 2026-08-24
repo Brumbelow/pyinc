@@ -4,9 +4,10 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _hostile_paths import make_symlink_loop, nul_path, posix_only
 
 import pyinc.integrations as integrations
-from pyinc import Database
+from pyinc import Database, UnsupportedValueError
 from pyinc.integrations import SourcePosition, SourceRange
 from pyinc.integrations.scope_resolution import scope_tree, symbol_at
 from pyinc.integrations.symbol_resolution import (
@@ -2572,3 +2573,44 @@ def test_class_model_truncation_reports_every_stopped_edge(tmp_path: Path) -> No
     assert "dm" not in {member.name for member in model.members}
     assert model.truncated_bases == ("Alpha", "Beta")
     assert model.unresolved_bases == ()
+
+
+def _ordinary_bindings(db: Database, tmp_path: Path) -> set[str]:
+    """Names bound by an ordinary module beside the hostile one.
+
+    A refusal is only worth pinning together with the evidence that it refused
+    the one path and left the database able to answer the next one.
+    """
+    ordinary = tmp_path / "ordinary.py"
+    ordinary.write_text("VALUE = 1\n")
+    return {binding.name for binding in scope_tree(db, str(ordinary)).bindings}
+
+
+@posix_only
+def test_a_scope_tree_of_a_looping_path_is_refused_by_type(tmp_path: Path) -> None:
+    # A link pointing at itself names no source file, and asking the platform
+    # to canonicalize it answers differently by interpreter version: the older
+    # ones raise a loop error, the newer ones hand back a path that is still a
+    # link. Canonicalizing through the tracked path makes the answer the same
+    # everywhere and the entry point refuses it in its own voice, rather than
+    # letting whatever the interpreter happened to raise reach the caller.
+    db = Database()
+    looping = make_symlink_loop(tmp_path / "loop")
+
+    with pytest.raises(UnsupportedValueError, match="Path cannot be resolved"):
+        scope_tree(db, str(looping))
+
+    assert _ordinary_bindings(db, tmp_path) == {"VALUE"}
+
+
+@posix_only
+def test_a_scope_tree_of_a_null_path_is_refused_by_type(tmp_path: Path) -> None:
+    # A path string holding a NUL names no file either, and the sentence the
+    # platform composes for it is spelled differently again by version. The
+    # refusal is the same one the looping path gets, for the same reason.
+    db = Database()
+
+    with pytest.raises(UnsupportedValueError, match="Path cannot be resolved"):
+        scope_tree(db, nul_path(tmp_path))
+
+    assert _ordinary_bindings(db, tmp_path) == {"VALUE"}

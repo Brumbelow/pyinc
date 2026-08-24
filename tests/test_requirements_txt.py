@@ -4,12 +4,14 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _hostile_paths import make_symlink_loop, nul_path, posix_only
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 
 import pyinc.integrations as integrations
-from pyinc import Database
+from pyinc import Database, UnsupportedValueError
+from pyinc._safe_fs import UnsafeFilesystemPathError
 from pyinc.integrations.requirements_txt import (
     RequirementsAnalysis,
     deep_requirements_analysis,
@@ -596,3 +598,80 @@ def test_deep_incremental_revalidation(tmp_path: Path) -> None:
     result2 = deep_requirements_analysis(db, str(main))
     names = {r.name for r in result2.requirements}
     assert names == {"numpy", "scipy", "pandas"}
+
+
+#: The two shapes a caller can hand an entry point that name no readable file.
+_HOSTILE_SHAPES = ("symlink-loop", "embedded-null")
+
+
+def _hostile_entry(shape: str, tmp_path: Path) -> str:
+    if shape == "symlink-loop":
+        return str(make_symlink_loop(tmp_path / "loop"))
+    return nul_path(tmp_path)
+
+
+@posix_only
+@pytest.mark.parametrize("shape", _HOSTILE_SHAPES)
+def test_a_deep_requirements_analysis_of_a_hostile_path_is_refused_by_type(
+    shape: str, tmp_path: Path
+) -> None:
+    # The deep entry canonicalizes the root it was handed, and what that used
+    # to answer for these two shapes depended on the interpreter: a loop error
+    # on the older ones, and on the newer ones a path that is still a link,
+    # which then read back as an ordinary empty analysis. Canonicalizing
+    # through the tracked path answers "unresolvable" on every interpreter, and
+    # a root the caller named that cannot be resolved is refused here rather
+    # than reported as an empty analysis of a file nobody could name. A file
+    # the analysis found a reference to is the other case and keeps its
+    # diagnostic: that path is content, not something the caller asked for.
+    db = Database()
+
+    with pytest.raises(UnsupportedValueError, match="Path cannot be resolved"):
+        deep_requirements_analysis(db, _hostile_entry(shape, tmp_path))
+
+    main = tmp_path / "requirements.txt"
+    main.write_text("flask\n")
+    assert {req.name for req in deep_requirements_analysis(db, str(main)).requirements} == {
+        "flask"
+    }
+
+
+@posix_only
+@pytest.mark.parametrize("shape", _HOSTILE_SHAPES)
+def test_a_shallow_requirements_analysis_of_a_hostile_path_is_refused_by_type(
+    shape: str, tmp_path: Path
+) -> None:
+    # The shallow entry canonicalizes nothing of its own: it reads the file
+    # through the tracked file resource, which is where both shapes are refused
+    # already. Pinned so the closure stays a property of the read seam rather
+    # than an accident of which entry point a caller happened to ask.
+    db = Database()
+
+    with pytest.raises(UnsafeFilesystemPathError):
+        requirements_analysis(db, _hostile_entry(shape, tmp_path))
+
+    main = tmp_path / "requirements.txt"
+    main.write_text("flask\n")
+    assert {req.name for req in requirements_analysis(db, str(main)).requirements} == {"flask"}
+
+
+@posix_only
+@pytest.mark.parametrize("shape", _HOSTILE_SHAPES)
+def test_a_workspace_requirements_analysis_of_a_hostile_root_is_refused_by_type(
+    shape: str, tmp_path: Path
+) -> None:
+    # The workspace entry lists its root before it reaches the deep entry, so a
+    # hostile root is refused by the tracked listing and never reaches the
+    # canonicalization below it. Pinned beside the deep entry's own refusal so
+    # the two are not read as the same refusal reached by two routes.
+    db = Database()
+
+    with pytest.raises(UnsafeFilesystemPathError):
+        workspace_requirements_analysis(db, _hostile_entry(shape, tmp_path))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "requirements.txt").write_text("flask\n")
+    analysis = workspace_requirements_analysis(db, str(workspace))
+    assert analysis is not None
+    assert {req.name for req in analysis.requirements} == {"flask"}
