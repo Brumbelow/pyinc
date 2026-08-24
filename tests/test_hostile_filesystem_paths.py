@@ -339,9 +339,14 @@ def test_a_pipe_source_reads_as_missing_in_every_mode(mode: str, tmp_path: Path)
 def test_a_pipe_source_survives_a_checkpoint_round_trip(mode: str, tmp_path: Path) -> None:
     # A checkpoint may only carry a probe a later process can reproduce. The
     # answer a pipe gets is reached by asking the path what kind it is, and a
-    # reload asks the same question and is given the same answer, so the record
-    # is reused across the round trip rather than rebuilt around.
+    # reload asks that question again in a database that never saw the first
+    # answer -- so this answer is re-derived rather than replayed, and what the
+    # round trip has to show is that re-deriving it lands where the warm run
+    # landed.
     pipe = make_fifo(tmp_path / "pipe.py")
+    ordinary = tmp_path / "module.py"
+    ordinary.write_text(_SOURCE_TEXT, encoding="utf-8")
+    ordinary_path = str(ordinary)
     store = InMemoryArtifactStore()
     source = Input[str]("hostile.paths.checkpoint.source")
 
@@ -349,28 +354,40 @@ def test_a_pipe_source_survives_a_checkpoint_round_trip(mode: str, tmp_path: Pat
     def reads_the_source(db: Database) -> tuple[str, str]:
         return _tracked_reads(db, source.read(db))
 
+    @query
+    def reads_an_ordinary_source(db: Database) -> tuple[str, str]:
+        return _tracked_reads(db, ordinary_path)
+
     warm = Database(mode, store=store)
     warm.set(source, str(pipe))
     warm_answer = warm.get(reads_the_source)
+    warm_sibling = warm.get(reads_an_ordinary_source)
     key = warm.save_checkpoint()
 
     reloaded = Database(mode, store=store)
     reloaded.set(source, str(pipe))
     reloaded.load_checkpoint(key)
+
+    # The sibling reads an ordinary file, so its record is one a checkpoint
+    # does carry, and the reloaded database answers it without running its
+    # body. That is what says the round trip below was live: written, loaded
+    # and used, rather than a reload that quietly carried nothing.
+    assert reloaded.get(reads_an_ordinary_source) == warm_sibling
+    assert warm_sibling == (_SOURCE_TEXT, _SOURCE_TEXT)
+    assert reloaded.statistics().query_executions == 0
+
+    # The pipe query is the one that re-derives, and the reason is specific: a
+    # read of a path naming no file leaves a failure record, and a checkpoint
+    # carries neither a failure record nor a reader that handled one. So the
+    # counter moves here and did not move for the sibling.
     reloaded_answer = reloaded.get(reads_the_source)
+    assert reloaded.statistics().query_executions == 1
 
     fresh = Database(mode)
     fresh.set(source, str(pipe))
 
     assert reloaded_answer == warm_answer == fresh.get(reads_the_source)
     assert reloaded_answer == (_MISSING_READ, _MISSING_READ)
-    # A read of a path naming no file leaves a failure record, and a failure
-    # record is not something a checkpoint carries: the reloaded database
-    # re-derives this query rather than replaying it. That is the point of the
-    # round trip rather than a hole in it -- re-deriving it asks the path what
-    # kind it is a second time, in a database that never saw the first answer,
-    # and lands on the same one.
-    assert reloaded.statistics().query_executions == 1
 
 
 @posix_only
