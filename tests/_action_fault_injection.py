@@ -35,16 +35,24 @@ from _action_witness import TreeWitness, manifest_bytes, tree_witness
 
 from pyinc import Database, InMemoryArtifactStore, Input, query
 from pyinc.action import Action, Output, action
-from pyinc.errors import ActionPathError
+from pyinc.errors import ActionManifestError, ActionPathError
 
 action_module = importlib.import_module("pyinc.action")
 
-#: What a fault may escape ``reconcile()`` as, today and after the error
-#: surface is retyped: raw escapes are OSError subclasses (including
-#: UnsafeFilesystemPathError), typed refusals are ValueError-based action
-#: errors. A cell that pins an escape it does not own asserts this union
-#: plus the phase's safety invariants, never a bare type.
-RAW_OR_TYPED: tuple[type[BaseException], ...] = (OSError, ActionPathError)
+#: What a fault may escape ``reconcile()`` as, at a seam whose type this
+#: suite does not own: raw escapes are OSError subclasses (including
+#: UnsafeFilesystemPathError), and the typed refusals are the action
+#: errors, which are ValueError-based and so disjoint from OSError. A
+#: manifest write is reported as a manifest error rather than a path error,
+#: which is why that member is named here beside the path error. A cell that
+#: pins an escape it does not own asserts this union plus the phase's safety
+#: invariants, never a bare type; a cell whose seam has a settled type
+#: asserts that type instead.
+RAW_OR_TYPED: tuple[type[BaseException], ...] = (
+    OSError,
+    ActionPathError,
+    ActionManifestError,
+)
 
 #: The injected OSError families. CPython maps a multi-argument OSError to
 #: its errno-keyed subclass (EACCES/EPERM -> PermissionError, ENOTDIR ->
