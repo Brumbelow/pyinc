@@ -1,4 +1,12 @@
-"""No-follow filesystem primitives used by durable stores and actions."""
+"""Filesystem primitives used by durable stores, actions and tracked reads.
+
+Two postures live here, and the difference between them is deliberate.
+Writing to a path the library owns opens without following symbolic links,
+because someone who can plant a link where a write lands can redirect that
+write. Reading a file the library was only asked to track is the opposite
+case: a source reached through a link is an ordinary source, so the following
+read guards against the read that never returns instead.
+"""
 
 from __future__ import annotations
 
@@ -424,6 +432,8 @@ def read_regular_file_with_identity(path: Path) -> tuple[bytes, tuple[int, int]]
             return None
         except OSError as error:
             raise UnsafeFilesystemPathError(f"Cannot safely open regular file: {path}") from error
+        except ValueError as error:
+            raise UnsafeFilesystemPathError(f"Cannot safely open regular file: {path}") from error
         try:
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode):
@@ -436,6 +446,97 @@ def read_regular_file_with_identity(path: Path) -> tuple[bytes, tuple[int, int]]
                 os.close(descriptor)
     finally:
         os.close(parent_fd)
+
+
+#: Errnos that mean a path names no readable regular file and never will by
+#: being read again, but which CPython gives no dedicated OSError subclass.
+#: ENXIO is what opening a bound unix socket raises.
+_READS_AS_MISSING_ERRNOS = frozenset({errno.ENXIO})
+
+
+def _read_error_means_missing(path: str, error: OSError) -> bool:
+    """Report whether a failed open means the path names no readable file.
+
+    Three groups answer the way an absent path does. The errors that name a
+    path whose shape can never be read as a file -- absent, a directory, or
+    reached through a file -- which platform reports which is the platform's
+    business and is why a permission denial cannot be decided by type alone:
+    Windows raises it for a directory where POSIX raises IsADirectoryError,
+    and it is also what an ACL denial on a perfectly ordinary file raises,
+    which must keep propagating. And the errnos with no subclass of their
+    own that mean the same thing -- opening a bound socket is the one that
+    reaches here.
+    """
+    if isinstance(error, (FileNotFoundError, IsADirectoryError, NotADirectoryError)):
+        return True
+    if error.errno in _READS_AS_MISSING_ERRNOS:
+        return True
+    return isinstance(error, PermissionError) and os.path.isdir(path)
+
+
+def read_regular_file_following_links(path: Path) -> bytes | None:
+    """Read a regular file, following symbolic links, without ever blocking.
+
+    The no-follow primitives beside this one guard a trusted write: they
+    refuse a symlinked target because an attacker who can plant a link can
+    redirect the write. A tracked read is the opposite posture -- a source
+    file reached through a symlink is an ordinary source file, and a
+    repository whose `src/` is a link, or a virtual environment's
+    site-packages entry, must stay readable. So this one follows links and
+    guards only against the read that never returns: it opens non-blocking,
+    asks the open descriptor what kind of thing it got, and answers a path
+    that is not a regular file the way an absent path is answered. The
+    non-blocking flag is cleared once the kind is known, so an ordinary
+    read of a large file is unaffected.
+
+    Returns None when the path names no readable regular file. Raises for a
+    failure a caller must see -- a permission denial on an ordinary file
+    keeps propagating, exactly as a plain read does.
+    """
+    if os.name == "nt":
+        return _read_regular_file_following_links_windows(path)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if _read_error_means_missing(os.fspath(path), error):
+            return None
+        raise
+    except ValueError as error:
+        raise UnsafeFilesystemPathError(f"Cannot safely open regular file: {path}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        os.set_blocking(descriptor, True)
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            return handle.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_regular_file_following_links_windows(path: Path) -> bytes | None:
+    """The same contract where there is no O_NONBLOCK to open with.
+
+    Windows has no non-blocking open flag, so the kind is asked first and
+    the read follows. The window between them costs a re-read at worst: a
+    path whose kind changes between the two answers one of the two states
+    it actually held, which is the same guarantee the descriptor-based arm
+    gives.
+    """
+    try:
+        metadata = os.stat(path)
+    except OSError as error:
+        if _read_error_means_missing(os.fspath(path), error):
+            return None
+        raise
+    except ValueError as error:
+        raise UnsafeFilesystemPathError(f"Cannot safely open regular file: {path}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    return path.read_bytes()
 
 
 def atomic_write(path: Path, data: bytes) -> None:
@@ -666,6 +767,8 @@ def _read_regular_file_with_identity_windows(path: Path) -> tuple[bytes, tuple[i
             if _windows_error_code(error) in _WIN_MISSING_ERRORS:
                 return None
             raise
+        except ValueError as error:
+            raise UnsafeFilesystemPathError(f"Cannot safely open regular file: {path}") from error
         owned_by_stream = False
         try:
             api.require_regular(handle, os.fspath(path))

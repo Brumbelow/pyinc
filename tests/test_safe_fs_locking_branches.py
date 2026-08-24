@@ -4,11 +4,22 @@ import errno
 import io
 import os
 import struct
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from _hostile_paths import (
+    character_device,
+    make_fifo,
+    make_socket,
+    nul_path,
+    posix_only,
+    skip_without_posix_permissions,
+    within_budget,
+)
 
 from pyinc import _locking as locking
 from pyinc import _safe_fs as safe_fs
@@ -292,6 +303,87 @@ def test_identity_read_and_identity_checked_unlink(tmp_path: Path) -> None:
     assert fresh is not None
     assert safe_fs.unlink_regular_file(target, expected_identity=fresh[1]) is True
     assert not target.exists()
+
+
+@posix_only
+def test_a_following_read_returns_the_bytes_behind_a_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"payload")
+    link = tmp_path / "link.bin"
+    link.symlink_to(target)
+    hop = tmp_path / "hop.bin"
+    hop.symlink_to(link)
+
+    assert safe_fs.read_regular_file_following_links(link) == b"payload"
+    assert safe_fs.read_regular_file_following_links(hop) == b"payload"
+
+    # The no-follow primitive beside it refuses both links, and reads the
+    # same bytes when handed the file itself. The two postures are pinned
+    # side by side so neither can drift into the other.
+    for linked in (link, hop):
+        with pytest.raises(
+            safe_fs.UnsafeFilesystemPathError, match="Cannot safely open regular file"
+        ):
+            safe_fs.read_regular_file(linked)
+    assert safe_fs.read_regular_file(target) == b"payload"
+
+
+@posix_only
+def test_a_following_read_answers_a_named_pipe_without_waiting(tmp_path: Path) -> None:
+    # A pipe with no writer never delivers a byte, so the answer has to come
+    # from the kind of the thing that was opened.
+    pipe = make_fifo(tmp_path / "pipe.bin")
+    read = partial(safe_fs.read_regular_file_following_links, pipe)
+    assert within_budget(read) == "returned"
+    assert read() is None
+
+
+@posix_only
+def test_a_following_read_answers_a_bound_socket_as_no_readable_file(tmp_path: Path) -> None:
+    path, server = make_socket(tmp_path / "socket.bin")
+    try:
+        assert safe_fs.read_regular_file_following_links(path) is None
+    finally:
+        server.close()
+
+
+@posix_only
+def test_a_following_read_answers_an_unending_device_without_waiting() -> None:
+    device = Path(character_device())
+    read = partial(safe_fs.read_regular_file_following_links, device)
+    assert within_budget(read) == "returned"
+    assert read() is None
+
+
+@posix_only
+def test_a_following_read_still_propagates_a_denied_regular_file(tmp_path: Path) -> None:
+    skip_without_posix_permissions()
+    denied = tmp_path / "denied.bin"
+    denied.write_bytes(b"payload")
+    denied.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError):
+            safe_fs.read_regular_file_following_links(denied)
+    finally:
+        denied.chmod(0o600)
+    assert denied.read_bytes() == b"payload"
+
+
+@posix_only
+@pytest.mark.parametrize(
+    "read",
+    [
+        safe_fs.read_regular_file,
+        safe_fs.read_regular_file_with_identity,
+        safe_fs.read_regular_file_following_links,
+    ],
+    ids=["no-follow", "no-follow-with-identity", "following"],
+)
+def test_an_embedded_null_is_refused_rather_than_escaping_untyped(
+    read: Callable[[Path], object], tmp_path: Path
+) -> None:
+    with pytest.raises(safe_fs.UnsafeFilesystemPathError, match="Cannot safely open regular file"):
+        read(Path(nul_path(tmp_path)))
 
 
 @pytest.mark.skipif(

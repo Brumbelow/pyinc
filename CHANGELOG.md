@@ -545,6 +545,10 @@ decided at release time.
   raw operating-system failure. Every existing `except OSError` still catches
   it, and it keeps the `errno`, `filename` and `[Errno N] ...` rendering it has
   always had when it is raised from a failed system call.
+- A path holding an embedded null character is now refused as an unsafe path
+  when a regular file is read, rather than escaping as a bare `ValueError` from
+  the open itself. The refusal reads the same as every other unsafe-path
+  refusal at that seam and carries the original failure as its cause.
 
 ## [3.1.1] - 2026-08-03
 
