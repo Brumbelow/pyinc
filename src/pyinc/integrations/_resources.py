@@ -15,9 +15,11 @@ def file_bytes(path: str) -> bytes | None:
     A path that is a directory, or that has a file somewhere in its parent
     chain, names no readable regular file and never will by being read again,
     so it answers the way an absent path does -- which is what keeps the probe
-    built on it total. Any other OSError propagates. Shares the kernel file
-    resources' read so the two classify a failed read the same way, which the
-    platforms make less obvious than it sounds.
+    built on it total. A pipe, a socket and a device answer that way too, the
+    socket through an errno CPython gives no subclass of its own, so it is
+    named by errno rather than decided by type; any other OSError propagates.
+    Shares the kernel file resources' read so the two classify a failed read
+    the same way, which the platforms make less obvious than it sounds.
     """
 
     return _read_file(path)
