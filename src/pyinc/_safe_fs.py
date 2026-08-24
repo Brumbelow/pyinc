@@ -13,9 +13,16 @@ import struct
 from pathlib import Path, PureWindowsPath
 from typing import Any, BinaryIO, cast
 
+from .errors import PyIncError
 
-class UnsafeFilesystemPathError(OSError):
-    """A path component or target is unsafe for a trusted filesystem write."""
+
+class UnsafeFilesystemPathError(PyIncError, OSError):
+    """A path is unsafe to read from or to write to as a regular file.
+
+    Both a base: it is what the library raises, so ``except PyIncError``
+    reaches it, and it is an ``OSError``, so the handlers that have always
+    caught a failed filesystem call still catch it unchanged.
+    """
 
 
 # Win32 file access, sharing, creation, attribute, and information constants.

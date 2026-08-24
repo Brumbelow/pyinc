@@ -540,6 +540,11 @@ decided at release time.
   the child read whatever it read before it asked for itself and its frame goes
   with those reads in it; nor is a `CycleError` that reaches back through
   another query, which is marked for the same reason.
+- An unsafe-path refusal from the filesystem layer is now a pyinc error as well
+  as an `OSError`, so `except PyIncError` reaches it and it no longer reads as a
+  raw operating-system failure. Every existing `except OSError` still catches
+  it, and it keeps the `errno`, `filename` and `[Errno N] ...` rendering it has
+  always had when it is raised from a failed system call.
 
 ## [3.1.1] - 2026-08-03
 
