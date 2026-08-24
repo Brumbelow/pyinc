@@ -101,13 +101,15 @@ def within_budget(call: Callable[[], Any], *, budget: float = BUDGET_SECONDS) ->
     if pid == 0:  # pragma: no cover - the child never reports coverage
         os.close(read_fd)
         try:
-            call()
-            outcome = "returned"
-        except BaseException as error:  # noqa: BLE001 - the type IS the result
-            outcome = f"raised: {type(error).__name__}"
-        with os.fdopen(write_fd, "w") as handle:
-            handle.write(outcome)
-        os._exit(0)
+            try:
+                call()
+                outcome = "returned"
+            except BaseException as error:  # noqa: BLE001 - the type IS the result
+                outcome = f"raised: {type(error).__name__}"
+            with os.fdopen(write_fd, "w") as handle:
+                handle.write(outcome)
+        finally:
+            os._exit(0)
     os.close(write_fd)
     deadline = time.monotonic() + budget
     while time.monotonic() < deadline:
