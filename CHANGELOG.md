@@ -254,6 +254,18 @@ decided at release time.
   paths stays reproducible. Sources reached through symbolic links keep reading
   exactly as before — one link or several — and a permission denial on an
   ordinary file still propagates rather than being reported as absent.
+- A symbolic link that leads back to itself, and a path string holding an
+  embedded null character, are now refused as unsafe paths at every resource
+  probe — file, binary file, file stat and directory — instead of escaping as
+  whatever the platform raised. Previously the loop escaped as a bare
+  `OSError` and the null path as a bare `ValueError`, in three different
+  spellings that also differ between interpreter versions, so a caller could
+  not name what it was catching. The refusal is a pyinc error and an
+  `OSError`, so both kinds of handler reach it, and it names the path in this
+  library's own words while carrying the original failure as its cause. Only
+  these two shapes changed: an absent path, a directory read as a file and a
+  path reached through a file still answer exactly as they did, and a
+  permission denial still propagates as a denial at all four probes.
 
 ### Added
 

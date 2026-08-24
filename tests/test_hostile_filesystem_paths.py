@@ -15,14 +15,23 @@ from _hostile_paths import (
     character_device,
     make_fifo,
     make_socket,
+    make_symlink_loop,
+    nul_path,
     posix_only,
     skip_without_posix_permissions,
     within_budget,
 )
 
 from pyinc import Database, InMemoryArtifactStore, Input, query
+from pyinc._safe_fs import UnsafeFilesystemPathError
+from pyinc.errors import PyIncError
 from pyinc.integrations._resources import file_bytes, file_probe, file_read_snapshot, file_text
-from pyinc.resources import BinaryFileResource, FileResource
+from pyinc.resources import (
+    BinaryFileResource,
+    DirectoryResource,
+    FileResource,
+    FileStatResource,
+)
 
 #: What every unchanged-source cell writes and reads back.
 _SOURCE_TEXT = "VALUE = 1\n"
@@ -412,3 +421,126 @@ def test_a_pipe_that_becomes_a_regular_file_is_re_read(tmp_path: Path) -> None:
 
     assert Database().get(reads_the_source) == (_SOURCE_TEXT, _SOURCE_TEXT)
     assert warm.get(reads_the_source) == (_SOURCE_TEXT, _SOURCE_TEXT)
+
+
+#: The probes whose value domain holds no member for a path that names nothing
+#: readable at all, so a typed refusal is the only total answer they can give.
+#: The resolved-path probe is deliberately not among them and its absence is not
+#: an inconsistency: an unresolvable path is already a member of that probe's
+#: value domain, so it answers where these four refuse, and that answer is
+#: pinned beside the other resolved-path cells rather than here.
+_REFUSING_PROBE_NAMES: tuple[str, ...] = ("file", "binary-file", "stat", "directory")
+
+#: The two shapes every one of those probes must refuse.
+_UNREADABLE_SHAPES: tuple[str, ...] = ("symlink-loop", "embedded-null")
+
+
+def _refusing_probes() -> dict[str, Callable[[str], object]]:
+    """Every probe that must refuse a path naming nothing readable, by name."""
+    return {
+        "file": FileResource().probe,
+        "binary-file": BinaryFileResource().probe,
+        "stat": FileStatResource().probe,
+        "directory": DirectoryResource().probe,
+    }
+
+
+def _unreadable_path(shape: str, base: Path) -> str:
+    """A path under ``base`` in one of the two shapes nothing can read."""
+    if shape == "symlink-loop":
+        return str(make_symlink_loop(base / "loop"))
+    return nul_path(base)
+
+
+def _expected_refusal(probe_name: str, shape: str) -> str:
+    """The words the refusal composes, which are always this library's own.
+
+    A file read refuses a path holding a NUL inside the read primitive, before
+    the resource seam below it is reached, so that refusal arrives in the
+    primitive's sentence; the three metadata seams compose theirs. Neither
+    phrase belongs to the platform on purpose: what a symlink loop and a NUL
+    path draw out of the operating system is spelled differently by interpreter
+    version and by platform, so no cell here pins one.
+    """
+
+    if shape == "embedded-null" and probe_name in {"file", "binary-file"}:
+        return "Cannot safely open regular file"
+    return "names no readable"
+
+
+@posix_only
+@pytest.mark.parametrize("shape", _UNREADABLE_SHAPES)
+@pytest.mark.parametrize("probe_name", _REFUSING_PROBE_NAMES)
+def test_a_path_that_names_nothing_readable_is_refused_by_type(
+    probe_name: str, shape: str, tmp_path: Path
+) -> None:
+    # A link pointing at itself and a path string holding a NUL name no file, no
+    # listing and no metadata. Unlike a pipe or a device they have no reading at
+    # all to report, so answering "missing" would certify an interval nothing
+    # observed; and unlike an absent path they never become readable by being
+    # asked again. Each probe refuses them by type, which is an outcome the
+    # kernel already knows what to do with, rather than by whatever the platform
+    # happened to raise.
+    probe = _refusing_probes()[probe_name]
+    path = _unreadable_path(shape, tmp_path)
+    with pytest.raises(UnsafeFilesystemPathError, match=_expected_refusal(probe_name, shape)):
+        probe(path)
+
+
+@posix_only
+@pytest.mark.parametrize("shape", _UNREADABLE_SHAPES)
+@pytest.mark.parametrize("probe_name", _REFUSING_PROBE_NAMES)
+def test_a_refusal_is_caught_by_the_library_base_and_as_an_operating_system_error(
+    probe_name: str, shape: str, tmp_path: Path
+) -> None:
+    # The refusal wears two faces on purpose. A caller guarding a query with the
+    # library's own base class reaches it, and so does every handler that has
+    # always wrapped a filesystem call in `except OSError` -- so routing these
+    # two shapes through a typed refusal takes nothing away from either.
+    probe = _refusing_probes()[probe_name]
+    path = _unreadable_path(shape, tmp_path)
+
+    reached: list[str] = []
+    try:
+        probe(path)
+    except PyIncError as error:
+        reached.append(f"PyIncError:{type(error).__name__}")
+    try:
+        probe(path)
+    except OSError as error:
+        reached.append(f"OSError:{type(error).__name__}")
+
+    assert reached == [
+        "PyIncError:UnsafeFilesystemPathError",
+        "OSError:UnsafeFilesystemPathError",
+    ]
+
+
+@posix_only
+@pytest.mark.parametrize("probe_name", _REFUSING_PROBE_NAMES)
+def test_a_denied_path_still_fails_every_probe_as_a_denial(
+    probe_name: str, tmp_path: Path
+) -> None:
+    # The other half of the policy, at all four probes: only a path that names
+    # nothing readable is refused as such. A denial on an otherwise ordinary
+    # path is a genuine failure the kernel's failure records already carry
+    # identically warm and fresh, so it keeps propagating as itself instead of
+    # being restated as a refusal about the path's shape.
+    skip_without_posix_permissions()
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    (holder / "sub").mkdir()
+    (holder / "thing.txt").write_text(_SOURCE_TEXT, encoding="utf-8")
+    denied = holder / ("sub" if probe_name == "directory" else "thing.txt")
+    probe = _refusing_probes()[probe_name]
+
+    holder.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError) as refusal:
+            probe(str(denied))
+        assert not isinstance(refusal.value, UnsafeFilesystemPathError)
+    finally:
+        holder.chmod(0o755)
+
+    # ... and the mode was the whole of it: the same paths read normally again.
+    assert probe(str(denied)) is not None

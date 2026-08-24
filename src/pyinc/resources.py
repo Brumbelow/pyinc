@@ -7,7 +7,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from ._safe_fs import _read_error_means_missing, read_regular_file_following_links
+from ._safe_fs import (
+    UnsafeFilesystemPathError,
+    _read_error_means_missing,
+    read_regular_file_following_links,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -26,11 +30,17 @@ ProbeT = TypeVar("ProbeT")
 # these is a transient failure a later read could survive: the path is absent,
 # it is a directory, something in its parent chain is a file, or it names a
 # pipe, a socket or a device rather than a file at all. They answer the way an
-# absent path does. Every other OSError is a genuine failure and keeps
-# propagating, where the kernel's failure records handle it identically warm and
-# fresh -- with one carve-out the last three kinds force: opening a bound socket
-# reports an errno CPython gives no subclass of its own, so the file read names
-# that errno explicitly instead of deciding by type alone.
+# absent path does -- with one carve-out the last three kinds force: opening a
+# bound socket reports an errno CPython gives no subclass of its own, so the
+# file read names that errno explicitly instead of deciding by type alone.
+#
+# A denial is the genuine failure that keeps propagating, where the kernel's
+# failure records handle it identically warm and fresh. What is left names
+# nothing readable and never will by being asked again -- a link that leads back
+# to itself, or a path string holding a NUL -- and the file, listing and stat
+# seams below refuse it by type. That is the third outcome a total probe is
+# allowed, and it keeps the platform's own spelling of these two, which differs
+# by interpreter version and by platform, out of a caller's handlers.
 #
 # Which error carries which of those is the platform's business, and the two
 # disagree. POSIX raises IsADirectoryError for a directory opened as a file and
@@ -338,13 +348,26 @@ def _read_file(path: str) -> bytes | None:
     # way re-reading cannot fix. They answer the way an absent path does --
     # identically warm and fresh, and reproducible by a fresh run, which is
     # what keeps the probe built on this total. A symlink is followed: a
-    # source file reached through one is an ordinary source file.
+    # source file reached through one is an ordinary source file -- but a link
+    # that leads back to itself names no file at all, and neither does a path
+    # string holding a NUL, so those two are refused by type rather than
+    # answered, which is the third outcome a total probe is allowed.
     try:
         return read_regular_file_following_links(Path(path))
+    except UnsafeFilesystemPathError:
+        # Already this library's own refusal, composed where the read decided
+        # it. Restating it here would only bury the sentence that knows why.
+        raise
     except OSError as exc:
         if _reads_as_missing(path, exc):
             return None
-        raise
+        if isinstance(exc, PermissionError):
+            # A denial on an otherwise ordinary path is a genuine failure the
+            # kernel's failure records already handle identically warm and
+            # fresh. It keeps propagating. The kind check above runs first
+            # because a directory refused as a file is a denial on Windows.
+            raise
+        raise UnsafeFilesystemPathError(f"Path names no readable file: {path}") from exc
 
 
 def _listing_snapshot(path: str) -> DirectoryProbe:
@@ -353,6 +376,23 @@ def _listing_snapshot(path: str) -> DirectoryProbe:
         names = tuple(sorted(child.name for child in dir_path.iterdir()))
     except FileNotFoundError:
         return False, ()
+    except (IsADirectoryError, NotADirectoryError):
+        # A path that is not a directory is reported as one that is not: a
+        # directory walk tells a module from a package by that answer, and the
+        # probe above turns it into its own third state rather than sharing
+        # the absent one.
+        raise
+    except PermissionError:
+        # A denial on an otherwise ordinary path is a genuine failure the
+        # kernel's failure records already handle identically warm and fresh.
+        # It keeps propagating.
+        raise
+    except (OSError, ValueError) as error:
+        # What is left names no directory and never will by being asked again:
+        # a link that leads back to itself, or a path string holding a NUL,
+        # which the platform reports by raising out of the listing call in a
+        # spelling of its own. Refused by type so the answer is the library's.
+        raise UnsafeFilesystemPathError(f"Path names no readable directory: {path}") from error
     return True, names
 
 
@@ -365,13 +405,21 @@ _NOT_A_DIRECTORY_PROBE: DirectoryProbe = (False, ("",))
 
 
 def _listing_probe(path: str) -> DirectoryProbe:
-    """Report a path that holds no listing rather than raising for it.
+    """Report a path whose kind holds no listing rather than raising for it.
 
     The load keeps raising: a caller reading a listing is told a file is not a
     directory, which is how a directory walk tells a module from a package. The
     probe cannot, because a probe that raises retires the record it was
     checking, and a warm database would then answer a path whose kind changed
     differently from a fresh one reading the same world.
+
+    That sentence is also why the two shapes this probe does still raise for
+    are refused by type rather than in the platform's own words. A link that
+    leads back to itself and a path string holding a NUL name no listing in
+    any world, so retiring the record that asked about one of them is the
+    right outcome -- and the caller is told so in a sentence this library
+    composed, which does not change with the interpreter or the platform
+    underneath it.
 
     A path reached *through* a file is where the platforms part: POSIX raises
     NotADirectoryError and lands here, Windows reports the path absent and never
@@ -388,12 +436,21 @@ def _listing_probe(path: str) -> DirectoryProbe:
 
 def _stat_snapshot(path: str) -> FileStatSnapshot:
     # A stat answers for directories, so of _MISSING_FILE_ERRORS only the
-    # absent-path members can fire here; a PermissionError means a parent ACL
-    # denial and keeps propagating into a failure record like any other OSError.
+    # absent-path members can fire here. A PermissionError means a parent ACL
+    # denial and keeps propagating into a failure record. What is left names no
+    # file whose metadata any read could ever reach -- a link that leads back to
+    # itself, or a path string holding a NUL -- so it is refused by type instead
+    # of escaping in whichever spelling the platform happened to give it.
     try:
         metadata = Path(path).stat()
     except _MISSING_FILE_ERRORS:
         return FileStatSnapshot(exists=False, size=None, mtime_ns=None)
+    except PermissionError:
+        # A denial is a genuine failure and keeps propagating; the refusal arm
+        # below must never take it.
+        raise
+    except (OSError, ValueError) as error:
+        raise UnsafeFilesystemPathError(f"Path names no readable file: {path}") from error
     return FileStatSnapshot(
         exists=True,
         size=metadata.st_size,
