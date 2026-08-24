@@ -427,10 +427,10 @@ def test_a_pipe_that_becomes_a_regular_file_is_re_read(tmp_path: Path) -> None:
 #: readable at all, so a typed refusal is the only total answer they can give.
 #: The resolved-path probe is deliberately not among them, and its absence is
 #: not an inconsistency: an unresolvable path is already a member of that
-#: probe's value domain, so a looping path is something it answers rather than
-#: refuses. The one shape it does not yet answer -- a path string holding a NUL,
-#: which still leaves it as the error the platform raised -- belongs beside the
-#: other resolved-path cells rather than here.
+#: probe's value domain, so a looping path and a path string holding a NUL are
+#: both shapes it answers rather than refuses. What those two answers are, and
+#: that every interpreter gives the same one, is pinned beside the other
+#: resolved-path cells rather than here.
 _REFUSING_PROBE_NAMES: tuple[str, ...] = ("file", "binary-file", "stat", "directory")
 
 #: The two shapes every one of those probes must refuse.

@@ -267,6 +267,20 @@ decided at release time.
   these two shapes changed: an absent path, a directory read as a file and a
   path reached through a file still answer exactly as they did, and a
   permission denial still propagates as a denial at all four probes.
+- `ResolvedPathResource` answers a path it cannot canonicalize the same way
+  wherever it runs. A path string holding an embedded null character now
+  answers as unresolvable — at the probe, the load and the atomic
+  probe-and-load — instead of escaping as a bare `ValueError`, so the probe is
+  total over every path a caller can hand it. And a path that leads through a
+  symbolic link back to itself now answers as unresolvable on every
+  interpreter, by its own name or through a name beneath it: some interpreters
+  refuse such a path outright while others hand back a path that still holds
+  the link, which left the recorded value describing the interpreter that
+  observed the path rather than the path. A checkpoint written by one process
+  and loaded by another agreed about an unchanged world only if both were
+  running the same interpreter; now they agree either way. Every other path
+  canonicalizes exactly as before, including one whose parent directory cannot
+  be searched.
 
 ### Added
 

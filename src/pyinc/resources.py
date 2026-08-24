@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -278,15 +279,34 @@ class EnvResource(Resource[str, str | None, tuple[str | None]]):
         return (value,), value
 
 
+# `Path.resolve(strict=False)` raised for a symlink loop through 3.12 and
+# stops at the loop from 3.13 on, handing back a path that is still a link.
+# The probe contract requires a probe value to be process-independent, and a
+# value that depends on which interpreter observed the same unchanged world
+# is not, so the newer interpreters are brought back to the older answer.
+_RESOLVE_STOPS_AT_SYMLINK_LOOPS = sys.version_info >= (3, 13)
+
+
+def _stopped_at_a_link(resolved: Path) -> bool:
+    """Report a resolution that gave up: a resolved path holds no link.
+
+    ``os.path.islink`` answers False for a path it cannot read rather than
+    raising, so asking it keeps the probe total.
+    """
+    return any(os.path.islink(candidate) for candidate in (resolved, *resolved.parents))
+
+
 def _resolved_path(path: str) -> str | None:
-    # `strict=False` still raises for a symlink loop -- OSError on current
-    # interpreters, RuntimeError historically -- and a probe has to be total.
     # A path that cannot resolve is answered as None, the way an unset
-    # environment variable is.
+    # environment variable is: a NUL path and a looping path each name no
+    # readable file, and a probe has to be total.
     try:
-        return str(Path(path).resolve(strict=False))
-    except (OSError, RuntimeError):
+        resolved = Path(path).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
         return None
+    if _RESOLVE_STOPS_AT_SYMLINK_LOOPS and _stopped_at_a_link(resolved):
+        return None
+    return str(resolved)
 
 
 @dataclass(frozen=True)
