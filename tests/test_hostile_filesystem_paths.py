@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 from _hostile_paths import (
+    BUDGET_SECONDS,
     character_device,
     make_fifo,
     make_socket,
@@ -17,7 +20,7 @@ from _hostile_paths import (
     within_budget,
 )
 
-from pyinc import Database
+from pyinc import Database, InMemoryArtifactStore, Input, query
 from pyinc.integrations._resources import file_bytes, file_probe, file_read_snapshot, file_text
 from pyinc.resources import BinaryFileResource, FileResource
 
@@ -206,3 +209,189 @@ def test_a_denied_regular_source_still_fails_the_read(tmp_path: Path, seam_name:
             call(str(source))
     finally:
         source.chmod(0o644)
+
+
+#: What a tracked read answers for a key that names no readable file. A read
+#: hands back a value or it hands back nothing at all, so it refuses the way a
+#: read of an absent path does; naming that outcome gives a query something to
+#: return, and a checkpoint something to carry.
+_MISSING_READ = "missing"
+
+#: The two file resources held as values rather than reached through their
+#: classes. A query body's captures are fingerprinted, and a resource is
+#: fingerprinted by the configuration that distinguishes it -- which an
+#: instance has and a class does not.
+_TEXT_FILE = FileResource()
+_BYTE_FILE = BinaryFileResource()
+
+
+def _tracked_reads(db: Database, path: str) -> tuple[str, str]:
+    """Both tracked read entry points on one key, as a value a query returns.
+
+    ``read`` is the entry point the seam table above leaves out, because it
+    hands the key to the database rather than calling the shared read. It is
+    driven here instead, through a real request, for the text resource and the
+    byte one, so the two agree about a key and a caller can tell which of them
+    stopped agreeing.
+    """
+
+    try:
+        text = _TEXT_FILE.read(db, path)
+    except FileNotFoundError:
+        text = _MISSING_READ
+    try:
+        raw = _BYTE_FILE.read(db, path).decode("utf-8")
+    except FileNotFoundError:
+        raw = _MISSING_READ
+    return (text, raw)
+
+
+@posix_only
+def test_an_unrelated_query_still_answers_while_a_pipe_is_being_read(tmp_path: Path) -> None:
+    # The database holds one lock across a resource read, so a read that
+    # never returns is not one caller's problem -- it is every caller's.
+    pipe = make_fifo(tmp_path / "pipe.py")
+    pipe_path = str(pipe)
+    unrelated = Input[str]("hostile.paths.escalation.unrelated")
+
+    @query
+    def reads_the_pipe(db: Database) -> tuple[str, str]:
+        return _tracked_reads(db, pipe_path)
+
+    @query
+    def reads_an_input(db: Database) -> str:
+        return unrelated.read(db).upper()
+
+    # The threads below are ordinary joinable ones, so a read that went back to
+    # waiting would strand them for the rest of the run. Both tracked reads run
+    # under the forked budget first, where waiting is reported rather than
+    # inherited, and nothing is started until they have answered.
+    assert within_budget(lambda: _tracked_reads(Database(), pipe_path)) == "returned"
+
+    db = Database()
+    db.set(unrelated, "alpha")
+
+    answers: dict[str, object] = {}
+    finished = {"pipe": threading.Event(), "unrelated": threading.Event()}
+
+    def drive(name: str, call: Callable[[], object]) -> None:
+        # Reaching the end is what this cell measures, so a refusal is recorded
+        # as an outcome rather than dropped: the flag says the thread got there
+        # and the recorded answer says what it got there with.
+        try:
+            answers[name] = call()
+        except BaseException as error:  # noqa: BLE001 - the outcome IS the result
+            answers[name] = error
+        finally:
+            finished[name].set()
+
+    pipe_thread = threading.Thread(target=drive, args=("pipe", lambda: db.get(reads_the_pipe)))
+    other_thread = threading.Thread(
+        target=drive, args=("unrelated", lambda: db.get(reads_an_input))
+    )
+    pipe_thread.start()
+    try:
+        # Long enough for the pipe request to have taken the lock it takes.
+        time.sleep(0.2)
+        other_thread.start()
+        assert finished["unrelated"].wait(BUDGET_SECONDS)
+        assert finished["pipe"].wait(BUDGET_SECONDS)
+    finally:
+        pipe_thread.join(BUDGET_SECONDS)
+        other_thread.join(BUDGET_SECONDS)
+    assert not pipe_thread.is_alive()
+    assert not other_thread.is_alive()
+
+    # Both halves. The unrelated query answered, which is what a lock held
+    # across a waiting read takes away; and the pipe query answered too, the
+    # way an absent path is answered, rather than by waiting for a byte.
+    assert answers["unrelated"] == "ALPHA"
+    assert answers["pipe"] == (_MISSING_READ, _MISSING_READ)
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_pipe_source_reads_as_missing_in_every_mode(mode: str, tmp_path: Path) -> None:
+    # A bounded answer that differed between a warm request and a fresh one
+    # would trade a hang for a worse thing: a run whose result depends on which
+    # database asked. The choice has to be the same one in every mode, warm and
+    # fresh alike.
+    pipe = make_fifo(tmp_path / "pipe.py")
+    pipe_path = str(pipe)
+
+    @query
+    def reads_the_pipe(db: Database) -> tuple[str, str]:
+        return _tracked_reads(db, pipe_path)
+
+    warm = Database(mode)
+    cold_answer = warm.get(reads_the_pipe)
+    warm_answer = warm.get(reads_the_pipe)
+    fresh_answer = Database(mode).get(reads_the_pipe)
+
+    assert cold_answer == warm_answer == fresh_answer == (_MISSING_READ, _MISSING_READ)
+    # The second request was served rather than re-derived, so the equality
+    # above is the warm path agreeing and not the body running twice.
+    assert warm.statistics().query_executions == 1
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_pipe_source_survives_a_checkpoint_round_trip(mode: str, tmp_path: Path) -> None:
+    # A checkpoint may only carry a probe a later process can reproduce. The
+    # answer a pipe gets is reached by asking the path what kind it is, and a
+    # reload asks the same question and is given the same answer, so the record
+    # is reused across the round trip rather than rebuilt around.
+    pipe = make_fifo(tmp_path / "pipe.py")
+    store = InMemoryArtifactStore()
+    source = Input[str]("hostile.paths.checkpoint.source")
+
+    @query
+    def reads_the_source(db: Database) -> tuple[str, str]:
+        return _tracked_reads(db, source.read(db))
+
+    warm = Database(mode, store=store)
+    warm.set(source, str(pipe))
+    warm_answer = warm.get(reads_the_source)
+    key = warm.save_checkpoint()
+
+    reloaded = Database(mode, store=store)
+    reloaded.set(source, str(pipe))
+    reloaded.load_checkpoint(key)
+    reloaded_answer = reloaded.get(reads_the_source)
+
+    fresh = Database(mode)
+    fresh.set(source, str(pipe))
+
+    assert reloaded_answer == warm_answer == fresh.get(reads_the_source)
+    assert reloaded_answer == (_MISSING_READ, _MISSING_READ)
+    # A read of a path naming no file leaves a failure record, and a failure
+    # record is not something a checkpoint carries: the reloaded database
+    # re-derives this query rather than replaying it. That is the point of the
+    # round trip rather than a hole in it -- re-deriving it asks the path what
+    # kind it is a second time, in a database that never saw the first answer,
+    # and lands on the same one.
+    assert reloaded.statistics().query_executions == 1
+
+
+@posix_only
+def test_a_pipe_that_becomes_a_regular_file_is_re_read(tmp_path: Path) -> None:
+    # The other half of reading as missing: the answer describes the path as it
+    # is now, not a verdict recorded against the name for good. A pipe replaced
+    # by an ordinary source is an ordinary source, to a database that watched it
+    # happen as much as to one that never saw the pipe.
+    source = tmp_path / "module.py"
+    make_fifo(source)
+    source_path = str(source)
+
+    @query
+    def reads_the_source(db: Database) -> tuple[str, str]:
+        return _tracked_reads(db, source_path)
+
+    warm = Database()
+    assert warm.get(reads_the_source) == (_MISSING_READ, _MISSING_READ)
+
+    source.unlink()
+    source.write_text(_SOURCE_TEXT, encoding="utf-8")
+
+    assert Database().get(reads_the_source) == (_SOURCE_TEXT, _SOURCE_TEXT)
+    assert warm.get(reads_the_source) == (_SOURCE_TEXT, _SOURCE_TEXT)
