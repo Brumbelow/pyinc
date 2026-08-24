@@ -255,9 +255,10 @@ decided at release time.
   exactly as before — one link or several — and a permission denial on an
   ordinary file still propagates rather than being reported as absent.
 - A symbolic link that leads back to itself, and a path string holding an
-  embedded null character, are now refused as unsafe paths at every resource
-  probe — file, binary file, file stat and directory — instead of escaping as
-  whatever the platform raised. Previously the loop escaped as a bare
+  embedded null character, are now refused as unsafe paths by the file, binary
+  file, file stat and directory resources — at the probe, the load and the
+  atomic probe-and-load alike — instead of escaping as whatever the platform
+  raised. Previously the loop escaped as a bare
   `OSError` and the null path as a bare `ValueError`, in three different
   spellings that also differ between interpreter versions, so a caller could
   not name what it was catching. The refusal is a pyinc error and an

@@ -425,24 +425,59 @@ def test_a_pipe_that_becomes_a_regular_file_is_re_read(tmp_path: Path) -> None:
 
 #: The probes whose value domain holds no member for a path that names nothing
 #: readable at all, so a typed refusal is the only total answer they can give.
-#: The resolved-path probe is deliberately not among them and its absence is not
-#: an inconsistency: an unresolvable path is already a member of that probe's
-#: value domain, so it answers where these four refuse, and that answer is
-#: pinned beside the other resolved-path cells rather than here.
+#: The resolved-path probe is deliberately not among them, and its absence is
+#: not an inconsistency: an unresolvable path is already a member of that
+#: probe's value domain, so a looping path is something it answers rather than
+#: refuses. The one shape it does not yet answer -- a path string holding a NUL,
+#: which still leaves it as the error the platform raised -- is closed where its
+#: own pin lives, beside the other resolved-path cells rather than here.
 _REFUSING_PROBE_NAMES: tuple[str, ...] = ("file", "binary-file", "stat", "directory")
 
 #: The two shapes every one of those probes must refuse.
 _UNREADABLE_SHAPES: tuple[str, ...] = ("symlink-loop", "embedded-null")
 
+#: Every entry point of a resource that reaches the filesystem for itself. The
+#: probe, the load and the atomic probe-and-load are three separate reads, so a
+#: refusal only one of them makes is a refusal a caller can walk around by
+#: asking a different way.
+_ENTRY_POINTS: tuple[str, ...] = ("probe", "load", "probe_and_load")
 
-def _refusing_probes() -> dict[str, Callable[[str], object]]:
-    """Every probe that must refuse a path naming nothing readable, by name."""
-    return {
-        "file": FileResource().probe,
-        "binary-file": BinaryFileResource().probe,
-        "stat": FileStatResource().probe,
-        "directory": DirectoryResource().probe,
+
+def _refusing_seams(db: Database, probe_name: str) -> dict[str, Callable[[str], object]]:
+    """One resource's three filesystem entry points, keyed by entry-point name.
+
+    The load and the probe-and-load take a database, which is what the kernel
+    hands them, so they are held here as calls of one path rather than as bound
+    methods; the probe takes the path alone.
+    """
+
+    files = FileResource()
+    binaries = BinaryFileResource()
+    stats = FileStatResource()
+    listings = DirectoryResource()
+    seams: dict[str, dict[str, Callable[[str], object]]] = {
+        "file": {
+            "probe": files.probe,
+            "load": lambda path: files.load(db, path),
+            "probe_and_load": lambda path: files.probe_and_load(db, path),
+        },
+        "binary-file": {
+            "probe": binaries.probe,
+            "load": lambda path: binaries.load(db, path),
+            "probe_and_load": lambda path: binaries.probe_and_load(db, path),
+        },
+        "stat": {
+            "probe": stats.probe,
+            "load": lambda path: stats.load(db, path),
+            "probe_and_load": lambda path: stats.probe_and_load(db, path),
+        },
+        "directory": {
+            "probe": listings.probe,
+            "load": lambda path: listings.load(db, path),
+            "probe_and_load": lambda path: listings.probe_and_load(db, path),
+        },
     }
+    return seams[probe_name]
 
 
 def _unreadable_path(shape: str, base: Path) -> str:
@@ -455,12 +490,12 @@ def _unreadable_path(shape: str, base: Path) -> str:
 def _expected_refusal(probe_name: str, shape: str) -> str:
     """The words the refusal composes, which are always this library's own.
 
-    A file read refuses a path holding a NUL inside the read primitive, before
-    the resource seam below it is reached, so that refusal arrives in the
-    primitive's sentence; the three metadata seams compose theirs. Neither
-    phrase belongs to the platform on purpose: what a symlink loop and a NUL
-    path draw out of the operating system is spelled differently by interpreter
-    version and by platform, so no cell here pins one.
+    A file read refuses a path holding a NUL inside the read primitive it
+    calls, so that refusal reaches a caller in the primitive's sentence; the
+    three metadata seams compose theirs for themselves. Neither phrase belongs
+    to the platform on purpose: what a symlink loop and a NUL path draw out of
+    the operating system is spelled differently by interpreter version and by
+    platform, so no cell here pins one.
     """
 
     if shape == "embedded-null" and probe_name in {"file", "binary-file"}:
@@ -469,22 +504,27 @@ def _expected_refusal(probe_name: str, shape: str) -> str:
 
 
 @posix_only
+@pytest.mark.parametrize("entry_point", _ENTRY_POINTS)
 @pytest.mark.parametrize("shape", _UNREADABLE_SHAPES)
 @pytest.mark.parametrize("probe_name", _REFUSING_PROBE_NAMES)
 def test_a_path_that_names_nothing_readable_is_refused_by_type(
-    probe_name: str, shape: str, tmp_path: Path
+    probe_name: str, shape: str, entry_point: str, tmp_path: Path
 ) -> None:
     # A link pointing at itself and a path string holding a NUL name no file, no
     # listing and no metadata. Unlike a pipe or a device they have no reading at
     # all to report, so answering "missing" would certify an interval nothing
     # observed; and unlike an absent path they never become readable by being
-    # asked again. Each probe refuses them by type, which is an outcome the
+    # asked again. Each resource refuses them by type, which is an outcome the
     # kernel already knows what to do with, rather than by whatever the platform
     # happened to raise.
-    probe = _refusing_probes()[probe_name]
+    #
+    # Every entry point is driven, not the probe alone: the probe, the load and
+    # the atomic probe-and-load read for themselves, so a refusal made at one of
+    # them and not the others is one a caller reaches around without noticing.
+    seam = _refusing_seams(Database(), probe_name)[entry_point]
     path = _unreadable_path(shape, tmp_path)
     with pytest.raises(UnsafeFilesystemPathError, match=_expected_refusal(probe_name, shape)):
-        probe(path)
+        seam(path)
 
 
 @posix_only
@@ -497,7 +537,7 @@ def test_a_refusal_is_caught_by_the_library_base_and_as_an_operating_system_erro
     # library's own base class reaches it, and so does every handler that has
     # always wrapped a filesystem call in `except OSError` -- so routing these
     # two shapes through a typed refusal takes nothing away from either.
-    probe = _refusing_probes()[probe_name]
+    probe = _refusing_seams(Database(), probe_name)["probe"]
     path = _unreadable_path(shape, tmp_path)
 
     reached: list[str] = []
@@ -532,7 +572,7 @@ def test_a_denied_path_still_fails_every_probe_as_a_denial(
     (holder / "sub").mkdir()
     (holder / "thing.txt").write_text(_SOURCE_TEXT, encoding="utf-8")
     denied = holder / ("sub" if probe_name == "directory" else "thing.txt")
-    probe = _refusing_probes()[probe_name]
+    probe = _refusing_seams(Database(), probe_name)["probe"]
 
     holder.chmod(0o000)
     try:

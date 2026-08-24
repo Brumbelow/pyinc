@@ -364,8 +364,10 @@ def _read_file(path: str) -> bytes | None:
         if isinstance(exc, PermissionError):
             # A denial on an otherwise ordinary path is a genuine failure the
             # kernel's failure records already handle identically warm and
-            # fresh. It keeps propagating. The kind check above runs first
-            # because a directory refused as a file is a denial on Windows.
+            # fresh. It keeps propagating, and the guard says so deliberately
+            # rather than leaving it to the order the arms happen to sit in.
+            # Which shapes read as missing is a separate question with a single
+            # answer, asked first, so a denial is a denial only once it has.
             raise
         raise UnsafeFilesystemPathError(f"Path names no readable file: {path}") from exc
 
@@ -379,8 +381,8 @@ def _listing_snapshot(path: str) -> DirectoryProbe:
     except (IsADirectoryError, NotADirectoryError):
         # A path that is not a directory is reported as one that is not: a
         # directory walk tells a module from a package by that answer, and the
-        # probe above turns it into its own third state rather than sharing
-        # the absent one.
+        # probe built on this listing turns it into a third state of its own
+        # rather than sharing the absent one.
         raise
     except PermissionError:
         # A denial on an otherwise ordinary path is a genuine failure the
