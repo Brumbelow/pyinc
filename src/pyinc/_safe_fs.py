@@ -450,8 +450,12 @@ def read_regular_file_with_identity(path: Path) -> tuple[bytes, tuple[int, int]]
 
 #: Errnos that mean a path names no readable regular file and never will by
 #: being read again, but which CPython gives no dedicated OSError subclass.
-#: ENXIO is what opening a bound unix socket raises.
-_READS_AS_MISSING_ERRNOS = frozenset({errno.ENXIO})
+#: Opening a bound unix socket is what reaches here, and the platforms spell
+#: it differently: Linux answers ENXIO, while POSIX leaves opening a socket
+#: to the implementation and the BSDs, macOS among them, answer EOPNOTSUPP.
+#: ENOTSUP is the same number as EOPNOTSUPP on Linux and a different one on
+#: macOS, so naming all three widens nothing where two of them agree.
+_READS_AS_MISSING_ERRNOS = frozenset({errno.ENXIO, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
 def _read_error_means_missing(path: str, error: OSError) -> bool:
@@ -465,7 +469,8 @@ def _read_error_means_missing(path: str, error: OSError) -> bool:
     and it is also what an ACL denial on a perfectly ordinary file raises,
     which must keep propagating. And the errnos with no subclass of their
     own that mean the same thing -- opening a bound socket is the one that
-    reaches here.
+    reaches here, under whichever spelling the platform gives it, because
+    Linux and the BSDs answer that open with different errnos.
     """
     if isinstance(error, (FileNotFoundError, IsADirectoryError, NotADirectoryError)):
         return True

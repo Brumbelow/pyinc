@@ -277,9 +277,13 @@ def _write_manifest(
             json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n",
         )
     except (OSError, ActionPathError) as error:
-        # The path is not what failed -- the write is. The outputs this
-        # ledger would have claimed are already published, so the next
-        # locked run is what reconciles the two.
+        # The step that did not happen is the ledger write, so that is what
+        # this is reported as -- including the one case where the manifest
+        # path itself is at fault and arrives here already converted to a
+        # path error, which is deliberately re-reported as a manifest failure
+        # rather than surfacing as a path refusal from a call the caller made
+        # about outputs. The outputs this ledger would have claimed are
+        # already published, so the next locked run is what reconciles the two.
         raise ActionManifestError(f"Cannot record owned outputs: {error}") from error
 
 

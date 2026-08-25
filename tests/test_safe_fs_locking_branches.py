@@ -347,6 +347,33 @@ def test_a_following_read_answers_a_bound_socket_as_no_readable_file(tmp_path: P
         server.close()
 
 
+@pytest.mark.parametrize(
+    ("spelling", "reads_as_missing"),
+    [("ENXIO", True), ("EOPNOTSUPP", True), ("ENOTSUP", True), ("EIO", False)],
+)
+def test_a_socket_reads_as_missing_under_every_platform_spelling(
+    spelling: str, reads_as_missing: bool, tmp_path: Path
+) -> None:
+    """The classifier answers for the errno, not for the platform it ran on.
+
+    Opening a bound socket is the failure the errno set exists for, and the
+    platforms disagree about which errno that is: Linux answers ENXIO, while
+    the BSDs, macOS among them, answer EOPNOTSUPP. Only one of those can be
+    produced by a real socket on the machine running this suite -- the cell
+    above binds one and gets whichever this platform gives -- so the
+    classifier is asked directly here instead. A constructed error is the only
+    honest way to pin the spelling this platform never raises, and without it
+    a socket would read as a refusal rather than as absent wherever the other
+    spelling is the one in use. A genuine I/O failure is the control: it names
+    no kind, and it keeps propagating.
+    """
+
+    number = getattr(errno, spelling)
+    path = str(tmp_path / "endpoint")
+    error = OSError(number, os.strerror(number), path)
+    assert safe_fs_internals._read_error_means_missing(path, error) is reads_as_missing
+
+
 @posix_only
 def test_a_following_read_answers_an_unending_device_without_waiting() -> None:
     device = Path(character_device())
