@@ -818,6 +818,43 @@ def thaw(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -
     return _thaw(value, registry, None)
 
 
+def _unhashable_thawed_subject(values: Iterable[Any]) -> str:
+    """Name the first thawed value a container refused to hold.
+
+    The interpreter's own unhashable-type error names the type and nothing
+    else, and its wording has moved between releases, so the refusals composed
+    from this one say which container arrived where only a hashable value can
+    go, in this module's words. Asked only after a container has already
+    refused, so an ordinary mapping or set pays nothing for the question. A
+    container can also refuse for a reason no single value carries -- a key
+    that hashes but raises while being compared to another -- and the unnamed
+    subject is what that reads as.
+    """
+
+    for value in values:
+        try:
+            hash(value)
+        except TypeError:
+            return f"a {type(value).__qualname__}"
+    return "a value"
+
+
+def _unhashable_key_refusal(keys: Iterable[Any]) -> UnsupportedValueError:
+    return UnsupportedValueError(
+        f"Frozen mapping key thaws into {_unhashable_thawed_subject(keys)}, which cannot "
+        "be a dictionary key. Encode such a key as a tuple or a frozen set, which thaw "
+        "into values a mapping can hold."
+    )
+
+
+def _unhashable_member_refusal(items: Iterable[Any]) -> UnsupportedValueError:
+    return UnsupportedValueError(
+        f"Frozen set member thaws into {_unhashable_thawed_subject(items)}, which cannot "
+        "be a set member. Encode such a member as a tuple or a frozen set, which thaw "
+        "into values a set can hold."
+    )
+
+
 def _thaw(value: Any, registry: _AdapterRegistry, env: list[Any] | None) -> Any:
     if isinstance(value, FrozenRef):
         if env is None:
@@ -833,14 +870,25 @@ def _thaw(value: Any, registry: _AdapterRegistry, env: list[Any] | None) -> Any:
     if isinstance(value, FrozenList):
         return [_thaw(item, registry, env) for item in value.items]
     if isinstance(value, FrozenDict):
-        return {
-            _thaw(key, registry, env): _thaw(item, registry, env) for key, item in value.entries
-        }
+        # Built first and inserted after, so a key the mapping will not take is
+        # reported as this module's refusal rather than as the interpreter's
+        # unhashable-type error, which names no position and spells itself
+        # differently on different releases.
+        entries = [
+            (_thaw(key, registry, env), _thaw(item, registry, env)) for key, item in value.entries
+        ]
+        try:
+            return dict(entries)
+        except TypeError as exc:
+            raise _unhashable_key_refusal(key for key, _item in entries) from exc
     if isinstance(value, FrozenSet):
         thawed_items = tuple(_thaw(item, registry, env) for item in value.items)
-        if value.kind == "frozenset":
-            return frozenset(thawed_items)
-        return set(thawed_items)
+        try:
+            if value.kind == "frozenset":
+                return frozenset(thawed_items)
+            return set(thawed_items)
+        except TypeError as exc:
+            raise _unhashable_member_refusal(thawed_items) from exc
     if isinstance(value, FrozenRecord):
         return {key: _thaw(item, registry, env) for key, item in value.entries}
     if isinstance(value, tuple):
@@ -881,13 +929,25 @@ def _fill_shell(shell: Any, node: Any, registry: _AdapterRegistry, env: list[Any
             shell.append(_thaw(item, registry, env))
         return
     if isinstance(node, FrozenDict):
+        # The same refusals the tree walk composes: a shared or cyclic value is
+        # reached through a reference here rather than written inline, and what
+        # the reference resolves to can be just as unable to be a key.
         for key, item in node.entries:
-            shell[_thaw(key, registry, env)] = _thaw(item, registry, env)
+            thawed_key = _thaw(key, registry, env)
+            thawed_item = _thaw(item, registry, env)
+            try:
+                shell[thawed_key] = thawed_item
+            except TypeError as exc:
+                raise _unhashable_key_refusal((thawed_key,)) from exc
         return
     if isinstance(node, FrozenSet):
         if node.kind == "set":
             for item in node.items:
-                shell.add(_thaw(item, registry, env))
+                thawed_item = _thaw(item, registry, env)
+                try:
+                    shell.add(thawed_item)
+                except TypeError as exc:
+                    raise _unhashable_member_refusal((thawed_item,)) from exc
         return
     if isinstance(node, FrozenRecord):
         for key, item in node.entries:

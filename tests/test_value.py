@@ -1431,3 +1431,72 @@ def test_canonical_relation_refuses_values_that_are_not_snapshots() -> None:
         snapshots_equal(object(), object())
     with pytest.raises(UnsupportedValueError):
         semantic_equal(object(), object())
+
+
+_UNHASHABLE_THAW_ARMS = (
+    pytest.param(
+        FrozenDict(entries=((FrozenDict(entries=(("k", 1),)), "value"),)),
+        "cannot be a dictionary key",
+        id="mapping-key",
+    ),
+    pytest.param(
+        FrozenSet(kind="set", items=(FrozenDict(entries=(("k", 1),)),)),
+        "cannot be a set member",
+        id="set-member",
+    ),
+    pytest.param(
+        FrozenGraph(
+            nodes=(
+                FrozenList(items=(1, 2)),
+                FrozenDict(entries=((FrozenRef(index=0), "value"),)),
+            ),
+            root=FrozenRef(index=1),
+        ),
+        "cannot be a dictionary key",
+        id="mapping-key-through-a-shared-node",
+    ),
+    pytest.param(
+        FrozenGraph(
+            nodes=(
+                FrozenList(items=(1, 2)),
+                FrozenSet(kind="set", items=(FrozenRef(index=0),)),
+            ),
+            root=FrozenRef(index=1),
+        ),
+        "cannot be a set member",
+        id="set-member-through-a-shared-node",
+    ),
+)
+
+
+@pytest.mark.parametrize(("snapshot", "expected"), _UNHASHABLE_THAW_ARMS)
+def test_thawing_a_container_where_a_hashable_value_belongs_is_refused(
+    snapshot: Any, expected: str
+) -> None:
+    """A key or member that thaws into a container is the encoding's business.
+
+    Both positions accept whatever the snapshot puts there, and a mapping or a
+    list arriving in one of them is discovered only when the reconstructed
+    container refuses to take it. That refusal is the interpreter's, in wording
+    that has moved between releases and that says nothing about the snapshot it
+    came out of, so the boundary answers in its own words instead and names the
+    container that cannot go where it was put. Both encodings reach it: written
+    inline, and lifted into a shared node the reference resolves to.
+    """
+
+    with pytest.raises(UnsupportedValueError, match=expected):
+        thaw(snapshot)
+
+
+def test_thawing_keeps_every_key_and_member_a_hashable_value_can_hold() -> None:
+    """The refusal is for the position, not for the shape reaching it.
+
+    A tuple key holding scalars, a frozen set member, and the same containers
+    in the value position are all hashable or unconstrained, and each still
+    thaws to the value it encodes.
+    """
+
+    mapping = {("a", 1): [1, 2], frozenset({1, 2}): "member"}
+    assert thaw(freeze(mapping)) == mapping
+    members = {1, ("a", 2), frozenset({3})}
+    assert thaw(freeze(members)) == members

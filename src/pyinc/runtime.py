@@ -283,6 +283,38 @@ def _live_type_binding(value: type[Any]) -> Any:
     return current
 
 
+def _sorted_state_entries(state: dict[Any, Any]) -> list[tuple[Any, Any]]:
+    """Order an instance dictionary's entries, whatever its keys turn out to be.
+
+    An instance dictionary is an ordinary dict, and nothing stops a caller
+    writing a key into one that is not a string. Ordering the entries by their
+    keys then asks an integer to compare against a string, which raises instead
+    of answering -- and a walk that has been handed a value has to decide the
+    order rather than let the keys decide whether there is one at all.
+
+    So the plain order is attempted first, which keeps every ordinary
+    dictionary on exactly the order, and the cost, it has today; a key set that
+    does not order itself falls back to each key's type name and repr, which
+    orders any two keys against each other. Attempted rather than checked in
+    front for the reason the handle observation states beside its own catch,
+    and because a check would refuse an all-integer dictionary that orders
+    itself perfectly well and is folded today. The fallback order is internal:
+    it is not a documented ordering and nothing outside this module may depend
+    on which order it picks. A key whose repr names its identity rather than
+    its value -- a plain object's does -- therefore orders differently in
+    another process; every ordinary key type reprs the same way everywhere, and
+    a key of the other kind carries no value a fingerprint could pin either.
+    """
+
+    try:
+        return sorted(state.items())
+    except TypeError:
+        return sorted(
+            state.items(),
+            key=lambda entry: (type(entry[0]).__qualname__, repr(entry[0])),
+        )
+
+
 def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
     """Live-binding leaves for every anchored type an eager value resolves.
 
@@ -327,7 +359,7 @@ def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
             return
         if not isinstance(state, dict):
             return
-        for name, item in sorted(state.items()):
+        for name, item in _sorted_state_entries(state):
             if name not in exclude:
                 sweep(item)
 
@@ -4728,7 +4760,9 @@ class Database:
             # proxy would pin an object rebuilt on the next read.
             if not isinstance(state, dict):
                 return None
-            return tuple((name, observe_value(item)) for name, item in sorted(state.items()))
+            return tuple(
+                (name, observe_value(item)) for name, item in _sorted_state_entries(state)
+            )
 
         def observe_function(fn: FunctionType) -> Any:
             if id(fn) in seen:
@@ -4755,7 +4789,10 @@ class Database:
                     else (name, _UNBOUND_GLOBAL_OBSERVATION)
                     for name in sorted(set(code.co_names))
                 ),
-                tuple((name, observe_value(value)) for name, value in sorted(vars(fn).items())),
+                tuple(
+                    (name, observe_value(value))
+                    for name, value in _sorted_state_entries(vars(fn))
+                ),
                 observe_metadata(fn),
             )
 
@@ -6101,7 +6138,9 @@ class Database:
                             active_ids=active_ids,
                         ),
                     )
-                    for state_name, item in sorted(self._static_instance_dict(value).items())
+                    for state_name, item in _sorted_state_entries(
+                        self._static_instance_dict(value)
+                    )
                     if state_name not in field_names
                 )
                 return (
@@ -6139,7 +6178,7 @@ class Database:
                     active_ids=active_ids,
                 ),
             )
-            for state_name, item in sorted(self._static_instance_dict(value).items())
+            for state_name, item in _sorted_state_entries(self._static_instance_dict(value))
             if not self._is_wraps_copied_annotations(value, state_name, item)
         )
 
@@ -7488,7 +7527,7 @@ class Database:
                     freeze(item, adapters=self._adapters),
                     encode(item),
                 )
-                for name, item in sorted(self._static_instance_dict(value).items())
+                for name, item in _sorted_state_entries(self._static_instance_dict(value))
                 if name not in excluded
             )
 
@@ -7945,7 +7984,7 @@ class Database:
                         name,
                         self._freeze_static_capture(item, active_ids),
                     )
-                    for name, item in sorted(self._static_instance_dict(value).items())
+                    for name, item in _sorted_state_entries(self._static_instance_dict(value))
                     if name not in field_names
                 )
                 return ("frozen-dataclass", type_payload, field_payload, extra_state)
@@ -7997,7 +8036,7 @@ class Database:
             )
         return tuple(
             (name, self._freeze_static_capture(item, active_ids))
-            for name, item in sorted(self._static_instance_dict(value).items())
+            for name, item in _sorted_state_entries(self._static_instance_dict(value))
         )
 
     @contextmanager

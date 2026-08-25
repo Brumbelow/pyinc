@@ -5890,3 +5890,80 @@ def test_reading_a_captured_functions_globals_is_rejected(
             Database().get(read_secret)
     finally:
         sys.modules.pop(module_name, None)
+
+
+def _with_state_entry(value: Any, key: Any, item: Any) -> Any:
+    """Write an entry straight into an instance dictionary.
+
+    Nothing about a `__dict__` requires its keys to be strings once the
+    instance exists, which is why the walks that fold instance state meet the
+    shape at all; attribute assignment is not a route to it.
+    """
+
+    cast(dict[Any, Any], object.__getattribute__(value, "__dict__"))[key] = item
+    return value
+
+
+class _MixedStateHolder:
+    def __init__(self) -> None:
+        self.value = 1
+
+
+class _TaggedInt(int):
+    pass
+
+
+_mixed_instance_state = _with_state_entry(_MixedStateHolder(), 7, "seven")
+_integer_keyed_state = _with_state_entry(_with_state_entry(_TaggedInt(3), 7, "seven"), 3, "three")
+_mixed_keyed_state = _with_state_entry(_with_state_entry(_TaggedInt(3), "tag", "t"), 7, "seven")
+
+
+def test_a_capture_whose_state_holds_a_non_string_key_answers_with_a_typed_refusal() -> None:
+    """The walk over an instance dictionary decides its own order.
+
+    A dictionary is free to hold a key that is not a string, and ordering such
+    a dictionary by its keys asks an integer to compare against a string, which
+    raises rather than answering. Deciding the order at the walk lets the
+    capture reach the verdict its shape has always earned -- this one is a
+    plain class carrying mutable state -- instead of a comparison failure from
+    inside the sort.
+    """
+
+    @query(key="non-string-instance-state")
+    def broken(db: Database) -> int:
+        return len(_mixed_instance_state.__dict__)
+
+    db = Database()
+    with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
+        db.get(broken)
+    # Nothing was recorded behind the refusal, so the answer is the same every
+    # time: the fingerprint memo is empty and the second request re-derives the
+    # verdict rather than serving a stored one.
+    assert broken not in db._query_fingerprint_memo
+    with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
+        db.get(broken)
+
+
+def test_a_capture_whose_state_keys_are_not_strings_is_still_fingerprinted() -> None:
+    """Deciding the order keeps the shapes that already had one.
+
+    An instance dictionary keyed entirely by integers orders itself perfectly
+    well and is fingerprinted today, so a refusal in front of the sort would
+    reject a shape that works. The order is decided instead, which keeps that
+    shape working and brings the mixed one with it -- each at one fingerprint
+    that does not move between two computations of the same unchanged value.
+    """
+
+    @query(key="integer-instance-state")
+    def integer_keys(db: Database) -> int:
+        return len(_integer_keyed_state.__dict__)
+
+    @query(key="mixed-instance-state")
+    def mixed_keys(db: Database) -> int:
+        return len(_mixed_keyed_state.__dict__)
+
+    assert Database().get(integer_keys) == 2
+    assert Database().get(mixed_keys) == 2
+    for handle in (integer_keys, mixed_keys):
+        first = Database()._query_fingerprint(handle)
+        assert Database()._query_fingerprint(handle) == first

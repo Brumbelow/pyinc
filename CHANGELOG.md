@@ -358,6 +358,28 @@ decided at release time.
   source — so nothing that read before reads differently, including a source
   reached through a symbolic link and one whose declared encoding is detected
   from its first lines.
+- A captured value whose instance dictionary holds a key that is not a string
+  no longer escapes `db.get()` as a comparison error from inside a sort. The
+  walks that folded such a dictionary by comparing its keys — the query's
+  definition observation, the type-anchor sweep, the ambient-capture payloads
+  and the resource configuration fold — decide the order themselves now: the
+  plain order is kept wherever the keys provide one, so nothing fingerprinted
+  before is fingerprinted differently, and a key set that does not order itself
+  falls back to a total order instead of raising. Such a value reaches the
+  verdict its own shape has always earned — for a plain class carrying mutable
+  state, the refusal naming the capture — and a dictionary keyed entirely by
+  integers keeps being folded as it always was. The equality/cutoff policy and
+  adapter state folds are unchanged, because neither ever let that comparison
+  error out: the policy fold already reported it in its own words, and the
+  adapter fold already recorded such an adapter as registered-unverified and
+  refused it on drift. Both keep the answers they gave.
+- Thawing a snapshot that names a container where only a hashable value can go
+  — a mapping key, a set member — now refuses as an unsupported value naming
+  the container that cannot go there, rather than letting the interpreter's own
+  unhashable-type error out with no mention of the snapshot it came from. Both
+  encodings reach the refusal: a container written inline, and one lifted into
+  a shared node that a reference resolves to. Every key and member a hashable
+  value can hold thaws exactly as before.
 
 ### Added
 
