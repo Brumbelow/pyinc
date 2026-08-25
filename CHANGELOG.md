@@ -7,7 +7,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 v3.1.1 was tagged but never published; its release run was cancelled after an
-external audit surfaced the consistency issues fixed below. The v3.1.1 tag
+internal review surfaced the consistency issues fixed below. The v3.1.1 tag
 remains in history and should not be used; the next published version will be
 decided at release time.
 
@@ -78,11 +78,11 @@ decided at release time.
   `thaw` received a tuple holding the unresolved reference in `checked` and
   `fast`, and in `strict` a tuple holding a container whose contents at that
   instant depended on how far the encoding's fill order had got, so one adapted
-  value round-tripped to two different values with nothing to say so. An adapter returns a payload
-  built from tuples and scalars, which is written inline and comes back whole
-  wherever the adapted value sits; an adapted value in a tree-shaped result is
-  unaffected in every payload shape, as the built-in stat adapter's triple of
-  scalars is everywhere.
+  value round-tripped to two different values with nothing to say so. An
+  adapter returns a payload built from tuples and scalars, which is written
+  inline and comes back whole wherever the adapted value sits; an adapted
+  value in a tree-shaped result is unaffected in every payload shape, as the
+  built-in stat adapter's triple of scalars is everywhere.
 
 ### Fixed
 
