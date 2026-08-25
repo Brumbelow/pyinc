@@ -510,7 +510,7 @@ decided at release time.
   exactly what is true; the demo page carries full provenance for its
   numbers.
 - The development-status classifier is `4 - Beta` until the hardened release
-  has soaked and an external audit of the fixes closes.
+  has soaked and an internal review of the fixes closes.
 - The default equality relation everywhere is canonical-encoding equality over
   the stored snapshots. `semantic_equal(1, 1.0)`, `semantic_equal(True, 1)`,
   `semantic_equal(False, 0)`, `semantic_equal(0.0, -0.0)` and
