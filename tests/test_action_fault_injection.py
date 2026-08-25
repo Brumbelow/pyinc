@@ -1468,6 +1468,44 @@ def _safe_fs_imports() -> frozenset[str]:
     return frozenset(names) - {"UnsafeFilesystemPathError"}
 
 
+def _imported_names() -> frozenset[str]:
+    """Every name the action module binds by importing it.
+
+    The four inventories above see attribute calls and a fixed list of
+    bare names, so a filesystem primitive imported by name from anywhere
+    but the safe-filesystem module and called as a plain name is invisible
+    to all of them. Freezing what the module imports closes that by
+    construction rather than by enumeration: a new import fails here
+    first, and whoever adds it decides then whether it touches the
+    filesystem.
+    """
+    names: set[str] = set()
+    for node in ast.walk(_action_ast()):
+        if isinstance(node, ast.Import):
+            names.update((alias.asname or alias.name).split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names)
+    return frozenset(names)
+
+
+#: Every name the action module imports, frozen. This set is DERIVED by
+#: running _imported_names() against the module and pasting its sorted
+#: output -- never transcribed by hand, because a hand-written entry pins
+#: what someone believed rather than what the module imports. A new import
+#: fails here first, and whoever adds it decides then whether it touches
+#: the filesystem and so needs a fault cell.
+IMPORTED_NAMES = frozenset({
+    "ActionLockTimeoutError", "ActionManifestError", "ActionPathError", "Any",
+    "Callable", "Collection", "Database", "FileLock", "Iterable", "Mapping",
+    "Path", "PurePosixPath", "PureWindowsPath", "TYPE_CHECKING",
+    "UnsafeFilesystemPathError", "_validate_lock_timeout", "annotations",
+    "atomic_write", "contextlib", "dataclass", "hashlib", "json", "os",
+    "overload", "read_regular_file", "read_regular_file_with_identity",
+    "remove_empty_directory", "stat", "tempfile", "time", "unicodedata",
+    "unlink_regular_file",
+})
+
+
 def _resolve_cell(reference: str) -> object:
     module_name, separator, test_name = reference.partition("::")
     if not separator:
@@ -1684,6 +1722,10 @@ def test_no_unlisted_os_call_enters_the_action_layer() -> None:
 
 def test_no_unlisted_method_call_enters_the_action_layer() -> None:
     assert _method_call_names() == METHOD_CALL_NAMES
+
+
+def test_no_unlisted_import_enters_the_action_layer() -> None:
+    assert _imported_names() == IMPORTED_NAMES
 
 
 def test_every_public_safe_fs_seam_reached_by_actions_is_registered() -> None:
