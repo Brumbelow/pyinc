@@ -335,6 +335,16 @@ decided at release time.
   and the original failure as its cause. A path that is simply absent is still
   answered as absent rather than refused, so no reconcile that succeeded before
   behaves differently.
+- Writing the ownership ledger that records an action's published outputs now
+  refuses as a manifest error rather than as a path error or a bare
+  operating-system error. The path the ledger is written to is not what failed —
+  the write is, and a manifest that cannot be trusted is already reported this
+  way on the read side. The outputs the ledger would have claimed are published
+  before it is written, so the refusal leaves them in place and the next locked
+  run is what reconciles the two: it finds the bytes already correct, classifies
+  them unchanged, and writes the ledger that could not be written before. The
+  refusal names the step that failed and keeps the original failure as its
+  cause.
 
 ### Added
 

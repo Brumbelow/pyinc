@@ -15,7 +15,6 @@ from pathlib import Path
 import pytest
 from _action_fault_injection import (
     FAULT_FAMILIES,
-    RAW_OR_TYPED,
     assert_mutation_fault_invariants,
     assert_no_tmp_residue,
     assert_refusal_replays_after_checkpoint,
@@ -90,7 +89,7 @@ def test_a_ledger_write_fault_leaves_outputs_published_and_the_next_run_converge
     db.set(source, desired_spec({"out.txt": "fresh"}))
     disarm = inject_fault(monkeypatch, "atomic_write", errno.ENOSPC, gate=manifest_gate)
 
-    with pytest.raises(RAW_OR_TYPED):
+    with pytest.raises(ActionManifestError):
         emit.reconcile(db, root=root)
 
     # The output landed before the ledger fault; the set is deliberately
@@ -1061,7 +1060,7 @@ def test_a_read_only_state_directory_leaves_outputs_published_and_the_ledger_old
 
     state.chmod(0o555)
     try:
-        with pytest.raises(RAW_OR_TYPED):
+        with pytest.raises(ActionManifestError):
             emit.reconcile(db, root=root, state_dir=state)
     finally:
         state.chmod(0o755)
@@ -1095,7 +1094,7 @@ def test_a_ledger_write_fault_during_a_voiding_run_leaves_the_void_unpersisted(
         monkeypatch, "atomic_write", errno.ENOSPC, gate=manifest_gate
     )
 
-    with pytest.raises(RAW_OR_TYPED):
+    with pytest.raises(ActionManifestError):
         emit.reconcile(db, root=root, state_dir=state)
 
     # The voiding decision could not be persisted: the ledger still holds

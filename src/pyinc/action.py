@@ -271,10 +271,16 @@ def _write_manifest(
         "version": _MANIFEST_VERSION,
         "outputs": dict(sorted(outputs.items())),
     }
-    _atomic_write(
-        _manifest_path(state_dir, tool),
-        json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n",
-    )
+    try:
+        _atomic_write(
+            _manifest_path(state_dir, tool),
+            json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n",
+        )
+    except (OSError, ActionPathError) as error:
+        # The path is not what failed -- the write is. The outputs this
+        # ledger would have claimed are already published, so the next
+        # locked run is what reconciles the two.
+        raise ActionManifestError(f"Cannot record owned outputs: {error}") from error
 
 
 def _atomic_write(target: Path, data: bytes) -> None:
