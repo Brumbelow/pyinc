@@ -113,7 +113,15 @@ class Resource(Generic[KeyT, ValueT, ProbeT]):
         return self.probe(key), self.load(db, key)
 
     def identity(self) -> Any:
-        """Return snapshot-safe configuration that distinguishes this resource."""
+        """Return snapshot-safe configuration that distinguishes this resource.
+
+        The configuration must not move while the resource is in use. The
+        default hands back the resource itself, so a resource that keeps
+        observation state in its own attributes redefines itself every time it
+        is read and is refused at the read that observes the change; such a
+        resource defines this method and returns the configuration that
+        distinguishes it instead.
+        """
         return self
 
     def label(self, key: KeyT) -> str:

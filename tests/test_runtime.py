@@ -2091,6 +2091,242 @@ def test_file_resource_identity_includes_configuration(tmp_path: Path) -> None:
     assert db.get(read_latin1, str(path)) == "caf\xe9"
 
 
+@dataclass
+class _ProbeRewritingResource(Resource[str, str, tuple[str, int]]):
+    """Probing writes into a log the resource keeps on itself.
+
+    The default ``identity()`` hands back the resource, so this log is the whole
+    of what distinguishes it and every probe redefines it. Written in place: the
+    list the resource holds keeps its identity, so nothing but the resource's
+    own recorded fingerprint can notice the write.
+    """
+
+    reads: list[str] = dataclasses.field(default_factory=list)
+
+    def probe(self, key: str) -> tuple[str, int]:
+        self.reads.append(key)
+        return ("present", len(self.reads))
+
+    def load(self, db: Database, key: str) -> str:
+        return f"{key}:{len(self.reads)}"
+
+    def label(self, key: str) -> str:
+        return f"probe-rewriting[{key}]"
+
+
+@dataclass
+class _LoadRewritingResource(Resource[str, str, tuple[str]]):
+    """The same defect with a constant probe: loading is what moves the state."""
+
+    loads: list[str] = dataclasses.field(default_factory=list)
+
+    def probe(self, key: str) -> tuple[str]:
+        return ("present",)
+
+    def load(self, db: Database, key: str) -> str:
+        self.loads.append(key)
+        return f"{key}:{len(self.loads)}"
+
+    def label(self, key: str) -> str:
+        return f"load-rewriting[{key}]"
+
+
+def _resource_tally(key: str, event: str) -> None:
+    with open(f"{key}.calls", "a", encoding="utf-8") as handle:
+        handle.write(event)
+
+
+def _resource_tallied(key: str) -> str:
+    calls = Path(f"{key}.calls")
+    return calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
+@dataclass(frozen=True)
+class _StableTallyingResource(Resource[str, str, tuple[str]]):
+    """Keeps no state of its own; the hook tally rides a file beside the key."""
+
+    def probe(self, key: str) -> tuple[str]:
+        _resource_tally(key, "p")
+        return ("present",)
+
+    def load(self, db: Database, key: str) -> str:
+        _resource_tally(key, "l")
+        return f"{key}-value"
+
+    def label(self, key: str) -> str:
+        return f"stable-tallying[{key}]"
+
+
+@dataclass
+class _ReparameterizingResource(Resource[str, str, tuple[str, int]]):
+    """Declares its own identity and moves it deliberately.
+
+    Every probe advances the generation the resource reports, so each read is a
+    differently configured resource rather than one resource contradicting
+    itself about what it is. It moves its state exactly the way the refused
+    resources above do, so what parts them is the declared identity and nothing
+    else.
+    """
+
+    generations: list[str] = dataclasses.field(default_factory=list)
+
+    def identity(self) -> Any:
+        return ("generation", len(self.generations))
+
+    def probe(self, key: str) -> tuple[str, int]:
+        self.generations.append(key)
+        return ("present", len(self.generations))
+
+    def load(self, db: Database, key: str) -> str:
+        return f"{key}:{len(self.generations)}"
+
+    def label(self, key: str) -> str:
+        return f"reparameterizing[{key}]"
+
+
+@dataclass
+class _TransientlyUnreadableResource(Resource[str, str, tuple[str]]):
+    """Hands back the resource itself, but a read of it can fail and then heal.
+
+    The marker file stands for a world that is briefly unreadable: the read
+    that finds it raises and clears it, so the read after that one answers.
+    """
+
+    marker: str = ""
+
+    def identity(self) -> Any:
+        marker = Path(self.marker)
+        if marker.exists():
+            marker.unlink()
+            raise RuntimeError("the resource cannot be read right now")
+        return self
+
+    def probe(self, key: str) -> tuple[str]:
+        return ("present",)
+
+    def load(self, db: Database, key: str) -> str:
+        return f"{key}-value"
+
+    def label(self, key: str) -> str:
+        return f"transiently-unreadable[{key}]"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(
+    "make_resource",
+    [_ProbeRewritingResource, _LoadRewritingResource],
+    ids=["mutates-in-probe", "mutates-in-load"],
+)
+def test_a_resource_that_rewrites_itself_between_reads_is_refused(
+    make_resource: Callable[[], Resource[str, str, Any]], mode: str, tmp_path: Path
+) -> None:
+    """Either half of the read is enough to leave the resource undefined.
+
+    A resource that distinguishes itself only by its own state, and moves that
+    state while being read, has nothing a warm request can compare against.
+    """
+
+    resource = make_resource()
+    target = str(tmp_path / "cell")
+
+    @query
+    def read_key(db: Database, key: str) -> str:
+        return resource.read(db, key)
+
+    db = Database(mode=mode)
+    # The first request records the fingerprint; the flip is what the next
+    # request's guard sees, so the refusal lands on the second get and not the
+    # first.
+    assert db.get(read_key, target) == f"{target}:1"
+    with pytest.raises(UnsupportedValueError, match="no stable identity"):
+        db.get(read_key, target)
+
+    # Refused rather than half-done: the second request left no execution and
+    # no second resource record behind it.
+    stats = db.statistics()
+    assert (stats.query_executions, stats.query_reuses, stats.resource_count) == (1, 0, 1)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_frozen_resource_reuses_its_record(mode: str, tmp_path: Path) -> None:
+    """The control: a resource that holds still is still reused, not refused."""
+
+    resource = _StableTallyingResource()
+    target = str(tmp_path / "cell")
+
+    @query
+    def read_key(db: Database, key: str) -> str:
+        return resource.read(db, key)
+
+    db = Database(mode=mode)
+    for _ in range(4):
+        assert db.get(read_key, target) == f"{target}-value"
+
+    stats = db.statistics()
+    assert (stats.query_executions, stats.query_reuses, stats.resource_count) == (1, 3, 1)
+    # The tally cannot ride the resource -- a resource that keeps its own
+    # counter is exactly what the refusal above is for -- so it rides a file
+    # beside the key: one load, then a probe for each warm validation.
+    assert _resource_tallied(target) == "pl" + "ppp"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_resource_defining_its_own_identity_may_reparameterize(
+    mode: str, tmp_path: Path
+) -> None:
+    """A declared identity that moves is a new configuration, not a defect.
+
+    Re-fingerprinting on every read is what such a resource has always cost and
+    what it keeps costing; only the resource that never said what distinguishes
+    it is refused.
+    """
+
+    resource = _ReparameterizingResource()
+    target = str(tmp_path / "cell")
+
+    @query
+    def read_key(db: Database, key: str) -> str:
+        return resource.read(db, key)
+
+    db = Database(mode=mode)
+    assert [db.get(read_key, target) for _ in range(4)] == [
+        f"{target}:{generation}" for generation in (1, 2, 3, 4)
+    ]
+
+    stats = db.statistics()
+    assert (stats.query_executions, stats.query_reuses, stats.resource_count) == (4, 0, 4)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_resource_that_becomes_unreadable_still_recomputes(mode: str, tmp_path: Path) -> None:
+    """A failed identity read is a degradation, not a redefinition.
+
+    The guard cannot compare a fingerprint it never got, so the request pays a
+    full recompute -- refusing there would turn a documented degradation into a
+    crash.
+    """
+
+    marker = tmp_path / "unreadable"
+    resource = _TransientlyUnreadableResource(marker=str(marker))
+    target = str(tmp_path / "cell")
+
+    @query
+    def read_key(db: Database, key: str) -> str:
+        return resource.read(db, key)
+
+    db = Database(mode=mode)
+    assert db.get(read_key, target) == f"{target}-value"
+
+    marker.write_text("", encoding="utf-8")
+    assert db.get(read_key, target) == f"{target}-value"
+    # Consumed by the guard's own read of the resource, which is the witness
+    # that the unreadable answer really is the one the guard had to judge.
+    assert not marker.exists()
+
+    stats = db.statistics()
+    assert (stats.query_executions, stats.query_reuses, stats.resource_count) == (1, 1, 1)
+
+
 def test_env_resource_instances_share_stable_behavior(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

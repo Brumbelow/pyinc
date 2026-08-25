@@ -871,9 +871,12 @@ files as a single reconcile from a fresh `Database` into an empty directory.
 - `Resource[KeyT, ValueT, ProbeT]` and `Database.read_resource(...)` are public.
   Resource identity includes the resource's configuration, the implementations
   of every state-observation hook (`probe`, `load`, `probe_and_load`, and
-  `identity`), and the interpreter/build identity. The built-in resources
-  (condition 2) cover text, binary, environment, stat, directory, and
-  path-resolution observation.
+  `identity`), and the interpreter/build identity. A configuration that changes
+  between two reads leaves the resource undefined, and is refused by name at the
+  read that observes the change: a resource that keeps observation state in its
+  own attributes must define `identity()` to return the configuration that
+  distinguishes it. The built-in resources (condition 2) cover text, binary,
+  environment, stat, directory, and path-resolution observation.
 - `Database.inspect(...)` exposes the last recorded provenance tree as structured
   data. `Database.explain(...)` formats it for humans. Inspection is
   observational and does not force an extra verification pass;

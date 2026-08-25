@@ -47,6 +47,18 @@ decided at release time.
   query body runs only when the kernel decides to execute it, so a teardown
   placed inside one landed zero or one time per request depending on cache
   history — the same ground on which registering from a body is refused.
+- A resource that redefines itself between two reads is now refused. The
+  default `identity()` hands back the resource itself, so a resource that keeps
+  observation state in its own attributes — a read log, a counter, a cache —
+  has no stable definition fingerprint, and the read that observes the change
+  now raises `UnsupportedValueError` naming the resource. It previously ran,
+  and ran worse than a refusal: every warm request cold-executed, nothing was
+  ever reused, and each request left the resource record it replaced behind, so
+  a query reading one resource key accumulated one orphaned record per request
+  while reporting nothing wrong. An author keeps the observation state outside
+  the resource, or defines `identity()` to return the configuration that
+  distinguishes it; a resource that reparameterizes itself through a declared
+  `identity()` keeps re-fingerprinting exactly as it did before.
 
 ### Fixed
 

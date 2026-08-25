@@ -4206,8 +4206,11 @@ class Database:
             and self._definition_observation_matches(cached[1], definition_observation)
             # Cheapest arm first: re-resolving a chain is a lookup per path
             # segment, where a module stamp hashes a file and a resource digest
-            # re-runs identity(). Every arm is a pure read, so the order only
-            # decides what a mismatch costs before it is found.
+            # re-runs identity(). Every arm but the last is a pure read, so
+            # among those the order only decides what a mismatch costs before
+            # it is found. The resource arm goes last because it can refuse,
+            # and a moved resource means the resource redefined itself only
+            # once nothing else about the query has moved.
             and all(
                 self._resolve_module_path_target(module, path) is expected
                 for module, path, expected in cached[5]
@@ -4220,10 +4223,7 @@ class Database:
             and all(
                 self._module_observation_stamp(module) == expected for module, expected in cached[3]
             )
-            and all(
-                self._resource_identity_digest(resource) == expected
-                for resource, expected in cached[4]
-            )
+            and self._resource_identities_hold(cached[4])
         ):
             return cached[2]
 
@@ -4448,6 +4448,43 @@ class Database:
                 f"{type(value).__module__}.{type(value).__qualname__} on its handle. "
                 "Move mutable state behind Input/Resource nodes or use an immutable value."
             ) from exc
+
+    def _resource_identities_hold(self, recorded: tuple[tuple[Any, str], ...]) -> bool:
+        """Re-read every captured resource's identity, refusing an unstable one.
+
+        A resource that distinguishes itself only by its own state -- the
+        default ``identity()`` hands back the instance -- has no stable
+        identity if a probe or a load mutates that state. Nothing else about
+        the query has moved by the time this arm is reached, so a digest that
+        has moved says the resource redefined itself between two reads: every
+        warm request would cold-execute and leave the record it replaced
+        behind. A resource that defines its own ``identity()`` and returns
+        something different is reparameterizing itself deliberately, and
+        keeps re-fingerprinting the way it always has.
+        """
+        for resource, expected in recorded:
+            digest = self._resource_identity_digest(resource)
+            if digest == expected:
+                continue
+            if digest == _UNREADABLE_RESOURCE_DIGEST:
+                # A resource that has become unreadable forces the full
+                # recompute rather than serving a fingerprint nothing
+                # checked. That is a degradation, not a redefinition.
+                return False
+            # A resource that hands back itself is one that never said what
+            # distinguishes it, so its own state is all there is to compare --
+            # which is asked here by identity rather than by class so that the
+            # question costs this module no new knowledge of the resource
+            # layer it is read from.
+            if self._resource_configuration(resource) is resource:
+                raise UnsupportedValueError(
+                    f"Resource {type(resource).__module__}:{type(resource).__qualname__} "
+                    "changed its own state between two reads, so it has no stable "
+                    "identity. Keep observation state out of the resource, or define "
+                    "identity() to return the configuration that distinguishes it."
+                )
+            return False
+        return True
 
     def _resource_identity_digest(self, resource: Any) -> str:
         """Re-read a captured resource's configuration for the memo guard.
