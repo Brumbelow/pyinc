@@ -6149,23 +6149,19 @@ class BoxedAdapter(ValueAdapter):
 
 @dataclass(frozen=True)
 class Point:
-    # Optional because the adapter below reports what it was actually handed,
-    # and in the graph shapes these cells build the payload is not filled yet
-    # when thaw runs.
-    x: int | None
-    y: int | None
+    x: int
+    y: int
 
 
 class PointAdapter(ValueAdapter):
     """Rebuilds a Point from a mapping payload, read while `thaw` runs.
 
-    Reading the payload instead of aliasing it is deliberate. An adapter that
+    Reading the payload instead of aliasing it is deliberate: an adapter that
     only stores what it is handed hides what the payload held at the moment
-    `thaw` was called -- under `checked` and `fast` it is holding a container
-    the kernel fills afterwards, and under `strict` a rebuilt shell the kernel
-    fills in node order. Whether either has been filled by then depends on
-    where the adapted value sits relative to its payload's node, so the cells
-    below fix the shape and assert what that shape yields.
+    `thaw` was called. A mapping payload is written into the value itself
+    wherever the encoding can hand it back whole, and a value whose payload it
+    could not is refused at the freeze instead of reaching `thaw`, so the
+    payload every cell below reads is the one the adapter wrote.
     """
 
     def freeze(self, value: Point, freeze: Any) -> Any:
@@ -6174,7 +6170,31 @@ class PointAdapter(ValueAdapter):
 
     def thaw(self, snapshot: Any, thaw: Any) -> Point:
         payload = thaw(snapshot)
-        return Point(x=payload.get("x"), y=payload.get("y"))
+        return Point(x=payload["x"], y=payload["y"])
+
+
+@dataclass(frozen=True)
+class Reading:
+    left: int
+    right: int
+
+
+class ReadingAdapter(ValueAdapter):
+    """Rebuilds a Reading from a positional payload of scalars.
+
+    A payload built from tuples and scalars is written into the value itself
+    rather than held as a node of the shared-structure encoding, so it comes
+    back whole wherever the adapted value sits. That is what lets the graph
+    cells below place an adapted value inside shared structure at all.
+    """
+
+    def freeze(self, value: Reading, freeze: Any) -> Any:
+        assert callable(freeze)
+        return (value.left, value.right)
+
+    def thaw(self, snapshot: Any, thaw: Any) -> Reading:
+        left, right = thaw(snapshot)
+        return Reading(left=left, right=right)
 
 
 class _MutableCurrency:
@@ -6424,19 +6444,19 @@ def test_strict_mode_reconstructs_adapted_values_inside_shared_graphs() -> None:
     stage = Input[int]("strict-adapted-graph-stage")
 
     @query
-    def shared_points(db: Database) -> object:
+    def shared_readings(db: Database) -> object:
         stage.read(db)
-        inner = [Point(4, 9)]
+        inner = [Reading(4, 9)]
         # A shared CONTAINER, not a shared leaf: an adapted value is inlined
         # rather than memoized, so only the container drives the snapshot into
         # the graph encoding this arm is about.
         return [inner, inner]
 
-    db = Database(mode="strict", adapters={Point: PointAdapter()})
+    db = Database(mode="strict", adapters={Reading: ReadingAdapter()})
     db.set(stage, 0)
-    exposed = db.get(shared_points)
+    exposed = db.get(shared_readings)
     assert db.statistics().query_executions == 1
-    key, _ = db._query_key(shared_points, (), {})
+    key, _ = db._query_key(shared_readings, (), {})
     assert isinstance(db._records[key].snapshot, FrozenGraph)
 
     assert isinstance(exposed, FrozenList)
@@ -6444,16 +6464,11 @@ def test_strict_mode_reconstructs_adapted_values_inside_shared_graphs() -> None:
     # Sharing survives the rebuild: both slots resolve to one view.
     assert exposed[0] is exposed[1]
     # The adapter ran on this arm -- the leaf is the reconstructed type, not
-    # the kernel's internal adapted-value wrapper.
-    assert isinstance(exposed[0][0], Point)
-    # Known limitation: a container payload becomes its own graph node, and what
-    # the adapter is handed then depends on where the adapted value sits
-    # relative to that node -- strict fills nodes in an internal order, so the
-    # payload can be empty or already filled by the time `thaw` reads it. This
-    # shape orders the node holding the adapted value before its payload's node,
-    # so the payload is still empty here and the reconstruction reads nothing.
-    # This is not a strict quirk -- see the mode-uniformity pin below.
-    assert (exposed[0][0].x, exposed[0][0].y) == (None, None)
+    # the kernel's internal adapted-value wrapper -- and it comes back whole.
+    # The positional payload is written into the value itself, so nothing the
+    # adapter reads depends on the order the encoding filled its nodes in.
+    assert isinstance(exposed[0][0], Reading)
+    assert (exposed[0][0].left, exposed[0][0].right) == (4, 9)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -6461,26 +6476,25 @@ def test_adapted_values_inside_shared_graphs_read_alike_in_every_mode(mode: str)
     stage = Input[int]("adapted-graph-parity-stage")
 
     @query
-    def shared_points(db: Database) -> object:
+    def shared_readings(db: Database) -> object:
         stage.read(db)
-        inner = [Point(4, 9)]
+        inner = [Reading(4, 9)]
         return [inner, inner]
 
-    db = Database(mode=mode, adapters={Point: PointAdapter()})
+    db = Database(mode=mode, adapters={Reading: ReadingAdapter()})
     db.set(stage, 0)
-    exposed = db.get(shared_points)
+    exposed = db.get(shared_readings)
     assert db.statistics().query_executions == 1
-    key, _ = db._query_key(shared_points, (), {})
+    key, _ = db._query_key(shared_readings, (), {})
     assert isinstance(db._records[key].snapshot, FrozenGraph)
 
     leaf = exposed[0][0]  # type: ignore[index]
-    assert isinstance(leaf, Point)
-    # Known limitation, pinned rather than papered over: a container payload is
-    # stored as its own graph node and the node holding the adapted value is
-    # filled first, so every mode hands the adapter an empty payload here. The
-    # mode boundary is what this cell protects -- the three modes must not
-    # drift apart while the limitation stands.
-    assert (leaf.x, leaf.y) == (None, None)
+    assert isinstance(leaf, Reading)
+    # The mode boundary is what this cell protects: an adapted value inside a
+    # shared graph reads the same in all three modes. A payload the encoding
+    # could not hand back whole never reaches an adapter -- the freeze refuses
+    # such a value -- so there is nothing left for the modes to drift over.
+    assert (leaf.left, leaf.right) == (4, 9)
 
 
 def test_strict_mode_policies_receive_adapted_types(capsys: pytest.CaptureFixture[str]) -> None:
@@ -6716,10 +6730,10 @@ def test_the_builtin_file_stat_adapter_round_trips_through_the_public_helpers() 
     snapshot = freeze(value, adapters=adapters)
     assert isinstance(snapshot, FrozenAdapterValue)
     assert snapshot.adapter_key == _adapter_key(FileStatSnapshot)
-    # The payload is the positional triple, written inline -- not hoisted into a
-    # graph node behind a FrozenRef. That is what makes the adapter safe inside
-    # a shared-structure snapshot, where a hoisted payload can reach `thaw` as
-    # an unfilled shell.
+    # The payload is the positional triple, written inline -- not held as a
+    # graph node behind a FrozenRef. That is what makes the adapter usable
+    # inside a shared-structure snapshot, where a payload the encoding would
+    # hold as a node is refused at the freeze instead.
     assert snapshot.payload == (True, 12, 345)
     assert pyinc.thaw(snapshot, adapters=adapters) == value
 
@@ -6730,9 +6744,9 @@ def test_the_builtin_file_stat_adapter_reconstructs_inside_a_shared_graph() -> N
     shared = {"seen": 1}
 
     # The aliased dict forces the whole snapshot into a FrozenGraph, which is
-    # the shape that breaks a container-payload adapter: the shell-fill order
-    # can hand `thaw` an empty payload. An inline positional payload never
-    # becomes a node, so it survives.
+    # the shape a container-payload adapter cannot survive: its payload would
+    # be a node of its own and the freeze refuses the value. An inline
+    # positional payload never becomes a node, so it goes through.
     snapshot = freeze({"alias": [shared, shared], "stat": value}, adapters=adapters)
     assert isinstance(snapshot, FrozenGraph)
     assert pyinc.thaw(snapshot, adapters=adapters)["stat"] == value

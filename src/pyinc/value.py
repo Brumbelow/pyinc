@@ -274,7 +274,9 @@ def _finalize_snapshot(snapshot: Snapshot, state: _FreezeState) -> Snapshot:
     """Collapse a freeze state into its public canonical snapshot form."""
 
     if state.has_back_edge:
-        return _canonicalize_graph(FrozenGraph(nodes=tuple(state.nodes), root=snapshot))
+        graph = _canonicalize_graph(FrozenGraph(nodes=tuple(state.nodes), root=snapshot))
+        _reject_hoisted_adapter_payloads(graph)
+        return graph
     if not state.nodes:
         # No memoization happened at all -- the walk already produced a
         # Database-owned snapshot (wrapper inputs were detached in _freeze),
@@ -283,6 +285,79 @@ def _finalize_snapshot(snapshot: Snapshot, state: _FreezeState) -> Snapshot:
     # Memoized but no back-edges: inline FrozenRefs so the public snapshot has the
     # same flat shape as v1 for tree-shaped inputs.
     return _inline_refs(snapshot, state.nodes)
+
+
+def _reject_hoisted_adapter_payloads(graph: FrozenGraph) -> None:
+    """Refuse an adapted value whose payload the graph encoding holds as a node.
+
+    An adapter's ``thaw`` is handed the payload as it is stored. Inside a
+    shared or cyclic value the encoding lifts a mapping, list, set or
+    dataclass payload into a node of its own and stores a reference in its
+    place, so what ``thaw`` receives is that reference, or -- where the
+    reference is resolved before ``thaw`` runs -- a container whose contents
+    at that instant depend on the order the encoding filled its nodes in.
+    Neither is something an adapter can be asked to work with, and the
+    second is worse than the first because it answers rather than raising.
+    A payload written inline is unaffected, which is why the kernel's own
+    adapters take positional payloads -- but a tuple is only inline as far
+    as its own elements, so a tuple holding a shared container is refused
+    on the same terms.
+    """
+
+    def holds_a_reference(value: Any) -> bool:
+        if type(value) is FrozenRef:
+            return True
+        if type(value) is FrozenList:
+            return any(holds_a_reference(item) for item in value.items)
+        if type(value) is FrozenDict:
+            return any(
+                holds_a_reference(key) or holds_a_reference(item) for key, item in value.entries
+            )
+        if type(value) is FrozenSet:
+            return any(holds_a_reference(item) for item in value.items)
+        if type(value) is FrozenRecord:
+            return any(holds_a_reference(item) for _name, item in value.entries)
+        if type(value) is FrozenAdapterValue:
+            return holds_a_reference(value.payload)
+        if type(value) is tuple:
+            return any(holds_a_reference(item) for item in value)
+        return False
+
+    def walk(value: Any) -> None:
+        if type(value) is FrozenAdapterValue:
+            if holds_a_reference(value.payload):
+                raise UnsupportedValueError(
+                    f"Adapter {value.adapter_key!r} produced a payload the shared-structure "
+                    "encoding cannot hand back whole. Return a payload built from tuples "
+                    "and scalars, which is written inline, rather than one holding a "
+                    "mapping, list, set, or dataclass that is shared or cyclic."
+                )
+            walk(value.payload)
+            return
+        if type(value) is FrozenList:
+            for item in value.items:
+                walk(item)
+        elif type(value) is FrozenDict:
+            for key, item in value.entries:
+                walk(key)
+                walk(item)
+        elif type(value) is FrozenSet:
+            for item in value.items:
+                walk(item)
+        elif type(value) is FrozenRecord:
+            for _name, item in value.entries:
+                walk(item)
+        elif type(value) is tuple:
+            for item in value:
+                walk(item)
+
+    # Neither walker follows a `FrozenRef` into the node table. `walk` reaches
+    # every node from the loop below, so following one would only revisit, and
+    # a cyclic graph would never terminate. `holds_a_reference` does not follow
+    # one either: a reference's presence is the hoist, which is the predicate.
+    walk(graph.root)
+    for node in graph.nodes:
+        walk(node)
 
 
 def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snapshot:

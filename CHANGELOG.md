@@ -65,6 +65,23 @@ decided at release time.
   return the configuration that distinguishes it; a resource that
   reparameterizes itself through a declared `identity()` keeps re-fingerprinting
   exactly as it did before.
+- An adapted value whose payload the shared-structure encoding cannot hand back
+  whole is now refused at the freeze with `UnsupportedValueError`, naming the
+  adapter key. That is a payload freezing to a mapping, list, set or dataclass
+  — or to a tuple holding one — while the adapted value sits inside a value
+  with shared structure or a cycle: the encoding holds such a payload as a node
+  of its own and stores a reference in its place. It previously produced a
+  value that differed by mode and by where the adapted value sat. A mapping
+  payload gave `strict` a `KeyError` and `checked` and `fast` a `TypeError` on
+  the unresolved reference; a list payload gave an `IndexError` and the same
+  `TypeError`. A tuple payload wrapping such a container raised nothing at all:
+  `thaw` received the bare reference in `checked` and `fast` and an
+  as-yet-unfilled container in `strict`, so one adapted value round-tripped to
+  two different values with nothing to say so. An adapter returns a payload
+  built from tuples and scalars, which is written inline and comes back whole
+  wherever the adapted value sits; an adapted value in a tree-shaped result is
+  unaffected in every payload shape, as the built-in stat adapter's triple of
+  scalars is everywhere.
 
 ### Fixed
 

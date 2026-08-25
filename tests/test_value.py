@@ -997,14 +997,19 @@ def test_adapted_hash_positions_are_isolated_from_graph_node_order() -> None:
 
     assert freeze(left, adapters=adapters) == freeze(right, adapters=adapters)
 
+    # A hash position freezes its value on its own, and a payload that shares
+    # or cycles is refused there: the encoding holds such a payload as a node
+    # and cannot hand it back to `thaw` whole. The refusal names the payload
+    # rather than the position, which is the more specific of the two answers
+    # available for the same value.
     shared: list[Any] = []
     shared_payload = [shared, shared]
-    with pytest.raises(UnsupportedValueError, match="remain hashable"):
+    with pytest.raises(UnsupportedValueError, match="cannot hand back whole"):
         freeze({AdaptedKey("shared", shared_payload)}, adapters=adapters)
 
     cyclic_payload: list[Any] = []
     cyclic_payload.append(cyclic_payload)
-    with pytest.raises(UnsupportedValueError, match="remain hashable"):
+    with pytest.raises(UnsupportedValueError, match="cannot hand back whole"):
         freeze({AdaptedKey("cyclic", cyclic_payload)}, adapters=adapters)
 
 
@@ -1368,13 +1373,27 @@ def test_semantic_equality_of_canonical_snapshots_matches_snapshot_equality() ->
         loop.append(loop)
         return {"c": loop, "o": build(depth + 1)}
 
+    compared = 0
     for _ in range(600):
         left_value = build(0)
         right_value = left_value if rng.random() < 0.3 else build(0)
-        left = freeze(left_value, adapters=adapters)
-        right = freeze(right_value, adapters=adapters)
+        try:
+            left = freeze(left_value, adapters=adapters)
+            right = freeze(right_value, adapters=adapters)
+        except UnsupportedValueError as refusal:
+            # The generator can place an adapted value inside shared or cyclic
+            # structure, where its mapping payload becomes a node of its own
+            # and the freeze refuses it. There is no snapshot for the property
+            # to compare, so the pair is skipped rather than asserted on.
+            assert "cannot hand back whole" in str(refusal)
+            continue
+        compared += 1
         assert fingerprint_snapshot(freeze(left, adapters=adapters)) == fingerprint_snapshot(left)
         assert semantic_equal(left, right, adapters=adapters) == snapshots_equal(left, right)
+    # The refusals must not be what the loop mostly does: the seeded generator
+    # yields well over four hundred comparable pairs, and a floor well under
+    # that catches a change that quietly empties the property.
+    assert compared >= 400
 
 
 _TOWER_PAIRS: tuple[tuple[object, object], ...] = (
@@ -1500,3 +1519,110 @@ def test_thawing_keeps_every_key_and_member_a_hashable_value_can_hold() -> None:
     assert thaw(freeze(mapping)) == mapping
     members = {1, ("a", 2), frozenset({3})}
     assert thaw(freeze(members)) == members
+
+
+# ---------------------------------------------------------------------------
+# Group L: adapted payloads the shared-structure encoding cannot return whole
+# ---------------------------------------------------------------------------
+
+
+class _AdaptedHolder:
+    """A boundary value an adapter carries, wrapping one container of its own."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+
+class _MappingPayloadAdapter(ValueAdapter):
+    def freeze(self, value: _AdaptedHolder, freeze: Any) -> object:
+        return {"payload": value.inner}
+
+    def thaw(self, snapshot: Any, thaw: Any) -> _AdaptedHolder:
+        return _AdaptedHolder(thaw(snapshot["payload"]))
+
+
+class _ListPayloadAdapter(ValueAdapter):
+    def freeze(self, value: _AdaptedHolder, freeze: Any) -> object:
+        return [value.inner]
+
+    def thaw(self, snapshot: Any, thaw: Any) -> _AdaptedHolder:
+        return _AdaptedHolder(thaw(snapshot[0]))
+
+
+class _TuplePayloadAdapter(ValueAdapter):
+    """A payload written inline that still reaches a container of its own."""
+
+    def freeze(self, value: _AdaptedHolder, freeze: Any) -> object:
+        return (value.inner,)
+
+    def thaw(self, snapshot: Any, thaw: Any) -> _AdaptedHolder:
+        return _AdaptedHolder(thaw(snapshot[0]))
+
+
+_PAYLOAD_SHAPES: dict[str, type[ValueAdapter]] = {
+    "mapping": _MappingPayloadAdapter,
+    "list": _ListPayloadAdapter,
+    "tuple": _TuplePayloadAdapter,
+}
+
+
+def _placed(adapted: _AdaptedHolder, placement: str) -> Any:
+    """Return the adapted value alone, inside shared structure, or in a cycle."""
+
+    if placement == "alone":
+        return adapted
+    if placement == "shared-container":
+        box = [adapted]
+        return {"left": box, "right": box}
+    holder: list[Any] = [adapted]
+    holder.append(holder)
+    return holder
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("shape", ["mapping", "list", "tuple"])
+@pytest.mark.parametrize("placement", ["alone", "shared-container", "cyclic"])
+def test_an_adapted_payload_comes_back_whole_or_is_refused(
+    mode: str, shape: str, placement: str
+) -> None:
+    """An adapted value is returned intact, or the freeze refuses it.
+
+    An adapter's `thaw` is handed the payload as the snapshot holds it. Alone,
+    every payload shape is written into the value itself and comes back whole
+    in every mode. Inside shared or cyclic structure the encoding lifts the
+    containers it memoizes into nodes of their own, and a payload that reaches
+    one of them can no longer be handed back: a mapping or list payload is
+    itself the node, and a tuple payload -- inline only as far as its own
+    elements -- carries a reference to one. Every such placement is refused at
+    the freeze rather than resolved into a value that depends on the mode and
+    on where the adapted value sat.
+    """
+
+    source = Input[int]("adapted-payload-source")
+
+    @query
+    def result(db: Database) -> Any:
+        return _placed(_AdaptedHolder({"n": source.read(db)}), placement)
+
+    db = Database(mode=mode, adapters={_AdaptedHolder: _PAYLOAD_SHAPES[shape]()})
+    db.set(source, 1)
+
+    if placement == "alone":
+        adapted = db.get(result)
+        assert isinstance(adapted, _AdaptedHolder)
+        assert dict(adapted.inner) == {"n": 1}
+        return
+
+    requests = db.statistics().total_requests
+    with pytest.raises(UnsupportedValueError, match="cannot hand back whole") as refusal:
+        db.get(result)
+    assert "_AdaptedHolder" in str(refusal.value)
+    # Nothing was kept that a second request could be served from: the refusal
+    # repeats rather than a stored value standing in for it, and the database
+    # holds no record of the query that was refused.
+    with pytest.raises(UnsupportedValueError, match="cannot hand back whole"):
+        db.get(result)
+    statistics = db.statistics()
+    assert statistics.total_requests == requests + 2
+    assert statistics.query_count == 0
+    assert statistics.query_reuses == 0

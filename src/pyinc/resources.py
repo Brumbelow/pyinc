@@ -217,16 +217,17 @@ class FileStatAdapter:
     ``(exists, size, mtime_ns)`` and every exposure reconstructs the dataclass
     from it.
 
-    The payload is positional rather than named on purpose. A tuple is written
-    inline into the frozen value, while a mapping, list, set or dataclass
-    payload is hoisted into a node of the shared-structure envelope. Checked
-    and fast mode then hand ``thaw`` that unresolved reference rather than the
-    payload, and strict mode hands it a container whose contents at that
-    moment follow the envelope's internal node order -- empty, complete, or
-    holding shells that are not filled yet -- so nothing about a hoisted
-    payload's contents can be relied on. An inline positional payload is never
-    hoisted, which keeps this adapter correct in every mode and in every
-    snapshot shape.
+    The payload is positional rather than named on purpose: a payload written
+    inline is the only kind the shared-structure encoding hands back whole. A
+    mapping, list, set or dataclass payload is held as a node of that envelope
+    instead, and a value carrying one is refused at the freeze rather than
+    handed to ``thaw`` as an unresolved reference or as a container filled in
+    an order nothing promises. What makes this payload inline all the way
+    through is that its three elements are scalars, not that it is a tuple: a
+    tuple is inline only as far as its own elements, so a tuple holding a
+    shared or cyclic container is refused on the same terms. Nothing in this
+    triple is a container, which keeps this adapter correct in every mode and
+    in every snapshot shape.
 
     Stateless by construction: no instance attributes, no slot state, no
     captured objects. That is what lets the kernel treat it as fixed --

@@ -27,6 +27,8 @@ from pyinc import (
     CheckpointVersionError,
     CycleError,
     Database,
+    FileStatResource,
+    FileStatSnapshot,
     InMemoryArtifactStore,
     Input,
     InputKeyError,
@@ -5967,3 +5969,45 @@ def test_a_capture_whose_state_keys_are_not_strings_is_still_fingerprinted() -> 
     for handle in (integer_keys, mixed_keys):
         first = Database()._query_fingerprint(handle)
         assert Database()._query_fingerprint(handle) == first
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("placement", ["shared-container", "cyclic"])
+def test_a_stat_reading_survives_every_placement(
+    tmp_path: Path, mode: str, placement: str
+) -> None:
+    """A stat reading comes back whole wherever it sits in a value.
+
+    The built-in adapter's payload is the positional triple of scalars, and a
+    scalar is written into the value itself rather than memoized, so no part
+    of that payload can become a node the encoding hands back as a reference.
+    A reading reached twice through one container, and a reading inside a
+    cycle, both rebuild into the dataclass a fresh read gives -- which is what
+    makes the refusal on hoisted payloads narrow enough to leave the kernel's
+    own adapters alone.
+    """
+
+    stats = FileStatResource()
+    target = tmp_path / "observed.txt"
+    target.write_text("contents", encoding="utf-8")
+
+    @query(key=f"stat-reading-{placement}")
+    def reading(db: Database, filename: str) -> Any:
+        snapshot = stats.read(db, filename)
+        if placement == "shared-container":
+            box = [snapshot]
+            return {"left": box, "right": box}
+        holder: list[Any] = [snapshot]
+        holder.append(holder)
+        return holder
+
+    expected = FileStatSnapshot(
+        exists=True, size=len(b"contents"), mtime_ns=os.stat(target).st_mtime_ns
+    )
+    result = Database(mode=mode).get(reading, str(target))
+    if placement == "shared-container":
+        assert result["left"][0] == expected
+        assert result["right"][0] == expected
+    else:
+        assert result[0] == expected
+        assert result[1][0] == expected
