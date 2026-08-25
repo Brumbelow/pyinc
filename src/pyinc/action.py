@@ -280,7 +280,11 @@ def _write_manifest(
 def _atomic_write(target: Path, data: bytes) -> None:
     try:
         atomic_write(target, data)
-    except UnsafeFilesystemPathError as error:
+    except OSError as error:
+        # Publication reaches the filesystem here, so a full disk or an
+        # unwritable parent is as much a refusal as an unsafe path is. The
+        # unsafe-path error is itself an OSError, so its conversion is
+        # unchanged and only the wider failures are newly typed.
         raise ActionPathError(str(error)) from error
 
 
@@ -297,17 +301,30 @@ def _action_lock_directory() -> Path:
         user_identity = hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
     else:
         user_identity = str(uid)
-    temp_directory = Path(tempfile.gettempdir()).resolve(strict=True)
-    directory = temp_directory / f"pyinc-action-locks-{user_identity}"
-    with contextlib.suppress(FileExistsError):
-        directory.mkdir(mode=0o700)
-    metadata = directory.lstat()
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise ActionPathError(f"Action lock path is not a directory: {directory}")
-    if uid is not None and metadata.st_uid != uid:
-        raise ActionPathError(f"Action lock path is owned by another user: {directory}")
-    if uid is not None and stat.S_IMODE(metadata.st_mode) & 0o077:
-        directory.chmod(0o700)
+    try:
+        temp_directory = Path(tempfile.gettempdir()).resolve(strict=True)
+        directory = temp_directory / f"pyinc-action-locks-{user_identity}"
+        with contextlib.suppress(FileExistsError):
+            directory.mkdir(mode=0o700)
+        metadata = directory.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ActionPathError(f"Action lock path is not a directory: {directory}")
+        if uid is not None and metadata.st_uid != uid:
+            raise ActionPathError(f"Action lock path is owned by another user: {directory}")
+        if uid is not None and stat.S_IMODE(metadata.st_mode) & 0o077:
+            directory.chmod(0o700)
+    except (OSError, RuntimeError) as error:
+        # The lock directory is prepared before the reconcile head opens its
+        # own try, so a failure here is never seen by that handler and this
+        # is where it becomes a typed refusal. A runtime error is caught
+        # beside the OS errors because resolving the temporary base reports a
+        # symbolic-link cycle that way on the older interpreters this library
+        # still supports, where the newer ones report the same cycle as an OS
+        # error. The two refusals raised just above are value errors, not OS
+        # or runtime errors, so they pass through untouched.
+        raise ActionPathError(
+            f"Cannot safely prepare the reconciliation lock directory: {error}"
+        ) from error
     return directory
 
 

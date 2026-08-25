@@ -184,10 +184,9 @@ def test_an_unwritable_lock_directory_base_fails_before_any_root_work(
 
     base.chmod(0o555)
     try:
-        # The lock directory is prepared before the reconcile's typed-wrap
-        # region, so today this escapes raw; the union survives a future
-        # retyping of the escape.
-        with pytest.raises(RAW_OR_TYPED):
+        # The lock directory is prepared before the reconcile head opens its
+        # own try, so the preparation carries the typed refusal itself.
+        with pytest.raises(ActionPathError):
             emit.reconcile(db, root=root)
     finally:
         base.chmod(0o755)
@@ -217,7 +216,7 @@ def test_a_lock_directory_creation_fault_fails_before_any_root_work(
 
     # The injected error fires ahead of the real mkdir, so the create's
     # FileExistsError suppression never absorbs it, whichever family it is.
-    with pytest.raises(RAW_OR_TYPED):
+    with pytest.raises(ActionPathError):
         emit.reconcile(db, root=root)
 
     assert not root.exists()
@@ -244,9 +243,9 @@ def test_a_lock_directory_mode_repair_fault_fails_before_any_root_work(
     lock_directory.chmod(0o755)  # explicit: group/other bits trip the repair
     disarm = inject_path_method_fault(monkeypatch, "chmod", errno.EPERM, gate=locks_gate)
 
-    # The mode repair also sits outside the reconcile's typed-wrap region,
-    # so this escapes raw today; the union survives a future retyping.
-    with pytest.raises(RAW_OR_TYPED):
+    # The mode repair also runs before the reconcile head opens its own try,
+    # so the same preparation handler is what types this one.
+    with pytest.raises(ActionPathError):
         emit.reconcile(db, root=root)
 
     assert not root.exists()
@@ -961,7 +960,7 @@ def test_an_unwritable_root_stops_publication_with_the_stale_bytes_intact(
 
     root.chmod(0o555)
     try:
-        with pytest.raises(RAW_OR_TYPED):
+        with pytest.raises(ActionPathError):
             emit.reconcile(db, root=root)
     finally:
         root.chmod(0o755)
@@ -996,8 +995,9 @@ def test_an_unwritable_root_stops_parent_creation_with_nothing_created(
     root.chmod(0o555)
     try:
         # Creating the missing parent suppresses only a lost race with
-        # another creator, so an unwritable root escapes raw today.
-        with pytest.raises(RAW_OR_TYPED):
+        # another creator, so an unwritable root reaches publication's own
+        # handler and is refused there.
+        with pytest.raises(ActionPathError):
             emit.reconcile(db, root=root)
     finally:
         root.chmod(0o755)
@@ -1024,7 +1024,7 @@ def test_a_publication_fault_leaves_no_temporary_and_the_next_run_converges(
     db.set(source, desired_spec({"out.txt": "new"}))
     disarm = inject_fault(monkeypatch, "atomic_write", code, gate=named_gate("out.txt"))
 
-    with pytest.raises(RAW_OR_TYPED):
+    with pytest.raises(ActionPathError):
         emit.reconcile(db, root=root)
 
     # The replacement never reached the target: the published bytes are the
