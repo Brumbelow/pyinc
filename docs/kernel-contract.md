@@ -872,9 +872,14 @@ files as a single reconcile from a fresh `Database` into an empty directory.
   Resource identity includes the resource's configuration, the implementations
   of every state-observation hook (`probe`, `load`, `probe_and_load`, and
   `identity`), and the interpreter/build identity. A configuration that changes
-  between two reads leaves the resource undefined, and is refused by name at the
-  read that observes the change: a resource that keeps observation state in its
-  own attributes must define `identity()` to return the configuration that
+  between two reads leaves the resource undefined. Where the change is written
+  into a container the resource holds — a read log, a cache, or any observation
+  state kept inside one — the read that observes it is refused, naming the
+  resource. Where it rebinds an attribute to a new value instead, the read is
+  not refused: that change is what the query's own definition check sees, so the
+  query re-fingerprints on every request as it always has, executing cold each
+  time and reusing nothing. Either way a resource that keeps observation state
+  of its own must define `identity()` to return the configuration that
   distinguishes it. The built-in resources (condition 2) cover text, binary,
   environment, stat, directory, and path-resolution observation.
 - `Database.inspect(...)` exposes the last recorded provenance tree as structured

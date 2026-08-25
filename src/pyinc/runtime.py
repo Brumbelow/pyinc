@@ -4475,7 +4475,10 @@ class Database:
             # distinguishes it, so its own state is all there is to compare --
             # which is asked here by identity rather than by class so that the
             # question costs this module no new knowledge of the resource
-            # layer it is read from.
+            # layer it is read from. Asking it with an isinstance check would
+            # take a third deferred import of that layer into a module already
+            # carrying two, each one deferred only because importing the two
+            # modules into each other at load time is what they cannot do.
             if self._resource_configuration(resource) is resource:
                 raise UnsupportedValueError(
                     f"Resource {type(resource).__module__}:{type(resource).__qualname__} "
