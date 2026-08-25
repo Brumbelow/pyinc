@@ -369,10 +369,11 @@ decided at release time.
   verdict its own shape has always earned — for a plain class carrying mutable
   state, the refusal naming the capture — and a dictionary keyed entirely by
   integers keeps being folded as it always was. The equality/cutoff policy and
-  adapter state folds are unchanged, because neither ever let that comparison
-  error out: the policy fold already reported it in its own words, and the
-  adapter fold already recorded such an adapter as registered-unverified and
-  refused it on drift. Both keep the answers they gave.
+  adapter state folds are deliberately unchanged: a callable policy object
+  already reports an unorderable state dictionary as a policy that cannot be
+  fingerprinted, and an adapter carrying one is already recorded as
+  registered-unverified and refused once it drifts, so both keep the answers
+  they gave.
 - Thawing a snapshot that names a container where only a hashable value can go
   — a mapping key, a set member — now refuses as an unsupported value naming
   the container that cannot go there, rather than letting the interpreter's own

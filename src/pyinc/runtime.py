@@ -300,10 +300,13 @@ def _sorted_state_entries(state: dict[Any, Any]) -> list[tuple[Any, Any]]:
     and because a check would refuse an all-integer dictionary that orders
     itself perfectly well and is folded today. The fallback order is internal:
     it is not a documented ordering and nothing outside this module may depend
-    on which order it picks. A key whose repr names its identity rather than
-    its value -- a plain object's does -- therefore orders differently in
-    another process; every ordinary key type reprs the same way everywhere, and
-    a key of the other kind carries no value a fingerprint could pin either.
+    on which order it picks. It can genuinely differ between two processes --
+    a repr may name an object's identity rather than its value, a frozenset's
+    depends on the hash seed once it holds more than one member, and two keys
+    whose type name and repr both tie keep the order the dictionary held them
+    in. Nothing contracts on that order, which is what makes all of it
+    acceptable; a caller who needs a stable fold gives the dictionary keys that
+    order themselves.
     """
 
     try:
