@@ -75,9 +75,10 @@ decided at release time.
   payload gave `strict` a `KeyError` and `checked` and `fast` a `TypeError` on
   the unresolved reference; a list payload gave an `IndexError` and the same
   `TypeError`. A tuple payload wrapping such a container raised nothing at all:
-  `thaw` received the bare reference in `checked` and `fast` and an
-  as-yet-unfilled container in `strict`, so one adapted value round-tripped to
-  two different values with nothing to say so. An adapter returns a payload
+  `thaw` received a tuple holding the unresolved reference in `checked` and
+  `fast`, and in `strict` a tuple holding a container whose contents at that
+  instant depended on how far the encoding's fill order had got, so one adapted
+  value round-tripped to two different values with nothing to say so. An adapter returns a payload
   built from tuples and scalars, which is written inline and comes back whole
   wherever the adapted value sits; an adapted value in a tree-shaped result is
   unaffected in every payload shape, as the built-in stat adapter's triple of

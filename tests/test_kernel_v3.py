@@ -29,6 +29,7 @@ from pyinc import (
     Database,
     FileStatResource,
     FileStatSnapshot,
+    FrozenGraph,
     InMemoryArtifactStore,
     Input,
     InputKeyError,
@@ -6004,7 +6005,12 @@ def test_a_stat_reading_survives_every_placement(
     expected = FileStatSnapshot(
         exists=True, size=len(b"contents"), mtime_ns=os.stat(target).st_mtime_ns
     )
-    result = Database(mode=mode).get(reading, str(target))
+    db = Database(mode=mode)
+    result = db.get(reading, str(target))
+    # The placement has to actually reach the graph encoding, or this cell
+    # proves nothing about a payload surviving one.
+    key, _ = db._query_key(reading, (str(target),), {})
+    assert isinstance(db._records[key].snapshot, FrozenGraph)
     if placement == "shared-container":
         assert result["left"][0] == expected
         assert result["right"][0] == expected
