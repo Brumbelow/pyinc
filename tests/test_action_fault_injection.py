@@ -184,8 +184,8 @@ def test_an_unwritable_lock_directory_base_fails_before_any_root_work(
 
     base.chmod(0o555)
     try:
-        # The lock directory is prepared before the reconcile head opens its
-        # own try, so the preparation carries the typed refusal itself.
+        # The lock directory is prepared outside every try reconcile opens,
+        # so the preparation carries the typed refusal itself.
         with pytest.raises(ActionPathError):
             emit.reconcile(db, root=root)
     finally:
@@ -243,8 +243,8 @@ def test_a_lock_directory_mode_repair_fault_fails_before_any_root_work(
     lock_directory.chmod(0o755)  # explicit: group/other bits trip the repair
     disarm = inject_path_method_fault(monkeypatch, "chmod", errno.EPERM, gate=locks_gate)
 
-    # The mode repair also runs before the reconcile head opens its own try,
-    # so the same preparation handler is what types this one.
+    # The mode repair also runs outside every try reconcile opens, so the
+    # same preparation handler is what types this one.
     with pytest.raises(ActionPathError):
         emit.reconcile(db, root=root)
 

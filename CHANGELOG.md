@@ -310,16 +310,17 @@ decided at release time.
   as an absent one already was.
 - Preparing the shared action lock directory and publishing an owned output now
   refuse as typed path errors instead of escaping as bare operating-system
-  errors. The lock directory is prepared before `Action.reconcile` opens the
-  region its own handler covers, so an unwritable temporary base, a create that
-  failed, an entry that could not be read or a mode repair that was refused
+  errors. The lock directory is prepared outside every region `Action.reconcile`
+  guards with a handler of its own, so an unwritable temporary base, a create
+  that failed, an entry that could not be read or a mode repair that was refused
   reached the caller as whatever the standard library raised — including a bare
-  `RuntimeError` for a temporary base that leads through a symbolic link back to
-  itself, on the older interpreters this library still supports. Publication
-  converted only an unsafe-path refusal, so a full disk, an unwritable output
-  root, or an output parent directory that could not be created escaped the same
-  way. Both now name the step that failed and keep the original failure as their
-  cause. The lock directory's existing refusals for a path that is not a
+  `RuntimeError` where the home directory cannot be determined, or for a
+  temporary base that leads through a symbolic link back to itself on the older
+  interpreters this library still supports. Publication converted only an
+  unsafe-path refusal, so a full disk, an unwritable output root, or an output
+  parent directory that could not be created escaped the same way. The lock
+  preparation names the step that failed, and both keep the original failure as
+  their cause. The lock directory's existing refusals for a path that is not a
   directory or is owned by another user are unchanged, and no reconcile that
   succeeded before behaves differently.
 

@@ -295,13 +295,13 @@ def _lock_path(root: Path, tool: str) -> Path:
 
 
 def _action_lock_directory() -> Path:
-    getuid = getattr(os, "getuid", None)
-    uid = getuid() if getuid is not None else None
-    if uid is None:
-        user_identity = hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
-    else:
-        user_identity = str(uid)
     try:
+        getuid = getattr(os, "getuid", None)
+        uid = getuid() if getuid is not None else None
+        if uid is None:
+            user_identity = hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
+        else:
+            user_identity = str(uid)
         temp_directory = Path(tempfile.gettempdir()).resolve(strict=True)
         directory = temp_directory / f"pyinc-action-locks-{user_identity}"
         with contextlib.suppress(FileExistsError):
@@ -314,12 +314,14 @@ def _action_lock_directory() -> Path:
         if uid is not None and stat.S_IMODE(metadata.st_mode) & 0o077:
             directory.chmod(0o700)
     except (OSError, RuntimeError) as error:
-        # The lock directory is prepared before the reconcile head opens its
-        # own try, so a failure here is never seen by that handler and this
+        # The lock directory is prepared outside every try ``reconcile``
+        # opens, so a failure here is never seen by those handlers and this
         # is where it becomes a typed refusal. A runtime error is caught
-        # beside the OS errors because resolving the temporary base reports a
-        # symbolic-link cycle that way on the older interpreters this library
-        # still supports, where the newer ones report the same cycle as an OS
+        # beside the OS errors because two steps report that way: locating
+        # the home directory raises it on every interpreter where there is no
+        # home to locate, and resolving the temporary base raises it for a
+        # symbolic-link cycle on the older interpreters this library still
+        # supports, where the newer ones report that same cycle as an OS
         # error. The two refusals raised just above are value errors, not OS
         # or runtime errors, so they pass through untouched.
         raise ActionPathError(
