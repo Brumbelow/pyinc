@@ -48,23 +48,23 @@ decided at release time.
   placed inside one landed zero or one time per request depending on cache
   history — the same ground on which registering from a body is refused.
 - A resource that redefines itself between two reads is now refused, where the
-  change is written into a container the resource holds. The default
-  `identity()` hands back the resource itself, so a read log, a cache, or any
-  observation state kept inside a container the resource holds leaves it with
-  no stable definition fingerprint, and the read that observes the change now
-  raises `UnsupportedValueError` naming the resource. It previously ran, and
-  ran worse than a refusal: every warm request cold-executed, nothing was ever
-  reused, and each request left the resource record it replaced behind, so a
-  query reading one resource key accumulated one orphaned record per request
-  while reporting nothing wrong. A resource that rebinds an attribute to a new
-  value on each read — a counter — is **not** refused, and is unchanged by
-  this release: that rebinding is what the query's own definition check sees,
-  so such a resource keeps re-fingerprinting on every request exactly as
-  before, and keeps paying the cold execution and the orphaned record with it.
-  An author keeps the observation state outside the resource, or defines
-  `identity()` to return the configuration that distinguishes it; a resource
-  that reparameterizes itself through a declared `identity()` keeps
-  re-fingerprinting exactly as it did before.
+  change is written into a list, dict or set the resource holds. The default
+  `identity()` hands back the resource itself, so a read log or a cache kept in
+  one of those leaves it with no stable definition fingerprint, and the read
+  that observes the change now raises `UnsupportedValueError` naming the
+  resource. It previously ran, and ran worse than a refusal: every warm request
+  cold-executed, nothing was ever reused, and each request left the resource
+  record it replaced behind, so a query reading one resource key accumulated
+  one orphaned record per request while reporting nothing wrong. A change made
+  anywhere else is **not** refused, and is unchanged by this release — a
+  counter rebound on the resource, or a value rebound inside another object it
+  holds, is what the query's own definition check sees instead, so such a
+  resource keeps re-fingerprinting on every request exactly as before, and
+  keeps paying the cold execution and the orphaned record with it. An author
+  keeps the observation state outside the resource, or defines `identity()` to
+  return the configuration that distinguishes it; a resource that
+  reparameterizes itself through a declared `identity()` keeps re-fingerprinting
+  exactly as it did before.
 
 ### Fixed
 

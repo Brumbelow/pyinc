@@ -118,13 +118,14 @@ class Resource(Generic[KeyT, ValueT, ProbeT]):
         The configuration must not move while the resource is in use. The
         default hands back the resource itself, so a resource that keeps
         observation state of its own redefines itself every time it is read.
-        Where that state is written into a container the resource holds -- a
-        read log, a cache, or anything else kept inside one -- the read that
-        observes the change is refused. Where it rebinds an attribute to a new
-        value the read is not refused, and the query re-fingerprints on every
-        request instead, executing cold each time and reusing nothing. Either
-        way such a resource defines this method and returns the configuration
-        that distinguishes it.
+        Where that state is written into a list, dict or set the resource
+        holds -- a read log or a cache kept in one -- the read that observes
+        the change is refused. A change made anywhere else is not refused: a
+        value rebound on the resource, or rebound inside another object it
+        holds, leaves the query re-fingerprinting on every request instead,
+        executing cold each time and reusing nothing. Either way such a
+        resource defines this method and returns the configuration that
+        distinguishes it.
         """
         return self
 

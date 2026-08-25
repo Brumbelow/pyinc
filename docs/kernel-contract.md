@@ -873,15 +873,16 @@ files as a single reconcile from a fresh `Database` into an empty directory.
   of every state-observation hook (`probe`, `load`, `probe_and_load`, and
   `identity`), and the interpreter/build identity. A configuration that changes
   between two reads leaves the resource undefined. Where the change is written
-  into a container the resource holds — a read log, a cache, or any observation
-  state kept inside one — the read that observes it is refused, naming the
-  resource. Where it rebinds an attribute to a new value instead, the read is
-  not refused: that change is what the query's own definition check sees, so the
-  query re-fingerprints on every request as it always has, executing cold each
-  time and reusing nothing. Either way a resource that keeps observation state
-  of its own must define `identity()` to return the configuration that
-  distinguishes it. The built-in resources (condition 2) cover text, binary,
-  environment, stat, directory, and path-resolution observation.
+  into a list, dict or set the resource holds — a read log or a cache kept in
+  one — the read that observes it is refused, naming the resource. A change made
+  anywhere else is not refused: a value rebound on the resource, or rebound
+  inside another object it holds, is what the query's own definition check sees
+  instead, so the query re-fingerprints on every request as it always has,
+  executing cold each time and reusing nothing. Either way a resource that keeps
+  observation state of its own must define `identity()` to return the
+  configuration that distinguishes it. The built-in resources (condition 2)
+  cover text, binary, environment, stat, directory, and path-resolution
+  observation.
 - `Database.inspect(...)` exposes the last recorded provenance tree as structured
   data. `Database.explain(...)` formats it for humans. Inspection is
   observational and does not force an extra verification pass;
