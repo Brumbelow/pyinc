@@ -266,6 +266,52 @@ def test_action_lock_directory_rejects_foreign_owner(
         _action_lock_directory()
 
 
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX ownership metadata")
+def test_action_lock_directory_refusals_reach_the_caller_unwrapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Both refusals above are worded inside a try whose handler rewords a
+    # failure as "Cannot safely prepare ...". A handler that also caught them
+    # would leave that wording intact underneath its own, so searching the
+    # message for a fragment cannot tell a refusal from a swallowed one --
+    # only the start of the message and the absence of a chained cause can.
+    # This layer wraps a refusal it did not word and passes through one it
+    # did, and the same rule holds wherever it converts a failed read or
+    # removal into a refusal.
+    uid = os.getuid()
+
+    non_directory_base = tmp_path / "non-directory-base"
+    non_directory_base.mkdir()
+    (non_directory_base / f"pyinc-action-locks-{uid}").write_bytes(b"hostile")
+    monkeypatch.setattr(action_module.tempfile, "gettempdir", lambda: os.fspath(non_directory_base))
+
+    with pytest.raises(ActionPathError) as caught:
+        _action_lock_directory()
+
+    assert str(caught.value).startswith("Action lock path is not a directory: ")
+    assert "Cannot safely prepare" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+    foreign_base = tmp_path / "foreign-base"
+    foreign_base.mkdir()
+    (foreign_base / f"pyinc-action-locks-{uid}").mkdir()
+    real_lstat = Path.lstat
+
+    def foreign_lstat(path: Path) -> object:
+        metadata = real_lstat(path)
+        return SimpleNamespace(st_mode=metadata.st_mode, st_uid=uid + 1)
+
+    monkeypatch.setattr(action_module.tempfile, "gettempdir", lambda: os.fspath(foreign_base))
+    monkeypatch.setattr(Path, "lstat", foreign_lstat)
+
+    with pytest.raises(ActionPathError) as caught:
+        _action_lock_directory()
+
+    assert str(caught.value).startswith("Action lock path is owned by another user: ")
+    assert "Cannot safely prepare" not in str(caught.value)
+    assert caught.value.__cause__ is None
+
+
 @pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX directory modes")
 def test_action_lock_directory_repairs_permissive_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

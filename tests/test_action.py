@@ -1573,7 +1573,7 @@ def test_action_rejects_nonregular_lock_path_with_typed_error(tmp_path: Path) ->
     except OSError:
         pytest.skip("symlink support is unavailable")
 
-    with pytest.raises(ActionPathError, match="reconciliation lock"):
+    with pytest.raises(ActionPathError, match="Cannot safely acquire the reconciliation lock"):
         locked_action.reconcile(Database(), root=root)
 
 

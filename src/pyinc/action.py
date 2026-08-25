@@ -654,7 +654,7 @@ class Action:
                 # is the user's now either way.
                 try:
                     current = read_regular_file(target)
-                except UnsafeFilesystemPathError as error:
+                except OSError as error:
                     raise ActionPathError(str(error)) from error
                 orphan_owned[relative] = (
                     current is not None and _content_hash(current) == previous[relative]
@@ -739,7 +739,7 @@ class Action:
             target, metadata = targets[relative]
             try:
                 current = read_regular_file(target) if metadata is not None else None
-            except UnsafeFilesystemPathError as error:
+            except OSError as error:
                 raise ActionPathError(str(error)) from error
             if current is not None and _content_hash(current) == desired_hashes[relative]:
                 unchanged.append(relative)
@@ -787,7 +787,7 @@ class Action:
                         continue
                     if unlink_regular_file(target, expected_identity=identity):
                         performed_deletions.append(relative)
-                except UnsafeFilesystemPathError as error:
+                except OSError as error:
                     raise ActionPathError(str(error)) from error
 
             for relative in sorted(

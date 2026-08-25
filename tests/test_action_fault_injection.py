@@ -602,15 +602,16 @@ def test_an_orphan_ownership_read_fault_refuses_with_nothing_mutated(
         monkeypatch, "read_regular_file", code, gate=named_gate("orphan.txt")
     )
 
-    # Only an unsafe-path error is caught at the ownership read, so every
-    # injected family escapes raw today; the union survives a retyping.
+    # The ownership read carries its own refusal now, so every injected
+    # family arrives typed. No message is pinned: the wording is whatever the
+    # failed read composed, and that spelling parts by platform.
     def refuse(active: Database) -> str:
-        with pytest.raises(RAW_OR_TYPED) as caught:
+        with pytest.raises(ActionPathError) as caught:
             emit.reconcile(active, root=root)
         return str(caught.value)
 
     assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
-    with pytest.raises(RAW_OR_TYPED):
+    with pytest.raises(ActionPathError):
         emit.plan(db, root=root)
     disarm()
     assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
@@ -681,15 +682,16 @@ def test_a_desired_state_read_fault_refuses_with_nothing_mutated(
         monkeypatch, "read_regular_file", code, gate=named_gate("out.txt")
     )
 
-    # The desired-state read catches only an unsafe-path error, so every
-    # injected family escapes raw today; the union survives a retyping.
+    # The desired-state read carries its own refusal now, so every injected
+    # family arrives typed. No message is pinned: the wording is whatever the
+    # failed read composed, and that spelling parts by platform.
     def refuse(active: Database) -> str:
-        with pytest.raises(RAW_OR_TYPED) as caught:
+        with pytest.raises(ActionPathError) as caught:
             emit.reconcile(active, root=root)
         return str(caught.value)
 
     assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
-    with pytest.raises(RAW_OR_TYPED):
+    with pytest.raises(ActionPathError):
         emit.plan(db, root=root)
     disarm()
     assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
@@ -757,10 +759,11 @@ def test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touche
         gate=named_gate("orphan.txt"),
     )
 
-    # Only an unsafe-path error is caught around the deletion, so every
-    # injected family escapes raw today; the union survives a retyping.
+    # The deletion window carries its own refusal now, so every injected
+    # family arrives typed. No message is pinned: the wording is whatever the
+    # failed verification composed, and that spelling parts by platform.
     def refuse(active: Database) -> str:
-        with pytest.raises(RAW_OR_TYPED) as caught:
+        with pytest.raises(ActionPathError) as caught:
             emit.reconcile(active, root=root)
         return str(caught.value)
 
@@ -798,11 +801,12 @@ def test_an_undeletable_orphan_stops_the_run_and_the_next_run_deletes_it(
     # while the last-moment verification read above it still succeeds.
     (root / "sub").chmod(0o555)
 
-    # The unlink sits outside the typed wrap, so this escapes raw today
-    # carrying the parent-relative name; the union survives a future
-    # retyping and no message is pinned here.
+    # The unlink sits inside the typed wrap, so the refusal arrives typed
+    # carrying whatever the failed removal said -- the entry's bare name
+    # where the removal is pinned to an open parent directory, and a whole
+    # path where the platform has no such handle, so no message is pinned.
     def refuse(active: Database) -> str:
-        with pytest.raises(RAW_OR_TYPED) as caught:
+        with pytest.raises(ActionPathError) as caught:
             emit.reconcile(active, root=root)
         return str(caught.value)
 
@@ -840,10 +844,11 @@ def test_an_unlink_fault_stops_the_run_with_the_orphan_and_ledger_intact(
         monkeypatch, "unlink_regular_file", code, gate=named_gate("orphan.txt")
     )
 
-    # The removal sits outside the typed wrap, so every injected family
-    # escapes raw today; the union survives a retyping.
+    # The removal sits inside the typed wrap, so every injected family
+    # arrives typed. No message is pinned: the wording is whatever the failed
+    # removal composed, and that spelling parts by platform.
     def refuse(active: Database) -> str:
-        with pytest.raises(RAW_OR_TYPED) as caught:
+        with pytest.raises(ActionPathError) as caught:
             emit.reconcile(active, root=root)
         return str(caught.value)
 
@@ -886,7 +891,7 @@ def test_a_mid_set_deletion_fault_preserves_the_performed_order_across_runs(
     # second faults.
     (root / "three").chmod(0o555)
     try:
-        with pytest.raises(RAW_OR_TYPED):
+        with pytest.raises(ActionPathError):
             emit.reconcile(db, root=root)
     finally:
         (root / "three").chmod(0o755)
@@ -1350,7 +1355,7 @@ def test_a_non_regular_lock_path_refuses_with_a_typed_error(
     lock_path = action_module._lock_path(root.resolve(), tool)
     make_nonregular_node(lock_path, kind)  # may skip: capability-gated
     try:
-        with pytest.raises(ActionPathError, match="reconciliation lock"):
+        with pytest.raises(ActionPathError, match="Cannot safely acquire the reconciliation lock"):
             emit.reconcile(db, root=root)
         assert list(root.iterdir()) == []
     finally:

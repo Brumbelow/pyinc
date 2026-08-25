@@ -323,6 +323,18 @@ decided at release time.
   their cause. The lock directory's existing refusals for a path that is not a
   directory or is owned by another user are unchanged, and no reconcile that
   succeeded before behaves differently.
+- Reading an orphan's bytes to decide whether the action still owns it, reading
+  an existing output to classify it, and the last-moment verification and
+  removal that delete an orphan now refuse as typed path errors instead of
+  escaping as bare operating-system errors. Each converted only an unsafe-path
+  refusal, so an entry whose bytes could not be read, a disk that filled under
+  the read, or a removal denied by its parent directory's mode reached the
+  caller as whatever the standard library raised, which in the deletion window
+  names the entry alone rather than a path wherever the removal is pinned to an
+  open parent directory. The refusal keeps the original wording
+  and the original failure as its cause. A path that is simply absent is still
+  answered as absent rather than refused, so no reconcile that succeeded before
+  behaves differently.
 
 ### Added
 
