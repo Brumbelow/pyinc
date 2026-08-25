@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import ModuleType
+from typing import cast
 
 import pytest
 from _hostile_paths import (
@@ -24,7 +28,7 @@ from _hostile_paths import (
 
 from pyinc import Database, InMemoryArtifactStore, Input, query
 from pyinc._safe_fs import UnsafeFilesystemPathError
-from pyinc.errors import PyIncError
+from pyinc.errors import PyIncError, UnsupportedValueError
 from pyinc.integrations._resources import file_bytes, file_probe, file_read_snapshot, file_text
 from pyinc.resources import (
     BinaryFileResource,
@@ -585,3 +589,88 @@ def test_a_denied_path_still_fails_every_probe_as_a_denial(
 
     # ... and the mode was the whole of it: the same paths read normally again.
     assert probe(str(denied)) is not None
+
+
+def _module_on_disk(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ModuleType, Path]:
+    """Import a real module written under ``tmp_path``, with its file.
+
+    A captured module is identified by the bytes at its ``__file__``, so the
+    fixture has to be a module that genuinely came from a file: only such a
+    file can then be replaced by a pipe underneath the module that was loaded
+    from it. The import is undone through ``monkeypatch`` so a cell that fails
+    partway leaves no entry behind for the next one to import instead.
+    """
+
+    source = tmp_path / f"{name}.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(name)
+    del sys.modules[name]
+    monkeypatch.setitem(sys.modules, name, module)
+    return module, source
+
+
+@posix_only
+def test_hashing_a_captured_module_whose_file_is_a_pipe_does_not_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A captured module's file is a path the library found rather than one a
+    # caller handed it, so it is not a hostile input in the ordinary sense --
+    # but a module loaded from a file someone has since replaced with a pipe is
+    # still a world the kernel has to end a request in. What this seam answers
+    # for a file it cannot read does not change: it refuses, because a
+    # fingerprint that skipped the module's own bytes would certify nothing.
+    # Only the waiting is removed.
+    module, source = _module_on_disk("pyinc_hostile_module_hash", tmp_path, monkeypatch)
+
+    @query
+    def reads_the_module(db: Database) -> int:
+        return cast(int, module.VALUE)
+
+    assert Database().get(reads_the_module) == 1
+
+    source.unlink()
+    make_fifo(source)
+
+    def fingerprint_a_fresh_database() -> None:
+        with pytest.raises(UnsupportedValueError, match="cannot be read safely"):
+            Database()._query_fingerprint(reads_the_module)
+
+    assert within_budget(fingerprint_a_fresh_database) == "returned"
+
+    # Asserted again in the parent, on a shape that can no longer block, because
+    # the type is half the claim: a read that reports "no readable file" has to
+    # reach the refusal rather than be handed to the hash. Hashing that report
+    # raises a TypeError about the argument, which tells a caller nothing about
+    # their module and is not what this seam promises.
+    with pytest.raises(UnsupportedValueError, match="cannot be read safely"):
+        Database()._query_fingerprint(reads_the_module)
+
+
+@posix_only
+def test_a_module_stamp_reports_a_pipe_rather_than_waiting_on_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The second read of the same file, and deliberately not the same answer.
+    # This one is the token that gates reuse of a memoized fingerprint, so its
+    # job is to report what it observed and let the comparison decide; a module
+    # file that has stopped being readable is a token that will not match, which
+    # is exactly the outcome that sends the request back to the identity read to
+    # be refused there, once, by the seam that owns that refusal.
+    module, _source = _module_on_disk("pyinc_hostile_module_stamp", tmp_path, monkeypatch)
+    file_path = Path(cast(str, module.__file__))
+
+    readable = Database()._module_observation_stamp(module)
+    assert ("unreadable-file",) not in readable
+
+    file_path.unlink()
+    make_fifo(file_path)
+
+    assert within_budget(lambda: Database()._module_observation_stamp(module)) == "returned"
+
+    unreadable = Database()._module_observation_stamp(module)
+    assert ("unreadable-file",) in unreadable
+    assert unreadable != readable

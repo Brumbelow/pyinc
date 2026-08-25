@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from _hostile_paths import within_budget
 
 import pyinc_tools.lsp as lsp
 import pyinc_tools.session as session_module
@@ -369,6 +371,27 @@ def test_workspace_refresh_deduplicates_paths_and_preserves_overlays(tmp_path: P
 
         assert session.refresh_paths([target, target]) == (str(target),)
         assert session.source_text(target) == "overlay = 2\n"
+
+
+def test_workspace_source_text_answers_a_pipe_rather_than_waiting_on_it(tmp_path: Path) -> None:
+    # A workspace is a directory the editor pointed at, so anything at all can
+    # be sitting inside it. Reading a source decodes it, which means opening it
+    # and waiting for bytes -- and a pipe with no writer never sends one. The
+    # kind is asked first so a source that is not a file reads as no source,
+    # which is the same answer this already gave for one that cannot be decoded.
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("os.mkfifo is unavailable on this platform")
+    target = tmp_path / "mod.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+
+    with WorkspaceSession(tmp_path) as session:
+        assert session.source_text(target) == "value = 1\n"
+
+        target.unlink()
+        os.mkfifo(target)
+
+        assert within_budget(lambda: session.source_text(target)) == "returned"
+        assert session.source_text(target) is None
 
 
 def test_workspace_navigation_methods_reject_non_python_targets(tmp_path: Path) -> None:

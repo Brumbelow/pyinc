@@ -345,6 +345,19 @@ decided at release time.
   them unchanged, and writes the ledger that could not be written before. The
   refusal names the step that failed and keeps the original failure as its
   cause.
+- Reading the source file behind a captured module or a workspace source no
+  longer waits on a path that will never deliver a byte. A module whose
+  `__file__` has been replaced by a pipe or a device previously held the read
+  open for as long as the path existed, both when a query's fingerprint hashed
+  the module's bytes and when a memoized fingerprint's reuse was checked; a
+  language-server workspace holding such a path stalled the same way when the
+  source behind it was read. Each of the three keeps the answer it always gave
+  for a file it could not read — the fingerprint refuses as an unsupported
+  value naming the module, the reuse check reports the file as unreadable so
+  the fingerprint is rebuilt rather than reused, and the workspace reports no
+  source — so nothing that read before reads differently, including a source
+  reached through a symbolic link and one whose declared encoding is detected
+  from its first lines.
 
 ### Added
 

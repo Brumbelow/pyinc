@@ -39,6 +39,7 @@ from types import (
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, ParamSpec, TypeVar, cast, overload
 
 from ._path_identity import is_stdlib_path
+from ._safe_fs import read_regular_file_following_links
 from .errors import (
     AdapterContractError,
     CheckpointIntegrityError,
@@ -7227,13 +7228,21 @@ class Database:
         # The identity is the bytes, hashed on every derivation. Stat-shaped
         # shortcuts (size, mtime, ctime, device, inode) are not collision-free:
         # a same-size rewrite inside one timestamp granule preserves all five.
+        # The read reports rather than waits: a module file someone replaced
+        # with a pipe or a device has no bytes to hash and never will, and that
+        # report is refused here on the same terms a failed read always was.
         with self._allow_raw_reads_scope():
             try:
-                digest = hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
+                content = read_regular_file_following_links(Path(file_path))
             except OSError as exc:
                 raise UnsupportedValueError(
                     f"Captured module {module_name!r} file cannot be read safely."
                 ) from exc
+            if content is None:
+                raise UnsupportedValueError(
+                    f"Captured module {module_name!r} file cannot be read safely."
+                )
+            digest = hashlib.sha256(content).hexdigest()
         file_identity = ("file-sha256", import_identity, digest)
         return (version_digest, file_identity, all_tuple, constants_payload)
 
@@ -7293,15 +7302,21 @@ class Database:
             else:
                 # Observed by content, never by stat identity: the stamp gates
                 # reuse of a memoized fingerprint, so it carries the same
-                # collision risk the identity payload does.
+                # collision risk the identity payload does. A file that cannot
+                # be read is reported as such rather than refused -- the token
+                # says what was observed, and a token that will not match is
+                # what sends the request back to the identity payload, which is
+                # where an unreadable module file is refused, once.
                 with self._allow_raw_reads_scope():
                     try:
-                        source_observation = (
-                            "file-sha256",
-                            hashlib.sha256(Path(file_path).read_bytes()).hexdigest(),
-                        )
+                        content = read_regular_file_following_links(Path(file_path))
                     except OSError:
-                        source_observation = ("unreadable-file",)
+                        content = None
+                    source_observation = (
+                        ("unreadable-file",)
+                        if content is None
+                        else ("file-sha256", hashlib.sha256(content).hexdigest())
+                    )
         return (
             module.__name__,
             sys.modules.get(module.__name__) is module,

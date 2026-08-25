@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TypeAlias
 
 from pyinc import Database
+from pyinc._safe_fs import read_regular_file_following_links
 from pyinc.integrations import (
     Binding,
     ClassMember,
@@ -3448,7 +3449,18 @@ class WorkspaceSession:
             overlay = self._overlays.get(real_path)
         if overlay is not None:
             return overlay
+        # `tokenize.open` detects the declared encoding from the leading bytes,
+        # so the read cannot be replaced by a byte read without changing what a
+        # source decodes to. The kind is asked first instead: a workspace is a
+        # directory an editor pointed at, and a pipe or a device sitting in it
+        # would keep this open call waiting for a byte that never arrives.
+        # Asking costs a second read of a file that is about to be read anyway.
+        # That measured too small against the work a session does around it to
+        # buy back with a bare stat, which would answer the kind more cheaply
+        # but from a different moment than the read it is guarding.
         try:
+            if read_regular_file_following_links(Path(real_path)) is None:
+                return None
             with tokenize.open(real_path) as source_file:
                 return source_file.read()
         except (OSError, SyntaxError, UnicodeError):
