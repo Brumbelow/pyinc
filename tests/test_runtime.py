@@ -1786,10 +1786,13 @@ def test_resolved_path_resource_probe_is_total_for_a_symlink_loop(tmp_path: Path
 def test_a_resolved_path_answers_an_embedded_null_as_unresolvable(tmp_path: Path) -> None:
     # A path string holding a null character names no file and never will by
     # being asked again -- which is exactly what this probe's `None` says, so
-    # it is answered rather than left as whatever the platform raised out of
-    # the resolution. All three entry points are driven because each reaches
-    # the filesystem for itself: a totality that held at one of them and not
-    # the others is one a caller walks around without noticing.
+    # it is answered. The answer is settled before the path is handed to the
+    # resolution, because what resolution does with a null is not one
+    # behaviour to catch: it raises on some builds and on others returns the
+    # null-bearing path unchanged, as if it had resolved. All three entry
+    # points are driven because each reaches the filesystem for itself: a
+    # totality that held at one of them and not the others is one a caller
+    # walks around without noticing.
     resolver = ResolvedPathResource()
     db = Database()
     path = nul_path(tmp_path)
@@ -1803,17 +1806,21 @@ def test_a_resolved_path_answers_an_embedded_null_as_unresolvable(tmp_path: Path
 def test_a_resolved_path_answers_a_symlink_loop_alike_on_every_interpreter(
     shape: str, tmp_path: Path
 ) -> None:
-    # The interpreters arrive at this answer by two different routes: the
-    # older ones raise out of the resolution, and the newer ones stop at the
-    # loop and hand back a path that still holds the link. The answer has to
-    # be the same either way. A probe value that told a reader which
-    # interpreter had looked at an unchanged world could not survive being
-    # written to a checkpoint by one process and read back by another.
+    # Resolution arrives at this answer by several routes. Some platforms and
+    # versions raise out of it; others stop at the loop and hand back a path
+    # that still holds the link; others again join the part they never
+    # resolved onto that path and return the join. Which route is taken varies
+    # by platform as much as by version, and it varies per shape: the same
+    # build can raise for the link named on its own and quietly join for a
+    # name beneath it. The answer has to be the same down every route. A probe
+    # value that told a reader which build had looked at an unchanged world
+    # could not survive being written to a checkpoint by one process and read
+    # back by another.
     #
     # All three shapes are driven, not the link alone: a loop is reached
-    # through a name under it as readily as by its own name, and the two
-    # deeper shapes are the ones a caller composing a path is most likely to
-    # hand over.
+    # through a name under it as readily as by its own name, the two deeper
+    # shapes are the ones a caller composing a path is most likely to hand
+    # over, and they are the shapes whose route differs most between builds.
     resolver = ResolvedPathResource()
     loop = make_symlink_loop(tmp_path / "loop")
     looped = {

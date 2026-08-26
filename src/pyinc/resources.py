@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -293,19 +292,19 @@ class EnvResource(Resource[str, str | None, tuple[str | None]]):
         return (value,), value
 
 
-# `Path.resolve(strict=False)` raised for a symlink loop through 3.12 and
-# stops at the loop from 3.13 on, handing back a path that is still a link.
-# The probe contract requires a probe value to be process-independent, and a
-# value that depends on which interpreter observed the same unchanged world
-# is not, so the newer interpreters are brought back to the older answer.
-_RESOLVE_STOPS_AT_SYMLINK_LOOPS = sys.version_info >= (3, 13)
-
-
 def _stopped_at_a_link(resolved: Path) -> bool:
     """Report a resolution that gave up: a resolved path holds no link.
 
+    A full resolution has followed every link it met, so no component of its
+    answer is one. A resolution that could not finish reports what it managed
+    instead, and what it managed still holds the link it stopped at -- which
+    is what this asks about, rather than trying to name the failure that
+    stopped it.
+
     ``os.path.islink`` answers False for a path it cannot read rather than
-    raising, so asking it keeps the probe total.
+    raising, so asking it keeps the probe total. The one path it will not
+    accept is one holding a null character, and `_resolved_path` turns those
+    away before anything here is asked.
     """
     return any(os.path.islink(candidate) for candidate in (resolved, *resolved.parents))
 
@@ -314,11 +313,25 @@ def _resolved_path(path: str) -> str | None:
     # A path that cannot resolve is answered as None, the way an unset
     # environment variable is: a NUL path and a looping path each name no
     # readable file, and a probe has to be total.
+    #
+    # Both are decided here rather than by catching what resolution raised,
+    # because WHICH of them raises is neither the same across platforms nor
+    # settled across versions. A null character is caught before the ask, the
+    # way an action's and a store's entry points test for one before they
+    # resolve; and the answer, however it was reached, is checked for the
+    # links a finished resolution cannot contain. Where one platform raises
+    # for a loop, another quietly joins the unresolved remainder onto the link
+    # it gave up at and returns that -- so the value is pinned by testing the
+    # answer, which every platform composes out of the same parts, and not by
+    # enumerating the failures, which they spell differently. The handler
+    # below stays as the backstop for the platforms that do raise.
+    if "\0" in path:
+        return None
     try:
         resolved = Path(path).resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         return None
-    if _RESOLVE_STOPS_AT_SYMLINK_LOOPS and _stopped_at_a_link(resolved):
+    if _stopped_at_a_link(resolved):
         return None
     return str(resolved)
 

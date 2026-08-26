@@ -306,17 +306,22 @@ decided at release time.
 - `ResolvedPathResource` answers a path it cannot canonicalize the same way
   wherever it runs. A path string holding an embedded null character now
   answers as unresolvable — at the probe, the load and the atomic
-  probe-and-load — instead of escaping as a bare `ValueError`, so the probe is
-  total over every path a caller can hand it. And a path that leads through a
-  symbolic link back to itself now answers as unresolvable on every
-  interpreter, by its own name or through a name beneath it: some interpreters
-  refuse such a path outright while others hand back a path that still holds
-  the link, which left the recorded value describing the interpreter that
-  observed the path rather than the path. A checkpoint written by one process
-  and loaded by another agreed about an unchanged world only if both were
-  running the same interpreter; now they agree either way. Every other path
-  canonicalizes exactly as before, including one whose parent directory cannot
-  be searched.
+  probe-and-load — where before it escaped as a bare `ValueError` on some
+  platforms and was answered as though it had resolved on others; it is turned
+  away before the path is resolved at all, so the probe is total over every
+  path a caller can hand it. And a path that leads through a symbolic link
+  back to itself now answers as unresolvable everywhere, by its own name or
+  through a name beneath it. Resolution treats such a path differently on
+  different platforms and versions, and differently for the two shapes on one
+  of them — refusing it outright, or stopping at the link, or joining the part
+  it never resolved onto the link and returning that — which left the recorded
+  value describing the machine that observed the path rather than the path
+  itself. The answer is now settled by checking the resolved path for the
+  links a finished resolution cannot contain, rather than by interpreting the
+  failure, so a checkpoint written by one process and loaded by another agrees
+  about an unchanged world whatever each was running; before, they agreed only
+  if the two matched. Every other path canonicalizes exactly as before,
+  including one whose parent directory cannot be searched.
 - An action root, an action state directory, an owned output's parent and an
   artifact-store root whose resolution fails are now refused with this
   library's own error types — a typed path error for the three action paths,
