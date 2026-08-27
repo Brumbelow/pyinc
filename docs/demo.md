@@ -10,7 +10,7 @@ no configuration added.
 The watcher analyzes the tree once, then re-analyzes when edited files settle.
 The stats pane shows both halves of that split: 109.08 s to analyze all 270
 files from cold, then 632 ms to bring the graph back up to date after one edit
-to `src/_pytest/warning_types.py` — 73 queries executed, 9,767 reused, and 47
+to `src/_pytest/warning_types.py` — 74 queries executed, 9,830 reused, and 52
 backdated because recomputing them produced a semantically equal result. The
 1,300 diagnostics are reported `undeclared-import` findings: imports of
 installed distributions that pytest's own dependency metadata does not
@@ -27,10 +27,15 @@ unresolvable import that surfaces as a new diagnostic.
 The clips are a single live recording, not a benchmark: one take, one run,
 no repetitions. The wall-clock figures above are what the stats pane showed
 during that take and are specific to the machine below; treat them as an
-illustration of the cold/warm split, not as expected timings. Deterministic
-work counts (executed / reused / backdated) are a function of the engine and
-the edit rather than of the machine; a given build partitions a given edit the
-same way each time.
+illustration of the cold/warm split, not as expected timings. The three work
+counts do not share that provenance: they were re-measured against the current
+build, on the same pinned workspace and the same one-line edit, and they
+replace the figures the recorded take showed. How a build splits an edit into
+executed and backdated work held steady across those measurements; the reuse
+total did not: it tracks the size of the surrounding graph, which shifts from
+one run to the next and with the packages installed alongside the workspace.
+Read all three as an illustration of the split rather than as figures to
+reproduce.
 
 - **Workspace:** pytest pinned at `56b196e921acec0259d84622a570fde6032e15b5`,
   270 `.py` files, no configuration added.

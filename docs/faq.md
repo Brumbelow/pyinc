@@ -72,7 +72,7 @@ something the arguments do not name:
   receive an equal argument — what it lacks is the dynamic dependency graph
   and revision metadata, so nothing decides *without recomputing the chain*
   that dependents are still current, and nothing ever tells it to drop the
-  entries that are not. The 47 backdated nodes in the [demo](demo.md) are
+  entries that are not. The 52 backdated nodes in the [demo](demo.md) are
   that effect.
 - **Ownership.** `lru_cache` hands every caller the same object; mutating a
   cached list corrupts every later hit. pyinc snapshots values at the boundary,
@@ -93,8 +93,9 @@ one.
 What is published:
 
 - The [demo](demo.md) numbers — a 270-file pytest checkout analyzed in 109.08 s
-  from cold, then re-analyzed in 632 ms after a single-file edit, executing 73
-  queries and reusing 9,767. One recorded run on one machine; the demo page
+  from cold, then re-analyzed in 632 ms after a single-file edit, executing 74
+  queries and reusing 9,830. The timings are one recorded run on one machine;
+  the counts were measured separately against the current build. The demo page
   states the full provenance.
 - The [benchmark and correctness harness](../bench/README.md), which runs a
   fixed 67-row matrix comparing pyinc against fresh recomputation, an
