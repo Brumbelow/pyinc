@@ -28,8 +28,9 @@ The clips are a single live recording, not a benchmark: one take, one run,
 no repetitions. The wall-clock figures above are what the stats pane showed
 during that take and are specific to the machine below; treat them as an
 illustration of the cold/warm split, not as expected timings. Deterministic
-work counts (executed / reused / backdated) are properties of the engine and
-the edit, and are reproducible.
+work counts (executed / reused / backdated) are a function of the engine and
+the edit rather than of the machine; a given build partitions a given edit the
+same way each time.
 
 - **Workspace:** pytest pinned at `56b196e921acec0259d84622a570fde6032e15b5`,
   270 `.py` files, no configuration added.

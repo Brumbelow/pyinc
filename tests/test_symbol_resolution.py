@@ -9,7 +9,7 @@ from _hostile_paths import make_symlink_loop, nul_path, posix_only
 import pyinc.integrations as integrations
 from pyinc import Database, UnsupportedValueError
 from pyinc.integrations import SourcePosition, SourceRange
-from pyinc.integrations.scope_resolution import scope_tree, symbol_at
+from pyinc.integrations.scope_resolution import ScopeTree, scope_tree, symbol_at
 from pyinc.integrations.symbol_resolution import (
     ClassMember,
     Parameter,
@@ -545,12 +545,24 @@ def test_comment_only_edit_backdates_symbol_table(tmp_path: Path) -> None:
 
     db = Database(mode="strict")
     first = module_symbol_table(db, root, path)
+    first_changed = db.inspect(module_symbol_table_payload, str(path)).changed_at
 
     path.write_text("def foo() -> int:\n    return 1\n# trailing\n", encoding="utf-8")
     second = module_symbol_table(db, root, path)
 
     assert first == second
-    assert db.inspect(module_symbol_table_payload, str(path)).last_decision == "reused"
+    # `last_recompute` is the discriminating half: `changed_at` is unmoved
+    # whether or not the read below this node compares by a coarser token, so
+    # the marker is what says the payload -- not the read -- absorbed the edit.
+    record = db.inspect(module_symbol_table_payload, str(path))
+    assert record.last_recompute == "backdated", (
+        f"last_recompute={record.last_recompute} | an equal table across a "
+        "comment-only edit has to be backdated"
+    )
+    assert record.changed_at == first_changed, (
+        f"changed_at={record.changed_at} before={first_changed} | the table "
+        "moved under an edit it does not carry"
+    )
 
 
 def test_signature_change_triggers_downstream_reresolution(tmp_path: Path) -> None:
@@ -575,6 +587,80 @@ def test_signature_change_triggers_downstream_reresolution(tmp_path: Path) -> No
     assert second.range.start.line == 1
     assert db.inspect(module_symbol_table_payload, str(a)).last_recompute == "executed"
     assert db.inspect(resolve_symbol_payload, str(root), str(b), "foo").last_recompute == "executed"
+
+
+def _module_scope_end(tree: ScopeTree) -> SourcePosition:
+    # The module scope is the one scope without a parent. `scopes` carries no
+    # documented ordering, so indexing it would be an assumption, not a lookup.
+    return next(scope for scope in tree.scopes if scope.parent_id is None).range.end
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_comment_edit_scope_tree_matches_fresh(mode: str, tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "a.py"
+    path.write_text("x = 1\n", encoding="utf-8")
+
+    incremental = Database(mode=mode)
+    scope_tree(incremental, path)
+
+    path.write_text("x = 1\n# trailing comment\n", encoding="utf-8")
+    warm = scope_tree(incremental, path)
+    fresh = scope_tree(Database(mode=mode), path)
+
+    assert warm == fresh, (
+        f"mode={mode} | warm_end={_module_scope_end(warm)} "
+        f"fresh_end={_module_scope_end(fresh)} | "
+        "module scope ends before a comment the same database already reads"
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_blank_line_edit_scope_tree_matches_fresh(mode: str, tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "a.py"
+    path.write_text("x = 1\n", encoding="utf-8")
+
+    incremental = Database(mode=mode)
+    scope_tree(incremental, path)
+
+    path.write_text("x = 1\n\n\n", encoding="utf-8")
+    warm = scope_tree(incremental, path)
+    fresh = scope_tree(Database(mode=mode), path)
+
+    assert warm == fresh, (
+        f"mode={mode} | warm_end={_module_scope_end(warm)} "
+        f"fresh_end={_module_scope_end(fresh)} | "
+        "module scope ends before blank lines the same database already reads"
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_trailing_space_edit_scope_tree_matches_fresh(mode: str, tmp_path: Path) -> None:
+    # Neither document ends in a newline, and that is what makes the cell
+    # discriminating. `DocumentMap` splits on `\r\n?|\n`, so a file that does end
+    # in one carries a trailing empty element and the module scope ends at
+    # `(line, 0)` whatever spaces precede it -- written as `x = 1\n` -> `x = 1   \n`
+    # the two ends are equal before the fix and the cell proves nothing.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "a.py"
+    path.write_text("x = 1", encoding="utf-8")
+
+    incremental = Database(mode=mode)
+    scope_tree(incremental, path)
+
+    path.write_text("x = 1   ", encoding="utf-8")
+    warm = scope_tree(incremental, path)
+    fresh = scope_tree(Database(mode=mode), path)
+
+    assert warm == fresh, (
+        f"mode={mode} | warm_end={_module_scope_end(warm)} "
+        f"fresh_end={_module_scope_end(fresh)} | "
+        "module scope ends before trailing space the same database already reads"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1985,12 +2071,23 @@ def test_comment_only_edit_backdates_class_models(tmp_path: Path) -> None:
 
     db = Database(mode="strict")
     first = class_model(db, root, path, "Widget")
+    first_changed = db.inspect(class_models_for_file, str(path)).changed_at
 
     path.write_text(_CLASS_MODEL_SAMPLE + "# trailing comment\n", encoding="utf-8")
     second = class_model(db, root, path, "Widget")
 
     assert first == second
-    assert db.inspect(class_models_for_file, str(path)).last_decision == "reused"
+    # `last_recompute` is the discriminating half here too; `changed_at` alone
+    # is unmoved either way.
+    record = db.inspect(class_models_for_file, str(path))
+    assert record.last_recompute == "backdated", (
+        f"last_recompute={record.last_recompute} | an equal set of models "
+        "across a comment-only edit has to be backdated"
+    )
+    assert record.changed_at == first_changed, (
+        f"changed_at={record.changed_at} before={first_changed} | the models "
+        "moved under an edit they do not carry"
+    )
 
 
 def test_class_model_member_carries_no_class_kind(tmp_path: Path) -> None:
@@ -2234,6 +2331,7 @@ def test_class_model_base_file_comment_edit_reused(tmp_path: Path) -> None:
 
     db = Database(mode="strict")
     first = class_model(db, root, derived, "Derived")
+    base_changed = db.inspect(class_models_for_file, str(base)).changed_at
 
     # A trailing-comment edit to the BASE file leaves the AST attributes
     # untouched, so class_models_for_file(base) backdates and the derived
@@ -2243,7 +2341,16 @@ def test_class_model_base_file_comment_edit_reused(tmp_path: Path) -> None:
 
     assert first == second
     assert {m.name for m in second.members} == {"shared"}
-    assert db.inspect(class_models_for_file, str(base)).last_decision == "reused"
+    base_record = db.inspect(class_models_for_file, str(base))
+    assert base_record.last_recompute == "backdated", (
+        f"last_recompute={base_record.last_recompute} | the base file's models "
+        "are equal across the edit and have to be backdated"
+    )
+    assert base_record.changed_at == base_changed, (
+        f"changed_at={base_record.changed_at} before={base_changed} | the base "
+        "file's models moved under an edit they do not carry"
+    )
+    assert db.inspect(class_models_for_file, str(derived)).last_decision == "reused"
 
 
 def test_class_model_unrelated_edit_leaves_model_green(tmp_path: Path) -> None:

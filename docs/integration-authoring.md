@@ -132,26 +132,48 @@ was. Reference: `module_export_surface` marks dynamic `__all__` as untracked.
 always safe; stale reuse is never safe. An integration that guesses wrong about reuse
 causes silent staleness that violates the soundness envelope.
 
-## Cutoff Functions
+## Comparison Policies
 
-Use `@query(cutoff=fn)` when semantic equivalence is cheaper than comparing full output
-values. The cutoff function maps a query result to a snapshot-safe comparison token:
+`@query(cutoff=fn)` maps a query result to a snapshot-safe comparison token, and the
+kernel backdates the node when two runs produce equal tokens. Cheapness is the reason
+to reach for it, but it is not the precondition. **The token must determine the value
+the query returns:** equal token has to imply equal value.
+
+That precondition is not a style preference. The kernel stores the fresh snapshot
+before it decides, then rolls `changed_at` back when the tokens match -- so a token
+coarser than the value it guards does not suppress a false ripple, it suppresses a real
+one. The query hands back the new value while declaring that nothing changed, and every
+dependent that reads position, byte offsets or whitespace out of it stays valid on the
+strength of that declaration.
+
+The consequence for raw text is direct: **a query that returns a file's text takes no
+`cutoff=`.** Any token you could write for it is some projection of the file, and no
+projection of a file is as fine as the file.
+
+Put the lossy projection in a query that *returns* the projection instead:
 
 ```python
-def _source_cutoff_token(source: str) -> tuple[str, str]:
-    try:
-        return ("ast", ast.dump(ast.parse(source), include_attributes=True))
-    except SyntaxError:
-        return ("source", source)
+@query
+def source_text(db: Database, path: str) -> str:
+    return _FILES.read(db, path)[0]
+
+
+@query
+def import_statements_for_file(db: Database, path: str) -> tuple[ImportStatementPayload, ...]:
+    tree = _try_parse(source_text(db, path))
+    ...
 ```
 
-Reference: `source_text` uses `_source_cutoff_token`. A comment-only edit produces the
-same AST dump, so the kernel backdates `source_text` and downstream queries are reused
-without re-execution.
+A comment-only edit re-runs both. `source_text` executes and answers with what is on
+disk. `import_statements_for_file` re-parses and lands an equal payload, which the
+kernel backdates on the value itself, under default equality and with no policy at all
+-- so everything downstream of the parse is reused, and nothing was told the file is
+unchanged.
 
-**Why?** Cutoff functions are the mechanism that enables backdating -- the Salsa/Skyframe
-optimization that prevents false ripple when recomputation yields a semantically equivalent
-result.
+**Why?** Backdating is the Salsa/Skyframe optimization that prevents false ripple when
+recomputation yields a semantically equivalent result, and it is worth having. A
+projection query earns it at the node where the projection *is* the result, which is
+where the precondition above holds by construction.
 
 ## Cycle-Safe Traversal
 
@@ -218,7 +240,7 @@ helpers are not re-exported. Reference:
 `fast` modes. Reference: `test_file_analysis_reports_top_level_symbols_by_mode` in
 `tests/test_python_source.py`. Verify backdating explicitly: non-semantic edits should
 trigger backdating and downstream reuse. Reference:
-`test_comment_only_edit_backdates_source_and_reuses_downstream` in the same file.
+`test_comment_only_edit_reuses_downstream_analysis` in the same file.
 
 **From-scratch consistency tests.** The gold standard: compare incremental results against
 fresh-database recomputation over a sequence of state changes. Reference:

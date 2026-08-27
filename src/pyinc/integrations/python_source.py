@@ -220,13 +220,6 @@ def _relative_import_module(module: str | None, level: int) -> str:
     return f"{prefix}{module or ''}"
 
 
-def _source_cutoff_token(source: str) -> tuple[str, str]:
-    try:
-        return ("ast", ast.dump(ast.parse(source), include_attributes=True))
-    except SyntaxError:
-        return ("source", source)
-
-
 def _try_parse(source: str) -> ast.Module | None:
     try:
         return ast.parse(source)
@@ -634,7 +627,7 @@ def _collect_python_files(
     return tuple(python_files)
 
 
-@query(cutoff=_source_cutoff_token)
+@query
 def source_text(db: Database, path: str) -> str:
     # Deliberately not memoized per request: query bodies read the source
     # through here, and answering one from an earlier call would rob the second
