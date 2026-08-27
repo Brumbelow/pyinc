@@ -8,7 +8,8 @@ from _hostile_paths import make_symlink_loop, nul_path, posix_only
 
 import pyinc.integrations as integrations
 from pyinc import Database, UnsupportedValueError
-from pyinc.integrations import SourcePosition, SourceRange
+from pyinc.integrations import DocumentMap, SourcePosition, SourceRange, request_scope
+from pyinc.integrations.python_source import source_text
 from pyinc.integrations.scope_resolution import ScopeTree, scope_tree, symbol_at
 from pyinc.integrations.symbol_resolution import (
     ClassMember,
@@ -888,6 +889,88 @@ def test_resolve_symbol_matches_fresh_recomputation_over_edits(mode: str, tmp_pa
         a.write_text(content, encoding="utf-8")
         fresh = Database(mode=mode)
         assert resolve_symbol(incremental, root, b, "foo") == resolve_symbol(fresh, root, b, "foo")
+
+
+# The repo's own `addopts = "-q --tb=no"` allows one line per failure, and both
+# node ids below are longer than that line on their own: measured, a red in
+# either prints `FAILED <node id>` and none of the message beneath it. The
+# messages are still written single-line and discriminator-first, and reading
+# one off a failure means re-running that node with `-o addopts="" --tb=long`.
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_scope_tree_matches_fresh_recomputation_over_edits(mode: str, tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "a.py"
+
+    incremental = Database(mode=mode)
+    contents = (
+        # Every neighbouring pair below parses to the same tree while the
+        # document geometry moves, except at the two steps marked as controls.
+        # The controls are what keep the row from exercising only the shapes a
+        # parse cannot see.
+        "def foo() -> int:\n    return 1\n",
+        "def foo() -> int:\n    return 1\n# trailing comment\n",
+        "def foo() -> int:\n    return 1\n",
+        "def foo() -> int:\n    return 1\n\n\n",
+        "def foo() -> int:\n    return 2\n",  # control: the body changes
+        "def foo() -> int:\n    return 2",
+        # Neither this document nor the one above it ends in a newline, and
+        # that is what makes the step discriminating: `DocumentMap` splits on
+        # `\r\n?|\n`, so a document that does end in one carries a trailing
+        # empty element and the module scope ends at `(line, 0)` whatever
+        # spaces precede it.
+        "def foo() -> int:\n    return 2   ",
+        "def foo(x: int) -> int:\n    return x   ",  # control: the signature changes
+    )
+    for content in contents:
+        path.write_text(content, encoding="utf-8")
+        warm = scope_tree(incremental, path)
+        fresh = scope_tree(Database(mode=mode), path)
+        assert warm == fresh, (
+            f"mode={mode} | warm_end={_module_scope_end(warm)} "
+            f"fresh_end={_module_scope_end(fresh)} | content={content!r} | "
+            "the module scope of a warm tree ends elsewhere than a fresh one"
+        )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_scope_tree_matches_the_text_it_is_built_from(mode: str, tmp_path: Path) -> None:
+    # The pair guarded here is (lexical, source): the ranges memo is keyed on a
+    # scope tree and a source text read within one request, which is what the
+    # `request_scope` below reproduces. A value-level divergence between the
+    # two is not reachable today -- an exhaustive position sweep over six
+    # parse-invisible edit shapes in three modes, 18 sweeps, found 0
+    # divergences, because the module scope's end is the only range derived
+    # from document geometry and the range builder derives every range it
+    # returns from the parse -- bindings, plus star-import aliases -- so the
+    # range that moves never reaches an answer. What is reachable is the pair
+    # being drawn from two revisions of the file, which is what comparing the
+    # tree against the text this same request returned rules out. Comparing
+    # that text against the bytes on disk would not: it matches either way,
+    # because the fresh snapshot is stored before the comparison decides
+    # anything.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "a.py"
+    path.write_text("x = 1\n", encoding="utf-8")
+
+    db = Database(mode=mode)
+    scope_tree(db, path)
+
+    path.write_text("x = 1\n# trailing comment\n", encoding="utf-8")
+    with request_scope(db):
+        text = source_text(db, str(path))
+        document = DocumentMap(text)
+        implied_end = SourcePosition(len(document.lines) - 1, len(document.lines[-1]))
+        tree_end = _module_scope_end(scope_tree(db, path))
+
+    assert tree_end == implied_end, (
+        f"mode={mode} | tree_end={tree_end} text_implies={implied_end} | "
+        f"text={text!r} | the tree and the text read beside it come from two "
+        "revisions of the file"
+    )
 
 
 # ---------------------------------------------------------------------------
