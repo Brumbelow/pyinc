@@ -14,12 +14,20 @@ This guide extracts the shared patterns from the shipped integrations, using
 
 Integrations use a layered query architecture:
 
-**Layer 1 -- Payload queries.** `@query`-decorated functions that return
-snapshot-safe payloads -- typically tuples, though a raw-text query such as
-`source_text` returns a plain `str`. These are the kernel-level cached nodes. They
-read resources, parse data, and return simple hashable structures. Examples include
-`source_text`, plus `imports_for_file` and `definitions_for_file`, which return
-tuple payloads.
+**Layer 1 -- Payload queries.** `@query`-decorated functions that read resources, parse
+data, and return snapshot-safe payloads. These are the kernel-level cached nodes, and
+they come in two kinds, separated by where a comparison policy may live:
+
+- *Raw-text reads* return a file's text as a plain `str`. They are compared by exact
+  equality and carry no comparison policy: a token coarser than the text would let the
+  node serve new bytes while reporting that nothing changed (see *Comparison Policies*).
+  Examples: `source_text` and `notebook_text`.
+- *Projection payloads* return the parsed structure a consumer needs, usually as a
+  tuple. An edit the projection does not carry cannot change it, so the node either
+  re-parses to an equal payload -- which the kernel backdates on the value itself,
+  under default equality -- or is reused behind a node that already did. Either way the
+  consumers below stay valid and no comparison policy was declared anywhere. Examples:
+  `imports_for_file`, `definitions_for_file`, and `notebook_cells_payload`.
 
 **Layer 2 -- Composition queries.** Queries that call other queries and assemble richer
 composite payloads. Example: `workspace_analysis_payload` calls `module_analysis_payload`
@@ -263,7 +271,10 @@ A new integration needs:
 - [ ] Uncertain resolution cases return conservative outcomes, not optimistic reuse
 - [ ] Dynamic or unsupported cases call `db.report_untracked_read(reason)`
 - [ ] Recursive traversal uses canonical visited sets and root containment checks
-- [ ] `@query(cutoff=fn)` is used where semantic equivalence is cheaper than full comparison
+- [ ] Queries that return raw text carry no `cutoff=`
+- [ ] Any `@query(cutoff=fn)` sits on a query whose token determines the value that
+      query returns; a coarser comparison belongs on the payload query that returns
+      the projection instead
 - [ ] `__all__` lists only stable types and entrypoints
 - [ ] `integrations/__init__.py` re-exports only the stable surface
 - [ ] Contract lock test verifies `__all__` and non-export of experimental helpers
@@ -273,12 +284,13 @@ A new integration needs:
 ## Canonical End-to-End Example: `calc`
 
 `examples/calc/` is a deliberately small consumer that exercises this whole
-pattern end to end: a single shared `FileResource`, a `@query(cutoff=...)` parse
-layer that backdates on comment/whitespace edits, cross-file dependency tracking
-via `include`, per-name incremental evaluation (each `binding_expr` backdates so
-unaffected `evaluate_name` nodes are reused), structural cycle detection that
-avoids relying on the kernel's `CycleError`, and reconciliation of the emitted
-results to disk through the [`@action` layer](action-contract.md). It is the
-recommended worked example to read alongside `python_source` when authoring a
-new query graph or a file→file compiler. See `tests/test_calc.py` for the
-incremental, provenance, and from-scratch assertions.
+pattern end to end: a single shared `FileResource`, a parse layer whose payload
+drops comments and blank lines so those edits never reach the evaluated
+results, cross-file dependency tracking via `include`, per-name incremental
+evaluation (each `binding_expr` backdates so unaffected `evaluate_name` nodes
+are reused), structural cycle detection that avoids relying on the kernel's
+`CycleError`, and reconciliation of the emitted results to disk through the
+[`@action` layer](action-contract.md). It is the recommended worked example to
+read alongside `python_source` when authoring a new query graph or a file→file
+compiler. See `tests/test_calc.py` for the incremental, provenance, and
+from-scratch assertions.
