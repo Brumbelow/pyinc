@@ -273,7 +273,7 @@ dropped, unless the magic runs that body as Python (`%%capture`, `%%debug`,
 `%%prun`, `%%python`, `%%python2`, `%%python3`, `%%time`, `%%timeit`).
 
 **Limits.** Workspace discovery is not recursive. Outputs and execution
-counts are ignored for cutoff purposes. Neutralization is lexical, is skipped
+counts never reach the parsed payloads. Neutralization is lexical, is skipped
 for a cell that already parses as Python, and only recognizes those
 constructs where IPython does — at the start of a logical line. A neutralized
 cell that still does not parse reports `notebook-non-python-cell` instead of
@@ -286,12 +286,12 @@ magic are not modeled.
 
 Cells are analyzed independently; there is no execution, magic expansion,
 cross-cell binding resolution, MIME rendering, attachment extraction, or
-nbformat schema dependency. Surrogate scanning covers what reaches the cached
-payload: cell sources, cell types, and the kernel metadata. Cell outputs and
-per-execution metadata never reach the payload or the cutoff token, so they
-are not scanned — a notebook whose outputs contain a lone surrogate stays
-fully analyzable, and one whose sources do is reported as a decode error
-rather than analyzed partially.
+nbformat schema dependency. Surrogate scanning covers what reaches the parsed
+payloads: cell sources, cell types, and the kernel metadata. Cell outputs and
+per-execution metadata never reach the parsed payloads, so they are not
+scanned — a notebook whose outputs contain a lone surrogate stays fully
+analyzable, and one whose sources do is reported as a decode error rather
+than analyzed partially.
 
 ## Request scoping
 

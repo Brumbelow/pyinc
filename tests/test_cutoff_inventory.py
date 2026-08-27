@@ -31,7 +31,6 @@ _STR_QUERIES_WITH_A_CUTOFF: frozenset[tuple[str, str]] = frozenset(
         ("src/pyinc/integrations/env_file.py", "env_file_text"),
         ("src/pyinc/integrations/installed_packages.py", "_metadata_text"),
         ("src/pyinc/integrations/json_config.py", "json_file_text"),
-        ("src/pyinc/integrations/notebook.py", "notebook_text"),
         ("src/pyinc/integrations/requirements_txt.py", "requirements_file_text"),
         ("src/pyinc/integrations/toml_config.py", "config_file_text"),
         ("src/pyinc/integrations/xml_config.py", "xml_file_text"),

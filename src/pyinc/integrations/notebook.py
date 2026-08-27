@@ -351,11 +351,11 @@ def _source_is_unicode_text(raw: Any) -> bool:
 def _surrogate_bearing_field(parsed: dict[str, Any]) -> str | None:
     """Name the first payload-bound string that is not valid Unicode.
 
-    Cell sources, cell types and the kernel metadata reach the cached payload --
-    and the cutoff token -- verbatim, where a lone surrogate is not a value
-    `freeze` can snapshot. Outputs and per-execution metadata reach neither, so
-    they are not walked: a notebook that only stores a surrogate loses no
-    analysis over it.
+    Cell sources and the kernel metadata reach the parsed payloads verbatim,
+    and a cell's type is read on the way to them, where a lone surrogate is
+    not a value `freeze` can snapshot. Outputs and per-execution metadata
+    reach none of the parsed payloads, so they are not walked: a notebook
+    that only stores a surrogate loses no analysis over it.
     """
     metadata = parsed.get("metadata")
     if isinstance(metadata, dict):
@@ -394,55 +394,12 @@ def _try_parse_notebook(text: str) -> dict[str, Any] | None:
     return parsed
 
 
-def _notebook_cutoff_token(text: str) -> tuple[str, ...]:
-    """Project the notebook text to the parts that affect analysis.
-
-    Outputs and per-execution metadata are stripped so that running cells
-    (which only changes ``outputs`` and ``execution_count``) backdates and
-    leaves downstream consumers untouched. JSON-decode failures fall back to
-    the raw text so a malformed notebook still has a stable cutoff.
-    """
-    parsed = _try_parse_notebook(text)
-    if parsed is None:
-        return ("raw", text)
-    cells_raw = parsed.get("cells", [])
-    if not isinstance(cells_raw, list):
-        return ("raw", text)
-    metadata = parsed.get("metadata", {})
-    kernel_name: str | None = None
-    language: str | None = None
-    if isinstance(metadata, dict):
-        kernelspec = metadata.get("kernelspec")
-        if isinstance(kernelspec, dict):
-            ks_name = kernelspec.get("name")
-            if isinstance(ks_name, str):
-                kernel_name = ks_name
-            ks_lang = kernelspec.get("language")
-            if isinstance(ks_lang, str):
-                language = ks_lang
-        language_info = metadata.get("language_info")
-        if language is None and isinstance(language_info, dict):
-            li_name = language_info.get("name")
-            if isinstance(li_name, str):
-                language = li_name
-    parts: list[str] = ["nb", repr(kernel_name), repr(language)]
-    for raw_cell in cells_raw:
-        if not isinstance(raw_cell, dict):
-            parts.append("invalid-cell")
-            continue
-        cell_type = str(raw_cell.get("cell_type", ""))
-        source = _coerce_source(raw_cell.get("source"))
-        parts.append(cell_type)
-        parts.append(source)
-    return tuple(parts)
-
-
 # ---------------------------------------------------------------------------
 # Layer 1 — Payload queries
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_notebook_cutoff_token)
+@query
 def notebook_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 

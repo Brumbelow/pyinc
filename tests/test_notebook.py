@@ -481,7 +481,7 @@ def test_notebook_falls_back_to_language_info(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cutoff / backdating
+# Backdating
 # ---------------------------------------------------------------------------
 
 
@@ -549,6 +549,32 @@ def test_semantic_source_edit_invalidates_notebook(tmp_path: Path) -> None:
 
     assert first != second
     assert second_changed > first_changed
+
+
+def test_cell_reshape_edit_matches_fresh_notebook_analysis(tmp_path: Path) -> None:
+    # The two documents differ in cell shape -- two cells that are not objects
+    # on one side, a single object cell whose type and source both read
+    # "invalid-cell" on the other -- but a projection that reads cell types and
+    # sources as one flat sequence of strings cannot tell them apart. A read
+    # that compared them that coarsely would serve the second document's bytes
+    # under the first document's analysis; `notebook_text` compares the bytes.
+    a = '{"cells": [1, 2]}'
+    b = '{"cells": [{"cell_type": "invalid-cell", "source": "invalid-cell"}]}'
+    path = tmp_path / "nb.ipynb"
+    path.write_text(a, encoding="utf-8")
+
+    incremental = Database(mode="strict")
+    notebook_analysis(incremental, str(path))
+    path.write_text(b, encoding="utf-8")
+
+    warm = notebook_analysis(incremental, str(path))
+    fresh = notebook_analysis(Database(mode="strict"), str(path))
+
+    assert warm == fresh, (
+        f"mode=strict | warm_cells={len(warm.cells)} fresh_cells={len(fresh.cells)}"
+        f" | warm_diags={len(warm.diagnostics)} fresh_diags={len(fresh.diagnostics)}"
+        " | the warm read answered with the analysis of the previous bytes"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -679,10 +705,10 @@ def test_notebook_markdown_heading_strips_hashes(tmp_path: Path) -> None:
 #
 # RFC 8259 permits `\uD800`-style escapes and `json.loads` decodes them, but a
 # lone surrogate is not a Unicode scalar value and so cannot cross a cached
-# boundary. Cell sources and the kernel metadata reach the cached payload
-# verbatim -- and the cutoff token too -- so whatever the integration reports
-# for such a notebook, it has to report it identically on a first read, after an
-# edit, and from a database that never saw the file.
+# boundary. Cell sources and the kernel metadata reach the parsed payloads
+# verbatim, so whatever the integration reports for such a notebook, it has to
+# report it identically on a first read, after an edit, and from a database that
+# never saw the file.
 
 
 _SURROGATE_NOTEBOOKS: tuple[tuple[str, str], ...] = (
@@ -713,7 +739,8 @@ def test_lone_surrogate_notebooks_analyze_identically_warm_and_fresh(
     incremental = Database()
     _write_notebook(path, _notebook([]))
     notebook_analysis(incremental, str(path))
-    # The cutoff runs only on recomputation, so the edit is what reaches it.
+    # Warm the database on a clean notebook first, so the surrogate arrives as
+    # an edit rather than as a first read.
     path.write_text(document, encoding="utf-8")
 
     assert notebook_analysis(incremental, str(path)) == first
