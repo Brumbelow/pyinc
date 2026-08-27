@@ -424,6 +424,31 @@ decided at release time.
   encodings reach the refusal: a container written inline, and one lifted into
   a shared node that a reference resolves to. Every key and member a hashable
   value can hold thaws exactly as before.
+- `scope_tree()`, `notebook_analysis()` and `workspace_notebook_analysis()`
+  answer a warm database the way a fresh one does after an edit. The two
+  queries that hand back a file's text — one for a Python source, one for a
+  notebook — compared a projection of that text rather than the text itself,
+  and no projection of a file is as fine as the file: where two revisions
+  projected the same way, the read served the new bytes while reporting that
+  nothing had changed, and every consumer that reads positions or raw structure
+  out of them stayed valid on the strength of that report. A trailing comment
+  left `scope_tree()` reporting the module scope as ending where it ended
+  before the comment existed, against the same database that was serving the
+  file's new text; a notebook whose `cells` entries changed shape kept
+  `notebook_analysis()` reporting the previous notebook's cells and
+  diagnostics. Both reads compare the text they return now. The parsed results
+  below them absorb an edit their own projection does not carry: they re-parse
+  to an equal payload, which the kernel backdates on the value itself under its
+  own default equality, so a comment-only edit still leaves the analysis where
+  it was and everything beyond the direct consumers of the text is reused as it
+  was before. `symbol_at()` and `find_references()` read the same text and are
+  re-verified against it rather than reused behind that comparison; no answer of
+  theirs was observed to move under it. A checkpoint saved before this change
+  still loads — the manifest schema is unchanged — but it no longer matches
+  these nodes or anything computed from them: dropping a comparison policy moves
+  a query's identity, and the identities below it move with it, so those records
+  are passed over and the queries that own them execute again on the first
+  request that asks for them. That one recomputation is the whole of the cost.
 
 ### Added
 
@@ -730,6 +755,20 @@ decided at release time.
   when a regular file is read, rather than escaping as a bare `ValueError` from
   the open itself. The refusal reads the same as every other unsafe-path
   refusal at that seam and carries the original failure as its cause.
+- The integration authoring guide states where a comparison policy may live.
+  Its Layer 1 description separates the queries that return a file's text from
+  the ones that return a parsed projection of it, and the section on
+  `@query(cutoff=fn)` states the precondition: the token has to determine the
+  value the query returns, so a query handing back a file's text takes no
+  token, and a lossy comparison belongs on the payload query that returns that
+  projection. The worked example, the authoring checklist and the `calc`
+  walkthrough follow it; the previous wording asked only whether the token was
+  cheaper than comparing the values. The notebook contract's two sentences
+  about outputs and per-execution metadata name the parsed payloads those
+  fields do not reach, where they previously named a comparison token. The
+  published work counts on the demo page and in the FAQ are brought up to date
+  with the current build, and the text around them says which of the figures
+  come from the recorded take and which do not.
 
 ## [3.1.1] - 2026-08-03
 
