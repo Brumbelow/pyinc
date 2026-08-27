@@ -256,31 +256,43 @@ def test_import_resolution_checks_later_installed_packages() -> None:
     assert result.distribution_name == "second"
 
 
-def test_notebook_cutoff_handles_malformed_shapes_and_metadata() -> None:
-    assert notebook._notebook_cutoff_token("not json") == ("raw", "not json")
-    cells_not_list = json.dumps({"cells": {}, "metadata": {}})
-    assert notebook._notebook_cutoff_token(cells_not_list) == ("raw", cells_not_list)
+def test_notebook_metadata_payload_handles_malformed_shapes_and_metadata(
+    tmp_path: Path,
+) -> None:
+    db = Database()
 
-    invalid_metadata = json.dumps({"cells": [None], "metadata": "invalid"})
-    assert notebook._notebook_cutoff_token(invalid_metadata) == (
-        "nb",
-        "None",
-        "None",
-        "invalid-cell",
+    def metadata_of(name: str, text: str) -> Any:
+        path = tmp_path / f"{name}.ipynb"
+        path.write_text(text, encoding="utf-8")
+        return notebook.notebook_metadata_payload(db, os.fspath(path))
+
+    # Undecodable text never becomes a document: `_try_parse_notebook` answers
+    # `None` and the payload returns before it looks at any metadata.
+    assert metadata_of("not_json", "not json") == (None, None)
+
+    # A `cells` field that is not a list still decodes to a document, so this
+    # one reaches the same answer by the other route: the metadata block runs
+    # and the empty `metadata` object yields neither a kernel nor a language.
+    assert metadata_of("cells_not_list", json.dumps({"cells": {}, "metadata": {}})) == (
+        None,
+        None,
     )
 
+    # A `metadata` field that is not an object short-circuits before either
+    # holder is consulted.
+    invalid_metadata = json.dumps({"cells": [None], "metadata": "invalid"})
+    assert metadata_of("invalid_metadata", invalid_metadata) == (None, None)
+
+    # A non-string `kernelspec.name` is ignored; `kernelspec.language` is taken.
     kernelspec_language = json.dumps(
         {
             "cells": [],
             "metadata": {"kernelspec": {"name": 7, "language": "R"}},
         }
     )
-    assert notebook._notebook_cutoff_token(kernelspec_language)[:3] == (
-        "nb",
-        "None",
-        "'R'",
-    )
+    assert metadata_of("kernelspec_language", kernelspec_language) == (None, "R")
 
+    # A non-string `kernelspec.language` falls through to `language_info`.
     language_info = json.dumps(
         {
             "cells": [],
@@ -290,12 +302,10 @@ def test_notebook_cutoff_handles_malformed_shapes_and_metadata() -> None:
             },
         }
     )
-    assert notebook._notebook_cutoff_token(language_info)[:3] == (
-        "nb",
-        "None",
-        "'python'",
-    )
+    assert metadata_of("language_info", language_info) == (None, "python")
 
+    # Neither holder yields a string: `kernelspec` is not an object at all and
+    # `language_info.name` is a number.
     nonstring_language_info = json.dumps(
         {
             "cells": [],
@@ -305,11 +315,12 @@ def test_notebook_cutoff_handles_malformed_shapes_and_metadata() -> None:
             },
         }
     )
-    assert notebook._notebook_cutoff_token(nonstring_language_info)[:3] == (
-        "nb",
-        "None",
-        "None",
-    )
+    assert metadata_of("nonstring_language_info", nonstring_language_info) == (None, None)
+
+    # A `language_info` that is present but not an object is passed over the
+    # same way an absent one is.
+    invalid_language_info = json.dumps({"cells": [], "metadata": {"language_info": "invalid"}})
+    assert metadata_of("invalid_language_info", invalid_language_info) == (None, None)
 
 
 def test_notebook_payload_queries_reject_invalid_container_shapes(

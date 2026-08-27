@@ -537,14 +537,38 @@ def test_toml_helper_uncommon_values_and_failures() -> None:
     )
 
 
-def test_notebook_cutoff_and_cell_helper_edges() -> None:
+def test_notebook_payload_and_cell_helper_edges(tmp_path: Path) -> None:
     assert notebook._coerce_source(42) == ""
-    assert notebook._notebook_cutoff_token("not json")[0] == "raw"
-    assert notebook._notebook_cutoff_token('{"cells": {}}')[0] == "raw"
-    cutoff = notebook._notebook_cutoff_token(
-        '{"cells":[null],"metadata":{"kernelspec":null,"language_info":{"name":"python"}}}'
+
+    db = Database()
+
+    not_json = tmp_path / "not-json.ipynb"
+    not_json.write_text("not json", encoding="utf-8")
+    decode_diagnostics = notebook.notebook_diagnostics_payload(db, str(not_json))
+    # The decoder's own wording belongs to the interpreter, so only the code
+    # and the (absent) cell index are pinned here.
+    assert [(entry[0], entry[2]) for entry in decode_diagnostics] == [
+        ("notebook-decode-error", None)
+    ]
+    assert notebook.notebook_cells_payload(db, str(not_json)) == ()
+
+    cells_not_list = tmp_path / "cells-not-list.ipynb"
+    cells_not_list.write_text('{"cells": {}}', encoding="utf-8")
+    assert notebook.notebook_diagnostics_payload(db, str(cells_not_list)) == (
+        ("notebook-shape-error", "'cells' is not a list", None),
     )
-    assert cutoff == ("nb", "None", "'python'", "invalid-cell")
+    assert notebook.notebook_cells_payload(db, str(cells_not_list)) == ()
+
+    null_cell = tmp_path / "null-cell.ipynb"
+    null_cell.write_text(
+        '{"cells":[null],"metadata":{"kernelspec":null,"language_info":{"name":"python"}}}',
+        encoding="utf-8",
+    )
+    assert notebook.notebook_metadata_payload(db, str(null_cell)) == (None, "python")
+    assert notebook.notebook_cells_payload(db, str(null_cell)) == ()
+    assert notebook.notebook_diagnostics_payload(db, str(null_cell)) == (
+        ("notebook-shape-error", "cell is not an object", 0),
+    )
 
 
 def test_deep_module_sys_path_filtering(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
