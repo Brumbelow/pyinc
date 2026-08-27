@@ -7,12 +7,14 @@ from typing import Any
 import pytest
 
 import pyinc.integrations as integrations
-from pyinc import Database
+from pyinc import Database, InMemoryArtifactStore
 from pyinc.integrations.notebook import (
     NotebookAnalysis,
     NotebookCell,
     notebook_analysis,
     notebook_analysis_payload,
+    notebook_cells_payload,
+    notebook_diagnostics_payload,
     workspace_notebook_analysis,
 )
 
@@ -551,32 +553,6 @@ def test_semantic_source_edit_invalidates_notebook(tmp_path: Path) -> None:
     assert second_changed > first_changed
 
 
-def test_cell_reshape_edit_matches_fresh_notebook_analysis(tmp_path: Path) -> None:
-    # The two documents differ in cell shape -- two cells that are not objects
-    # on one side, a single object cell whose type and source both read
-    # "invalid-cell" on the other -- but a projection that reads cell types and
-    # sources as one flat sequence of strings cannot tell them apart. A read
-    # that compared them that coarsely would serve the second document's bytes
-    # under the first document's analysis; `notebook_text` compares the bytes.
-    a = '{"cells": [1, 2]}'
-    b = '{"cells": [{"cell_type": "invalid-cell", "source": "invalid-cell"}]}'
-    path = tmp_path / "nb.ipynb"
-    path.write_text(a, encoding="utf-8")
-
-    incremental = Database(mode="strict")
-    notebook_analysis(incremental, str(path))
-    path.write_text(b, encoding="utf-8")
-
-    warm = notebook_analysis(incremental, str(path))
-    fresh = notebook_analysis(Database(mode="strict"), str(path))
-
-    assert warm == fresh, (
-        f"mode=strict | warm_cells={len(warm.cells)} fresh_cells={len(fresh.cells)}"
-        f" | warm_diags={len(warm.diagnostics)} fresh_diags={len(fresh.diagnostics)}"
-        " | the warm read answered with the analysis of the previous bytes"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
@@ -661,6 +637,101 @@ def test_notebook_analysis_matches_fresh_recomputation_over_changes(
         path.write_text(json.dumps(content), encoding="utf-8")
         fresh = Database(mode=mode)
         assert notebook_analysis(incremental, str(path)) == notebook_analysis(fresh, str(path))
+
+
+# The pool above is well-formed throughout, which is why it never caught the
+# reshape below: these two documents are deliberately malformed, so the
+# `_notebook` envelope is the wrong shape for them and they are written raw.
+_ARITY_A = '{"cells": [1, 2]}'
+_ARITY_B = '{"cells": [{"cell_type": "invalid-cell", "source": "invalid-cell"}]}'
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [(_ARITY_A, _ARITY_B), (_ARITY_B, _ARITY_A)],
+    ids=["A->B", "B->A"],
+)
+def test_notebook_edit_matches_a_fresh_read(
+    tmp_path: Path, mode: str, before: str, after: str
+) -> None:
+    # These two documents project to the same flat tuple of strings: a cell
+    # that is not an object contributes one element and a cell that is
+    # contributes two, so a one-cell notebook and a two-cell one can line up.
+    # A read that compared by that projection answered the second document
+    # with the first document's analysis.
+    path = tmp_path / "sample.ipynb"
+    path.write_text(before, encoding="utf-8")
+    incremental = Database(mode=mode)
+    notebook_analysis(incremental, str(path))
+
+    path.write_text(after, encoding="utf-8")
+    warm = notebook_analysis(incremental, str(path))
+    scratch = Database(mode=mode)
+    fresh = notebook_analysis(scratch, str(path))
+
+    # One line, counts first. A parametrized node id this long fills the whole
+    # summary line on its own, so under the default `--tb=no` no message
+    # survives at all; read a failure here with `-o addopts="" --tb=long`. The
+    # message is laid out for that read: the numbers that identify the failure
+    # first, the documents last.
+    assert warm == fresh, (
+        f"cells {len(warm.cells)}!={len(fresh.cells)} | "
+        f"diags {len(warm.diagnostics)}!={len(fresh.diagnostics)} | "
+        f"{before} -> {after}"
+    )
+
+    # Secondary diagnostics: which parsed projection moved. Metadata is left
+    # out on purpose -- it reads only the kernelspec and the language info,
+    # which both documents share, so a metadata comparison passes here whether
+    # or not the analysis diverged.
+    warm_cells = notebook_cells_payload(incremental, str(path))
+    scratch_cells = notebook_cells_payload(scratch, str(path))
+    assert warm_cells == scratch_cells, (
+        f"cells payload {len(warm_cells)}!={len(scratch_cells)} | {before} -> {after}"
+    )
+
+    warm_diags = notebook_diagnostics_payload(incremental, str(path))
+    scratch_diags = notebook_diagnostics_payload(scratch, str(path))
+    assert warm_diags == scratch_diags, (
+        f"diagnostics payload {len(warm_diags)}!={len(scratch_diags)} | {before} -> {after}"
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_notebook_edit_survives_a_checkpoint(tmp_path: Path, mode: str) -> None:
+    # The edit has to happen before the save. Saving first and editing after
+    # does not reproduce: on reload the resource probe mismatches, the read
+    # executes on the new bytes, and there is no earlier comparison left to
+    # answer from -- the test would then be green whether or not the bug is
+    # present.
+    path = tmp_path / "sample.ipynb"
+    path.write_text(_ARITY_A, encoding="utf-8")
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    notebook_analysis(saver, str(path))
+
+    path.write_text(_ARITY_B, encoding="utf-8")
+    notebook_analysis(saver, str(path))
+    key = saver.save_checkpoint()
+
+    reloaded = Database(mode=mode, store=store)
+    reloaded.load_checkpoint(key)
+
+    # Compare values, never a recompute marker: a reloaded record reports
+    # `executed` or `reused` either way, so the marker cannot tell a restored
+    # analysis from a stale one. Ask the entrypoint rather than a payload
+    # leaf, too -- checkpoint warming is parent-driven, and a leaf asked on
+    # its own cold-executes even when its record is in the manifest.
+    warm = notebook_analysis(reloaded, str(path))
+    fresh = notebook_analysis(Database(mode=mode), str(path))
+
+    assert warm == fresh, (
+        f"cells {len(warm.cells)}!={len(fresh.cells)} | "
+        f"diags {len(warm.diagnostics)}!={len(fresh.diagnostics)} | "
+        f"reloaded from a checkpoint saved after {_ARITY_A} -> {_ARITY_B}"
+    )
 
 
 # ---------------------------------------------------------------------------
