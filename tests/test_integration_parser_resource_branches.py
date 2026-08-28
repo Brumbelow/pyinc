@@ -99,11 +99,9 @@ def test_env_parser_preserves_unterminated_quoted_values() -> None:
     ]
 
 
-def test_json_helpers_cover_raw_cutoff_and_nonstandard_values() -> None:
-    assert json_config._json_cutoff_token("{") == ("raw", "{")
+def test_json_helpers_cover_nonstandard_values() -> None:
     assert json_config._json_value_type({"nested": True}) == "object"
     assert json_config._json_value_type((1, 2)) == "unknown"
-    assert json_config._json_value_to_string({"b": 2, "a": 1}) == "[('a', 1), ('b', 2)]"
 
 
 def test_toml_helpers_cover_value_kinds_and_shape_edges() -> None:

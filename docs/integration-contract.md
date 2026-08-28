@@ -112,8 +112,7 @@ silently normalized, as is object or array nesting deeper than 200 levels —
 the `json-decode-error` diagnostic names that limit, and depth is counted from
 the file text before parsing, so the rejection is the same from every call
 site. On stack exhaustion that diagnostic carries the fixed text `JSON parsing
-exhausted the interpreter stack`; a spent stack can cost a cutoff, never make
-one wrong.
+exhausted the interpreter stack`.
 
 ## Requirements files
 

@@ -9,7 +9,7 @@ from typing import Any, Literal
 import pytest
 
 import pyinc.integrations as integrations
-from pyinc import Database
+from pyinc import Database, FileSystemArtifactStore
 from pyinc.integrations import json_config, xml_config
 from pyinc.integrations.json_config import (
     _MAX_JSON_DEPTH,
@@ -18,6 +18,8 @@ from pyinc.integrations.json_config import (
     _text_nesting_depth,
     _walk_sections,
     json_analysis,
+    json_analysis_payload,
+    json_sections_payload,
     workspace_json_analysis,
 )
 from pyinc.value import _MAX_SNAPSHOT_DEPTH
@@ -240,7 +242,7 @@ def test_json_analysis_value_types(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cutoff / backdating
+# Incremental answers and backdating
 # ---------------------------------------------------------------------------
 
 
@@ -273,6 +275,179 @@ def test_semantic_edit_invalidates_downstream(tmp_path: Path) -> None:
     second = json_analysis(db, str(path))
 
     assert first != second
+
+
+# Reorder edits. The order an object's keys were written in survives into the
+# public string, which renders them as they were parsed, but not into any sorted
+# projection of the document. `expected` is what the document on the right
+# actually analyses to, so a warm answer still describing the document on the
+# left fails against a value rather than against a marker. The ladder walks the
+# same reorder one, two, three and four containers down.
+_REORDERED_EDITS: tuple[tuple[str, str, str, tuple[Any, ...]], ...] = (
+    (
+        "a dependency list",
+        '{"deps": [{"name": "a", "version": "1"}]}',
+        '{"deps": [{"version": "1", "name": "a"}]}',
+        (("<root>", (("<root>", "deps", "array", "[{'version': '1', 'name': 'a'}]"),), ()),),
+    ),
+    (
+        "an object one container down",
+        '{"a": [{"x": 1, "y": 2}]}',
+        '{"a": [{"y": 2, "x": 1}]}',
+        (("<root>", (("<root>", "a", "array", "[{'y': 2, 'x': 1}]"),), ()),),
+    ),
+    (
+        "an object two containers down",
+        '{"a": [[{"x": 1, "y": 2}]]}',
+        '{"a": [[{"y": 2, "x": 1}]]}',
+        (("<root>", (("<root>", "a", "array", "[[{'y': 2, 'x': 1}]]"),), ()),),
+    ),
+    (
+        "an object three containers down",
+        '{"a": [{"b": [{"x": 1, "y": 2}]}]}',
+        '{"a": [{"b": [{"y": 2, "x": 1}]}]}',
+        (("<root>", (("<root>", "a", "array", "[{'b': [{'y': 2, 'x': 1}]}]"),), ()),),
+    ),
+    (
+        "an object four containers down",
+        '{"a": [{"b": [[{"x": 1, "y": 2}]]}]}',
+        '{"a": [{"b": [[{"y": 2, "x": 1}]]}]}',
+        (("<root>", (("<root>", "a", "array", "[{'b': [[{'y': 2, 'x': 1}]]}]"),), ()),),
+    ),
+)
+
+_REORDER_IDS = ("deps", "depth-1", "depth-2", "depth-3", "depth-4")
+
+
+def _sections_of(result: JsonAnalysis) -> tuple[Any, ...]:
+    """Project an analysis back onto the section payload shape, for readable failures."""
+    return tuple(
+        (
+            section.name,
+            tuple((k.section, k.key, k.value_type, k.string_value) for k in section.keys),
+            section.subsections,
+        )
+        for section in result.sections
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(
+    ("label", "before", "after", "expected"), _REORDERED_EDITS, ids=_REORDER_IDS
+)
+def test_a_reorder_edit_is_answered_with_the_text_that_was_read(
+    label: str, before: str, after: str, expected: tuple[Any, ...], mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "package.json"
+    path.write_text(before, encoding="utf-8")
+
+    db = Database(mode=mode)
+    json_analysis(db, str(path))
+    workspace_json_analysis(db, str(tmp_path))
+    path.write_text(after, encoding="utf-8")
+
+    warm = json_analysis(db, str(path))
+    warm_workspace = workspace_json_analysis(db, str(tmp_path))
+    fresh = json_analysis(Database(mode=mode), str(path))
+
+    assert _sections_of(fresh) == expected, f"{label} | fresh {_sections_of(fresh)}"
+    assert _sections_of(warm) == expected, (
+        f"{label} | warm {_sections_of(warm)} | expected {expected}"
+    )
+    assert warm_workspace is not None
+    assert _sections_of(warm_workspace) == expected, (
+        f"{label} | workspace {_sections_of(warm_workspace)} | expected {expected}"
+    )
+    assert warm == fresh, f"{label} | {before!r} -> {after!r} | warm {_sections_of(warm)}"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reorder_edit_moves_the_reported_string_value(mode: str, tmp_path: Path) -> None:
+    # The narrowest statement of the same defect: one key, one public field.
+    path = tmp_path / "package.json"
+    path.write_text('{"x": [{"b": 1, "a": 2}]}', encoding="utf-8")
+
+    db = Database(mode=mode)
+    json_analysis(db, str(path))
+    path.write_text('{"x": [{"a": 2, "b": 1}]}', encoding="utf-8")
+
+    warm = json_analysis(db, str(path)).sections[0].keys[0]
+    fresh = json_analysis(Database(mode=mode), str(path)).sections[0].keys[0]
+
+    assert fresh.string_value == "[{'a': 2, 'b': 1}]", f"fresh {fresh.string_value}"
+    assert warm.string_value == "[{'a': 2, 'b': 1}]", f"warm {warm.string_value}"
+    assert warm == fresh, f"warm {warm} | fresh {fresh}"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reorder_edit_survives_a_checkpoint(mode: str, tmp_path: Path) -> None:
+    # Both the edit and a drive that lets the stale answer form have to happen
+    # before the save. Saving first and editing after does not reproduce: on
+    # reload the resource probe mismatches, the read executes on the new bytes,
+    # and no earlier answer is left to serve -- the row would then be green
+    # whether or not the defect is present.
+    label, before, after, expected = _REORDERED_EDITS[0]
+    path = tmp_path / "package.json"
+    path.write_text(before, encoding="utf-8")
+
+    store_dir = tmp_path / "store"
+    saver = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    json_analysis(saver, str(path))
+
+    path.write_text(after, encoding="utf-8")
+    json_analysis(saver, str(path))
+    key = saver.save_checkpoint()
+
+    reloaded = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    reloaded.load_checkpoint(key)
+
+    # Values only: a reloaded record reports `executed` or `reused` either way,
+    # so no recompute marker can tell a restored answer from a stale one.
+    warm = json_analysis(reloaded, str(path))
+    fresh = json_analysis(Database(mode=mode), str(path))
+
+    assert _sections_of(warm) == expected, (
+        f"{label} | reloaded {_sections_of(warm)} | expected {expected}"
+    )
+    assert warm == fresh, f"{label} | {before!r} -> {after!r} | reloaded {_sections_of(warm)}"
+
+
+# The two queries that re-read the text and re-derive a projection of it.
+_PAYLOAD_QUERIES = ("json_sections_payload", "json_diagnostics_payload")
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_formatting_only_edit_recomputes_the_payloads_and_backdates_the_analysis(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(_MINIMAL_JSON, encoding="utf-8")
+
+    db = Database(mode=mode)
+    first = json_analysis(db, str(path))
+
+    db.reset_statistics()
+    path.write_text(json.dumps(json.loads(_MINIMAL_JSON), indent=4), encoding="utf-8")
+    second = json_analysis(db, str(path))
+
+    assert first == second, "a reformat moved the analysis"
+
+    # `query_profile()` records executions only and `reset_statistics()` has just
+    # cleared it, so a query that was reused has no row at all -- there is no row
+    # carrying a zero to look for. Labels also carry an argument-hash suffix, so a
+    # lookup by bare query name never matches; match by substring instead.
+    executed = [profile.query_label for profile in db.query_profile()]
+    for name in _PAYLOAD_QUERIES:
+        assert any(name in label for label in executed), (
+            f"{name} did not re-run | executed {executed}"
+        )
+    assert not [label for label in executed if "json_analysis_payload" in label], (
+        f"json_analysis_payload re-ran instead of backdating | executed {executed}"
+    )
+
+    statistics = db.statistics()
+    assert statistics.query_executions > 0, f"nothing re-ran | {statistics}"
+    assert statistics.query_backdates > 0, f"nothing backdated | {statistics}"
 
 
 # ---------------------------------------------------------------------------
@@ -484,10 +659,58 @@ def test_the_section_walk_does_not_consume_the_interpreter_recursion_budget() ->
     assert walked == [_MAX_JSON_DEPTH]
 
 
-def test_the_nesting_cap_keeps_every_accepted_document_snapshot_safe(tmp_path: Path) -> None:
-    # `freeze` refuses to snapshot a value nested deeper than this, and a JSON
-    # document's container depth is exactly its snapshot depth.
-    assert _MAX_JSON_DEPTH <= _MAX_SNAPSHOT_DEPTH
+def _snapshot_depth(value: object) -> int:
+    """Report the container nesting of a cached value without recursing into it."""
+    deepest = 0
+    pending: list[tuple[object, int]] = [(value, 1)]
+
+    while pending:
+        current, depth = pending.pop()
+        children: list[object]
+        if isinstance(current, tuple | list):
+            children = list(current)
+        elif isinstance(current, dict):
+            children = list(current.values())
+        else:
+            continue
+        if depth > deepest:
+            deepest = depth
+        pending.extend((child, depth + 1) for child in children)
+
+    return deepest
+
+
+def test_a_deep_document_neither_deepens_the_cache_nor_escapes_the_analysis(
+    tmp_path: Path,
+) -> None:
+    # What gets cached is a flat tuple of `(name, keys, subsections)` triples, so
+    # its nesting is a property of that shape and not of the document's: the same
+    # document written two orders of magnitude deeper caches exactly as deep. That
+    # is what keeps every accepted document inside the kernel's snapshot limit,
+    # however deep it nests, and it is why the cap is free to sit where the ~1 MiB
+    # payload budget puts it.
+    shallow = tmp_path / "shallow.json"
+    shallow.write_text(_nested_json(3), encoding="utf-8")
+    deep = tmp_path / "deep.json"
+    deep.write_text(_nested_json(_MAX_JSON_DEPTH), encoding="utf-8")
+
+    db = Database()
+    depths: dict[tuple[str, str], int] = {}
+    for document in (shallow, deep):
+        depths[(document.stem, "sections")] = _snapshot_depth(
+            db.get(json_sections_payload, str(document))
+        )
+        depths[(document.stem, "analysis")] = _snapshot_depth(
+            db.get(json_analysis_payload, str(document))
+        )
+
+    assert depths == {
+        ("shallow", "sections"): 4,
+        ("deep", "sections"): 4,
+        ("shallow", "analysis"): 5,
+        ("deep", "analysis"): 5,
+    }, f"document depths 3 and {_MAX_JSON_DEPTH} | {depths}"
+    assert max(depths.values()) < _MAX_SNAPSHOT_DEPTH, f"{depths}"
 
     path = tmp_path / "over-deep.json"
     path.write_text(_nested_json(_MAX_JSON_DEPTH + 1), encoding="utf-8")
@@ -497,14 +720,16 @@ def test_the_nesting_cap_keeps_every_accepted_document_snapshot_safe(tmp_path: P
         db = Database()
         try:
             json_analysis(db, str(path))
-            # The cutoff runs only on recomputation, so the edit is what reaches it.
+            # The document is scanned again only on recomputation, so the edit is
+            # what drives it back through the depth check.
             path.write_text(_nested_json(_MAX_JSON_DEPTH + 1) + " ", encoding="utf-8")
             observed.append(json_analysis(db, str(path)).diagnostics)
         except Exception as exc:
             observed.append(exc)
 
-    # Enough stack that the parse and the cutoff's `freeze` both get far enough to
-    # reach the kernel's snapshot-nesting limit rather than running out first.
+    # A large stack and a raised limit, so the diagnostic observed below is the
+    # cap's own and not stack exhaustion. Both are reported as
+    # `json-decode-error`, and only running with budget to spare tells them apart.
     original_limit = sys.getrecursionlimit()
     original_stack = threading.stack_size(64 * 1024 * 1024)
     sys.setrecursionlimit(5000)
@@ -558,7 +783,8 @@ def test_lone_surrogate_documents_analyze_identically_warm_and_fresh(
     incremental = Database()
     path.write_text('{"a": 1}', encoding="utf-8")
     json_analysis(incremental, str(path))
-    # The cutoff runs only on recomputation, so the edit is what reaches it.
+    # The analysis is redone only on recomputation, so the edit is what drives the
+    # surrogate document back through it.
     path.write_text(document, encoding="utf-8")
 
     assert json_analysis(incremental, str(path)) == first

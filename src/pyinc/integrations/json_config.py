@@ -12,7 +12,7 @@ from pyinc.core import query
 from pyinc.errors import UnsupportedValueError
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
-from pyinc.value import freeze, thaw
+from pyinc.value import thaw
 
 from ._resources import file_probe, file_read_snapshot, file_text
 
@@ -97,16 +97,15 @@ class _JsonSurrogateKeyError(ValueError):
 # `xml_config` caps `_MAX_XML_DEPTH` for the same reason and against the same
 # budget — a document at the cap must not cache more than ~1 MiB.
 #
-# Two constraints meet at 200. The budget: measured with 20-character keys, a
+# The budget is what puts the cap at 200: measured with 20-character keys, a
 # document at this cap caches 832 KB of section payload text (422 KB of it section
 # names); at 256 levels, the cap `xml_config` carries, the same document would
 # cache 1.33 MiB, over budget. XML sits higher under one budget because an XML
 # element emits its path once where a JSON object emits it twice, as its own
-# section name and again in its parent's `subsections`. Independently, `freeze`
-# refuses to snapshot a value nested deeper than 200 levels, and a JSON document's
-# container depth is exactly its snapshot depth, so a document past 200 could never
-# be cached at all — it raises `UnsupportedValueError` out of the cutoff instead.
-# 200 is still an order of magnitude deeper than any real configuration document.
+# section name and again in its parent's `subsections`. What gets cached is a flat
+# tuple of `(name, keys, subsections)` triples whose own nesting does not grow with
+# the document's, so nesting costs cache size and nothing else. 200 is an order of
+# magnitude deeper than any real configuration document.
 _MAX_JSON_DEPTH = 200
 
 # Every byte that cannot change the nesting depth, so that only quotes and brackets
@@ -237,8 +236,6 @@ def _json_value_type(value: Any) -> str:
 
 
 def _json_value_to_string(value: Any) -> str:
-    if isinstance(value, dict):
-        return repr(sorted(value.items()))
     return repr(value)
 
 
@@ -246,7 +243,11 @@ def _walk_sections(
     data: dict[str, Any],
     prefix: str,
 ) -> list[JsonSectionPayload]:
-    """Collect every object in document pre-order, deepest nesting included.
+    """Collect every object in sorted pre-order, deepest nesting included.
+
+    Keys are visited in sorted order at every level rather than in the order the
+    document wrote them, so a file that writes `"b"` before `"a"` still yields
+    `<root>`, `a`, `b`.
 
     The traversal keeps its own stack rather than recursing, so the payload a
     document produces depends only on the document — never on how much of the
@@ -278,25 +279,10 @@ def _walk_sections(
                 )
 
         sections.append((section_name, tuple(keys), tuple(subsections)))
-        # Reversed so the first subsection is popped first, preserving document order.
+        # Reversed so the first subsection is popped first, preserving sorted order.
         pending.extend(reversed(children))
 
     return sections
-
-
-def _json_cutoff_token(text: str) -> tuple[str, str]:
-    try:
-        parsed = _load_json(text)
-        snapshot = freeze(parsed)
-        return ("parsed", repr(snapshot))
-    except (ValueError, RecursionError, OverflowError, UnsupportedValueError):
-        # `freeze` rejects a value outside the snapshot grammar with
-        # `UnsupportedValueError`, which is a `PyIncError` and not a
-        # `ValueError`: a document `json.loads` accepts but `freeze` refuses --
-        # a lone surrogate escape in a string value, say -- must degrade to the
-        # raw text here, not escape the cutoff and fail the recomputation a
-        # fresh database completes.
-        return ("raw", text)
 
 
 def _try_parse_json(text: str) -> dict[str, Any] | None:
@@ -314,7 +300,7 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_json_cutoff_token)
+@query
 def json_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 

@@ -514,8 +514,6 @@ def test_csv_empty_reader_and_sniffer_failures(monkeypatch: pytest.MonkeyPatch) 
 
 def test_json_helper_uncommon_values_and_failures() -> None:
     assert json_config._json_value_type(object()) == "unknown"
-    assert json_config._json_value_to_string({"b": 1, "a": 2}) == "[('a', 2), ('b', 1)]"
-    assert json_config._json_cutoff_token("{broken")[0] == "raw"
     assert json_config._try_parse_json("[]") is None
     assert json_config._try_parse_json("{broken") is None
 
