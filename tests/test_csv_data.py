@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 import pyinc.integrations as integrations
-from pyinc import Database
+from pyinc import Database, FileSystemArtifactStore
 from pyinc.integrations.csv_data import (
     CsvAnalysis,
     csv_analysis,
@@ -36,6 +36,11 @@ Alice,30,Portland
 Bob,25
 Charlie,35,Denver,extra
 """
+
+# The same table twice: unquoted, then with every field quoted and a trailing
+# blank line added.
+_UNFORMATTED_CSV = "name,age\nAlice,30\nBob,25\n"
+_REFORMATTED_CSV = '"name","age"\n"Alice","30"\n"Bob","25"\n\n'
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +257,135 @@ def test_diagnostic_only_edit_invalidates_csv(tmp_path: Path) -> None:
 
     assert incremental == fresh
     assert "row 3:" in incremental.diagnostics[0][1]
+
+
+# ---------------------------------------------------------------------------
+# Reformatting costs nothing above the payloads
+# ---------------------------------------------------------------------------
+
+# The three queries that re-read the text and re-derive a projection of it.
+_PAYLOAD_QUERIES = ("csv_columns_payload", "csv_meta_payload", "csv_diagnostics_payload")
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reformat_recomputes_the_payloads_and_backdates_the_composition(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "data.csv"
+    path.write_text(_UNFORMATTED_CSV, encoding="utf-8")
+
+    db = Database(mode=mode)
+    first = csv_analysis(db, str(path))
+
+    db.reset_statistics()
+    path.write_text(_REFORMATTED_CSV, encoding="utf-8")
+    second = csv_analysis(db, str(path))
+
+    assert first == second, f"a reformat moved the analysis | first {first} | second {second}"
+
+    # `query_profile()` records executions only, and `reset_statistics()` has
+    # just cleared it, so a query that was reused has no row at all -- there is
+    # no row carrying a zero to look for. Labels also carry an argument-hash
+    # suffix, so a lookup by bare query name never matches; match by substring.
+    executed = [profile.query_label for profile in db.query_profile()]
+    for name in _PAYLOAD_QUERIES:
+        assert any(name in label for label in executed), (
+            f"{name} did not re-run | executed {executed}"
+        )
+    assert not [label for label in executed if "csv_analysis_payload" in label], (
+        f"csv_analysis_payload re-ran instead of backdating | executed {executed}"
+    )
+
+    # Absolute counts for the second read, not deltas: the read executes on the
+    # new bytes, the three payload queries re-derive equal projections and are
+    # backdated, and everything above them is reused. The reuse figure is what
+    # the reformat is supposed to cost nothing on.
+    statistics = db.statistics()
+    counts = (
+        statistics.query_executions,
+        statistics.query_backdates,
+        statistics.query_reuses,
+    )
+    assert counts == (1, 3, 6), f"work counts moved | exec/backdate/reuse {counts}"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reformat_leaves_workspace_discovery_identical(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "data.csv"
+    path.write_text(_UNFORMATTED_CSV, encoding="utf-8")
+
+    db = Database(mode=mode)
+    first = workspace_csv_analysis(db, str(tmp_path))
+
+    path.write_text(_REFORMATTED_CSV, encoding="utf-8")
+    second = workspace_csv_analysis(db, str(tmp_path))
+
+    assert first is not None, "discovery found no file to analyse"
+    assert first == second, f"a reformat moved discovery | first {first} | second {second}"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints
+# ---------------------------------------------------------------------------
+
+# The ordering other integrations use -- edit, drive the entrypoint so a stale
+# answer forms, then save -- is unconstructible here: this read compares the text
+# it hands back, so there is no answer that disagrees with the file to save. The
+# substitute edits the file after the save, which the reload has to notice. The
+# second arm is what keeps that honest: with no edit the saved answer and a fresh
+# one agree, and the row would pass on any tree at all.
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_checkpoint_reload_answers_an_edit_made_after_the_save(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "data.csv"
+    path.write_text(_UNFORMATTED_CSV, encoding="utf-8")
+
+    store_dir = tmp_path / "store"
+    saver = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    warm = csv_analysis(saver, str(path))
+    key = saver.save_checkpoint()
+
+    path.write_text("name,age\nAlice,31\nBob,25\nCarol,41\n", encoding="utf-8")
+
+    reloaded = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    reloaded.load_checkpoint(key)
+
+    restored = csv_analysis(reloaded, str(path))
+    fresh = csv_analysis(Database(mode=mode), str(path))
+
+    assert restored == fresh, f"reloaded != fresh | reloaded {restored} | fresh {fresh}"
+    assert restored != warm, f"the edit never reached the reload | warm {warm}"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_checkpoint_reload_over_an_unchanged_file_runs_nothing(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "data.csv"
+    path.write_text(_UNFORMATTED_CSV, encoding="utf-8")
+
+    store_dir = tmp_path / "store"
+    saver = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    warm = csv_analysis(saver, str(path))
+    key = saver.save_checkpoint()
+
+    reloaded = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    reloaded.load_checkpoint(key)
+    restored = csv_analysis(reloaded, str(path))
+
+    assert restored == warm, f"the saved answer did not survive | warm {warm}"
+
+    statistics = reloaded.statistics()
+    counts = (
+        statistics.query_executions,
+        statistics.query_reuses,
+        statistics.resource_loads,
+        statistics.resource_probe_hits,
+    )
+    assert counts == (0, 1, 0, 1), f"the reload did work | exec/reuse/loads/probes {counts}"
 
 
 # ---------------------------------------------------------------------------

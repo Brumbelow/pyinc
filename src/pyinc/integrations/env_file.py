@@ -9,7 +9,7 @@ from typing import TypeAlias, cast
 from pyinc.core import query
 from pyinc.resources import DirectoryResource, Resource
 from pyinc.runtime import Database
-from pyinc.value import freeze, thaw
+from pyinc.value import thaw
 
 from ._resources import file_probe, file_read_snapshot, file_text
 from .source_geometry import SourcePosition, SourceRange
@@ -148,18 +148,12 @@ def _parse_env_lines(
     return entries, diagnostics
 
 
-def _env_cutoff_token(text: str) -> tuple[str, str]:
-    entries, diagnostics = _parse_env_lines(text)
-    snapshot = freeze((entries, diagnostics))
-    return ("parsed", repr(snapshot))
-
-
 # ---------------------------------------------------------------------------
 # Layer 1 — Payload queries
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_env_cutoff_token)
+@query
 def env_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 

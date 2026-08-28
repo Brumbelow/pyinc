@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 import pyinc.integrations as integrations
-from pyinc import Database
+from pyinc import Database, FileSystemArtifactStore
 from pyinc.integrations import SourcePosition, SourceRange
 from pyinc.integrations.env_file import (
     EnvFileAnalysis,
@@ -37,6 +37,12 @@ HOST=localhost # the host
 PORT=8080 # the port
 NAME="quoted value" # this comment is inside quotes? no
 """
+
+# The same environment twice: the whole-line comment is reworded to a different
+# length and the quote style changes, and every entry keeps its value and its
+# source range through both.
+_UNFORMATTED_ENV = "# aaa\nKEY=value\nOTHER='x'\n"
+_REFORMATTED_ENV = '# a much longer comment body\nKEY=value\nOTHER="x"\n'
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +294,143 @@ def test_diagnostic_only_edit_invalidates_env(tmp_path: Path) -> None:
 
     assert incremental == fresh
     assert incremental.diagnostics[0][1].startswith("line 3:")
+
+
+# ---------------------------------------------------------------------------
+# Reformatting costs nothing above the payloads
+# ---------------------------------------------------------------------------
+
+# The two queries that re-read the text and re-derive a projection of it.
+_PAYLOAD_QUERIES = ("env_entries_payload", "env_diagnostics_payload")
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reformat_recomputes_the_payloads_and_backdates_the_composition(
+    mode: str, tmp_path: Path
+) -> None:
+    # There are two comment classes here and only one of them is narrow. A
+    # whole-line comment is skipped before anything is derived from it, so
+    # rewording its body reaches nothing at any length -- which is why this edit
+    # rewrites one to a different length. An inline comment is part of its
+    # entry's own raw line, and the range end is that line's length, so there
+    # only an equal-length rewrite leaves the entry where it was. Adding or
+    # removing a comment line is a third thing again: it moves every following
+    # entry's line number, and the analysis moves with it.
+    path = tmp_path / ".env"
+    path.write_text(_UNFORMATTED_ENV, encoding="utf-8")
+
+    db = Database(mode=mode)
+    first = env_analysis(db, str(path))
+
+    db.reset_statistics()
+    path.write_text(_REFORMATTED_ENV, encoding="utf-8")
+    second = env_analysis(db, str(path))
+
+    assert first == second, f"a reformat moved the analysis | first {first} | second {second}"
+
+    # `query_profile()` records executions only, and `reset_statistics()` has
+    # just cleared it, so a query that was reused has no row at all -- there is
+    # no row carrying a zero to look for. Labels also carry an argument-hash
+    # suffix, so a lookup by bare query name never matches; match by substring.
+    executed = [profile.query_label for profile in db.query_profile()]
+    for name in _PAYLOAD_QUERIES:
+        assert any(name in label for label in executed), (
+            f"{name} did not re-run | executed {executed}"
+        )
+    assert not [label for label in executed if "env_analysis_payload" in label], (
+        f"env_analysis_payload re-ran instead of backdating | executed {executed}"
+    )
+
+    # Absolute counts for the second read, not deltas: the read executes on the
+    # new bytes, the two payload queries re-derive equal projections and are
+    # backdated, and everything above them is reused. The reuse figure is what
+    # the reformat is supposed to cost nothing on.
+    statistics = db.statistics()
+    counts = (
+        statistics.query_executions,
+        statistics.query_backdates,
+        statistics.query_reuses,
+    )
+    assert counts == (1, 2, 4), f"work counts moved | exec/backdate/reuse {counts}"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reformat_leaves_workspace_discovery_identical(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+    path.write_text(_UNFORMATTED_ENV, encoding="utf-8")
+
+    db = Database(mode=mode)
+    first = workspace_env_analysis(db, str(tmp_path))
+
+    path.write_text(_REFORMATTED_ENV, encoding="utf-8")
+    second = workspace_env_analysis(db, str(tmp_path))
+
+    assert first is not None, "discovery found no file to analyse"
+    assert first == second, f"a reformat moved discovery | first {first} | second {second}"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints
+# ---------------------------------------------------------------------------
+
+# The ordering other integrations use -- edit, drive the entrypoint so a stale
+# answer forms, then save -- is unconstructible here: this read compares the text
+# it hands back, so there is no answer that disagrees with the file to save. The
+# substitute edits the file after the save, which the reload has to notice. The
+# second arm is what keeps that honest: with no edit the saved answer and a fresh
+# one agree, and the row would pass on any tree at all.
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_checkpoint_reload_answers_an_edit_made_after_the_save(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / ".env"
+    path.write_text(_UNFORMATTED_ENV, encoding="utf-8")
+
+    store_dir = tmp_path / "store"
+    saver = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    warm = env_analysis(saver, str(path))
+    key = saver.save_checkpoint()
+
+    path.write_text("# aaa\nKEY=changed\nOTHER='x'\n", encoding="utf-8")
+
+    reloaded = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    reloaded.load_checkpoint(key)
+
+    restored = env_analysis(reloaded, str(path))
+    fresh = env_analysis(Database(mode=mode), str(path))
+
+    assert restored == fresh, f"reloaded != fresh | reloaded {restored} | fresh {fresh}"
+    assert restored != warm, f"the edit never reached the reload | warm {warm}"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_checkpoint_reload_over_an_unchanged_file_runs_nothing(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / ".env"
+    path.write_text(_UNFORMATTED_ENV, encoding="utf-8")
+
+    store_dir = tmp_path / "store"
+    saver = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    warm = env_analysis(saver, str(path))
+    key = saver.save_checkpoint()
+
+    reloaded = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    reloaded.load_checkpoint(key)
+    restored = env_analysis(reloaded, str(path))
+
+    assert restored == warm, f"the saved answer did not survive | warm {warm}"
+
+    statistics = reloaded.statistics()
+    counts = (
+        statistics.query_executions,
+        statistics.query_reuses,
+        statistics.resource_loads,
+        statistics.resource_probe_hits,
+    )
+    assert counts == (0, 1, 0, 1), f"the reload did work | exec/reuse/loads/probes {counts}"
 
 
 # ---------------------------------------------------------------------------

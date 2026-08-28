@@ -10,7 +10,7 @@ from typing import TypeAlias, cast
 from pyinc.core import query
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
-from pyinc.value import freeze, thaw
+from pyinc.value import thaw
 
 from ._resources import file_probe, file_read_snapshot, file_text
 
@@ -136,18 +136,12 @@ def _parse_csv(
     return columns, row_count, delimiter, has_header, diagnostics
 
 
-def _csv_cutoff_token(text: str) -> tuple[str, str]:
-    columns, row_count, delimiter, has_header, diagnostics = _parse_csv(text)
-    snapshot = freeze((columns, row_count, delimiter, has_header, diagnostics))
-    return ("parsed", repr(snapshot))
-
-
 # ---------------------------------------------------------------------------
 # Layer 1 — Payload queries
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_csv_cutoff_token)
+@query
 def csv_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 
