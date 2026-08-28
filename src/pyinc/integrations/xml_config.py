@@ -8,10 +8,9 @@ from pathlib import Path
 from typing import TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.errors import UnsupportedValueError
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
-from pyinc.value import freeze, thaw
+from pyinc.value import thaw
 
 from ._resources import file_probe, file_read_snapshot, file_text
 
@@ -93,17 +92,18 @@ _DIRECTORIES = DirectoryResource()
 _NS_PAT = "}"
 
 # Element nesting is capped during parsing because every element re-emits the dot
-# path of all its ancestors: the cached cutoff token grows with the square of the
-# nesting depth, so this cap is what bounds the *cache*, not just the parse.
+# path of all its ancestors: the cached element payload grows with the square of
+# the nesting depth, so this cap is what bounds the *cache*, not just the parse.
 #
 # It is therefore set from an explicit amplification budget, not from the
 # interpreter's recursion limit — the walk keeps its own stack and needs under 20
 # frames at any depth, so the interpreter's ceiling is not the constraint here.
-# Budget: a document at the cap must not cache more than ~1 MiB of cutoff token.
-# At 256 levels that holds for element names up to 20 characters (measured: 708 KB
-# for a 20-character name, 207 KB for a 5-character one, 74 KB for a 1-character
-# one). The token scales linearly in name length on top of the quadratic depth
-# term, so the budget is stated for that name length rather than unconditionally.
+# Budget: a document at the cap must not cache more than ~1 MiB of element paths.
+# At 256 levels that holds for element names up to 20 characters (measured: 670 KB
+# of paths for a 20-character name, 192 KB for a 5-character one, 65 KB for a
+# 1-character one). The paths scale linearly in name length on top of the
+# quadratic depth term, so the budget is stated for that name length rather than
+# unconditionally.
 # 256 is still an order of magnitude deeper than any real configuration document.
 _MAX_XML_DEPTH = 256
 
@@ -207,21 +207,6 @@ def _safe_parse(text: str) -> ET.Element:
     return builder.close()
 
 
-def _xml_cutoff_token(text: str) -> tuple[str, str]:
-    try:
-        root = _safe_parse(text)
-        elements = _walk_elements(root, "")
-        snapshot = freeze(elements)
-        return ("parsed", repr(snapshot))
-    except (ET.ParseError, RecursionError, UnsupportedValueError):
-        # `freeze` refuses a value outside the snapshot grammar with
-        # `UnsupportedValueError`, which is a `PyIncError` and not a
-        # `ValueError`: a document the parser accepts but `freeze` will not
-        # snapshot must degrade to the raw text, not escape the cutoff and fail
-        # a recomputation a fresh database completes.
-        return ("raw", text)
-
-
 def _try_parse_xml(text: str) -> ET.Element | None:
     try:
         return _safe_parse(text)
@@ -234,7 +219,7 @@ def _try_parse_xml(text: str) -> ET.Element | None:
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_xml_cutoff_token)
+@query
 def xml_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 

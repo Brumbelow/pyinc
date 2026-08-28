@@ -182,10 +182,9 @@ attribute names are exposed by local name; workspace discovery defaults to
 `xml-parse-error` diagnostic, as is element nesting deeper than 256 levels —
 the diagnostic names that limit, and depth counts the document's root element
 as the first level. On stack exhaustion it carries the fixed text `XML parsing
-exhausted the interpreter stack`; a spent stack can cost a cutoff, never make
-one wrong. DTD/XSD validation, external entities, XInclude, streaming APIs,
-and general XPath are not supported. Dot paths identify hierarchy but do not
-index repeated siblings.
+exhausted the interpreter stack`. DTD/XSD validation, external entities,
+XInclude, streaming APIs, and general XPath are not supported. Dot paths
+identify hierarchy but do not index repeated siblings.
 
 ## CSV data
 

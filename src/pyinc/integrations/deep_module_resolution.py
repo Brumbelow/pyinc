@@ -159,10 +159,6 @@ def _parse_pth_content(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return tuple(paths), tuple(exec_lines)
 
 
-def _pth_cutoff_token(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    return _parse_pth_content(text)
-
-
 def _get_sys_path_entries() -> tuple[str, ...]:
     seen: set[str] = set()
     result: list[str] = []
@@ -215,9 +211,14 @@ def _pth_listing(db: Database, directory: str) -> tuple[str, ...]:
     return tuple(sorted(entry for entry in entries if entry.endswith(".pth")))
 
 
-@query(cutoff=_pth_cutoff_token)
+@query
 def _pth_file_text(db: Database, pth_path: str) -> str:
-    """Raw text of a .pth file. Cutoff ignores comment/whitespace edits."""
+    """Raw text of a .pth file, exactly as written.
+
+    Comment and whitespace edits are absorbed one layer up, by
+    `_pth_directives_payload`, which re-derives an equal set of directives from
+    the new text and backdates on it.
+    """
     return _FILES.read(db, pth_path)
 
 

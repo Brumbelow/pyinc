@@ -6,7 +6,7 @@ import pytest
 
 import pyinc.integrations as integrations
 import pyinc.integrations.deep_module_resolution as dmr
-from pyinc import Database
+from pyinc import Database, FileSystemArtifactStore
 from pyinc.integrations.deep_module_resolution import (
     DeepModuleResolutionAnalysis,
     ModulePathEntry,
@@ -265,7 +265,9 @@ def test_missing_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 # ---------------------------------------------------------------------------
 
 
-def test_pth_comment_edit_backdates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_pth_comment_edit_backdates_the_directives_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     site = tmp_path / "site"
     site.mkdir()
     extra = tmp_path / "extra"
@@ -277,11 +279,77 @@ def test_pth_comment_edit_backdates(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     db = Database()
     first = deep_module_resolution_analysis(db)
 
+    db.reset_statistics()
+
     # Rewrite with whitespace/comments but identical path directives.
     pth.write_text(f"\n# leading comment\n{extra}\n\n", encoding="utf-8")
     second = deep_module_resolution_analysis(db)
 
     assert first == second
+
+    # `query_profile()` records executions only, and `reset_statistics()` has
+    # just cleared it, so a query that was reused has no row at all -- there is
+    # no row carrying a zero to look for. A label reads `module:name[hash] name()`
+    # and a bare-name search would alias here, because `_all_pth_directives_payload`
+    # contains `_pth_directives_payload`; anchoring on `:name[` picks out the one
+    # meant. The read executes on the new bytes and the parse re-derives an equal
+    # set of directives from them, which is where the backdating now happens; the
+    # composition above them is left reused. The search-path queries beside it are
+    # not: `_raw_sys_path_entries` reports an untracked read, so it and the two
+    # payloads over it execute on every request whatever the .pth file says.
+    executed = [profile.query_label for profile in db.query_profile()]
+    for name in ("_pth_file_text", "_pth_directives_payload"):
+        assert any(f":{name}[" in label for label in executed), (
+            f"{name} did not re-run | executed {executed}"
+        )
+    assert not [label for label in executed if ":_deep_analysis_payload[" in label], (
+        f"_deep_analysis_payload re-ran instead of staying reused | executed {executed}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints
+# ---------------------------------------------------------------------------
+
+# The ordering other integrations use -- edit, drive the entrypoint so a stale
+# answer forms, then save -- is unconstructible here: this read compares the text
+# it hands back, so there is no answer that disagrees with the file to save. The
+# substitute edits the file after the save, which the reload has to notice. The
+# second arm is what keeps that honest: with no edit the saved answer and a fresh
+# one agree, and the row would pass on any tree at all. The CSV, environment-file
+# and XML suites carry the same substitute for the same reason.
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_checkpoint_reload_answers_an_edit_made_after_the_save(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = tmp_path / "site"
+    site.mkdir()
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    pth = site / "z.pth"
+    pth.write_text(f"{extra}\n", encoding="utf-8")
+
+    _install_search_paths(monkeypatch, (str(site),))
+
+    store_dir = tmp_path / "store"
+    saver = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    warm = deep_module_resolution_analysis(saver)
+    key = saver.save_checkpoint()
+
+    pth.write_text(f"{extra}\n{other}\n", encoding="utf-8")
+
+    reloaded = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    reloaded.load_checkpoint(key)
+
+    restored = deep_module_resolution_analysis(reloaded)
+    fresh = deep_module_resolution_analysis(Database(mode=mode))
+
+    assert restored == fresh, f"reloaded != fresh | reloaded {restored} | fresh {fresh}"
+    assert restored != warm, f"the edit never reached the reload | warm {warm}"
 
 
 # ---------------------------------------------------------------------------

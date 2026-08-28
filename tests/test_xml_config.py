@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import pyinc.integrations as integrations
-from pyinc import Database
+from pyinc import Database, FileSystemArtifactStore
 from pyinc.integrations import xml_config
 from pyinc.integrations.xml_config import (
     _MAX_XML_DEPTH,
@@ -16,9 +16,10 @@ from pyinc.integrations.xml_config import (
     _safe_parse,
     _try_parse_xml,
     _walk_elements,
-    _xml_cutoff_token,
     workspace_xml_analysis,
     xml_analysis,
+    xml_diagnostics_payload,
+    xml_elements_payload,
 )
 
 _MINIMAL_XML = """\
@@ -504,7 +505,6 @@ def test_a_recursion_error_never_escapes_the_parse_helpers(
     monkeypatch.setattr(xml_config, "_safe_parse", _exhaust_the_stack)
 
     assert _try_parse_xml("<root/>") is None
-    assert _xml_cutoff_token("<root/>") == ("raw", "<root/>")
 
 
 def test_stack_exhaustion_diagnostic_does_not_vary_with_the_recursion_message(
@@ -538,20 +538,13 @@ def test_stack_exhaustion_diagnostic_does_not_vary_with_the_recursion_message(
 # ---------------------------------------------------------------------------
 
 
-# Every element re-emits the dot path of all its ancestors, so the cached token
-# grows quadratically in nesting depth and linearly in element-name length.
-# `_MAX_XML_DEPTH` is chosen to hold the worst case the budget covers — an element
-# name of `_BUDGETED_NAME_LENGTH` characters at the cap — under this ceiling.
-_CUTOFF_TOKEN_BUDGET = 1024 * 1024
+# Every element re-emits the dot path of all its ancestors, so the cached element
+# payload grows quadratically in nesting depth and linearly in element-name
+# length. `_MAX_XML_DEPTH` is chosen to hold the worst case the budget covers — an
+# element name of `_BUDGETED_NAME_LENGTH` characters at the cap — under this
+# ceiling.
+_ELEMENT_PATH_BUDGET = 1024 * 1024
 _BUDGETED_NAME_LENGTH = 20
-
-
-def test_cutoff_token_at_the_cap_stays_within_the_amplification_budget() -> None:
-    tag = "c" * _BUDGETED_NAME_LENGTH
-    kind, token = _xml_cutoff_token(_nested_xml(_MAX_XML_DEPTH - 1, tag=tag))
-
-    assert kind == "parsed"
-    assert len(token) < _CUTOFF_TOKEN_BUDGET
 
 
 def test_element_payload_at_the_cap_stays_within_the_amplification_budget(
@@ -564,11 +557,11 @@ def test_element_payload_at_the_cap_stays_within_the_amplification_budget(
     elements = xml_analysis(Database(), str(path)).elements
 
     assert len(elements) == _MAX_XML_DEPTH
-    assert sum(len(e.path) for e in elements) < _CUTOFF_TOKEN_BUDGET
+    assert sum(len(e.path) for e in elements) < _ELEMENT_PATH_BUDGET
 
 
 # ---------------------------------------------------------------------------
-# Payload and cutoff stability
+# Payload stability
 # ---------------------------------------------------------------------------
 
 
@@ -588,12 +581,138 @@ def test_elements_are_emitted_in_document_pre_order(tmp_path: Path) -> None:
     )
 
 
-def test_cutoff_token_is_byte_for_byte_stable() -> None:
-    assert _xml_cutoff_token('<root attr="v"><child>text</child><other/></root>') == (
-        "parsed",
-        "FrozenList(items=("
-        "('root', 'root', '', (('attr', 'v'),), ('child', 'other')), "
-        "('child', 'root.child', 'text', (), ()), "
-        "('other', 'root.other', '', (), ())))",
+def test_the_element_payload_is_byte_for_byte_stable(tmp_path: Path) -> None:
+    # The cached structure, spelled out rather than derived, so that a change to
+    # the element shape has to be made here deliberately. The payload is a tuple
+    # of plain tuples, which is what the cache holds -- not a list wrapper -- so
+    # the whole value is written out literally.
+    path = tmp_path / "config.xml"
+    path.write_text('<root attr="v"><child>text</child><other/></root>', encoding="utf-8")
+
+    assert Database().get(xml_elements_payload, str(path)) == (
+        ("root", "root", "", (("attr", "v"),), ("child", "other")),
+        ("child", "root.child", "text", (), ()),
+        ("other", "root.other", "", (), ()),
     )
-    assert _xml_cutoff_token("<root><unclosed>") == ("raw", "<root><unclosed>")
+
+
+def test_a_malformed_document_caches_no_elements_and_one_diagnostic(tmp_path: Path) -> None:
+    # A document the parser rejects yields no elements at all; the reason is
+    # carried beside them, by the diagnostics payload. Only the diagnostic's code
+    # is pinned -- its message is the parser's own wording and varies with the
+    # expat build underneath.
+    path = tmp_path / "config.xml"
+    path.write_text("<root><unclosed>", encoding="utf-8")
+    db = Database()
+
+    assert db.get(xml_elements_payload, str(path)) == ()
+
+    diagnostics = db.get(xml_diagnostics_payload, str(path))
+    assert tuple(code for code, _message in diagnostics) == ("xml-parse-error",)
+
+
+# ---------------------------------------------------------------------------
+# Reformatting costs nothing above the payloads
+# ---------------------------------------------------------------------------
+
+_UNFORMATTED_XML = '<root  attr="v" >\n\n  <child>text</child>\n      <other/>\n</root>\n'
+_REFORMATTED_XML = '<root attr="v">\n    <child>\n        text\n    </child>\n    <other/>\n</root>\n'
+
+# The two queries that re-read the text and re-derive a projection of it.
+_PAYLOAD_QUERIES = ("xml_elements_payload", "xml_diagnostics_payload")
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reformat_recomputes_the_payloads_and_backdates_the_composition(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "config.xml"
+    path.write_text(_UNFORMATTED_XML, encoding="utf-8")
+
+    db = Database(mode=mode)
+    first = xml_analysis(db, str(path))
+
+    db.reset_statistics()
+    path.write_text(_REFORMATTED_XML, encoding="utf-8")
+    second = xml_analysis(db, str(path))
+
+    assert first == second, f"a reformat moved the analysis | first {first} | second {second}"
+
+    # `query_profile()` records executions only, and `reset_statistics()` has
+    # just cleared it, so a query that was reused has no row at all -- there is
+    # no row carrying a zero to look for. A label reads `module:name[hash] name()`,
+    # so a lookup by bare query name never matches; anchoring on `:name[` picks out
+    # the one meant and cannot be satisfied by a longer sibling name that happens
+    # to contain it.
+    executed = [profile.query_label for profile in db.query_profile()]
+    for name in _PAYLOAD_QUERIES:
+        assert any(f":{name}[" in label for label in executed), (
+            f"{name} did not re-run | executed {executed}"
+        )
+    assert not [label for label in executed if ":xml_analysis_payload[" in label], (
+        f"xml_analysis_payload re-ran instead of staying reused | executed {executed}"
+    )
+
+    # Absolute counts for the second read, not deltas: the read executes on the
+    # new bytes, the two payload queries re-derive equal projections and are
+    # backdated, and everything above them is reused. The reuse figure is what
+    # the reformat is supposed to cost nothing on.
+    statistics = db.statistics()
+    counts = (
+        statistics.query_executions,
+        statistics.query_backdates,
+        statistics.query_reuses,
+    )
+    assert counts == (1, 2, 4), f"work counts moved | exec/backdate/reuse {counts}"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reformat_leaves_workspace_discovery_identical(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "pom.xml"
+    path.write_text(_UNFORMATTED_XML, encoding="utf-8")
+
+    db = Database(mode=mode)
+    first = workspace_xml_analysis(db, str(tmp_path))
+
+    path.write_text(_REFORMATTED_XML, encoding="utf-8")
+    second = workspace_xml_analysis(db, str(tmp_path))
+
+    assert first is not None, "discovery found no file to analyse"
+    assert first == second, f"a reformat moved discovery | first {first} | second {second}"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints
+# ---------------------------------------------------------------------------
+
+# The ordering other integrations use -- edit, drive the entrypoint so a stale
+# answer forms, then save -- is unconstructible here: this read compares the text
+# it hands back, so there is no answer that disagrees with the file to save. The
+# substitute edits the file after the save, which the reload has to notice. The
+# second arm is what keeps that honest: with no edit the saved answer and a fresh
+# one agree, and the row would pass on any tree at all. The CSV, environment-file
+# and .pth suites carry the same substitute for the same reason.
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_checkpoint_reload_answers_an_edit_made_after_the_save(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "config.xml"
+    path.write_text(_UNFORMATTED_XML, encoding="utf-8")
+
+    store_dir = tmp_path / "store"
+    saver = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    warm = xml_analysis(saver, str(path))
+    key = saver.save_checkpoint()
+
+    path.write_text('<root attr="v"><child>changed</child></root>', encoding="utf-8")
+
+    reloaded = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    reloaded.load_checkpoint(key)
+
+    restored = xml_analysis(reloaded, str(path))
+    fresh = xml_analysis(Database(mode=mode), str(path))
+
+    assert restored == fresh, f"reloaded != fresh | reloaded {restored} | fresh {fresh}"
+    assert restored != warm, f"the edit never reached the reload | warm {warm}"
