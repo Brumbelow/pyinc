@@ -21,7 +21,6 @@ from pyinc_codegen.schema import (
     _annotation_diagnostics,
     _build_enum,
     _build_model,
-    _canonical_json_token,
     _constraint_shape_problem,
     _decode_pointer_segment,
     _definition_entries,
@@ -99,11 +98,10 @@ def test_loader_preserves_an_already_normalized_json_error(
     assert caught.value is expected
 
 
-def test_float_parser_and_canonical_token_cover_nonfinite_and_raw_input() -> None:
+def test_float_parser_rejects_nonfinite_values() -> None:
     assert _parse_float("1.25") == 1.25
     with pytest.raises(ValueError, match="non-finite"):
         _parse_float("1e999")
-    assert _canonical_json_token("not json") == ("raw", "not json")
 
 
 def test_definition_entries_handle_nonobjects_and_prefer_defs() -> None:

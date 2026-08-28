@@ -26,7 +26,6 @@ _STR_QUERIES_WITH_A_CUTOFF: frozenset[tuple[str, str]] = frozenset(
     {
         ("examples/calc/engine.py", "calc_source"),
         ("examples/correctness_demo.py", "read_source"),
-        ("src/pyinc_codegen/schema.py", "schema_text"),
     }
 )
 

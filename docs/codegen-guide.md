@@ -292,8 +292,10 @@ does not validate instances.
 The query graph is decomposed so the kernel's backdating gives output-granular
 incrementality, which the action layer turns into write-granular incrementality:
 
-- **whitespace / key reorder** — the `schema_text` cutoff is the canonicalized
-  JSON, so formatting-only edits backdate and nothing downstream runs or writes.
+- **whitespace / key reorder** — `schema_text` hands back the file's own bytes,
+  so a formatting-only edit re-reads it; `document_diagnostics`,
+  `definition_names`, `definition_raw` and `definition_pointer` each re-derive
+  the same canonical value and backdate, so nothing downstream writes.
 - **description-only change** — rewrites only the affected `docs/<x>.md`. The
   description-free `definition_structure` payload backdates, so the `.py`
   render query is reused and the model is not rewritten.

@@ -10,16 +10,17 @@ from typing import Any
 import pytest
 
 import pyinc_codegen
-from pyinc import Database
+from pyinc import Database, FileSystemArtifactStore
 from pyinc_codegen import (
     DiagnosticSeverity,
+    SchemaAnalysis,
     SchemaGenerationError,
     generate,
     schema_analysis,
 )
 from pyinc_codegen.schema import (
-    _canonical_json_token,
     definition_names,
+    definition_raw,
     model_doc,
     model_python,
     schema_text,
@@ -30,6 +31,10 @@ _SAMPLE = Path(__file__).resolve().parent.parent / "examples" / "schemas" / "sam
 
 def _write_schema(path: Path, schema: object) -> None:
     path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+
+
+def _model_names(analysis: SchemaAnalysis) -> tuple[str, ...]:
+    return tuple(model.name for model in analysis.models)
 
 
 def _tree(root: Path) -> dict[str, bytes]:
@@ -43,12 +48,83 @@ def _tree(root: Path) -> dict[str, bytes]:
 
 
 # --------------------------------------------------------------------------- #
-# Task 2B.1 — canonical cutoff (C1)
+# Task 2B.1 — reformatting edits (C1)
 # --------------------------------------------------------------------------- #
 
+_UNFORMATTED_SCHEMA = (
+    '{"$defs": {"B": {"type": "object", "properties": '
+    '{"q": {"type": "string"}, "p": {"type": "integer"}}}, '
+    '"A": {"type": "object", "properties": '
+    '{"y": {"type": "string"}, "x": {"type": "integer"}}}}}'
+)
 
-def test_canonical_token_ignores_whitespace_and_key_order() -> None:
-    assert _canonical_json_token('{"a": 1, "b": 2}') == _canonical_json_token('{\n "b":2,\n "a":1}')
+_REFORMATTED_SCHEMA = """{
+  "$defs": {
+    "A": {
+      "properties": {
+        "x": { "type": "integer" },
+        "y": { "type": "string" }
+      },
+      "type": "object"
+    },
+    "B": {
+      "properties": {
+        "p": { "type": "integer" },
+        "q": { "type": "string" }
+      },
+      "type": "object"
+    }
+  }
+}
+"""
+
+
+def test_a_reformat_recomputes_the_definition_payloads_to_equal_values(tmp_path: Path) -> None:
+    p = tmp_path / "s.json"
+    p.write_text(_UNFORMATTED_SCHEMA, encoding="utf-8")
+
+    db = Database(mode="strict")
+    text_before = schema_text(db, str(p))
+    names_before = definition_names(db, str(p))
+    raw_before = tuple(definition_raw(db, str(p), name) for name in names_before)
+
+    p.write_text(_REFORMATTED_SCHEMA, encoding="utf-8")
+    db.reset_statistics()
+    text_after = schema_text(db, str(p))
+    names_after = definition_names(db, str(p))
+    raw_after = tuple(definition_raw(db, str(p), name) for name in names_after)
+
+    # The read now answers with the bytes it was given, so it moves on a
+    # reformat; what absorbs the edit is the layer that sorts and re-emits.
+    assert text_before != text_after, "the reformat never reached the read"
+    assert names_before == names_after, (
+        f"a reformat moved the names | before {names_before} | after {names_after}"
+    )
+    assert raw_before == raw_after, (
+        f"a reformat moved the canonical bodies | before {raw_before} | after {raw_after}"
+    )
+
+    # Absorbing it costs a recomputation, and this is where that shows: both
+    # payload queries run again on the new text. Match on ":{name}[" rather than
+    # the bare name -- a label reads "module:name[hash] name()", so a bare
+    # substring also matches any query whose name merely contains this one, and
+    # the check would pass on a tree where nothing re-ran.
+    executed = [profile.query_label for profile in db.query_profile()]
+    for name in ("definition_names", "definition_raw"):
+        assert [label for label in executed if f":{name}[" in label], (
+            f"{name} did not re-run | executed {executed}"
+        )
+
+    # Absolute counts for the second read, not deltas: the read executes on the
+    # new bytes, the three payload instances re-derive equal projections and are
+    # backdated, and the repeat lookups the request makes are served from cache.
+    statistics = db.statistics()
+    counts = (
+        statistics.query_executions,
+        statistics.query_backdates,
+        statistics.query_reuses,
+    )
+    assert counts == (1, 3, 6), f"work counts moved | exec/backdate/reuse {counts}"
 
 
 def test_whitespace_edit_backdates_and_writes_nothing(tmp_path: Path) -> None:  # C1
@@ -62,7 +138,9 @@ def test_whitespace_edit_backdates_and_writes_nothing(tmp_path: Path) -> None:  
     res = generate(db, str(p), out)
     assert res.created == () and res.updated == () and res.repaired == ()
     assert res.deleted == ()
-    assert db.inspect(schema_text, str(p)).last_recompute == "backdated"
+    # The read is byte-exact now, so a reformat runs it; the payloads that
+    # project it land an equal value and leave the renderer nothing to redo.
+    assert db.inspect(schema_text, str(p)).last_recompute == "executed"
     assert db.inspect(model_python, str(p), "A").last_decision == "reused"
 
 
@@ -1444,6 +1522,56 @@ def test_codegen_incremental_byte_identical_to_fresh(mode: str, tmp_path: Path) 
         generate(fresh_db, str(p), out_fresh)
 
         assert _tree(out_inc) == _tree(out_fresh)
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoints
+# --------------------------------------------------------------------------- #
+
+# The ordering other integrations use -- edit, drive the entrypoint so a stale
+# answer forms, then save -- is set out beside the same shape in
+# tests/test_csv_data.py, where it cannot be built at all. Here it can be built
+# and is still worth nothing: a reformat leaves every public surface equal, so a
+# database saved in the middle of one reloads to an answer that agrees with the
+# warm one and with a fresh one alike, in every mode. This row edits after the
+# save instead, which the reload has to notice. The second arm is what keeps it
+# honest: with no edit the saved answer and a fresh one agree and the row would
+# pass on any tree at all.
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_checkpoint_reload_answers_an_edit_made_after_the_save(
+    mode: str, tmp_path: Path
+) -> None:
+    p = tmp_path / "s.json"
+    p.write_text(_UNFORMATTED_SCHEMA, encoding="utf-8")
+
+    store_dir = tmp_path / "store"
+    saver = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    warm = schema_analysis(saver, str(p))
+    key = saver.save_checkpoint()
+
+    _write_schema(
+        p,
+        {
+            "$defs": {
+                "A": {"type": "object", "properties": {"x": {"type": "integer"}}},
+                "B": {"type": "object", "properties": {"p": {"type": "integer"}}},
+                "C": {"type": "object", "properties": {"z": {"type": "string"}}},
+            }
+        },
+    )
+
+    reloaded = Database(mode=mode, store=FileSystemArtifactStore(store_dir))
+    reloaded.load_checkpoint(key)
+
+    restored = schema_analysis(reloaded, str(p))
+    fresh = schema_analysis(Database(mode=mode), str(p))
+
+    assert restored == fresh, (
+        f"reloaded != fresh | reloaded {_model_names(restored)} | fresh {_model_names(fresh)}"
+    )
+    assert restored != warm, f"the edit never reached the reload | warm {_model_names(warm)}"
 
 
 # --------------------------------------------------------------------------- #

@@ -170,20 +170,6 @@ def _load(text: str) -> object:
     return parsed
 
 
-def _canonical_json_token(text: str) -> tuple[str, str]:
-    try:
-        parsed = _load(text)
-        canonical = json.dumps(
-            parsed,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-    except (ValueError, UnicodeError, RecursionError, OverflowError):
-        return ("raw", text)
-    return ("parsed", canonical)
-
-
 def _pointer_token(value: str) -> str:
     return value.replace("~", "~0").replace("/", "~1")
 
@@ -1370,9 +1356,9 @@ def _render_doc(payload: ModelPayload) -> str:
     return "\n".join(lines)
 
 
-@query(cutoff=_canonical_json_token)
+@query
 def schema_text(db: Database, path: str) -> str:
-    """Raw schema text with a semantic JSON cutoff."""
+    """The schema file's decoded text, or a marker for input that is not UTF-8."""
 
     raw = _FILES.read(db, path)
     try:
@@ -1474,11 +1460,11 @@ def document_diagnostics(db: Database, path: str) -> tuple[DiagnosticPayload, ..
                 )
             )
 
-    # Canonical order, like every other diagnostic group here: the schema_text
-    # cutoff canonicalizes with sorted keys, so a key-reorder edit backdates and
-    # this query is not recomputed. Emitting in document key order would let an
-    # incremental database keep the pre-reorder ordering while a fresh database
-    # reads the new one.
+    # Canonical order, like every other diagnostic group here: sorting by name
+    # makes the emitted order a property of what the schema declares rather than
+    # of how its keys happen to be laid out. Document key order would move this
+    # tuple on a reorder that changes nothing a caller can see, and the analysis
+    # that reads it would be rebuilt for that.
     for name in sorted(unique_names):
         location = locations_by_name[name][0]
         diagnostics.extend(_definition_name_diagnostics(name, location))
