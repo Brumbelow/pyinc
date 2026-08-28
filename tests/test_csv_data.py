@@ -9,6 +9,7 @@ from pyinc import Database, FileSystemArtifactStore
 from pyinc.integrations.csv_data import (
     CsvAnalysis,
     csv_analysis,
+    csv_file_text,
     workspace_csv_analysis,
 )
 
@@ -41,6 +42,16 @@ Charlie,35,Denver,extra
 # blank line added.
 _UNFORMATTED_CSV = "name,age\nAlice,30\nBob,25\n"
 _REFORMATTED_CSV = '"name","age"\n"Alice","30"\n"Bob","25"\n\n'
+
+# Written as bytes so the carriage returns reach the parser untranslated: a
+# single quoted column with CRLF line endings, and a file whose only line breaks
+# are bare carriage returns. Sniffing either one guesses a line terminator for
+# the delimiter.
+_CRLF_CSV_BYTES = b'"a"\r\n"b"\r\n"c"\r\n'
+_LONE_CR_CSV_BYTES = b"a\rb\rc\r"
+
+_REFUSED_CR = ("csv-dialect-error", "sniffed delimiter '\\r' is a line terminator; read as ','")
+_UNREADABLE_AS_COMMA = ("csv-dialect-error", "text is not readable as ','-delimited")
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +397,95 @@ def test_a_checkpoint_reload_over_an_unchanged_file_runs_nothing(
         statistics.resource_probe_hits,
     )
     assert counts == (0, 1, 0, 1), f"the reload did work | exec/reuse/loads/probes {counts}"
+
+
+# ---------------------------------------------------------------------------
+# Dialects no reader can use
+# ---------------------------------------------------------------------------
+
+
+def _shape_of(analysis: CsvAnalysis) -> tuple[object, ...]:
+    return (
+        tuple((column.name, column.index) for column in analysis.columns),
+        analysis.row_count,
+        analysis.delimiter,
+        analysis.has_header,
+        analysis.diagnostics,
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_crlf_file_is_read_as_comma_delimited(mode: str, tmp_path: Path) -> None:
+    # The whole answer, not just the delimiter: refusing the sniffed value is
+    # what makes this shape independent of which version read the file, so the
+    # row pins all of it rather than only the field that used to move.
+    path = tmp_path / "data.csv"
+    path.write_bytes(_CRLF_CSV_BYTES)
+
+    result = csv_analysis(Database(mode=mode), str(path))
+
+    assert _shape_of(result) == ((("column_0", 0),), 3, ",", False, (_REFUSED_CR,)), (
+        f"CRLF file | {_shape_of(result)}"
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_carriage_return_only_file_reports_what_it_could_not_read(
+    mode: str, tmp_path: Path
+) -> None:
+    # Two diagnostics and an empty table, where the CRLF file gets one and three
+    # rows. The first records the refused delimiter; the second records that the
+    # comma fallback did not read this text either, which is where the reader
+    # gives up rather than where anything is refused.
+    path = tmp_path / "data.csv"
+    path.write_bytes(_LONE_CR_CSV_BYTES)
+
+    result = csv_analysis(Database(mode=mode), str(path))
+
+    assert _shape_of(result) == ((), 0, ",", False, (_REFUSED_CR, _UNREADABLE_AS_COMMA)), (
+        f"carriage-return-only file | {_shape_of(result)}"
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_the_read_returns_the_bytes_and_the_payloads_choose_the_dialect(
+    mode: str, tmp_path: Path
+) -> None:
+    # Warm first, then edit. A cold read has no earlier answer to compare
+    # against, so it cannot show which layer the dialect decision belongs to;
+    # the second read is where a comparison happens and where the whole question
+    # of what this query is allowed to know about the text arises.
+    path = tmp_path / "data.csv"
+    path.write_text(_UNFORMATTED_CSV, encoding="utf-8")
+
+    db = Database(mode=mode)
+    db.get(csv_file_text, str(path))
+
+    path.write_bytes(_CRLF_CSV_BYTES)
+    text = db.get(csv_file_text, str(path))
+
+    assert text == '"a"\r\n"b"\r\n"c"\r\n', f"the read did not hand back the file | {text!r}"
+
+    analysis = csv_analysis(db, str(path))
+    assert (analysis.delimiter, analysis.diagnostics) == (",", (_REFUSED_CR,)), (
+        f"the dialect decision did not land in the payloads | {_shape_of(analysis)}"
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_an_ordinary_comma_file_gains_no_dialect_diagnostic(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "data.csv"
+    path.write_text(_MINIMAL_CSV, encoding="utf-8")
+
+    result = csv_analysis(Database(mode=mode), str(path))
+
+    assert _shape_of(result) == (
+        (("name", 0), ("age", 1), ("city", 2)),
+        3,
+        ",",
+        True,
+        (),
+    ), f"an ordinary file moved | {_shape_of(result)}"
 
 
 # ---------------------------------------------------------------------------

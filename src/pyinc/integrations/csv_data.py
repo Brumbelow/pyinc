@@ -83,14 +83,14 @@ def _detect_delimiter(text: str) -> str:
     try:
         dialect = csv.Sniffer().sniff(text[:8192])
         return dialect.delimiter
-    except csv.Error:
+    except (csv.Error, ValueError):
         return ","
 
 
 def _detect_has_header(text: str) -> bool:
     try:
         return csv.Sniffer().has_header(text[:8192])
-    except csv.Error:
+    except (csv.Error, ValueError):
         return False
 
 
@@ -103,14 +103,32 @@ def _parse_csv(
 
     delimiter = _detect_delimiter(stripped)
     has_header = _detect_has_header(stripped)
+    diagnostics: list[DiagnosticPayload] = []
 
-    reader = csv.reader(io.StringIO(stripped), delimiter=delimiter)
-    rows = list(reader)
+    # A line terminator is not a usable delimiter, and what a reader does with
+    # one is a property of the reader rather than of the file: some refuse it
+    # outright, some accept it and split fields where the file's own line breaks
+    # are. Refusing it here is what makes the answer independent of which version
+    # read the file.
+    if delimiter in ("\r", "\n"):
+        diagnostics.append(
+            (
+                "csv-dialect-error",
+                f"sniffed delimiter {delimiter!r} is a line terminator; read as ','",
+            )
+        )
+        delimiter = ","
+
+    try:
+        rows = list(csv.reader(io.StringIO(stripped), delimiter=delimiter))
+    except (csv.Error, ValueError):
+        diagnostics.append(
+            ("csv-dialect-error", f"text is not readable as {delimiter!r}-delimited")
+        )
+        return [], 0, delimiter, has_header, diagnostics
 
     if not rows:
-        return [], 0, delimiter, has_header, []
-
-    diagnostics: list[DiagnosticPayload] = []
+        return [], 0, delimiter, has_header, diagnostics
 
     if has_header:
         header_row = rows[0]
