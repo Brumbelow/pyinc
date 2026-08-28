@@ -10,7 +10,7 @@ from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 
 import pyinc.integrations as integrations
-from pyinc import Database, UnsupportedValueError
+from pyinc import Database, InMemoryArtifactStore, UnsupportedValueError
 from pyinc._safe_fs import UnsafeFilesystemPathError
 from pyinc.integrations.requirements_txt import (
     RequirementsAnalysis,
@@ -389,7 +389,7 @@ def test_requirements_analysis_parses_url_requirements(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Cutoff / backdating
+# Backdating
 # ---------------------------------------------------------------------------
 
 
@@ -423,6 +423,269 @@ def test_semantic_edit_invalidates_downstream_requirements(tmp_path: Path) -> No
     assert "httpx" in names
     assert "requests" not in names
     assert first != second
+
+
+# ---------------------------------------------------------------------------
+# Reads that must answer with the text they compared
+# ---------------------------------------------------------------------------
+
+# One document carrying every line kind whose public output is built from text
+# that a line-normalizing comparison throws away: an index directive, a plain
+# requirement, an editable install, a line the parser rejects, and a two-line
+# requirement joined by a continuation backslash.
+_SEQUENCE_START = (
+    "--index-url https://example.com/simple  # primary\n"
+    "requests>=2.0  # http client\n"
+    "-e ./pkg  # local\n"
+    "this is not a requirement  # junk\n"
+    "flask \\\n"
+    "==2.0\n"
+)
+
+# Seven edits, each changing exactly one thing from the state above it. The
+# first four reword an inline comment on each line kind in turn; the next two
+# move only whitespace; the last puts a single space after the continuation
+# backslash, which stops it continuing the line at all.
+#
+# The requirement-evaluation suite imports this to drive the other two
+# entrypoints over it. Defined once so the two rows cannot drift apart.
+_EDIT_SEQUENCE: tuple[tuple[str, str], ...] = (
+    ("initial", _SEQUENCE_START),
+    (
+        "reword the comment on a requirement",
+        "--index-url https://example.com/simple  # primary\n"
+        "requests>=2.0  # the http client we use\n"
+        "-e ./pkg  # local\n"
+        "this is not a requirement  # junk\n"
+        "flask \\\n"
+        "==2.0\n",
+    ),
+    (
+        "reword the comment on an index directive",
+        "--index-url https://example.com/simple  # the primary index\n"
+        "requests>=2.0  # the http client we use\n"
+        "-e ./pkg  # local\n"
+        "this is not a requirement  # junk\n"
+        "flask \\\n"
+        "==2.0\n",
+    ),
+    (
+        "reword the comment on an editable install",
+        "--index-url https://example.com/simple  # the primary index\n"
+        "requests>=2.0  # the http client we use\n"
+        "-e ./pkg  # the local package\n"
+        "this is not a requirement  # junk\n"
+        "flask \\\n"
+        "==2.0\n",
+    ),
+    (
+        "reword the comment on an unparseable line",
+        "--index-url https://example.com/simple  # the primary index\n"
+        "requests>=2.0  # the http client we use\n"
+        "-e ./pkg  # the local package\n"
+        "this is not a requirement  # not a requirement at all\n"
+        "flask \\\n"
+        "==2.0\n",
+    ),
+    (
+        "indent a requirement",
+        "--index-url https://example.com/simple  # the primary index\n"
+        "    requests>=2.0  # the http client we use\n"
+        "-e ./pkg  # the local package\n"
+        "this is not a requirement  # not a requirement at all\n"
+        "flask \\\n"
+        "==2.0\n",
+    ),
+    (
+        "add trailing whitespace",
+        "--index-url https://example.com/simple  # the primary index\n"
+        "    requests>=2.0  # the http client we use\n"
+        "-e ./pkg  # the local package   \n"
+        "this is not a requirement  # not a requirement at all\n"
+        "flask \\\n"
+        "==2.0\n",
+    ),
+    (
+        "put a space after the continuation backslash",
+        "--index-url https://example.com/simple  # the primary index\n"
+        "    requests>=2.0  # the http client we use\n"
+        "-e ./pkg  # the local package   \n"
+        "this is not a requirement  # not a requirement at all\n"
+        "flask \\ \n"
+        "==2.0\n",
+    ),
+)
+
+
+def _assert_ranges_span_their_raw_lines(analysis: RequirementsAnalysis, where: str) -> None:
+    """Every one-line unindented requirement's range must measure its own raw_line.
+
+    The reported range and the reported raw_line come from two different reads
+    of the same file, so this is an internal-coherence check on a single
+    answer: it needs no second database to compare against. Restricted to
+    requirements that start at column zero and end on the line they start on,
+    where the arithmetic is exact -- a continued or indented line has a range
+    that legitimately spans more than its stripped text.
+    """
+    for req in analysis.requirements:
+        if req.range.start.line != req.range.end.line or req.range.start.character != 0:
+            continue
+        span = req.range.end.character - req.range.start.character
+        assert span == len(req.raw_line), (
+            f"range spans {span} characters but raw_line is {len(req.raw_line)} | "
+            f"raw_line={req.raw_line!r} | name={req.name} | {where}"
+        )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_every_requirements_surface_matches_a_fresh_read_across_the_edit_sequence(
+    mode: str, tmp_path: Path
+) -> None:
+    """Every requirements entrypoint answers each edit the way a fresh database does.
+
+    Five entrypoints consume this parse. The three that live in this module are
+    driven here; the two evaluation surfaces are driven in the
+    requirement-evaluation suite, which owns the environment they need and
+    imports _EDIT_SEQUENCE from this module rather than restating it. All five
+    are asserted at every step.
+    """
+    root = tmp_path / "ws"
+    root.mkdir()
+    path = root / "requirements.txt"
+
+    incremental = Database(mode=mode)
+    for label, content in _EDIT_SEQUENCE:
+        path.write_text(content, encoding="utf-8")
+        fresh = Database(mode=mode)
+        for name, warm_value, fresh_value in (
+            (
+                "requirements_analysis",
+                requirements_analysis(incremental, str(path)),
+                requirements_analysis(fresh, str(path)),
+            ),
+            (
+                "deep_requirements_analysis",
+                deep_requirements_analysis(incremental, str(path)),
+                deep_requirements_analysis(fresh, str(path)),
+            ),
+            (
+                "workspace_requirements_analysis",
+                workspace_requirements_analysis(incremental, str(root)),
+                workspace_requirements_analysis(fresh, str(root)),
+            ),
+        ):
+            assert warm_value == fresh_value, (
+                f"{name} disagrees with a fresh read | after: {label} | mode={mode}"
+            )
+            # Both sides must have answered: workspace discovery returns None
+            # when it finds no requirements.txt, and None == None would satisfy
+            # the comparison above without either surface having read anything.
+            assert fresh_value is not None, (
+                f"{name} returned nothing to compare | after: {label} | mode={mode}"
+            )
+    # Range-against-raw_line coherence is not checked here: on a fresh database
+    # it cannot fail for a staleness reason. Its witness is the warm-database row
+    # below, test_a_requirement_range_spans_exactly_its_own_raw_line.
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_requirement_range_spans_exactly_its_own_raw_line(mode: str, tmp_path: Path) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text("flask==2.0  # web framework\n", encoding="utf-8")
+
+    db = Database(mode=mode)
+    requirements_analysis(db, str(path))
+
+    # Reword the comment so the line grows by six characters. Nothing about the
+    # requirement itself changes, so this is exactly the edit a line-normalizing
+    # comparison would absorb. Under such a comparison the range would be
+    # measured on the file as it is now while raw_line was carried over from the
+    # file as it was, and the two would stop describing the same line -- 27
+    # characters of text under a 33-character span. Both are re-derived from one
+    # read now, so the arithmetic below holds.
+    path.write_text("flask==2.0  # small web framework\n", encoding="utf-8")
+
+    _assert_ranges_span_their_raw_lines(
+        requirements_analysis(db, str(path)), "comment reworded six characters longer"
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_space_after_a_continuation_backslash_ends_the_logical_line(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text("flask \\\n==2.0\n", encoding="utf-8")
+
+    db = Database(mode=mode)
+    requirements_analysis(db, str(path))
+
+    # A backslash followed by a space does not continue anything, so the two
+    # physical lines stop being one requirement. Three public fields move at
+    # once -- the specifier, the raw line, and the diagnostics -- while the
+    # trailing space is invisible to any comparison that strips it.
+    path.write_text("flask \\ \n==2.0\n", encoding="utf-8")
+
+    warm = requirements_analysis(db, str(path))
+    fresh = requirements_analysis(Database(mode=mode), str(path))
+
+    assert warm == fresh, (
+        f"a space after the continuation backslash reads differently warm | mode={mode} | "
+        f"warm={[(r.name, r.version_spec, r.raw_line) for r in warm.requirements]} "
+        f"diagnostics={warm.diagnostics}"
+    )
+    assert [(r.name, r.version_spec, r.raw_line) for r in fresh.requirements] == [
+        ("flask", "\\", "flask \\")
+    ]
+    assert fresh.diagnostics == (("unparseable-line", "line 2: ==2.0"),)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reloaded_requirements_checkpoint_answers_like_a_fresh_database(
+    mode: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text("flask==2.0  # web framework\n", encoding="utf-8")
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    requirements_analysis(saver, str(path))
+    deep_requirements_analysis(saver, str(path))
+
+    # The edit lands BEFORE the save and both entrypoints are re-driven, so what
+    # gets written is the state the database reached by answering after the
+    # edit. Saving first and editing afterwards would checkpoint a database that
+    # had never answered from a stale comparison, and the row would pass whether
+    # or not anything is wrong.
+    path.write_text("flask==2.0  # small web framework\n", encoding="utf-8")
+    requirements_analysis(saver, str(path))
+    deep_requirements_analysis(saver, str(path))
+    key = saver.save_checkpoint()
+
+    reloaded = Database(mode=mode, store=store)
+    reloaded.load_checkpoint(key)
+    fresh = Database(mode=mode)
+
+    for name, entrypoint in (
+        ("requirements_analysis", requirements_analysis),
+        ("deep_requirements_analysis", deep_requirements_analysis),
+    ):
+        restored = entrypoint(reloaded, str(path))
+        expected = entrypoint(fresh, str(path))
+        assert restored == expected, (
+            f"{name} from a reloaded checkpoint disagrees with a fresh read | mode={mode} | "
+            f"restored raw_lines={[r.raw_line for r in restored.requirements]} | "
+            f"expected raw_lines={[r.raw_line for r in expected.requirements]}"
+        )
+
+    # The reload is the durable half of what this guards against: a restored
+    # database that had answered from a stale comparison would serve the file's
+    # current text beside a raw_line captured before the edit, and that pairing
+    # would outlive the process that produced it. Checked here as well as on the
+    # live database because a checkpoint carries it across a restart.
+    _assert_ranges_span_their_raw_lines(
+        requirements_analysis(reloaded, str(path)), "reloaded from a checkpoint"
+    )
 
 
 # ---------------------------------------------------------------------------

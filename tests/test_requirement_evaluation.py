@@ -8,6 +8,7 @@ import pytest
 from packaging.markers import Marker, default_environment
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
+from test_requirements_txt import _EDIT_SEQUENCE
 
 import pyinc.integrations as integrations
 from pyinc import Database
@@ -686,6 +687,69 @@ def test_applicable_requirements_comment_only_edit_backdates(
     second = applicable_requirements(db, str(req_file))
 
     assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Reads that must answer with the text they compared
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_both_applicable_surfaces_match_a_fresh_read_across_the_edit_sequence(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both evaluation surfaces answer every step the way a fresh database does.
+
+    The document and the seven edits are imported from the requirements suite
+    rather than restated here, so "the same sequence" is a fact about the object
+    both rows walk instead of a claim about two copies staying in step.
+
+    The assertion is uniform across the seven edits; the divergence it guards
+    against is not, and the difference matters when reading a green run. Only
+    two of the seven edits reach here at all -- the editable install's name and
+    the continuation backslash, both of which change a requirement's identity.
+    Rewording the comment on a plain requirement, on an index directive, or on
+    a line the parser rejects changes what the requirements suite reports while
+    leaving these two surfaces untouched, so three of the cells below hold for
+    reasons that have nothing to do with what they are here to catch. They are
+    written anyway, because which edits reach this layer is a fact about
+    today's evaluation code rather than a property anyone has pinned.
+    """
+    _patch_env(monkeypatch, _fixed_env())
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "requests", "2.31.0", top_level="requests")
+    _patch_site(monkeypatch, site_dir)
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    req_file = root / "requirements.txt"
+
+    incremental = Database(mode=mode)
+    for label, content in _EDIT_SEQUENCE:
+        req_file.write_text(content, encoding="utf-8")
+        fresh = Database(mode=mode)
+        for name, warm_value, fresh_value in (
+            (
+                "applicable_requirements",
+                applicable_requirements(incremental, str(req_file)),
+                applicable_requirements(fresh, str(req_file)),
+            ),
+            (
+                "workspace_applicable_requirements",
+                workspace_applicable_requirements(incremental, str(root)),
+                workspace_applicable_requirements(fresh, str(root)),
+            ),
+        ):
+            assert warm_value == fresh_value, (
+                f"{name} disagrees with a fresh read | after: {label} | mode={mode}"
+            )
+            # Both sides must have answered: workspace discovery returns None
+            # when it finds no requirements.txt, and None == None would satisfy
+            # the comparison above without either surface having read anything.
+            assert fresh_value is not None, (
+                f"{name} returned nothing to compare | after: {label} | mode={mode}"
+            )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

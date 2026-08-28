@@ -513,7 +513,6 @@ def test_namespace_discovery_ignores_unsafe_candidates_and_regular_shadows(
 def test_requirements_parser_defensive_branches() -> None:
     assert requirements_txt._parse_requirement_line("   ", 1) is None
     assert requirements_txt._parse_file_references("-c bad\0path") == ()
-    assert requirements_txt._requirements_cutoff_token(" \n# comment\n") == ("", "#")
 
     source_range = requirements_txt._range_for_line({}, 0)
     assert source_range.start.line == 0

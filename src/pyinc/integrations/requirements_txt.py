@@ -386,36 +386,11 @@ def _parse_diagnostics(text: str) -> tuple[DiagnosticPayload, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Cutoff
-# ---------------------------------------------------------------------------
-
-
-def _requirements_cutoff_token(text: str) -> tuple[str, ...]:
-    """Normalize requirements text for semantic comparison.
-
-    Preserves line structure (blank lines and comment lines keep their
-    positions) because downstream results include line numbers.  Only
-    comment *text* and trailing whitespace are normalized so that edits
-    to comment wording — without changing line count — are backdated.
-    """
-    lines: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            lines.append("")
-        elif stripped.startswith("#"):
-            lines.append("#")
-        else:
-            lines.append(_strip_inline_comment(stripped).rstrip())
-    return tuple(lines)
-
-
-# ---------------------------------------------------------------------------
 # Layer 1 — Payload queries
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_requirements_cutoff_token)
+@query
 def requirements_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 
