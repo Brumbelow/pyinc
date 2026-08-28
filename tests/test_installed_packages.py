@@ -6,10 +6,11 @@ from typing import Literal
 import pytest
 
 import pyinc.integrations as integrations
-from pyinc import Database
+from pyinc import Database, InMemoryArtifactStore
 from pyinc.integrations.installed_packages import (
     InstalledPackagesAnalysis,
     environment_index,
+    installed_distributions_index,
     installed_packages_analysis,
     resolve_import_name,
 )
@@ -319,7 +320,7 @@ def test_non_dist_info_entries_ignored(tmp_path: Path, monkeypatch: pytest.Monke
 
 
 # ---------------------------------------------------------------------------
-# Cutoff / backdating
+# Backdating
 # ---------------------------------------------------------------------------
 
 
@@ -368,6 +369,229 @@ def test_version_change_invalidates(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     second = installed_packages_analysis(db)
     assert second.packages[0].version == "2.0.0"
     assert first != second
+
+
+# ---------------------------------------------------------------------------
+# Reads that must answer with the text they compared
+# ---------------------------------------------------------------------------
+
+# A METADATA header has three states, not two: absent, present-and-empty, and
+# present-with-a-value. _parse_metadata_field answers None for the first and ''
+# for the second, and the package layer branches on exactly that difference --
+# an absent Name or Version is a distribution it cannot describe, an empty one
+# is a distribution whose name or version is the empty string. Any comparison
+# that fills a missing field in with '' cannot tell those two apart, so it
+# reports no change across an edit that moves a package on and off the listing.
+
+
+def _metadata_document(*, name: str | None, version: str | None, summary: str = "s") -> str:
+    """Build a METADATA document, omitting a header entirely when its value is None."""
+    lines = ["Metadata-Version: 2.1"]
+    for field, value in (("Name", name), ("Version", version)):
+        if value is not None:
+            # An empty value writes "Name:", not "Name: " -- a header left
+            # empty carries nothing after the colon.
+            lines.append(f"{field}: {value}".rstrip())
+    lines.append(f"Summary: {summary}")
+    return "\n".join(lines) + "\n"
+
+
+# Each step carries the document, the distribution listing it must produce, and
+# the diagnostic codes that must come with it. Both sequences pass through the
+# empty state twice, so both directions of the edit that a field-value
+# comparison cannot see are walked: absent -> empty on the way in, and
+# empty -> absent on the way out. The two middle steps move the field to a real
+# value and back, which any comparison can see; they are here to separate the
+# two blind transitions rather than to witness anything themselves.
+_Step = tuple[str, str, tuple[tuple[str, str], ...], tuple[str, ...]]
+
+_NAME_SEQUENCE: tuple[_Step, ...] = (
+    (
+        "no Name header",
+        _metadata_document(name=None, version="1.0"),
+        (),
+        ("metadata-parse-failed",),
+    ),
+    ("an empty Name header", _metadata_document(name="", version="1.0"), (("", "1.0"),), ()),
+    (
+        "a Name header with a value",
+        _metadata_document(name="example", version="1.0"),
+        (("example", "1.0"),),
+        (),
+    ),
+    ("an empty Name header again", _metadata_document(name="", version="1.0"), (("", "1.0"),), ()),
+    (
+        "the Name header removed",
+        _metadata_document(name=None, version="1.0"),
+        (),
+        ("metadata-parse-failed",),
+    ),
+)
+
+_VERSION_SEQUENCE: tuple[_Step, ...] = (
+    (
+        "no Version header",
+        _metadata_document(name="example", version=None),
+        (),
+        ("metadata-parse-failed",),
+    ),
+    (
+        "an empty Version header",
+        _metadata_document(name="example", version=""),
+        (("example", ""),),
+        (),
+    ),
+    (
+        "a Version header with a value",
+        _metadata_document(name="example", version="1.0"),
+        (("example", "1.0"),),
+        (),
+    ),
+    (
+        "an empty Version header again",
+        _metadata_document(name="example", version=""),
+        (("example", ""),),
+        (),
+    ),
+    (
+        "the Version header removed",
+        _metadata_document(name="example", version=None),
+        (),
+        ("metadata-parse-failed",),
+    ),
+)
+
+
+def _site_with_one_dist_info(tmp_path: Path) -> tuple[Path, Path]:
+    """A site-packages holding one dist-info whose METADATA the caller rewrites."""
+    site_dir = tmp_path / "site-packages"
+    dist_info = site_dir / "example-1.0.dist-info"
+    dist_info.mkdir(parents=True)
+    # A top_level.txt keeps the import name fixed across the sequence, so the
+    # resolution surface moves only when the distribution itself moves.
+    (dist_info / "top_level.txt").write_text("example\n", encoding="utf-8")
+    return site_dir, dist_info / "METADATA"
+
+
+def _every_surface(db: Database) -> dict[str, object]:
+    """The four public surfaces this metadata read reaches.
+
+    The two indexes are the cross-integration half: they are what dependency
+    checking, python-source enrichment and module resolution read the installed
+    environment through, so a stale answer here travels well past this module.
+    """
+    analysis = installed_packages_analysis(db)
+    stdlib_modules, package_entries = environment_index(db)
+    return {
+        "installed_packages_analysis packages": analysis.packages,
+        "installed_packages_analysis diagnostics": analysis.diagnostics,
+        "resolve_import_name": resolve_import_name(db, "example"),
+        # environment_index is compared as both of its halves rather than as one
+        # value, so that a failure prints the package entries instead of
+        # truncating inside three hundred stdlib module names.
+        "environment_index stdlib modules": stdlib_modules,
+        "environment_index package entries": package_entries,
+        "installed_distributions_index": installed_distributions_index(db),
+    }
+
+
+def _brief(value: object) -> str:
+    """A bounded single-line rendering, for the one surface that can still be long."""
+    text = repr(value)
+    return text if len(text) <= 160 else text[:160] + "...<truncated>"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(
+    "field, sequence",
+    [("Name", _NAME_SEQUENCE), ("Version", _VERSION_SEQUENCE)],
+    ids=["Name", "Version"],
+)
+def test_every_installed_packages_surface_matches_a_fresh_read_across_the_field_sequence(
+    field: str,
+    sequence: tuple[_Step, ...],
+    mode: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every surface answers each METADATA edit the way a fresh database does."""
+    site_dir, meta = _site_with_one_dist_info(tmp_path)
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    incremental = Database(mode=mode)
+    for label, document, expected_listing, expected_codes in sequence:
+        meta.write_text(document, encoding="utf-8")
+        warm = _every_surface(incremental)
+        fresh = _every_surface(Database(mode=mode))
+
+        for name in warm:
+            assert warm[name] == fresh[name], (
+                f"{name} disagrees with a fresh read | after: {label} | field={field} | "
+                f"mode={mode} | warm={_brief(warm[name])} | fresh={_brief(fresh[name])}"
+            )
+
+        # The equality above is satisfied by two databases that are wrong the
+        # same way, so each step also pins the answer itself. This is where the
+        # empty-field states are held to what they report: a distribution whose
+        # Name or Version is present and empty stays on the listing with that
+        # empty value, and carries no diagnostic.
+        analysis = installed_packages_analysis(incremental)
+        listing = tuple((pkg.distribution_name, pkg.version) for pkg in analysis.packages)
+        assert listing == expected_listing, (
+            f"listing is not what this document describes | after: {label} | field={field} | "
+            f"mode={mode} | listing={listing} | expected={expected_listing}"
+        )
+        codes = tuple(code for code, _ in analysis.diagnostics)
+        assert codes == expected_codes, (
+            f"diagnostics are not what this document produces | after: {label} | field={field} | "
+            f"mode={mode} | codes={codes} | expected={expected_codes}"
+        )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reloaded_installed_packages_checkpoint_answers_like_a_fresh_database(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir, meta = _site_with_one_dist_info(tmp_path)
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    meta.write_text(_metadata_document(name=None, version="1.0"), encoding="utf-8")
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    _every_surface(saver)
+
+    # The edit lands BEFORE the save and the surfaces are re-driven, so what
+    # gets written is the state the database reached by answering after the
+    # edit. Saving first and editing afterwards would checkpoint a database that
+    # had never answered across this edit at all, and the row would pass whether
+    # or not anything is wrong.
+    meta.write_text(_metadata_document(name="", version="1.0"), encoding="utf-8")
+    _every_surface(saver)
+    key = saver.save_checkpoint()
+
+    reloaded = Database(mode=mode, store=store)
+    reloaded.load_checkpoint(key)
+    restored = _every_surface(reloaded)
+    fresh = _every_surface(Database(mode=mode))
+
+    for name in restored:
+        assert restored[name] == fresh[name], (
+            f"{name} from a reloaded checkpoint disagrees with a fresh read | mode={mode} | "
+            f"restored={_brief(restored[name])} | fresh={_brief(fresh[name])}"
+        )
+
+    # A reload is the durable half of what this guards against: an answer
+    # carried over from before the edit would outlive the process that produced
+    # it, and every consumer of the two indexes would inherit it.
+    analysis = installed_packages_analysis(reloaded)
+    assert [(p.distribution_name, p.version) for p in analysis.packages] == [("", "1.0")]
+    assert analysis.diagnostics == ()
 
 
 # ---------------------------------------------------------------------------

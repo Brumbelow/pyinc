@@ -172,15 +172,6 @@ def _parse_metadata_fields(text: str, field_name: str) -> tuple[str, ...]:
     return tuple(str(value).strip() for value in message.get_all(field_name, ()))
 
 
-def _metadata_cutoff_token(text: str) -> tuple[str, ...]:
-    """Cutoff: only the parsed field values, not comments or whitespace."""
-    name = _parse_metadata_field(text, "Name") or ""
-    version = _parse_metadata_field(text, "Version") or ""
-    summary = _parse_metadata_field(text, "Summary") or ""
-    requires = _parse_metadata_fields(text, "Requires-Dist")
-    return (name, version, summary, *requires)
-
-
 def _get_site_packages_dirs() -> tuple[str, ...]:
     """Discover site-packages directories from the current Python environment."""
     dirs: list[str] = []
@@ -224,9 +215,9 @@ def _dist_info_listing(db: Database, site_dir: str) -> tuple[str, ...]:
     return tuple(sorted(entry for entry in entries if re.match(_DIST_INFO_PAT, entry)))
 
 
-@query(cutoff=_metadata_cutoff_token)
+@query
 def _metadata_text(db: Database, metadata_path: str) -> str:
-    """Read a dist-info METADATA file. Cutoff on parsed fields only."""
+    """Read a dist-info METADATA file."""
     return _METADATA.read(db, metadata_path)
 
 
