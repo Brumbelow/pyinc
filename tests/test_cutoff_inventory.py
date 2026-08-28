@@ -54,6 +54,11 @@ def carries_a_cutoff(db: Database, path: str) -> str:
 @query
 def carries_none(db: Database, path: str) -> str:
     return ""
+
+
+@query(cutoff=None)
+def declares_no_policy(db: Database, path: str) -> str:
+    return ""
 '''
 
 
@@ -130,16 +135,25 @@ def _classify(module: ast.Module) -> tuple[frozenset[str], frozenset[str]]:
     return frozenset(with_cutoff), frozenset(without)
 
 
-def _walk(want_cutoff: bool) -> frozenset[tuple[str, str]]:
+def _walk(want_cutoff: bool | None) -> frozenset[tuple[str, str]]:
     # The recorded identity is the repo-relative path and the function name,
     # never a line number: a line-number literal would go red on any unrelated
     # edit to these files and would teach a reader to update it blindly.
+    #
+    # `want_cutoff=None` means both classes, unioned inside this loop rather
+    # than by calling the walk twice: a second call would re-read and re-parse
+    # every file under the scanned roots to produce an answer this pass already
+    # holds.
     found: set[tuple[str, str]] = set()
     for path in _module_files():
         module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         with_cutoff, without = _classify(module)
+        if want_cutoff is None:
+            names: frozenset[str] = with_cutoff | without
+        else:
+            names = with_cutoff if want_cutoff else without
         relative = path.relative_to(_ROOT).as_posix()
-        found.update((relative, name) for name in (with_cutoff if want_cutoff else without))
+        found.update((relative, name) for name in names)
     return frozenset(found)
 
 
@@ -148,7 +162,7 @@ def _str_queries_with_a_cutoff() -> frozenset[tuple[str, str]]:
 
 
 def _str_returning_queries() -> frozenset[tuple[str, str]]:
-    return _walk(want_cutoff=True) | _walk(want_cutoff=False)
+    return _walk(want_cutoff=None)
 
 
 def test_the_cutoff_inventory_is_exact() -> None:
@@ -179,6 +193,12 @@ def test_the_predicate_separates_the_two_decorator_spellings() -> None:
     # Tree-independent, so it still has teeth when the literal above is empty:
     # a predicate that stops recognizing the call form would empty the
     # inventory and pass the tree-based guard while saying nothing.
+    #
+    # `declares_no_policy` is the third case rather than a third spelling: it is
+    # written in the call form, like `carries_a_cutoff`, and must still be
+    # classified with the bare form, because naming `cutoff=None` declares no
+    # policy at all. No such site exists in the scanned tree, so this fixture is
+    # the only thing holding that clause of the predicate down.
     with_cutoff, without = _classify(ast.parse(_PREDICATE_FIXTURE))
     assert with_cutoff == {"carries_a_cutoff"}
-    assert without == {"carries_none"}
+    assert without == {"carries_none", "declares_no_policy"}
