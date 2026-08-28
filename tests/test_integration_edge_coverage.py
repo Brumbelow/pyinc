@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import csv
-import datetime
 import sys
 from pathlib import Path
 from typing import Any
@@ -525,16 +524,6 @@ def test_toml_helper_uncommon_values_and_failures() -> None:
     assert toml_config._toml_value_type(1.5) == "float"
     assert toml_config._toml_value_type({}) == "table"
     assert toml_config._toml_value_type(object()) == "unknown"
-    assert toml_config._toml_value_to_string({"b": 1, "a": 2}) == "[('a', 2), ('b', 1)]"
-    assert toml_config._config_cutoff_token("[broken")[0] == "raw"
-    assert toml_config._toml_cutoff_value(datetime.date(2026, 7, 9)) == (
-        "date",
-        "2026-07-09",
-    )
-    assert toml_config._toml_cutoff_value(datetime.time(1, 2, 3)) == (
-        "time",
-        "01:02:03",
-    )
 
 
 def test_notebook_payload_and_cell_helper_edges(tmp_path: Path) -> None:

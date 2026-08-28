@@ -5,7 +5,6 @@ import importlib
 import json
 import os
 from collections.abc import Callable
-from datetime import date, datetime, time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -108,18 +107,9 @@ def test_json_helpers_cover_raw_cutoff_and_nonstandard_values() -> None:
 
 
 def test_toml_helpers_cover_value_kinds_and_shape_edges() -> None:
-    timestamp = datetime(2025, 1, 2, 3, 4, 5)
-    calendar_date = date(2025, 1, 2)
-    clock_time = time(3, 4, 5)
-
     assert toml_config._toml_value_type(1.5) == "float"
     assert toml_config._toml_value_type({"key": "value"}) == "table"
     assert toml_config._toml_value_type(object()) == "unknown"
-    assert toml_config._toml_value_to_string({"b": 2, "a": 1}) == "[('a', 1), ('b', 2)]"
-    assert toml_config._config_cutoff_token("invalid = [") == ("raw", "invalid = [")
-    assert toml_config._toml_cutoff_value(timestamp) == ("datetime", timestamp.isoformat())
-    assert toml_config._toml_cutoff_value(calendar_date) == ("date", calendar_date.isoformat())
-    assert toml_config._toml_cutoff_value(clock_time) == ("time", clock_time.isoformat())
 
     diagnostics = toml_config._config_shape_diagnostics(
         {"project": {"optional-dependencies": "invalid"}}

@@ -69,9 +69,8 @@ dot path, so cached payloads grow with the square of the nesting depth. Each cap
 keeps a document at the cap inside the same ~1 MiB payload budget and inside
 what `freeze` will snapshot, so nothing these integrations accept can fail to
 cache. None of the three raises `RecursionError`: when the interpreter's stack
-is exhausted the diagnostic carries that integration's fixed text and the cutoff
-token falls back to the raw file text. Stack exhaustion is a property of the
-caller's remaining stack, not of the file.
+is exhausted the diagnostic carries that integration's fixed text. Stack
+exhaustion is a property of the caller's remaining stack, not of the file.
 
 ## TOML configuration
 
@@ -87,13 +86,12 @@ parse and project-shape diagnostics. Values are summarized as stable strings,
 with date/time values rendered in ISO form.
 
 **Limits.** No build-backend execution, schema validation, dependency
-resolution, or file mutation occurs. Table or array nesting deeper than 100
+resolution, or file mutation occurs. Table or array nesting deeper than 200
 levels is rejected with a `toml-decode-error` diagnostic that names the limit;
 depth is measured on the parsed document and counts its implicit top-level
 table as the first level, so `[a.b]` is three and `[[a]]` is three as well, an
 array wrapping a table. On stack exhaustion that diagnostic carries the fixed
-text `TOML parsing exhausted the interpreter stack`; a spent stack can cost a
-cutoff, never make one wrong.
+text `TOML parsing exhausted the interpreter stack`.
 
 ## JSON configuration
 

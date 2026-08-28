@@ -8,10 +8,9 @@ from pathlib import Path
 from typing import Any, TypeAlias, cast
 
 from pyinc.core import query
-from pyinc.errors import UnsupportedValueError
 from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
-from pyinc.value import freeze, thaw
+from pyinc.value import thaw
 
 from ._resources import file_probe, file_read_snapshot, file_text
 
@@ -100,27 +99,15 @@ class _TomlNestingLimitError(ValueError):
 # and against the same budget — a document at the cap must not cache more than
 # ~1 MiB.
 #
-# Unlike in those two, the budget is not what binds here. Depth counts the
-# document's implicit top-level table as level 1, the way `json_config` counts the
-# outermost `{`, so `[a.b]` is three levels. `freeze` refuses to snapshot a value
-# nested deeper than `value._MAX_SNAPSHOT_DEPTH`, which is 200, and
-# `_toml_cutoff_value` spends *two* snapshot levels on every table against one on
-# every array: it rewrites each table as a tuple of `(key, value)` pairs, so the
-# pair tuple is a level of its own. An all-table document therefore reaches snapshot
-# depth 2 x 100 = exactly 200 at this cap and cannot exceed it — measured, 99 nested
-# inline tables (100 levels with the root) freeze and 100 raise
-# `UnsupportedValueError` out of the cutoff, while an all-array document at the same
-# cap reaches snapshot depth 101 and every mixture of the two falls between. That
-# relation is what makes the escape unreachable rather than merely caught, and it is
-# the reason this cap sits at half of `json_config`'s: TOML's cutoff value costs
-# twice as much per table as JSON's, which freezes the parsed document as-is.
-#
-# The ~1 MiB budget would have allowed considerably more. Measured with 20-character
-# table names, a document at this cap caches 205 KiB of section payload text
-# (101 KiB of it section names); at 200 levels the same document would cache
-# 824 KiB, still inside the budget but past what `freeze` will accept. 100 levels is
-# an order of magnitude deeper than any real configuration document.
-_MAX_TOML_DEPTH = 100
+# That budget is the only thing that binds here. Depth counts the document's
+# implicit top-level table as level 1, the way `json_config` counts the outermost
+# `{`, so `[a.b]` is three levels. What gets cached is a flat tuple of
+# `(name, keys, subsections)` triples whose own nesting does not grow with the
+# document's, so nesting costs cache size and nothing else. Measured with
+# 20-character table names, a document at this cap caches 823 KiB of section
+# payload text — inside the ceiling, and an order of magnitude deeper than any real
+# configuration document.
+_MAX_TOML_DEPTH = 200
 
 
 def _structure_depth(value: object) -> int:
@@ -185,9 +172,9 @@ def _load_toml(text: str) -> dict[str, Any]:
 # That closes the message axis, not the outcome axis: `tomllib` still descends once
 # per inline-table and array level, so whether a document within the cap parses at
 # all remains a property of the call site as well as of the file, and a caller
-# entering with its stack nearly spent turns a valid document into this diagnostic
-# and drops its cutoff token back to the raw file text. `json_config` and
-# `xml_config` emit the same shape for the same reason and carry the same residual.
+# entering with its stack nearly spent turns a valid document into this diagnostic.
+# `json_config` and `xml_config` emit the same shape for the same reason and carry
+# the same residual.
 _STACK_EXHAUSTED_DIAGNOSTIC = "TOML parsing exhausted the interpreter stack"
 
 
@@ -212,8 +199,6 @@ def _toml_value_type(value: Any) -> str:
 def _toml_value_to_string(value: Any) -> str:
     if isinstance(value, datetime | date | time):
         return value.isoformat()
-    if isinstance(value, dict):
-        return repr(sorted(value.items()))
     return repr(value)
 
 
@@ -221,7 +206,11 @@ def _walk_sections(
     data: dict[str, Any],
     prefix: str,
 ) -> list[ConfigSectionPayload]:
-    """Collect every table in document pre-order, deepest nesting included.
+    """Collect every table in sorted pre-order, deepest nesting included.
+
+    Keys are visited in sorted order at every level rather than in the order the
+    document wrote them, so a file that writes `[b]` before `[a]` still yields
+    `<root>`, `a`, `b`.
 
     The traversal keeps its own stack rather than recursing, so the payload a
     document produces depends only on the document — never on how much of the
@@ -253,40 +242,10 @@ def _walk_sections(
                 )
 
         sections.append((section_name, tuple(keys), tuple(subsections)))
-        # Reversed so the first subsection is popped first, preserving document order.
+        # Reversed so the first subsection is popped first, preserving sorted order.
         pending.extend(reversed(children))
 
     return sections
-
-
-def _config_cutoff_token(text: str) -> tuple[str, str]:
-    try:
-        parsed = _load_toml(text)
-        snapshot = freeze(_toml_cutoff_value(parsed))
-        return ("parsed", repr(snapshot))
-    except (ValueError, RecursionError, OverflowError, UnsupportedValueError):
-        # `_load_toml` bounds `_toml_cutoff_value`'s recursion and `freeze`'s walk
-        # at the cap, so neither can raise for a document that got this far. The
-        # clause stays defensive anyway: an unforeseen path degrades to the raw
-        # text, which only misses a cutoff, rather than escaping `config_analysis`.
-        # `freeze` refuses a value outside the snapshot grammar with
-        # `UnsupportedValueError`, which is a `PyIncError` and not a `ValueError`,
-        # so it has to be named for the clause to cover the `freeze` call at all.
-        return ("raw", text)
-
-
-def _toml_cutoff_value(value: Any) -> object:
-    if isinstance(value, datetime):
-        return ("datetime", value.isoformat())
-    if isinstance(value, date):
-        return ("date", value.isoformat())
-    if isinstance(value, time):
-        return ("time", value.isoformat())
-    if isinstance(value, dict):
-        return tuple((key, _toml_cutoff_value(item)) for key, item in sorted(value.items()))
-    if isinstance(value, list):
-        return tuple(_toml_cutoff_value(item) for item in value)
-    return value
 
 
 def _try_parse_toml(text: str) -> dict[str, Any] | None:
@@ -341,7 +300,7 @@ def _config_shape_diagnostics(parsed: dict[str, Any]) -> tuple[DiagnosticPayload
 # ---------------------------------------------------------------------------
 
 
-@query(cutoff=_config_cutoff_token)
+@query
 def config_file_text(db: Database, path: str) -> str:
     return _FILES.read(db, path)
 
