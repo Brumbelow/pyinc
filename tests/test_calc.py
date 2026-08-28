@@ -12,7 +12,7 @@ if str(_EXAMPLES) not in sys.path:
 
 from calc.engine import (  # noqa: E402
     _parse,
-    _semantic_token,
+    _parse_payload,
     binding_expr,
     calc_emit,
     calc_source,
@@ -38,7 +38,7 @@ def _tree(root: Path) -> dict[str, bytes]:
 
 
 # --------------------------------------------------------------------------- #
-# Task 2A.1 — parser + semantic cutoff token
+# Task 2A.1 — parser + parse payload
 # --------------------------------------------------------------------------- #
 
 
@@ -51,10 +51,10 @@ def test_parse_extracts_includes_bindings_emits() -> None:
     assert parsed.diagnostics == ()
 
 
-def test_semantic_token_ignores_comments_and_whitespace() -> None:
+def test_parse_payload_ignores_comments_and_whitespace() -> None:
     a = "let x = 1 + 2\nemit x\n"
     b = "# header\nlet x = 1 + 2   \n\nemit x\n"
-    assert _semantic_token(a) == _semantic_token(b)
+    assert _parse_payload(a) == _parse_payload(b)
 
 
 def test_parse_reports_unparseable_line() -> None:
@@ -143,8 +143,10 @@ def test_comment_only_edit_backdates(tmp_path: Path) -> None:  # B3
     evaluate_name(db, str(root), "a")
     _write(root, "# note\nlet a = 1 + 1\nemit a\n")
     assert evaluate_name(db, str(root), "a") == ("value", 2, "", "")
-    assert db.inspect(calc_source, str(root)).last_recompute == "backdated"
-    assert db.inspect(parse_calc, str(root)).last_decision == "reused"
+    # The read re-runs on the new bytes; the parse is what lands an equal
+    # payload and backdates, so the evaluation is reused.
+    assert db.inspect(calc_source, str(root)).last_recompute == "executed"
+    assert db.inspect(parse_calc, str(root)).last_decision == "backdated"
     assert db.inspect(evaluate_name, str(root), "a").last_decision == "reused"
 
 

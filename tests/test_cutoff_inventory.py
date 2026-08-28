@@ -24,7 +24,6 @@ _SCANNED_ROOTS = ("src", "examples")
 #: state.
 _STR_QUERIES_WITH_A_CUTOFF: frozenset[tuple[str, str]] = frozenset(
     {
-        ("examples/calc/engine.py", "calc_source"),
         ("examples/correctness_demo.py", "read_source"),
     }
 )

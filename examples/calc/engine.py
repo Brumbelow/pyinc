@@ -21,7 +21,7 @@ Semantics:
 
 Query graph (each layer is a kernel-cached node):
 
-    calc_source (cutoff=semantic token)  -> raw text; comment/whitespace edits backdate
+    calc_source                          -> raw text
     parse_calc                           -> (includes, bindings, emits, diagnostics)
     binding_table                        -> merged name->expr over referenced includes
     binding_expr                         -> one name's expression (backdates when unchanged)
@@ -29,6 +29,12 @@ Query graph (each layer is a kernel-cached node):
     evaluate_name                        -> value or diagnostic (per-name, cross-query recursion)
     emit_names                           -> the root file's ``emit`` declarations
     calc_emit  (@action)                 -> one ``<name>.out`` per emit
+
+A comment-only or whitespace-only edit re-reads ``calc_source`` and reparses it;
+the payload comes back equal, so ``parse_calc`` backdates and nothing that
+depends on it re-evaluates. The exception is a line the parser rejects: its
+diagnostic quotes the line verbatim, so whitespace inside such a line does change
+the payload.
 
 Regexes are inlined as string literals (not module-level ``re.Pattern``
 singletons) because the kernel walks query-reachable functions' captures and
@@ -106,11 +112,13 @@ def _parse_expr(rhs: str) -> tuple[_Expr | None, str | None]:
         idx += 1
 
 
-def _semantic_token(source: str) -> _ParsePayload:
+def _parse_payload(source: str) -> _ParsePayload:
     """Parse to the canonical (includes, bindings, emits, diagnostics) payload.
 
-    Used both as the parse layer and as ``calc_source``'s cutoff token, so
-    comment-only and whitespace-only edits map to an equal token and backdate.
+    Comments and blank lines are dropped and every line is stripped, so a
+    comment-only or whitespace-only edit maps to an equal payload and
+    ``parse_calc`` backdates — except on a line the parser rejects, whose
+    diagnostic quotes the line verbatim.
     """
     includes: list[str] = []
     bindings: list[_Binding] = []
@@ -154,7 +162,7 @@ def _semantic_token(source: str) -> _ParsePayload:
 def _parse(source: str) -> _Parsed:
     """Convenience wrapper returning a named structure (test/inspection only;
     not reachable from any ``@query``)."""
-    includes, bindings, emits, diagnostics = _semantic_token(source)
+    includes, bindings, emits, diagnostics = _parse_payload(source)
     return _Parsed(includes, bindings, emits, diagnostics)
 
 
@@ -162,15 +170,17 @@ def _resolve_include(current_file: str, target: str) -> str:
     return os.path.normpath(os.path.join(os.path.dirname(current_file), target))
 
 
-@query(cutoff=_semantic_token)
+@query
 def calc_source(db: Database, path: str) -> str:
-    """Raw text of a ``.calc`` file. Comment/whitespace-only edits backdate."""
+    """Raw text of a ``.calc`` file. Every edit re-reads it; ``parse_calc`` is
+    where a comment/whitespace-only edit lands an equal payload and backdates,
+    unless the edit falls on a line the parser rejects and quotes verbatim."""
     return _FILES.read(db, path)
 
 
 @query
 def parse_calc(db: Database, path: str) -> _ParsePayload:
-    return _semantic_token(calc_source(db, path))
+    return _parse_payload(calc_source(db, path))
 
 
 @query

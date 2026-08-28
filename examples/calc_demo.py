@@ -19,7 +19,7 @@ from pathlib import Path
 # script's directory to sys.path).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from calc.engine import calc_emit, calc_source, evaluate_name  # noqa: E402
+from calc.engine import calc_emit, evaluate_name, parse_calc  # noqa: E402
 
 from pyinc import Database  # noqa: E402
 
@@ -57,7 +57,7 @@ def main() -> None:
             encoding="utf-8",
         )
         calc_emit.reconcile(db, str(root), root=out)
-        backdated = db.inspect(calc_source, str(root)).last_recompute == "backdated"
+        backdated = db.inspect(parse_calc, str(root)).last_recompute == "backdated"
         print(f"comment_edit_backdated={backdated}")
 
         # Removing an emit deletes only that owned output.
