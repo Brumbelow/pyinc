@@ -11,6 +11,7 @@ from pyinc import Database, InMemoryArtifactStore
 from pyinc.integrations.notebook import (
     NotebookAnalysis,
     NotebookCell,
+    NotebookDiagnostic,
     notebook_analysis,
     notebook_analysis_payload,
     notebook_cells_payload,
@@ -731,6 +732,213 @@ def test_notebook_edit_survives_a_checkpoint(tmp_path: Path, mode: str) -> None:
         f"cells {len(warm.cells)}!={len(fresh.cells)} | "
         f"diags {len(warm.diagnostics)}!={len(fresh.diagnostics)} | "
         f"reloaded from a checkpoint saved after {_ARITY_A} -> {_ARITY_B}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shapes a flat projection could not tell apart
+# ---------------------------------------------------------------------------
+#
+# The diagnostics payload decides on `cells` three ways -- the field is absent,
+# it is present but is not a list, or it is walked cell by cell -- and the
+# documents below cover all three, together with the pair above whose cell
+# counts differ while their flattened text lines up. Each row drives the public
+# entrypoint over an explicit ordered pair, never a sampled one, and pins the
+# analysis the second document has to produce, so a change to a reported
+# diagnostic fails here as itself rather than somewhere downstream as a
+# mismatch against a corpus.
+
+_NB_NO_CELLS_FIELD = '{"metadata": {}, "nbformat": 4}'
+_NB_EMPTY_CELLS = '{"cells": [], "metadata": {}, "nbformat": 4}'
+_NB_CELLS_NOT_A_LIST = '{"cells": {}, "metadata": {}, "nbformat": 4}'
+
+_NotebookShape = tuple[str, tuple[NotebookCell, ...], tuple[NotebookDiagnostic, ...]]
+
+# One spelling for the comparand throughout: the entrypoint reports
+# `NotebookDiagnostic`, which compares unequal to any tuple, so the expectation
+# is written as the dataclass rather than as the payload's flat triple.
+_NOTEBOOK_SHAPES: dict[str, _NotebookShape] = {
+    "missing": (
+        _NB_NO_CELLS_FIELD,
+        (),
+        (
+            NotebookDiagnostic(
+                code="notebook-shape-error",
+                message="missing 'cells' field",
+                cell_index=None,
+                range=None,
+            ),
+        ),
+    ),
+    "empty": (_NB_EMPTY_CELLS, (), ()),
+    "not-a-list": (
+        _NB_CELLS_NOT_A_LIST,
+        (),
+        (
+            NotebookDiagnostic(
+                code="notebook-shape-error",
+                message="'cells' is not a list",
+                cell_index=None,
+                range=None,
+            ),
+        ),
+    ),
+    "non-object-cells": (
+        _ARITY_A,
+        (),
+        (
+            NotebookDiagnostic(
+                code="notebook-shape-error",
+                message="cell is not an object",
+                cell_index=0,
+                range=None,
+            ),
+            NotebookDiagnostic(
+                code="notebook-shape-error",
+                message="cell is not an object",
+                cell_index=1,
+                range=None,
+            ),
+        ),
+    ),
+    "unknown-cell": (
+        _ARITY_B,
+        (
+            NotebookCell(
+                index=0,
+                cell_type="unknown",
+                source="invalid-cell",
+                heading=None,
+                imports=(),
+                definitions=(),
+            ),
+        ),
+        (),
+    ),
+}
+
+# Both directions for every pair. A read that answers with an earlier analysis
+# answers with the *first* document's, so which document that is decides what a
+# wrong read reports and one direction alone leaves half the shape unpinned.
+_NOTEBOOK_SHAPE_PAIRS = (
+    ("missing", "empty"),
+    ("empty", "missing"),
+    ("non-object-cells", "unknown-cell"),
+    ("unknown-cell", "non-object-cells"),
+    ("not-a-list", "empty"),
+    ("empty", "not-a-list"),
+    ("not-a-list", "missing"),
+    ("missing", "not-a-list"),
+)
+
+# Across a checkpoint, the missing/empty and object/non-object pairs: the two
+# whose members a projection reading `cells` with a default cannot tell apart.
+# A `cells` field that is not a list is distinguishable in the text itself, so
+# it is covered live above rather than across a save as well.
+_NOTEBOOK_SHAPE_CHECKPOINT_PAIRS = (
+    ("missing", "empty"),
+    ("empty", "missing"),
+    ("non-object-cells", "unknown-cell"),
+    ("unknown-cell", "non-object-cells"),
+)
+
+
+def _diagnostic_summary(diagnostics: tuple[NotebookDiagnostic, ...]) -> str:
+    return ";".join(f"{d.message}@{d.cell_index}" for d in diagnostics) or "none"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(("before", "after"), _NOTEBOOK_SHAPE_PAIRS)
+def test_notebook_shape_pair_reads_the_same_warm_and_fresh(
+    tmp_path: Path, mode: str, before: str, after: str
+) -> None:
+    before_text = _NOTEBOOK_SHAPES[before][0]
+    after_text, expected_cells, expected_diagnostics = _NOTEBOOK_SHAPES[after]
+
+    path = tmp_path / "sample.ipynb"
+    path.write_text(before_text, encoding="utf-8")
+    incremental = Database(mode=mode)
+    notebook_analysis(incremental, str(path))
+
+    path.write_text(after_text, encoding="utf-8")
+    warm = notebook_analysis(incremental, str(path))
+    fresh = notebook_analysis(Database(mode=mode), str(path))
+
+    # Pin the diagnostics, not only warm == fresh: two reads that agree on the
+    # wrong analysis agree just as loudly as two that are right. One line per
+    # message, discriminator first -- a node id this long fills the summary
+    # line on its own, so read a failure with `-o addopts="" --tb=long`.
+    expected = _diagnostic_summary(expected_diagnostics)
+    assert warm.diagnostics == expected_diagnostics, (
+        f"warm diagnostics {_diagnostic_summary(warm.diagnostics)} != {expected}"
+        f" | {before} -> {after}"
+    )
+    assert warm.cells == expected_cells, (
+        f"warm cells {len(warm.cells)}!={len(expected_cells)} | {before} -> {after}"
+    )
+    assert fresh.diagnostics == expected_diagnostics, (
+        f"fresh diagnostics {_diagnostic_summary(fresh.diagnostics)} != {expected}"
+        f" | {before} -> {after}"
+    )
+    assert fresh.cells == expected_cells, (
+        f"fresh cells {len(fresh.cells)}!={len(expected_cells)} | {before} -> {after}"
+    )
+    assert warm == fresh, (
+        f"warm cells {len(warm.cells)}!={len(fresh.cells)} | "
+        f"diags {len(warm.diagnostics)}!={len(fresh.diagnostics)} | {before} -> {after}"
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(("before", "after"), _NOTEBOOK_SHAPE_CHECKPOINT_PAIRS)
+def test_notebook_shape_pair_survives_a_checkpoint(
+    tmp_path: Path, mode: str, before: str, after: str
+) -> None:
+    # The edit has to happen before the save, and the entrypoint has to be
+    # driven again afterwards. Saving first and editing after does not
+    # reproduce: on reload the resource probe mismatches, the read executes on
+    # the new bytes, and there is no earlier comparison left to answer from.
+    before_text, before_cells, before_diagnostics = _NOTEBOOK_SHAPES[before]
+    after_text, expected_cells, expected_diagnostics = _NOTEBOOK_SHAPES[after]
+
+    path = tmp_path / "sample.ipynb"
+    path.write_text(before_text, encoding="utf-8")
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    notebook_analysis(saver, str(path))
+
+    path.write_text(after_text, encoding="utf-8")
+    notebook_analysis(saver, str(path))
+    key = saver.save_checkpoint()
+
+    reloaded_db = Database(mode=mode, store=store)
+    reloaded_db.load_checkpoint(key)
+
+    # Values only. A reloaded record reports `executed` or `reused` either way,
+    # so a recompute marker cannot tell a restored analysis from a stale one.
+    reloaded = notebook_analysis(reloaded_db, str(path))
+    fresh = notebook_analysis(Database(mode=mode), str(path))
+
+    expected = _diagnostic_summary(expected_diagnostics)
+    assert reloaded.diagnostics == expected_diagnostics, (
+        f"reloaded diagnostics {_diagnostic_summary(reloaded.diagnostics)} != {expected}"
+        f" | saved after {before} -> {after}"
+    )
+    assert reloaded.cells == expected_cells, (
+        f"reloaded cells {len(reloaded.cells)}!={len(expected_cells)}"
+        f" | saved after {before} -> {after}"
+    )
+    assert reloaded == fresh, (
+        f"reloaded cells {len(reloaded.cells)}!={len(fresh.cells)} | "
+        f"diags {len(reloaded.diagnostics)}!={len(fresh.diagnostics)} | "
+        f"saved after {before} -> {after}"
+    )
+    # The two documents have to analyze differently at the entrypoint, or the
+    # assertions above would hold whatever the reload carried across.
+    assert (reloaded.cells, reloaded.diagnostics) != (before_cells, before_diagnostics), (
+        f"reloaded matches the pre-edit analysis {_diagnostic_summary(before_diagnostics)}"
+        f" | saved after {before} -> {after}"
     )
 
 
