@@ -45,13 +45,21 @@ _REFORMATTED_CSV = '"name","age"\n"Alice","30"\n"Bob","25"\n\n'
 
 # Written as bytes so the carriage returns reach the parser untranslated: a
 # single quoted column with CRLF line endings, and a file whose only line breaks
-# are bare carriage returns. Sniffing either one guesses a line terminator for
-# the delimiter.
+# are bare carriage returns. The parser translates both to newlines before it
+# sniffs, so neither file's line endings reach the sniffer.
 _CRLF_CSV_BYTES = b'"a"\r\n"b"\r\n"c"\r\n'
 _LONE_CR_CSV_BYTES = b"a\rb\rc\r"
 
-_REFUSED_CR = ("csv-dialect-error", "sniffed delimiter '\\r' is a line terminator; read as ','")
-_UNREADABLE_AS_COMMA = ("csv-dialect-error", "text is not readable as ','-delimited")
+# The same single quoted column with ordinary newlines. Nothing about its line
+# endings is unusual, and it is what the two files above look like once they are
+# translated, so it is the shape that shows the quote character is the whole of
+# what gets refused.
+_QUOTED_COLUMN_CSV_BYTES = b'"a"\n"b"\n"c"\n'
+
+_REFUSED_QUOTE = (
+    "csv-dialect-error",
+    "sniffed delimiter '\"' is the quote character; read as ','",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -416,34 +424,53 @@ def _shape_of(analysis: CsvAnalysis) -> tuple[object, ...]:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_crlf_file_is_read_as_comma_delimited(mode: str, tmp_path: Path) -> None:
-    # The whole answer, not just the delimiter: refusing the sniffed value is
-    # what makes this shape independent of which version read the file, so the
-    # row pins all of it rather than only the field that used to move.
+    # The whole answer, not just the delimiter. Translating the line endings is
+    # what stops the file's own line breaks reaching the sniffer, and refusing
+    # the quote character is what stops the guess it makes instead deciding the
+    # answer, so the row pins all of it rather than only the field that moved.
     path = tmp_path / "data.csv"
     path.write_bytes(_CRLF_CSV_BYTES)
 
     result = csv_analysis(Database(mode=mode), str(path))
 
-    assert _shape_of(result) == ((("column_0", 0),), 3, ",", False, (_REFUSED_CR,)), (
+    assert _shape_of(result) == ((("column_0", 0),), 3, ",", False, (_REFUSED_QUOTE,)), (
         f"CRLF file | {_shape_of(result)}"
     )
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_a_carriage_return_only_file_reports_what_it_could_not_read(
+def test_a_carriage_return_only_file_is_read_like_any_other_line_ending(
     mode: str, tmp_path: Path
 ) -> None:
-    # Two diagnostics and an empty table, where the CRLF file gets one and three
-    # rows. The first records the refused delimiter; the second records that the
-    # comma fallback did not read this text either, which is where the reader
-    # gives up rather than where anything is refused.
+    # Three rows and no diagnostic at all: bare carriage returns are translated
+    # like every other line ending, and the text left over is an unquoted single
+    # column the sniffer cannot call either way, which is the comma fallback's
+    # ordinary silent case rather than anything this file did wrong.
     path = tmp_path / "data.csv"
     path.write_bytes(_LONE_CR_CSV_BYTES)
 
     result = csv_analysis(Database(mode=mode), str(path))
 
-    assert _shape_of(result) == ((), 0, ",", False, (_REFUSED_CR, _UNREADABLE_AS_COMMA)), (
+    assert _shape_of(result) == ((("column_0", 0),), 3, ",", False, ()), (
         f"carriage-return-only file | {_shape_of(result)}"
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_quoted_single_column_file_is_read_as_comma_delimited(
+    mode: str, tmp_path: Path
+) -> None:
+    # No carriage return anywhere in this file, so nothing here is about line
+    # endings: the sniffer reads a column of quoted fields and answers with the
+    # quote character, which some readers accept and others refuse. Refusing it
+    # here is what keeps this file's answer off that difference.
+    path = tmp_path / "data.csv"
+    path.write_bytes(_QUOTED_COLUMN_CSV_BYTES)
+
+    result = csv_analysis(Database(mode=mode), str(path))
+
+    assert _shape_of(result) == ((("column_0", 0),), 3, ",", False, (_REFUSED_QUOTE,)), (
+        f"quoted single-column file | {_shape_of(result)}"
     )
 
 
@@ -467,7 +494,7 @@ def test_the_read_returns_the_bytes_and_the_payloads_choose_the_dialect(
     assert text == '"a"\r\n"b"\r\n"c"\r\n', f"the read did not hand back the file | {text!r}"
 
     analysis = csv_analysis(db, str(path))
-    assert (analysis.delimiter, analysis.diagnostics) == (",", (_REFUSED_CR,)), (
+    assert (analysis.delimiter, analysis.diagnostics) == (",", (_REFUSED_QUOTE,)), (
         f"the dialect decision did not land in the payloads | {_shape_of(analysis)}"
     )
 

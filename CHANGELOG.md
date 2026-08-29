@@ -487,17 +487,23 @@ decided at release time.
   repaired alongside them.
 - `csv_analysis()` returns an answer for a file whose sniffed dialect the
   stdlib reader cannot use, instead of letting the failure escape the analysis.
-  A sniffed delimiter that is a line terminator is refused outright and the text
-  is read as comma-delimited; text the fallback dialect cannot read either comes
-  back as an empty table. Each step down is recorded as a `csv-dialect-error`
-  diagnostic, and the integration contract states them. What happened before
-  depended on which interpreter read the file: a file of quoted fields with
-  CRLF line endings escaped `csv_analysis()` as an error on one interpreter and
-  came back as two columns under a carriage-return delimiter on another.
-  Refusing the delimiter is the analysis's own decision rather than the stdlib
-  reader's, so the answer no longer depends on the interpreter version — that
-  file now reports one column, three rows, a comma delimiter and the
-  diagnostic. A file the sniffer reads normally is unaffected.
+  A file's line endings are translated before its dialect is sniffed, so a
+  carriage return no longer reaches the sniffer as something to guess from. Two
+  guesses are then refused and the text is read as comma-delimited instead: a
+  line terminator, and the quote character itself. Text the fallback dialect
+  cannot read either comes back as an empty table. Each step down is recorded as
+  a `csv-dialect-error` diagnostic, and the integration contract states them.
+  What happened before depended on which build read the file, in two ways that
+  looked like one: a file of quoted fields with CRLF line endings escaped
+  `csv_analysis()` as an error on some builds and came back as two columns under
+  a carriage-return delimiter on others, and a file of quoted fields with
+  ordinary line endings — nothing unusual about it at all — came back as an
+  empty table on some builds and as three rows under a quote-character delimiter
+  on others. Both decisions are now the analysis's own rather than the stdlib
+  reader's, and both files report one column, three rows, a comma delimiter and
+  the diagnostic on every build this was measured on. A file whose only oddity
+  was its line endings is simply read, with no diagnostic at all. A file the
+  sniffer reads normally is unaffected.
 
 ### Added
 

@@ -101,20 +101,41 @@ def _parse_csv(
     if not stripped:
         return [], 0, ",", False, []
 
+    # The text arrives with whatever line endings the file holds, so translate
+    # them before anything looks at it. Spelled as two replacements rather than
+    # splitlines(), which also breaks on the vertical tab, form feed and the
+    # other separators a field is allowed to contain.
+    stripped = stripped.replace("\r\n", "\n").replace("\r", "\n")
+
     delimiter = _detect_delimiter(stripped)
     has_header = _detect_has_header(stripped)
     diagnostics: list[DiagnosticPayload] = []
 
-    # A line terminator is not a usable delimiter, and what a reader does with
-    # one is a property of the reader rather than of the file: some refuse it
-    # outright, some accept it and split fields where the file's own line breaks
-    # are. Refusing it here is what makes the answer independent of which version
-    # read the file.
+    # Two guesses no reader can be relied on to use the same way: a line
+    # terminator, and the quote character itself. Readers disagree about both --
+    # some refuse them outright, some accept them and split fields somewhere the
+    # file never meant. The translation above settles what the sniffer sees;
+    # refusing these two settles what is done with the answer, so neither the
+    # file's line endings nor a guess of the quote character can decide the
+    # dialect. The quote character is read from the dialect the reader below
+    # falls back on, which is the module's fixed default for a call that names
+    # only a delimiter. The terminator arm is belt and braces: no sniffer path
+    # measured here returns one once the text above has been translated, and it
+    # is kept for the reader that does rather than removed for the ones that
+    # do not.
     if delimiter in ("\r", "\n"):
         diagnostics.append(
             (
                 "csv-dialect-error",
                 f"sniffed delimiter {delimiter!r} is a line terminator; read as ','",
+            )
+        )
+        delimiter = ","
+    elif delimiter == csv.excel.quotechar:
+        diagnostics.append(
+            (
+                "csv-dialect-error",
+                f"sniffed delimiter {delimiter!r} is the quote character; read as ','",
             )
         )
         delimiter = ","

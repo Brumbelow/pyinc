@@ -194,7 +194,7 @@ identify hierarchy but do not index repeated siblings.
 | Entrypoints | `csv_analysis`, `workspace_csv_analysis` |
 | Result types | `CsvAnalysis`, `CsvColumn` |
 | Supported shapes | CSV/TSV text handled by the stdlib CSV parser, delimiter/header sniffing, columns, row counts, and inconsistent-column diagnostics. Workspace discovery defaults to `data.csv`. |
-| Key limits | The complete file is read and parsed, but delimiter and header sniffing inspect only the first 8192 characters, so a file whose dialect or header shape becomes apparent only later may be misclassified. A sniffed delimiter that is a line terminator is refused and the text is read as comma-delimited instead; text the fallback dialect cannot read either is reported as an empty table. Each step down is recorded as a `csv-dialect-error` diagnostic. There is no schema/type inference, streaming result API, or guarantee for dialects the stdlib sniffer cannot identify. |
+| Key limits | The complete file is read and parsed, but delimiter and header sniffing inspect only the first 8192 characters, so a file whose dialect or header shape becomes apparent only later may be misclassified. Line endings are translated before the dialect is sniffed. A sniffed delimiter that is a line terminator or the quote character is refused and the text is read as comma-delimited instead; text the fallback dialect cannot read either is reported as an empty table. Each step down is recorded as a `csv-dialect-error` diagnostic. There is no schema/type inference, streaming result API, or guarantee for dialects the stdlib sniffer cannot identify. |
 
 ## Lexical scope
 
