@@ -449,6 +449,55 @@ decided at release time.
   a query's identity, and the identities below it move with it, so those records
   are passed over and the queries that own them execute again on the first
   request that asks for them. That one recomputation is the whole of the cost.
+- `config_analysis()`, `json_analysis()`, `requirements_analysis()`,
+  `installed_packages_analysis()`, `csv_analysis()`, `env_analysis()`,
+  `xml_analysis()`, `deep_module_resolution_analysis()` and `schema_analysis()`
+  answer a warm database the way a fresh one does after an edit, together with
+  the workspace-wide and derived queries that read through them. Each of them
+  sat on a query of the same shape as the two above — one that hands back a
+  file's text while comparing a projection of that text — and no projection of a
+  file is as fine as the file: where two revisions projected the same way, the
+  read served the new bytes while reporting that nothing had changed. The
+  projections collided on ordinary edits. A TOML table and an array of two
+  strings projected alike, as did a date and a two-element array, so
+  `config_analysis()` went on reporting the value the file used to hold. Key
+  order inside a nested object or inline table reached no projection at all, so
+  a dependency entry whose `name` and `version` keys swapped places left
+  `json_analysis()` and `config_analysis()` reporting the previous spelling. A
+  requirement whose trailing comment was reworded left `requirements_analysis()`
+  reporting the line as it read before the edit, against a source range measured
+  on the file as it is now. And a dist-info metadata header that is absent
+  projected the same as one present but empty, so adding or removing such a
+  header left `installed_packages_analysis()` and `resolve_import_name()`
+  reporting the distributions from before the edit — with a parse diagnostic
+  about a dist-info that now parses, or none about one that no longer does.
+  Every one of these reads compares the text it returns now. The collisions
+  above belong to four of them; the CSV, environment-file, XML,
+  module-resolution and schema reads carried the same comparison, and no answer
+  of theirs was observed to move under it. The parsed results below them absorb
+  the edits their own projection did not carry: they re-run and land equal
+  values, which the kernel backdates on the value itself under its own default
+  equality. A checkpoint saved before this change still loads and answers
+  correctly, but it no longer matches these reads or anything computed from
+  them — dropping a comparison policy moves a query's identity, and the
+  identities below it move with it — so the subgraphs below these reads execute
+  once, on the first request that asks for them, while the rest of the
+  checkpoint is warmed as before. No manifest bump was needed for this change.
+  The `calc` example and the correctness demo carried the same shape and were
+  repaired alongside them.
+- `csv_analysis()` returns an answer for a file whose sniffed dialect the
+  stdlib reader cannot use, instead of letting the failure escape the analysis.
+  A sniffed delimiter that is a line terminator is refused outright and the text
+  is read as comma-delimited; text the fallback dialect cannot read either comes
+  back as an empty table. Each step down is recorded as a `csv-dialect-error`
+  diagnostic, and the integration contract states them. What happened before
+  depended on which interpreter read the file: a file of quoted fields with
+  CRLF line endings escaped `csv_analysis()` as an error on one interpreter and
+  came back as two columns under a carriage-return delimiter on another.
+  Refusing the delimiter is the analysis's own decision rather than the stdlib
+  reader's, so the answer no longer depends on the interpreter version — that
+  file now reports one column, three rows, a comma delimiter and the
+  diagnostic. A file the sniffer reads normally is unaffected.
 
 ### Added
 
@@ -769,6 +818,14 @@ decided at release time.
   published work counts on the demo page and in the FAQ are brought up to date
   with the current build, and the text around them says which of the figures
   come from the recorded take and which do not.
+- TOML table and array nesting is accepted to 200 levels, the same limit JSON
+  carries. A document between 101 and 200 levels deep is analyzed instead of
+  being rejected with the `toml-decode-error` diagnostic that names the limit,
+  and the integration contract states the new number. TOML's cap was half of
+  JSON's because its comparison encoding spent two snapshot levels per table;
+  that encoding is gone, so what bounds the cap is the payload a document at it
+  caches — the budget JSON is already held to, which puts both at the same
+  number.
 
 ## [3.1.1] - 2026-08-03
 
