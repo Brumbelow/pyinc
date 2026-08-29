@@ -1266,11 +1266,12 @@ def _assert_entrypoints_match_fresh(
 # nothing else.
 #
 # The `!= warm` arm that would show the comparison is not vacuous is left out of
-# every checkpoint row in this section on purpose: these pools are formatting
-# classes, which analyse equal by construction, and sampling can draw the same
-# document twice, so `warm == fresh` holds and a `!=` arm goes red on a correct
-# tree. That arm lives in the hand-written rows that choose their own semantic
-# edit -- test_a_checkpoint_reload_answers_an_edit_made_after_the_save in
+# every checkpoint row in this section on purpose: each step's before/after pair
+# is two separate draws from the pool, so a sequence can repeat one document
+# or pair two members that analyse equal, and then the answer before the edit
+# equals the answer after it -- a `!=` arm goes red on a correct tree. That arm
+# lives in the hand-written rows that choose their own semantic edit --
+# test_a_checkpoint_reload_answers_an_edit_made_after_the_save in
 # tests/test_csv_data.py, tests/test_env_file.py, tests/test_xml_config.py,
 # tests/test_deep_module_resolution.py and tests/test_codegen.py.
 

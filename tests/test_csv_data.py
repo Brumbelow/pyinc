@@ -279,7 +279,7 @@ _PAYLOAD_QUERIES = ("csv_columns_payload", "csv_meta_payload", "csv_diagnostics_
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_a_reformat_recomputes_the_payloads_and_backdates_the_composition(
+def test_a_reformat_recomputes_the_payloads_and_leaves_the_composition_reused(
     mode: str, tmp_path: Path
 ) -> None:
     path = tmp_path / "data.csv"
@@ -304,7 +304,7 @@ def test_a_reformat_recomputes_the_payloads_and_backdates_the_composition(
             f"{name} did not re-run | executed {executed}"
         )
     assert not [label for label in executed if "csv_analysis_payload" in label], (
-        f"csv_analysis_payload re-ran instead of backdating | executed {executed}"
+        f"csv_analysis_payload re-ran instead of staying reused | executed {executed}"
     )
 
     # Absolute counts for the second read, not deltas: the read executes on the

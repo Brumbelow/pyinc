@@ -417,7 +417,7 @@ _PAYLOAD_QUERIES = ("json_sections_payload", "json_diagnostics_payload")
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_a_formatting_only_edit_recomputes_the_payloads_and_backdates_the_analysis(
+def test_a_formatting_only_edit_recomputes_the_payloads_and_leaves_the_analysis_reused(
     mode: str, tmp_path: Path
 ) -> None:
     path = tmp_path / "config.json"
@@ -442,7 +442,7 @@ def test_a_formatting_only_edit_recomputes_the_payloads_and_backdates_the_analys
             f"{name} did not re-run | executed {executed}"
         )
     assert not [label for label in executed if "json_analysis_payload" in label], (
-        f"json_analysis_payload re-ran instead of backdating | executed {executed}"
+        f"json_analysis_payload re-ran instead of staying reused | executed {executed}"
     )
 
     statistics = db.statistics()

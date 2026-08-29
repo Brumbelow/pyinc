@@ -32,9 +32,8 @@ Query graph (each layer is a kernel-cached node):
 
 A comment-only or whitespace-only edit re-reads ``calc_source`` and reparses it;
 the payload comes back equal, so ``parse_calc`` backdates and nothing that
-depends on it re-evaluates. The exception is a line the parser rejects: its
-diagnostic quotes the line verbatim, so whitespace inside such a line does change
-the payload.
+depends on it re-evaluates. The exception is a line the parser rejects and quotes
+verbatim in its diagnostic: whitespace inside such a line changes the payload.
 
 Regexes are inlined as string literals (not module-level ``re.Pattern``
 singletons) because the kernel walks query-reachable functions' captures and
@@ -117,7 +116,7 @@ def _parse_payload(source: str) -> _ParsePayload:
 
     Comments and blank lines are dropped and every line is stripped, so a
     comment-only or whitespace-only edit maps to an equal payload and
-    ``parse_calc`` backdates — except on a line the parser rejects, whose
+    ``parse_calc`` backdates — except on a line the parser rejects whose
     diagnostic quotes the line verbatim.
     """
     includes: list[str] = []

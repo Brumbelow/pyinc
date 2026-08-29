@@ -623,7 +623,7 @@ _PAYLOAD_QUERIES = ("xml_elements_payload", "xml_diagnostics_payload")
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_a_reformat_recomputes_the_payloads_and_backdates_the_composition(
+def test_a_reformat_recomputes_the_payloads_and_leaves_the_composition_reused(
     mode: str, tmp_path: Path
 ) -> None:
     path = tmp_path / "config.xml"

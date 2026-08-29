@@ -503,7 +503,7 @@ _PAYLOAD_QUERIES = (
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-def test_a_formatting_only_edit_recomputes_the_payloads_and_backdates_the_analysis(
+def test_a_formatting_only_edit_recomputes_the_payloads_and_leaves_the_analysis_reused(
     mode: str, tmp_path: Path
 ) -> None:
     path = tmp_path / "pyproject.toml"
@@ -528,7 +528,7 @@ def test_a_formatting_only_edit_recomputes_the_payloads_and_backdates_the_analys
             f"{name} did not re-run | executed {executed}"
         )
     assert not [label for label in executed if "config_analysis_payload" in label], (
-        f"config_analysis_payload re-ran instead of backdating | executed {executed}"
+        f"config_analysis_payload re-ran instead of staying reused | executed {executed}"
     )
 
     statistics = db.statistics()
@@ -858,7 +858,6 @@ def test_every_container_shape_analyses_cleanly_at_the_cap_and_reports_past_it(
             ):
                 for edited in (False, True):
                     case = f"{shape} {depth_label} edited={edited}"
-                    cases.append(case)
                     path.write_text(build(levels), encoding="utf-8")
                     db = Database(mode=mode)
                     try:
@@ -877,11 +876,12 @@ def test_every_container_shape_analyses_cleanly_at_the_cap_and_reports_past_it(
                             f"{case}: warm {len(warm.sections)} sections "
                             f"!= fresh {len(fresh.sections)}"
                         )
+                    cases.append(case)
 
     _in_a_deep_stacked_thread(_sweep)
 
-    assert len(cases) == 12, f"{cases}"
     assert anomalies == [], " | ".join(anomalies)
+    assert len(cases) == 12, f"{cases}"
 
 
 def test_every_mixed_container_shape_parses_at_the_cap() -> None:
