@@ -46,13 +46,14 @@ jobs:
         run: pytest -q -n auto --dist load --ignore=tests/test_properties.py
 
   test-properties:
-    name: Properties (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    name: Properties (${{ matrix.os }}, Python ${{ matrix.python-version }}, ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ['3.11', '3.12', '3.13', '3.14']
+        shard: [strict, checked, fast]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -68,7 +69,11 @@ jobs:
           python -m pip install -e '.[dev]'
 
       - name: Run property suite
-        run: pytest -q -n auto --dist load tests/test_properties.py
+        # Every case in the file is parametrized over the three modes and the
+        # mode is the last parameter in the identifier, so the closing bracket is
+        # what keeps a case whose own name reads "fast" out of the fast shard.
+        shell: bash
+        run: python -m pytest -q -n auto --dist load -k "${{ matrix.shard }}]" tests/test_properties.py
 
   quality:
     name: Static analysis and coverage
@@ -96,7 +101,9 @@ jobs:
         run: python scripts/check_docs.py
 
       - name: Measure branch coverage
-        run: pytest -n auto --dist load --cov=pyinc --cov=pyinc_codegen --cov=pyinc_tools --cov-branch --cov-report=term-missing --cov-fail-under=90
+        # The property suite has its own jobs, and the rest of the suite clears
+        # the coverage floor without it.
+        run: pytest -n auto --dist load --ignore=tests/test_properties.py --cov=pyinc --cov=pyinc_codegen --cov=pyinc_tools --cov-branch --cov-report=term-missing --cov-fail-under=90
 
   distribution:
     name: Build and validate installed artifacts
