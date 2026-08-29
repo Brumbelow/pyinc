@@ -10,7 +10,7 @@ no configuration added.
 The watcher analyzes the tree once, then re-analyzes when edited files settle.
 The stats pane shows both halves of that split: 109.08 s to analyze all 270
 files from cold, then 632 ms to bring the graph back up to date after one edit
-to `src/_pytest/warning_types.py` — 74 queries executed, 9,830 reused, and 52
+to `src/_pytest/warning_types.py` — 74 queries executed, 9,722 reused, and 52
 backdated because recomputing them produced a semantically equal result. The
 1,300 diagnostics are reported `undeclared-import` findings: imports of
 installed distributions that pytest's own dependency metadata does not

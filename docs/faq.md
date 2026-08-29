@@ -94,7 +94,7 @@ What is published:
 
 - The [demo](demo.md) numbers — a 270-file pytest checkout analyzed in 109.08 s
   from cold, then re-analyzed in 632 ms after a single-file edit, executing 74
-  queries and reusing 9,830. The timings are one recorded run on one machine;
+  queries and reusing 9,722. The timings are one recorded run on one machine;
   the counts were measured separately against the current build. The demo page
   states the full provenance.
 - The [benchmark and correctness harness](../bench/README.md), which runs a
