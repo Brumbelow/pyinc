@@ -4,6 +4,7 @@ import json
 import math
 import site
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -12,6 +13,8 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+import pyinc.integrations.deep_module_resolution as deep_module_resolution
+import pyinc.integrations.installed_packages as installed_packages
 from pyinc import (
     Database,
     FileResource,
@@ -23,6 +26,21 @@ from pyinc import (
     semantic_equal,
 )
 from pyinc.integrations import SourcePosition
+from pyinc.integrations.csv_data import csv_analysis, workspace_csv_analysis
+from pyinc.integrations.deep_module_resolution import (
+    deep_module_resolution_analysis,
+    resolve_module_path,
+)
+from pyinc.integrations.dependency_check import (
+    dependency_check_analysis,
+    workspace_dependency_check,
+)
+from pyinc.integrations.env_file import env_analysis, workspace_env_analysis
+from pyinc.integrations.installed_packages import (
+    installed_packages_analysis,
+    resolve_import_name,
+)
+from pyinc.integrations.json_config import json_analysis, workspace_json_analysis
 from pyinc.integrations.notebook import (
     NotebookAnalysis,
     notebook_analysis,
@@ -37,8 +55,20 @@ from pyinc.integrations.python_source import (
     module_analysis,
     workspace_analysis,
 )
+from pyinc.integrations.requirement_evaluation import (
+    applicable_requirements,
+    workspace_applicable_requirements,
+)
+from pyinc.integrations.requirements_txt import (
+    deep_requirements_analysis,
+    requirements_analysis,
+    workspace_requirements_analysis,
+)
 from pyinc.integrations.scope_resolution import scope_tree, symbol_at
 from pyinc.integrations.symbol_resolution import class_model, find_references, module_symbol_table
+from pyinc.integrations.toml_config import config_analysis, workspace_config_analysis
+from pyinc.integrations.xml_config import workspace_xml_analysis, xml_analysis
+from pyinc_codegen import generate, schema_analysis
 
 Operation = tuple[str, object]
 WorkspaceState = tuple[str, str, bool]
@@ -674,8 +704,9 @@ def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
 #
 # One property, four shapes of it: for every generated edit sequence, in every
 # mode, and across a checkpoint round trip, a public entrypoint answers a warm
-# database exactly as it answers a fresh one. The rows below carry the two
-# source-file integrations; the same shape extends to the rest of them.
+# database exactly as it answers a fresh one. The two source-file integrations
+# come first; the section below this one carries the same pair of shapes for
+# each of the remaining nine.
 #
 # The document pools are hand-written corpora sampled from, never generated
 # text. Every projection in these integrations degenerates to a raw-text escape
@@ -1160,4 +1191,1030 @@ def test_notebook_checkpoint_reload_matches_fresh(mode: str, documents: list[str
             assert warm_workspace == fresh_workspace, (
                 f"workspace_notebook_analysis reloaded!=fresh | mode={mode} | "
                 f"{before!r} -> {after!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Configuration, environment and packaging entrypoints against a fresh read
+# ---------------------------------------------------------------------------
+#
+# The same property as the two source-file sections above, one live row and one
+# checkpoint row per integration. Every row drives public entrypoints and never
+# a payload leaf, and every row leaves the raw-text read out of the comparison:
+# raw text always differs when the bytes do, so including it would degenerate
+# the property into "the file changed".
+#
+# mode is a pytest parametrize on every row; max_query_nodes deliberately is
+# not, for the reason recorded above the python_source row -- a two-node cap
+# over a real integration closure evicts the graph and makes warm == fresh true
+# for the wrong reason.
+#
+# The document pools are hand-written corpora sampled from, never generated
+# text, and each pool carries the shapes a projection of the file could collapse:
+# reordered inline tables and objects for TOML and JSON, the
+# continuation-backslash pair and an editable install with an inline comment for
+# requirements, an absent header against an empty one for distribution metadata,
+# and the quoting, comment and whitespace classes for the rest. A pool with no
+# such shape in it makes its row vacuous.
+
+_EntrypointGroup = Callable[[Database, str, str], dict[str, object]]
+
+
+def _sampled_documents(documents: tuple[str, ...]) -> st.SearchStrategy[list[str]]:
+    # min_size=2 so every example writes the file at least twice; max_size=4
+    # because the sequence length, not the pool size, is what each row's cost
+    # scales with -- one extra fresh Database per step.
+    return st.lists(st.sampled_from(documents), min_size=2, max_size=4)
+
+
+def _assert_entrypoints_match_fresh(
+    *,
+    filename: str,
+    entrypoints: _EntrypointGroup,
+    mode: str,
+    documents: list[str],
+) -> None:
+    """Walk the pool, comparing every entrypoint against a database with no history.
+
+    One file at a workspace root, under the name workspace discovery looks for,
+    so the path-taking and the root-taking entrypoints both have something to
+    answer about.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "workspace"
+        root.mkdir()
+        path = root / filename
+        incremental = Database(mode=mode)
+
+        for step, content in enumerate(documents):
+            previous = documents[step - 1] if step else None
+            path.write_text(content, encoding="utf-8")
+            warm = entrypoints(incremental, str(root), str(path))
+            fresh = entrypoints(Database(mode=mode), str(root), str(path))
+            for name in warm:
+                # One line, discriminator first: these node ids are long enough
+                # to fill the summary line on their own under the repo's own
+                # `--tb=no`. Read a failure with `-o addopts="" --tb=long`.
+                assert warm[name] == fresh[name], (
+                    f"{name} warm!=fresh | mode={mode} | step={step} | "
+                    f"{previous!r} -> {content!r}"
+                )
+
+
+# The checkpoint rows come in two orderings and the difference is the whole
+# point of each. Both compare a reloaded database against a fresh one and assert
+# nothing else.
+#
+# The `!= warm` arm that would show the comparison is not vacuous is left out of
+# every checkpoint row in this section on purpose: these pools are formatting
+# classes, which analyse equal by construction, and sampling can draw the same
+# document twice, so `warm == fresh` holds and a `!=` arm goes red on a correct
+# tree. That arm lives in the hand-written rows that choose their own semantic
+# edit -- test_a_checkpoint_reload_answers_an_edit_made_after_the_save in
+# tests/test_csv_data.py, tests/test_env_file.py, tests/test_xml_config.py,
+# tests/test_deep_module_resolution.py and tests/test_codegen.py.
+
+
+def _assert_reload_after_an_edit_before_the_save_matches_fresh(
+    *,
+    filename: str,
+    entrypoints: _EntrypointGroup,
+    mode: str,
+    documents: list[str],
+) -> None:
+    """Save a database that has already answered across the edit, then reload it.
+
+    The edit lands BEFORE the save and the entrypoints are re-driven after it,
+    so what gets written is the state the database reached by answering on the
+    new bytes. Saving first and editing afterwards reproduces nothing: on reload
+    the resource probe mismatches, the read executes on the new bytes, and there
+    is no earlier answer left to serve from -- a row that cannot fail.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "workspace"
+        root.mkdir()
+        path = root / filename
+
+        for before, after in zip(documents, documents[1:], strict=False):
+            path.write_text(before, encoding="utf-8")
+            store = InMemoryArtifactStore()
+            saver = Database(mode=mode, store=store)
+            entrypoints(saver, str(root), str(path))
+
+            path.write_text(after, encoding="utf-8")
+            entrypoints(saver, str(root), str(path))
+            key = saver.save_checkpoint()
+
+            reloaded = Database(mode=mode, store=store)
+            reloaded.load_checkpoint(key)
+            warm = entrypoints(reloaded, str(root), str(path))
+            fresh = entrypoints(Database(mode=mode), str(root), str(path))
+            for name in warm:
+                assert warm[name] == fresh[name], (
+                    f"{name} reloaded!=fresh | mode={mode} | {before!r} -> {after!r}"
+                )
+
+
+def _assert_reload_after_an_edit_after_the_save_matches_fresh(
+    *,
+    filename: str,
+    entrypoints: _EntrypointGroup,
+    mode: str,
+    documents: list[str],
+) -> None:
+    """Edit after the save, and the reload has to notice.
+
+    This is the substitute ordering for the reads that hand back the text they
+    compared: no answer they hold can disagree with the file, so a database
+    saved mid-edit carries nothing stale and the ordering above cannot be built
+    at all. It is the standard for those sites, recorded here so a later reader
+    does not "fix" one of these rows into an ordering that measures nothing.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "workspace"
+        root.mkdir()
+        path = root / filename
+
+        for before, after in zip(documents, documents[1:], strict=False):
+            path.write_text(before, encoding="utf-8")
+            store = InMemoryArtifactStore()
+            saver = Database(mode=mode, store=store)
+            entrypoints(saver, str(root), str(path))
+            key = saver.save_checkpoint()
+
+            path.write_text(after, encoding="utf-8")
+
+            reloaded = Database(mode=mode, store=store)
+            reloaded.load_checkpoint(key)
+            warm = entrypoints(reloaded, str(root), str(path))
+            fresh = entrypoints(Database(mode=mode), str(root), str(path))
+            for name in warm:
+                assert warm[name] == fresh[name], (
+                    f"{name} reloaded!=fresh | mode={mode} | {before!r} -> {after!r}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# CSV
+
+# Quoting classes carrying the same table, a separator and a quote character
+# living inside a quoted field, a ragged row that produces a diagnostic, and a
+# file whose delimiter is not a comma at all.
+_CSV_DOCUMENTS = (
+    "name,age\nAlice,30\nBob,25\n",
+    '"name","age"\n"Alice","30"\n"Bob","25"\n',
+    '"name","age"\n"Alice","30"\n"Bob","25"\n\n',
+    'name,"age"\n"Alice",30\nBob,"25"\n',
+    'name,age\n"Doe, Alice",30\nBob,25\n',
+    'name,age\n"Alice ""A""",30\nBob,25\n',
+    "name,age\nAlice,30\nBob\n",
+    "name;age\nAlice;30\nBob;25\n",
+)
+
+
+def _csv_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    return {
+        "csv_analysis": csv_analysis(db, path),
+        "workspace_csv_analysis": workspace_csv_analysis(db, root),
+    }
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=30, deadline=None)
+@given(documents=_sampled_documents(_CSV_DOCUMENTS))
+def test_csv_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
+    _assert_entrypoints_match_fresh(
+        filename="data.csv", entrypoints=_csv_entrypoints, mode=mode, documents=documents
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=30, deadline=None)
+@given(documents=_sampled_documents(_CSV_DOCUMENTS))
+def test_csv_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
+    _assert_reload_after_an_edit_after_the_save_matches_fresh(
+        filename="data.csv", entrypoints=_csv_entrypoints, mode=mode, documents=documents
+    )
+
+
+# ---------------------------------------------------------------------------
+# Environment files
+
+# Whole-line comments of two different lengths, both quote styles and none, an
+# export prefix, an inline comment, blank lines that move every range below
+# them, and a line the parser rejects.
+_ENV_DOCUMENTS = (
+    "# aaa\nKEY=value\nOTHER='x'\n",
+    "# a much longer comment body\nKEY=value\nOTHER='x'\n",
+    '# aaa\nKEY=value\nOTHER="x"\n',
+    "# aaa\nKEY=value\nOTHER=x\n",
+    "# aaa\nexport KEY=value\nOTHER='x'\n",
+    "# aaa\nKEY=value  # the key\nOTHER='x'\n",
+    "# aaa\n\nKEY=value\n\nOTHER='x'\n",
+    "# aaa\nKEY=value\nnot an assignment\nOTHER='x'\n",
+)
+
+
+def _env_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    return {
+        "env_analysis": env_analysis(db, path),
+        "workspace_env_analysis": workspace_env_analysis(db, root),
+    }
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=30, deadline=None)
+@given(documents=_sampled_documents(_ENV_DOCUMENTS))
+def test_env_file_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
+    _assert_entrypoints_match_fresh(
+        filename=".env", entrypoints=_env_entrypoints, mode=mode, documents=documents
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=30, deadline=None)
+@given(documents=_sampled_documents(_ENV_DOCUMENTS))
+def test_env_file_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
+    _assert_reload_after_an_edit_after_the_save_matches_fresh(
+        filename=".env", entrypoints=_env_entrypoints, mode=mode, documents=documents
+    )
+
+
+# ---------------------------------------------------------------------------
+# JSON
+
+# The first two are the discriminating pair: the same object with its keys in a
+# different order, which a canonicalizing projection of the document maps onto
+# one value while the reported section strings differ. The rest are that shape
+# reformatted, the pair repeated one and two containers down, a scalar spread,
+# and a document the parser rejects.
+_JSON_DOCUMENTS = (
+    '{"deps": [{"name": "a", "version": "1"}]}',
+    '{"deps": [{"version": "1", "name": "a"}]}',
+    '{\n  "deps": [\n    { "name": "a", "version": "1" }\n  ]\n}\n',
+    '{"a": [{"x": 1, "y": 2}]}',
+    '{"a": [{"y": 2, "x": 1}]}',
+    '{"a": [[{"x": 1, "y": 2}]]}',
+    '{"n": 1, "s": "t", "b": true, "z": null}',
+    '{"a": [1, 2',
+)
+
+
+def _json_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    return {
+        "json_analysis": json_analysis(db, path),
+        "workspace_json_analysis": workspace_json_analysis(db, root),
+    }
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=30, deadline=None)
+@given(documents=_sampled_documents(_JSON_DOCUMENTS))
+def test_json_config_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
+    _assert_entrypoints_match_fresh(
+        filename="package.json", entrypoints=_json_entrypoints, mode=mode, documents=documents
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=30, deadline=None)
+@given(documents=_sampled_documents(_JSON_DOCUMENTS))
+def test_json_config_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
+    _assert_reload_after_an_edit_before_the_save_matches_fresh(
+        filename="package.json", entrypoints=_json_entrypoints, mode=mode, documents=documents
+    )
+
+
+# ---------------------------------------------------------------------------
+# TOML
+
+# The first two are the inline-table reorder pair, the third and fourth the same
+# pair written as an array of tables. Then a table against the array carrying
+# the same names, one of the date-like scalars the public value type folds
+# together against an array that spells it out, a project table with
+# dependencies, and a document the parser rejects.
+_TOML_DOCUMENTS = (
+    "x = [{b = 1, a = 2}]\n",
+    "x = [{a = 2, b = 1}]\n",
+    "[[array.of.tables]]\nb = 1\na = 2\n",
+    "[[array.of.tables]]\na = 2\nb = 1\n",
+    '[x]\na = "b"\n',
+    'x = [["a", "b"]]\n',
+    "x = 1979-05-27T07:32:00\n",
+    'x = ["datetime", "1979-05-27T07:32:00"]\n',
+    '[project]\nname = "demo"\ndependencies = ["requests>=2.0"]\n',
+    "[x\n",
+)
+
+
+def _toml_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    return {
+        "config_analysis": config_analysis(db, path),
+        "workspace_config_analysis": workspace_config_analysis(db, root),
+    }
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=30, deadline=None)
+@given(documents=_sampled_documents(_TOML_DOCUMENTS))
+def test_toml_config_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
+    _assert_entrypoints_match_fresh(
+        filename="pyproject.toml", entrypoints=_toml_entrypoints, mode=mode, documents=documents
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=30, deadline=None)
+@given(documents=_sampled_documents(_TOML_DOCUMENTS))
+def test_toml_config_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
+    _assert_reload_after_an_edit_before_the_save_matches_fresh(
+        filename="pyproject.toml", entrypoints=_toml_entrypoints, mode=mode, documents=documents
+    )
+
+
+# ---------------------------------------------------------------------------
+# XML
+
+# The same element tree flat and indented, its attributes in both orders, a
+# comment inserted between siblings, a declaration prologue, one more level of
+# nesting, and a document that never closes its element.
+_XML_DOCUMENTS = (
+    '<root><child a="1">t</child></root>',
+    '<root>\n  <child a="1">t</child>\n</root>\n',
+    '<root><child a="1" b="2">t</child></root>',
+    '<root><child b="2" a="1">t</child></root>',
+    '<root><!-- note --><child a="1">t</child></root>',
+    '<?xml version="1.0" encoding="UTF-8"?>\n<root><child a="1">t</child></root>',
+    '<root><child a="1"><grand>t</grand></child></root>',
+    "<root><unclosed>",
+)
+
+
+def _xml_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    return {
+        "xml_analysis": xml_analysis(db, path),
+        "workspace_xml_analysis": workspace_xml_analysis(db, root),
+    }
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=30, deadline=None)
+@given(documents=_sampled_documents(_XML_DOCUMENTS))
+def test_xml_config_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
+    _assert_entrypoints_match_fresh(
+        filename="pom.xml", entrypoints=_xml_entrypoints, mode=mode, documents=documents
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=30, deadline=None)
+@given(documents=_sampled_documents(_XML_DOCUMENTS))
+def test_xml_config_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
+    _assert_reload_after_an_edit_after_the_save_matches_fresh(
+        filename="pom.xml", entrypoints=_xml_entrypoints, mode=mode, documents=documents
+    )
+
+
+# ---------------------------------------------------------------------------
+# Requirements
+
+# Every line kind whose public output is built from text a line-normalizing
+# projection throws away, varied one at a time: inline comments on a
+# requirement, on an index directive, on an editable install and on a line the
+# parser rejects; an indent; trailing whitespace; and the pair that matters
+# most -- a continuation backslash at the end of a line against the same
+# backslash with one space after it, which stops it continuing the line at all.
+_REQUIREMENTS_DOCUMENTS = (
+    "--index-url https://example.com/simple  # primary\n"
+    "requests>=2.0  # http client\n"
+    "-e ./pkg  # local\n"
+    "this is not a requirement  # junk\n"
+    "flask \\\n==2.0\n",
+    "--index-url https://example.com/simple  # primary\n"
+    "requests>=2.0  # the http client we use\n"
+    "-e ./pkg  # local\n"
+    "this is not a requirement  # junk\n"
+    "flask \\\n==2.0\n",
+    "--index-url https://example.com/simple  # the primary index\n"
+    "requests>=2.0  # http client\n"
+    "-e ./pkg  # local\n"
+    "this is not a requirement  # junk\n"
+    "flask \\\n==2.0\n",
+    "--index-url https://example.com/simple  # primary\n"
+    "requests>=2.0  # http client\n"
+    "-e ./pkg  # the local package\n"
+    "this is not a requirement  # junk\n"
+    "flask \\\n==2.0\n",
+    "--index-url https://example.com/simple  # primary\n"
+    "requests>=2.0  # http client\n"
+    "-e ./pkg  # local\n"
+    "this is not a requirement  # not a requirement at all\n"
+    "flask \\\n==2.0\n",
+    "--index-url https://example.com/simple  # primary\n"
+    "    requests>=2.0  # http client\n"
+    "-e ./pkg  # local\n"
+    "this is not a requirement  # junk\n"
+    "flask \\\n==2.0\n",
+    "--index-url https://example.com/simple  # primary\n"
+    "requests>=2.0  # http client\n"
+    "-e ./pkg  # local   \n"
+    "this is not a requirement  # junk\n"
+    "flask \\\n==2.0\n",
+    "--index-url https://example.com/simple  # primary\n"
+    "requests>=2.0  # http client\n"
+    "-e ./pkg  # local\n"
+    "this is not a requirement  # junk\n"
+    "flask \\ \n==2.0\n",
+)
+
+
+# All five documented entrypoints are driven, in two rows rather than one. One
+# row over all five measured past this file's per-cell budget, and the budget is
+# what the CI job that runs this file alone exists to hold; splitting by
+# entrypoint group is the only reduction taken, and the pool, the mode
+# parametrize and the example count are untouched by it.
+#
+# The boundary is the one the two groups already draw, not an arbitrary cut:
+# only the three reporting surfaces move on the comment, index-directive and
+# diagnostic classes at all. The two evaluation surfaces move on the
+# editable-install name and on the continuation-backslash pair and nowhere else,
+# so several of their cells agree for reasons that have nothing to do with the
+# property -- uninformative by construction rather than by accident.
+
+
+def _requirements_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    return {
+        "requirements_analysis": requirements_analysis(db, path),
+        "deep_requirements_analysis": deep_requirements_analysis(db, path),
+        "workspace_requirements_analysis": workspace_requirements_analysis(db, root),
+    }
+
+
+def _requirements_evaluation_entrypoints(
+    db: Database, root: str, path: str
+) -> dict[str, object]:
+    return {
+        "applicable_requirements": applicable_requirements(db, path),
+        "workspace_applicable_requirements": workspace_applicable_requirements(db, root),
+    }
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_REQUIREMENTS_DOCUMENTS))
+def test_requirements_entrypoints_match_fresh_recomputation(
+    mode: str, documents: list[str]
+) -> None:
+    _assert_entrypoints_match_fresh(
+        filename="requirements.txt",
+        entrypoints=_requirements_entrypoints,
+        mode=mode,
+        documents=documents,
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_REQUIREMENTS_DOCUMENTS))
+def test_requirements_evaluation_entrypoints_match_fresh_recomputation(
+    mode: str, documents: list[str]
+) -> None:
+    _assert_entrypoints_match_fresh(
+        filename="requirements.txt",
+        entrypoints=_requirements_evaluation_entrypoints,
+        mode=mode,
+        documents=documents,
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_REQUIREMENTS_DOCUMENTS))
+def test_requirements_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
+    _assert_reload_after_an_edit_before_the_save_matches_fresh(
+        filename="requirements.txt",
+        entrypoints=_requirements_entrypoints,
+        mode=mode,
+        documents=documents,
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_REQUIREMENTS_DOCUMENTS))
+def test_requirements_evaluation_checkpoint_reload_matches_fresh(
+    mode: str, documents: list[str]
+) -> None:
+    _assert_reload_after_an_edit_before_the_save_matches_fresh(
+        filename="requirements.txt",
+        entrypoints=_requirements_evaluation_entrypoints,
+        mode=mode,
+        documents=documents,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Path-configuration files
+
+# A directory named, the same line commented out, the name with a comment beside
+# it, the name surrounded by blank lines and by spaces, a directory that does
+# not exist, both together, and an executable line.
+_PTH_DOCUMENTS = (
+    "extra\n",
+    "# extra\n",
+    "extra\n# a note\n",
+    "\nextra\n\n",
+    "   extra   \n",
+    "missing\n",
+    "extra\nmissing\n",
+    "import os\nextra\n",
+)
+
+_PTH_MODULE = "import extra_pkg\n\n\ndef helper() -> int:\n    return 1\n"
+
+
+def _build_pth_workspace(tmpdir: str) -> tuple[Path, Path, Path, Path]:
+    """A search-path root holding one .pth file, the directory it can add, and a module."""
+    base = Path(tmpdir)
+    search_root = base / "site"
+    search_root.mkdir()
+    package = search_root / "extra" / "extra_pkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    workspace = base / "workspace"
+    workspace.mkdir()
+    module = workspace / "sample.py"
+    module.write_text(_PTH_MODULE, encoding="utf-8")
+    return search_root, search_root / "paths.pth", workspace, module
+
+
+# The two entrypoints this integration publishes, and module_analysis as the one
+# cross-integration consumer: the import resolution it reports is enriched from
+# the effective search path, so a .pth read answered from a coarser comparison
+# surfaces there and nowhere cheaper.
+#
+# They are driven in two rows rather than one for the reason recorded above the
+# requirements rows: one row over all of them measured past this file's per-cell
+# budget, and the group boundary is where the cost is -- module_analysis drags
+# the whole python-source closure into every step, and the other two do not.
+# Nothing else about the rows is reduced.
+#
+# Left out on purpose, and none of them for lack of a connection: file_analysis
+# and directory_analysis never resolve an import against the search path at all,
+# and workspace_analysis, module_symbol_table, class_model, find_references and
+# symbol_at reach it only through the same resolution module_analysis already
+# drives, at several times the cost per step -- the python_source row above pays
+# that closure once.
+
+
+def _pth_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    del root, path
+    return {
+        "deep_module_resolution_analysis": deep_module_resolution_analysis(db),
+        "resolve_module_path[extra_pkg]": resolve_module_path(db, "extra_pkg"),
+        "resolve_module_path[missing_pkg]": resolve_module_path(db, "missing_pkg"),
+    }
+
+
+def _pth_consumer_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    return {"module_analysis": module_analysis(db, root, path)}
+
+
+def _walk_the_pth_pool_against_fresh(
+    mode: str, documents: list[str], entrypoints: _EntrypointGroup
+) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        search_root, pth_path, workspace, module = _build_pth_workspace(tmpdir)
+        # Discovery is patched with a context manager rather than the
+        # monkeypatch fixture, which Hypothesis refuses under @given, and the
+        # replacement is written in this module: the kernel pins the source of
+        # the query that reads it and will not accept a global it cannot place.
+        # Installed-distribution discovery is emptied for the reason the
+        # python_source row gives -- without it every fresh Database re-reads
+        # every METADATA file in the development environment.
+        with (
+            patch.object(
+                deep_module_resolution, "_get_sys_path_entries", lambda: (str(search_root),)
+            ),
+            patch.object(site, "getsitepackages", return_value=[]),
+            patch.object(site, "getusersitepackages", return_value=""),
+        ):
+            incremental = Database(mode=mode)
+
+            for step, content in enumerate(documents):
+                previous = documents[step - 1] if step else None
+                pth_path.write_text(content, encoding="utf-8")
+                warm = entrypoints(incremental, str(workspace), str(module))
+                fresh = entrypoints(Database(mode=mode), str(workspace), str(module))
+                for name in warm:
+                    assert warm[name] == fresh[name], (
+                        f"{name} warm!=fresh | mode={mode} | step={step} | "
+                        f"{previous!r} -> {content!r}"
+                    )
+
+
+def _reload_the_pth_pool_against_fresh(
+    mode: str, documents: list[str], entrypoints: _EntrypointGroup
+) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        search_root, pth_path, workspace, module = _build_pth_workspace(tmpdir)
+        with (
+            patch.object(
+                deep_module_resolution, "_get_sys_path_entries", lambda: (str(search_root),)
+            ),
+            patch.object(site, "getsitepackages", return_value=[]),
+            patch.object(site, "getusersitepackages", return_value=""),
+        ):
+            # Edited after the save, for the reason set out above the two
+            # orderings: this read hands back the text it compared, so a
+            # database saved in the middle of an edit holds nothing stale.
+            for before, after in zip(documents, documents[1:], strict=False):
+                pth_path.write_text(before, encoding="utf-8")
+                store = InMemoryArtifactStore()
+                saver = Database(mode=mode, store=store)
+                entrypoints(saver, str(workspace), str(module))
+                key = saver.save_checkpoint()
+
+                pth_path.write_text(after, encoding="utf-8")
+
+                reloaded = Database(mode=mode, store=store)
+                reloaded.load_checkpoint(key)
+                warm = entrypoints(reloaded, str(workspace), str(module))
+                fresh = entrypoints(Database(mode=mode), str(workspace), str(module))
+                for name in warm:
+                    assert warm[name] == fresh[name], (
+                        f"{name} reloaded!=fresh | mode={mode} | {before!r} -> {after!r}"
+                    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_PTH_DOCUMENTS))
+def test_pth_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
+    _walk_the_pth_pool_against_fresh(mode, documents, _pth_entrypoints)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_PTH_DOCUMENTS))
+def test_pth_import_resolution_matches_fresh_recomputation(
+    mode: str, documents: list[str]
+) -> None:
+    _walk_the_pth_pool_against_fresh(mode, documents, _pth_consumer_entrypoints)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_PTH_DOCUMENTS))
+def test_pth_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
+    _reload_the_pth_pool_against_fresh(mode, documents, _pth_entrypoints)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_PTH_DOCUMENTS))
+def test_pth_import_resolution_checkpoint_reload_matches_fresh(
+    mode: str, documents: list[str]
+) -> None:
+    _reload_the_pth_pool_against_fresh(mode, documents, _pth_consumer_entrypoints)
+
+
+# ---------------------------------------------------------------------------
+# Installed distribution metadata
+
+
+def _metadata_document(name: str | None, version: str | None) -> str:
+    """A METADATA document, omitting a header entirely when its value is None."""
+    lines = ["Metadata-Version: 2.1"]
+    for field, value in (("Name", name), ("Version", version)):
+        if value is not None:
+            # An empty value writes "Name:", not "Name: " -- a header left empty
+            # carries nothing after the colon.
+            lines.append(f"{field}: {value}".rstrip())
+    lines.append("Summary: s")
+    return "\n".join(lines) + "\n"
+
+
+# A METADATA header has three states, not two: absent, present-and-empty, and
+# present-with-a-value. The package layer branches on the difference between the
+# first two -- an absent Name is a distribution it cannot describe, an empty one
+# is a distribution whose name is the empty string -- so the absent/empty pair is
+# exactly what a comparison that fills a missing field in with '' cannot see. It
+# is in this pool for both headers, and for both together.
+_METADATA_DOCUMENTS = (
+    _metadata_document(None, "1.0"),
+    _metadata_document("", "1.0"),
+    _metadata_document("example", "1.0"),
+    _metadata_document("example", None),
+    _metadata_document("example", ""),
+    _metadata_document("example", "2.0"),
+    _metadata_document(None, None),
+    _metadata_document("", ""),
+)
+
+_METADATA_MODULE = "import example\n\n\ndef helper() -> int:\n    return 1\n"
+
+_DECLARED_DEPENDENCIES = ("example", "absent-package")
+
+
+def _build_metadata_workspace(tmpdir: str) -> tuple[Path, Path, Path, Path]:
+    """A site-packages holding one dist-info, and a workspace importing its name."""
+    base = Path(tmpdir)
+    site_dir = base / "site-packages"
+    dist_info = site_dir / "example-1.0.dist-info"
+    dist_info.mkdir(parents=True)
+    # A top_level.txt keeps the import name fixed across the pool, so the
+    # resolution surface moves only when the distribution itself moves.
+    (dist_info / "top_level.txt").write_text("example\n", encoding="utf-8")
+    workspace = base / "workspace"
+    workspace.mkdir()
+    module = workspace / "sample.py"
+    module.write_text(_METADATA_MODULE, encoding="utf-8")
+    return site_dir, dist_info / "METADATA", workspace, module
+
+
+# Four of the twelve entrypoints this metadata read reaches. The other eight are
+# left out with reasons rather than by omission: module_analysis,
+# workspace_analysis, class_model, find_references and symbol_at reach it through
+# python-source import enrichment, which the python_source row above already pays
+# for; resolve_module_path is driven by the path-configuration rows above; and
+# applicable_requirements and workspace_applicable_requirements are driven by the
+# requirements rows.
+#
+# The two dependency-checking surfaces are not optional. They are how the
+# installed environment reaches a workspace's declared dependencies, so a
+# metadata read answered from a coarser comparison travels past this module
+# through them. What they cannot see, measured rather than assumed, is this
+# pool's absent-versus-empty transition: a distribution with no Name is not
+# listed and a distribution whose Name is empty is listed under the empty
+# string, and neither state answers to a declared dependency by name -- not even
+# to the empty name. They stay in the set because they carry every other way
+# this read can go wrong into a workspace, not because they discriminate here.
+#
+# All four are driven by both shapes. The live row drives them together, which
+# measured inside this file's per-cell budget; the checkpoint shape, which pays
+# for three databases per pair rather than two, did not, so it drives them in
+# three rows -- this integration's own surfaces, then the declared-dependency
+# check, then the workspace check that walks a tree on top of it. Splitting is
+# the only reduction taken: the pool, the mode parametrize and the example count
+# are the same in every one of them, and no entrypoint is dropped.
+
+
+def _metadata_own_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    # Neither the root nor the module path is needed for these two, and neither
+    # is compared: each is the same string in both arms by construction, which
+    # is exactly the kind of cell that passes while measuring nothing.
+    del root, path
+    analysis = installed_packages_analysis(db)
+    return {
+        "installed_packages_analysis packages": analysis.packages,
+        # Split from the packages tuple so a failure prints the diagnostics
+        # instead of truncating inside the package listing.
+        "installed_packages_analysis diagnostics": analysis.diagnostics,
+        "resolve_import_name": resolve_import_name(db, "example"),
+    }
+
+
+def _dependency_check_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    del root, path
+    return {"dependency_check_analysis": dependency_check_analysis(db, _DECLARED_DEPENDENCIES)}
+
+
+def _workspace_dependency_check_entrypoints(
+    db: Database, root: str, path: str
+) -> dict[str, object]:
+    del path
+    return {
+        "workspace_dependency_check": workspace_dependency_check(db, root, _DECLARED_DEPENDENCIES)
+    }
+
+
+def _metadata_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
+    return {
+        **_metadata_own_entrypoints(db, root, path),
+        **_dependency_check_entrypoints(db, root, path),
+        **_workspace_dependency_check_entrypoints(db, root, path),
+    }
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_METADATA_DOCUMENTS))
+def test_installed_packages_entrypoints_match_fresh_recomputation(
+    mode: str, documents: list[str]
+) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        site_dir, metadata, workspace, module = _build_metadata_workspace(tmpdir)
+        with (
+            patch.object(installed_packages, "_get_site_packages_dirs", lambda: (str(site_dir),)),
+            patch.object(deep_module_resolution, "_get_sys_path_entries", lambda: (str(site_dir),)),
+        ):
+            incremental = Database(mode=mode)
+
+            for step, content in enumerate(documents):
+                previous = documents[step - 1] if step else None
+                metadata.write_text(content, encoding="utf-8")
+                warm = _metadata_entrypoints(incremental, str(workspace), str(module))
+                fresh = _metadata_entrypoints(Database(mode=mode), str(workspace), str(module))
+                for name in warm:
+                    assert warm[name] == fresh[name], (
+                        f"{name} warm!=fresh | mode={mode} | step={step} | "
+                        f"{previous!r} -> {content!r}"
+                    )
+
+
+def _reload_the_metadata_pool_against_fresh(
+    mode: str, documents: list[str], entrypoints: _EntrypointGroup
+) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        site_dir, metadata, workspace, module = _build_metadata_workspace(tmpdir)
+        with (
+            patch.object(installed_packages, "_get_site_packages_dirs", lambda: (str(site_dir),)),
+            patch.object(deep_module_resolution, "_get_sys_path_entries", lambda: (str(site_dir),)),
+        ):
+            for before, after in zip(documents, documents[1:], strict=False):
+                metadata.write_text(before, encoding="utf-8")
+                store = InMemoryArtifactStore()
+                saver = Database(mode=mode, store=store)
+                entrypoints(saver, str(workspace), str(module))
+
+                # Edited before the save and the surfaces re-driven after it:
+                # this read can hold an answer that disagrees with the file, and
+                # the ordering is what puts one into the checkpoint.
+                metadata.write_text(after, encoding="utf-8")
+                entrypoints(saver, str(workspace), str(module))
+                key = saver.save_checkpoint()
+
+                reloaded = Database(mode=mode, store=store)
+                reloaded.load_checkpoint(key)
+                warm = entrypoints(reloaded, str(workspace), str(module))
+                fresh = entrypoints(Database(mode=mode), str(workspace), str(module))
+                for name in warm:
+                    assert warm[name] == fresh[name], (
+                        f"{name} reloaded!=fresh | mode={mode} | {before!r} -> {after!r}"
+                    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_METADATA_DOCUMENTS))
+def test_installed_packages_checkpoint_reload_matches_fresh(
+    mode: str, documents: list[str]
+) -> None:
+    _reload_the_metadata_pool_against_fresh(mode, documents, _metadata_own_entrypoints)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_METADATA_DOCUMENTS))
+def test_dependency_check_checkpoint_reload_matches_fresh(
+    mode: str, documents: list[str]
+) -> None:
+    _reload_the_metadata_pool_against_fresh(mode, documents, _dependency_check_entrypoints)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_METADATA_DOCUMENTS))
+def test_workspace_dependency_check_checkpoint_reload_matches_fresh(
+    mode: str, documents: list[str]
+) -> None:
+    _reload_the_metadata_pool_against_fresh(
+        mode, documents, _workspace_dependency_check_entrypoints
+    )
+
+
+# ---------------------------------------------------------------------------
+# Code-generation schemas
+
+
+def _schema_text(definitions: dict[str, Any], **dumps_kwargs: Any) -> str:
+    return json.dumps({"$defs": definitions}, **dumps_kwargs)
+
+
+_SCHEMA_A: dict[str, Any] = {
+    "type": "object",
+    "properties": {"y": {"type": "string"}, "x": {"type": "integer"}},
+}
+_SCHEMA_B: dict[str, Any] = {
+    "type": "object",
+    "properties": {"q": {"type": "string"}, "p": {"type": "integer"}},
+}
+_SCHEMA_C: dict[str, Any] = {"type": "object", "properties": {"z": {"type": "string"}}}
+
+# Every member is error-free, and the restriction is not stylistic: both
+# generating entrypoints raise on a schema whose analysis carries errors, so a
+# malformed member would make this row raise instead of compare. The
+# discriminating shapes are the key orders -- definitions and properties in both
+# directions -- which a canonicalizing projection of the document maps onto one
+# value while the emitted models take their order from the text.
+_SCHEMA_DOCUMENTS = (
+    _schema_text({"B": _SCHEMA_B, "A": _SCHEMA_A}),
+    _schema_text({"A": _SCHEMA_A, "B": _SCHEMA_B}),
+    _schema_text({"A": _SCHEMA_A, "B": _SCHEMA_B}, indent=2, sort_keys=True),
+    _schema_text({"A": _SCHEMA_A}),
+    _schema_text({"A": _SCHEMA_A, "B": _SCHEMA_B, "C": _SCHEMA_C}),
+    _schema_text({"C": _SCHEMA_C, "B": _SCHEMA_B, "A": _SCHEMA_A}, indent=4),
+    _schema_text({"A": _SCHEMA_A, "Alias": {"$ref": "#/$defs/A"}}),
+    _schema_text({"A": {"type": "object", "properties": {"x": {"type": "integer"}}}}),
+)
+
+
+def _generated_tree(root: Path) -> dict[str, bytes]:
+    """The emitted files, keyed by path, with the action's own manifest left out."""
+    if not root.exists():
+        return {}
+    return {
+        p.relative_to(root).as_posix(): p.read_bytes()
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and not p.name.startswith(".pyinc-action.")
+    }
+
+
+# generate_outputs is not driven directly: it is the action behind generate and
+# it takes no output root -- the root is a reconcile argument rather than a
+# parameter of the function -- so calling it alone would compare a desired output
+# set that never reaches a disk. What is compared instead is what generate
+# leaves behind. The ReconcileResult it returns is deliberately not compared:
+# its created/updated/repaired split is a fact about what the destination
+# already held, so an arm writing into a directory it has filled before and an
+# arm writing into an empty one differ there by construction. Each arm therefore
+# gets its own output root.
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_SCHEMA_DOCUMENTS))
+def test_schema_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        path = base / "sample.schema.json"
+        warm_out = base / "warm"
+        incremental = Database(mode=mode)
+
+        for step, content in enumerate(documents):
+            previous = documents[step - 1] if step else None
+            path.write_text(content, encoding="utf-8")
+            fresh = Database(mode=mode)
+            fresh_out = base / f"fresh-{step}"
+
+            warm_analysis = schema_analysis(incremental, str(path))
+            fresh_analysis = schema_analysis(fresh, str(path))
+            assert warm_analysis == fresh_analysis, (
+                f"schema_analysis warm!=fresh | mode={mode} | step={step} | "
+                f"{previous!r} -> {content!r}"
+            )
+
+            generate(incremental, str(path), warm_out)
+            generate(fresh, str(path), fresh_out)
+            warm_tree = _generated_tree(warm_out)
+            fresh_tree = _generated_tree(fresh_out)
+            assert warm_tree == fresh_tree, (
+                f"generated tree warm!=fresh | mode={mode} | step={step} | "
+                f"warm {sorted(warm_tree)} | fresh {sorted(fresh_tree)}"
+            )
+
+
+# The ordering below is the one that can put a stale answer into a checkpoint,
+# and it is written that way here even though this read cannot be caught with
+# one: the state it forms is not observable at any public surface -- the
+# analysis, the emitted models and the generated tree all agree with a fresh
+# read across every edit in this pool. So this is a consistency row rather than
+# a counterexample row, and what would falsify a regression here is the
+# hand-written row in tests/test_codegen.py that chooses its own semantic edit.
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@settings(max_examples=10, deadline=None)
+@given(documents=_sampled_documents(_SCHEMA_DOCUMENTS))
+def test_schema_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        path = base / "sample.schema.json"
+
+        for index, (before, after) in enumerate(zip(documents, documents[1:], strict=False)):
+            path.write_text(before, encoding="utf-8")
+            store = InMemoryArtifactStore()
+            saver = Database(mode=mode, store=store)
+            schema_analysis(saver, str(path))
+            generate(saver, str(path), base / f"saver-{index}")
+
+            path.write_text(after, encoding="utf-8")
+            schema_analysis(saver, str(path))
+            generate(saver, str(path), base / f"saver-{index}")
+            key = saver.save_checkpoint()
+
+            reloaded = Database(mode=mode, store=store)
+            reloaded.load_checkpoint(key)
+            reloaded_analysis = schema_analysis(reloaded, str(path))
+            fresh_analysis = schema_analysis(Database(mode=mode), str(path))
+            assert reloaded_analysis == fresh_analysis, (
+                f"schema_analysis reloaded!=fresh | mode={mode} | {before!r} -> {after!r}"
+            )
+
+            reloaded_out = base / f"reloaded-{index}"
+            fresh_out = base / f"fresh-{index}"
+            generate(reloaded, str(path), reloaded_out)
+            generate(Database(mode=mode), str(path), fresh_out)
+            reloaded_tree = _generated_tree(reloaded_out)
+            fresh_tree = _generated_tree(fresh_out)
+            assert reloaded_tree == fresh_tree, (
+                f"generated tree reloaded!=fresh | mode={mode} | "
+                f"reloaded {sorted(reloaded_tree)} | fresh {sorted(fresh_tree)}"
             )
