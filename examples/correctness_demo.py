@@ -3,7 +3,7 @@
 This demo walks through pyinc's core differentiators in sequence:
 
 1. Incremental recomputation with dependency tracking
-2. Backdating (early cutoff) — comment-only edits skip downstream work
+2. Backdating — a comment-only edit recomputes equal counts and stops there
 3. Selective recomputation — only affected queries re-execute
 4. Untracked read enforcement — raw open() raises inside queries
 5. Mutation protection — frozen values reject writes in strict mode
@@ -27,16 +27,7 @@ from pyinc import Database, FileResource, UntrackedReadError, query
 _FILES = FileResource()
 
 
-# A cutoff function that compares by AST structure, not raw text.
-# Comment-only edits produce the same AST → backdated (early cutoff).
-def _ast_cutoff(source: str) -> str:
-    try:
-        return ast.dump(ast.parse(source))
-    except SyntaxError:
-        return source
-
-
-@query(cutoff=_ast_cutoff)
+@query
 def read_source(db: Database, path: str) -> str:
     """Read a Python source file through the resource API."""
     return _FILES.read(db, path)
@@ -109,8 +100,8 @@ def main() -> None:
         print("\nProvenance tree:")
         print(db.explain(summary, str(sample)))
 
-        # --- Phase 2: Comment-only edit → backdating (early cutoff) ---
-        _banner("Phase 2: Comment-only edit → backdating (early cutoff)")
+        # --- Phase 2: Comment-only edit → backdating at the counts ---
+        _banner("Phase 2: Comment-only edit → backdating at the counts")
 
         print("Adding a comment to the source file...")
         sample.write_text(
@@ -132,9 +123,9 @@ def main() -> None:
 
         node = db.inspect(summary, str(sample))
         print(f"\nsummary decision: {node.last_decision}")
-        print("  (read_source was re-read from disk but the AST cutoff")
-        print("   detected no structural change → downstream queries")
-        print("   were backdated and did NOT re-execute)")
+        print("  (read_source re-ran on the new bytes; the counts above it")
+        print("   recomputed to the same numbers and were backdated, so")
+        print("   summary saw no change and did NOT re-execute)")
         print("\nFull provenance:")
         print(db.explain(summary, str(sample)))
 

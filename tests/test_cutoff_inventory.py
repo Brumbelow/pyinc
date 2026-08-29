@@ -3,9 +3,9 @@
 A ``cutoff=`` token is sound only when it determines the value the query
 returns. A query that returns a file's text and compares by a projection of
 that text can report "nothing changed" while handing back different bytes,
-because the fresh snapshot is stored before the comparison decides. The set
-below is what is left of that shape, and it is being emptied; this file is
-how a reintroduction becomes visible.
+because the fresh snapshot is stored before the comparison decides. No shipped
+query has that shape any more, so the set below is empty; this file is how a
+reintroduction becomes visible.
 """
 
 from __future__ import annotations
@@ -19,14 +19,10 @@ _SCANNED_ROOTS = ("src", "examples")
 #: Every shipped query that returns raw `str` while declaring a `cutoff=`
 #: token that does not determine that text. A token coarser than the value it
 #: guards lets a recomputation report "nothing changed" while handing back
-#: different bytes, so this set is being emptied. Removing an entry belongs in
-#: the commit that removes the token; adding one needs a reason this file can
+#: different bytes, so this set is empty. Removing an entry belongs in the
+#: commit that removes the token; adding one needs a reason this file can
 #: state.
-_STR_QUERIES_WITH_A_CUTOFF: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("examples/correctness_demo.py", "read_source"),
-    }
-)
+_STR_QUERIES_WITH_A_CUTOFF: frozenset[tuple[str, str]] = frozenset()
 
 _PREDICATE_FIXTURE = '''
 from __future__ import annotations
