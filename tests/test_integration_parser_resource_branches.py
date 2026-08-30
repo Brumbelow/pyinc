@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from _hostile_paths import posix_only, skip_without_posix_permissions
 
 from pyinc import Database
 from pyinc.value import freeze
@@ -59,6 +60,56 @@ def test_file_resources_support_independent_probe_and_load(
         hashlib.sha256(contents.encode()).hexdigest(),
     )
     assert resource.load(Database(), missing) == contents
+
+
+def test_the_requirements_presence_resource_supports_independent_probe_and_load(
+    tmp_path: Path,
+) -> None:
+    # Shape-mirrored on the table above rather than folded into it: this
+    # resource answers whether a path names a readable file, so its load is a
+    # bool where every resource up there answers text. The probe is the file
+    # resource's own, which is what keeps the two from disagreeing about a
+    # shape neither of them classifies for itself.
+    resource = requirements_txt._RequirementsFilePresenceResource()
+    path = tmp_path / "requirements.txt"
+    missing = os.fspath(path)
+
+    assert resource.probe(missing) == ("missing",)
+    assert resource.load(Database(), missing) is False
+
+    contents = "example>=1\n"
+    path.write_bytes(contents.encode("utf-8"))
+    assert resource.probe(missing) == (
+        "present",
+        hashlib.sha256(contents.encode()).hexdigest(),
+    )
+    assert resource.load(Database(), missing) is True
+
+
+@posix_only
+def test_the_requirements_presence_resource_answers_a_denied_path_as_missing(
+    tmp_path: Path,
+) -> None:
+    # The half the file resource does not answer for itself: it lets a denial
+    # out, and a probe owes the kernel an answer for every key it is asked
+    # about. A path this library will not read is reported the way an absent
+    # one is, which is the one thing the walk above has to say about a
+    # reference it cannot read.
+    skip_without_posix_permissions()
+    resource = requirements_txt._RequirementsFilePresenceResource()
+    path = tmp_path / "requirements.txt"
+    path.write_text("example>=1\n", encoding="utf-8")
+    denied = os.fspath(path)
+
+    path.chmod(0o000)
+    try:
+        assert resource.probe(denied) == ("missing",)
+        assert resource.load(Database(), denied) is False
+    finally:
+        path.chmod(0o644)
+
+    # ... and the mode was the whole of it: the same path reads normally again.
+    assert resource.load(Database(), denied) is True
 
 
 @pytest.mark.parametrize(

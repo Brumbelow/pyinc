@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias, cast
 
+from pyinc._safe_fs import UnsafeFilesystemPathError
 from pyinc.core import query
 from pyinc.errors import UnsupportedValueError
 from pyinc.resources import DirectoryResource, ResolvedPathResource
@@ -106,7 +107,46 @@ class _RequirementsFileResource:
         return probe, text if text is not None else ""
 
 
+@dataclass(frozen=True)
+class _RequirementsFilePresenceResource:
+    """Whether a referenced requirements file exists, read as a dependency.
+
+    Asking the filesystem directly is an ambient read the kernel cannot see, so
+    the walk's answer would rest on state it never declared. The probe is the
+    file resource's own, which already answers ``('missing',)`` for every shape
+    that names no readable file: an absent path, a directory, a path below a
+    file.
+
+    A path this library refuses to read answers the same way here. The walk has
+    one thing to say about a reference it cannot read, and the diagnostic at the
+    call site says it -- the same answer the sibling arm already gives a
+    reference that cannot be canonicalized at all. A denial is the shape that
+    reaches this; the other class is caught because a probe owes the kernel a
+    total answer, not because the arms in front of this one let it through.
+    """
+
+    def read(self, db: Database, path: str | os.PathLike[str]) -> bool:
+        return cast(bool, db.read_resource(self, os.fspath(path)))
+
+    def label(self, path: str) -> str:
+        return f"requirementsfilepresence[{path}]"
+
+    def probe(self, path: str) -> tuple[str, str] | tuple[str]:
+        try:
+            return file_probe(path)
+        except (PermissionError, UnsafeFilesystemPathError):
+            return ("missing",)
+
+    def load(self, db: Database, path: str) -> bool:
+        return self.probe(path)[0] == "present"
+
+    def probe_and_load(self, db: Database, path: str) -> tuple[tuple[str, str] | tuple[str], bool]:
+        probe = self.probe(path)
+        return probe, probe[0] == "present"
+
+
 _FILES = _RequirementsFileResource()
+_PRESENCE = _RequirementsFilePresenceResource()
 _DIRECTORIES = DirectoryResource()
 _RESOLVED_PATHS = ResolvedPathResource()
 
@@ -547,7 +587,7 @@ def deep_requirements_analysis(db: Database, path: str | os.PathLike[str]) -> Re
         if canonical in active:
             all_diagnostics.append(("cycle", f"circular -r reference: {canonical}"))
             return
-        if not file_path.is_file():
+        if not _PRESENCE.read(db, os.fspath(file_path)):
             all_diagnostics.append(
                 (
                     "missing-requirements-file",

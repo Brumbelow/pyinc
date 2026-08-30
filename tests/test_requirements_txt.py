@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
 import pytest
-from _hostile_paths import make_symlink_loop, nul_path, posix_only
+from _hostile_paths import (
+    make_symlink_loop,
+    nul_path,
+    posix_only,
+    skip_without_posix_permissions,
+)
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
@@ -12,12 +19,14 @@ from packaging.utils import canonicalize_name
 import pyinc.integrations as integrations
 from pyinc import Database, InMemoryArtifactStore, UnsupportedValueError
 from pyinc._safe_fs import UnsafeFilesystemPathError
+from pyinc.integrations import requirements_txt as requirements_module
 from pyinc.integrations.requirements_txt import (
     RequirementsAnalysis,
     deep_requirements_analysis,
     requirements_analysis,
     workspace_requirements_analysis,
 )
+from pyinc.resources import ResolvedPathResource
 
 Operation = tuple[Literal["write", "delete"], str, str | None]
 
@@ -938,3 +947,463 @@ def test_a_workspace_requirements_analysis_of_a_hostile_root_is_refused_by_type(
     analysis = workspace_requirements_analysis(db, str(workspace))
     assert analysis is not None
     assert {req.name for req in analysis.requirements} == {"flask"}
+
+
+# ---------------------------------------------------------------------------
+# The referenced file's existence
+# ---------------------------------------------------------------------------
+
+
+def _resolved(path: Path | str) -> str:
+    """The spelling the walk reaches for *path*, read the way the walk reads it.
+
+    The walk names a reference by the canonical path, not by the one a caller
+    wrote, and a temporary directory is reached through a link on some
+    platforms. Deriving the expectation from the same tracked resolution keeps
+    these cells comparing the two spellings the code actually distinguishes
+    rather than the two a fixture happened to produce.
+    """
+    resolved = ResolvedPathResource().read(Database(), os.fspath(path))
+    assert resolved is not None
+    return resolved
+
+
+#: Worlds whose ``-r`` target names nothing readable and then comes to name a
+#: readable file. Each is a shape the walk answers with the missing-file
+#: diagnostic before the transition and with the reference's own requirements
+#: after it, and each reaches the answer by a different route through the
+#: filesystem: an absent sibling, an absent entry below a real directory, a
+#: directory where a file is expected, a path whose parent is a file, and a
+#: link with no target yet.
+_APPEARING_REFERENCE_CASES = (
+    "absent-sibling",
+    "absent-below-a-directory",
+    "directory-becomes-a-file",
+    "parent-file-becomes-a-directory",
+    "dangling-link-gains-a-target",
+)
+
+#: Worlds whose target already named a readable file and then changed some
+#: other way. They travel with the five above through the preservation oracle
+#: and nowhere else.
+_ALREADY_READABLE_CASES = ("present-then-deleted", "link-retargeted")
+
+
+def _reference_world(case: str, workspace: Path) -> tuple[Path, Callable[[], None]]:
+    """Build *case* under *workspace*; return its reference path and transition.
+
+    The returned path is the one the ``-r`` line names, before resolution. The
+    fixtures carry no inline comments, which decide a line's parse elsewhere in
+    this file and would confound a case that is about the filesystem.
+    """
+    workspace.mkdir(parents=True, exist_ok=True)
+    reference = "extra.txt"
+
+    def _write_reference(target: Path) -> Callable[[], None]:
+        def transition() -> None:
+            target.write_text("requests\n", encoding="utf-8")
+
+        return transition
+
+    if case == "absent-sibling":
+        raw = workspace / "extra.txt"
+        transition = _write_reference(raw)
+    elif case == "absent-below-a-directory":
+        reference = "sub/extra.txt"
+        (workspace / "sub").mkdir()
+        raw = workspace / "sub" / "extra.txt"
+        transition = _write_reference(raw)
+    elif case == "directory-becomes-a-file":
+        raw = workspace / "extra.txt"
+        raw.mkdir()
+
+        def transition() -> None:
+            raw.rmdir()
+            raw.write_text("requests\n", encoding="utf-8")
+
+    elif case == "parent-file-becomes-a-directory":
+        reference = "sub/extra.txt"
+        blocker = workspace / "sub"
+        blocker.write_text("not a directory\n", encoding="utf-8")
+        raw = blocker / "extra.txt"
+
+        def transition() -> None:
+            blocker.unlink()
+            blocker.mkdir()
+            raw.write_text("requests\n", encoding="utf-8")
+
+    elif case == "dangling-link-gains-a-target":
+        raw = workspace / "extra.txt"
+        raw.symlink_to(workspace / "target.txt")
+        transition = _write_reference(workspace / "target.txt")
+    elif case == "present-then-deleted":
+        raw = workspace / "extra.txt"
+        raw.write_text("requests\n", encoding="utf-8")
+
+        def transition() -> None:
+            raw.unlink()
+
+    elif case == "link-retargeted":
+        reference = "link.txt"
+        (workspace / "a.txt").write_text("requests\n", encoding="utf-8")
+        (workspace / "b.txt").write_text("urllib3\n", encoding="utf-8")
+        raw = workspace / "link.txt"
+        raw.symlink_to(workspace / "a.txt")
+
+        def transition() -> None:
+            raw.unlink()
+            raw.symlink_to(workspace / "b.txt")
+
+    else:  # pragma: no cover - a case name with no world is a test bug
+        raise AssertionError(f"unknown reference world: {case}")
+
+    (workspace / "requirements.txt").write_text(f"-r {reference}\nclick\n", encoding="utf-8")
+    return raw, transition
+
+
+def _records_naming(db: Database, target: str) -> dict[str, int]:
+    """Every resource record whose label names *target*, by its ``changed_at``."""
+    return {
+        node.label: node.changed_at
+        for node in db.dependency_graph()
+        if node.kind == "resource" and target in node.label
+    }
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reference_coming_into_existence_moves_a_record_the_walk_declared(
+    mode: str, tmp_path: Path
+) -> None:
+    # The walk's answer for a reference rests on whether that path names a
+    # readable file, so that has to be a dependency the walk declared -- a
+    # record already in the graph, whose own probe moves when the filesystem
+    # does. Only records present BEFORE the transition count: a record that
+    # merely appeared afterwards says nothing about what the earlier answer
+    # rested on, and one does appear here, because reaching the reference at
+    # all registers the reference's own file record.
+    for case in _APPEARING_REFERENCE_CASES:
+        workspace = tmp_path / case
+        raw, transition = _reference_world(case, workspace)
+        target = _resolved(raw)
+        presence = f"requirementsfilepresence[{target}]"
+        root = str(workspace / "requirements.txt")
+        db = Database(mode=mode)
+
+        warm = deep_requirements_analysis(db, root)
+        assert [code for code, _ in warm.diagnostics] == ["missing-requirements-file"], (
+            f"the world did not start missing | case={case} | mode={mode} | "
+            f"diagnostics={warm.diagnostics}"
+        )
+        assert {req.name for req in warm.requirements} == {"click"}, (
+            f"the root's own requirements did not survive | case={case} | mode={mode}"
+        )
+
+        before = _records_naming(db, target)
+        assert presence in before, (
+            f"the walk declared no existence read for the reference | case={case} | "
+            f"mode={mode} | records naming the target={sorted(before)}"
+        )
+        probe_before = requirements_module._PRESENCE.probe(target)
+
+        transition()
+        probe_after = requirements_module._PRESENCE.probe(target)
+        answer = deep_requirements_analysis(db, root)
+        after = _records_naming(db, target)
+
+        moved = sorted(label for label, changed in before.items() if after.get(label) != changed)
+        appeared = sorted(set(after) - set(before))
+        assert moved, (
+            f"the reference came to name a file and no record the walk had already "
+            f"declared moved | case={case} | mode={mode} | before={sorted(before)} | "
+            f"appeared={appeared}"
+        )
+        assert presence in moved, (
+            f"the record that moved is not the existence read's own | case={case} | "
+            f"mode={mode} | moved={moved}"
+        )
+        assert probe_before == ("missing",), (
+            f"the existence probe did not start missing | case={case} | mode={mode} | "
+            f"probe={probe_before}"
+        )
+        assert probe_after[0] == "present", (
+            f"the existence probe did not end present | case={case} | mode={mode} | "
+            f"probe={probe_after}"
+        )
+        assert {req.name for req in answer.requirements} == {"click", "requests"}, (
+            f"the reference's requirements were not merged | case={case} | mode={mode} | "
+            f"requirements={sorted(req.name for req in answer.requirements)}"
+        )
+        assert answer.diagnostics == (), (
+            f"the diagnostic outlived the missing file | case={case} | mode={mode} | "
+            f"diagnostics={answer.diagnostics}"
+        )
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_direct_walk_answers_a_changed_reference_the_way_a_fresh_one_does(
+    mode: str, tmp_path: Path
+) -> None:
+    # A preservation oracle, not a defect oracle. Every case here already
+    # answers soundly when the entry point is called directly, because such a
+    # call owns no node for its answer to be reused from and re-walks each
+    # time. These cells say the existence read did not take that away; they are
+    # not coverage of anything it repairs, and reading seven green rows as such
+    # would overstate what this file measures.
+    for case in _APPEARING_REFERENCE_CASES + _ALREADY_READABLE_CASES:
+        workspace = tmp_path / case
+        _raw, transition = _reference_world(case, workspace)
+        root = str(workspace / "requirements.txt")
+
+        warm_db = Database(mode=mode)
+        deep_requirements_analysis(warm_db, root)
+        workspace_requirements_analysis(warm_db, str(workspace))
+
+        transition()
+
+        warm_deep = deep_requirements_analysis(warm_db, root)
+        warm_workspace = workspace_requirements_analysis(warm_db, str(workspace))
+
+        fresh_db = Database(mode=mode)
+        fresh_deep = deep_requirements_analysis(fresh_db, root)
+        fresh_workspace = workspace_requirements_analysis(fresh_db, str(workspace))
+
+        assert warm_deep == fresh_deep, (
+            f"a warm direct walk disagrees with a fresh one | case={case} | mode={mode} | "
+            f"warm={sorted(req.name for req in warm_deep.requirements)} "
+            f"diagnostics={warm_deep.diagnostics} | "
+            f"fresh={sorted(req.name for req in fresh_deep.requirements)} "
+            f"diagnostics={fresh_deep.diagnostics}"
+        )
+        assert warm_workspace == fresh_workspace, (
+            f"a warm workspace walk disagrees with a fresh one | case={case} | mode={mode} | "
+            f"warm={warm_workspace} | fresh={fresh_workspace}"
+        )
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reference_below_an_unreadable_directory_reports_the_missing_file(
+    mode: str, tmp_path: Path
+) -> None:
+    # The file is there and the process cannot reach it. Asking the filesystem
+    # directly answers that question differently on different builds -- one
+    # swallows the denial and reports the reference missing, another lets it
+    # out of the entry point -- so the answer a caller gets depends on which
+    # interpreter is running. Reading the existence through the file resource's
+    # own probe settles it: a reference this library will not read is reported
+    # the way an absent one is, everywhere.
+    skip_without_posix_permissions()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    blocked = workspace / "blocked"
+    blocked.mkdir()
+    (blocked / "extra.txt").write_text("requests\n", encoding="utf-8")
+    (workspace / "requirements.txt").write_text("-r blocked/extra.txt\nflask\n", encoding="utf-8")
+
+    blocked.chmod(0o000)
+    try:
+        analysis = deep_requirements_analysis(
+            Database(mode=mode), str(workspace / "requirements.txt")
+        )
+    finally:
+        blocked.chmod(0o755)
+
+    assert [code for code, _ in analysis.diagnostics] == ["missing-requirements-file"], (
+        f"a reference below an unreadable directory was not reported missing | mode={mode} | "
+        f"diagnostics={analysis.diagnostics}"
+    )
+    assert {req.name for req in analysis.requirements} == {"flask"}, (
+        f"the root's own requirements did not survive the unreachable reference | mode={mode} | "
+        f"requirements={sorted(req.name for req in analysis.requirements)}"
+    )
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reference_the_process_cannot_open_reports_the_missing_file(
+    mode: str, tmp_path: Path
+) -> None:
+    # The other denial: the reference itself is a regular file with no read
+    # permission, reached through a directory the process can traverse. The
+    # walk has one thing to say about a reference it cannot read, and it says
+    # it here rather than letting the denial out of the entry point -- the same
+    # answer the sibling arm already gives a reference that cannot be
+    # canonicalized at all, and one a caller can act on.
+    skip_without_posix_permissions()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    extra = workspace / "extra.txt"
+    extra.write_text("requests\n", encoding="utf-8")
+    (workspace / "requirements.txt").write_text("-r extra.txt\nflask\n", encoding="utf-8")
+
+    extra.chmod(0o000)
+    try:
+        analysis = deep_requirements_analysis(
+            Database(mode=mode), str(workspace / "requirements.txt")
+        )
+    finally:
+        extra.chmod(0o644)
+
+    assert [code for code, _ in analysis.diagnostics] == ["missing-requirements-file"], (
+        f"an unreadable reference was not reported missing | mode={mode} | "
+        f"diagnostics={analysis.diagnostics}"
+    )
+    assert {req.name for req in analysis.requirements} == {"flask"}, (
+        f"the root's own requirements did not survive the unreadable reference | mode={mode} | "
+        f"requirements={sorted(req.name for req in analysis.requirements)}"
+    )
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_an_unreadable_root_requirements_file_reports_the_missing_file(
+    mode: str, tmp_path: Path
+) -> None:
+    # The root the caller names goes through the same arm its own references
+    # do, so a root the process cannot open is answered the same way: an
+    # analysis of that file holding nothing but the report that it could not be
+    # read. Both entry points are driven, because the workspace one finds the
+    # file by listing and then hands it to the deep one, and a caller who
+    # reaches the walk that way gets the same answer rather than a denial.
+    skip_without_posix_permissions()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    root = workspace / "requirements.txt"
+    root.write_text("flask\n", encoding="utf-8")
+    expected = _resolved(root)
+
+    root.chmod(0o000)
+    try:
+        direct = deep_requirements_analysis(Database(mode=mode), str(root))
+        by_discovery = workspace_requirements_analysis(Database(mode=mode), str(workspace))
+    finally:
+        root.chmod(0o644)
+
+    assert by_discovery is not None, (
+        f"the workspace entry point stopped finding the root it lists | mode={mode}"
+    )
+    for name, analysis in (("deep", direct), ("workspace", by_discovery)):
+        assert analysis.diagnostics == (
+            ("missing-requirements-file", f"referenced requirements file is missing: {expected}"),
+        ), f"an unreadable root was not reported missing | entry={name} | mode={mode}"
+        assert analysis.requirements == (), (
+            f"an unreadable root yielded requirements | entry={name} | mode={mode} | "
+            f"requirements={sorted(req.name for req in analysis.requirements)}"
+        )
+        assert analysis.path == expected, (
+            f"the analysis is not about the root that was asked for | entry={name} | "
+            f"mode={mode} | path={analysis.path}"
+        )
+
+
+#: The three shapes that reach the reference arm and name no readable file.
+#: Every one of them is reported by the same code, and the code is what a
+#: caller one layer up reads.
+_NON_FILE_REFERENCE_SHAPES = ("absent", "a-directory", "below-a-file")
+
+
+@posix_only
+@pytest.mark.parametrize("shape", _NON_FILE_REFERENCE_SHAPES)
+def test_a_reference_that_names_no_file_is_reported_by_its_resolved_path(
+    shape: str, tmp_path: Path
+) -> None:
+    # The workspace is reached through a symlinked directory, so the path the
+    # caller writes and the path the walk resolves to are different strings by
+    # construction and the message can only be built from one of them. The
+    # expectation comes from the same tracked resolution the walk uses: built
+    # from the fixture's own spelling it would pass here and fail on a platform
+    # whose temporary directory is itself reached through a link.
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+
+    reference = "extra.txt"
+    if shape == "a-directory":
+        (real / "extra.txt").mkdir()
+    elif shape == "below-a-file":
+        reference = "blocker/extra.txt"
+        (real / "blocker").write_text("not a directory\n", encoding="utf-8")
+
+    (real / "requirements.txt").write_text(f"-r {reference}\nflask\n", encoding="utf-8")
+    expected = _resolved(linked / reference)
+    assert expected != os.fspath(linked / reference), (
+        "the fixture stopped distinguishing the two spellings, so the assertion below "
+        f"would hold whichever one the walk reported | resolved={expected}"
+    )
+
+    analysis = deep_requirements_analysis(Database(), str(linked / "requirements.txt"))
+
+    assert analysis.diagnostics == (
+        ("missing-requirements-file", f"referenced requirements file is missing: {expected}"),
+    ), f"the reference was not reported by its resolved path | shape={shape}"
+    assert {req.name for req in analysis.requirements} == {"flask"}, (
+        f"the root's own requirements did not survive the missing reference | shape={shape}"
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_reloaded_checkpoint_restores_the_reference_existence_record(
+    mode: str, tmp_path: Path
+) -> None:
+    # One filesystem path throughout: saving under one name and loading under
+    # another reuses nothing, and the row would pass on any tree. The edit
+    # lands BEFORE the save and the entry point is re-driven, so what gets
+    # written is the state the database reached by answering after the edit.
+    root = tmp_path / "requirements.txt"
+    root.write_text("-r extra.txt\nclick\n", encoding="utf-8")
+    presence = f"requirementsfilepresence[{_resolved(tmp_path / 'extra.txt')}]"
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode=mode, store=store)
+    deep_requirements_analysis(saver, str(root))
+    root.write_text("-r extra.txt\nclick\nflask\n", encoding="utf-8")
+    deep_requirements_analysis(saver, str(root))
+    key = saver.save_checkpoint()
+
+    assert presence in {node.label for node in saver.dependency_graph()}, (
+        f"the saved database declared no existence read to carry | mode={mode} | "
+        f"records={sorted(node.label for node in saver.dependency_graph())}"
+    )
+
+    reloaded = Database(mode=mode, store=store)
+    reloaded.load_checkpoint(key)
+    reloaded.reset_statistics()
+    restored = deep_requirements_analysis(reloaded, str(root))
+    statistics = reloaded.statistics()
+    profile = [
+        entry
+        for entry in reloaded.query_profile()
+        if ":requirements_analysis_payload[" in entry.query_label
+    ]
+    expected = deep_requirements_analysis(Database(mode=mode), str(root))
+
+    assert restored == expected, (
+        f"a reloaded checkpoint disagrees with a fresh read | mode={mode} | "
+        f"restored={sorted(req.name for req in restored.requirements)} | "
+        f"expected={sorted(req.name for req in expected.requirements)}"
+    )
+
+    # The record is in the graph and the ask that revealed it loaded nothing,
+    # so its value came across the reload rather than out of this database's
+    # own read of the filesystem. The graph cannot be read any earlier: a
+    # reload stages the checkpoint and warms records as they are asked for, so
+    # immediately after it every record is absent, restored or not.
+    assert presence in {node.label for node in reloaded.dependency_graph()}, (
+        f"the existence read did not come back from the checkpoint | mode={mode} | "
+        f"records={sorted(node.label for node in reloaded.dependency_graph())}"
+    )
+    assert statistics.resource_loads == 0, (
+        f"the first ask after a reload loaded a resource, so a record it should have "
+        f"carried was rebuilt instead | mode={mode} | loads={statistics.resource_loads}"
+    )
+    assert statistics.query_executions == 0, (
+        f"the first ask after a reload re-executed | mode={mode} | "
+        f"executions={statistics.query_executions}"
+    )
+    assert profile == [], (
+        f"the payload nodes were not reused across the reload | mode={mode} | "
+        f"profile={[(entry.query_label, entry.execution_count) for entry in profile]}"
+    )
