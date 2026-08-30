@@ -13,6 +13,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
 from ._resources import file_probe, file_read_snapshot, file_text
 from .source_geometry import DocumentMap, SourcePosition, SourceRange, identifier_range
 
@@ -619,6 +620,7 @@ def _decode_diagnostic(
 
 
 def notebook_analysis(db: Database, path: str | os.PathLike[str]) -> NotebookAnalysis:
+    _reject_in_query(db, "notebook_analysis")
     normalized = os.fspath(path)
     payload = cast(NotebookAnalysisPayload, thaw(db.get(notebook_analysis_payload, normalized)))
     path_str, kernel_name, language, cells, diagnostics = payload
@@ -637,6 +639,7 @@ def workspace_notebook_analysis(
     db: Database,
     root: str | os.PathLike[str],
 ) -> tuple[NotebookAnalysis, ...]:
+    _reject_in_query(db, "workspace_notebook_analysis")
     normalized_root = os.fspath(root)
     try:
         entries = _DIRECTORIES.read(db, normalized_root)

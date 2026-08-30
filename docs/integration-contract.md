@@ -9,7 +9,9 @@ All public result records are frozen dataclasses whose collection fields are
 tuples. Public source positions use zero-based, end-exclusive `SourceRange`
 values. High-level entrypoints decode cached tuple payloads into those records;
 the payload queries and decoding helpers in individual modules are not part of
-this contract.
+this contract. A high-level entrypoint is called from outside a query: a query
+body that reaches one is refused rather than served, as the composition section
+below sets out.
 
 ## Shared source geometry
 
@@ -329,6 +331,16 @@ dependency checking combines installed metadata with workspace imports;
 requirement evaluation combines parsed requirements, environment markers, and
 installed versions; scope and symbol analysis build on shared Python source.
 Those calls become ordinary dependency edges and require no user wiring.
+
+That composition is between queries. A high-level entrypoint is not a query and
+is not available inside one: a query body that reaches an entrypoint is refused
+before the entrypoint runs, raising `CompositionError` where the call is reached
+and `UnsupportedValueError` where the kernel rejects what the query captured
+before its body starts. Both derive from `PyIncError`, so one `except` covers
+the boundary either way. Read the payload query an entrypoint decodes, or call
+the entrypoint outside the query. The three names under `Request scoping` are
+outside this rule: they declare and use a span rather than analyze anything, and
+the entrypoints call one of them themselves.
 
 Individual integration modules also expose payload queries and helper names for
 in-repository composition. They are intentionally absent from

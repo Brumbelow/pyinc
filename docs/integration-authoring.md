@@ -35,7 +35,11 @@ in a loop over discovered Python files.
 
 **Layer 3 -- High-level entrypoints.** Non-query functions that call `db.get()` and
 decode tuple payloads into frozen dataclasses. These are the public API. Examples:
-`file_analysis` and `workspace_analysis`.
+`file_analysis` and `workspace_analysis`. They are called from outside a query: a
+query body that reaches a high-level entrypoint is refused before the entrypoint
+runs, raising `CompositionError` where the call is reached and
+`UnsupportedValueError` where the kernel rejects what the query captured before
+its body starts. Both derive from `PyIncError`.
 
 **Why this layering?** The kernel caches and compares tuple payloads efficiently (they are
 snapshot-safe and hashable by default). The decode layer converts to ergonomic dataclasses
@@ -227,7 +231,12 @@ query's result changes, the downstream query is re-verified and re-executed as n
   private helpers.
 - The importing integration gains an incremental dependency edge tracked by the runtime.
   No special wiring is required beyond calling `db.get()` on the imported query (or
-  calling it directly inside another `@query`, which the kernel intercepts).
+  calling it directly inside another `@query`, which the kernel intercepts). That is
+  the query layer only. A high-level entrypoint is not a query and is not available
+  inside one: a query body that reaches an entrypoint is refused before it runs,
+  raising `CompositionError` where the call is reached and `UnsupportedValueError`
+  where the kernel rejects what the query captured first. Compose with the payload
+  query the entrypoint decodes, or call the entrypoint outside the query.
 - Composition queries are public `@query` functions but are intentionally **not**
   re-exported from `pyinc.integrations`. They exist for query-layer use, not as
   user-facing entrypoints.
@@ -280,6 +289,7 @@ A new integration needs:
 - [ ] Contract lock test verifies `__all__` and non-export of experimental helpers
 - [ ] Mode-parametrized correctness tests cover `strict`, `checked`, and `fast`
 - [ ] From-scratch consistency test compares incremental vs fresh over edit sequences
+- [ ] Every high-level entrypoint refuses a query body before any other work
 
 ## Canonical End-to-End Example: `calc`
 

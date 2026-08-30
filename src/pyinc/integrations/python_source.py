@@ -16,7 +16,7 @@ from pyinc.integrations.installed_packages import environment_index
 from pyinc.resources import DirectoryResource, ResolvedPathResource
 from pyinc.runtime import Database
 
-from ._decoding import decoded, once_per_request
+from ._decoding import _reject_in_query, decoded, once_per_request
 from ._resources import file_bytes, file_probe
 from .source_geometry import (
     DocumentMap,
@@ -1194,6 +1194,7 @@ def _decoded_module_analysis(
 # already the payload. Thawing it again only walks and copies the whole tree --
 # on a workspace-sized request that copy dominated the cost of decoding.
 def file_analysis(db: Database, path: str | os.PathLike[str]) -> PythonFileAnalysis:
+    _reject_in_query(db, "file_analysis")
     normalized_path = _normalize_path(path)
     payload = db.get(file_analysis_payload, normalized_path)
     return _decoded_file_analysis(db, payload, source_ranges_for_file(db, normalized_path))
@@ -1202,6 +1203,7 @@ def file_analysis(db: Database, path: str | os.PathLike[str]) -> PythonFileAnaly
 def directory_analysis(
     db: Database, root: str | os.PathLike[str]
 ) -> tuple[PythonFileAnalysis, ...]:
+    _reject_in_query(db, "directory_analysis")
     normalized_root = _normalize_path(root)
     payload = db.get(directory_analysis_payload, normalized_root)
     return tuple(
@@ -1213,6 +1215,7 @@ def directory_analysis(
 def module_analysis(
     db: Database, root: str | os.PathLike[str], path: str | os.PathLike[str]
 ) -> PythonModuleAnalysis:
+    _reject_in_query(db, "module_analysis")
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
     return once_per_request(
@@ -1234,6 +1237,7 @@ def _module_analysis(db: Database, normalized_root: str, normalized_path: str) -
 
 
 def workspace_analysis(db: Database, root: str | os.PathLike[str]) -> PythonWorkspaceAnalysis:
+    _reject_in_query(db, "workspace_analysis")
     normalized_root = _normalize_path(root)
     return once_per_request(
         db,

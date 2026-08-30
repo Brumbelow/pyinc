@@ -14,7 +14,7 @@ from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, Sour
 from pyinc.resources import ResolvedPathResource
 from pyinc.runtime import Database
 
-from ._decoding import decoded, once_per_request
+from ._decoding import _reject_in_query, decoded, once_per_request
 
 ScopeKind: TypeAlias = Literal[
     "module", "class", "function", "lambda", "comprehension", "type_alias"
@@ -1070,6 +1070,8 @@ def _decode_scope_tree(payload: ScopeTreePayload) -> ScopeTree:
 
 
 def scope_tree(db: Database, path: str | os.PathLike[str]) -> ScopeTree:
+    _reject_in_query(db, "scope_tree")
+
     # Canonicalizing through the tracked path declares the edge, so retargeting
     # any link along the chain invalidates what was answered from the old
     # target -- a bare `Path.resolve` reaches the live filesystem untracked. It
@@ -1118,6 +1120,8 @@ def symbol_at(
     Passing a workspace root enables conservative cross-module resolution for
     direct imports and module attributes. The two-argument form is purely local.
     """
+
+    _reject_in_query(db, "symbol_at")
 
     if position is None:
         if not isinstance(path_or_position, SourcePosition):

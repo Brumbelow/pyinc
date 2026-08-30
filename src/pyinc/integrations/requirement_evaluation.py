@@ -26,6 +26,8 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
+
 # ---------------------------------------------------------------------------
 # Payload type aliases
 # ---------------------------------------------------------------------------
@@ -720,6 +722,7 @@ def _decode_applicable(payload: ApplicableRequirementPayload) -> ApplicableRequi
 
 def evaluate_markers(db: Database, marker: str) -> MarkerEvaluation:
     """Evaluate a PEP 508 marker expression against the current Python environment."""
+    _reject_in_query(db, "evaluate_markers")
     payload = cast(
         MarkerEvaluationPayload,
         thaw(db.get(_evaluate_markers_payload, marker)),
@@ -732,6 +735,7 @@ def evaluate_version_specifier(
     db: Database, specifier: str, version: str
 ) -> VersionSpecifierEvaluation:
     """Evaluate a PEP 440 specifier set against a concrete version string."""
+    _reject_in_query(db, "evaluate_version_specifier")
     payload = cast(
         VersionSpecifierEvalPayload,
         thaw(db.get(_evaluate_version_specifier_payload, specifier, version)),
@@ -746,6 +750,7 @@ def applicable_requirements(
     db: Database, path: str | os.PathLike[str]
 ) -> ApplicableRequirementsAnalysis:
     """Return the effective applicable/satisfied requirement set for the current env."""
+    _reject_in_query(db, "applicable_requirements")
     normalized = os.fspath(path)
     payload = cast(
         ApplicableRequirementsAnalysisPayload,
@@ -763,6 +768,7 @@ def applicable_requirements(
 def workspace_applicable_requirements(
     db: Database, root: str | os.PathLike[str]
 ) -> ApplicableRequirementsAnalysis | None:
+    _reject_in_query(db, "workspace_applicable_requirements")
     normalized_root = os.fspath(root)
     entries = _DIRECTORIES.read(db, normalized_root)
     for name in entries:

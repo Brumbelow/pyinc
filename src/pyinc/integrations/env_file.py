@@ -11,6 +11,7 @@ from pyinc.resources import DirectoryResource, Resource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
 from ._resources import file_probe, file_read_snapshot, file_text
 from .source_geometry import SourcePosition, SourceRange
 
@@ -194,6 +195,7 @@ def env_analysis_payload(db: Database, path: str) -> EnvAnalysisPayload:
 
 
 def env_analysis(db: Database, path: str | os.PathLike[str]) -> EnvFileAnalysis:
+    _reject_in_query(db, "env_analysis")
     normalized = os.fspath(path)
     payload = cast(EnvAnalysisPayload, thaw(db.get(env_analysis_payload, normalized)))
     path_str, entries, diagnostics = payload
@@ -220,6 +222,7 @@ def workspace_env_analysis(
     root: str | os.PathLike[str],
     filename: str = ".env",
 ) -> EnvFileAnalysis | None:
+    _reject_in_query(db, "workspace_env_analysis")
     normalized_root = os.fspath(root)
     dir_entries = _DIRECTORIES.read(db, normalized_root)
     env_path = None

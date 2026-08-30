@@ -13,6 +13,7 @@ from pyinc.resources import DirectoryResource, ResolvedPathResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
 from ._resources import file_probe, file_read_snapshot, file_text
 from .source_geometry import SourcePosition, SourceRange
 
@@ -516,6 +517,7 @@ def _decode_index_directive(
 
 
 def requirements_analysis(db: Database, path: str | os.PathLike[str]) -> RequirementsAnalysis:
+    _reject_in_query(db, "requirements_analysis")
     normalized = os.fspath(path)
     payload = cast(
         RequirementsAnalysisPayload,
@@ -535,6 +537,7 @@ def requirements_analysis(db: Database, path: str | os.PathLike[str]) -> Require
 def workspace_requirements_analysis(
     db: Database, root: str | os.PathLike[str]
 ) -> RequirementsAnalysis | None:
+    _reject_in_query(db, "workspace_requirements_analysis")
     normalized_root = os.fspath(root)
     entries = _DIRECTORIES.read(db, normalized_root)
     for name in entries:
@@ -550,6 +553,7 @@ def deep_requirements_analysis(db: Database, path: str | os.PathLike[str]) -> Re
     file in the chain, merges results.  Cycle detection via canonical path set.
     Constraint files (-c) are noted as file references but not followed.
     """
+    _reject_in_query(db, "deep_requirements_analysis")
     # Every canonicalization below runs through the tracked path, so each one
     # declares an edge: retargeting a link anywhere in the chain of files this
     # walk reaches invalidates the analysis, which a bare `Path.resolve` could

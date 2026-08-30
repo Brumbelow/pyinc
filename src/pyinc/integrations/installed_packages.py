@@ -16,6 +16,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
 from ._resources import file_probe, file_read_snapshot, file_text
 
 # ---------------------------------------------------------------------------
@@ -336,6 +337,7 @@ def _decode_package(payload: InstalledPackagePayload) -> InstalledPackageRef:
 
 def installed_packages_analysis(db: Database) -> InstalledPackagesAnalysis:
     """Discover all installed packages and stdlib modules."""
+    _reject_in_query(db, "installed_packages_analysis")
     raw = cast(
         InstalledPackagesAnalysisPayload,
         thaw(db.get(_installed_packages_payload)),
@@ -350,6 +352,7 @@ def installed_packages_analysis(db: Database) -> InstalledPackagesAnalysis:
 
 def resolve_import_name(db: Database, import_name: str) -> ImportNameResolution:
     """Resolve an import name to its origin: stdlib, installed, or unknown."""
+    _reject_in_query(db, "resolve_import_name")
     raw = cast(
         InstalledPackagesAnalysisPayload,
         thaw(db.get(_installed_packages_payload)),

@@ -18,7 +18,7 @@ from pyinc.integrations.scope_resolution import ScopeTree, SymbolId, scope_tree,
 from pyinc.integrations.source_geometry import DocumentMap, SourcePosition, SourceRange
 from pyinc.runtime import Database
 
-from ._decoding import decoded, once_per_request
+from ._decoding import _reject_in_query, decoded, once_per_request
 
 # ---------------------------------------------------------------------------
 # Literal aliases
@@ -1252,6 +1252,7 @@ def module_symbol_table(
     root: str | os.PathLike[str],
     path: str | os.PathLike[str],
 ) -> ModuleSymbolTable:
+    _reject_in_query(db, "module_symbol_table")
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
     return once_per_request(
@@ -1339,6 +1340,7 @@ def _resolve_qualified_name(
 
 
 def workspace_symbol_index(db: Database, root: str | os.PathLike[str]) -> WorkspaceSymbolIndex:
+    _reject_in_query(db, "workspace_symbol_index")
     normalized_root = _normalize_path(root)
     payload = db.get(workspace_symbol_index_payload, normalized_root)
     decoded = _decode_workspace_symbol_index(payload)
@@ -1374,6 +1376,7 @@ def find_references(
     *,
     include_declaration: bool = True,
 ) -> ReferenceQueryResult:
+    _reject_in_query(db, "find_references")
     if not isinstance(symbol_id, SymbolId):
         raise TypeError("find_references() requires a resolved SymbolId")
     return _find_references_for_symbol(
@@ -1854,6 +1857,7 @@ def class_model(
     path: str | os.PathLike[str],
     qualified_name: str,
 ) -> ClassModel:
+    _reject_in_query(db, "class_model")
     normalized_root = _normalize_path(root)
     normalized_path = _normalize_path(path)
     payload = db.get(

@@ -12,6 +12,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
 from ._resources import file_probe, file_read_snapshot, file_text
 
 ConfigKeyPayload: TypeAlias = tuple[str, str, str, str]
@@ -399,6 +400,7 @@ def _decode_section(payload: ConfigSectionPayload) -> ConfigSection:
 
 
 def config_analysis(db: Database, path: str | os.PathLike[str]) -> ConfigAnalysis:
+    _reject_in_query(db, "config_analysis")
     normalized = os.fspath(path)
     payload = cast(ConfigAnalysisPayload, thaw(db.get(config_analysis_payload, normalized)))
     path_str, sections, deps, optional_deps, tools, diagnostics = payload
@@ -413,6 +415,7 @@ def config_analysis(db: Database, path: str | os.PathLike[str]) -> ConfigAnalysi
 
 
 def workspace_config_analysis(db: Database, root: str | os.PathLike[str]) -> ConfigAnalysis | None:
+    _reject_in_query(db, "workspace_config_analysis")
     normalized_root = os.fspath(root)
     entries = _DIRECTORIES.read(db, normalized_root)
     config_path = None

@@ -14,6 +14,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
 from ._resources import file_probe, file_read_snapshot, file_text
 
 JsonKeyPayload: TypeAlias = tuple[str, str, str, str]
@@ -357,6 +358,7 @@ def _decode_section(payload: JsonSectionPayload) -> JsonSection:
 
 
 def json_analysis(db: Database, path: str | os.PathLike[str]) -> JsonAnalysis:
+    _reject_in_query(db, "json_analysis")
     normalized = os.fspath(path)
     payload = cast(JsonAnalysisPayload, thaw(db.get(json_analysis_payload, normalized)))
     path_str, sections, diagnostics = payload
@@ -372,6 +374,7 @@ def workspace_json_analysis(
     root: str | os.PathLike[str],
     filename: str = "package.json",
 ) -> JsonAnalysis | None:
+    _reject_in_query(db, "workspace_json_analysis")
     normalized_root = os.fspath(root)
     entries = _DIRECTORIES.read(db, normalized_root)
     json_path = None

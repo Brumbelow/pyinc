@@ -12,6 +12,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
 from ._resources import file_probe, file_read_snapshot, file_text
 
 XmlAttributePayload: TypeAlias = tuple[str, str]
@@ -277,6 +278,7 @@ def _decode_element(payload: XmlElementPayload) -> XmlElement:
 
 
 def xml_analysis(db: Database, path: str | os.PathLike[str]) -> XmlAnalysis:
+    _reject_in_query(db, "xml_analysis")
     normalized = os.fspath(path)
     payload = cast(XmlAnalysisPayload, thaw(db.get(xml_analysis_payload, normalized)))
     path_str, root_tag, elements, diagnostics = payload
@@ -293,6 +295,7 @@ def workspace_xml_analysis(
     root: str | os.PathLike[str],
     filename: str = "pom.xml",
 ) -> XmlAnalysis | None:
+    _reject_in_query(db, "workspace_xml_analysis")
     normalized_root = os.fspath(root)
     dir_entries = _DIRECTORIES.read(db, normalized_root)
     xml_path = None

@@ -15,6 +15,8 @@ from pyinc.integrations.installed_packages import (
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
+
 # ---------------------------------------------------------------------------
 # Payload type aliases
 # ---------------------------------------------------------------------------
@@ -163,6 +165,7 @@ def dependency_check_analysis(
     db: Database, declared_deps: tuple[str, ...]
 ) -> DependencyCheckAnalysis:
     """Check declared dependencies against installed packages."""
+    _reject_in_query(db, "dependency_check_analysis")
     raw = cast(
         DependencyCheckPayload,
         thaw(db.get(dependency_check_payload, declared_deps)),
@@ -183,6 +186,8 @@ def workspace_dependency_check(
     Composes with python_source.workspace_analysis at the entrypoint layer
     (not the query layer) to detect imports that are installed but not declared.
     """
+    _reject_in_query(db, "workspace_dependency_check")
+
     from pyinc.integrations.python_source import workspace_analysis
 
     base = dependency_check_analysis(db, declared_deps)

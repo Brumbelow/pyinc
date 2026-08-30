@@ -12,6 +12,7 @@ from pyinc.resources import DirectoryResource
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
 from ._resources import file_probe, file_read_snapshot, file_text
 
 CsvColumnPayload: TypeAlias = tuple[str, int]
@@ -232,6 +233,7 @@ def csv_analysis_payload(db: Database, path: str) -> CsvAnalysisPayload:
 
 
 def csv_analysis(db: Database, path: str | os.PathLike[str]) -> CsvAnalysis:
+    _reject_in_query(db, "csv_analysis")
     normalized = os.fspath(path)
     payload = cast(CsvAnalysisPayload, thaw(db.get(csv_analysis_payload, normalized)))
     path_str, columns, row_count, delimiter, has_header, diagnostics = payload
@@ -250,6 +252,7 @@ def workspace_csv_analysis(
     root: str | os.PathLike[str],
     filename: str = "data.csv",
 ) -> CsvAnalysis | None:
+    _reject_in_query(db, "workspace_csv_analysis")
     normalized_root = os.fspath(root)
     dir_entries = _DIRECTORIES.read(db, normalized_root)
     csv_path = None

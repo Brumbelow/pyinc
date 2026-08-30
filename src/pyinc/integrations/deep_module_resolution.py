@@ -12,6 +12,7 @@ from pyinc.resources import DirectoryResource, FileStatResource, ResolvedPathRes
 from pyinc.runtime import Database
 from pyinc.value import thaw
 
+from ._decoding import _reject_in_query
 from ._resources import file_probe, file_read_snapshot, file_text
 
 # ---------------------------------------------------------------------------
@@ -543,6 +544,7 @@ def _decode_location(payload: ResolvedModuleLocationPayload) -> ResolvedModuleLo
 
 def resolve_module_path(db: Database, dotted_name: str) -> ResolvedModuleLocation:
     """Resolve a dotted module name to its file or namespace contributions."""
+    _reject_in_query(db, "resolve_module_path")
     payload = cast(
         ResolvedModuleLocationPayload,
         thaw(db.get(resolve_module_location, dotted_name)),
@@ -552,6 +554,7 @@ def resolve_module_path(db: Database, dotted_name: str) -> ResolvedModuleLocatio
 
 def deep_module_resolution_analysis(db: Database) -> DeepModuleResolutionAnalysis:
     """Snapshot of effective module search paths, .pth directives, and namespaces."""
+    _reject_in_query(db, "deep_module_resolution_analysis")
     payload = cast(
         DeepModuleResolutionAnalysisPayload,
         thaw(db.get(_deep_analysis_payload)),
