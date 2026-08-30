@@ -83,6 +83,26 @@ decided at release time.
   inline and comes back whole wherever the adapted value sits; an adapted
   value in a tree-shaped result is unaffected in every payload shape, as the
   built-in stat adapter's triple of scalars is everywhere.
+- Every high-level integration entrypoint is now outside-only, matching
+  `db.observe()` and `Subscription.unsubscribe()` on the kernel surface below
+  it: called from a query body it raises `CompositionError`, which names the
+  entrypoint and what to reach for instead, and the entrypoint does not run. A
+  query that names one directly may not get that far. Where the kernel cannot
+  fingerprint what the name reaches it rejects the query itself with
+  `UnsupportedValueError` before the body starts, and that is the stronger of
+  the two refusals: it lands whether or not the call would have been reached.
+  Which of the two a query meets is not something to depend on — both derive
+  from `PyIncError`, so one `except` covers the boundary either way, and under
+  both the entrypoint never executes. That last part is what this release
+  makes uniform; the refusal class is not. Whether an entrypoint ran inside a
+  query body previously followed what the kernel could fingerprint about the
+  query rather than any rule a caller could see, so some ran there, others
+  were already refused, and nothing said which. No call in this repository
+  moved: every entrypoint call it makes already sat outside a query body,
+  including the entrypoints that compose with one another. A query body that
+  wants what an entrypoint knows reads the payload query the entrypoint
+  decodes with `db.get()`; a caller that wants the entrypoint itself calls it
+  outside the query.
 
 ### Fixed
 
@@ -504,6 +524,32 @@ decided at release time.
   the diagnostic on every build this was measured on. A file whose only oddity
   was its line endings is simply read, with no diagnostic at all. A file the
   sniffer reads normally is unaffected.
+- `deep_requirements_analysis()` declares the existence of every file it walks
+  to, instead of asking the filesystem directly. Following an `-r` reference,
+  it decided whether the referenced file was there with a bare filesystem
+  check — the last read on the integration surface the kernel could not see,
+  so the walk's answer rested on a step it never declared. That existence is
+  now a tracked read, taken through the same file probe the contents are read
+  through, and the answers are unchanged: `missing-requirements-file` still
+  reports an absent reference, a directory and a path below a file, in the
+  same words. Nothing a caller can observe moves under that on this release,
+  and the reason is worth stating plainly rather than dressing up — the one
+  path along which such an undeclared read could have gone stale is a query
+  body reaching the entrypoint, which the same release refuses. The read this
+  adds moves no query's identity, so a checkpoint that matched before still
+  matches and no manifest bump was needed. And a requirements file the process
+  cannot read now reports the missing-file diagnostic rather than escaping the
+  analysis, whether it is the root the analysis was handed or a file reached
+  from one through an `-r` reference. A reference below a directory the
+  process could not traverse raised on some builds and reported the diagnostic
+  on others; a reference it could not open raised on all of them; and the root
+  file itself, when it could not be opened, raised on all of them too. All
+  three now report `missing-requirements-file` on every build this was
+  measured on, through `deep_requirements_analysis()` and
+  `workspace_requirements_analysis()` alike — the same answer the walk already
+  gives a reference it cannot canonicalize at all, and one a caller can act
+  on. The file resources themselves still propagate a denial as a denial; what
+  changed is what this walk does with one.
 
 ### Added
 
@@ -530,6 +576,8 @@ decided at release time.
   fingerprinted once per process and stays outside the request-scope
   configuration check; a replacement of your own is verified in full, like any
   other registered adapter.
+- `CompositionError`, raised when a high-level integration entrypoint is
+  called from inside a query body.
 
 ### Changed
 
