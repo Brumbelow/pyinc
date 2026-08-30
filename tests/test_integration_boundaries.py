@@ -11,6 +11,12 @@ The property harness cannot stand in for this: it reaches the entrypoints from
 plain test bodies and never from a query, so it holds no opinion about the
 calling context at all. That is why the composition family lives beside the
 surface lock rather than in the harness.
+
+The last group varies how the query spells the name -- through a local import,
+through the entrypoint's module, or in a branch the body never takes -- because
+a rule that held for one spelling and not the others would leave the boundary
+where it was found. What every cell there pins is that the entrypoint does not
+run; which of the two refusals arrives is not part of the rule.
 """
 
 from __future__ import annotations
@@ -53,11 +59,13 @@ from pyinc.integrations import (
     module_analysis,
     module_symbol_table,
     notebook_analysis,
+    python_source,
     requirements_analysis,
     resolve_import_name,
     resolve_module_path,
     scope_tree,
     symbol_at,
+    symbol_resolution,
     workspace_analysis,
     workspace_applicable_requirements,
     workspace_config_analysis,
@@ -71,6 +79,7 @@ from pyinc.integrations import (
     workspace_xml_analysis,
     xml_analysis,
 )
+from pyinc.integrations._decoding import _reject_in_query
 
 _INTEGRATIONS = Path(__file__).parents[1] / "src" / "pyinc" / "integrations"
 _CONTRACT = Path(__file__).parents[1] / "docs" / "integration-contract.md"
@@ -702,3 +711,336 @@ def test_every_high_level_entrypoint_answers_outside_a_query(mode: str, workspac
     assert answers["symbol_at"].name == "Alpha"
     assert answers["csv_analysis"].row_count == 1
     assert answers["class_model"].qualified_name == "Alpha"
+
+
+# ---------------------------------------------------------------------------
+# The shapes a query can name an entrypoint by
+# ---------------------------------------------------------------------------
+
+# What a driver says when its entrypoint ran, and what it says when the body
+# finished without ever reaching the call. Keeping the two apart is what lets a
+# clean answer still be evidence: an answer that came back is either the one
+# shape that never made the call, or a driver that ran what it should not have.
+_RAN = "the entrypoint answered"
+_NOT_REACHED = "the call was never reached"
+_REFUSED = "refused by "
+
+_SPELLINGS = ("dead-code", "function-local-import", "module-attribute")
+
+
+def _drive(db: Database, driver: Query[..., str], *arguments: object) -> str:
+    """Say what a driving query did, without deciding what refused it.
+
+    Two refusals reach a caller across these spellings: the one an entrypoint
+    owes a query body, and the kernel's own objection to what such a query
+    captures. Which one arrives is a judgement about the caller's compiled code
+    that moves between interpreter versions, so the answer records only that a
+    refusal happened and leaves the name of it to the failure message.
+    """
+    try:
+        return db.get(driver, *arguments)
+    except (CompositionError, UnsupportedValueError) as refusal:
+        assert isinstance(refusal, PyIncError)
+        return _REFUSED + type(refusal).__name__
+
+
+def _payload_records(db: Database, payload_query: str) -> tuple[str, ...]:
+    """The records the entrypoint's payload query would have left behind.
+
+    Every subject below asks a cached query named after itself as its first act
+    past the refusal, so whether that query left a record is whether the
+    entrypoint got any further than its own front door. Each cell proves the
+    read has teeth in its own mode by asking the entrypoint from outside a
+    query afterwards and finding the record it left. The name is anchored on
+    both sides because a label carries the defining module in front of it and
+    an argument digest behind.
+    """
+    anchor = f":{payload_query}["
+    return tuple(node.label for node in db.dependency_graph() if anchor in node.label)
+
+
+def _assert_never_executed(outcome: str, db: Database, payload_query: str) -> None:
+    """The whole rule: the entrypoint did not run, whatever came back instead."""
+    assert outcome.startswith(_REFUSED) or outcome == _NOT_REACHED, outcome
+    assert _payload_records(db, payload_query) == ()
+
+
+# One driver per spelling per subject. The two subjects are the two sides of
+# what the kernel makes of an ordinary caller. `directory_analysis` hides the
+# work it decodes with inside a generator expression and a query naming it is
+# admitted, so the refusal it meets is its own. `workspace_symbol_index` is
+# turned away before any body runs -- and the two supported interpreters do not
+# even read its body the same way, agreeing on the verdict only because a name
+# they both see is objected to first. Neither cell reads a capture set: both
+# read what happened.
+
+
+@query
+def _dead_code_directory_analysis(db: Database, root: str, reach_the_call: bool) -> str:
+    # The flag is an argument, so the branch is decided while the body runs.
+    # Written as `if False:` the compiler drops the branch and the name never
+    # reaches the caller's code object, which would test the compiler instead.
+    if reach_the_call:
+        directory_analysis(db, root)
+        return _RAN
+    return _NOT_REACHED
+
+
+@query
+def _local_import_directory_analysis(db: Database, root: str) -> str:
+    from pyinc.integrations.python_source import directory_analysis
+
+    directory_analysis(db, root)
+    return _RAN
+
+
+@query
+def _module_attribute_directory_analysis(db: Database, root: str) -> str:
+    python_source.directory_analysis(db, root)
+    return _RAN
+
+
+@query
+def _dead_code_workspace_symbol_index(db: Database, root: str, reach_the_call: bool) -> str:
+    if reach_the_call:
+        workspace_symbol_index(db, root)
+        return _RAN
+    return _NOT_REACHED
+
+
+@query
+def _local_import_workspace_symbol_index(db: Database, root: str) -> str:
+    from pyinc.integrations.symbol_resolution import workspace_symbol_index
+
+    workspace_symbol_index(db, root)
+    return _RAN
+
+
+@query
+def _module_attribute_workspace_symbol_index(db: Database, root: str) -> str:
+    symbol_resolution.workspace_symbol_index(db, root)
+    return _RAN
+
+
+@query
+def _local_import_file_analysis(db: Database, path: str) -> str:
+    from pyinc.integrations.python_source import file_analysis
+
+    file_analysis(db, path)
+    return _RAN
+
+
+_BYPASS_DRIVERS: dict[str, dict[str, Query[..., str]]] = {
+    "directory_analysis": {
+        "dead-code": _dead_code_directory_analysis,
+        "function-local-import": _local_import_directory_analysis,
+        "module-attribute": _module_attribute_directory_analysis,
+    },
+    "workspace_symbol_index": {
+        "dead-code": _dead_code_workspace_symbol_index,
+        "function-local-import": _local_import_workspace_symbol_index,
+        "module-attribute": _module_attribute_workspace_symbol_index,
+    },
+}
+
+
+def _bypass_arguments(spelling: str, subject_argument: str) -> tuple[object, ...]:
+    # Only the dead-code body takes a second argument: the flag that keeps its
+    # branch shut, passed rather than written in so the branch is a run-time
+    # decision.
+    if spelling == "dead-code":
+        return (subject_argument, False)
+    return (subject_argument,)
+
+
+@pytest.mark.parametrize("spelling", _SPELLINGS)
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_no_spelling_of_an_entrypoint_runs_inside_a_query(
+    spelling: str, mode: str, workspace: Path
+) -> None:
+    # The three spellings do not all end the same way, and that is the reason
+    # the assertion is about the effect rather than about what refused it.
+    # Mentioning the entrypoint only in a branch the body never takes leaves
+    # the analysis undone either way: either the mention alone is enough for
+    # the kernel to turn the query away, or the query answers having called
+    # nothing. Reaching the entrypoint through its module resolves to the same
+    # function and ends exactly where the plain name ends -- the module is not
+    # what decides it, which is why two entrypoints of the same module end
+    # differently under this spelling. Importing it inside the body is the one
+    # spelling the supported interpreters disagree about, so it is the one that
+    # would pin an interpreter's reading if the class were asserted. None of
+    # that is recorded below; only that the entrypoint did not run.
+    db = Database(mode=mode)
+    outcome = _drive(
+        db,
+        _BYPASS_DRIVERS["directory_analysis"][spelling],
+        *_bypass_arguments(spelling, str(workspace)),
+    )
+    _assert_never_executed(outcome, db, "directory_analysis_payload")
+
+    directory_analysis(db, str(workspace))
+    assert _payload_records(db, "directory_analysis_payload") != ()
+
+
+@pytest.mark.parametrize("spelling", _SPELLINGS)
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_no_spelling_reaches_the_index_the_interpreters_read_differently(
+    spelling: str, mode: str, workspace: Path
+) -> None:
+    # This entrypoint builds part of its answer inside a comprehension, and the
+    # supported interpreters disagree about whether the names that comprehension
+    # uses belong to the body around it: one of them counts a name the other
+    # does not. The two nonetheless reach the same verdict for an ordinary
+    # caller, because a name they both count is objected to first -- an
+    # agreement that rests on something neither the caller nor the entrypoint
+    # chose. So this cell asserts what happened and never what was read, and
+    # stays true whichever way an interpreter reads the body.
+    db = Database(mode=mode)
+    outcome = _drive(
+        db,
+        _BYPASS_DRIVERS["workspace_symbol_index"][spelling],
+        *_bypass_arguments(spelling, str(workspace)),
+    )
+    _assert_never_executed(outcome, db, "workspace_symbol_index_payload")
+
+    workspace_symbol_index(db, str(workspace))
+    assert _payload_records(db, "workspace_symbol_index_payload") != ()
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_local_import_beside_a_module_level_one_never_runs(mode: str, workspace: Path) -> None:
+    # The sharpest shape available here, and the reason it is its own cell:
+    # this module imports every documented entrypoint at the top, and the body
+    # below imports one of them again inside itself. The two supported
+    # interpreters disagree about that body -- one reads the name the local
+    # import binds as a global of the body and the other does not -- so this
+    # exact shape is refused by the entrypoint on one of them and by the kernel
+    # on the other, and before the entrypoint refused anything it ran the
+    # analysis on one of them. Neither outcome is asserted; what is asserted is
+    # that the analysis does not happen either way.
+    db = Database(mode=mode)
+    module = str(workspace / "pkg" / "mod.py")
+    outcome = _drive(db, _local_import_file_analysis, module)
+    _assert_never_executed(outcome, db, "file_analysis_payload")
+
+    file_analysis(db, module)
+    assert _payload_records(db, "file_analysis_payload") != ()
+
+
+# Two miniature high-level entrypoints over one payload query, differing only
+# in where the decode step is named. The decode helper is a plain function of
+# its argument on purpose: modelled on a real one it would reach the request
+# memo and the cache the kernel refuses to walk, the direct spelling would be
+# turned away for holding them while the hidden one was not, and this control
+# would go red for the difference it exists to rule out.
+
+
+@query
+def _demo_payload(db: Database, text: str) -> tuple[str, ...]:
+    return tuple(piece for piece in text.split(",") if piece)
+
+
+def _demo_decode(piece: str) -> str:
+    return piece.strip().upper()
+
+
+def _demo_named(db: Database, text: str) -> tuple[str, ...]:
+    _reject_in_query(db, "_demo_named")
+    decoded = []
+    for piece in db.get(_demo_payload, text):
+        decoded.append(_demo_decode(piece))
+    return tuple(decoded)
+
+
+def _demo_hidden(db: Database, text: str) -> tuple[str, ...]:
+    _reject_in_query(db, "_demo_hidden")
+    return tuple(_demo_decode(piece) for piece in db.get(_demo_payload, text))
+
+
+@query
+def _in_query_demo_named(db: Database, text: str) -> str:
+    _demo_named(db, text)
+    return _RAN
+
+
+@query
+def _in_query_demo_hidden(db: Database, text: str) -> str:
+    _demo_hidden(db, text)
+    return _RAN
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_hiding_the_decode_step_changes_nothing_about_the_refusal(mode: str) -> None:
+    db = Database(mode=mode)
+
+    named = _drive(db, _in_query_demo_named, "alpha,beta")
+    hidden = _drive(db, _in_query_demo_hidden, "alpha,beta")
+
+    # Same refusal, not merely two refusals: an entrypoint that was turned away
+    # by the kernel and one that refused for itself would both read as "not run"
+    # while differing exactly where they must not.
+    assert named == hidden, f"named: {named} | hidden: {hidden}"
+    _assert_never_executed(named, db, "_demo_payload")
+    _assert_never_executed(hidden, db, "_demo_payload")
+
+    # And both work, so the refusal above is about where they were called from.
+    assert _demo_named(db, "alpha,beta") == ("ALPHA", "BETA")
+    assert _demo_hidden(db, "alpha,beta") == ("ALPHA", "BETA")
+    assert _payload_records(db, "_demo_payload") != ()
+
+
+# Every driver above, and every miniature one of them drives, with the name its
+# body must still call. Thirty-five drivers of one shape are thirty-five
+# chances to paste the wrong name into one of them, and a driver pointed at
+# some other entrypoint is refused just as flatly as the right one -- so the
+# cells that drive it stay green while its own subject is never driven at all.
+# The bodies are read here rather than trusted.
+_DRIVER_SUBJECTS: dict[str, str] = {
+    **{f"_in_query_{name}": name for name in _GUARDED_ENTRYPOINTS},
+    **{
+        driver.key.rsplit(":", 1)[-1]: subject
+        for subject, by_spelling in _BYPASS_DRIVERS.items()
+        for driver in by_spelling.values()
+    },
+    "_local_import_file_analysis": "file_analysis",
+    "_in_query_demo_named": "_demo_named",
+    "_in_query_demo_hidden": "_demo_hidden",
+    "_demo_named": "_reject_in_query",
+    "_demo_hidden": "_reject_in_query",
+}
+
+
+def _called_names(source: str) -> dict[str, frozenset[str]]:
+    """Every name each top-level function calls, plainly or through a module."""
+    called: dict[str, frozenset[str]] = {}
+    for node in ast.parse(source).body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        names: set[str] = set()
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            if isinstance(inner.func, ast.Name):
+                names.add(inner.func.id)
+            elif isinstance(inner.func, ast.Attribute):
+                names.add(inner.func.attr)
+        called[node.name] = frozenset(names)
+    return called
+
+
+def test_every_driver_still_calls_the_thing_it_drives() -> None:
+    called = _called_names(Path(__file__).read_text(encoding="utf-8"))
+
+    # The registry has to cover the whole guarded surface, and each entry has
+    # to be the query the surface cell actually runs -- otherwise a driver
+    # could be checked here and a different one driven there.
+    assert {f"_in_query_{name}" for name in _GUARDED_ENTRYPOINTS} <= set(_DRIVER_SUBJECTS)
+    for name in sorted(_GUARDED_ENTRYPOINTS):
+        assert _DRIVERS[name].key.endswith(f":_in_query_{name}")
+
+    silent = sorted(
+        f"{driver} no longer calls {subject}"
+        for driver, subject in _DRIVER_SUBJECTS.items()
+        if subject not in called.get(driver, frozenset())
+    )
+    assert silent == []
