@@ -12,11 +12,15 @@ plain test bodies and never from a query, so it holds no opinion about the
 calling context at all. That is why the composition family lives beside the
 surface lock rather than in the harness.
 
-The last group varies how the query spells the name -- through a local import,
+A further group varies how the query spells the name -- through a local import,
 through the entrypoint's module, or in a branch the body never takes -- because
 a rule that held for one spelling and not the others would leave the boundary
 where it was found. What every cell there pins is that the entrypoint does not
 run; which of the two refusals arrives is not part of the rule.
+
+The last group leaves the query behind. Two of these entrypoints are read
+directly, either side of a link retargeted underneath them, which is the only
+way the question can be put now that the boundary above stands.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import os
 import re
 from pathlib import Path
 
@@ -39,6 +44,7 @@ from pyinc import (
     query,
 )
 from pyinc.integrations import (
+    ScopeTree,
     SourcePosition,
     SymbolId,
     applicable_requirements,
@@ -80,6 +86,7 @@ from pyinc.integrations import (
     xml_analysis,
 )
 from pyinc.integrations._decoding import _reject_in_query
+from pyinc.resources import ResolvedPathResource
 
 _INTEGRATIONS = Path(__file__).parents[1] / "src" / "pyinc" / "integrations"
 _CONTRACT = Path(__file__).parents[1] / "docs" / "integration-contract.md"
@@ -946,10 +953,10 @@ def _demo_decode(piece: str) -> str:
 
 def _demo_named(db: Database, text: str) -> tuple[str, ...]:
     _reject_in_query(db, "_demo_named")
-    decoded = []
+    converted = []
     for piece in db.get(_demo_payload, text):
-        decoded.append(_demo_decode(piece))
-    return tuple(decoded)
+        converted.append(_demo_decode(piece))
+    return tuple(converted)
 
 
 def _demo_hidden(db: Database, text: str) -> tuple[str, ...]:
@@ -987,6 +994,169 @@ def test_hiding_the_decode_step_changes_nothing_about_the_refusal(mode: str) -> 
     assert _demo_named(db, "alpha,beta") == ("ALPHA", "BETA")
     assert _demo_hidden(db, "alpha,beta") == ("ALPHA", "BETA")
     assert _payload_records(db, "_demo_payload") != ()
+
+
+# ---------------------------------------------------------------------------
+# Reading through a link retargeted underneath the reader
+# ---------------------------------------------------------------------------
+
+_FIRST_TARGET = """\
+def alpha() -> int:
+    return 1
+"""
+
+_SECOND_TARGET = """\
+def beta() -> int:
+    return 2
+"""
+
+# Both targets name their definition on the first line at the fifth column, so
+# one position asks the same question of whichever of them the link reaches.
+_DEFINITION = SourcePosition(line=0, character=4)
+
+
+@pytest.fixture
+def linked_module(tmp_path: Path) -> Path:
+    """A link with two candidate targets beside it, pointing at the first."""
+    (tmp_path / "a.py").write_text(_FIRST_TARGET, encoding="utf-8")
+    (tmp_path / "b.py").write_text(_SECOND_TARGET, encoding="utf-8")
+    link = tmp_path / "link.py"
+    try:
+        link.symlink_to(tmp_path / "a.py")
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink support is unavailable in this environment")
+    return link
+
+
+def _retarget(link: Path, target: Path) -> None:
+    link.unlink()
+    link.symlink_to(target)
+
+
+def _tree_answer(tree: ScopeTree) -> dict[str, object]:
+    return {
+        "path": tree.path,
+        "scopes": tuple(scope.id for scope in tree.scopes),
+        "bindings": tuple(sorted(binding.name for binding in tree.bindings)),
+    }
+
+
+def _symbol_answer(symbol: SymbolId | None) -> dict[str, object]:
+    assert symbol is not None, "the position names no symbol"
+    return {"path": symbol.path, "scope_id": symbol.scope_id, "name": symbol.name}
+
+
+def _resolved(path: Path) -> str:
+    """The canonical spelling of ``path``, read the way the entrypoints read it.
+
+    A temporary directory is reached through a link on some platforms, so a
+    string built from the fixture's own idea of where it wrote can differ from
+    the one the answers carry. Deriving the expectation from the same tracked
+    resolution keeps these cells comparing what the code distinguishes.
+    """
+    resolved = ResolvedPathResource().read(Database(), os.fspath(path))
+    assert resolved is not None
+    return resolved
+
+
+def _canonicalization_key(link: Path) -> str:
+    """The label the database files ``link``'s canonicalization under.
+
+    Asked of the resource that does the canonicalizing rather than spelled out
+    here, so the arm below cannot be answered by some other record whose label
+    merely mentions the same path.
+    """
+    return ResolvedPathResource().label(os.fspath(link))
+
+
+def _canonicalizations(db: Database, key: str) -> dict[str, int]:
+    """When the record filed under ``key`` last moved its answer.
+
+    Reaching a file through a link means canonicalizing the link first, and
+    this is where that step shows up as something the database declared rather
+    than something it asked the filesystem behind its own back. An empty answer
+    is a step nothing downstream can depend on.
+    """
+    return {
+        node.label: node.changed_at
+        for node in db.dependency_graph()
+        if node.kind == "resource" and node.label == key
+    }
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_scope_tree_read_through_a_link_follows_the_retarget(
+    mode: str, linked_module: Path
+) -> None:
+    # Read directly and never from a query body, because the boundary above
+    # leaves outside a query the only place this question can be put from.
+    db = Database(mode=mode)
+    beside = linked_module.parent
+    key = _canonicalization_key(linked_module)
+
+    before = _tree_answer(scope_tree(db, str(linked_module)))
+    declared_before = _canonicalizations(db, key)
+    assert before["path"] == _resolved(beside / "a.py")
+    assert before["bindings"] == ("alpha",)
+
+    _retarget(linked_module, beside / "b.py")
+
+    warm = _tree_answer(scope_tree(db, str(linked_module)))
+    declared_after = _canonicalizations(db, key)
+    fresh = _tree_answer(scope_tree(Database(mode=mode), str(linked_module)))
+
+    # The four below preserve an answer rather than catch one going wrong: the
+    # shipped tree gives them warm and fresh alike, and so would a tree that
+    # canonicalized the link without declaring the step. What covers the step
+    # is the block at the end, not these.
+    assert warm == fresh
+    assert warm != before, "the link was retargeted and the answer did not move"
+    assert warm["path"] == _resolved(beside / "b.py")
+    assert warm["bindings"] == ("beta",)
+    # The two targets are shaped alike, so the scopes are the one part of the
+    # answer with no reason to move -- which keeps the two that did honest.
+    assert warm["scopes"] == before["scopes"]
+
+    # Canonicalizing the link is a step the database declared: one record,
+    # filed under the label the canonicalizing resource itself gives the link,
+    # answered both reads and moved its answer between them.
+    assert set(declared_before) == {key}, "canonicalizing the link declared nothing"
+    assert set(declared_after) == {key}
+    assert declared_after[key] != declared_before[key]
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_symbol_read_through_a_link_follows_the_retarget(mode: str, linked_module: Path) -> None:
+    # Direct for the same reason: a query body cannot reach this entrypoint
+    # either, so the question is put from outside one.
+    db = Database(mode=mode)
+    beside = linked_module.parent
+    key = _canonicalization_key(linked_module)
+
+    before = _symbol_answer(symbol_at(db, str(linked_module), _DEFINITION))
+    declared_before = _canonicalizations(db, key)
+    assert before["path"] == _resolved(beside / "a.py")
+    assert before["name"] == "alpha"
+
+    _retarget(linked_module, beside / "b.py")
+
+    warm = _symbol_answer(symbol_at(db, str(linked_module), _DEFINITION))
+    declared_after = _canonicalizations(db, key)
+    fresh = _symbol_answer(symbol_at(Database(mode=mode), str(linked_module), _DEFINITION))
+
+    # Preserving an answer again, not catching one going wrong: the identity
+    # under the position follows the link warm and fresh alike, and would do so
+    # whether or not the step that reached it was declared. The block at the
+    # end is what covers that step.
+    assert warm == fresh
+    assert warm != before, "the link was retargeted and the symbol did not move"
+    assert warm["path"] == _resolved(beside / "b.py")
+    assert warm["name"] == "beta"
+    assert warm["scope_id"] == before["scope_id"]
+
+    assert set(declared_before) == {key}, "canonicalizing the link declared nothing"
+    assert set(declared_after) == {key}
+    assert declared_after[key] != declared_before[key]
 
 
 # Every driver above, and every miniature one of them drives, with the name its
