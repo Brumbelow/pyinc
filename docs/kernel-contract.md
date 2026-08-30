@@ -1275,6 +1275,7 @@ Errors:
 | `ArtifactStoreError` | Base error for artifact-store failures. |
 | `ArtifactStoreKeyError` | An artifact key is malformed or unsafe. |
 | `ArtifactStoreLockError` | An artifact-store lock cannot be acquired. |
+| `CompositionError` | A high-level integration entrypoint was called from inside a query body. |
 
 ## Verification
 

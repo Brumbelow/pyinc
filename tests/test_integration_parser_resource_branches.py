@@ -12,10 +12,11 @@ from typing import Any, cast
 import pytest
 from _hostile_paths import posix_only, skip_without_posix_permissions
 
-from pyinc import Database
+from pyinc import CompositionError, Database
 from pyinc.value import freeze
 
 csv_data: Any = importlib.import_module("pyinc.integrations.csv_data")
+decoding: Any = importlib.import_module("pyinc.integrations._decoding")
 deep_resolution: Any = importlib.import_module("pyinc.integrations.deep_module_resolution")
 dependency_check: Any = importlib.import_module("pyinc.integrations.dependency_check")
 env_file: Any = importlib.import_module("pyinc.integrations.env_file")
@@ -215,8 +216,14 @@ def test_workspace_dependency_check_skips_noninstalled_resolutions(
     monkeypatch.setattr(dependency_check, "environment_index", lambda _db: freeze(((), ())))
     monkeypatch.setattr(python_source, "workspace_analysis", lambda *_args: workspace)
 
+    class FakeDatabase:
+        """A database that is not executing a query."""
+
+        def _current_frame(self) -> None:
+            return None
+
     result = dependency_check.workspace_dependency_check(
-        cast(Database, object()),
+        cast(Database, FakeDatabase()),
         "workspace",
         (),
     )
@@ -288,6 +295,9 @@ def test_import_resolution_checks_later_installed_packages() -> None:
     class FakeDatabase:
         def get(self, *_args: object, **_kwargs: object) -> object:
             return freeze(payload)
+
+        def _current_frame(self) -> None:
+            return None
 
     result = installed_packages.resolve_import_name(cast(Database, FakeDatabase()), "second.child")
 
@@ -712,3 +722,26 @@ def test_shipped_file_resources_read_a_denied_directory_as_missing(
         resource.probe(str(regular))
     with pytest.raises(PermissionError):
         resource.load(db, str(regular))
+
+
+def test_the_entrypoint_refusal_fires_for_a_database_inside_an_execution() -> None:
+    frame = object()
+
+    class ExecutingDatabase:
+        """A database part-way through a query execution."""
+
+        def _current_frame(self) -> object:
+            return frame
+
+    with pytest.raises(CompositionError) as caught:
+        decoding._reject_in_query(cast(Database, ExecutingDatabase()), "widget_analysis")
+
+    message = str(caught.value)
+    assert "widget_analysis()" in message
+    assert "high-level entrypoint" in message
+    # The message names no payload query: most entrypoints have no same-stem one.
+    assert "widget_analysis_payload" not in message
+
+
+def test_the_entrypoint_refusal_stays_silent_outside_an_execution() -> None:
+    assert decoding._reject_in_query(Database(), "widget_analysis") is None

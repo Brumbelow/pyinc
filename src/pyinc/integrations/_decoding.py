@@ -1,4 +1,5 @@
-"""Reuse of decoded query payloads, across requests and within one.
+"""Reuse of decoded query payloads, across requests and within one, and the
+refusal a high-level entrypoint owes a query body.
 
 Two memos, with different lifetimes and different reasons to be sound.
 
@@ -39,6 +40,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, TypeVar
+
+from pyinc.errors import CompositionError
 
 if TYPE_CHECKING:
     from pyinc.runtime import Database
@@ -136,3 +139,19 @@ def once_per_request(
     value = compute()
     memo[key] = value
     return value
+
+
+def _reject_in_query(db: Database, name: str) -> None:
+    """Raise ``CompositionError`` if ``db`` is part-way through a query execution.
+
+    High-level entrypoints belong outside the query graph. The message names
+    the entrypoint and no payload query: most of them have no same-stem query
+    to name, and one that names nothing beats one that names the wrong thing.
+    """
+
+    if db._current_frame() is not None:
+        raise CompositionError(
+            f"{name}() is a high-level entrypoint and cannot be called from "
+            f"inside a query body. Read the payload query it composes with "
+            f"db.get(), or call {name}() outside the query."
+        )

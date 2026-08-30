@@ -29,6 +29,10 @@ class ReentrantDatabaseError(PyIncError):
     """Raised when a call re-enters the database from inside its own execution."""
 
 
+class CompositionError(PyIncError):
+    """Raised when a high-level entrypoint is called from inside a query body."""
+
+
 class InputKeyError(PyIncError, ValueError):
     """Raised when an input key is invalid or conflicts within a database."""
 
