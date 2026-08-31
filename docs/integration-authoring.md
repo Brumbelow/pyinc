@@ -166,9 +166,10 @@ prevents reuse. The node re-executes on every request and never backdates, so
 stale reuse cannot happen; the read itself stays as nondeterministic as it
 was. Reference: `module_export_surface` marks dynamic `__all__` as untracked.
 
-**Why?** From-scratch consistency is the kernel's primary guarantee. Re-execution is
-always safe; stale reuse is never safe. An integration that guesses wrong about reuse
-causes silent staleness that violates the soundness envelope.
+**Why?** From-scratch consistency is the kernel's primary guarantee, and a stale answer
+is indistinguishable from a fresh one at the point a caller reads it, so the kernel pays
+for the re-execution rather than risk the reuse. An integration that guesses wrong about
+reuse causes silent staleness that violates the soundness envelope.
 
 ## Comparison Policies
 

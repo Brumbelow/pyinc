@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -125,3 +127,48 @@ def test_field_parity_reports_field_names_listed_out_of_order(tmp_path: Path) ->
 
 def test_field_parity_check_is_registered_with_the_composed_checker() -> None:
     assert "check_documented_dataclass_fields" in check_docs.__code__.co_names
+
+
+_TEST_TOKEN = re.compile(r"\btest_[A-Za-z0-9_]+")
+
+
+def _cited_test_names(root: Path) -> set[str]:
+    """Every `test_*` token the shipped documents name, minus the test modules themselves.
+
+    A token that also names a file under `tests/` was matched inside a path such
+    as `tests/test_python_source.py`; it names a module, not a function, and the
+    census would report all six of them as missing without this exclusion.
+    """
+    tokens: set[str] = set()
+    for document in sorted((root / "docs").glob("*.md")):
+        tokens.update(_TEST_TOKEN.findall(document.read_text(encoding="utf-8")))
+    return {token for token in tokens if not (root / "tests" / f"{token}.py").exists()}
+
+
+def _defined_test_names(root: Path) -> set[str]:
+    """Every `test_*` function name defined under `tests/`, read without importing."""
+    names: set[str] = set()
+    for module in sorted((root / "tests").rglob("*.py")):
+        tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name.startswith(
+                "test_"
+            ):
+                names.add(node.name)
+    return names
+
+
+def test_every_test_the_documentation_cites_still_exists() -> None:
+    """A renamed test has to take its citations with it.
+
+    The documentation names individual tests as the evidence for what it claims,
+    and the documentation checker reads none of those names -- a rename that
+    leaves one behind passes every other gate silently. This is the gate that
+    catches it.
+    """
+    cited = _cited_test_names(PROJECT_ROOT)
+    assert len(cited) > 50, f"expected the documents to cite many tests, found {len(cited)}"
+
+    orphaned = sorted(cited - _defined_test_names(PROJECT_ROOT))
+
+    assert not orphaned, "documentation cites tests that do not exist: " + ", ".join(orphaned)

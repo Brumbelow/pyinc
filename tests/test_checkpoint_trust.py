@@ -647,7 +647,8 @@ def test_transitive_dep_change_invalidates_warmed_parent_without_live_child() ->
     assert db2.inspect(warm_parent).last_recompute == "executed"
 
 
-def test_untracked_records_are_never_warmed() -> None:
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_untracked_records_are_never_warmed(mode: str) -> None:
     p = Input[int]("warm_untracked")
 
     @query
@@ -656,13 +657,13 @@ def test_untracked_records_are_never_warmed() -> None:
         return p.read(db) + 1
 
     store = InMemoryArtifactStore()
-    db1 = Database(store=store)
+    db1 = Database(store=store, mode=mode)
     db1.set(p, 7)
     assert db1.get(warm_untracked_query) == 8
     assert db1.inspect(warm_untracked_query).is_untracked
     ck_key = db1.save_checkpoint()
 
-    db2 = Database(store=store)
+    db2 = Database(store=store, mode=mode)
     db2.set(p, 7)
     db2.load_checkpoint(ck_key)
     # An untracked record is impure by definition; it must never be served from

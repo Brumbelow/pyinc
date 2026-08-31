@@ -198,6 +198,13 @@ The kernel intercepts the following during query execution and raises
 Reads not intercepted by this mechanism (see limitation 1) must be declared
 via `db.report_untracked_read()` ([Escape Hatches](#escape-hatches)).
 
+A module imported for the first time inside a query body runs its module-scope
+code inside that query's boundary. A read performed while the module is
+initializing is therefore treated exactly as one written in the query body:
+refused if it is on the list above, silently untracked if it is not. Import at
+module scope instead, so the initialization has already run by the time a query
+body reaches the name.
+
 **3. Deterministic queries w.r.t. tracked dependencies.**
 Given the same tracked inputs, resources, and sub-query results, a query function
 must return a semantically equal value. Nondeterminism (timestamps, random
@@ -477,12 +484,16 @@ Four of those gaps sit close enough to the guarded set to be named individually.
   edge is recorded, so the query is reused unchanged after that file appears,
   disappears, or is rewritten, while a fresh `Database` reports the new state.
   Route the observation through `FileStatResource`, whose probe covers
-  existence, size, and mtime, through `ResolvedPathResource` when the
-  observation is where a path canonicalizes to, or declare it with
-  `db.report_untracked_read(reason)`.
+  existence, size, and mtime, or through `ResolvedPathResource` when the
+  observation is where a path canonicalizes to: either one makes the
+  observation tracked, so a query that depends on it is invalidated when the
+  metadata moves. Declaring the read with `db.report_untracked_read(reason)`
+  does not make it tracked. It removes stale reuse for the declaring node
+  alone, which then re-executes on every request; another query that observes
+  the same metadata without declaring it is still reused unchanged.
   (See: `test_file_metadata_reads_bypass_untracked_read_guard`,
   `test_stat_only_query_is_never_invalidated_by_the_file_it_stats`,
-  `test_report_untracked_read_restores_consistency_for_a_stat_only_query`,
+  `test_report_untracked_read_stops_memo_reuse_for_a_stat_only_query`,
   `test_file_stat_resource_tracks_metadata_changes`,
   `test_resolved_path_resource_tracks_symlink_retargeting`)
 - **The byte-oriented environment.** `os.getenv` and `os.environ` are

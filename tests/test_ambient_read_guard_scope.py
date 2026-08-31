@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -146,7 +147,7 @@ def test_stat_only_query_is_never_invalidated_by_the_file_it_stats(tmp_path: Pat
     assert Database().get(observed_size) == 12
 
 
-def test_report_untracked_read_restores_consistency_for_a_stat_only_query(
+def test_report_untracked_read_stops_memo_reuse_for_a_stat_only_query(
     tmp_path: Path,
 ) -> None:
     """The declared escape hatch for the metadata gap."""
@@ -164,8 +165,43 @@ def test_report_untracked_read_restores_consistency_for_a_stat_only_query(
     path.write_text("hello, world", encoding="utf-8")
 
     assert db.get(declared_size) == 12
+    # Nothing rewrites the file between these two gets, so both stat the same
+    # size: the equality is about the reading holding still, not about the
+    # declaration making a warm database agree with a fresh one. Rewrite the
+    # file in between and the two sides disagree. The companion below pins that
+    # limit with a reading that moves on its own.
     assert db.get(declared_size) == Database().get(declared_size)
     assert db.inspect(declared_size).is_untracked
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_report_untracked_read_leaves_a_clock_reading_unreproducible(mode: str) -> None:
+    """The limit of the hatch, beside the cell that pins what the hatch buys.
+
+    Declaring the read stops the node being reused; it does not make the reading
+    reproducible. Two requests to one database disagree, and a warm database and
+    a fresh one disagree, in every mode.
+    """
+
+    @query(key=f"declared-clock:{mode}")
+    def declared_clock(db: Database) -> int:
+        db.report_untracked_read("elapsed time observed via a monotonic clock")
+        return time.perf_counter_ns()
+
+    db = Database(mode=mode)
+    first = db.get(declared_clock)
+    second = db.get(declared_clock)
+
+    # Re-execution on every request is the whole of what the declaration buys,
+    # and here that is exactly what makes the two answers differ.
+    assert first != second
+    # From-scratch consistency does not come back with it: a fresh database
+    # computes an answer of its own.
+    assert db.get(declared_clock) != Database(mode=mode).get(declared_clock)
+
+    node = db.inspect(declared_clock)
+    assert node.is_untracked
+    assert node.last_decision == "executed"
 
 
 _GUARDED_ENTRY_POINTS = (
