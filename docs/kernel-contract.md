@@ -950,8 +950,11 @@ per-context via a `ContextVar` stack of active databases — two threads inside
 queries on different `Database` instances do not stomp each other's
 enforcement, and raw I/O from a thread that is *not* inside any query continues
 to work unaffected. If many threads share a single `Database`, work serialises
-on the per-instance lock; if they hold separate `Database` instances they run
-in parallel.
+on the per-instance lock; threads holding separate `Database` instances do not
+contend on each other's lock. That is not parallelism: on a default build,
+CPU-bound Python work does not run in parallel across threads, and threading
+such work can be slower than not threading it at all. Parallel speedup for that
+work needs separate processes.
 
 A thread that a query body **starts** is one case that does not simply
 wait: it inherits the boundary of the query that started it. Its undeclared

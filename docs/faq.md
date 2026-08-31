@@ -121,15 +121,16 @@ actually changed.
 **Threads.** `Database` is thread-safe both across independent instances and on
 a single shared instance. Each instance holds a `threading.RLock` that
 serializes every public read and mutation, so threads sharing one `Database`
-serialize on that lock while threads holding separate instances run in
-parallel. The ambient-read guard is installed globally exactly once and
-dispatches per context through a `ContextVar` stack, so a query on one
-`Database` does not disturb enforcement on another, and raw I/O from a thread
-that is not inside a query is unaffected. See
+serialize on that lock while threads holding separate instances do not contend
+on each other's lock. pyinc is pure Python and does nothing special with the
+GIL, and neither arrangement buys parallel speedup for CPU-bound Python work on
+a default build: threading such work can be slower than not threading it, and
+parallel speedup for that work needs the separate processes described below.
+What threads buy is correctness. The ambient-read guard is installed globally
+exactly once and dispatches per context through a `ContextVar` stack, so a query
+on one `Database` does not disturb enforcement on another, and raw I/O from a
+thread that is not inside a query is unaffected. See
 [Thread Safety](kernel-contract.md#thread-safety).
-
-pyinc is pure Python and does nothing special with the GIL. Sharing one
-`Database` across threads buys correctness, not parallel speedup.
 
 **Free-threaded builds.** The test matrix covers CPython 3.11–3.14 on the
 default build; it does not currently include a free-threaded build, so pyinc
@@ -144,7 +145,7 @@ it misses safely and recomputes rather than reusing a record — or a checkpoint
 execution; that is [out of scope](architecture.md#scope) by design. Separate
 processes hold separate databases and run fully in parallel, and they can share
 completed work through checkpoints and a `FileSystemArtifactStore`: save in one
-interpreter, load in another. That path is exercised by a cross-process test
+process, load in another. That path is exercised by a cross-process test
 matrix.
 
 ## When should I not use pyinc?
