@@ -257,6 +257,66 @@ def test_query_cutoff_backdates_and_skips_downstream(tmp_path: Path) -> None:
     assert inspection.last_decision == "reused"
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_reused_decision_leaves_the_earlier_recompute_outcome_standing(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    # Each mode gets its own tmp_path, so each starts from the unedited bytes.
+    # Sharing one file across the three would leave the second and third
+    # reading the first one's edit and seeing nothing change.
+    files = FileResource()
+    path = tmp_path / "words.txt"
+    path.write_text("alpha beta gamma", encoding="utf-8")
+
+    @query
+    def source_text(db: Database, filename: str) -> str:
+        return files.read(db, filename)
+
+    @query
+    def word_count(db: Database, filename: str) -> int:
+        return len(source_text(db, filename).split())
+
+    db = Database(mode=mode)
+    assert db.get(word_count, str(path)) == 3
+    cold = _inspect_node(db, word_count, str(path))
+    assert cold.last_decision == "executed"
+    assert cold.last_recompute == "executed"
+
+    # A whitespace-only edit moves the file, so `source_text` re-executes;
+    # `word_count` runs again, lands the same count and backdates.
+    backdates = db.statistics().query_backdates
+    path.write_text("alpha   beta\n\tgamma\n", encoding="utf-8")
+    assert db.get(word_count, str(path)) == 3
+    backdated = _inspect_node(db, word_count, str(path))
+    assert backdated.last_decision == "backdated"
+    assert backdated.last_recompute == "backdated"
+    assert db.statistics().query_backdates == backdates + 1
+
+    # A later request that changes nothing reuses the node without running it.
+    # The reuse is what that request concluded; the backdate is still the
+    # outcome of the last run, so the two fields disagree.
+    executions = db.statistics().query_executions
+    assert db.get(word_count, str(path)) == 3
+    reused = _inspect_node(db, word_count, str(path))
+    assert reused.last_decision == "reused"
+    assert reused.last_recompute == "backdated"
+
+    # And for the cheap case inside one request: the second reach at the same
+    # node is recorded as a reuse without re-checking anything, and leaves the
+    # recompute outcome alone as well. The reason is asserted because it is what
+    # distinguishes this arm from the one above -- without it the arm rests on
+    # the span construction alone to reach the within-request branch.
+    with db.request_span():
+        assert db.get(word_count, str(path)) == 3
+        assert db.get(word_count, str(path)) == 3
+        restamped = _inspect_node(db, word_count, str(path))
+    assert restamped.last_decision == "reused"
+    assert restamped.last_recompute == "backdated"
+    assert restamped.reason == "already checked in current request"
+    assert db.statistics().query_executions == executions
+
+
 def test_cutoff_tokens_must_be_snapshot_safe() -> None:
     number = Input[int]("number", cutoff=lambda value: iter((value,)))
 
@@ -939,6 +999,75 @@ def test_disappearing_resource_raises_inside_the_query_body(mode: str, tmp_path:
     path.unlink()
     assert db.get(read_optional, str(path)) == Database(mode=mode).get(read_optional, str(path))
     assert db.get(read_optional, str(path)) == "<default>"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_unhandled_resource_load_failure_propagates_out_of_get(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    files = FileResource()
+
+    @query
+    def required_text(db: Database, filename: str) -> str:
+        return files.read(db, filename)
+
+    @query
+    def required_words(db: Database, filename: str) -> int:
+        return len(required_text(db, filename).split())
+
+    @query
+    def optional_words(db: Database, filename: str) -> int:
+        try:
+            return len(files.read(db, filename).split())
+        except FileNotFoundError:
+            return -1
+
+    # The class is the assertion, never the message: the text comes from the
+    # operating system and differs by platform.
+    missing = tmp_path / "gone.txt"
+    db = Database(mode=mode)
+    with pytest.raises(FileNotFoundError) as cold:
+        db.get(required_text, str(missing))
+    assert type(cold.value) is FileNotFoundError
+    assert not isinstance(cold.value, PyIncError)
+
+    # Through a parent that does not handle it either.
+    with pytest.raises(FileNotFoundError) as through_parent:
+        db.get(required_words, str(missing))
+    assert type(through_parent.value) is FileNotFoundError
+
+    # A refresh that raises while a dependent is being verified: the chain is
+    # warm over a file that then disappears, so the load runs again as part of
+    # verifying the parent.
+    live = tmp_path / "live.txt"
+    live.write_text("alpha beta gamma", encoding="utf-8")
+    warm = Database(mode=mode)
+    assert warm.get(required_words, str(live)) == 3
+    live.unlink()
+    with pytest.raises(FileNotFoundError) as refresh:
+        warm.get(required_words, str(live))
+    assert type(refresh.value) is FileNotFoundError
+
+    # The control: a query body that catches the failure keeps it, and moves
+    # from the warm value to its own answer once the file goes.
+    handled = tmp_path / "handled.txt"
+    handled.write_text("one two three four", encoding="utf-8")
+    control = Database(mode=mode)
+    assert control.get(optional_words, str(handled)) == 4
+    handled.unlink()
+    assert control.get(optional_words, str(handled)) == -1
+    assert control.get(optional_words, str(handled)) == Database(mode=mode).get(
+        optional_words, str(handled)
+    )
+
+    # Propagating out of get() does not change the record-keeping: the failing
+    # resource node reports a failure for both decision fields, with a reason
+    # naming what failed.
+    failed = _find_node(_inspect_node(control, optional_words, str(handled)), "file[")
+    assert failed.last_decision == "failed"
+    assert failed.last_recompute == "failed"
+    assert "FileNotFoundError" in failed.reason
 
 
 def test_unchanged_failing_resource_probe_keeps_dependents_green(tmp_path: Path) -> None:

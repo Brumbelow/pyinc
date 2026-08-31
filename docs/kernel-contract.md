@@ -225,8 +225,13 @@ probe-comparison machinery drive invalidation:
   the exception propagates, so a later `get()` re-checks that node instead of
   treating the reader as dependency-free.
 - The exception surfaces **inside the query body**, where the query's own
-  `try`/`except` can see it. A refresh that raises while a dependent is being
-  verified never escapes `get()`.
+  `try`/`except` can see it. An exception no query body handles **propagates
+  out of `db.get()`** — including one raised while a dependent is being
+  verified. The caller sees the exception the load raised; the kernel does not
+  replace it with an error type of its own. The record-keeping is unaffected
+  either way: the failing node still reports `failed` for both `last_decision`
+  and `last_recompute`, with a reason naming the load failure (see
+  [Node Record Fields](#node-record-fields)).
 - An unchanged failing probe does not move the revision, so a query that handled
   the failure stays green across repeated requests. A changed probe — or a
   transition between success and failure in either direction — invalidates the
@@ -1140,6 +1145,51 @@ Dispatch model:
 since backdates and reuses never fire — and the `changed_at` /
 `verified_at` revisions at the time of execution.
 
+## Node Record Fields
+
+An `inspect()` or `explain()` report carries the kernel's decision history for
+every node it shows — the query asked about, and the queries, inputs and
+resources beneath it — in four fields. The first two answer different questions
+and routinely disagree, so both are defined here rather than left to be
+inferred from a report.
+
+- **`last_decision`** — what the most recent request that *touched* this node
+  concluded about it: `executed`, `reused`, `backdated` or `failed`, and
+  `pending` before any request has recorded a decision against it. Touching
+  includes the cheap case: when one request reaches the same node a second
+  time, that reach is recorded as `reused` without re-checking anything, so a
+  node that re-ran and backdated earlier in the same request reads `reused`
+  afterwards.
+- **`last_recompute`** — the outcome of the last time this node's query body
+  actually ran: `executed`, `backdated` or `failed`, and `never` before it ever
+  has. An input node records the set that gave it its value the same way, and a
+  resource node records its load. **A reuse does not advance it** — neither the
+  second reach above nor an ordinary warm reuse across requests, which
+  re-verifies the node's dependencies without running it. A node reporting
+  `last_decision` `reused` may therefore still report `last_recompute`
+  `backdated`: the reuse is what the latest request concluded, the backdate is
+  what the last run produced. The one exception is a checkpoint restore, which
+  stamps **both** fields `reused` on a node this database never ran.
+- **`reason`** — a short phrase describing why that decision was reached,
+  written for a reader. The definitions here are stated in terms of the
+  decisions, not those phrases.
+- **`untracked_reasons`** — the reasons recorded during this node's **most
+  recent run**, in the order that run recorded them and **not deduplicated**: a
+  reason recorded twice in the run appears twice. The list is rebuilt from the
+  run rather than accumulated across runs, so what an earlier run recorded is
+  gone. It holds the reasons a query passed to `db.report_untracked_read(...)`
+  and the ones the kernel recorded on its own account — catching an exception
+  raised by a sub-query, and catching a hook refusal from a resource this
+  `Database` has never loaded, the two cases [Escape Hatches](#escape-hatches)
+  describes. Each reason the kernel records names the sub-query or the resource
+  it caught.
+
+Inspecting a node that already has a record advances neither decision field:
+both read the same before and after. It is not free of accounting, though: it
+opens a request like any other call, so outside a `request_span` each call
+moves `total_requests`, and inside one it joins the span. And inspecting a node
+this database has never executed runs it, exactly as a `get()` would.
+
 ## Public Surface
 
 Everything `pyinc` exports, and nothing else, carries the semver contract.
@@ -1241,7 +1291,7 @@ Inspection and observation:
 | Name | What it is |
 |---|---|
 | `DatabaseStatistics` | Node, input, query, and resource counts plus work counters for one database. Fields: `node_count`, `input_count`, `query_count`, `resource_count`, `query_executions`, `query_reuses`, `query_backdates`, `resource_loads`, `resource_probe_hits`, `input_sets`, `input_equal_ignores`, `evictions`, `total_requests`. |
-| `InspectionNode` | One node in an `inspect`/`explain` report. Fields: `label`, `kind`, `changed_at`, `verified_at`, `last_decision`, `last_recompute`, `reason`, `untracked_reasons`, `dependencies`. |
+| `InspectionNode` | One node in an `inspect`/`explain` report; its decision fields are defined in [Node Record Fields](#node-record-fields). Fields: `label`, `kind`, `changed_at`, `verified_at`, `last_decision`, `last_recompute`, `reason`, `untracked_reasons`, `dependencies`. |
 | `DependencyGraphNode` | One labeled node in the exported dependency graph. Fields: `label`, `kind`, `changed_at`, `verified_at`, `last_decision`, `is_untracked`, `dependency_labels`. |
 | `QueryProfile` | Per-query timing aggregate from `query_profile()`: one execution count with the total, mean, minimum, maximum, and last nanosecond figures. Reuse and backdate counts live on `DatabaseStatistics`. Fields: `query_label`, `execution_count`, `total_ns`, `mean_ns`, `min_ns`, `max_ns`, `last_ns`. |
 | `CaptureInfo` | One entry in an `explain_query_captures` report: a captured name, a reflective namespace read, or one piece of handle state. |
