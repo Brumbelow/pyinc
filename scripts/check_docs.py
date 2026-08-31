@@ -39,6 +39,21 @@ _CHECKPOINT_VERSION_PROSE = (
         re.compile(r"Manifest schema v(?P<version>\d+) rejects"),
     ),
 )
+# Public-surface rows whose description cell must carry a `Fields:` sentence
+# listing the dataclass's own annotated fields, in declaration order.
+_DATACLASS_FIELD_SOURCES = {
+    "DatabaseStatistics": Path("src/pyinc/runtime.py"),
+    "DependencyGraphNode": Path("src/pyinc/runtime.py"),
+    "InspectionNode": Path("src/pyinc/explain.py"),
+    "QueryProfile": Path("src/pyinc/runtime.py"),
+}
+# A table row is one physical line, so both patterns anchor on the raw line and
+# the second one also requires the closing pipe. A wrapped row keeps a
+# well-formed head line, so a `Fields:` sentence that does not open and close on
+# the same line as its name cell is malformed rather than absent.
+_SURFACE_ROW_NAME_CELL = re.compile(r"^\|(?P<name_cell>[^|]*)\|")
+_SURFACE_ROW = re.compile(r"^\|(?P<name_cell>[^|]*)\|(?P<description>[^|]*)\|\s*$")
+_FIELDS_SENTENCE = re.compile(r"Fields:(?P<names>[^.]*)\.")
 _API_FILES = {
     "pyinc": Path("src/pyinc/__init__.py"),
     "pyinc.integrations": Path("src/pyinc/integrations/__init__.py"),
@@ -417,6 +432,77 @@ def check_checkpoint_manifest_version(root: Path) -> tuple[str, ...]:
     return tuple(errors)
 
 
+def _read_dataclass_fields(root: Path, name: str) -> tuple[str, ...]:
+    path = root / _DATACLASS_FIELD_SOURCES[name]
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for statement in tree.body:
+        if not isinstance(statement, ast.ClassDef) or statement.name != name:
+            continue
+        fields = [
+            entry.target.id
+            for entry in statement.body
+            if isinstance(entry, ast.AnnAssign) and isinstance(entry.target, ast.Name)
+        ]
+        return tuple(fields)
+    raise ValueError(f"{path} does not define a class named {name}")
+
+
+def _first_field_difference(documented: tuple[str, ...], declared: tuple[str, ...]) -> str:
+    # The two lists differ in length whenever a name was dropped or invented, so
+    # the common prefix is compared first and the ragged tail is reported below.
+    for position, (written, actual) in enumerate(zip(documented, declared, strict=False), start=1):
+        if written != actual:
+            return f"field {position} is documented as `{written}` but is declared `{actual}`"
+    if len(documented) < len(declared):
+        return f"the sentence stops before the declared field `{declared[len(documented)]}`"
+    return f"the sentence names `{documented[len(declared)]}`, which is not a declared field"
+
+
+def check_documented_dataclass_fields(root: Path) -> tuple[str, ...]:
+    """Compare the public-surface field lists with the dataclasses they describe."""
+    contract_path = root / "docs/kernel-contract.md"
+    errors: list[str] = []
+    in_section = False
+    for line in contract_path.read_text(encoding="utf-8").splitlines():
+        heading = _HEADING.match(line)
+        if heading is not None:
+            in_section = heading.group("title") == "Public Surface"
+            continue
+        if not in_section:
+            continue
+        name_cell = _SURFACE_ROW_NAME_CELL.match(line)
+        if name_cell is None:
+            continue
+        names = _INLINE_CODE.findall(name_cell.group("name_cell"))
+        if len(names) != 1 or names[0] not in _DATACLASS_FIELD_SOURCES:
+            continue
+        name = names[0]
+        row = _SURFACE_ROW.match(line)
+        if row is None:
+            errors.append(
+                f"docs/kernel-contract.md: the {name} row is not a single two-cell row on one line"
+            )
+            continue
+        description = row.group("description")
+        sentence = _FIELDS_SENTENCE.search(description)
+        if sentence is None:
+            detail = (
+                "no `Fields:` sentence ending in a period"
+                if "Fields:" in description
+                else "no `Fields:` sentence"
+            )
+            errors.append(f"docs/kernel-contract.md: the {name} row has {detail}")
+            continue
+        documented = tuple(_INLINE_CODE.findall(sentence.group("names")))
+        declared = _read_dataclass_fields(root, name)
+        if documented != declared:
+            errors.append(
+                f"docs/kernel-contract.md: {name} field list disagrees with the dataclass: "
+                + _first_field_difference(documented, declared)
+            )
+    return tuple(errors)
+
+
 def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
     """Run every offline documentation check."""
     files = markdown_files(root)
@@ -430,6 +516,7 @@ def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
         *check_documented_integration_api(root),
         *check_documented_kernel_api(root),
         *check_checkpoint_manifest_version(root),
+        *check_documented_dataclass_fields(root),
     )
 
 

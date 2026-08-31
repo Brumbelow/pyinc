@@ -1240,10 +1240,10 @@ Inspection and observation:
 
 | Name | What it is |
 |---|---|
-| `DatabaseStatistics` | Node, edge, and work counters for one database. |
-| `InspectionNode` | One node in an `inspect`/`explain` report: decision, reason, dependencies. |
-| `DependencyGraphNode` | One labeled node in the exported dependency graph. |
-| `QueryProfile` | Per-query execution/reuse/backdate counts from profiling. |
+| `DatabaseStatistics` | Node, input, query, and resource counts plus work counters for one database. Fields: `node_count`, `input_count`, `query_count`, `resource_count`, `query_executions`, `query_reuses`, `query_backdates`, `resource_loads`, `resource_probe_hits`, `input_sets`, `input_equal_ignores`, `evictions`, `total_requests`. |
+| `InspectionNode` | One node in an `inspect`/`explain` report. Fields: `label`, `kind`, `changed_at`, `verified_at`, `last_decision`, `last_recompute`, `reason`, `untracked_reasons`, `dependencies`. |
+| `DependencyGraphNode` | One labeled node in the exported dependency graph. Fields: `label`, `kind`, `changed_at`, `verified_at`, `last_decision`, `is_untracked`, `dependency_labels`. |
+| `QueryProfile` | Per-query timing aggregate from `query_profile()`: one execution count with the total, mean, minimum, maximum, and last nanosecond figures. Reuse and backdate counts live on `DatabaseStatistics`. Fields: `query_label`, `execution_count`, `total_ns`, `mean_ns`, `min_ns`, `max_ns`, `last_ns`. |
 | `CaptureInfo` | One entry in an `explain_query_captures` report: a captured name, a reflective namespace read, or one piece of handle state. |
 | `explain_query_captures` | Preview how a query's captures will be classified before first `get`; also reports reflective namespace reads and, given a `Query`, its handle state. |
 | `Subscription` | Handle returned by `Database.observe`; closes the subscription. |
