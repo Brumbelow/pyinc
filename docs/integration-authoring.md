@@ -184,6 +184,12 @@ one. The query hands back the new value while declaring that nothing changed, an
 dependent that reads position, byte offsets or whitespace out of it stays valid on the
 strength of that declaration.
 
+The kernel contract states the general form of that rule as **substitutivity** and
+allows a coarser policy at a price -- from-scratch consistency then holds modulo the
+equivalence the policy declares -- so the token rule above is the stronger of the two,
+and a query that meets it owes no separate substitutivity argument (see
+[condition 3](kernel-contract.md#conditions-for-from-scratch-consistency)).
+
 The consequence for raw text is direct: **a query that returns a file's text takes no
 `cutoff=`.** Any token you could write for it is some projection of the file, and no
 projection of a file is as fine as the file.
@@ -202,11 +208,18 @@ def import_statements_for_file(db: Database, path: str) -> tuple[ImportStatement
     ...
 ```
 
-A comment-only edit re-runs both. `source_text` executes and answers with what is on
-disk. `import_statements_for_file` re-parses and lands an equal payload, which the
-kernel backdates on the value itself, under default equality and with no policy at all
--- so everything downstream of the parse is reused, and nothing was told the file is
-unchanged.
+An edit the projection does not carry re-runs both. `source_text` executes and answers
+with what is on disk. `import_statements_for_file` re-parses and lands an equal payload,
+which the kernel backdates on the value itself, under default equality and with no
+policy at all -- so everything downstream of the parse is reused, and nothing was told
+the file is unchanged.
+
+An edit the projection *does* carry buys none of that, and "comment-only" is not the
+test. The payload's line number is part of this projection: a comment inserted above
+the statement whose line number the payload carries moves it, the re-parse lands a
+different payload, there is nothing to backdate, and the parse's consumers run again.
+Read the payload, not the edit -- what a coarser payload buys is incrementality, and it
+buys it only for the edits the payload drops.
 
 **Why?** Backdating is the Salsa/Skyframe optimization that prevents false ripple when
 recomputation yields a semantically equivalent result, and it is worth having. A
@@ -281,9 +294,12 @@ helpers are not re-exported. Reference:
 
 **Mode-parametrized correctness tests.** Verify results across `strict`, `checked`, and
 `fast` modes. Reference: `test_file_analysis_reports_top_level_symbols_by_mode` in
-`tests/test_python_source.py`. Verify backdating explicitly: non-semantic edits should
-trigger backdating and downstream reuse. Reference:
-`test_comment_only_edit_reuses_downstream_analysis` in the same file.
+`tests/test_python_source.py`. Verify backdating explicitly, and verify the property
+the payload actually claims rather than a class of edits: an edit the payload does not
+carry lands an equal payload, backdates, and leaves everything downstream reused, while
+an edit it does carry lands a different payload and re-runs those consumers. Both
+halves need a test. References: `test_comment_only_edit_reuses_downstream_analysis` and
+`test_comment_inserted_above_the_import_reruns_downstream_analysis` in the same file.
 
 **From-scratch consistency tests.** The gold standard: compare incremental results against
 fresh-database recomputation over a sequence of state changes. Reference:
@@ -318,6 +334,8 @@ A new integration needs:
 - [ ] Mode-parametrized correctness tests cover `strict`, `checked`, and `fast`
 - [ ] From-scratch consistency test compares incremental vs fresh over edit sequences
 - [ ] Every high-level entrypoint refuses a query body before any other work
+- [ ] A test pins the comparison property on real edits: equal tokens imply an equal
+      public payload, and an edit the payload does carry re-runs its consumers
 
 ## Canonical End-to-End Example: `calc`
 

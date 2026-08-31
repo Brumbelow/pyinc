@@ -293,6 +293,47 @@ def test_comment_only_edit_reuses_downstream_analysis(
     assert db.inspect(file_analysis_payload, str(path)).last_decision == "reused"
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_comment_inserted_above_the_import_reruns_downstream_analysis(
+    mode: str, tmp_path: Path
+) -> None:
+    """A comment above the import moves the payload, so nothing below it is reused.
+
+    `ImportStatementPayload` carries each statement's line number, so an edit
+    above the statement whose line number the payload carries lands a different
+    payload: the parse has nothing to backdate and every consumer of it runs
+    again. Only incrementality is lost -- the warm answer still equals a fresh
+    one, which is what the last assertion pins.
+    """
+    path = tmp_path / "sample.py"
+    path.write_text("import os\n", encoding="utf-8")
+    db = Database(mode=mode)
+
+    first = file_analysis(db, path)
+    assert first.imports == (ImportRef(module="os", kind="import", range=_range(0, 0, 9)),)
+    assert import_statements_for_file(db, str(path)) == (("os", "import", 1, ()),)
+    executions_before = db.statistics().query_executions
+
+    path.write_text("# leading comment\nimport os\n", encoding="utf-8")
+    second = file_analysis(db, path)
+    executed = db.statistics().query_executions - executions_before
+
+    # The third slot is the statement's line number, and the inserted line moved it.
+    assert import_statements_for_file(db, str(path)) == (("os", "import", 2, ()),)
+    # So the parse re-ran on a value that changed rather than backdating on an
+    # equal one, and the five nodes whose values moved with it all executed: the
+    # read, the parse, `imports_for_file`, the ranges and the analysis payload.
+    # Backdating instead would leave only the read, since the parse would absorb
+    # the edit. `definitions_for_file` and `syntax_diagnostics_for_file` do
+    # backdate here -- this file declares neither.
+    assert db.inspect(import_statements_for_file, str(path)).last_recompute == "executed"
+    assert executed == 5
+
+    # Nothing was answered wrongly; the edit only cost the reuse.
+    assert second.imports == (ImportRef(module="os", kind="import", range=_range(1, 0, 9)),)
+    assert second == file_analysis(Database(mode=mode), path)
+
+
 def test_semantic_edit_invalidates_downstream_analysis(tmp_path: Path) -> None:
     path = tmp_path / "sample.py"
     path.write_text("import os\n", encoding="utf-8")

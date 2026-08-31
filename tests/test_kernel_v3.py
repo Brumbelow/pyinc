@@ -29,6 +29,7 @@ from pyinc import (
     Database,
     FileStatResource,
     FileStatSnapshot,
+    FileSystemArtifactStore,
     FrozenGraph,
     InMemoryArtifactStore,
     Input,
@@ -659,13 +660,18 @@ def test_query_identity_includes_defaults_and_keyword_defaults() -> None:
     assert db._query_key(first, (), {})[0].identity != db._query_key(second, (), {})[0].identity
 
 
-def test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative() -> None:
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative(
+    mode: str, tmp_path: Path
+) -> None:
     """Pins the documented shape of consistency under a coarse policy.
 
     A cutoff that declares two values unchanged makes dependents consistent
     modulo that equivalence: they legitimately stay at results computed from
     the earlier representative, while a fresh database starts from the later
     one. Exact-value agreement requires a substitutive policy (condition 3).
+    The equivalence is not a within-process effect: a checkpoint saved while a
+    dependent sits at the earlier representative reloads it unchanged.
     """
     coarse = Input[int]("congruence.value", cutoff=lambda _value: 0)
 
@@ -673,16 +679,28 @@ def test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative(
     def doubled(db: Database) -> int:
         return coarse.read(db) * 2
 
-    db = Database(mode="checked")
+    db = Database(mode=mode, store=FileSystemArtifactStore(tmp_path))
     db.set(coarse, 1)
     assert db.get(doubled) == 2
 
     db.set(coarse, 2)
     assert db.get(doubled) == 2
 
-    fresh = Database(mode="checked")
+    fresh = Database(mode=mode)
     fresh.set(coarse, 2)
     assert fresh.get(doubled) == 4
+
+    # The dependent is already stale when the checkpoint is written, and the
+    # same store directory is read back with nothing edited in between.
+    checkpoint = db.save_checkpoint()
+    reloaded = Database(mode=mode, store=FileSystemArtifactStore(tmp_path))
+    reloaded.set(coarse, 2)
+    reloaded.load_checkpoint(checkpoint)
+
+    assert reloaded.get(doubled) == 2
+    # Nothing recomputed it: the reload carried the earlier representative's
+    # result across, rather than the loader deriving 4 from the input it holds.
+    assert reloaded.statistics().query_executions == 0
 
 
 def test_live_kwdefault_mutation_changes_query_identity_between_requests() -> None:
