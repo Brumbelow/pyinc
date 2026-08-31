@@ -92,8 +92,13 @@ listing, and `Path.iterdir()` are intercepted outside resource scope and raise
 extensions—call `db.report_untracked_read(reason)`. That node then executes on
 every request and cannot backdate.
 
-Custom resources implement the public `read`, `probe`, `load`, optional
-`probe_and_load`, `identity`, and `label` hooks. Read the
+A custom resource implements `probe`, `load`, and `label`; `read`,
+`probe_and_load`, and `identity` arrive with working defaults you may override.
+The instance itself must be snapshot-safe — a frozen dataclass whose fields are
+themselves snapshot-safe, or a class whose `identity()` returns a snapshot-safe
+value — or the first `get()` of a query that captures it is refused. The kernel
+probes a resource when a request needs that node verified: at most one standalone
+probe per request per resource key, none if the node is not reached. Read the
 [kernel contract](kernel-contract.md#conditions-for-from-scratch-consistency)
 before relying on a custom probe across checkpoints.
 

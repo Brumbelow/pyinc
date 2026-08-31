@@ -2293,6 +2293,22 @@ class _StableTallyingResource(Resource[str, str, tuple[str]]):
         return f"stable-tallying[{key}]"
 
 
+@dataclass(frozen=True)
+class _TallyingContentResource(Resource[str, str, tuple[str]]):
+    """Probes the file's own text, so an edit is a probe the record misses."""
+
+    def probe(self, key: str) -> tuple[str]:
+        _resource_tally(key, "p")
+        return (Path(key).read_text(encoding="utf-8"),)
+
+    def load(self, db: Database, key: str) -> str:
+        _resource_tally(key, "l")
+        return Path(key).read_text(encoding="utf-8")
+
+    def label(self, key: str) -> str:
+        return f"tallying-content[{key}]"
+
+
 @dataclass
 class _ReparameterizingResource(Resource[str, str, tuple[str, int]]):
     """Declares its own identity and moves it deliberately.
@@ -2407,6 +2423,100 @@ def test_a_frozen_resource_reuses_its_record(mode: str, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_node_a_request_does_not_reach_is_not_probed(mode: str, tmp_path: Path) -> None:
+    """Zero probe hits does not mean the node went unprobed.
+
+    ``resource_probe_hits`` counts probes that answered "unchanged", so a node
+    that is reached and whose probe misses records the same zero as a node the
+    request never reaches at all. The hook trace is what parts them.
+    """
+
+    resource = _TallyingContentResource()
+    reached = str(tmp_path / "reached.txt")
+    unreached = str(tmp_path / "unreached.txt")
+    Path(reached).write_text("first", encoding="utf-8")
+    Path(unreached).write_text("other", encoding="utf-8")
+
+    @query
+    def read_key(db: Database, key: str) -> str:
+        return resource.read(db, key)
+
+    assert (_resource_tallied(reached), _resource_tallied(unreached)) == ("", "")
+
+    db = Database(mode=mode)
+    assert db.get(read_key, reached) == "first"
+    assert db.get(read_key, unreached) == "other"
+    before = db.statistics()
+    assert (before.resource_count, before.resource_loads, before.resource_probe_hits) == (
+        2,
+        2,
+        0,
+    )
+
+    # One request, reaching exactly one of the two nodes -- the one whose file
+    # moved underneath it.
+    Path(reached).write_text("second", encoding="utf-8")
+    assert db.get(read_key, reached) == "second"
+    after = db.statistics()
+
+    # Reached and missed: the standalone probe ran, disagreed, and the
+    # combined observation reloaded.
+    assert _resource_tallied(reached) == "pl" + "ppl"
+    assert after.resource_loads == before.resource_loads + 1
+    # Not reached: no hook ran on it at all.
+    assert _resource_tallied(unreached) == "pl"
+    # Both nodes contributed zero hits, which is why the counter alone cannot
+    # tell the two cases apart: a miss is not a hit, and neither is a probe
+    # that never ran.
+    assert after.resource_probe_hits == 0
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_span_with_no_declared_change_probes_once(mode: str, tmp_path: Path) -> None:
+    """Four top-level gets inside one span cost one request and one probe.
+
+    The span example in the kernel contract shows four calls costing two
+    requests and two probes because it declares a change halfway through, which
+    rolls the span onto a second request. A span that declares no change is the
+    other shape, and it is the one that shows what a span is worth.
+    """
+
+    resource = _TallyingContentResource()
+    target = str(tmp_path / "notes.txt")
+    Path(target).write_text("body", encoding="utf-8")
+
+    @query
+    def read_key(db: Database, key: str) -> str:
+        return resource.read(db, key)
+
+    assert _resource_tallied(target) == ""
+
+    db = Database(mode=mode)
+    assert db.get(read_key, target) == "body"
+    warm = db.statistics()
+
+    with db.request_span():
+        for _ in range(4):
+            assert db.get(read_key, target) == "body"
+    spanned = db.statistics()
+    assert spanned.total_requests - warm.total_requests == 1
+    assert spanned.resource_probe_hits - warm.resource_probe_hits == 1
+    assert spanned.resource_loads == warm.resource_loads
+    assert _resource_tallied(target) == "pl" + "p"
+
+    # The same four calls outside a span open four requests and re-probe on
+    # every one of them: the span is what collapses the validation, not the
+    # record.
+    for _ in range(4):
+        assert db.get(read_key, target) == "body"
+    bare = db.statistics()
+    assert bare.total_requests - spanned.total_requests == 4
+    assert bare.resource_probe_hits - spanned.resource_probe_hits == 4
+    assert bare.resource_loads == warm.resource_loads
+    assert _resource_tallied(target) == "pl" + "p" + "pppp"
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_resource_defining_its_own_identity_may_reparameterize(
     mode: str, tmp_path: Path
 ) -> None:
@@ -2463,11 +2573,15 @@ def test_a_resource_that_becomes_unreadable_still_recomputes(mode: str, tmp_path
     assert (stats.query_executions, stats.query_reuses, stats.resource_count) == (1, 1, 1)
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_env_resource_instances_share_stable_behavior(
+    mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     env_a = EnvResource()
     env_b = EnvResource()
+    assert env_a is not env_b
+    assert env_a == env_b
     monkeypatch.setenv("PYINC_SAMPLE", "value")
 
     @query
@@ -2478,9 +2592,21 @@ def test_env_resource_instances_share_stable_behavior(
     def read_b(db: Database) -> str | None:
         return env_b.read(db, "PYINC_SAMPLE")
 
-    db = Database()
+    db = Database(mode=mode)
     assert db.get(read_a) == "value"
+    first = db.statistics()
+    assert (first.resource_count, first.resource_loads) == (1, 1)
+
+    # Two separate but equal instances are one node, not two: the key is
+    # derived from the resource type, its identity() payload and the
+    # parameter, and none of the three separates them. The second query reads
+    # the record the first one wrote, so nothing loads again. The exported
+    # dependency_graph() labels cannot witness this -- they come from the same
+    # key and read identically for both instances -- so the counters do.
     assert db.get(read_b) == "value"
+    second = db.statistics()
+    assert (second.resource_count, second.resource_loads) == (1, 1)
+    assert second.resource_probe_hits == first.resource_probe_hits + 1
 
 
 def test_query_lru_eviction_prunes_oldest_query_records() -> None:

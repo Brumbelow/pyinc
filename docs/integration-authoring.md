@@ -98,24 +98,50 @@ query execution and raises `UntrackedReadError` otherwise.
 **Built-in resources:** `FileResource`, `BinaryFileResource`, `FileStatResource`,
 `EnvResource`, `DirectoryResource`, and `ResolvedPathResource` cover common cases.
 
-**Custom resources:** When built-in resources do not fit, define a custom resource as a
-frozen dataclass implementing the public `Resource[KeyT, ValueT, ProbeT]` hooks:
+**Custom resources:** When built-in resources do not fit, subclass
+`Resource[KeyT, ValueT, ProbeT]`. Three of the six public hooks are yours to write,
+three arrive with working defaults, and the class itself owes one thing that is not a
+hook at all.
+
+**Required hooks** -- the base class raises `NotImplementedError` for each:
+
+- `probe(key)` -- returns a cheap, snapshot-safe fingerprint for change detection.
+  Must not require `db`. The kernel probes a resource when a request needs that node
+  verified: at most one standalone probe per request per resource key, none if the
+  node is not reached.
+- `load(db, key)` -- performs the actual I/O. The database applies raw-read allowance
+  internally while invoking resource hooks, so the `db` a hook is handed is for that
+  allowance and not for reading back: `get`, `read_input`, `read_resource`, and every
+  administrative and observational entry point raise `ReentrantDatabaseError` when a
+  hook calls them (kernel-contract.md condition 2).
+- `label(key)` -- returns a human-readable string for provenance display.
+
+**Required of the class, not of a hook:** a snapshot-safe instance -- a frozen
+dataclass whose fields are themselves snapshot-safe, or a class whose `identity()`
+returns a snapshot-safe value. The kernel enforces this: a resource that is neither is
+refused by the first `get()` of a query that captures it, with `UnsupportedValueError`
+naming the resource, before any hook runs.
+
+**Inherited defaults you may override:**
 
 - `read(db, key)` -- public read method; delegates to `db.read_resource(self, key)`.
-- `label(key)` -- returns a human-readable string for provenance display.
-- `probe(key)` -- returns a cheap, snapshot-safe fingerprint for change detection.
-  Must not require `db`. Called on every request.
-- `load(db, key)` -- performs the actual I/O. The database applies raw-read allowance
-  internally while invoking resource hooks.
-- `probe_and_load(db, key)` -- observes the probe and value from one underlying state
-  when separate calls could race.
-- `identity()` -- optionally returns snapshot-safe resource configuration.
+- `probe_and_load(db, key)` -- probes, then loads. Override it to observe the probe and
+  value from one underlying state when separate calls could race.
+- `identity()` -- returns the resource itself. Override it to declare snapshot-safe
+  resource configuration when the instance is not snapshot-safe on its own.
+
+Hook bodies are walked by the capture fingerprinter exactly like query bodies, so a
+hook that touches mutable module state is refused the same way, before it ever runs.
 
 Reference: `_SourceTextResource` uses SHA-256 content hashing in `probe` for precise
 invalidation beyond stat-based detection.
 
-Instantiate resources as **module-level singletons**: `_FILES = _SourceTextResource()`,
-`_DIRECTORIES = DirectoryResource()`.
+Instantiate resources as **module-level singletons** by convention:
+`_FILES = _SourceTextResource()`, `_DIRECTORIES = DirectoryResource()`. The convention
+buys fewer identity fingerprints and one obvious handle; it is not what collapses
+duplicates. Two equal instances of the same snapshot-safe resource already map to one
+node, because the node key is derived from the resource type plus the `identity()`
+payload plus the parameter.
 
 **Why?** Resources are how the kernel enforces tracked ambient reads (kernel-contract.md
 condition 2). `probe_and_load` prevents torn observations while `probe` keeps validation
@@ -274,9 +300,11 @@ A new integration needs:
       tuples, or a plain string for raw text), with explicit decode transformations
       where the public dataclass shape differs
 - [ ] High-level entrypoints decode payloads into frozen dataclasses
-- [ ] Custom resources implement the public
-      `read`/`label`/`probe`/`load`/`probe_and_load`/`identity` hooks as frozen dataclasses
-- [ ] Resource instances are module-level singletons
+- [ ] Custom resources implement the required `probe`/`label`/`load` hooks, and override
+      the inherited `read`/`probe_and_load`/`identity` defaults only where those defaults
+      do not fit, as frozen dataclasses whose fields are themselves snapshot-safe
+- [ ] Resource instances are module-level singletons by convention; equal instances of a
+      snapshot-safe resource already share one node
 - [ ] Uncertain resolution cases return conservative outcomes, not optimistic reuse
 - [ ] Dynamic or unsupported cases call `db.report_untracked_read(reason)`
 - [ ] Recursive traversal uses canonical visited sets and root containment checks

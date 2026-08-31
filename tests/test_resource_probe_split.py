@@ -13,6 +13,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from pyinc import Database, query
 from pyinc.resources import FileStatResource, Resource
 
@@ -119,7 +121,16 @@ class _FlakyProbeResource(Resource[str, str, str]):
         return f"flaky-probe[{key}]"
 
 
-def test_warm_unchanged_read_probes_without_loading(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_warm_unchanged_read_probes_without_loading(mode: str, tmp_path: Path) -> None:
+    """Only probe, load and label are written here; the rest are inherited.
+
+    The resource implements exactly the three hooks the base class leaves
+    unimplemented, so this drives the whole path -- first read, warm
+    validation, invalidation, and a from-scratch comparison -- on the smallest
+    resource that can exist.
+    """
+
     resource = _TallyingFileResource()
     target = str(tmp_path / "data.txt")
     Path(target).write_text("hello", encoding="utf-8")
@@ -128,7 +139,11 @@ def test_warm_unchanged_read_probes_without_loading(tmp_path: Path) -> None:
     def read_file(db: Database, key: str) -> str:
         return resource.read(db, key)
 
-    db = Database()
+    # Each mode gets its own tmp_path, so the tally beside the key starts
+    # empty; a cell reading another cell's tally would show up right here.
+    assert _tallied(target) == ""
+
+    db = Database(mode=mode)
     assert db.get(read_file, target) == "hello"
     assert _tallied(target) == "pl"
 
@@ -138,9 +153,22 @@ def test_warm_unchanged_read_probes_without_loading(tmp_path: Path) -> None:
     # An unchanged file is validated by the probe alone: read + hash, no
     # decode. The load must not run again until the probe misses.
     assert _tallied(target) == "pl" + "ppp"
+    assert db.statistics().resource_loads == 1
     record = db._records[db._resource_key(resource, target)]
     assert record.last_decision == "reused"
     assert record.reason == "resource probe unchanged"
+
+    # The probe misses once the bytes move: a standalone probe that
+    # disagrees, then the combined observation that reloads, and the answer
+    # follows the file.
+    Path(target).write_text("world", encoding="utf-8")
+    assert db.get(read_file, target) == "world"
+    assert _tallied(target) == "pl" + "ppp" + "ppl"
+    assert db.statistics().resource_loads == 2
+
+    # The warm answer is the one a database with no history gives. Reading
+    # through the fresh database tallies again, so it goes last.
+    assert Database(mode=mode).get(read_file, target) == "world"
 
 
 def test_probe_mismatch_stores_the_atomically_observed_pair(tmp_path: Path) -> None:
