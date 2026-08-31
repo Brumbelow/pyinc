@@ -910,13 +910,14 @@ decided at release time.
   drops. It keeps the fields in declaration order with their values, tagged
   with the class's `__qualname__` alone — so two same-named dataclasses
   defined in different modules share a tag, and instances whose ordered fields
-  and values match serialize to identical bytes. It drops the class itself:
-  thawing hands back a dictionary, and rebuilding the original class takes a
-  `ValueAdapter`, where the `FrozenRecord` row previously said the snapshot
-  preserves type identity. A pure nested value drops only the `FrozenGraph`
-  envelope — it is frozen through, one frozen shell per container at every
-  level, so no alias to a container in the source can influence the snapshot —
-  where the text previously said pure trees pay no overhead.
+  and encoded values match serialize to identical bytes. It drops the class
+  itself: thawing hands back a dictionary, and rebuilding the original class
+  takes a `ValueAdapter`, where the `FrozenRecord` row previously said the
+  snapshot preserves type identity. A pure nested value drops only the
+  `FrozenGraph` envelope — it is frozen through, one frozen shell per
+  container at every level, so no alias to a container in the source can
+  influence the snapshot — where the text previously said pure trees pay no
+  overhead.
 - The authoring and getting-started guides say which hooks a custom resource
   owes. `probe`, `load` and `label` are the three an author writes; `read`,
   `probe_and_load` and `identity` arrive with working defaults to override

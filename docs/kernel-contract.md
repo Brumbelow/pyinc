@@ -52,8 +52,8 @@ Dataclasses thaw to dictionaries because the kernel does not import and
 reconstruct arbitrary user classes. The kernel tags such a snapshot with the
 class's `__qualname__` alone, so two same-named dataclasses defined in
 different modules produce the same tag, and instances whose ordered fields and
-values match serialize to identical bytes. Its own resource snapshot types are
-the exception: a `Database` registers built-in adapters for them, so
+encoded values match serialize to identical bytes. Its own resource snapshot
+types are the exception: a `Database` registers built-in adapters for them, so
 `FileStatSnapshot` is rebuilt as itself at every boundary in every mode.
 `BUILTIN_ADAPTERS` names those entries, and registering an adapter for one of
 those types replaces the built-in rather than colliding with it. A dataclass, a
@@ -1214,7 +1214,7 @@ Inspecting a node that already has a record advances neither decision field:
 both read the same before and after. It is not free of accounting, though: it
 opens a request like any other call, so outside a `request_span` each call
 moves `total_requests`, and inside one it joins the span. And inspecting a node
-this database has never executed runs it, exactly as a `get()` would.
+that has no record executes it.
 
 ## Public Surface
 
