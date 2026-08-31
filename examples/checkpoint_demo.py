@@ -84,7 +84,7 @@ def main() -> None:
         print(f"run2_result={result2}")  # same result: 15
 
         node2 = db2.inspect(scaled_word_count, data_path)
-        print(f"run2_decision={node2.last_recompute}")  # "reused"
+        print(f"run2_last_recompute={node2.last_recompute}")  # "reused"
         stats2 = db2.statistics()
         print(f"run2_executions={stats2.query_executions}")  # 0
 
@@ -101,7 +101,7 @@ def main() -> None:
         print(f"run3_result={result3}")  # 5 words * 10 = 50
 
         node3 = db3.inspect(scaled_word_count, data_path)
-        print(f"run3_decision={node3.last_recompute}")  # "executed"
+        print(f"run3_last_recompute={node3.last_recompute}")  # "executed"
         stats3 = db3.statistics()
         print(f"run3_executions={stats3.query_executions}")  # 1
 

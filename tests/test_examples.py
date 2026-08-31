@@ -84,11 +84,20 @@ def test_checkpoint_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "run1_result=15" in output
     assert "run1_executions=3" in output
     assert "run2_result=15" in output
-    assert "run2_decision=reused" in output
+    assert "run2_last_recompute=reused" in output
     assert "run2_executions=0" in output
     assert "run3_result=50" in output
-    assert "run3_decision=executed" in output
+    assert "run3_last_recompute=executed" in output
     assert "run3_executions=1" in output
+
+    # The two labels above name the field the demo reads, and the values they
+    # print are equal to `last_decision` at both runs -- so the assertions on
+    # the output alone hold just as well if the reads are switched. These pin
+    # the reads themselves.
+    source = (EXAMPLES_DIR / "checkpoint_demo.py").read_text(encoding="utf-8")
+    assert "node2.last_recompute" in source
+    assert "node3.last_recompute" in source
+    assert "last_decision" not in source
 
 
 def test_action_reconcile_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
