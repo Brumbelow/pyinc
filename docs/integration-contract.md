@@ -66,13 +66,17 @@ below sets out.
 
 `toml_config`, `json_config`, and `xml_config` each cap how deeply a document
 may nest, and each names its cap in the diagnostic that rejects it. The cap
-bounds the *cache* rather than the parser: every section re-emits its ancestors'
-dot path, so cached payloads grow with the square of the nesting depth. Each cap
-keeps a document at the cap inside the same ~1 MiB payload budget and inside
-what `freeze` will snapshot, so nothing these integrations accept can fail to
-cache. None of the three raises `RecursionError`: when the interpreter's stack
-is exhausted the diagnostic carries that integration's fixed text. Stack
-exhaustion is a property of the caller's remaining stack, not of the file.
+bounds the depth-driven growth of the *cache* rather than the parser: every
+section re-emits its ancestors' dot path, so cached payloads grow with the
+square of the nesting depth. At the cap, for the key lengths each integration's
+own cap rationale measures, a document stays inside the same ~1 MiB payload
+budget and inside what `freeze` will snapshot. The cap is not a size bound:
+payload size also scales with key length and with document width, so a wide
+document at shallow depth and a document at the cap with long keys are both
+accepted and can cache more than that budget. None of the three raises
+`RecursionError`: when the interpreter's stack is exhausted the diagnostic
+carries that integration's fixed text. Stack exhaustion is a property of the
+caller's remaining stack, not of the file.
 
 ## TOML configuration
 

@@ -94,9 +94,12 @@ class _JsonSurrogateKeyError(ValueError):
 
 # Object and array nesting is capped before parsing because every section re-emits
 # the dot path of all its ancestors: `json_sections_payload` grows with the square
-# of the nesting depth, so this cap is what bounds the *cache*, not just the parse.
-# `xml_config` caps `_MAX_XML_DEPTH` for the same reason and against the same
-# budget — a document at the cap must not cache more than ~1 MiB.
+# of the nesting depth, so this cap is what bounds the depth-driven growth of the
+# *cache*, not just the parse. `xml_config` caps `_MAX_XML_DEPTH` for the same
+# reason and against the same budget — at the key length that budget is stated for,
+# a document at the cap must not cache more than ~1 MiB. Width at shallow depth is
+# bounded by none of that: a document of many sibling objects two levels deep is
+# accepted and can cache past the budget.
 #
 # The budget is what puts the cap at 200: measured with 20-character keys, a
 # document at this cap caches 832 KB of section payload text (422 KB of it section

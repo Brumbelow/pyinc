@@ -834,6 +834,63 @@ def test_sections_payload_at_the_cap_stays_within_the_amplification_budget() -> 
     assert len(repr(tuple(sections))) < _SECTIONS_PAYLOAD_BUDGET
 
 
+# The cap is not a size bound, and the two cells below are the two ways past it.
+# Both measure the payload the way the cell above does and against the same
+# constant: `_walk_sections` over the parsed document, which is exactly the tuple
+# `json_sections_payload` caches. Both documents are accepted with no
+# diagnostics, so the budget is a property of the cap's own rationale rather than
+# of everything the integration takes.
+#
+# Width first. This document is two levels deep, two orders of magnitude inside
+# `_MAX_JSON_DEPTH`, and its payload runs over the budget on sibling count alone.
+_WIDE_SIBLING_COUNT = 20_000
+
+# Then key length, at the cap. The payload scales linearly in key length on top of
+# the quadratic depth term, so a key long enough past the length the cap rationale
+# measures takes a document at the cap over the same budget.
+_OVER_BUDGET_KEY_LENGTH = 36
+
+
+def _wide_shallow_json() -> str:
+    """One object holding `_WIDE_SIBLING_COUNT` sibling objects, one scalar each."""
+    siblings = {
+        f"s{index:0{_BUDGETED_KEY_LENGTH - 1}d}": {"leaf": 1}
+        for index in range(_WIDE_SIBLING_COUNT)
+    }
+    return json.dumps(siblings)
+
+
+def test_a_wide_shallow_document_is_accepted_and_caches_over_the_budget(
+    tmp_path: Path,
+) -> None:
+    text = _wide_shallow_json()
+    path = tmp_path / "config.json"
+    path.write_text(text, encoding="utf-8")
+
+    analysis = json_analysis(Database(), str(path))
+    sections = _walk_sections(_load_json(text), "")
+
+    assert _text_nesting_depth(text) == 2
+    assert analysis.diagnostics == ()
+    assert len(analysis.sections) == _WIDE_SIBLING_COUNT + 1
+    assert len(repr(tuple(sections))) > _SECTIONS_PAYLOAD_BUDGET
+
+
+def test_a_document_at_the_cap_with_long_keys_is_accepted_and_caches_over_the_budget(
+    tmp_path: Path,
+) -> None:
+    text = _nested_json(_MAX_JSON_DEPTH, key="k" * _OVER_BUDGET_KEY_LENGTH)
+    path = tmp_path / "config.json"
+    path.write_text(text, encoding="utf-8")
+
+    analysis = json_analysis(Database(), str(path))
+    sections = _walk_sections(_load_json(text), "")
+
+    assert analysis.diagnostics == ()
+    assert len(analysis.sections) == _MAX_JSON_DEPTH
+    assert len(repr(tuple(sections))) > _SECTIONS_PAYLOAD_BUDGET
+
+
 # ---------------------------------------------------------------------------
 # Stack exhaustion
 # ---------------------------------------------------------------------------

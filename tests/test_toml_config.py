@@ -1018,6 +1018,61 @@ def test_sections_payload_at_the_cap_stays_within_the_amplification_budget() -> 
     assert len(repr(tuple(sections))) < _SECTIONS_PAYLOAD_BUDGET
 
 
+# The cap is not a size bound, and the two cells below are the two ways past it.
+# Both measure the payload the way the cell above does and against the same
+# constant: `_walk_sections` over the parsed document, which is exactly the tuple
+# `config_sections_payload` caches. Both documents are accepted with no
+# diagnostics, so the budget is a property of the cap's own rationale rather than
+# of everything the integration takes.
+#
+# Width first, and TOML reaches the budget at the shallowest nesting that yields
+# sibling sections at all: a file of tables writing one header component each,
+# which runs over on table count alone.
+_WIDE_TABLE_COUNT = 20_000
+
+# Then name length, at the cap. The payload scales linearly in name length on top
+# of the quadratic depth term, so a name long enough past the length the cap
+# rationale measures takes a document at the cap over the same budget.
+_OVER_BUDGET_NAME_LENGTH = 36
+
+
+def _wide_shallow_tables() -> str:
+    """`_WIDE_TABLE_COUNT` sibling tables, one `_BUDGETED_NAME_LENGTH` key each."""
+    key = "k" * _BUDGETED_NAME_LENGTH
+    return "".join(f"[t{index:05d}]\n{key} = 1\n" for index in range(_WIDE_TABLE_COUNT))
+
+
+def test_a_wide_shallow_document_is_accepted_and_caches_over_the_budget(
+    tmp_path: Path,
+) -> None:
+    text = _wide_shallow_tables()
+    path = tmp_path / "pyproject.toml"
+    path.write_text(text, encoding="utf-8")
+
+    analysis = config_analysis(Database(), str(path))
+    sections = _walk_sections(_load_toml(text), "")
+
+    assert _structure_depth(_load_toml(text)) == 2
+    assert analysis.diagnostics == ()
+    assert len(analysis.sections) == _WIDE_TABLE_COUNT + 1
+    assert len(repr(tuple(sections))) > _SECTIONS_PAYLOAD_BUDGET
+
+
+def test_a_document_at_the_cap_with_long_names_is_accepted_and_caches_over_the_budget(
+    tmp_path: Path,
+) -> None:
+    text = _nested_tables(_MAX_TOML_DEPTH, name="k" * _OVER_BUDGET_NAME_LENGTH)
+    path = tmp_path / "pyproject.toml"
+    path.write_text(text, encoding="utf-8")
+
+    analysis = config_analysis(Database(), str(path))
+    sections = _walk_sections(_load_toml(text), "")
+
+    assert analysis.diagnostics == ()
+    assert len(analysis.sections) == _MAX_TOML_DEPTH
+    assert len(repr(tuple(sections))) > _SECTIONS_PAYLOAD_BUDGET
+
+
 # ---------------------------------------------------------------------------
 # Stack exhaustion
 # ---------------------------------------------------------------------------

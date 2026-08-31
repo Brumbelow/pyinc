@@ -95,10 +95,13 @@ class _TomlNestingLimitError(ValueError):
 
 # Table and array nesting is capped because every section re-emits the dot path of
 # all its ancestors: `config_sections_payload` grows with the square of the nesting
-# depth, so this cap is what bounds the *cache*, not just the parse. `json_config`
-# caps `_MAX_JSON_DEPTH` and `xml_config` caps `_MAX_XML_DEPTH` for the same reason
-# and against the same budget — a document at the cap must not cache more than
-# ~1 MiB.
+# depth, so this cap is what bounds the depth-driven growth of the *cache*, not just
+# the parse. `json_config` caps `_MAX_JSON_DEPTH` and `xml_config` caps
+# `_MAX_XML_DEPTH` for the same reason and against the same budget — at the table
+# name length that budget is stated for, a document at the cap must not cache more
+# than ~1 MiB. Width at shallow depth is bounded by none of that: a document of many
+# sibling tables one header component deep is accepted and can cache past the
+# budget.
 #
 # That budget is the only thing that binds here. Depth counts the document's
 # implicit top-level table as level 1, the way `json_config` counts the outermost
