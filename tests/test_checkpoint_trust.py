@@ -48,6 +48,7 @@ from pyinc import (
     FileStatResource,
     FileStatSnapshot,
     FileSystemArtifactStore,
+    FrozenRecord,
     InMemoryArtifactStore,
     Input,
     InputKeyError,
@@ -1742,6 +1743,68 @@ def test_dataclass_parameter_resource_probe_hint_refuses_and_reexecutes() -> Non
     # being served from the checkpoint.
     assert db2.inspect(read_spec).last_recompute == "executed"
     assert db2.statistics().query_executions == 1
+
+
+@dataclass(frozen=True)
+class _Point:
+    """A dataclass-valued query result for the round trip below."""
+
+    x: int
+    y: int
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_dataclass_value_round_trips_a_checkpoint_without_its_class(
+    mode: str, tmp_path: Path
+) -> None:
+    """A checkpointed dataclass comes back as data, in every mode.
+
+    Nothing reconstructs the class -- not the first request, not the reload,
+    not a fresh database -- so what a caller holds is the snapshot shape its
+    mode exposes: strict keeps the `FrozenRecord` view, checked and fast hand
+    back the owned thawed dict.
+    """
+    point = Input[_Point]("checkpoint_dataclass_point")
+
+    @query
+    def point_value(db: Database) -> Any:
+        return point.read(db)
+
+    # One store directory throughout: the loader reads back exactly what the
+    # saver wrote, at the same path, with nothing edited in between.
+    saver = Database(mode=mode, store=FileSystemArtifactStore(tmp_path))
+    saver.set(point, _Point(5, 6))
+    saved = saver.get(point_value)
+    checkpoint = saver.save_checkpoint()
+
+    loader = Database(mode=mode, store=FileSystemArtifactStore(tmp_path))
+    loader.set(point, _Point(5, 6))
+    loader.load_checkpoint(checkpoint)
+    before = loader.statistics()
+    reloaded = loader.get(point_value)
+    after = loader.statistics()
+
+    fresh = Database(mode=mode)
+    fresh.set(point, _Point(5, 6))
+    fresh_value = fresh.get(point_value)
+
+    # Witnesses that the load actually warmed the record: the request that
+    # produced `reloaded` executed no query and reused one.
+    assert after.query_executions - before.query_executions == 0
+    assert after.query_reuses - before.query_reuses >= 1
+
+    # The value survives the round trip; the class does not, and no adapter is
+    # registered to bring it back.
+    assert reloaded == saved
+    assert reloaded == fresh_value
+    assert not isinstance(reloaded, _Point)
+
+    # What the caller holds is mode-dependent, and neither shape is the class.
+    if mode == "strict":
+        assert reloaded == FrozenRecord(type_name="_Point", entries=(("x", 5), ("y", 6)))
+    else:
+        assert type(reloaded) is dict
+        assert reloaded == {"x": 5, "y": 6}
 
 
 # ---------------------------------------------------------------------------

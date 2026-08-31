@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import random
 import re
 import struct
-from dataclasses import dataclass
+import sys
+from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -258,6 +260,77 @@ def test_freeze_thaw_round_trip_dataclass() -> None:
     assert thawed == {"name": "x", "values": (1, 2)}
 
 
+def test_thawing_a_dataclass_snapshot_returns_a_dict_and_not_the_class() -> None:
+    snapshot = freeze(Point(1, 2))
+    assert isinstance(snapshot, FrozenRecord)
+
+    # The tag is the class's __qualname__ and nothing else: no module component,
+    # no import path a thaw could resolve back to a class.
+    assert snapshot.type_name == Point.__qualname__
+    assert snapshot.type_name == "Point"
+    assert snapshot.entries == (("x", 1), ("y", 2))
+
+    thawed = thaw(snapshot)
+    assert type(thawed) is dict
+    assert thawed == {"x": 1, "y": 2}
+    assert not isinstance(thawed, Point)
+
+
+def _module_scope_point(
+    monkeypatch: pytest.MonkeyPatch, directory: Path, module_name: str
+) -> type:
+    """Import a module defining a frozen `Point` and hand back the class.
+
+    Module scope is what this needs. A class defined inside a function carries
+    a `<locals>` component in its `__qualname__`, so two of them could not
+    share a tag in the first place, and a query that captures one is refused.
+    Both modules are written under `tmp_path` and registered through
+    `monkeypatch`, so the import is undone when the test ends.
+    """
+    path = directory / f"{module_name}.py"
+    path.write_text(
+        "from dataclasses import dataclass\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Point:\n"
+        "    x: int\n"
+        "    y: int\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    return cast(type, module.Point)
+
+
+def test_same_named_dataclasses_from_two_modules_share_one_tag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    left = _module_scope_point(monkeypatch, tmp_path, "value_tag_left")
+    right = _module_scope_point(monkeypatch, tmp_path, "value_tag_right")
+
+    # Two different classes, same bare name, different defining modules.
+    assert left is not right
+    assert left.__qualname__ == right.__qualname__ == "Point"
+    assert left.__module__ != right.__module__
+    assert left(1, 2) != right(1, 2)
+    assert not isinstance(left(1, 2), right)
+
+    left_snapshot = cast(FrozenRecord, freeze(left(1, 2)))
+    right_snapshot = cast(FrozenRecord, freeze(right(1, 2)))
+
+    # The tag carries no module component, so the two collapse onto one
+    # snapshot: equal, equal under the kernel's own comparison, and equal
+    # byte for byte once serialized.
+    assert left_snapshot.type_name == right_snapshot.type_name == "Point"
+    assert left_snapshot == right_snapshot
+    assert semantic_equal(left(1, 2), right(1, 2))
+    assert serialize_snapshot(left_snapshot) == serialize_snapshot(right_snapshot)
+
+
 # ---------------------------------------------------------------------------
 # Group B: Container protocol operations
 # ---------------------------------------------------------------------------
@@ -353,6 +426,51 @@ def test_freeze_already_frozen_values_are_detached_clones() -> None:
         assert fingerprint_snapshot(clone) == fingerprint_snapshot(wrapper)
     with pytest.raises(UnsupportedValueError, match="FrozenRef index"):
         freeze(fref)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_tampering_with_an_exposed_boundary_value_cannot_reach_the_record(mode: str) -> None:
+    payload = Input[Any]("exposed_boundary_payload")
+
+    @query
+    def exposed(db: Database) -> Any:
+        return payload.read(db)
+
+    db = Database(mode=mode)
+    db.set(payload, {"a": 1, "b": 2})
+    view = db.get(exposed)
+
+    if mode == "strict":
+        # Strict hands out a Frozen* view. It is a frozen dataclass, so an
+        # ordinary attribute or item write is refused -- but that is a
+        # convention of the dataclass machinery, not a capability: the field
+        # rebinds under object.__setattr__ like any other.
+        assert isinstance(view, FrozenDict)
+        ordinary_write = cast(Any, view)
+        with pytest.raises(FrozenInstanceError):
+            ordinary_write.entries = ()
+        with pytest.raises(TypeError):
+            ordinary_write["a"] = "EVIL"
+        object.__setattr__(view, "entries", (("a", "EVIL"),))
+        assert view.entries == (("a", "EVIL"),)
+    else:
+        # checked and fast hand out an owned thawed value, which is an
+        # ordinary mutable container and takes the write.
+        assert type(view) is dict
+        view["a"] = "EVIL"
+        assert view == {"a": "EVIL", "b": 2}
+
+    # Either way the stored record is intact, because the kernel rebuilt the
+    # value it handed out rather than sharing the one it holds: the next
+    # request answers with the original, and a database that never saw the
+    # tampering agrees with it.
+    warm = db.get(exposed)
+    fresh_db = Database(mode=mode)
+    fresh_db.set(payload, {"a": 1, "b": 2})
+    fresh = fresh_db.get(exposed)
+
+    assert warm == fresh
+    assert thaw(freeze(warm)) == {"a": 1, "b": 2}
 
 
 def test_freeze_clones_reach_every_nested_shell() -> None:
@@ -784,6 +902,26 @@ def test_freeze_pure_tree_does_not_wrap_in_frozen_graph() -> None:
     # so the common case stays zero-overhead.
     snapshot = freeze([1, [2, [3]]])
     assert isinstance(snapshot, FrozenList)
+
+
+def test_freeze_of_a_pure_tree_still_pays_the_deep_freeze() -> None:
+    # What a pure tree skips is the FrozenGraph envelope, not the freeze: every
+    # container on the way down still gets its own Frozen* shell, which is what
+    # leaves the caller holding no alias into the snapshot.
+    inner = [2, 3]
+    source: list[Any] = [1, inner]
+    snapshot = freeze(source)
+
+    assert not isinstance(snapshot, FrozenGraph)
+    assert snapshot == FrozenList(items=(1, FrozenList(items=(2, 3))))
+    assert isinstance(snapshot.items[1], FrozenList)
+
+    # Neither alias into the source reaches the snapshot afterwards.
+    inner.append(99)
+    source.append(4)
+
+    assert snapshot == FrozenList(items=(1, FrozenList(items=(2, 3))))
+    assert thaw(snapshot) == [1, [2, 3]]
 
 
 def test_freeze_reencodes_shared_wrapper_structure_as_the_raw_frozen_graph() -> None:

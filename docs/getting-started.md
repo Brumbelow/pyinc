@@ -104,7 +104,7 @@ ambient-read tracking.
 
 | Mode | Values seen by queries and callers | In-query mutation |
 |---|---|---|
-| `strict` | Immutable snapshots such as `FrozenList`, `FrozenDict`, `FrozenSet`, and `FrozenRecord` | A write fails immediately. |
+| `strict` | Frozen snapshot views such as `FrozenList`, `FrozenDict`, `FrozenSet`, and `FrozenRecord` | An ordinary write fails immediately. `object.__setattr__` still rebinds a field, so the kernel rebuilds every exposed view instead of trusting it. |
 | `checked` | Owned thawed copies | A before/after fingerprint detects mutation. |
 | `fast` | Owned thawed copies | Not checked; deterministic, non-mutating queries are the caller's responsibility. |
 

@@ -49,8 +49,11 @@ move: every digest, store key and checkpoint is derived from an encoding that
 reads entries in the order they are stored.
 
 Dataclasses thaw to dictionaries because the kernel does not import and
-reconstruct arbitrary user classes. Its own resource snapshot types are the
-exception: a `Database` registers built-in adapters for them, so
+reconstruct arbitrary user classes. The kernel tags such a snapshot with the
+class's `__qualname__` alone, so two same-named dataclasses defined in
+different modules produce the same tag, and instances whose ordered fields and
+values match serialize to identical bytes. Its own resource snapshot types are
+the exception: a `Database` registers built-in adapters for them, so
 `FileStatSnapshot` is rebuilt as itself at every boundary in every mode.
 `BUILTIN_ADAPTERS` names those entries, and registering an adapter for one of
 those types replaces the built-in rather than colliding with it. A dataclass, a
@@ -101,12 +104,18 @@ database-produced `FileStatSnapshot` outside a database means passing
 `adapters=dict(BUILTIN_ADAPTERS)`. Omitting it raises `UnsupportedValueError`
 naming the adapter key rather than returning a mapping.
 
-The kernel stores frozen snapshots internally. `strict` exposes the immutable
-`Frozen*` views themselves (a query receives, for example, a `FrozenDict` where
+The kernel stores frozen snapshots internally. `strict` exposes `Frozen*`
+views of those snapshots (a query receives, for example, a `FrozenDict` where
 the other modes hand it a `dict`); `checked` and `fast` expose owned thawed
 values (the exposed shape differs, a mapping's canonical entry order described
 above does not — all three modes iterate a mapping in the stored snapshot's
-order). A set's canonical member order is carried by the snapshot and by
+order). Those views are frozen dataclasses: they reject ordinary attribute and
+item writes, but they are not immutable at the capability level —
+`object.__setattr__` still rebinds a field on the view a query or a caller was
+handed. That is why the kernel rebuilds a view for every exposure instead of
+relying on view immutability: rebinding a field that way changes the view
+alone, the stored record is untouched, and the next request answers from the
+record. A set's canonical member order is carried by the snapshot and by
 `strict`'s `FrozenSet` view; a thawed `set` or `frozenset` is an ordinary
 unordered Python container, so `checked` and `fast` carry no member order out
 of the boundary, and their iteration order is Python's, which varies between
@@ -129,8 +138,11 @@ Cyclic and shared object graphs are supported via the `FrozenGraph` /
 `dict`, `set`, dataclass) by id and emits a `FrozenGraph(nodes, root)` envelope
 when shared identity or back-edges are detected. `thaw` reconstructs identity
 faithfully via two-pass allocate-then-fill so a list-with-itself round-trips to
-an actual self-referential list. Pure trees pay no overhead — they continue to
-return the bare flat snapshot shape.
+an actual self-referential list. Pure trees avoid the envelope, not the freeze:
+they keep the bare snapshot shape rather than the `FrozenGraph` envelope, and
+the deep freeze is paid in full — one `Frozen*` shell per container at every
+level, so no external alias to a container in the source can influence the
+snapshot.
 
 Memoization is by **mutable container** identity, so the graph support above
 covers exactly those four types. Values crossing through a `ValueAdapter`, a
@@ -1268,7 +1280,7 @@ Values and snapshots:
 | `FrozenList` | Immutable list view crossing cached boundaries. |
 | `FrozenDict` | Immutable mapping view crossing cached boundaries. |
 | `FrozenSet` | Immutable set view crossing cached boundaries. |
-| `FrozenRecord` | Immutable dataclass snapshot preserving type identity. |
+| `FrozenRecord` | Dataclass snapshot: the class's `__qualname__` (no module component, so same-named classes in different modules share a tag) plus ordered fields. Thaws to a dict; reconstructing the original class requires a `ValueAdapter`. |
 | `FrozenGraph` | Canonical encoding of a cyclic or shared object graph. |
 | `FrozenRef` | Back-edge marker inside a `FrozenGraph` node table. |
 | `FrozenAdapterValue` | Snapshot produced by a registered `ValueAdapter`. |
