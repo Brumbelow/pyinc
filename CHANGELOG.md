@@ -881,6 +881,104 @@ decided at release time.
   caches — the budget JSON is already held to, which puts both at the same
   number.
 
+### Documentation
+
+- The kernel contract defines the fields a node record carries in an
+  `inspect()` or `explain()` report, in a section of its own. `last_decision`
+  is what the most recent request that touched the node concluded about it,
+  and it includes the cheap case: a second reach inside one request is
+  recorded as a reuse, so a node that re-ran and backdated earlier in that
+  request reads `reused` afterwards. `last_recompute` is the outcome of the
+  last time the node's query body actually ran, and a reuse does not advance
+  it — neither that second reach nor an ordinary warm reuse across requests —
+  so a node reporting `last_decision` `reused` can still report
+  `last_recompute` `backdated`. A checkpoint restore is the one case that
+  stamps both fields `reused` on a node the database has not run. Inspecting a
+  node that already has a record advances neither field, but it opens a
+  request like any other call, and inspecting a node that has no record
+  executes it.
+- The kernel contract says where a failing resource load ends up. The
+  exception surfaces inside the query body, where the query's own
+  `try`/`except` can see it, and an exception no query body handles propagates
+  out of `db.get()` — including one raised while a dependent is being
+  verified. The caller sees the exception the load raised rather than an error
+  type of the kernel's own, where the text previously promised that such a
+  refresh could not escape `get()`. The record-keeping is unaffected either
+  way: the failing node reports `failed` for both decision fields, with a
+  reason naming the load failure.
+- The kernel contract says what a frozen dataclass snapshot keeps and what it
+  drops. It keeps the fields in declaration order with their values, tagged
+  with the class's `__qualname__` alone — so two same-named dataclasses
+  defined in different modules share a tag, and instances whose ordered fields
+  and values match serialize to identical bytes. It drops the class itself:
+  thawing hands back a dictionary, and rebuilding the original class takes a
+  `ValueAdapter`, where the `FrozenRecord` row previously said the snapshot
+  preserves type identity. A pure nested value drops only the `FrozenGraph`
+  envelope — it is frozen through, one frozen shell per container at every
+  level, so no alias to a container in the source can influence the snapshot —
+  where the text previously said pure trees pay no overhead.
+- The authoring and getting-started guides say which hooks a custom resource
+  owes. `probe`, `load` and `label` are the three an author writes; `read`,
+  `probe_and_load` and `identity` arrive with working defaults to override
+  where those defaults do not fit; all six were previously presented as hooks
+  the author implements. Snapshot safety is stated as a requirement on the
+  instance rather than on a hook, and as one the kernel enforces: a resource
+  that is neither a frozen dataclass whose fields are themselves snapshot-safe
+  nor a class whose `identity()` returns a snapshot-safe value is refused with
+  `UnsupportedValueError` by the first `get()` of a query that captures it.
+  The probe cadence is stated as a bound — the kernel probes a resource when a
+  request needs that node verified, at most one standalone probe per request
+  per resource key, and none when the node is not reached — where the guide
+  previously said `probe` is called on every request. Module-level singletons
+  are named as the convention they are: two equal instances of a snapshot-safe
+  resource already map to one node.
+- The authoring guide says when a comment edit backdates. Backdating follows
+  the payload rather than a class of edit: the import projection carries the
+  payload's line number, so a comment inserted above the statement whose line
+  number the payload carries lands a different payload, there is nothing to
+  backdate, and the parse's consumers run again. The guide previously said a
+  comment-only edit re-runs the parse and reuses everything downstream of it,
+  and its testing section asked for non-semantic edits to backdate; it now
+  asks for both halves to be pinned — an edit the payload does not carry, and
+  one it does.
+- The kernel contract separates the two resource remedies for an unguarded
+  file-metadata read from the declaration that shared a list with them.
+  `FileStatResource` and `ResolvedPathResource` make the observation tracked;
+  `db.report_untracked_read(reason)` does not. It removes stale reuse for the
+  declaring node alone, which then re-executes on every request, while another
+  query that observes the same metadata without declaring it is still reused
+  unchanged. The authoring guide's answer to why the kernel prefers
+  re-execution gives the reason — a stale answer is indistinguishable from a
+  fresh one at the point a caller reads it — in place of a blanket ranking of
+  the two.
+- The integration contract says what a nesting cap bounds and what it does
+  not. A cap bounds the depth-driven growth of the cached payload, and at the
+  cap, for the key lengths each integration's own cap rationale measures, a
+  document stays inside the same ~1 MiB payload budget and inside what
+  `freeze` will snapshot. It is not a size bound: payload size also scales
+  with key length and with document width, so a wide document at shallow depth
+  and a document at the cap with long keys are both accepted with no
+  diagnostic and can cache more than that budget. The previous wording
+  presented the cap as a bound on the size of the cached payload.
+- The kernel contract and the FAQ say what threads holding separate `Database`
+  instances buy: they do not contend on each other's lock, which is not the
+  same as running in parallel; both documents previously offered that
+  arrangement as parallelism. On a default build, CPU-bound Python work does
+  not run in parallel across threads — threading such work can be slower than
+  not threading it — and parallel speedup for that work needs the separate
+  processes the FAQ already describes. What threads buy is correctness.
+- The Public Surface table lists the fields of four of the types it describes:
+  the database statistics, the inspection node, the dependency-graph node and
+  the query profile. Two of those descriptions named things that were not
+  there: the database statistics row named an edge counter among counters that
+  hold no edges, and the query profile row named reuse and backdate counts,
+  which are database statistics rather than fields of a profile — a query
+  profile is a timing aggregate, one execution count beside the total, mean,
+  minimum, maximum and last nanosecond figures. The documentation check now
+  compares each documented field list against the dataclass it describes, in
+  declaration order, so a field added, removed or reordered cannot leave its
+  documented list behind.
+
 ## [3.1.1] - 2026-08-03
 
 ### Highlights
