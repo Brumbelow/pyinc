@@ -24,19 +24,46 @@ _PUBLIC_ROW_NAMES = frozenset({"Entrypoints", "Result types", "Shared types"})
 _CHECKPOINT_VERSION_NAME = "_CHECKPOINT_MANIFEST_VERSION"
 _CHECKPOINT_VERSION_SOURCE = Path("src/pyinc/runtime.py")
 # Prose that states the durable checkpoint manifest schema version. Each pattern
-# matches the surrounding sentence so a stale number cannot survive unnoticed.
+# matches the surrounding sentence so a stale number cannot survive unnoticed,
+# and each entry carries the name of the sentence it guards: one document can
+# hold two of them, and without the name the two errors read identically.
 _CHECKPOINT_VERSION_PROSE = (
     (
         Path("docs/kernel-contract.md"),
+        "the manifest-key sentence",
         re.compile(r"content-addressed manifest \(schema v(?P<version>\d+)\)"),
     ),
     (
         Path("docs/architecture.md"),
+        "the load-acceptance sentence",
         re.compile(r"accepts manifest schema v(?P<version>\d+) only"),
     ),
     (
         Path("docs/kernel-contract.md"),
+        "the rejection sentence",
         re.compile(r"Manifest schema v(?P<version>\d+) rejects"),
+    ),
+)
+_ACTION_VERSION_NAME = "_MANIFEST_VERSION"
+_ACTION_VERSION_SOURCE = Path("src/pyinc/action.py")
+# Prose that states the action ledger's manifest schema version. The two
+# documents spell it differently -- `Schema v3` against `schema-v3` -- so one
+# pattern cannot serve both.
+_ACTION_VERSION_PROSE = (
+    (
+        Path("docs/action-contract.md"),
+        "the schema-records sentence",
+        re.compile(r"Schema v(?P<version>\d+) records exactly"),
+    ),
+    (
+        Path("docs/action-contract.md"),
+        "the incompatibility sentence",
+        re.compile(r"not compatible with v(?P<version>\d+)'s ledger semantics"),
+    ),
+    (
+        Path("docs/architecture.md"),
+        "the ledger-publication clause",
+        re.compile(r"the schema-v(?P<version>\d+) ledger is published last"),
     ),
 )
 # Public-surface rows whose description cell must carry a `Fields:` sentence
@@ -392,44 +419,79 @@ def check_documented_kernel_api(root: Path) -> tuple[str, ...]:
     return tuple(errors)
 
 
-def _read_checkpoint_manifest_version(root: Path) -> int:
-    path = root / _CHECKPOINT_VERSION_SOURCE
+def _read_int_constant(root: Path, source: Path, name: str) -> int:
+    path = root / source
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for statement in tree.body:
         if not isinstance(statement, ast.Assign):
             continue
         if not any(
-            isinstance(target, ast.Name) and target.id == _CHECKPOINT_VERSION_NAME
-            for target in statement.targets
+            isinstance(target, ast.Name) and target.id == name for target in statement.targets
         ):
             continue
         value = ast.literal_eval(statement.value)
         if isinstance(value, int) and not isinstance(value, bool):
             return value
         break
-    raise ValueError(f"{path} does not assign an integer {_CHECKPOINT_VERSION_NAME}")
+    raise ValueError(f"{path} does not assign an integer {name}")
 
 
-def check_checkpoint_manifest_version(root: Path) -> tuple[str, ...]:
-    """Pin the documented manifest schema version to the kernel's own constant."""
-    expected = _read_checkpoint_manifest_version(root)
+def _check_version_prose(
+    root: Path,
+    *,
+    subject: str,
+    constant: str,
+    expected: int,
+    entries: tuple[tuple[Path, str, re.Pattern[str]], ...],
+) -> tuple[str, ...]:
+    """Compare each documented schema version against the constant that decides it.
+
+    A named document that is not there is reported rather than read: a check that
+    raises on a removed file takes every other check down with it and prints no
+    result line at all, which is worse than the stale sentence it was looking for.
+    """
     errors: list[str] = []
-    for relative, pattern in _CHECKPOINT_VERSION_PROSE:
-        prose = re.sub(r"\s+", " ", " ".join(_prose_lines(root / relative)))
+    for relative, label, pattern in entries:
+        document = root / relative
+        if not document.is_file():
+            errors.append(f"{relative}: missing document named by the {subject} check")
+            continue
+        prose = re.sub(r"\s+", " ", " ".join(_prose_lines(document)))
         match = pattern.search(prose)
         if match is None:
             errors.append(
-                f"{relative}: no checkpoint manifest version statement "
-                f"matching {pattern.pattern!r}"
+                f"{relative}: no {subject} statement matching {label} ({pattern.pattern!r})"
             )
             continue
         documented = int(match.group("version"))
         if documented != expected:
             errors.append(
-                f"{relative}: documents checkpoint manifest schema v{documented}, "
-                f"but {_CHECKPOINT_VERSION_NAME} is {expected}"
+                f"{relative}: {label} documents {subject} v{documented}, "
+                f"but {constant} is {expected}"
             )
     return tuple(errors)
+
+
+def check_checkpoint_manifest_version(root: Path) -> tuple[str, ...]:
+    """Pin the documented manifest schema version to the kernel's own constant."""
+    return _check_version_prose(
+        root,
+        subject="checkpoint manifest schema",
+        constant=_CHECKPOINT_VERSION_NAME,
+        expected=_read_int_constant(root, _CHECKPOINT_VERSION_SOURCE, _CHECKPOINT_VERSION_NAME),
+        entries=_CHECKPOINT_VERSION_PROSE,
+    )
+
+
+def check_action_manifest_version(root: Path) -> tuple[str, ...]:
+    """Pin the documented action ledger schema version to the ledger's own constant."""
+    return _check_version_prose(
+        root,
+        subject="action manifest schema",
+        constant=_ACTION_VERSION_NAME,
+        expected=_read_int_constant(root, _ACTION_VERSION_SOURCE, _ACTION_VERSION_NAME),
+        entries=_ACTION_VERSION_PROSE,
+    )
 
 
 def _read_dataclass_fields(root: Path, name: str) -> tuple[str, ...]:
@@ -517,6 +579,7 @@ def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
         *check_documented_kernel_api(root),
         *check_checkpoint_manifest_version(root),
         *check_documented_dataclass_fields(root),
+        *check_action_manifest_version(root),
     )
 
 

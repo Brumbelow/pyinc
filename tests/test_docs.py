@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from scripts.check_docs import (
+        _ACTION_VERSION_PROSE,
         PROJECT_ROOT,
+        check_action_manifest_version,
+        check_checkpoint_manifest_version,
         check_docs,
         check_documented_dataclass_fields,
         check_local_links,
@@ -16,7 +19,10 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
     from check_docs import (  # noqa: E402
+        _ACTION_VERSION_PROSE,
         PROJECT_ROOT,
+        check_action_manifest_version,
+        check_checkpoint_manifest_version,
         check_docs,
         check_documented_dataclass_fields,
         check_local_links,
@@ -172,3 +178,183 @@ def test_every_test_the_documentation_cites_still_exists() -> None:
     orphaned = sorted(cited - _defined_test_names(PROJECT_ROOT))
 
     assert not orphaned, "documentation cites tests that do not exist: " + ", ".join(orphaned)
+
+
+def _write_action_version_tree(
+    root: Path,
+    *,
+    constant: int,
+    action_contract: int | None,
+    architecture: int | None,
+) -> None:
+    """Write the smallest tree the action-ledger check reads: the module and two documents.
+
+    The module is written rather than read from the repository so a fixture can
+    say what the constant is; a check that only ever sees the shipped 3 could be
+    comparing against a literal and nothing here would notice.
+    """
+    package = root / "src" / "pyinc"
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "action.py").write_text(
+        '"""The action ledger."""\n'
+        "\n"
+        f"_MANIFEST_VERSION = {constant}\n"
+        '_LEDGER_NAME = "ledger.json"\n',
+        encoding="utf-8",
+    )
+    docs = root / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    if action_contract is not None:
+        (docs / "action-contract.md").write_text(
+            "# Action contract\n\n"
+            f"Schema v{action_contract} records exactly `root`, `tool`, and `outputs`.\n\n"
+            "v1 and v2 manifests are intentionally not compatible with "
+            f"v{action_contract}'s ledger semantics and may be discarded.\n",
+            encoding="utf-8",
+        )
+    if architecture is not None:
+        (docs / "architecture.md").write_text(
+            "# Architecture\n\n"
+            f"Files publish atomically, and the schema-v{architecture} ledger is "
+            "published last.\n",
+            encoding="utf-8",
+        )
+
+
+def _write_checkpoint_version_tree(
+    root: Path,
+    *,
+    constant: int,
+    kernel_contract: int,
+    architecture: int | None,
+) -> None:
+    """Write the smallest tree the checkpoint check reads: the module and two documents."""
+    package = root / "src" / "pyinc"
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "runtime.py").write_text(
+        '"""The durable cache."""\n'
+        "\n"
+        f"_CHECKPOINT_MANIFEST_VERSION = {constant}\n",
+        encoding="utf-8",
+    )
+    docs = root / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    (docs / "kernel-contract.md").write_text(
+        "# Kernel contract\n\n"
+        f"Each checkpoint carries a content-addressed manifest (schema v{kernel_contract}).\n\n"
+        f"Manifest schema v{kernel_contract} rejects everything older with "
+        "`CheckpointVersionError`.\n",
+        encoding="utf-8",
+    )
+    if architecture is not None:
+        (docs / "architecture.md").write_text(
+            "# Architecture\n\n"
+            f"The loader accepts manifest schema v{architecture} only and validates "
+            "every entry.\n",
+            encoding="utf-8",
+        )
+
+
+def test_action_ledger_check_reports_a_document_naming_the_wrong_schema_version(
+    tmp_path: Path,
+) -> None:
+    _write_action_version_tree(tmp_path, constant=3, action_contract=3, architecture=2)
+
+    errors = check_action_manifest_version(tmp_path)
+
+    assert len(errors) == 1
+    assert "the ledger-publication clause" in errors[0]
+    assert "v2" in errors[0]
+    assert "is 3" in errors[0]
+
+
+def test_action_ledger_check_accepts_documents_that_agree_with_the_constant(
+    tmp_path: Path,
+) -> None:
+    _write_action_version_tree(tmp_path, constant=3, action_contract=3, architecture=3)
+
+    assert check_action_manifest_version(tmp_path) == ()
+
+
+def test_action_ledger_check_reports_every_stale_sentence_separately(tmp_path: Path) -> None:
+    """Three stale sentences over two documents have to arrive as three readable errors.
+
+    Two of them are in the same file, so an error line that does not name the
+    sentence it came from would report the same text twice and leave a reader
+    with no way to tell which one to fix.
+    """
+    _write_action_version_tree(tmp_path, constant=4, action_contract=3, architecture=3)
+
+    errors = check_action_manifest_version(tmp_path)
+
+    assert len(errors) == 3
+    assert len(set(errors)) == 3
+    for label in (
+        "the schema-records sentence",
+        "the incompatibility sentence",
+        "the ledger-publication clause",
+    ):
+        assert sum(1 for error in errors if label in error) == 1
+
+
+def test_action_ledger_check_reports_a_missing_document_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    _write_action_version_tree(tmp_path, constant=3, action_contract=3, architecture=None)
+
+    errors = check_action_manifest_version(tmp_path)
+
+    assert len(errors) == 1
+    assert "docs/architecture.md" in errors[0]
+    assert "missing document" in errors[0]
+
+
+def test_checkpoint_check_reports_a_missing_document_instead_of_raising(tmp_path: Path) -> None:
+    """A named document that has been removed must not take every other check down with it."""
+    _write_checkpoint_version_tree(tmp_path, constant=8, kernel_contract=8, architecture=None)
+
+    errors = check_checkpoint_manifest_version(tmp_path)
+
+    assert len(errors) == 1
+    assert "docs/architecture.md" in errors[0]
+    assert "missing document" in errors[0]
+
+
+def test_checkpoint_check_distinguishes_two_stale_sentences_in_one_document(
+    tmp_path: Path,
+) -> None:
+    _write_checkpoint_version_tree(tmp_path, constant=9, kernel_contract=8, architecture=9)
+
+    errors = check_checkpoint_manifest_version(tmp_path)
+
+    assert len(errors) == 2
+    assert errors[0] != errors[1]
+
+
+def test_every_documentation_check_is_registered_with_the_composed_checker() -> None:
+    """A check the script defines but the composition never calls is a check that never runs."""
+    source = PROJECT_ROOT / "scripts" / "check_docs.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    defined = {
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+        and node.name.startswith("check_")
+        # The composition is excluded because it cannot register itself: a
+        # function's own name is absent from its own co_names unless it recurses.
+        and node.name != check_docs.__name__
+    }
+    assert defined, "expected the checker to define checks to compose"
+
+    unregistered = sorted(defined - set(check_docs.__code__.co_names))
+
+    assert not unregistered, "checks the composition never calls: " + ", ".join(unregistered)
+
+
+def test_the_action_ledger_check_reads_three_sentences_in_two_documents() -> None:
+    """Dropping an entry would narrow the check silently: the sentence left behind stays green."""
+    documents = [relative for relative, _label, _pattern in _ACTION_VERSION_PROSE]
+
+    assert len(documents) == 3
+    assert documents.count(Path("docs/action-contract.md")) == 2
+    assert documents.count(Path("docs/architecture.md")) == 1

@@ -71,9 +71,9 @@ Resource node identity includes configuration plus the implementations of
 
 Mutable object graphs with shared or cyclic references are supported via the
 `FrozenGraph` / `FrozenRef` snapshot variants. `freeze` memoizes mutable
-containers by id; pure trees retain the flat snapshot shape. `thaw` runs a
-two-pass allocate-then-fill so cycles and shared identity are preserved across
-the boundary.
+containers by id; pure trees keep the bare snapshot shape rather than the
+`FrozenGraph` envelope. `thaw` runs a two-pass allocate-then-fill so cycles and
+shared identity are preserved across the boundary.
 
 ## Durable Cache
 
@@ -135,7 +135,7 @@ The top-level package exposes a stable kernel surface:
 - declared-output reconciliation via the `@action` layer (`Output`,
   `ReconcileResult`, `Action.reconcile`/`plan`): the complete cycle is
   cross-process locked, path/manifest trust is prevalidated, files publish
-  atomically, and the schema-v2 ledger is published last; see
+  atomically, and the schema-v3 ledger is published last; see
   [action-contract.md](action-contract.md)
 
 ### Integrations (`pyinc.integrations`)
