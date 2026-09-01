@@ -1702,7 +1702,7 @@ decided at release time.
 ### Migration
 
 - This is a clean API and persistence break. See
-  [`docs/migration-v3.md`](docs/migration-v3.md) before upgrading and discard
+  `docs/migration-v3.md` before upgrading and discard
   v2 checkpoint/action ledger state as described there.
 
 ## [2.6.0] - 2026-07-05

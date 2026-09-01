@@ -141,7 +141,6 @@ tamper repair, orphan cleanup, and dry-run planning. See the
 - [Integration contract](https://github.com/Brumbelow/pyinc/blob/main/docs/integration-contract.md) — stable entrypoints, result types, supported shapes, and limits.
 - [`pyinc-tools` guide](https://github.com/Brumbelow/pyinc/blob/main/docs/pyinc-tools-guide.md) and [LSP reference](https://github.com/Brumbelow/pyinc/blob/main/docs/lsp-reference.md) — CLI, editor setup, overlays, protocol methods, and user-visible limitations.
 - [Integration authoring](https://github.com/Brumbelow/pyinc/blob/main/docs/integration-authoring.md) — the three-layer integration pattern.
-- [Migrating from 2.x](https://github.com/Brumbelow/pyinc/blob/main/docs/migration-v3.md) — state cleanup and 3.0 API changes.
 - [Releases and verification](https://github.com/Brumbelow/pyinc/blob/main/docs/releases.md) — signed tags, trusted publishing, and checking a download.
 
 ## Development
