@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         check_docs,
         check_documented_dataclass_fields,
         check_local_links,
+        markdown_files,
         table_rows,
     )
 else:
@@ -33,6 +34,7 @@ else:
         check_docs,
         check_documented_dataclass_fields,
         check_local_links,
+        markdown_files,
         table_rows,
     )
 
@@ -59,6 +61,54 @@ def test_documentation_checker_ignores_external_links(tmp_path: Path) -> None:
     readme.write_text("# Root\n\n[external](https://example.invalid/missing)\n", encoding="utf-8")
 
     assert check_local_links(tmp_path, (readme,)) == ()
+
+
+def test_the_checked_files_end_with_the_changelog_and_the_issue_templates(tmp_path: Path) -> None:
+    """The changelog and every issue template are read, in a fixed order.
+
+    Asserting the templates as well as the changelog matters because they arrive
+    through a glob: drop the glob and the changelog alone would still be there,
+    with three files silently unread. The `config.yml` beside them is written to
+    say that the glob takes Markdown and leaves the rest of the directory alone.
+    """
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n", encoding="utf-8")
+    templates = tmp_path / ".github" / "ISSUE_TEMPLATE"
+    templates.mkdir(parents=True)
+    for name in ("soundness.md", "bug.md", "feature.md"):
+        (templates / name).write_text(f"# {name}\n", encoding="utf-8")
+    (templates / "config.yml").write_text("blank_issues_enabled: false\n", encoding="utf-8")
+
+    files = markdown_files(tmp_path)
+
+    assert files[-4:] == (
+        tmp_path / "CHANGELOG.md",
+        templates / "bug.md",
+        templates / "feature.md",
+        templates / "soundness.md",
+    )
+
+
+def test_documentation_checker_reports_a_broken_link_in_the_changelog(tmp_path: Path) -> None:
+    """A dead local link in the changelog is reported now that the file is read.
+
+    Written against a changelog of its own rather than the shipped one. A code
+    span that opens on one line and closes on the next swallows every line
+    between it, links included, so a link injected into a long file can land
+    somewhere nothing would ever read it and the cell would pass without
+    checking anything. This fixture carries no backtick at all, which the
+    assertion below states rather than leaves to inspection.
+    """
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(
+        "# Changelog\n\n## 3.0.0\n\n- See [gone](docs/nowhere.md) before upgrading.\n",
+        encoding="utf-8",
+    )
+    assert "`" not in changelog.read_text(encoding="utf-8")
+
+    errors = check_local_links(tmp_path, (changelog,))
+
+    assert len(errors) == 1
+    assert "missing local link target: docs/nowhere.md" in errors[0]
 
 
 def _write_field_parity_tree(root: Path, *rows: str) -> None:
@@ -147,14 +197,18 @@ _TEST_TOKEN = re.compile(r"\btest_[A-Za-z0-9_]+")
 
 
 def _cited_test_names(root: Path) -> set[str]:
-    """Every `test_*` token the shipped documents name, minus the test modules themselves.
+    """Every `test_*` token the checked documents name, minus the test modules themselves.
+
+    The scan follows the checker's own file set rather than `docs/` alone. A
+    test named in `CONTRIBUTING.md` is then guarded here in its own right,
+    instead of only for as long as some other document happens to name it too.
 
     A token that also names a file under `tests/` was matched inside a path such
     as `tests/test_python_source.py`; it names a module, not a function, and the
-    census would report all six of them as missing without this exclusion.
+    census would report every one of them as missing without this exclusion.
     """
     tokens: set[str] = set()
-    for document in sorted((root / "docs").glob("*.md")):
+    for document in markdown_files(root):
         tokens.update(_TEST_TOKEN.findall(document.read_text(encoding="utf-8")))
     return {token for token in tokens if not (root / "tests" / f"{token}.py").exists()}
 

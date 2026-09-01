@@ -111,13 +111,22 @@ def _is_fence_close(line: str, marker: str) -> bool:
 
 
 def markdown_files(root: Path) -> tuple[Path, ...]:
-    """Return the checked Markdown files in deterministic order."""
+    """Return the checked Markdown files in deterministic order.
+
+    The changelog and the issue templates are public Markdown the project
+    ships, so a link that stops resolving in one of them is worth as much as a
+    link in a guide. The template entries come from a glob and heal themselves
+    when a template is added or renamed; the changelog is named outright, like
+    the four files above it.
+    """
     return (
         root / "README.md",
         root / "CONTRIBUTING.md",
         root / "SECURITY.md",
         root / "bench/README.md",
         *sorted((root / "docs").glob("*.md")),
+        root / "CHANGELOG.md",
+        *sorted((root / ".github/ISSUE_TEMPLATE").glob("*.md")),
     )
 
 
