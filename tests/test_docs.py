@@ -17,6 +17,7 @@ if TYPE_CHECKING:
         check_checkpoint_manifest_version,
         check_docs,
         check_documented_dataclass_fields,
+        check_documented_lsp_methods,
         check_local_links,
         markdown_files,
         table_rows,
@@ -33,6 +34,7 @@ else:
         check_checkpoint_manifest_version,
         check_docs,
         check_documented_dataclass_fields,
+        check_documented_lsp_methods,
         check_local_links,
         markdown_files,
         table_rows,
@@ -518,3 +520,152 @@ def test_the_kernel_contract_public_surface_rows_are_still_found() -> None:
     rows = _kernel_public_surface_rows(PROJECT_ROOT)
 
     assert len(rows) >= 60, f"expected the public-surface tables to hold many rows, found {len(rows)}"
+
+
+def _write_lsp_tree(
+    root: Path,
+    *,
+    documented: tuple[str, ...],
+    handled: tuple[str, ...],
+    published: tuple[str, ...] = (),
+    dispatch_name: str = "_dispatch_request",
+) -> None:
+    """Write the smallest tree the LSP method check reads: the server module and the reference.
+
+    Every stub defines all three dispatch functions, whatever the cell is
+    about. A function the check cannot find is an error in its own right, so a
+    stub that left one out would be answering for that rather than for the
+    disagreement between the matrix and the server.
+    """
+    package = root / "src" / "pyinc_tools"
+    package.mkdir(parents=True, exist_ok=True)
+    dispatch = [f"    def {dispatch_name}(self, method, params):"]
+    for name in handled:
+        dispatch.append(f'        if method == "{name}":')
+        dispatch.append("            return method")
+    dispatch.append("        return None")
+    notifications = [f'        self._send_notification("{name}", {{}})' for name in published]
+    (package / "lsp.py").write_text(
+        '"""A stub language server."""\n'
+        "\n"
+        "\n"
+        "class _Server:\n"
+        "    def _handle_request(self, method, params):\n"
+        "        return None\n"
+        "\n" + "\n".join(dispatch) + "\n"
+        "\n"
+        "    def _handle_notification(self, method, params):\n"
+        + "".join(f"{line}\n" for line in notifications)
+        + "        return False\n"
+        "\n"
+        "    def _send_notification(self, method, params):\n"
+        "        return None\n",
+        encoding="utf-8",
+    )
+    docs = root / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    (docs / "lsp-reference.md").write_text(
+        "# LSP Reference\n"
+        "\n"
+        "## Method matrix\n"
+        "\n"
+        "| Method | Result | User-visible limits |\n"
+        "|---|---|---|\n"
+        + "".join(f"| `{name}` | A result. | A limit. |\n" for name in documented),
+        encoding="utf-8",
+    )
+
+
+def test_lsp_method_check_reports_a_handled_method_the_matrix_omits(tmp_path: Path) -> None:
+    _write_lsp_tree(
+        tmp_path,
+        documented=("initialize",),
+        handled=("initialize", "textDocument/hover"),
+    )
+
+    errors = check_documented_lsp_methods(tmp_path, minimum=1)
+
+    assert len(errors) == 1
+    assert "undocumented methods: textDocument/hover" in errors[0]
+
+
+def test_lsp_method_check_reports_a_documented_method_the_server_never_sees(
+    tmp_path: Path,
+) -> None:
+    _write_lsp_tree(
+        tmp_path,
+        documented=("initialize", "textDocument/hover"),
+        handled=("initialize",),
+    )
+
+    errors = check_documented_lsp_methods(tmp_path, minimum=1)
+
+    assert len(errors) == 1
+    assert "methods the server does not handle: textDocument/hover" in errors[0]
+
+
+def test_lsp_method_check_accepts_a_matrix_naming_what_the_server_handles(
+    tmp_path: Path,
+) -> None:
+    """The published notification counts as implemented: the server sends it unasked."""
+    _write_lsp_tree(
+        tmp_path,
+        documented=("initialize", "textDocument/hover", "textDocument/publishDiagnostics"),
+        handled=("initialize", "textDocument/hover"),
+        published=("textDocument/publishDiagnostics",),
+    )
+
+    assert check_documented_lsp_methods(tmp_path, minimum=1) == ()
+
+
+def test_lsp_method_check_reports_a_dispatch_function_it_cannot_find(tmp_path: Path) -> None:
+    """A renamed dispatch chain must be loud, not read as a server handling less."""
+    _write_lsp_tree(
+        tmp_path,
+        documented=("initialize", "textDocument/hover"),
+        handled=("initialize", "textDocument/hover"),
+        dispatch_name="_dispatch_request_under_another_name",
+    )
+
+    errors = check_documented_lsp_methods(tmp_path, minimum=1)
+
+    assert len(errors) == 1
+    assert "no _dispatch_request to read LSP methods from" in errors[0]
+
+
+def test_lsp_method_check_reports_a_harvest_too_small_for_the_shipped_floor(
+    tmp_path: Path,
+) -> None:
+    """The default floor is the guard against a walk that quietly stops matching.
+
+    The matrix and the stub agree here, so the comparison alone would pass: what
+    reports the two-method harvest is the floor and nothing else.
+    """
+    _write_lsp_tree(
+        tmp_path,
+        documented=("initialize", "textDocument/hover"),
+        handled=("initialize", "textDocument/hover"),
+    )
+
+    errors = check_documented_lsp_methods(tmp_path)
+
+    assert len(errors) == 1
+    assert "found 2 LSP method strings, too few to compare" in errors[0]
+
+
+def test_lsp_method_check_reports_a_missing_reference_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """A removed reference must not take every other check down with it."""
+    _write_lsp_tree(
+        tmp_path,
+        documented=("initialize", "textDocument/hover"),
+        handled=("initialize", "textDocument/hover"),
+    )
+    (tmp_path / "docs" / "lsp-reference.md").unlink()
+
+    errors = check_documented_lsp_methods(tmp_path, minimum=1)
+
+    assert len(errors) == 1
+    assert "docs/lsp-reference.md" in errors[0]
+    assert "missing document" in errors[0]

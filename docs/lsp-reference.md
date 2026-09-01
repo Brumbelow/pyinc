@@ -20,7 +20,7 @@ configuration are in the [`pyinc-tools` guide](pyinc-tools-guide.md).
 | Method | Result | User-visible limits |
 |---|---|---|
 | `initialize`, `initialized`, `shutdown`, `exit` | Ordered server lifecycle and negotiated capabilities. | One workspace per server process. Requests before initialization or after shutdown fail. |
-| `textDocument/didOpen`, `didChange`, `didSave`, `didClose` | Maintains editor overlays and republishes diagnostics. | `didChange` expects full document text; `didSave` reads the saved file rather than accepting text. |
+| `textDocument/didOpen`, `textDocument/didChange`, `textDocument/didSave`, `textDocument/didClose` | Maintains editor overlays and republishes diagnostics. | `textDocument/didChange` expects full document text; `textDocument/didSave` reads the saved file rather than accepting text. |
 | `workspace/didChangeWatchedFiles` | Refreshes changed, created, or deleted files from disk. | Paths outside the workspace are rejected. The built-in polling watcher can provide the same refresh path. |
 | `textDocument/documentSymbol` | Functions, classes, variables, and imports in one file. | Python files only; malformed source may produce an empty or partial result. |
 | `workspace/symbol` | Case-insensitive name filtering across workspace symbols. | Workspace declarations only; installed and stdlib symbols are not indexed. |
@@ -89,5 +89,5 @@ Review the returned workspace edit before applying it to a structural move.
 The server does not advertise formatting, code formatting-on-save, range
 formatting, implementation navigation, document colors, inline values,
 monikers, notebook synchronization, call/type hierarchy beyond direct edges,
-semantic-token deltas, completion-item resolution, code-lens resolution, or
-inlay-hint resolution.
+semantic-token deltas, completion-item resolution, document-link resolution,
+code-lens resolution, or inlay-hint resolution.

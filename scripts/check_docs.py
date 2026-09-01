@@ -82,6 +82,14 @@ _API_FILES = {
     "pyinc_codegen": Path("src/pyinc_codegen/__init__.py"),
     "pyinc_tools": Path("src/pyinc_tools/__init__.py"),
 }
+_LSP_DOCUMENT = Path("docs/lsp-reference.md")
+_LSP_SOURCE = Path("src/pyinc_tools/lsp.py")
+# The language server decides what it supports by comparing `method` against a
+# string in one of these three functions, and it publishes diagnostics of its
+# own accord; a method the reference names that appears in neither place is one
+# the server never sees.
+_LSP_DISPATCH_FUNCTIONS = ("_handle_request", "_dispatch_request", "_handle_notification")
+_LSP_NOTIFICATION_SENDER = "_send_notification"
 
 
 @dataclass(frozen=True)
@@ -614,6 +622,106 @@ def check_documented_dataclass_fields(root: Path) -> tuple[str, ...]:
     return tuple(errors)
 
 
+def _lsp_dispatched_methods(function: ast.AsyncFunctionDef | ast.FunctionDef) -> set[str]:
+    """Return every string the function tests `method` for equality against."""
+    names: set[str] = set()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1 or len(node.comparators) != 1:
+            continue
+        left = node.left
+        comparator = node.comparators[0]
+        if not isinstance(left, ast.Name) or left.id != "method":
+            continue
+        if not isinstance(node.ops[0], ast.Eq):
+            continue
+        if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
+            names.add(comparator.value)
+    return names
+
+
+def _lsp_published_methods(tree: ast.AST) -> set[str]:
+    """Return every method name the server sends as a notification of its own."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        called = node.func
+        if not isinstance(called, ast.Attribute) or called.attr != _LSP_NOTIFICATION_SENDER:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            names.add(first.value)
+    return names
+
+
+def check_documented_lsp_methods(root: Path, *, minimum: int = 30) -> tuple[str, ...]:
+    """Compare the reference's method matrix with the methods the server handles.
+
+    The matrix is the only description of the protocol surface, and nothing
+    compares it with the dispatch chain, so a method the server gains or loses
+    drifts away from the document silently. Every inline-code span in the
+    Method column counts as a documented method: the lifecycle methods carry no
+    slash and neither does an abbreviated spelling, so no shape rule separates
+    a real name from a wrong one, and one would hide the abbreviations this
+    comparison exists to report.
+
+    `minimum` guards the extraction rather than the surface. It counts the
+    distinct method strings: a function can compare `method` against the same
+    name twice, and the published notification is collected apart from the
+    chain. The default sits well under what the dispatch chain yields, so a
+    walk that matches nothing or nearly nothing is reported rather than passing
+    on an empty harvest; a single dropped method is the comparison's own job.
+    """
+    document = root / _LSP_DOCUMENT
+    if not document.is_file():
+        return (f"{_LSP_DOCUMENT}: missing document named by the LSP method check",)
+    documented: set[str] = set()
+    for row in table_rows(document.read_text(encoding="utf-8")):
+        if row.section != "Method matrix" or len(row.cells) != 3:
+            continue
+        if row.cells[0] == "Method" or set(row.cells[0]) <= {"-"}:
+            continue
+        documented.update(_INLINE_CODE.findall(row.cells[0]))
+
+    source = root / _LSP_SOURCE
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+        and node.name in _LSP_DISPATCH_FUNCTIONS
+    }
+    implemented = _lsp_published_methods(tree)
+    unreadable: list[str] = []
+    for name in _LSP_DISPATCH_FUNCTIONS:
+        function = functions.get(name)
+        if function is None:
+            unreadable.append(f"{_LSP_SOURCE}: no {name} to read LSP methods from")
+            continue
+        implemented |= _lsp_dispatched_methods(function)
+    if unreadable:
+        # A harvest known to be short is not compared: every method the missing
+        # function dispatched would be reported as documented but unhandled,
+        # which blames the reference for a rename in the server.
+        return tuple(unreadable)
+    if len(implemented) < minimum:
+        return (
+            f"{_LSP_SOURCE}: found {len(implemented)} LSP method strings, too few to compare "
+            f"against the documented matrix (expected at least {minimum})",
+        )
+
+    errors: list[str] = []
+    undocumented = sorted(implemented - documented)
+    unhandled = sorted(documented - implemented)
+    if undocumented:
+        errors.append(f"{_LSP_DOCUMENT}: undocumented methods: " + ", ".join(undocumented))
+    if unhandled:
+        errors.append(
+            f"{_LSP_DOCUMENT}: methods the server does not handle: " + ", ".join(unhandled)
+        )
+    return tuple(errors)
+
+
 def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
     """Run every offline documentation check."""
     files = markdown_files(root)
@@ -629,6 +737,7 @@ def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
         *check_checkpoint_manifest_version(root),
         *check_documented_dataclass_fields(root),
         *check_action_manifest_version(root),
+        *check_documented_lsp_methods(root),
     )
 
 
