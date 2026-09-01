@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,12 +75,6 @@ _DATACLASS_FIELD_SOURCES = {
     "InspectionNode": Path("src/pyinc/explain.py"),
     "QueryProfile": Path("src/pyinc/runtime.py"),
 }
-# A table row is one physical line, so both patterns anchor on the raw line and
-# the second one also requires the closing pipe. A wrapped row keeps a
-# well-formed head line, so a `Fields:` sentence that does not open and close on
-# the same line as its name cell is malformed rather than absent.
-_SURFACE_ROW_NAME_CELL = re.compile(r"^\|(?P<name_cell>[^|]*)\|")
-_SURFACE_ROW = re.compile(r"^\|(?P<name_cell>[^|]*)\|(?P<description>[^|]*)\|\s*$")
 _FIELDS_SENTENCE = re.compile(r"Fields:(?P<names>[^.]*)\.")
 _API_FILES = {
     "pyinc": Path("src/pyinc/__init__.py"),
@@ -95,6 +90,15 @@ class Fence:
     line: int
     info: tuple[str, ...]
     content: str
+
+
+@dataclass(frozen=True)
+class TableRow:
+    line: int
+    raw: str
+    cells: tuple[str, ...]
+    section: str | None
+    closed: bool
 
 
 def _is_fence_close(line: str, marker: str) -> bool:
@@ -184,6 +188,42 @@ def heading_anchors(path: Path) -> frozenset[str]:
         counts[base] = duplicate + 1
         anchors.add(base if duplicate == 0 else f"{base}-{duplicate}")
     return frozenset(anchors)
+
+
+def table_rows(text: str, *, max_indent: int = 3) -> Iterator[TableRow]:
+    """Yield every Markdown table row, with the heading it sits under.
+
+    The documented tables come in two shapes -- one names a category and lists
+    the names in its second cell, the other names one thing per row -- so the
+    consumers differ in which cell they read and which rows they want. What
+    they must not differ in is what counts as a row, which is what this yields:
+    header and separator rows included, because each caller recognises its own.
+
+    A row indented further than `max_indent` is not yielded. At the default of
+    three that is the four spaces where the renderer stops seeing a table and
+    starts seeing an indented code block, so reading one would mean checking
+    text nobody renders as a table. `closed` reports whether the row also ends
+    in a pipe, which is how a row wrapped across two lines is told from a whole
+    one.
+    """
+    section: str | None = None
+    for number, line in enumerate(text.splitlines(), 1):
+        heading = _HEADING.match(line)
+        if heading is not None:
+            section = heading.group("title")
+            continue
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        if len(line) - len(line.lstrip(" ")) > max_indent:
+            continue
+        yield TableRow(
+            line=number,
+            raw=line,
+            cells=tuple(cell.strip() for cell in stripped.strip("|").split("|")),
+            section=section,
+            closed=stripped.endswith("|"),
+        )
 
 
 def _local_target(root: Path, source: Path, raw_target: str) -> tuple[Path, str] | None:
@@ -376,11 +416,10 @@ def check_documented_integration_api(root: Path) -> tuple[str, ...]:
     """Compare the integration contract's stable-name rows with package exports."""
     contract_path = root / "docs/integration-contract.md"
     documented: set[str] = set()
-    for line in contract_path.read_text(encoding="utf-8").splitlines():
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if len(cells) != 2 or cells[0] not in _PUBLIC_ROW_NAMES:
+    for row in table_rows(contract_path.read_text(encoding="utf-8")):
+        if len(row.cells) != 2 or row.cells[0] not in _PUBLIC_ROW_NAMES:
             continue
-        documented.update(_INLINE_CODE.findall(cells[1]))
+        documented.update(_INLINE_CODE.findall(row.cells[1]))
     exported = _read_exports(root, "pyinc.integrations")
     errors: list[str] = []
     missing = sorted(exported - documented)
@@ -396,18 +435,12 @@ def check_documented_kernel_api(root: Path) -> tuple[str, ...]:
     """Compare the kernel contract's public-surface tables with package exports."""
     contract_path = root / "docs/kernel-contract.md"
     documented: set[str] = set()
-    in_section = False
-    for line in contract_path.read_text(encoding="utf-8").splitlines():
-        heading = _HEADING.match(line)
-        if heading is not None:
-            in_section = heading.group("title") == "Public Surface"
+    for row in table_rows(contract_path.read_text(encoding="utf-8")):
+        if row.section != "Public Surface" or len(row.cells) != 2:
             continue
-        if not in_section or not line.strip().startswith("|"):
+        if row.cells[0] in {"Name", ""} or set(row.cells[0]) <= {"-"}:
             continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if len(cells) != 2 or cells[0] in {"Name", ""} or set(cells[0]) <= {"-"}:
-            continue
-        documented.update(_INLINE_CODE.findall(cells[0]))
+        documented.update(_INLINE_CODE.findall(row.cells[0]))
     exported = _read_exports(root, "pyinc")
     errors: list[str] = []
     missing = sorted(exported - documented)
@@ -524,29 +557,36 @@ def check_documented_dataclass_fields(root: Path) -> tuple[str, ...]:
     """Compare the public-surface field lists with the dataclasses they describe."""
     contract_path = root / "docs/kernel-contract.md"
     errors: list[str] = []
-    in_section = False
-    for line in contract_path.read_text(encoding="utf-8").splitlines():
-        heading = _HEADING.match(line)
-        if heading is not None:
-            in_section = heading.group("title") == "Public Surface"
+    for row in table_rows(contract_path.read_text(encoding="utf-8")):
+        if row.section != "Public Surface":
             continue
-        if not in_section:
-            continue
-        name_cell = _SURFACE_ROW_NAME_CELL.match(line)
-        if name_cell is None:
-            continue
-        names = _INLINE_CODE.findall(name_cell.group("name_cell"))
-        if len(names) != 1 or names[0] not in _DATACLASS_FIELD_SOURCES:
+        names = _INLINE_CODE.findall(row.cells[0])
+        if len(names) != 1:
             continue
         name = names[0]
-        row = _SURFACE_ROW.match(line)
-        if row is None:
-            errors.append(
-                f"docs/kernel-contract.md: the {name} row is not a single two-cell row on one line"
-            )
+        tracked = name in _DATACLASS_FIELD_SOURCES
+        # A wrapped row keeps a well-formed head line, so a `Fields:` sentence
+        # that does not open and close on the same line as its name cell is
+        # malformed rather than absent.
+        if not row.closed or len(row.cells) != 2:
+            if tracked:
+                errors.append(
+                    f"docs/kernel-contract.md: the {name} row is not a single two-cell row "
+                    "on one line"
+                )
             continue
-        description = row.group("description")
+        description = row.cells[1]
         sentence = _FIELDS_SENTENCE.search(description)
+        if not tracked:
+            # A row that lists fields for a name no source is recorded for is a
+            # sentence nothing compares. Without this, dropping an entry from
+            # the mapping above leaves its row documented, unchecked and green.
+            if sentence is not None:
+                errors.append(
+                    f"docs/kernel-contract.md: the {name} row lists fields, but "
+                    f"{name} is not one of the types whose fields are checked"
+                )
+            continue
         if sentence is None:
             detail = (
                 "no `Fields:` sentence ending in a period"

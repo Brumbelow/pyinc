@@ -30,7 +30,9 @@ import inspect
 import json
 import os
 import re
+import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -87,6 +89,12 @@ from pyinc.integrations import (
 )
 from pyinc.integrations._decoding import _reject_in_query
 from pyinc.resources import ResolvedPathResource
+
+if TYPE_CHECKING:
+    from scripts.check_docs import _INLINE_CODE, table_rows
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from check_docs import _INLINE_CODE, table_rows  # noqa: E402
 
 _INTEGRATIONS = Path(__file__).parents[1] / "src" / "pyinc" / "integrations"
 _CONTRACT = Path(__file__).parents[1] / "docs" / "integration-contract.md"
@@ -249,6 +257,28 @@ def test_the_documented_entrypoints_are_the_packages_plain_functions() -> None:
     assert _entrypoint_drift(document, exported) == ((), ())
     assert len(_documented_entrypoint_names(document)) == 38
     assert len(exported) == 38
+
+
+def test_the_entrypoint_rows_read_the_same_through_the_shared_row_parser() -> None:
+    """Two readers of one table have to agree about what the table says.
+
+    The reader above splits the row on pipes without stripping the outer ones;
+    the documentation checker reads the same tables through a shared parser
+    that strips them and tracks the heading each row sits under. The count
+    pinned above holds a cardinality, not an agreement, so either reader could
+    narrow on its own and stay green while the other kept finding the names.
+    """
+    document = _CONTRACT.read_text(encoding="utf-8")
+
+    shared = {
+        name
+        for row in table_rows(document)
+        if len(row.cells) == 2 and row.cells[0] == "Entrypoints"
+        for name in _INLINE_CODE.findall(row.cells[1])
+    }
+
+    assert shared, "the shared parser found no entrypoint rows"
+    assert _documented_entrypoint_names(document) == shared
 
 
 # ---------------------------------------------------------------------------

@@ -9,23 +9,31 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from scripts.check_docs import (
         _ACTION_VERSION_PROSE,
+        _INLINE_CODE,
+        _PUBLIC_ROW_NAMES,
         PROJECT_ROOT,
+        TableRow,
         check_action_manifest_version,
         check_checkpoint_manifest_version,
         check_docs,
         check_documented_dataclass_fields,
         check_local_links,
+        table_rows,
     )
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
     from check_docs import (  # noqa: E402
         _ACTION_VERSION_PROSE,
+        _INLINE_CODE,
+        _PUBLIC_ROW_NAMES,
         PROJECT_ROOT,
+        TableRow,
         check_action_manifest_version,
         check_checkpoint_manifest_version,
         check_docs,
         check_documented_dataclass_fields,
         check_local_links,
+        table_rows,
     )
 
 
@@ -358,3 +366,101 @@ def test_the_action_ledger_check_reads_three_sentences_in_two_documents() -> Non
     assert len(documents) == 3
     assert documents.count(Path("docs/action-contract.md")) == 2
     assert documents.count(Path("docs/architecture.md")) == 1
+
+
+def test_a_public_surface_row_is_read_even_when_it_is_indented(tmp_path: Path) -> None:
+    """An indented row still renders as a table row, so a stale one still has to be reported."""
+    _write_field_parity_tree(
+        tmp_path,
+        "  | `InspectionNode` | One node. Fields: `label`, `name`. |",
+    )
+
+    errors = check_documented_dataclass_fields(tmp_path)
+
+    assert len(errors) == 1
+    assert "InspectionNode" in errors[0]
+    assert "`kind`" in errors[0]
+
+
+def test_a_row_indented_four_spaces_is_not_read_as_a_table_row(tmp_path: Path) -> None:
+    """Four spaces of indent is an indented code block, and nobody renders it as a table.
+
+    The row is the one the cell above reports, moved two spaces to the right:
+    what changes is not the sentence but whether the document says it at all.
+    """
+    _write_field_parity_tree(
+        tmp_path,
+        "    | `InspectionNode` | One node. Fields: `label`, `name`. |",
+    )
+
+    assert check_documented_dataclass_fields(tmp_path) == ()
+
+
+def test_a_row_listing_fields_for_an_unchecked_type_is_reported(tmp_path: Path) -> None:
+    """A `Fields:` sentence nothing compares reads exactly like one that is compared.
+
+    Without this, removing a type from the checked set leaves its sentence in
+    place, unread and green, which is the failure the check exists to catch
+    happening to the check itself.
+    """
+    _write_field_parity_tree(
+        tmp_path,
+        "| `CaptureInfo` | One capture. Fields: `path`, `digest`. |",
+    )
+
+    errors = check_documented_dataclass_fields(tmp_path)
+
+    assert len(errors) == 1
+    assert "CaptureInfo" in errors[0]
+
+
+def _documented_integration_names(root: Path) -> set[str]:
+    """Every name the integration contract's stable-surface rows carry, as the check reads it."""
+    document = (root / "docs" / "integration-contract.md").read_text(encoding="utf-8")
+    names: set[str] = set()
+    for row in table_rows(document):
+        if len(row.cells) == 2 and row.cells[0] in _PUBLIC_ROW_NAMES:
+            names.update(_INLINE_CODE.findall(row.cells[1]))
+    return names
+
+
+def _kernel_public_surface_rows(root: Path) -> list[TableRow]:
+    """Every data row of the kernel contract's public-surface tables, as the check reads it."""
+    document = (root / "docs" / "kernel-contract.md").read_text(encoding="utf-8")
+    return [
+        row
+        for row in table_rows(document)
+        if row.section == "Public Surface"
+        and len(row.cells) == 2
+        and row.cells[0] not in {"Name", ""}
+        and not set(row.cells[0]) <= {"-"}
+    ]
+
+
+def test_the_integration_contract_rows_still_carry_the_whole_documented_surface() -> None:
+    """Say where a collapsed harvest came from: the row reader, not the document.
+
+    The checks that compare these names with `__all__` do report a narrowed row
+    reader -- they compare both directions, so fewer documented names arrive as
+    undocumented exports. What they report is every name in `__all__`, which
+    reads as a document that stopped listing its surface and invites the fix to
+    be made in `docs/`. This says the harvest itself collapsed. It is also the
+    only cover a later consumer would have if it compared these rows against
+    something other than an exact set, because such a check reports less when it
+    is given less. A floor rather than an equality: ordinary documentation edits
+    move the number, and a collapse does not.
+    """
+    names = _documented_integration_names(PROJECT_ROOT)
+
+    assert len(names) >= 90, f"expected the contract to name the whole surface, found {len(names)}"
+
+
+def test_the_kernel_contract_public_surface_rows_are_still_found() -> None:
+    """The same floor for the other table shape, where the names sit in the first cell.
+
+    Counted as rows rather than names, so what it pins is the parser's own
+    harvest rather than whatever a consumer goes on to read out of a cell.
+    """
+    rows = _kernel_public_surface_rows(PROJECT_ROOT)
+
+    assert len(rows) >= 60, f"expected the public-surface tables to hold many rows, found {len(rows)}"
