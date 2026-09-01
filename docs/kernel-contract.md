@@ -1218,7 +1218,11 @@ that has no record executes it.
 
 ## Public Surface
 
-Everything `pyinc` exports, and nothing else, carries the semver contract.
+Everything `pyinc` exports, and nothing else, is inside the semver contract
+this document defines. `pyinc.integrations` states its own stable surface in
+[integration-contract.md](integration-contract.md); the consumer packages
+`pyinc_tools` and `pyinc_codegen` are **unstable** — see
+[SECURITY.md](../SECURITY.md).
 The offline documentation check compares these tables against
 `pyinc.__all__` in both directions.
 

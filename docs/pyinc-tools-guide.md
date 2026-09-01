@@ -4,6 +4,12 @@
 in the `pyinc` distribution. It consumes the stable `pyinc.integrations` API;
 the kernel itself does not contain LSP or filesystem-watcher behavior.
 
+**Stability.** `pyinc_tools` is **unstable**: it is not covered by the project's
+semantic-versioning promise. Its exported names, the fields of its result types,
+the `pyinc-tools` command-line surface and the LSP wire behavior may change in
+any release. The kernel and `pyinc.integrations` carry that promise — see
+[SECURITY.md](../SECURITY.md).
+
 ## Install and verify
 
 ```console

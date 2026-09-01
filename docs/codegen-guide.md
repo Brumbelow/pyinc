@@ -10,6 +10,11 @@ actually changed are rewritten.
 It is stdlib-only and depends only on pyinc's public API; see [Architectural
 boundary](#architectural-boundary) below.
 
+**Stability.** `pyinc_codegen` is **unstable**: it is not covered by the
+project's semantic-versioning promise, and its exported names and
+generated-output shape may change in any release. The `pyinc` APIs it builds on
+do carry that promise — see [SECURITY.md](../SECURITY.md).
+
 ## Usage
 
 ```python

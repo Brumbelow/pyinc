@@ -122,8 +122,8 @@ surface is a subpackage of `pyinc`:
 |---|---|---|
 | `pyinc` | Stable query kernel, resources, snapshots, artifact stores, and declared-output actions. | [Kernel contract](https://github.com/Brumbelow/pyinc/blob/main/docs/kernel-contract.md) |
 | `pyinc.integrations` | Stable, frozen analysis results and high-level entrypoints for Python source, configuration, dependencies, symbols, and notebooks. | [Integration contract](https://github.com/Brumbelow/pyinc/blob/main/docs/integration-contract.md) |
-| `pyinc_tools` | `pyinc-tools analyze`, a polling watcher, `WorkspaceSession`, and a stdio LSP server built on the integration API. | [Tooling guide](https://github.com/Brumbelow/pyinc/blob/main/docs/pyinc-tools-guide.md) |
-| `pyinc_codegen` | JSON Schema to typed Python generation through the public query and action APIs. | [Codegen guide](https://github.com/Brumbelow/pyinc/blob/main/docs/codegen-guide.md) |
+| `pyinc_tools` | **Unstable.** `pyinc-tools analyze`, a polling watcher, `WorkspaceSession`, and a stdio LSP server built on the integration API. | [Tooling guide](https://github.com/Brumbelow/pyinc/blob/main/docs/pyinc-tools-guide.md) |
+| `pyinc_codegen` | **Unstable.** JSON Schema to typed Python generation through the public query and action APIs. | [Codegen guide](https://github.com/Brumbelow/pyinc/blob/main/docs/codegen-guide.md) |
 
 Queries remain pure. Filesystem writes belong to the separate `@action` layer,
 which reconciles a complete desired output set with atomic file replacement,
