@@ -908,8 +908,8 @@ decided at release time.
   prints the temporary directory it built, which was the one part of its
   output that differed between runs.
 - The source-analysis example analyzes a workspace it builds for itself. It
-  analyzed the directory it lives in and printed a sixty-kilobyte dataclass
-  repr carrying the environment's absolute paths and the installed version;
+  analyzed the directory it lives in and printed sixty kilobytes of dataclass
+  reprs carrying the environment's absolute paths and the installed version;
   it now writes a fixed two-module workspace into a temporary directory and
   prints seven lines of named fields that do not depend on what is installed
   or where it is run from. It no longer writes into the directory it lives in

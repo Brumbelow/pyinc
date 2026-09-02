@@ -288,9 +288,9 @@ def test_symbol_lookup_follows_the_whole_re_export_chain(
     assert match is not None
     assert Path(match.group(1).strip()).name == "origin.py"
     # Following no hop at all would name facade.py and following one would name
-    # middle.py, so the file name alone says both hops were taken. Line 3 is
-    # `def process(items):` and character 4 is where `process` starts, so the
-    # position landed on the identifier and not on the start of the line.
+    # middle.py, so the file name alone says both hops were taken. Zero-based
+    # line 3 is `def process(items):` and character 4 is where `process` starts,
+    # so the position landed on the identifier and not on the start of the line.
     assert "Defining position: SourcePosition(line=3, character=4)" in output
 
 
@@ -351,6 +351,8 @@ def test_calc_demo_warm_matches_fresh(
     fresh = database(mode=mode)
     calc_emit.reconcile(fresh, str(root), root=fresh_out)
 
+    # Two empty roots would compare equal, so the fresh root must not be empty.
+    assert _emitted(fresh_out)
     assert _emitted(warm_out) == _emitted(fresh_out)
 
     namespace["main"](mode=mode)
@@ -386,6 +388,8 @@ def test_action_reconcile_demo_warm_matches_fresh(
     fresh.set(names, ("alpha", "gamma"))
     emit.reconcile(fresh, str(src), root=fresh_out)
 
+    # Two empty roots would compare equal, so the fresh root must not be empty.
+    assert _emitted(fresh_out)
     assert _emitted(warm_out) == _emitted(fresh_out)
 
     namespace["main"](mode=mode)
