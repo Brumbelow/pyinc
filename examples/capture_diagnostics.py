@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from pyinc import Database, explain_query_captures, query
-from pyinc.errors import UnsupportedValueError
+from pyinc import Database, UnsupportedValueError, explain_query_captures, query
 
 
 def main() -> None:

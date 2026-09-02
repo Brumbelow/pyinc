@@ -7,6 +7,14 @@ from typing import Any
 
 from pyinc import Database
 from pyinc.integrations import notebook_analysis
+
+# `notebook_analysis_payload` is a module-local helper rather than part of the
+# package's stable surface: it is deliberately absent from
+# `pyinc.integrations.__all__`, and the integration contract's "Composition and
+# experimental helpers" section places such names outside that contract — an
+# experimental helper, by that section's own name. It is imported here because
+# `db.inspect` takes a query, and the public entrypoint
+# `notebook_analysis` is a plain function.
 from pyinc.integrations.notebook import notebook_analysis_payload
 
 
