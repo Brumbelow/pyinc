@@ -51,7 +51,10 @@ def main() -> None:
         repaired = emit.reconcile(db, str(src), root=out)
         print(f"tamper_repaired={repaired.repaired}")
 
-        # Removing a declaration deletes only that owned output.
+        # Removing a declaration deletes only that owned output — and only
+        # while that file still holds the bytes the ledger recorded for it, and
+        # is still the same file the check read. A drifted orphan is released
+        # instead: the ledger stops claiming it, and the file stays where it is.
         db.set(NAMES, ("alpha",))
         removed = emit.reconcile(db, str(src), root=out)
         print(f"orphan_deleted={removed.deleted}")
