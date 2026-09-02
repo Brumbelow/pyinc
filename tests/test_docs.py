@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import re
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from scripts.check_docs import (
         _ACTION_VERSION_PROSE,
+        _CONSUMER_SURFACES,
         _INLINE_CODE,
         _PUBLIC_ROW_NAMES,
         PROJECT_ROOT,
@@ -16,6 +18,7 @@ if TYPE_CHECKING:
         check_action_manifest_version,
         check_checkpoint_manifest_version,
         check_docs,
+        check_documented_consumer_api,
         check_documented_dataclass_fields,
         check_documented_lsp_methods,
         check_local_links,
@@ -26,6 +29,7 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
     from check_docs import (  # noqa: E402
         _ACTION_VERSION_PROSE,
+        _CONSUMER_SURFACES,
         _INLINE_CODE,
         _PUBLIC_ROW_NAMES,
         PROJECT_ROOT,
@@ -33,6 +37,7 @@ else:
         check_action_manifest_version,
         check_checkpoint_manifest_version,
         check_docs,
+        check_documented_consumer_api,
         check_documented_dataclass_fields,
         check_documented_lsp_methods,
         check_local_links,
@@ -669,3 +674,141 @@ def test_lsp_method_check_reports_a_missing_reference_instead_of_raising(
     assert len(errors) == 1
     assert "docs/lsp-reference.md" in errors[0]
     assert "missing document" in errors[0]
+
+
+def _write_consumer_surface_tree(
+    root: Path,
+    *,
+    tools_rows: tuple[tuple[str, tuple[str, ...]], ...] = (("Entrypoints", ("WorkspaceSession",)),),
+    tools_exports: tuple[str, ...] = ("WorkspaceSession",),
+    codegen_rows: tuple[tuple[str, tuple[str, ...]], ...] = (("Entrypoints", ("generate",)),),
+    codegen_exports: tuple[str, ...] = ("generate",),
+) -> None:
+    """Write the smallest tree the consumer surface check reads: both packages, both guides.
+
+    Every fixture writes all four files whatever the cell is about. The check
+    walks both surfaces, so a tree holding only one of them would answer with
+    the other one's missing document rather than with the disagreement the cell
+    is asking about.
+    """
+    docs = root / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    for module, document, rows, exports in (
+        ("pyinc_tools", "pyinc-tools-guide.md", tools_rows, tools_exports),
+        ("pyinc_codegen", "codegen-guide.md", codegen_rows, codegen_exports),
+    ):
+        package = root / "src" / module
+        package.mkdir(parents=True, exist_ok=True)
+        (package / "__init__.py").write_text(
+            '"""A stub package."""\n\n__all__ = [\n'
+            + "".join(f'    "{name}",\n' for name in exports)
+            + "]\n",
+            encoding="utf-8",
+        )
+        (docs / document).write_text(
+            f"# {module}\n"
+            "\n"
+            "## Public surface\n"
+            "\n"
+            "| Group | Names |\n"
+            "|---|---|\n"
+            + "".join(
+                f"| {label} | " + ", ".join(f"`{name}`" for name in names) + " |\n"
+                for label, names in rows
+            ),
+            encoding="utf-8",
+        )
+
+
+def test_consumer_surface_check_reports_a_documented_name_the_package_never_exports(
+    tmp_path: Path,
+) -> None:
+    _write_consumer_surface_tree(
+        tmp_path,
+        tools_rows=(("Entrypoints", ("WorkspaceSession", "WorkspaceWatcher")),),
+        tools_exports=("WorkspaceSession",),
+    )
+
+    errors = check_documented_consumer_api(tmp_path)
+
+    assert len(errors) == 1
+    assert "docs/pyinc-tools-guide.md: names absent from __all__: WorkspaceWatcher" in errors[0]
+
+
+def test_consumer_surface_check_reports_an_export_the_guide_never_names(tmp_path: Path) -> None:
+    _write_consumer_surface_tree(
+        tmp_path,
+        tools_rows=(("Entrypoints", ("WorkspaceSession",)),),
+        tools_exports=("WorkspaceSession", "PollingWorkspaceWatcher"),
+    )
+
+    errors = check_documented_consumer_api(tmp_path)
+
+    assert len(errors) == 1
+    assert "docs/pyinc-tools-guide.md: undocumented exports: PollingWorkspaceWatcher" in errors[0]
+
+
+def test_consumer_surface_check_accepts_guides_naming_exactly_what_is_exported(
+    tmp_path: Path,
+) -> None:
+    _write_consumer_surface_tree(
+        tmp_path,
+        tools_rows=(
+            ("Entrypoints", ("WorkspaceSession",)),
+            ("Kind aliases", ("RenameStatus",)),
+        ),
+        tools_exports=("WorkspaceSession", "RenameStatus"),
+    )
+
+    assert check_documented_consumer_api(tmp_path) == ()
+
+
+def test_consumer_surface_check_ignores_a_row_under_a_label_the_surface_does_not_name(
+    tmp_path: Path,
+) -> None:
+    """The codegen guide carries other two-cell tables whose first cells are not names.
+
+    The label is the whole gate, so a row the surface does not name contributes
+    nothing in either direction: neither a documented name nor a complaint that
+    the package fails to export one. The tools guide's only other table is
+    four-cell, so it cannot reach a two-cell gate in the first place.
+    """
+    _write_consumer_surface_tree(
+        tmp_path,
+        codegen_rows=(
+            ("Entrypoints", ("generate",)),
+            ("Keyword", ("format", "pattern")),
+        ),
+        codegen_exports=("generate",),
+    )
+
+    assert check_documented_consumer_api(tmp_path) == ()
+
+
+def test_consumer_surface_check_reports_a_missing_guide_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """A removed guide must not take every other check down with it."""
+    _write_consumer_surface_tree(tmp_path)
+    (tmp_path / "docs" / "codegen-guide.md").unlink()
+
+    errors = check_documented_consumer_api(tmp_path)
+
+    assert len(errors) == 1
+    assert "docs/codegen-guide.md" in errors[0]
+    assert "missing document" in errors[0]
+
+
+def test_both_consumer_packages_are_still_compared_against_a_guide() -> None:
+    """Dropping a surface would stop checking that package without reporting anything."""
+    assert {surface.module for surface in _CONSUMER_SURFACES} == {"pyinc_tools", "pyinc_codegen"}
+    for surface in _CONSUMER_SURFACES:
+        assert (PROJECT_ROOT / surface.document).is_file()
+
+
+def test_every_advertised_name_resolves_on_the_package_that_advertises_it() -> None:
+    """A name in `__all__` that the package does not define breaks `import *` at import time."""
+    for module in ("pyinc", "pyinc.integrations", "pyinc_codegen", "pyinc_tools"):
+        imported = importlib.import_module(module)
+        unresolved = [name for name in imported.__all__ if not hasattr(imported, name)]
+        assert not unresolved, f"{module}: {unresolved}"

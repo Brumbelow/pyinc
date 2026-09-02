@@ -109,6 +109,40 @@ class TableRow:
     closed: bool
 
 
+@dataclass(frozen=True)
+class ConsumerSurface:
+    module: str
+    document: Path
+    labels: frozenset[str]
+
+
+# Each consumer package documents its exported names as grouped rows, and the
+# group labels are what tells such a row from the other two-cell tables the
+# codegen guide carries. The document belongs to the key as much as the labels
+# do, so a label may repeat across guides without one guide answering for the
+# other.
+_CONSUMER_SURFACES = (
+    ConsumerSurface(
+        "pyinc_tools",
+        Path("docs/pyinc-tools-guide.md"),
+        frozenset(
+            {
+                "Entrypoints",
+                "Analysis results",
+                "Navigation results",
+                "Editing results",
+                "Kind aliases",
+            }
+        ),
+    ),
+    ConsumerSurface(
+        "pyinc_codegen",
+        Path("docs/codegen-guide.md"),
+        frozenset({"Entrypoints", "Result types", "Errors and enumerations"}),
+    ),
+)
+
+
 def _is_fence_close(line: str, marker: str) -> bool:
     candidate = line.strip()
     return (
@@ -469,6 +503,48 @@ def check_documented_kernel_api(root: Path) -> tuple[str, ...]:
     return tuple(errors)
 
 
+def check_documented_consumer_api(root: Path) -> tuple[str, ...]:
+    """Compare each consumer guide's public-surface rows with the package's exports.
+
+    A row is recognised by the group its first cell names, not by the section
+    it sits under. The codegen guide carries other two-cell tables whose first
+    cells are schema tokens, and reading those as documented names would accuse
+    that package of exporting `format` and `pattern`; the tools guide's only
+    other table is four-cell, so it cannot reach a two-cell gate at all. A
+    heading gate would keep the schema tables out as well, but it would also
+    lose any row a fenced comment beginning with `#` had cut loose from its
+    heading, and both guides contain fences. The labels themselves are the
+    gate, and they are paired with the document that carries them so the same
+    label may appear in both guides.
+
+    The groups are the guides' own editorial arrangement, so nothing here
+    compares a name against the group it was filed under. What is compared is
+    the union: every exported name appears in some row, and every name the
+    rows carry is exported.
+    """
+    errors: list[str] = []
+    for surface in _CONSUMER_SURFACES:
+        document = root / surface.document
+        if not document.is_file():
+            errors.append(
+                f"{surface.document}: missing document named by the consumer surface check"
+            )
+            continue
+        documented: set[str] = set()
+        for row in table_rows(document.read_text(encoding="utf-8")):
+            if len(row.cells) != 2 or row.cells[0] not in surface.labels:
+                continue
+            documented.update(_INLINE_CODE.findall(row.cells[1]))
+        exported = _read_exports(root, surface.module)
+        missing = sorted(exported - documented)
+        extra = sorted(documented - exported)
+        if missing:
+            errors.append(f"{surface.document}: undocumented exports: " + ", ".join(missing))
+        if extra:
+            errors.append(f"{surface.document}: names absent from __all__: " + ", ".join(extra))
+    return tuple(errors)
+
+
 def _read_int_constant(root: Path, source: Path, name: str) -> int:
     path = root / source
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -738,6 +814,7 @@ def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
         *check_documented_dataclass_fields(root),
         *check_action_manifest_version(root),
         *check_documented_lsp_methods(root),
+        *check_documented_consumer_api(root),
     )
 
 

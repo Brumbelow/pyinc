@@ -222,6 +222,23 @@ All public source ranges are zero-based and end-exclusive. Library positions
 count Unicode code points; the LSP boundary converts them to the encoding
 negotiated with the editor.
 
+## Public surface
+
+`pyinc_tools` exports exactly the names below. The groups are editorial: they
+say what a name is for, and a later release may regroup them without changing
+anything a caller can observe. What the table states is the union — these rows
+together are exactly what the package exports. The kind aliases are
+`Literal[...]` string aliases rather than enumerations, so each one's values are
+plain strings.
+
+| Group | Names |
+|---|---|
+| Entrypoints | `WorkspaceSession`, `PollingWorkspaceWatcher` |
+| Analysis results | `AnalysisDiagnostic`, `FileAnalysisResult`, `WorkspaceAnalysisResult` |
+| Navigation results | `CallHierarchyCallSite`, `CallHierarchyIncomingCall`, `CallHierarchyItem`, `CallHierarchyOutgoingCall`, `DeclarationLocation`, `DocumentHighlight`, `DocumentLink`, `SelectionRange`, `TypeDefinitionLocation`, `TypeHierarchyItem` |
+| Editing results | `CodeAction`, `CodeActionEdit`, `CodeLens`, `CompletionItem`, `FileDeletionEdit`, `FileRenameEdit`, `FoldingRange`, `InlayHint`, `LinkedEditingRange`, `RenameEdit`, `RenameResult`, `SemanticToken`, `SignatureHelp`, `SignatureParameterInfo` |
+| Kind aliases | `CallHierarchyItemKind`, `CodeActionKind`, `CompletionItemKind`, `DocumentHighlightKind`, `FoldingRangeKind`, `InlayHintKind`, `RenameStatus`, `SemanticTokenModifier`, `SemanticTokenType`, `TypeHierarchyItemKind` |
+
 ## Common operations from Python
 
 ```python

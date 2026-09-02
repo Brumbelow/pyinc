@@ -40,6 +40,18 @@ completed before reconciliation starts, so malformed or unsupported input
 cannot overwrite or delete outputs from the last valid run. The same boundary
 applies when calling `generate_outputs.reconcile(...)` directly.
 
+## Public surface
+
+`pyinc_codegen` exports exactly the names below. The groups are editorial and a
+later release may regroup them; what the table states is the union — these rows
+together are exactly what the package exports.
+
+| Group | Names |
+|---|---|
+| Entrypoints | `generate`, `schema_analysis`, `generate_outputs` |
+| Result types | `SchemaAnalysis`, `SchemaModel`, `FieldModel`, `Diagnostic` |
+| Errors and enumerations | `SchemaGenerationError`, `DiagnosticSeverity` |
+
 ## Output layout
 
 For each definition `D` (under `$defs` or legacy `definitions`):
