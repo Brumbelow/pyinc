@@ -25,7 +25,7 @@ from calc.engine import calc_emit, evaluate_name, parse_calc  # noqa: E402
 from pyinc import Database  # noqa: E402
 
 
-def main() -> None:
+def main(mode: str = "strict") -> None:
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
         constants = base / "constants.calc"
@@ -40,7 +40,7 @@ def main() -> None:
         )
         unrelated.write_text("let z = 1\n", encoding="utf-8")
 
-        db = Database(mode="strict")
+        db = Database(mode=mode)
         calc_emit.reconcile(db, str(root), root=out)
         print(f"alpha={evaluate_name(db, str(root), 'alpha')[1]}")  # 42
 

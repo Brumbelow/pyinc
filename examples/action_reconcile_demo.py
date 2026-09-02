@@ -30,14 +30,14 @@ def emit(db: Database, src: str) -> list[Output]:
     return [Output.text(f"{name}.txt", f"{name}:{body}") for name in NAMES.read(db)]
 
 
-def main() -> None:
+def main(mode: str = "strict") -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         src = root / "src.txt"
         src.write_text("hi", encoding="utf-8")
         out = root / "out"
 
-        db = Database(mode="strict")
+        db = Database(mode=mode)
         db.set(NAMES, ("alpha", "beta"))
 
         first = emit.reconcile(db, str(src), root=out)

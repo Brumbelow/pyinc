@@ -4,6 +4,7 @@ import re
 import runpy
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,6 +13,16 @@ EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples"
 
 def _run_example(name: str) -> None:
     runpy.run_path(str(EXAMPLES_DIR / name), run_name="__main__")
+
+
+def _load_example(name: str) -> dict[str, Any]:
+    """The example's module namespace, without running the body under its __main__ guard.
+
+    The run name is the file's own stem rather than "__main__", so the guard at
+    the foot of the file does not run the demo; the module body still runs,
+    which is what defines `main` and the queries it uses.
+    """
+    return runpy.run_path(str(EXAMPLES_DIR / name), run_name=Path(name).stem)
 
 
 def _make_dist_info(site_dir: Path, name: str, version: str, *, top_level: str) -> Path:
@@ -42,6 +53,21 @@ def _examples_tree() -> dict[str, tuple[int, int]]:
         str(path.relative_to(EXAMPLES_DIR)): (path.stat().st_size, path.stat().st_mtime_ns)
         for path in sorted(EXAMPLES_DIR.rglob("*"))
         if path.is_file() and "__pycache__" not in path.parts
+    }
+
+
+def _emitted(root: Path) -> dict[str, bytes]:
+    """The files an action reconciled into a root, without its ledger.
+
+    The ledger's name is a digest of the tool, so a warm root and a fresh root
+    each hold one -- but its contents carry a digest of the output root's path
+    and the directory's own inode, so two roots never produce equal ledger bytes
+    and comparing them would report a difference that is not one.
+    """
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and not path.name.startswith(".pyinc-action.")
     }
 
 
@@ -291,3 +317,121 @@ def test_applicable_requirements_evaluates_the_markers(
     # requirement. Those report what the surrounding environment happens to
     # have installed -- a version that differs between environments, and an
     # absence that depends on which extras were installed.
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_calc_demo_warm_matches_fresh(
+    mode: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A database that has been carrying results answers what a from-scratch one answers."""
+    namespace = _load_example("calc_demo.py")
+    database, calc_emit = namespace["Database"], namespace["calc_emit"]
+
+    base = tmp_path / "workspace"
+    base.mkdir()
+    constants = base / "constants.calc"
+    constants.write_text("let base = 40\n", encoding="utf-8")
+    root = base / "m.calc"
+    root.write_text(
+        'include "constants.calc"\nlet alpha = base + 2\nemit alpha\nemit base\n',
+        encoding="utf-8",
+    )
+
+    # The warm database reconciles once, then the included file changes a value
+    # every emitted output depends on. A comment-only edit would not do: it
+    # backdates, so both roots would hold the same bytes however badly the warm
+    # database had failed to notice it.
+    warm_out = tmp_path / "warm"
+    warm = database(mode=mode)
+    calc_emit.reconcile(warm, str(root), root=warm_out)
+    constants.write_text("let base = 41\n", encoding="utf-8")
+    calc_emit.reconcile(warm, str(root), root=warm_out)
+
+    fresh_out = tmp_path / "fresh"
+    fresh = database(mode=mode)
+    calc_emit.reconcile(fresh, str(root), root=fresh_out)
+
+    assert _emitted(warm_out) == _emitted(fresh_out)
+
+    namespace["main"](mode=mode)
+    printed = capsys.readouterr().out
+    assert "unrelated_edit_executions=0" in printed
+    assert "comment_edit_backdated=True" in printed
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_action_reconcile_demo_warm_matches_fresh(
+    mode: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A root reconciled twice holds what a root reconciled once from scratch holds."""
+    namespace = _load_example("action_reconcile_demo.py")
+    database, emit, names = namespace["Database"], namespace["emit"], namespace["NAMES"]
+
+    src = tmp_path / "src.txt"
+    src.write_text("hi", encoding="utf-8")
+
+    # The warm root reaches the final state through an intermediate one: the
+    # source changed and a declared name was replaced, so the warm root must
+    # both rewrite alpha.txt and delete the beta.txt it once owned.
+    warm_out = tmp_path / "warm"
+    warm = database(mode=mode)
+    warm.set(names, ("alpha", "beta"))
+    emit.reconcile(warm, str(src), root=warm_out)
+    src.write_text("bye", encoding="utf-8")
+    warm.set(names, ("alpha", "gamma"))
+    emit.reconcile(warm, str(src), root=warm_out)
+
+    fresh_out = tmp_path / "fresh"
+    fresh = database(mode=mode)
+    fresh.set(names, ("alpha", "gamma"))
+    emit.reconcile(fresh, str(src), root=fresh_out)
+
+    assert _emitted(warm_out) == _emitted(fresh_out)
+
+    namespace["main"](mode=mode)
+    printed = capsys.readouterr().out
+    assert "orphan_deleted=('beta.txt',)" in printed
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_checkpoint_demo_reload_matches_fresh(
+    mode: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reloaded database answers what a from-scratch one answers, without running the queries."""
+    # runpy reuses this interpreter, so the save and the reload below happen in
+    # one process. What this reads is the reload: the same values, without the
+    # queries running again. Carrying a checkpoint across a real process
+    # boundary is what tests/test_checkpoint_cross_process.py exercises, and it
+    # says so in its own words.
+    namespace = _load_example("checkpoint_demo.py")
+    database = namespace["Database"]
+    store = namespace["FileSystemArtifactStore"](str(tmp_path / "store"))
+    scaled, multiplier = namespace["scaled_word_count"], namespace["MULTIPLIER"]
+    data = tmp_path / "data.txt"
+    data.write_text("alpha beta gamma delta epsilon", encoding="utf-8")
+
+    saver = database(mode, store=store)
+    saver.set(multiplier, 3)
+    saver.get(scaled, str(data))
+    key = saver.save_checkpoint()
+
+    # Saved and loaded in one mode: a checkpoint warms only a database running
+    # the mode that wrote it, and loading across modes is refused outright.
+    reloaded = database(mode, store=store)
+    reloaded.set(multiplier, 3)
+    reloaded.load_checkpoint(key)
+    reloaded_value = reloaded.get(scaled, str(data))
+
+    fresh = database(mode)
+    fresh.set(multiplier, 3)
+    fresh_value = fresh.get(scaled, str(data))
+
+    assert reloaded_value == fresh_value
+    assert reloaded.statistics().query_executions == 0
+    assert fresh.statistics().query_executions == 3  # the three queries in the chain
+
+    namespace["main"](mode=mode)
+    printed = capsys.readouterr().out
+    assert "run2_result=15" in printed
+    assert "run3_result=50" in printed
+    # checkpoint_key is content-addressed and differs on every run: never pinned.

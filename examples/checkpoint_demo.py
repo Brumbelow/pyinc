@@ -47,7 +47,7 @@ def scaled_word_count(db: Database, path: str) -> int:
     return word_count(db, path) * MULTIPLIER.read(db)
 
 
-def main() -> None:
+def main(mode: str = "strict") -> None:
     with (
         tempfile.TemporaryDirectory() as store_root,
         tempfile.TemporaryDirectory() as file_root,
@@ -62,7 +62,7 @@ def main() -> None:
         # -----------------------------------------------------------------------
         # Run 1: compute from scratch and save a checkpoint.
         # -----------------------------------------------------------------------
-        db1 = Database(store=store)
+        db1 = Database(mode, store=store)
         db1.set(MULTIPLIER, 3)
         result1 = db1.get(scaled_word_count, data_path)
         print(f"run1_result={result1}")  # 5 words * 3 = 15
@@ -82,7 +82,7 @@ def main() -> None:
         # state, the whole resource-backed query chain warms without re-running:
         # every query reuses and nothing executes.
         # -----------------------------------------------------------------------
-        db2 = Database(store=store)
+        db2 = Database(mode, store=store)
         db2.set(MULTIPLIER, 3)  # same input as run 1
         db2.load_checkpoint(ck_key)
         result2 = db2.get(scaled_word_count, data_path)
@@ -99,7 +99,7 @@ def main() -> None:
         # against the unchanged file.  The result lands at 50, consistent with a
         # from-scratch run.
         # -----------------------------------------------------------------------
-        db3 = Database(store=store)
+        db3 = Database(mode, store=store)
         db3.set(MULTIPLIER, 10)  # different multiplier
         db3.load_checkpoint(ck_key)
         result3 = db3.get(scaled_word_count, data_path)
