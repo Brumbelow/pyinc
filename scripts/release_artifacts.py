@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -139,8 +140,16 @@ def extract_release_notes(changelog: str, version: str) -> str:
     if len(starts) != 1:
         _reject(f"CHANGELOG.md must contain exactly one {version} release section")
     start = starts[0]
-    if re.fullmatch(rf"## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}", lines[start]) is None:
+    dated = re.fullmatch(
+        rf"## \[{re.escape(version)}\] - (?P<date>\d{{4}}-\d{{2}}-\d{{2}})", lines[start]
+    )
+    if dated is None:
         _reject(f"the {version} release heading must include an ISO date")
+    date = dated.group("date")
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError:
+        _reject(f"the {version} release heading names {date}, which is not a real date")
     end = next(
         (index for index in range(start + 1, len(lines)) if lines[index].startswith("## [")),
         len(lines),

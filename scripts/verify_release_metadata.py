@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import re
 import subprocess
 import sys
@@ -82,8 +83,16 @@ def _release_section(changelog: str, version: str) -> tuple[str, ...]:
     if len(starts) != 1:
         _reject(f"CHANGELOG.md must contain exactly one {version} release section")
     heading = lines[starts[0]]
-    if re.fullmatch(rf"## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}", heading) is None:
+    dated = re.fullmatch(
+        rf"## \[{re.escape(version)}\] - (?P<date>\d{{4}}-\d{{2}}-\d{{2}})", heading
+    )
+    if dated is None:
         _reject(f"the {version} CHANGELOG.md heading must use '## [{version}] - YYYY-MM-DD'")
+    date = dated.group("date")
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError:
+        _reject(f"the {version} CHANGELOG.md heading is dated {date}, which is not a real date")
     start = starts[0] + 1
     end = next(
         (index for index in range(start, len(lines)) if lines[index].startswith("## [")),

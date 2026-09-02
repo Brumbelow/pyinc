@@ -99,6 +99,25 @@ def test_rejects_missing_malformed_empty_or_duplicate_release_section(changelog:
         release_artifacts.extract_release_notes(changelog, VERSION)
 
 
+@pytest.mark.parametrize("date", ["2026-13-45", "2026-02-30"])
+def test_rejects_a_release_heading_dated_a_day_that_does_not_exist(date: str) -> None:
+    changelog = f"## [{VERSION}] - {date}\n\n- Release candidate.\n"
+
+    with pytest.raises(
+        release_artifacts.ReleaseArtifactError, match="not a real date"
+    ) as rejection:
+        release_artifacts.extract_release_notes(changelog, VERSION)
+    assert "must include an ISO date" not in str(rejection.value)
+
+
+def test_extracts_a_release_section_dated_a_leap_day_that_exists() -> None:
+    changelog = f"## [{VERSION}] - 2024-02-29\n\n- Release candidate.\n"
+
+    assert release_artifacts.extract_release_notes(changelog, VERSION) == (
+        "- Release candidate.\n"
+    )
+
+
 def _published_documents(
     pypi_payloads: dict[str, bytes],
     github_payloads: dict[str, bytes],

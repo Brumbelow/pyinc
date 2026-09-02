@@ -200,6 +200,33 @@ def test_rejects_missing_mismatched_malformed_empty_or_duplicate_rc_section(
         )
 
 
+@pytest.mark.parametrize("date", ["2026-13-45", "2026-02-30"])
+def test_rejects_a_release_heading_dated_a_day_that_does_not_exist(date: str) -> None:
+    with pytest.raises(ReleaseMetadataError, match="not a real date") as rejection:
+        verify_release_metadata(
+            ReleaseMetadata(
+                tag="v3.0.1",
+                project_version="3.0.1",
+                release_commit=FINAL_COMMIT,
+                project_document=_project("3.0.1"),
+                changelog=f"# Changelog\n\n## [3.0.1] - {date}\n\n- Release.\n".encode(),
+            )
+        )
+    assert "must use '## [3.0.1] - YYYY-MM-DD'" not in str(rejection.value)
+
+
+def test_accepts_a_release_heading_dated_a_leap_day_that_exists() -> None:
+    verify_release_metadata(
+        ReleaseMetadata(
+            tag="v3.0.1",
+            project_version="3.0.1",
+            release_commit=FINAL_COMMIT,
+            project_document=_project("3.0.1"),
+            changelog=b"# Changelog\n\n## [3.0.1] - 2024-02-29\n\n- Release.\n",
+        )
+    )
+
+
 def test_rejects_non_utf8_release_changelog() -> None:
     with pytest.raises(ReleaseMetadataError, match="valid UTF-8"):
         verify_release_metadata(
