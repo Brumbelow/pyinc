@@ -1030,7 +1030,7 @@ decided at release time.
 - The release page's verification commands take the release from a shell
   variable, with a sentence telling the reader to set it. Each of the three
   spelled a release out instead. They are correct and run today — the release
-  they named is the current one — but the page had no way to keep three
+  they named is the newest published one — but the page had no way to keep three
   literal versions current past the next release.
 - Both consumer guides list every name their package exports. Each carries a
   `## Public surface` table whose rows group the names by what they are for,

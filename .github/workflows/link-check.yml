@@ -1,8 +1,8 @@
 name: Link check
 
 # Scheduled and dispatch only. Nothing waits on this job: the documentation
-# checker that runs on every change stays offline, and a third-party site going
-# down must never be able to stop a change or a release.
+# checker that runs on every change stays offline, and a site outside this
+# repository going down must never be able to stop a change or a release.
 on:
   schedule:
     - cron: '17 6 * * 1'

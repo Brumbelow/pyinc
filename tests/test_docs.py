@@ -74,7 +74,7 @@ def test_documentation_checker_ignores_external_links(tmp_path: Path) -> None:
 
 
 def _pinned_link_tree(root: Path, link: str) -> Path:
-    """A one-link project at version 1.2.3, whose errors name `<root>` rather than a temporary path."""
+    """A one-link project at version 1.2.3, returning the README the link was written into."""
     root.mkdir(parents=True, exist_ok=True)
     (root / "pyproject.toml").write_text(
         '[project]\nname = "pyinc"\nversion = "1.2.3"\n', encoding="utf-8"
@@ -85,6 +85,7 @@ def _pinned_link_tree(root: Path, link: str) -> Path:
 
 
 def _pinned_link_errors(root: Path, link: str) -> tuple[str, ...]:
+    """The same tree's errors, naming `<root>` rather than the temporary path they came from."""
     readme = _pinned_link_tree(root, link)
     return tuple(error.replace(str(root), "<root>") for error in check_local_links(root, (readme,)))
 
@@ -173,14 +174,16 @@ def test_the_checked_files_end_with_the_changelog_and_the_issue_templates(tmp_pa
 
 
 def test_documentation_checker_reports_a_broken_link_in_the_changelog(tmp_path: Path) -> None:
-    """A dead local link in the changelog is reported now that the file is read.
+    """A dead local link in a changelog is reported when the file is read.
 
-    Written against a changelog of its own rather than the shipped one. A code
-    span that opens on one line and closes on the next swallows every line
-    between it, links included, so a link injected into a long file can land
-    somewhere nothing would ever read it and the cell would pass without
-    checking anything. This fixture carries no backtick at all, which the
-    assertion below states rather than leaves to inspection.
+    Written against a changelog of its own and handed to the check directly;
+    that the shipped changelog is one of the files the checker reads is the
+    file-set cell's fact, not this one's. A code span that opens on one line
+    and closes on the next swallows every line between it, links included, so a
+    link injected into a long file can land somewhere nothing would ever read it
+    and the cell would pass without checking anything. This fixture carries no
+    backtick at all, which the assertion below states rather than leaves to
+    inspection.
     """
     changelog = tmp_path / "CHANGELOG.md"
     changelog.write_text(
@@ -330,7 +333,7 @@ def _write_action_version_tree(
     root: Path,
     *,
     constant: int,
-    action_contract: int | None,
+    action_contract: int,
     architecture: int | None,
 ) -> None:
     """Write the smallest tree the action-ledger check reads: the module and two documents.
@@ -350,14 +353,13 @@ def _write_action_version_tree(
     )
     docs = root / "docs"
     docs.mkdir(parents=True, exist_ok=True)
-    if action_contract is not None:
-        (docs / "action-contract.md").write_text(
-            "# Action contract\n\n"
-            f"Schema v{action_contract} records exactly `root`, `tool`, and `outputs`.\n\n"
-            "v1 and v2 manifests are intentionally not compatible with "
-            f"v{action_contract}'s ledger semantics and may be discarded.\n",
-            encoding="utf-8",
-        )
+    (docs / "action-contract.md").write_text(
+        "# Action contract\n\n"
+        f"Schema v{action_contract} records exactly `root`, `tool`, and `outputs`.\n\n"
+        "v1 and v2 manifests are intentionally not compatible with "
+        f"v{action_contract}'s ledger semantics and may be discarded.\n",
+        encoding="utf-8",
+    )
     if architecture is not None:
         (docs / "architecture.md").write_text(
             "# Architecture\n\n"
@@ -583,7 +585,7 @@ def test_the_integration_contract_rows_still_carry_the_whole_documented_surface(
     undocumented exports. What they report is every name in `__all__`, which
     reads as a document that stopped listing its surface and invites the fix to
     be made in `docs/`. This says the harvest itself collapsed. It is also the
-    only cover a later consumer would have if it compared these rows against
+    broadest cover a later consumer would have if it compared these rows against
     something other than an exact set, because such a check reports less when it
     is given less. A floor rather than an equality: ordinary documentation edits
     move the number, and a collapse does not.
@@ -891,9 +893,10 @@ def test_every_advertised_name_resolves_on_the_package_that_advertises_it() -> N
         assert not unresolved, f"{module}: {unresolved}"
 
 
-# The version grammar `scripts/release_artifacts.py` accepts, written out rather
-# than imported: a documentation test that reached into a release script for a
-# private constant would tie the two together for nothing.
+# Mirrors the version grammar `scripts/release_artifacts.py` accepts, with the
+# tag's leading `v` in front of it and `\d` where the script writes `[0-9]`,
+# rather than importing it: a documentation test that reached into a release
+# script for a private constant would tie the two together for nothing.
 _TAGGED_VERSION = re.compile(r"v(?P<version>\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?)")
 
 
@@ -1038,16 +1041,25 @@ def test_every_pinned_link_the_project_ships_names_the_project_version() -> None
 
 
 def test_a_shipped_link_pinned_to_another_projects_version_is_reported(tmp_path: Path) -> None:
-    """The repository answer above is vacuous by construction; this is where it discriminates."""
+    """The repository answer above is vacuous by construction; this is where it discriminates.
+
+    Both spellings a documentation link uses for a file in this repository are
+    written here, so neither half of the pattern can stop matching and leave a
+    reference pinned to the wrong tree unreported. They carry different refs so
+    that a half which stopped matching is named by what the list is missing
+    rather than only by its length.
+    """
     (tmp_path / "README.md").write_text(
-        "# Root\n\n[docs](https://github.com/Brumbelow/pyinc/blob/v9.9.9/docs/README.md)\n",
+        "# Root\n\n"
+        "[docs](https://github.com/Brumbelow/pyinc/blob/v9.9.9/docs/README.md)\n"
+        "![demo](https://raw.githubusercontent.com/Brumbelow/pyinc/v8.8.8/docs/assets/demo.gif)\n",
         encoding="utf-8",
     )
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "pyinc"\nversion = "1.2.3"\n', encoding="utf-8"
     )
 
-    assert _shipped_link_disagreements(tmp_path) == ["v9.9.9"]
+    assert _shipped_link_disagreements(tmp_path) == ["v9.9.9", "v8.8.8"]
 
 
 def test_a_partly_repinned_project_is_accepted_because_a_link_left_on_main_is_not_compared(
@@ -1237,3 +1249,36 @@ def test_the_scheduled_link_check_step_is_valid_python() -> None:
     assert block[-1] == "PY", block[-1]
 
     ast.parse("\n".join(block[1:-1]))
+
+
+def test_action_ledger_check_names_the_sentence_a_document_no_longer_carries(
+    tmp_path: Path,
+) -> None:
+    """A guarded sentence that is simply gone has to be reported by name.
+
+    The tree is the one the check accepts, with one of the two sentences
+    `docs/action-contract.md` carries taken back out: the document is still
+    there and the constant still reads, so the missing-document branch and the
+    stale-number branch both stay quiet and this is the only report left. An
+    error that named the document alone would leave a reader holding a file
+    with two guarded sentences in it and nothing saying which one to write
+    back, so the site's own name and the text the check looked for are both
+    part of the message.
+    """
+    dropped = "the incompatibility sentence"
+    grammar = next(
+        pattern.pattern for _, label, pattern in _ACTION_VERSION_PROSE if label == dropped
+    )
+    _write_action_version_tree(tmp_path, constant=3, action_contract=3, architecture=3)
+    (tmp_path / "docs" / "action-contract.md").write_text(
+        "# Action contract\n\nSchema v3 records exactly `root`, `tool`, and `outputs`.\n",
+        encoding="utf-8",
+    )
+
+    errors = check_action_manifest_version(tmp_path)
+
+    assert len(errors) == 1
+    assert errors[0].startswith("docs/action-contract.md: no action manifest schema statement")
+    assert dropped in errors[0]
+    assert repr(grammar) in errors[0]
+    assert "documents action manifest schema" not in errors[0]
