@@ -71,6 +71,80 @@ def test_documentation_checker_ignores_external_links(tmp_path: Path) -> None:
     assert check_local_links(tmp_path, (readme,)) == ()
 
 
+def _pinned_link_tree(root: Path, link: str) -> Path:
+    """A one-link project at version 1.2.3, whose errors name `<root>` rather than a temporary path."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "pyinc"\nversion = "1.2.3"\n', encoding="utf-8"
+    )
+    readme = root / "README.md"
+    readme.write_text(f"# Root\n\n{link}\n", encoding="utf-8")
+    return readme
+
+
+def _pinned_link_errors(root: Path, link: str) -> tuple[str, ...]:
+    readme = _pinned_link_tree(root, link)
+    return tuple(error.replace(str(root), "<root>") for error in check_local_links(root, (readme,)))
+
+
+def test_a_link_pinned_to_the_project_version_is_resolved_like_a_branch_pinned_one(
+    tmp_path: Path,
+) -> None:
+    """A tag the worktree stands in for names the same file the branch does.
+
+    The two spellings are asserted against each other rather than against a
+    quoted message, because the point of the generalization is that a reader
+    cannot tell from the report which of them was written.
+    """
+    blob = "https://github.com/Brumbelow/pyinc/blob"
+    tagged = _pinned_link_errors(tmp_path / "tagged", f"[gone]({blob}/v1.2.3/docs/gone.md)")
+    on_branch = _pinned_link_errors(tmp_path / "branch", f"[gone]({blob}/main/docs/gone.md)")
+
+    assert len(tagged) == 1
+    assert "missing local link target" in tagged[0]
+    assert tagged[0] == on_branch[0].replace("/blob/main/", "/blob/v1.2.3/")
+
+
+def test_a_link_pinned_to_the_project_version_has_its_anchor_checked(tmp_path: Path) -> None:
+    """Resolving the file is only half of it; the fragment is checked there too."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("# Present\n", encoding="utf-8")
+    readme = _pinned_link_tree(
+        tmp_path,
+        "[bad](https://github.com/Brumbelow/pyinc/blob/v1.2.3/docs/guide.md#missing)",
+    )
+
+    errors = check_local_links(tmp_path, (readme,))
+
+    assert len(errors) == 1
+    assert "missing anchor #missing" in errors[0]
+
+
+def test_a_link_pinned_to_some_other_ref_is_left_alone(tmp_path: Path) -> None:
+    """Only `main` and the project's own version describe this worktree.
+
+    An older tag names a tree that is not this one, so checking its links here
+    would answer a question about the wrong content; it stays an external URL.
+    """
+    readme = _pinned_link_tree(
+        tmp_path,
+        "[old](https://github.com/Brumbelow/pyinc/blob/v0.9.0/docs/gone.md)",
+    )
+
+    assert check_local_links(tmp_path, (readme,)) == ()
+
+
+def test_an_image_served_from_the_raw_host_is_checked_for_existence(tmp_path: Path) -> None:
+    """The raw host spells the same repository without a `blob` segment."""
+    raw = "https://raw.githubusercontent.com/Brumbelow/pyinc"
+    readme = _pinned_link_tree(tmp_path, f"![demo]({raw}/v1.2.3/docs/gone.png)")
+
+    errors = check_local_links(tmp_path, (readme,))
+
+    assert len(errors) == 1
+    assert "missing local image target" in errors[0]
+
+
 def test_the_checked_files_end_with_the_changelog_and_the_issue_templates(tmp_path: Path) -> None:
     """The changelog and every issue template are read, in a fixed order.
 

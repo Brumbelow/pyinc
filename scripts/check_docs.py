@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 import urllib.parse
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -20,7 +21,10 @@ _HEADING = re.compile(r"^(?P<level>#{1,6})\s+(?P<title>.+?)\s*#*\s*$")
 _INLINE_LINK = re.compile(r"(?<!!)\[[^]]*\]\((?P<target>[^)\s]+)")
 _IMAGE_LINK = re.compile(r"!\[[^]]*\]\((?P<target>[^)\s]+)")
 _INLINE_CODE = re.compile(r"`([^`]+)`")
-_GITHUB_LOCAL_PREFIX = "/Brumbelow/pyinc/blob/main/"
+# The two ways the documentation spells a file in this repository over HTTPS.
+# Both put the Git ref immediately after the prefix.
+_GITHUB_BLOB_PREFIX = "/Brumbelow/pyinc/blob/"
+_GITHUB_RAW_PREFIX = "/Brumbelow/pyinc/"
 _PUBLIC_ROW_NAMES = frozenset({"Entrypoints", "Result types", "Shared types"})
 _CHECKPOINT_VERSION_NAME = "_CHECKPOINT_MANIFEST_VERSION"
 _CHECKPOINT_VERSION_SOURCE = Path("src/pyinc/runtime.py")
@@ -277,15 +281,53 @@ def table_rows(text: str, *, max_indent: int = 3) -> Iterator[TableRow]:
         )
 
 
-def _local_target(root: Path, source: Path, raw_target: str) -> tuple[Path, str] | None:
+def _pinned_refs(root: Path) -> frozenset[str]:
+    """The Git refs whose content this tree may answer for.
+
+    `main` always, and the project's own version tag as soon as the project
+    metadata says what that version is. A link pinned to any other ref describes
+    a tree this one is not, so it is left to an external link checker.
+    """
+    refs = {"main"}
+    metadata = root / "pyproject.toml"
+    if metadata.is_file():
+        try:
+            project = tomllib.loads(metadata.read_text(encoding="utf-8")).get("project")
+        except tomllib.TOMLDecodeError:
+            return frozenset(refs)
+        if isinstance(project, dict):
+            version = project.get("version")
+            if isinstance(version, str) and version:
+                refs.add(f"v{version}")
+    return frozenset(refs)
+
+
+def _repository_path(netloc: str, path: str, refs: frozenset[str]) -> str | None:
+    """The in-repository path a GitHub URL names, or None if it names something else."""
+    host = netloc.casefold()
+    if host == "github.com":
+        prefix = _GITHUB_BLOB_PREFIX
+    elif host == "raw.githubusercontent.com":
+        prefix = _GITHUB_RAW_PREFIX
+    else:
+        return None
+    if not path.startswith(prefix):
+        return None
+    ref, separator, remainder = path[len(prefix) :].partition("/")
+    if not separator or ref not in refs:
+        return None
+    return urllib.parse.unquote(remainder)
+
+
+def _local_target(
+    root: Path, source: Path, raw_target: str, refs: frozenset[str]
+) -> tuple[Path, str] | None:
     target = raw_target.strip("<>")
     parsed = urllib.parse.urlsplit(target)
     if parsed.scheme in {"http", "https"}:
-        if parsed.netloc.casefold() != "github.com":
+        relative = _repository_path(parsed.netloc, parsed.path, refs)
+        if relative is None:
             return None
-        if not parsed.path.startswith(_GITHUB_LOCAL_PREFIX):
-            return None
-        relative = urllib.parse.unquote(parsed.path[len(_GITHUB_LOCAL_PREFIX) :])
         return root / relative, urllib.parse.unquote(parsed.fragment)
     if parsed.scheme or parsed.netloc:
         return None
@@ -303,13 +345,14 @@ def check_local_links(root: Path, files: tuple[Path, ...]) -> tuple[str, ...]:
     errors: list[str] = []
     anchors: dict[Path, frozenset[str]] = {}
     resolved_root = root.resolve()
+    refs = _pinned_refs(root)
     for path in files:
         prose = "\n".join(_prose_lines(path))
         prose = _INLINE_CODE.sub("", prose)
         for kind, pattern in (("link", _INLINE_LINK), ("image", _IMAGE_LINK)):
             for match in pattern.finditer(prose):
                 raw_target = match.group("target")
-                local = _local_target(root, path, raw_target)
+                local = _local_target(root, path, raw_target, refs)
                 if local is None:
                     continue
                 destination, fragment = local
