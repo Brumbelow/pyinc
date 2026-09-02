@@ -1,0 +1,135 @@
+name: Link check
+
+# Scheduled and dispatch only. Nothing waits on this job: the documentation
+# checker that runs on every change stays offline, and a third-party site going
+# down must never be able to stop a change or a release.
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  external-links:
+    name: Request the external links the documentation names
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14'
+
+      - name: Request every external link the documentation names
+        run: |
+          python - <<'PY'
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          sys.path.insert(0, "scripts")
+          from check_docs import (
+              PROJECT_ROOT,
+              _pinned_refs,
+              _repository_path,
+              external_urls,
+              markdown_files,
+          )
+
+          # The project's own release links. One pattern rather than a list of
+          # tags, so that publishing a release does not also mean editing this.
+          RELEASE_TAG = re.compile(r"^https://github\.com/Brumbelow/pyinc/releases/tag/v")
+
+          # Some sites answer a plain script with 403 and a browser with 200.
+          HEADERS = {
+              "User-Agent": (
+                  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+              ),
+              "Accept": "*/*",
+          }
+          ATTEMPTS = 3
+          BACKOFF = 5
+          TIMEOUT = 30
+
+
+          def already_checked_offline(url, refs):
+              """True when the documentation checker already resolves this address.
+
+              A link into this repository at a ref this tree answers for is
+              checked against the worktree on every change: the target must
+              exist, and where the link carries a fragment the heading must too.
+              Asking GitHub for it once a week says nothing new and spends a
+              rate limit to say it.
+              """
+              parsed = urllib.parse.urlsplit(url)
+              return _repository_path(parsed.netloc, parsed.path, refs) is not None
+
+
+          def answers(url):
+              """Return "" when the address answers, or the reason it did not.
+
+              HEAD first because it is the cheap question, then GET for the sites
+              that will not answer a HEAD at all, and a backoff between rounds so
+              that one busy moment is not read as rot.
+              """
+              reason = ""
+              for attempt in range(ATTEMPTS):
+                  if attempt:
+                      time.sleep(BACKOFF * 2 ** (attempt - 1))
+                  for method in ("HEAD", "GET"):
+                      request = urllib.request.Request(url, method=method, headers=HEADERS)
+                      try:
+                          with urllib.request.urlopen(request, timeout=TIMEOUT):
+                              return ""
+                      except urllib.error.HTTPError as error:
+                          reason = f"{method} {error.code}"
+                      except urllib.error.URLError as error:
+                          reason = f"{method} {error.reason}"
+                      except OSError as error:
+                          reason = f"{method} {error}"
+              return reason
+
+
+          def main():
+              urls = external_urls(markdown_files(PROJECT_ROOT))
+              # Not an assert: this has to survive `python -O`, where a job that
+              # asks about nothing would otherwise report success.
+              if not urls:
+                  raise SystemExit("the collector found no external URLs")
+
+              refs = _pinned_refs(PROJECT_ROOT)
+              candidates = sorted(
+                  url
+                  for url in set(urls)
+                  if not RELEASE_TAG.match(url) and not already_checked_offline(url, refs)
+              )
+              print(
+                  f"{len(set(urls))} distinct addresses in {len(markdown_files(PROJECT_ROOT))} "
+                  f"documents, {len(candidates)} of them to request"
+              )
+
+              failures = []
+              for url in candidates:
+                  reason = answers(url)
+                  print(f"did not answer: {url} ({reason})" if reason else f"ok: {url}")
+                  if reason:
+                      failures.append(f"{url}: {reason}")
+
+              if failures:
+                  print(f"\n{len(failures)} of {len(candidates)} addresses did not answer:")
+                  for failure in failures:
+                      print(f"  {failure}")
+                  return 1
+              print(f"\nall {len(candidates)} addresses answered")
+              return 0
+
+
+          raise SystemExit(main())
+          PY

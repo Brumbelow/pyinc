@@ -21,6 +21,9 @@ _HEADING = re.compile(r"^(?P<level>#{1,6})\s+(?P<title>.+?)\s*#*\s*$")
 _INLINE_LINK = re.compile(r"(?<!!)\[[^]]*\]\((?P<target>[^)\s]+)")
 _IMAGE_LINK = re.compile(r"!\[[^]]*\]\((?P<target>[^)\s]+)")
 _INLINE_CODE = re.compile(r"`([^`]+)`")
+# An address written out in prose, ending where the surrounding bracket or
+# quote begins. Deliberately not the inline-link pattern above, which needs `](`.
+_EXTERNAL_URL = re.compile(r"""https?://[^\s)\]>"'`]+""")
 # The two ways the documentation spells a file in this repository over HTTPS.
 # Both put the Git ref immediately after the prefix.
 _GITHUB_BLOB_PREFIX = "/Brumbelow/pyinc/blob/"
@@ -370,6 +373,25 @@ def check_local_links(root: Path, files: tuple[Path, ...]) -> tuple[str, ...]:
                     if fragment.casefold() not in destination_anchors:
                         errors.append(f"{path}: missing anchor #{fragment} in {resolved}")
     return tuple(errors)
+
+
+def external_urls(files: tuple[Path, ...]) -> tuple[str, ...]:
+    """Return every external URL written in those files' prose, in reading order.
+
+    Nothing here opens a connection, and `check_docs` never calls it: this
+    collects the addresses so that a separate, scheduled job can ask whether
+    they still answer, while the check that runs on every change stays offline.
+
+    The scan looks for a bare `https?://` run rather than for Markdown link
+    syntax, because a link-reference definition -- `[3.1.0]: https://...`, the
+    form the changelog writes its release links in -- carries no `](` and would
+    otherwise be collected from nowhere.
+    """
+    found: list[str] = []
+    for path in files:
+        for line in _prose_lines(path):
+            found.extend(_EXTERNAL_URL.findall(line))
+    return tuple(found)
 
 
 def _read_exports(root: Path, module: str) -> frozenset[str]:

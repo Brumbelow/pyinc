@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         check_documented_dataclass_fields,
         check_documented_lsp_methods,
         check_local_links,
+        external_urls,
         markdown_files,
         table_rows,
     )
@@ -42,6 +43,7 @@ else:
         check_documented_dataclass_fields,
         check_documented_lsp_methods,
         check_local_links,
+        external_urls,
         markdown_files,
         table_rows,
     )
@@ -1187,3 +1189,51 @@ def test_a_wheel_run_list_missing_a_designated_example_does_not_match() -> None:
 
     assert named == frozenset(_DESIGNATED_WHEEL_EXAMPLES) - {dropped}
     assert named != frozenset(_DESIGNATED_WHEEL_EXAMPLES)
+
+
+def test_the_documents_name_many_external_links() -> None:
+    """A collector that quietly stopped seeing most of the addresses still looks busy.
+
+    The scheduled job refuses an empty harvest outright, so that case is
+    covered where it happens. What nothing else can see is a narrowed one: a
+    reading that finds a third of the addresses still asks for a third of them,
+    reports every one of them healthy and passes. This is the floor that says
+    the collector is still reading widely, and it is a floor rather than a count
+    so that ordinary documentation edits do not have to move it.
+    """
+    urls = external_urls(markdown_files(PROJECT_ROOT))
+
+    distinct = set(urls)
+    assert len(distinct) > 30, f"expected the documents to name many external URLs, found {len(distinct)}"
+    assert all(url.startswith("http") for url in urls)
+
+
+def test_the_scheduled_link_check_step_is_valid_python() -> None:
+    """The workflow's inline step is the one Python here that no static gate reads.
+
+    The type checker and the linter are pointed at the source, the tests, the
+    benchmarks and the scripts, and a workflow is none of those -- so a syntax
+    error in that step would first be seen by a scheduled run, a week later and
+    on a branch nobody is watching. This reads the block the way the shell will,
+    by its own indentation, and compiles what the heredoc feeds to Python.
+    """
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "link-check.yml").read_text(
+        encoding="utf-8"
+    )
+    lines = workflow.splitlines()
+
+    opener = next(index for index, line in enumerate(lines) if line.strip() == "run: |")
+    indent = " " * (len(lines[opener]) - len(lines[opener].lstrip()) + 2)
+    block: list[str] = []
+    for line in lines[opener + 1 :]:
+        if line.strip() and not line.startswith(indent):
+            break
+        block.append(line[len(indent) :] if line.startswith(indent) else "")
+    while block and not block[-1]:
+        block.pop()
+
+    assert len(block) > 2, "the run block is empty"
+    assert block[0] == "python - <<'PY'", block[0]
+    assert block[-1] == "PY", block[-1]
+
+    ast.parse("\n".join(block[1:-1]))
