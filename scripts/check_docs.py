@@ -527,7 +527,7 @@ def check_documented_consumer_api(root: Path) -> tuple[str, ...]:
         document = root / surface.document
         if not document.is_file():
             errors.append(
-                f"{surface.document}: missing document named by the consumer surface check"
+                f"{surface.document.as_posix()}: missing document named by the consumer surface check"
             )
             continue
         documented: set[str] = set()
@@ -539,9 +539,13 @@ def check_documented_consumer_api(root: Path) -> tuple[str, ...]:
         missing = sorted(exported - documented)
         extra = sorted(documented - exported)
         if missing:
-            errors.append(f"{surface.document}: undocumented exports: " + ", ".join(missing))
+            errors.append(
+                f"{surface.document.as_posix()}: undocumented exports: " + ", ".join(missing)
+            )
         if extra:
-            errors.append(f"{surface.document}: names absent from __all__: " + ", ".join(extra))
+            errors.append(
+                f"{surface.document.as_posix()}: names absent from __all__: " + ", ".join(extra)
+            )
     return tuple(errors)
 
 
@@ -580,19 +584,22 @@ def _check_version_prose(
     for relative, label, pattern in entries:
         document = root / relative
         if not document.is_file():
-            errors.append(f"{relative}: missing document named by the {subject} check")
+            errors.append(
+                f"{relative.as_posix()}: missing document named by the {subject} check"
+            )
             continue
         prose = re.sub(r"\s+", " ", " ".join(_prose_lines(document)))
         match = pattern.search(prose)
         if match is None:
             errors.append(
-                f"{relative}: no {subject} statement matching {label} ({pattern.pattern!r})"
+                f"{relative.as_posix()}: no {subject} statement matching {label} "
+                f"({pattern.pattern!r})"
             )
             continue
         documented = int(match.group("version"))
         if documented != expected:
             errors.append(
-                f"{relative}: {label} documents {subject} v{documented}, "
+                f"{relative.as_posix()}: {label} documents {subject} v{documented}, "
                 f"but {constant} is {expected}"
             )
     return tuple(errors)
@@ -750,7 +757,7 @@ def check_documented_lsp_methods(root: Path, *, minimum: int = 30) -> tuple[str,
     """
     document = root / _LSP_DOCUMENT
     if not document.is_file():
-        return (f"{_LSP_DOCUMENT}: missing document named by the LSP method check",)
+        return (f"{_LSP_DOCUMENT.as_posix()}: missing document named by the LSP method check",)
     documented: set[str] = set()
     for row in table_rows(document.read_text(encoding="utf-8")):
         if row.section != "Method matrix" or len(row.cells) != 3:
@@ -772,7 +779,7 @@ def check_documented_lsp_methods(root: Path, *, minimum: int = 30) -> tuple[str,
     for name in _LSP_DISPATCH_FUNCTIONS:
         function = functions.get(name)
         if function is None:
-            unreadable.append(f"{_LSP_SOURCE}: no {name} to read LSP methods from")
+            unreadable.append(f"{_LSP_SOURCE.as_posix()}: no {name} to read LSP methods from")
             continue
         implemented |= _lsp_dispatched_methods(function)
     if unreadable:
@@ -782,18 +789,21 @@ def check_documented_lsp_methods(root: Path, *, minimum: int = 30) -> tuple[str,
         return tuple(unreadable)
     if len(implemented) < minimum:
         return (
-            f"{_LSP_SOURCE}: found {len(implemented)} LSP method strings, too few to compare "
-            f"against the documented matrix (expected at least {minimum})",
+            f"{_LSP_SOURCE.as_posix()}: found {len(implemented)} LSP method strings, "
+            f"too few to compare against the documented matrix (expected at least {minimum})",
         )
 
     errors: list[str] = []
     undocumented = sorted(implemented - documented)
     unhandled = sorted(documented - implemented)
     if undocumented:
-        errors.append(f"{_LSP_DOCUMENT}: undocumented methods: " + ", ".join(undocumented))
+        errors.append(
+            f"{_LSP_DOCUMENT.as_posix()}: undocumented methods: " + ", ".join(undocumented)
+        )
     if unhandled:
         errors.append(
-            f"{_LSP_DOCUMENT}: methods the server does not handle: " + ", ".join(unhandled)
+            f"{_LSP_DOCUMENT.as_posix()}: methods the server does not handle: "
+            + ", ".join(unhandled)
         )
     return tuple(errors)
 
