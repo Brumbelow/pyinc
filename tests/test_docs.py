@@ -1077,3 +1077,113 @@ def test_a_partly_repinned_project_is_accepted_because_a_link_left_on_main_is_no
     )
 
     assert _shipped_link_disagreements(tmp_path) == []
+
+
+# The examples a published wheel has to run. Every place that names the set is
+# checked against this list, so the set cannot move in one of them alone. It is
+# deliberately not everything under examples/: sample_module.py is input for
+# another example rather than a demo of its own, mini_analyzer.py walks the whole
+# directory and writes into it when that input is missing, and
+# undeclared_imports.py answers from whatever the environment has installed --
+# none of which is a thing to hang a release gate on.
+_DESIGNATED_WHEEL_EXAMPLES = (
+    "action_reconcile_demo.py",
+    "calc_demo.py",
+    "codegen_demo.py",
+    "correctness_demo.py",
+)
+
+_EXAMPLE_SCRIPT = re.compile(r"examples/(?P<name>[A-Za-z0-9_]+\.py)")
+
+
+def _workflow_text(name: str) -> str:
+    return (PROJECT_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+
+
+def _job_text(text: str, job: str) -> str:
+    """Return one job's block, ending where the next top-level job key begins."""
+
+    match = re.search(rf"(?ms)^  {re.escape(job)}:$\n.*?(?=^  \S|\Z)", text)
+    assert match, f"the {job} job is missing"
+    return match.group(0)
+
+
+def _invoked_examples(text: str) -> frozenset[str]:
+    """Every `examples/<name>.py` the text names, wherever in it they are named.
+
+    Matching the path rather than a command keeps the reading indifferent to how
+    the script is reached: a trailing comment, a line split over a continuation,
+    an added argument or another interpreter in front of it all leave the path
+    where it is, and each of those is a likelier edit than dropping an example.
+    """
+    return frozenset(match.group("name") for match in _EXAMPLE_SCRIPT.finditer(text))
+
+
+def _named_examples(text: str) -> frozenset[str]:
+    """`_invoked_examples`, read twice over before the answer is compared to anything.
+
+    An extractor that quietly stopped matching would let every comparison below
+    pass against an empty set, and a name that resolves to no file would be
+    reported as a disagreement with the list rather than as the typo it is. Both
+    are caught here, at the parse, rather than at the compare.
+    """
+    named = _invoked_examples(text)
+    assert named, "no example script is named here"
+    unresolved = sorted(
+        name for name in named if not (PROJECT_ROOT / "examples" / name).is_file()
+    )
+    assert not unresolved, f"named examples that no file answers to: {unresolved}"
+    return named
+
+
+def test_the_distribution_job_runs_every_designated_example() -> None:
+    """The job that installs the built wheel is where these examples meet a real install.
+
+    Read out of that job's own block rather than the whole file, so an example
+    named somewhere else in it could not stand in for one this job stopped
+    running.
+    """
+    job = _job_text(_workflow_text("ci.yml"), "distribution")
+
+    assert _named_examples(job) == frozenset(_DESIGNATED_WHEEL_EXAMPLES)
+
+
+def test_the_release_workflow_runs_every_designated_example() -> None:
+    """The release repeats the list, which makes it the easy one to update in one place only.
+
+    Read file-wide rather than by step, because the step carries a name this
+    repository is free to reword and a reading pinned to it would call a rename a
+    missing example.
+    """
+    assert _named_examples(_workflow_text("release.yml")) == frozenset(_DESIGNATED_WHEEL_EXAMPLES)
+
+
+def test_the_release_page_names_every_designated_example() -> None:
+    """The page tells a reader which examples the published wheel is put through.
+
+    They are written there as inline code rather than as commands, which is why
+    the reading is a scan for the paths rather than anything shaped like a shell
+    line.
+    """
+    page = (PROJECT_ROOT / "docs" / "releases.md").read_text(encoding="utf-8")
+
+    assert _named_examples(page) == frozenset(_DESIGNATED_WHEEL_EXAMPLES)
+
+
+def test_a_wheel_run_list_missing_a_designated_example_does_not_match() -> None:
+    """The three answers above are only worth their green if a shorter list fails.
+
+    The step is written out here in the shape the workflows use, with one line
+    gone -- which is the edit the three readings exist to catch.
+    """
+    dropped = "calc_demo.py"
+    step = "      - name: Execute shipped examples\n        run: |\n" + "".join(
+        f"          .artifact-venv/bin/python examples/{name}\n"
+        for name in _DESIGNATED_WHEEL_EXAMPLES
+        if name != dropped
+    )
+
+    named = _named_examples(step)
+
+    assert named == frozenset(_DESIGNATED_WHEEL_EXAMPLES) - {dropped}
+    assert named != frozenset(_DESIGNATED_WHEEL_EXAMPLES)
