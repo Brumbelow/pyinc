@@ -1,10 +1,15 @@
 """Demonstrate cross-run cache reuse via save_checkpoint / load_checkpoint.
 
-The checkpoint API lets a process serialise its entire node-record cache to an
-ArtifactStore and reload it in a subsequent process, skipping re-execution for
-any query whose declared inputs and resource probes are unchanged.
+The checkpoint API lets a process serialise its eligible node records to an
+ArtifactStore and reload them in a subsequent process, skipping re-execution for
+any query whose declared inputs and resource probes are unchanged.  Only query
+and resource records are written — input records are not — and a record the
+kernel cannot vouch for is left out along with everything that reads it: one
+whose cached value no longer matches the live graph, and one that failed.  A
+record marked untracked rests on state no record describes: nothing that reads
+it is written, and the record itself re-executes on reload rather than warming.
 
-This script simulates two "runs" in a single process to make the behaviour
+This script simulates three "runs" in a single process to make the behaviour
 visible without spawning a subprocess.  In real use, each run would be a
 separate invocation sharing the same FileSystemArtifactStore path.
 """
