@@ -987,3 +987,93 @@ def test_the_release_page_counts_the_required_sdist_paths_the_install_check_list
 
     assert required < len(_COUNT_WORDS), f"no spelling on hand for {required} required paths"
     assert f"{_COUNT_WORDS[required]} required paths" in page
+
+
+# The two spellings a documentation link uses for a file in this repository. Both
+# carry the Git ref immediately after the prefix.
+_PINNED_REF = re.compile(
+    r"https://(?:github\.com/Brumbelow/pyinc/blob|raw\.githubusercontent\.com/Brumbelow/pyinc)"
+    r"/(?P<ref>[^/\s)]+)/"
+)
+
+
+def _refs_pinned_beside(text: str, version: str) -> list[str]:
+    """Refs in `text` naming neither `main` nor the tag `version` calls for.
+
+    `main` is excluded by construction, so a link left on the branch never
+    contributes one. This says a pinned link names the right tree; it does not
+    say that everything which should have been pinned has been.
+    """
+    stands_for = {"main", f"v{version}"}
+    return [
+        match.group("ref")
+        for match in _PINNED_REF.finditer(text)
+        if match.group("ref") not in stands_for
+    ]
+
+
+def _shipped_link_disagreements(root: Path) -> list[str]:
+    """The same reading over the two surfaces a published release puts in front of a reader."""
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    version = str(project["version"])
+    surfaces = [(root / "README.md").read_text(encoding="utf-8")]
+    surfaces.extend(str(url) for url in project.get("urls", {}).values())
+    return [ref for text in surfaces for ref in _refs_pinned_beside(text, version)]
+
+
+def test_every_pinned_link_the_project_ships_names_the_project_version() -> None:
+    """The front page and the project URLs are what an installed release links to.
+
+    Vacuous by construction while every shipped reference stays on `main`, and
+    that is the point: it is what the next repin is measured against, so the
+    version it moves to has to be this project's own rather than some other
+    tree's. The issue templates are deliberately out of scope, since neither the
+    wheel nor the sdist carries them and their links correctly stay on `main`.
+    """
+    disagreements = _shipped_link_disagreements(PROJECT_ROOT)
+
+    assert not disagreements, f"README.md and [project.urls] pin {disagreements}"
+
+
+def test_a_shipped_link_pinned_to_another_projects_version_is_reported(tmp_path: Path) -> None:
+    """The repository answer above is vacuous by construction; this is where it discriminates."""
+    (tmp_path / "README.md").write_text(
+        "# Root\n\n[docs](https://github.com/Brumbelow/pyinc/blob/v9.9.9/docs/README.md)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "pyinc"\nversion = "1.2.3"\n', encoding="utf-8"
+    )
+
+    assert _shipped_link_disagreements(tmp_path) == ["v9.9.9"]
+
+
+def test_a_partly_repinned_project_is_accepted_because_a_link_left_on_main_is_not_compared(
+    tmp_path: Path,
+) -> None:
+    """What this reading does not catch, recorded rather than assumed.
+
+    A README half moved to the project's own version and half still on `main` is
+    accepted, because `main` is excluded from the comparison by construction. The
+    project URLs beside it are moved in full, which is the shape a finished repin
+    produces, and they are accepted too: what is asserted is that a pinned link
+    names the right tree, never that every link that should be pinned is.
+    """
+    (tmp_path / "README.md").write_text(
+        "# Root\n\n"
+        "[docs](https://github.com/Brumbelow/pyinc/blob/v1.2.3/docs/README.md)\n"
+        "[faq](https://github.com/Brumbelow/pyinc/blob/main/docs/faq.md)\n"
+        "![demo](https://raw.githubusercontent.com/Brumbelow/pyinc/main/docs/assets/demo.gif)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\n"
+        'name = "pyinc"\n'
+        'version = "1.2.3"\n\n'
+        "[project.urls]\n"
+        'Documentation = "https://github.com/Brumbelow/pyinc/blob/v1.2.3/docs/README.md"\n'
+        'Changelog = "https://github.com/Brumbelow/pyinc/blob/v1.2.3/CHANGELOG.md"\n',
+        encoding="utf-8",
+    )
+
+    assert _shipped_link_disagreements(tmp_path) == []
