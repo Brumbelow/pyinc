@@ -103,6 +103,18 @@ decided at release time.
   wants what an entrypoint knows reads the payload query the entrypoint
   decodes with `db.get()`; a caller that wants the entrypoint itself calls it
   outside the query.
+- The semantic-versioning promise is stated as an enumeration of the packages
+  it covers. Everything `pyinc` and `pyinc.integrations` export, and nothing
+  else, carries the contract. `pyinc_tools` and `pyinc_codegen` ship in the
+  same distribution and are documented in full, but they are unstable: their
+  exported names, the fields of their result types, the `pyinc-tools`
+  command-line surface and the LSP wire behavior may change in any release,
+  including a minor one. This adds a statement rather than withdrawing one —
+  nothing said anything about the stability of either consumer package before,
+  and the promise as it was written covered what `pyinc` exports, so neither
+  package was ever inside it. The security policy carries the enumeration, and
+  the kernel contract's Public Surface section, the README's package table and
+  both consumer guides agree with it.
 
 ### Fixed
 
@@ -550,6 +562,12 @@ decided at release time.
   gives a reference it cannot canonicalize at all, and one a caller can act
   on. The file resources themselves still propagate a denial as a denial; what
   changed is what this walk does with one.
+- The release metadata and artifact checks refuse a changelog heading whose
+  date is not a real calendar date. Both tested the date's shape only, so a
+  heading dated `2026-02-30` was accepted; both now parse the date the shape
+  check matched and reject an impossible one by name. The parse runs on top of
+  that check rather than in place of it, so the accepted spelling is still
+  exactly `YYYY-MM-DD`.
 
 ### Added
 
@@ -979,6 +997,45 @@ decided at release time.
   compares each documented field list against the dataclass it describes, in
   declaration order, so a field added, removed or reordered cannot leave its
   documented list behind.
+- The 2.x migration guide is removed, along with the two index entries that
+  pointed at it. The 3.0.0 entry below still tells an upgrader to read
+  `docs/migration-v3.md` before upgrading and to discard v2 state, because that
+  is what it said at the time and the record of it stands; the reference is no
+  longer a link, because there is no longer a document at that path.
+- The architecture overview said the ledger an action publishes last is schema
+  v2. It is schema v3 — the version the action contract states and the version
+  the `@action` layer writes and accepts. The same page's account of what a
+  pure tree keeps through a freeze now reads as the kernel contract's does: the
+  bare snapshot shape rather than the `FrozenGraph` envelope.
+- The LSP reference spells the document-synchronization methods in full.
+  `textDocument/didChange`, `textDocument/didSave` and `textDocument/didClose`
+  appeared under their bare suffixes beside a fully spelled
+  `textDocument/didOpen` — in the method column, and for the first two in the
+  limits column beside it — and a suffix on its own is not a method a client
+  can send. The section listing what the server does not advertise also names
+  document-link resolution now, beside the other resolution requests already
+  there; the server declines it in the capabilities it sends, as it declines
+  those.
+- The release page says what the release checks before it publishes. The wheel
+  is installed into a clean environment, where the installed distribution's
+  version, the extra-gating of every requirement, the `pyinc-tools` console
+  script, an import of every module of the three packages, a language-server
+  handshake and a package generated from a schema with a cyclic reference are
+  all checked before four named shipped examples run against it; the sdist is
+  checked for fifteen required paths, for the absence of compiled bytecode and
+  for the archive name the version calls for. The page previously said the
+  wheel was exercised by running the shipped examples and that the sdist was
+  checked for completeness, which said less than the wheel check does and more
+  than the sdist check does.
+- The release page's verification commands take the release from a shell
+  variable, with a sentence telling the reader to set it. Each of the three
+  spelled a release out instead. They are correct and run today — the release
+  they named is the current one — but the page had no way to keep three
+  literal versions current past the next release.
+- Both consumer guides list every name their package exports. Each carries a
+  `## Public surface` table whose rows group the names by what they are for,
+  with the grouping stated as editorial and the union of the rows stated as
+  the whole export set; neither guide enumerated its package's exports before.
 
 ## [3.1.1] - 2026-08-03
 
