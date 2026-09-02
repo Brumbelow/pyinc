@@ -2,7 +2,8 @@
 
 Builds a tiny ``.calc`` workspace, reconciles the emitted results to disk via the
 ``@action`` layer, and shows the incremental properties: an edit to an
-unreferenced file does no work and no writes; a comment-only edit backdates the
+unreferenced file executes zero query bodies and writes no files, though the
+reconcile still locks, probes and verifies; a comment-only edit backdates the
 parse; removing an ``emit`` deletes only that owned output.
 
 Run: ``python examples/calc_demo.py``
@@ -43,13 +44,18 @@ def main() -> None:
         calc_emit.reconcile(db, str(root), root=out)
         print(f"alpha={evaluate_name(db, str(root), 'alpha')[1]}")  # 42
 
-        # Editing a file that nothing includes does no query work and no writes.
+        # Editing a file that nothing includes executes zero query bodies and
+        # writes no files. The reconcile still takes its lock, probes what it
+        # declared and verifies the ledger — the reuse count below is what that
+        # work looks like from the statistics.
         db.reset_statistics()
         unrelated.write_text("let z = 2\n", encoding="utf-8")
         unrelated_run = calc_emit.reconcile(db, str(root), root=out)
         changes = unrelated_run.created + unrelated_run.updated + unrelated_run.repaired
         print(f"unrelated_edit_changes={changes}")
-        print(f"unrelated_edit_executions={db.statistics().query_executions}")
+        stats = db.statistics()
+        print(f"unrelated_edit_executions={stats.query_executions}")
+        print(f"unrelated_edit_reuses={stats.query_reuses}")
 
         # A comment-only edit reparses but backdates the semantic parse.
         root.write_text(

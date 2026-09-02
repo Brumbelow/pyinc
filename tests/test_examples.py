@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import runpy
 from pathlib import Path
 
@@ -116,6 +117,12 @@ def test_calc_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "alpha=42" in output
     assert "unrelated_edit_changes=()" in output
     assert "unrelated_edit_executions=0" in output
+    reuses = re.search(r"unrelated_edit_reuses=(\d+)", output)
+    assert reuses is not None
+    # The count itself is a kernel counter and has moved before now. What the
+    # example claims is that the reconcile did real work without running a
+    # query body, and any reuse at all witnesses that.
+    assert int(reuses.group(1)) > 0
     assert "comment_edit_backdated=True" in output
     assert "removed_emit_deleted=('base.out',)" in output
 
