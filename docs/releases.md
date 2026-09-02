@@ -37,8 +37,9 @@ surfaces on the push that introduces it rather than at the next release.
 
 **Release metadata.**
 [`scripts/verify_release_metadata.py`](../scripts/verify_release_metadata.py)
-requires the tag name to equal the `pyproject.toml` version and requires exactly
-one non-empty, correctly dated `CHANGELOG.md` section for that version.
+requires the tag name to equal the `pyproject.toml` version, and requires
+exactly one non-empty `CHANGELOG.md` section for that version whose heading
+carries a real calendar date in `YYYY-MM-DD` form.
 
 **The gates.** The full test matrix — Python 3.11–3.14 on Linux, macOS, and
 Windows — plus static analysis, branch coverage, the documentation check,
@@ -46,9 +47,21 @@ CodeQL, and a five-repetition run of the correctness and work-count benchmark
 must all pass before anything is built.
 
 **The artifacts.** The sdist and wheel are built once. The wheel is installed
-into a clean virtual environment and exercised there by running the shipped
-examples against the installed package; the sdist is checked for completeness.
-Those exact files, not a later rebuild, are what gets published.
+into a clean virtual environment, where
+[`scripts/validate_install.py`](../scripts/validate_install.py) requires the
+installed distribution to report the expected version and every one of its
+requirements to be gated behind an extra, so the runtime has no hard
+dependencies; runs the `pyinc-tools` console script and requires it to print
+that same version; imports every module of `pyinc`, `pyinc_codegen` and
+`pyinc_tools`; starts a language server, sends it an `initialize` request and
+checks the `serverInfo` it answers with; and generates a package from a schema
+with a cyclic `$ref`, byte-compiles it, and imports it. Four shipped examples
+then run against the installed package: `examples/correctness_demo.py`,
+`examples/action_reconcile_demo.py`, `examples/calc_demo.py` and
+`examples/codegen_demo.py`. The same script checks the sdist for fifteen
+required paths, for the absence of compiled bytecode, and for carrying the
+archive name the version calls for. Those exact files, not a later rebuild, are
+what gets published.
 
 **Publication.** Upload to PyPI uses trusted publishing over OIDC. No API token
 is stored in the repository or in Actions secrets.
@@ -71,10 +84,12 @@ PyPI across all twelve supported operating-system and Python combinations.
 ## Verifying a download yourself
 
 `SHA256SUMS` on each GitHub Release covers the same sdist and wheel that were
-published to PyPI:
+published to PyPI. The commands below take the release from `VERSION`, so set it
+to the one you are checking, without the leading `v`:
 
 ```console
-gh release download v3.1.0 --repo Brumbelow/pyinc
+VERSION=...
+gh release download "v$VERSION" --repo Brumbelow/pyinc
 sha256sum --check SHA256SUMS
 ```
 
@@ -82,7 +97,7 @@ To check the tag from a clone of the repository:
 
 ```console
 gpg --import .github/release-signing-key.asc
-git verify-tag v3.1.0
+git verify-tag "v$VERSION"
 ```
 
 `git verify-tag` reports a good signature from the fingerprint above, followed
@@ -93,5 +108,5 @@ what a matching fingerprint establishes: continuity with the key pinned in
 this repository — every release signed by the same key that signed the ones
 before it — not an independently certified maintainer identity. GPG's warning
 is correct that nothing outside this repository vouches for the key.
-`git verify-commit v3.1.0^{commit}` checks the commit the tag names in the
+`git verify-commit "v$VERSION^{commit}"` checks the commit the tag names in the
 same way.

@@ -4,6 +4,7 @@ import ast
 import importlib
 import re
 import sys
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -812,3 +813,103 @@ def test_every_advertised_name_resolves_on_the_package_that_advertises_it() -> N
         imported = importlib.import_module(module)
         unresolved = [name for name in imported.__all__ if not hasattr(imported, name)]
         assert not unresolved, f"{module}: {unresolved}"
+
+
+# The version grammar `scripts/release_artifacts.py` accepts, written out rather
+# than imported: a documentation test that reached into a release script for a
+# private constant would tie the two together for nothing.
+_TAGGED_VERSION = re.compile(r"v(?P<version>\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?)")
+
+
+def _versions_the_page_names_beside(page_text: str, version: str) -> list[str]:
+    """Every tagged version the release page names that is not the project's own.
+
+    Reads the page as written rather than through the checker's prose lines: the
+    download commands sit inside ```console fences, which the prose reader strips
+    out entirely, so a reading built on it would be blind to the sites this
+    guards and would stay blind however stale they got.
+    """
+    return [
+        match.group("version")
+        for match in _TAGGED_VERSION.finditer(page_text)
+        if match.group("version") != version
+    ]
+
+
+def _release_page_disagreements(root: Path) -> list[str]:
+    page = (root / "docs" / "releases.md").read_text(encoding="utf-8")
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    return _versions_the_page_names_beside(page, project["version"])
+
+
+def test_the_release_page_names_no_version_the_project_does_not_carry() -> None:
+    """The page takes its version from a shell variable, so this holds while it stays that way.
+
+    It is what makes writing a literal version back into the page a decision
+    rather than a habit: the next one written there has to be the project's own.
+    """
+    disagreements = _release_page_disagreements(PROJECT_ROOT)
+
+    assert not disagreements, f"docs/releases.md names {disagreements}"
+
+
+def test_a_release_page_naming_another_projects_version_is_reported(tmp_path: Path) -> None:
+    """The repository answer above is vacuous by construction; this is where it discriminates."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "releases.md").write_text(
+        "# Releases\n\n```console\ngh release download v9.9.9\n```\n", encoding="utf-8"
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "pyinc"\nversion = "1.2.3"\n', encoding="utf-8"
+    )
+
+    assert _release_page_disagreements(tmp_path) == ["9.9.9"]
+
+
+_COUNT_WORDS = (
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+)
+
+
+def _required_sdist_path_count() -> int:
+    """How many paths the install check requires an sdist to carry, from its own set literal."""
+    source = (PROJECT_ROOT / "scripts" / "validate_install.py").read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source, filename="validate_install.py")):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Set):
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id == "required" for target in node.targets
+        ):
+            return len(node.value.elts)
+    raise AssertionError("scripts/validate_install.py no longer builds a `required` set of paths")
+
+
+def test_the_release_page_counts_the_required_sdist_paths_the_install_check_lists() -> None:
+    """A count spelled out in prose goes stale the first time the set behind it grows."""
+    required = _required_sdist_path_count()
+    document = (PROJECT_ROOT / "docs" / "releases.md").read_text(encoding="utf-8")
+    # The sentence is free to wrap wherever the paragraph needs it to.
+    page = " ".join(document.split())
+
+    assert required < len(_COUNT_WORDS), f"no spelling on hand for {required} required paths"
+    assert f"{_COUNT_WORDS[required]} required paths" in page
