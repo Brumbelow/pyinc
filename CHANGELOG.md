@@ -898,6 +898,24 @@ decided at release time.
   that encoding is gone, so what bounds the cap is the payload a document at it
   caches — the budget JSON is already held to, which puts both at the same
   number.
+- The dependency example fails when the environment cannot produce the finding
+  it exists to show. It builds a workspace that imports pyinc without
+  declaring it and reports pyinc as undeclared — a finding that comes from the
+  `.dist-info` directories site-packages carries, so a source tree reached
+  only through `PYTHONPATH` cannot produce it. Run that way the example
+  previously printed "(none — all imports accounted for)" and exited 0,
+  demonstrating nothing; it now exits non-zero and says why. It also no longer
+  prints the temporary directory it built, which was the one part of its
+  output that differed between runs.
+- The source-analysis example analyzes a workspace it builds for itself. It
+  analyzed the directory it lives in and printed a sixty-kilobyte dataclass
+  repr carrying the environment's absolute paths and the installed version;
+  it now writes a fixed two-module workspace into a temporary directory and
+  prints seven lines of named fields that do not depend on what is installed
+  or where it is run from. It no longer writes into the directory it lives in
+  when a file it expected is missing, and the file it expected — which it
+  recreated with different content than the one in the repository — is
+  removed, since nothing else read it.
 
 ### Documentation
 
@@ -1036,6 +1054,26 @@ decided at release time.
   `## Public surface` table whose rows group the names by what they are for,
   with the grouping stated as editorial and the union of the rows stated as
   the whole export set; neither guide enumerated its package's exports before.
+- The checkpoint example says what a checkpoint saves. It said the API
+  serialises the entire node-record cache; only query and resource records are
+  written — its own five-node graph produces four records, because the input
+  is not one of them — and a record whose cached value no longer matches the
+  live graph, or that failed, is dropped along with everything that reads it.
+  The same docstring said the script simulates two runs where it builds three
+  databases and prints three.
+- The reconcile example says what removing a declaration deletes. Deleting an
+  output it previously owned also requires that file still to hold the bytes
+  the ledger recorded and still to be the same file the check read; an orphan
+  edited out of band is released rather than deleted, and stays where it is.
+- The calc example says what an unrelated edit costs. It said such an edit does
+  no work and no writes; it executes zero query bodies and writes no files,
+  while the reconcile still takes its lock, probes what it declared and
+  verifies the ledger. The example now prints the reuse count that work leaves
+  behind, beside the execution count it already printed.
+- The frozen-graph example describes a pure tree's snapshot the way the kernel
+  contract does: the bare snapshot shape rather than the `FrozenGraph`
+  envelope, with the deep freeze paid in full. It called that shape flat and
+  called it free of overhead, and it is neither.
 
 ## [3.1.1] - 2026-08-03
 
