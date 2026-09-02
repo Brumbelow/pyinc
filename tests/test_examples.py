@@ -29,6 +29,21 @@ def _make_dist_info(site_dir: Path, name: str, version: str, *, top_level: str) 
     return dist_info
 
 
+def _examples_tree() -> dict[str, tuple[int, int]]:
+    """Every file under examples/, by size and modification time.
+
+    Bytecode caches are left out. Another example puts this directory on the
+    import path and imports the package beside it, which writes a cache here on
+    every run; counting those would report that example's write rather than
+    this one's.
+    """
+    return {
+        str(path.relative_to(EXAMPLES_DIR)): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in sorted(EXAMPLES_DIR.rglob("*"))
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+
+
 def test_inspect_fresh_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     _run_example("inspect_fresh_demo.py")
     output = capsys.readouterr().out
@@ -182,3 +197,19 @@ def test_undeclared_imports_fails_when_the_environment_cannot_answer(
 
     with pytest.raises(SystemExit, match="found no undeclared import"):
         _run_example("undeclared_imports.py")
+
+
+def test_mini_analyzer_prints_named_fields_and_leaves_the_tree_alone(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The example analyzes a workspace it builds, not the directory it lives in."""
+    before = _examples_tree()
+
+    _run_example("mini_analyzer.py")
+    output = capsys.readouterr().out
+
+    assert _examples_tree() == before
+    assert len(output) < 1000, f"unbounded example output: {len(output)} bytes"
+    assert "file:          app.py" in output
+    assert "workspace:     2 modules" in output
+    assert "resolutions=('stdlib', 'workspace')" in output
