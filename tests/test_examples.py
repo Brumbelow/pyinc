@@ -13,6 +13,22 @@ def _run_example(name: str) -> None:
     runpy.run_path(str(EXAMPLES_DIR / name), run_name="__main__")
 
 
+def _make_dist_info(site_dir: Path, name: str, version: str, *, top_level: str) -> Path:
+    """The metadata an installer leaves in site-packages for one distribution.
+
+    Written here rather than imported from the dependency-check tests: the two
+    files would then share a collection and a future, for nine lines.
+    """
+    dist_info = site_dir / f"{name}-{version}.dist-info"
+    dist_info.mkdir(parents=True, exist_ok=True)
+    (dist_info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\nSummary: A test package\n",
+        encoding="utf-8",
+    )
+    (dist_info / "top_level.txt").write_text(top_level + "\n", encoding="utf-8")
+    return dist_info
+
+
 def test_inspect_fresh_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     _run_example("inspect_fresh_demo.py")
     output = capsys.readouterr().out
@@ -137,3 +153,32 @@ def test_codegen_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "whitespace_edit_changed=()" in output
     assert "description_edit_updated=('docs/widget.md',)" in output
     assert "removed_def_deleted=('color.py', 'docs/color.md')" in output
+
+
+def test_undeclared_imports_reports_the_promised_finding(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The example exists to name an import the environment has and the project does not declare."""
+    # Returning at all is half the witness: the example raises SystemExit when
+    # it cannot produce the finding, so reaching the assertions below means it
+    # produced one.
+    _run_example("undeclared_imports.py")
+    output = capsys.readouterr().out
+    assert "- pyinc" in output
+    assert "distribution: pyinc" in output
+
+
+def test_undeclared_imports_fails_when_the_environment_cannot_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An example that cannot show its finding says so, rather than reporting that it found nothing and exiting 0."""
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "unrelated", "1.0", top_level="unrelated")
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    with pytest.raises(SystemExit, match="found no undeclared import"):
+        _run_example("undeclared_imports.py")
