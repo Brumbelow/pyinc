@@ -10,6 +10,7 @@ from typing import Any, BinaryIO, cast
 
 import pytest
 
+import pyinc_tools
 import pyinc_tools.cli as cli
 import pyinc_tools.session as session_module
 from pyinc import Database
@@ -8995,3 +8996,53 @@ def test_session_stays_usable_when_a_request_scope_exit_fails(
     finally:
         monkeypatch.undo()
         session.close()
+
+
+def test_pyinc_tools_exports_only_stable_api() -> None:
+    assert set(pyinc_tools.__all__) == {
+        "AnalysisDiagnostic",
+        "CallHierarchyCallSite",
+        "CallHierarchyIncomingCall",
+        "CallHierarchyItem",
+        "CallHierarchyItemKind",
+        "CallHierarchyOutgoingCall",
+        "CodeAction",
+        "CodeActionEdit",
+        "CodeActionKind",
+        "CodeLens",
+        "CompletionItem",
+        "CompletionItemKind",
+        "DeclarationLocation",
+        "DocumentHighlight",
+        "DocumentHighlightKind",
+        "DocumentLink",
+        "FileAnalysisResult",
+        "FileDeletionEdit",
+        "FileRenameEdit",
+        "FoldingRange",
+        "FoldingRangeKind",
+        "InlayHint",
+        "InlayHintKind",
+        "LinkedEditingRange",
+        "PollingWorkspaceWatcher",
+        "RenameEdit",
+        "RenameResult",
+        "RenameStatus",
+        "SelectionRange",
+        "SemanticToken",
+        "SemanticTokenModifier",
+        "SemanticTokenType",
+        "SignatureHelp",
+        "SignatureParameterInfo",
+        "TypeDefinitionLocation",
+        "TypeHierarchyItem",
+        "TypeHierarchyItemKind",
+        "WorkspaceAnalysisResult",
+        "WorkspaceSession",
+    }
+    assert hasattr(pyinc_tools, "WorkspaceSession")
+    assert hasattr(pyinc_tools, "PollingWorkspaceWatcher")
+    # No assertion that an unexported name is absent from the package: this
+    # module imports three `pyinc_tools` submodules at its head, and each of
+    # those imports binds the submodule as a package attribute, so what is
+    # reachable here depends on import order rather than on the export list.
