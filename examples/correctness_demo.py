@@ -179,7 +179,7 @@ def main() -> None:
         _banner("Phase 5: Mutation protection (strict mode)")
 
         @query
-        def get_config(db: Database) -> dict[str, int]:
+        def get_config(db: Database) -> Mapping[str, int]:
             return {"a": 1, "b": 2}
 
         frozen_result: Mapping[str, int] = db.get(get_config)

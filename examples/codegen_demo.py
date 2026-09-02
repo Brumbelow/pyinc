@@ -57,7 +57,7 @@ def main() -> None:
         print(f"description_edit_updated={described.updated}")
 
         # Removing a definition deletes only the files it owned.
-        del widget["properties"]["color"]  # type: ignore[index]
+        del widget["properties"]["color"]
         del schema["$defs"]["Color"]  # type: ignore[attr-defined]
         schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
         removed = generate(db, schema_path, out)

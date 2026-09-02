@@ -31,8 +31,8 @@ Run all four locally before pushing:
 
 ```console
 pytest -q
-python3 -m mypy src tests bench scripts
-python3 -m ruff check src tests bench scripts
+python3 -m mypy src tests bench scripts examples
+python3 -m ruff check src tests bench scripts examples
 python3 scripts/check_docs.py
 ```
 

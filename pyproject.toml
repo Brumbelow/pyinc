@@ -98,7 +98,7 @@ no_implicit_reexport = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 warn_unused_configs = true
-files = ["src", "tests", "bench", "scripts"]
+files = ["src", "tests", "bench", "scripts", "examples"]
 
 [tool.ruff]
 line-length = 100
