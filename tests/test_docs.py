@@ -1095,11 +1095,11 @@ def test_a_partly_repinned_project_is_accepted_because_a_link_left_on_main_is_no
 
 # The examples a published wheel has to run. Every place that names the set is
 # checked against this list, so the set cannot move in one of them alone. It is
-# deliberately not everything under examples/: sample_module.py is input for
-# another example rather than a demo of its own, mini_analyzer.py walks the whole
-# directory and writes into it when that input is missing, and
-# undeclared_imports.py answers from whatever the environment has installed --
-# none of which is a thing to hang a release gate on.
+# deliberately not everything under examples/: undeclared_imports.py answers
+# from whatever the environment has installed, and mini_analyzer.py is a
+# demonstration of an analysis rather than of the packaging -- neither is a
+# thing to hang a release gate on. Both are covered by tests/test_examples.py,
+# which runs in every test job.
 _DESIGNATED_WHEEL_EXAMPLES = (
     "action_reconcile_demo.py",
     "calc_demo.py",
@@ -1201,6 +1201,44 @@ def test_a_wheel_run_list_missing_a_designated_example_does_not_match() -> None:
 
     assert named == frozenset(_DESIGNATED_WHEEL_EXAMPLES) - {dropped}
     assert named != frozenset(_DESIGNATED_WHEEL_EXAMPLES)
+
+
+def test_the_release_page_counts_the_examples_it_names() -> None:
+    """A count spelled out in prose goes stale the first time the list behind it moves."""
+    designated = len(_DESIGNATED_WHEEL_EXAMPLES)
+    document = (PROJECT_ROOT / "docs" / "releases.md").read_text(encoding="utf-8")
+    # The page is whitespace-normalised and lower-cased before the reading, so
+    # the sentence is free to wrap wherever the paragraph needs it to, and free
+    # to stop opening a sentence as it does today.
+    page = " ".join(document.split()).lower()
+
+    assert designated < len(_COUNT_WORDS), f"no spelling on hand for {designated} examples"
+    assert f"{_COUNT_WORDS[designated]} shipped examples" in page
+
+
+def _gate_targets(text: str, command: str, where: str) -> tuple[str, ...]:
+    """The directories a `python -m <tool>` line hands its tool."""
+    match = re.search(rf"python3? -m {command} (?P<targets>[^\n]+)", text)
+    assert match, f"{where} no longer runs {command}"
+    targets = tuple(match.group("targets").split())
+    assert targets, f"{where} runs {command} over nothing"
+    return targets
+
+
+def test_the_static_gates_name_the_same_directories_wherever_they_are_named() -> None:
+    """Three places say what is type-checked and linted, and the guide promises its two are the commands CI runs."""
+    job = _job_text(_workflow_text("ci.yml"), "quality")
+    guide = (PROJECT_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    config = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    for command in ("mypy", "ruff check"):
+        assert _gate_targets(job, command, "the quality job") == _gate_targets(
+            guide, command, "CONTRIBUTING.md"
+        )
+
+    # An explicit path argument overrides this setting, so the two only agree
+    # while somebody keeps them agreeing.
+    assert tuple(config["tool"]["mypy"]["files"]) == _gate_targets(job, "mypy", "the quality job")
 
 
 def test_the_documents_name_many_external_links() -> None:
