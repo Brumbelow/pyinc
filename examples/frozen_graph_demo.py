@@ -4,14 +4,16 @@ from pyinc import FrozenGraph, freeze, thaw
 
 
 def main() -> None:
-    # 1. Pure tree: no shared identity, no cycles → flat snapshot shape, zero overhead.
+    # 1. Pure tree: no shared identity, no cycles → the bare snapshot shape
+    #    rather than the FrozenGraph envelope. The freeze is still paid in
+    #    full: every container gets its own Frozen* shell.
     tree = {"name": "root", "items": [1, 2, 3]}
     tree_snapshot = freeze(tree)
     print(f"tree_is_FrozenGraph={isinstance(tree_snapshot, FrozenGraph)}")
 
     # 2. Shared identity: the same list appears at two slots of a parent dict.
-    #    The flat v1 shape would silently turn this into two independent copies;
-    #    FrozenGraph preserves identity across the boundary.
+    #    A snapshot without the envelope would turn this into two separate
+    #    copies; FrozenGraph preserves identity across the boundary.
     shared_inner: list[int] = [10, 20]
     shared_parent = {"left": shared_inner, "right": shared_inner}
     shared_snapshot = freeze(shared_parent)
