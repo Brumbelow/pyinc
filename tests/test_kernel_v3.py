@@ -20,6 +20,7 @@ from typing import Any, NamedTuple, TypeVar, cast
 import pytest
 
 import pyinc.runtime as runtime_module
+import pyinc.value as value_module
 from pyinc import (
     ArtifactStoreError,
     BinaryFileResource,
@@ -593,6 +594,21 @@ def test_runtime_build_payload_covers_full_release_and_abi(
     monkeypatch.setattr(sysconfig, "get_config_var", changed_config)
     assert runtime_module._build_runtime_build_payload() != original
     assert db._runtime_build_payload() == original
+
+
+def test_the_kernel_fingerprint_version_mirrors_the_encoder_prefix() -> None:
+    """The kernel's version constant and the prefix every digest carries agree.
+
+    The encoder stamps each fingerprint with a version prefix, and the kernel
+    holds the same number as an integer it compares and reasons about. The two
+    are written in different modules and nothing in the tree made them agree,
+    so a bump applied to one and not the other would ship digests whose prefix
+    contradicts the version the kernel believes it is computing.
+    """
+
+    assert int(value_module._KERNEL_FINGERPRINT_PREFIX[1:2]) == (
+        runtime_module._KERNEL_FINGERPRINT_VERSION
+    )
 
 
 def test_recursive_query_and_policy_captures_have_finite_identity() -> None:
@@ -1361,6 +1377,74 @@ def test_module_identity_observes_rewritten_bytes_when_stat_identity_collides(
     second = db._module_identity_payload(module)
 
     assert first != second
+
+
+def test_the_module_stamp_folds_exactly_what_the_identity_folds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_name = "pyinc_stamp_mirror_module"
+    (tmp_path / f"{module_name}.py").write_text("SCALE = 3\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    planted = importlib.import_module(module_name)
+    try:
+        db = Database()
+        frozen = sys.modules["importlib._bootstrap"]
+        assert cast(Any, sys.__spec__).origin == "built-in"
+        assert cast(Any, frozen.__spec__).origin == "frozen"
+        # One representative of every class the fold distinguishes: a built-in,
+        # a frozen module, a standard-library source module, a package module
+        # of this project's own, and a module the caller wrote.
+        for module in (sys, frozen, string, runtime_module, planted):
+            identity = db._module_identity_payload(module)
+            # The slot is read rather than assumed: both branches of the
+            # payload return a four-tuple whose last element is the constants,
+            # and the stamp carries them last.
+            assert len(identity) == 4
+            assert identity[3] == db._module_observation_stamp(module)[-1]
+        # What the loop above holds is the elision mirror, not the constants:
+        # the three modules the runtime build identity pins contribute none, so
+        # those three rows compare an empty payload with an empty payload. The
+        # last two rows are what keeps that from being the whole cell -- they
+        # carry real constants through both derivations.
+        for pinned in (sys, frozen, string):
+            assert db._module_identity_payload(pinned)[3] == ()
+        for folded in (runtime_module, planted):
+            assert db._module_identity_payload(folded)[3] != ()
+
+        @query(key="stamp-mirror-landings")
+        def letters(db: Database) -> int:
+            return len(string.ascii_lowercase)
+
+        db._query_fingerprint(letters)
+        entry = db._query_fingerprint_memo[letters]
+        # The landings a runtime-pinned capture folds are recorded inside the
+        # query's own memo entry, not in any module payload. Which slot holds
+        # them is found by shape rather than by index, so a reordering of the
+        # entry is a failure here rather than a silently skipped assertion.
+        landing_slots = [
+            slot
+            for slot in entry
+            if isinstance(slot, tuple)
+            and slot
+            and all(
+                isinstance(record, tuple)
+                and len(record) == 3
+                and isinstance(record[0], ModuleType)
+                and isinstance(record[1], tuple)
+                and all(isinstance(segment, str) for segment in record[1])
+                for record in slot
+            )
+        ]
+        assert len(landing_slots) == 1
+        # The comprehension above is what established the shape; the annotation
+        # only carries it across to the reads below.
+        landings = cast(tuple[tuple[ModuleType, tuple[str, ...], Any], ...], landing_slots[0])
+        assert any(landed is string for landed, _path, _target in landings)
+        for landed, path, expected in landings:
+            assert db._resolve_module_path_target(landed, path) is expected
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def test_frozen_local_dataclass_capture_is_rejected_instead_of_erasing_behavior() -> None:
@@ -2830,7 +2914,7 @@ def test_memoized_fingerprint_tracks_constants_outside_the_captured_chain(
         sys.modules.pop(module_name, None)
 
 
-def test_memoized_fingerprint_tracks_constants_on_a_captured_stdlib_module(
+def test_memoized_fingerprint_tracks_a_stdlib_constant_the_query_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     @query(key="memo-stdlib-constant")
@@ -2838,13 +2922,100 @@ def test_memoized_fingerprint_tracks_constants_on_a_captured_stdlib_module(
         return len(string.ascii_lowercase)
 
     db = Database()
-    db._query_fingerprint(letters)
-    # A stdlib capture folds paths rather than the values behind them, but its
-    # module identity payload still carries the namespace constants.
-    monkeypatch.setattr(string, "PYINC_PROBE_CONSTANT", 5, raising=False)
+    before = db._query_fingerprint(letters)
+    # The half of the pair below that says the fold still detects something. A
+    # standard-library namespace is not folded wholesale -- the runtime build
+    # identity and the module's file bytes pin it -- but the constants the
+    # query's own body names are folded beside the capture, so a write to one
+    # of them moves identity. The replacement is several characters long: a
+    # one-character string is interned, and a cell written on one can end up
+    # comparing a value with itself.
+    monkeypatch.setattr(string, "ascii_lowercase", "zyxwvu")
     memoized, truth = _memo_and_truth(db, letters)
+    assert memoized != before
     assert memoized == truth
     assert memoized == Database()._query_fingerprint(letters)
+
+
+def test_constants_outside_a_captured_stdlib_module_move_no_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="offpath-stdlib-constant")
+    def letters(db: Database) -> int:
+        return len(string.ascii_lowercase)
+
+    db = Database()
+    assert db.get(letters) == 26
+    before = db._query_fingerprint(letters)
+    monkeypatch.setattr(string, "PYINC_PROBE_CONSTANT", 5, raising=False)
+    executions = db.statistics().query_executions
+    # The inverse of the pin above, and the limitation it buys. A module the
+    # runtime build identity pins is covered by that identity and by its own
+    # file bytes, so a namespace write to a constant no query reads is outside
+    # what identity covers: nothing about this query moved, the stored answer
+    # is still the right one, and it is served rather than recomputed. The
+    # execution counter is the witness -- an identity that moved would have no
+    # record to reuse and would execute here.
+    assert db.get(letters) == 26
+    assert db.statistics().query_executions == executions
+    memoized, truth = _memo_and_truth(db, letters)
+    assert memoized == truth == before
+    assert Database()._query_fingerprint(letters) == before
+
+
+def test_memoized_fingerprint_reuses_the_memo_for_a_stdlib_accessed_path_capture() -> None:
+    @query(key="memo-stdlib-accessed-path-steady")
+    def scaled(db: Database) -> int:
+        return len(string.ascii_lowercase) * 2
+
+    db = Database()
+    first = db._query_fingerprint(scaled)
+    entry = db._query_fingerprint_memo[scaled]
+    assert db._query_fingerprint(scaled) == first
+    assert db._query_fingerprint(scaled) == first
+    # The accessed-path landings a standard-library capture folds are recorded,
+    # and the guard re-resolves each chain and compares the target by identity
+    # on every memo hit. An arm that answered with a freshly built object each
+    # call would recompute here with every coherence pin still green, because a
+    # recompute stores a newly built entry that carries the same digest: entry
+    # identity is what separates a served memo from one that rebuilt it.
+    assert db._query_fingerprint_memo[scaled] is entry
+
+
+def test_an_equal_but_distinct_stdlib_constant_settles_after_one_recompute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-stdlib-equal-rebinding")
+    def letters(db: Database) -> int:
+        return len(string.ascii_lowercase)
+
+    db = Database()
+    assert db.get(letters) == 26
+    executions = db.statistics().query_executions
+    before = db._query_fingerprint(letters)
+    entry = db._query_fingerprint_memo[letters]
+    # A fresh object holding an equal value. The constant is several characters
+    # long on purpose: slicing a one-character string returns the interned
+    # original, which would make the rebinding no rebinding at all.
+    rebound = (string.ascii_lowercase + "x")[:-1]
+    assert rebound == string.ascii_lowercase
+    assert rebound is not string.ascii_lowercase
+    monkeypatch.setattr(string, "ascii_lowercase", rebound)
+    # The direction of error, stated: the memo compares a recorded landing by
+    # object identity while identity folds the value, so an equal value in a
+    # new object over-invalidates and never under-invalidates. The cost is
+    # bounded at one recompute -- the digest it arrives at is the one already
+    # stored, the rebuilt entry records the new object, and the next
+    # fingerprint is served from it again.
+    memoized, truth = _memo_and_truth(db, letters)
+    assert memoized == truth == before
+    settled = db._query_fingerprint_memo[letters]
+    assert settled is not entry
+    assert db._query_fingerprint(letters) == before
+    assert db._query_fingerprint_memo[letters] is settled
+    # The stored record still answers: an unchanged digest costs no execution.
+    assert db.get(letters) == 26
+    assert db.statistics().query_executions == executions
 
 
 def test_memoized_fingerprint_tracks_functions_a_captured_module_function_calls(
