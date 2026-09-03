@@ -568,6 +568,19 @@ decided at release time.
   check matched and reject an impossible one by name. The parse runs on top of
   that check rather than in place of it, so the accepted spelling is still
   exactly `YYYY-MM-DD`.
+- A checkpoint written by one process warms another whatever hash seed either
+  process ran under, and whatever absolute prefix either tree was installed
+  at. A query's identity folded a captured module's whole namespace, and the
+  interpreter rebuilds some of those values once per process — a standard
+  library module's constants can be joined from a set, so their order follows
+  the hash seed — and it folded a code object's absolute source path, which
+  binds every identity to the checkout, container or virtualenv the code was
+  installed into. Query identities, input policy digests, resource identities
+  and adapter digests were all affected. A checkpoint now warms across
+  processes, across containers, across virtualenvs, and on a second continuous
+  integration runner that checked the tree out somewhere else. The fold also
+  got cheaper, because it no longer walks a standard library module's whole
+  namespace to do it.
 
 ### Added
 
@@ -916,6 +929,17 @@ decided at release time.
   when a file it expected is missing, and the file it expected — which it
   recreated with different content than the one in the repository — is
   removed, since nothing else read it.
+- Every identity this release computes differs from the one the previous build
+  computed, so a checkpoint written by an earlier build misses and its queries
+  re-execute. Nothing is mis-warmed by that: a record whose identity moved is
+  skipped rather than trusted, so neither the manifest schema version nor the
+  kernel fingerprint version moved. The interpreter build identity folds
+  `sys.flags` by name rather than by position — every field the running
+  interpreter exposes, so a flag a future version adds is folded the day it
+  appears — and hash randomization deliberately leaves it, so a
+  `PYTHONHASHSEED=0` process shares a cache with an ordinary one. A dynamic
+  capture of a caller's module that answers to a standard-library name is now
+  refused, as the contract already promised for a custom module.
 
 ### Documentation
 
@@ -1074,6 +1098,18 @@ decided at release time.
   contract does: the bare snapshot shape rather than the `FrozenGraph`
   envelope, with the deep freeze paid in full. It called that shape flat and
   called it free of overhead, and it is neither.
+- The kernel contract says what a captured standard-library module contributes
+  to an identity: only the constants on the attribute paths a query's own code
+  names statically, and a path read dynamically contributes none, so a
+  namespace write to what such a read returns is not detected, warm or fresh.
+  It says what the code encoding pins about location — where a definition sits
+  inside its package rather than where the package sits on the machine — and
+  which two shapes still name a path. It states the rule the interpreter build
+  identity folds flags by rather than listing them, and says that hash
+  randomization is deliberately not among them. And it says that a module from
+  outside the standard library still contributes its module-level constants,
+  so one holding a process id or an import timestamp at module scope makes
+  every identity that captures it process-varying.
 
 ## [3.1.1] - 2026-08-03
 

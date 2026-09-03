@@ -583,6 +583,18 @@ it. The mechanisms that earn this:
   different identity and the stale record simply misses. This encoding never
   depends on object reference counts and supports nested code and slice
   constants.
+  It pins where a definition sits inside its package — the defining module's
+  dotted name and its source file's basename — rather than the absolute path
+  that package was installed at, so two byte-identical installations of the
+  same distribution at different prefixes agree about every identity that does
+  not itself name a path. Two things still name one: a body that reads
+  `__file__` or passes a path as an argument folds that path as it always did,
+  and code whose compiled filename is not its defining module's own file — a
+  module imported without a `__file__`, or a sourceless `.pyc` whose recorded
+  filename is the source it was built from — falls back to folding that
+  filename verbatim beside the module name, so it can never take a real
+  module's location. Code compiled without a source file at all (`<string>`,
+  `<stdin>`) is folded verbatim for the same reason.
 - **Inputs and dependency edges verify exactly.** Warmed records carry their
   real dependency edges; each input and sub-query dependency is re-checked
   against the live graph by digest before the record is trusted. Input policy
@@ -612,37 +624,50 @@ warming from — so the load is refused outright and stages nothing.
 Residual limitations that stay outside the envelope: the stdlib-module gap of
 limitation 5 applies across runs exactly as it does in-process; and a
 checkpoint does not survive an interpreter or build-configuration change — such
-records miss safely (they re-execute) rather than being trusted.
+records miss safely (they re-execute) rather than being trusted. The hash seed
+is not part of that build configuration: a checkpoint written by a process
+running under one `PYTHONHASHSEED` warms one running under another, and a
+process that pinned the seed to zero shares a cache with one that left it
+unset. Neither is the absolute prefix the tree was installed at: by the
+location rule the code encoding follows, a checkpoint written from one
+installation warms a byte-identical installation unpacked somewhere else.
 
 **5. Ambient module or class monkey-patching.**
 Captured modules contribute their `__version__`, a SHA-256 digest of their
-source or compiled file bytes, declared `__all__`, their module-level stable
-constants read live, and — outside the standard library — the behavior reached
-through statically resolvable attribute chains. Re-exported functions and
-submodules pin their defining modules transitively; dynamic access to a custom
-module is rejected when the behavior cannot be proven. A third-party version
-bump, a source-file edit, or a namespace write to a captured module's constant
-invalidates cached results that capture that module. Query definitions are
-weakly memoized per `Database` for high-cardinality calls, and before a
-memoized fingerprint is reused the memo rechecks the runtime build, the
-observed definition objects, each captured module's file bytes and constants,
-each captured resource's configuration digest, and each statically captured
-attribute chain — re-resolving the chain and observing the definitions behind
-the landings whose payloads read one live: functions, wraps-decorated
-callables, `Query` handles, `Input`s, type aliases, type parameters and
-resources, whose globals, defaults, policies, evaluators, instance and handle
-state the fold reads at fingerprint time. Rebinding a statically captured
-module attribute, or an entry in a directly captured class body, therefore
-moves query identity at the next request, warm or fresh alike — and so does a
-rebinding one of those landings' definitions reads, such as the module-level
-function an `Input`'s `eq` policy calls, the class a chain-landed type alias
-resolves to, or the function a chain-landed resource's `load` calls. Where the
-interpreter exposes no Python evaluator to observe — a `type` alias before
-3.14, or a runtime-constructed `TypeVar`'s bound on every interpreter — the
-payload resolves the value eagerly and anchors each class it reaches to its
-live module binding, and the warm path carries the anchors for every class
-and carrier type the value names: rebinding such a binding then refuses
-loudly, warm and fresh alike, instead of moving identity. The further
+source or compiled file bytes, declared `__all__`, and — outside the standard
+library — their module-level stable constants read live and the behavior
+reached through statically resolvable attribute chains. A standard-library
+module — and any built-in or frozen module — contributes none of its namespace
+wholesale: the interpreter/build identity already pins the build those values
+come from, and some of them the interpreter rebuilds from one process to the
+next. What it contributes from that namespace is the constants on the attribute
+paths a capturing query's own code reads off it, folded beside the capture.
+Re-exported functions and submodules pin their defining modules transitively;
+dynamic access to a custom module is rejected when the behavior cannot be
+proven. A third-party version bump, a source-file edit, or a namespace write
+to a captured module's constant invalidates cached results that capture that
+module; for a standard-library module, that last case means a write to a
+constant on an attribute path the capturing query's own code reads. Query
+definitions are weakly memoized per `Database` for high-cardinality calls, and
+before a memoized fingerprint is reused the memo rechecks the runtime build,
+the observed definition objects, each captured module's file bytes and the
+constants it contributes, each captured resource's configuration digest, and
+each statically captured attribute chain — re-resolving the chain and
+observing the definitions behind the landings whose payloads read one live:
+functions, wraps-decorated callables, `Query` handles, `Input`s, type aliases,
+type parameters and resources, whose globals, defaults, policies, evaluators,
+instance and handle state the fold reads at fingerprint time. Rebinding a
+statically captured module attribute, or an entry in a directly captured class
+body, therefore moves query identity at the next request, warm or fresh alike
+— and so does a rebinding one of those landings' definitions reads, such as
+the module-level function an `Input`'s `eq` policy calls, the class a
+chain-landed type alias resolves to, or the function a chain-landed resource's
+`load` calls. Where the interpreter exposes no Python evaluator to observe — a
+`type` alias before 3.14, or a runtime-constructed `TypeVar`'s bound on every
+interpreter — the payload resolves the value eagerly and anchors each class it
+reaches to its live module binding, and the warm path carries the anchors for
+every class and carrier type the value names: rebinding such a binding then
+refuses loudly, warm and fresh alike, instead of moving identity. The further
 anchors a class's own definition contributes — its bases, its metaclass, the
 classes its body binds directly — are carried warm as well as fresh, because
 the warm path follows each anchored class's definition closure: rebinding a
@@ -665,12 +690,26 @@ Rebinding is the other half of that landing: when a class such a container
 carries stops being its defining module's live binding, a warm database still
 serves the stored answer while a fresh computation refuses loudly instead of
 moving identity. And a captured standard-library module folds the names of the
-paths read off it rather than the behavior behind them, so patching a stdlib
-function or class it reaches (`json.dumps = other`) is not detected at all,
-warm or fresh; a stdlib type is pinned by its name anchor — its own name
-beside the identity of the module that defines it — and by the runtime build,
-so the type's own namespace is never walked. Route such mutable state through
-an `Input` or a custom `Resource`.
+paths read off it rather than the behavior behind them, and only the constants
+on those paths are folded, so patching a stdlib function or class it reaches
+(`json.dumps = other`) is not detected at all, warm or fresh; a stdlib type is
+pinned by its name anchor — its own name beside the identity of the module
+that defines it — and by the runtime build, so the type's own namespace is
+never walked. A path read dynamically — through `getattr` with a computed
+name — contributes no path, so the constant it lands on is folded only if the
+same body also names that path statically; a namespace write to what a purely
+dynamic read returns is not detected, warm or fresh. Route such mutable state
+through an `Input` or a custom `Resource`.
+
+Outside the standard library a captured module still contributes its
+module-level constants, so a package that stores a process id, an import
+timestamp or anything derived from them at module scope makes every identity
+that captures it process-varying. It is rare per module and not rare per
+distribution — a survey of a 765-module environment found three such modules,
+in three of its twenty-two distributions — and the rule is deliberately about
+where a module came from rather than what its constants hold, because a
+process id is an `int` and a timestamp a `float`. Route such state through an
+`Input` or a `Resource`.
 
 **6. LRU eviction under active dependencies.**
 If `max_query_nodes` is set low enough that an intermediate query is evicted while
@@ -931,9 +970,18 @@ files as a single reconcile from a fresh `Database` into an empty directory.
 Query identities, input policy digests, resource identities, and adapter
 digests each embed a common interpreter/build identity. Its components include
 the Python implementation, the full version tuple (including the prerelease
-level), the `-O` optimize flag, the platform, `os.name`, UTF-8 mode, the
-API/ABI tag, the multiarch/platform tag, the extension suffix, the build
-string, and the pointer width.
+level), the platform, `os.name`, the byte order, the API/ABI tag, the
+multiarch/platform tag, the extension suffix, the build string, the pointer
+width, and every field of `sys.flags` this interpreter exposes except
+`hash_randomization` — folded by name rather than by position, so a flag a
+future interpreter adds is folded the day it appears and no flag can shift the
+meaning of another's slot.
+
+Hash randomization is deliberately not among them. Two processes that leave
+`PYTHONHASHSEED` unset carry the same flag and different hash orders, so
+folding it would separate a `PYTHONHASHSEED=0` process from every other one
+without separating anything a query's answer can depend on. Route a dependence
+on hash order through an `Input` or a `Resource`.
 
 ## Thread Safety
 
@@ -1397,7 +1445,12 @@ fresh-recomputation equivalence, extended to the checkpoint path:
   and are pinned by the cross-mode suite in `tests/test_checkpoint_trust.py`.
 - `tests/test_checkpoint_cross_process.py` — a subprocess matrix that saves in
   one process and reloads in another, checking that identities and digests
-  line up across processes.
+  line up across processes, under differing hash seeds and at differing
+  install prefixes.
+- `tests/test_fingerprint_process_stability.py` — every shipped query and
+  resource handle is fingerprinted in three processes running under different
+  hash seeds and the digests compared, and no module the tree imports is left
+  carrying an identity that varies from one process to the next.
 - `tests/test_checkpoint_trust.py` — the adversarial store and trust suite:
   bit-flipped and truncated snapshot bytes, tampered and wrong-version
   manifests, all six ordered cross-mode load pairings, changed
