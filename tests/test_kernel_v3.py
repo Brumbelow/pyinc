@@ -1379,6 +1379,52 @@ def test_module_identity_observes_rewritten_bytes_when_stat_identity_collides(
     assert first != second
 
 
+def test_two_copies_of_one_module_at_different_paths_share_one_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The query is defined INSIDE the module source rather than in this test,
+    # and that is what makes the cell test anything. A module identity payload
+    # carries no path leaf at all, so the only leaf that can move when the same
+    # code is installed under a different prefix is the origin of the query's
+    # own code object -- and a query written here would carry this file's path
+    # in both halves and pass whatever the kernel folded. Hoisting the query
+    # out of the module source makes this cell vacuous.
+    module_name = "pyinc_install_prefix_module"
+    source = (
+        "from pyinc import Database, query\n"
+        "\n"
+        "\n"
+        '@query(key="install-prefix-identity")\n'
+        "def scaled(db: Database) -> int:\n"
+        "    return 21 * 2\n"
+    )
+    digests: list[str] = []
+    origins: list[Path] = []
+    # The two directory names differ in length, so a fold that kept any part of
+    # the absolute path -- its length included -- still separates the halves.
+    for directory_name in ("short", "a_considerably_longer_directory"):
+        root = tmp_path / directory_name
+        root.mkdir()
+        (root / f"{module_name}.py").write_text(source, encoding="utf-8")
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "dont_write_bytecode", True)
+            patch.syspath_prepend(str(root))
+            importlib.invalidate_caches()
+            try:
+                module = importlib.import_module(module_name)
+                origin = Path(cast(str, module.__file__))
+                assert origin.parent == root
+                origins.append(origin)
+                # Taken before the module is popped: a query holding a module
+                # that is no longer its live binding is refused outright.
+                digests.append(Database()._query_fingerprint(module.scaled))
+            finally:
+                sys.modules.pop(module_name, None)
+
+    assert origins[0] != origins[1]
+    assert digests[0] == digests[1]
+
+
 def test_the_module_stamp_folds_exactly_what_the_identity_folds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1012,9 +1012,9 @@ def test_code_constant_payload_covers_all_constant_kinds_and_rejection() -> None
         slice(1, 2, 1),
         test_code_constant_payload_covers_all_constant_kinds_and_rejection.__code__,
     )
-    assert all(db._code_constant_payload(value) for value in values)
+    assert all(db._code_constant_payload(value, __name__) for value in values)
     with pytest.raises(TypeError, match="Unsupported code constant"):
-        db._code_constant_payload(object())
+        db._code_constant_payload(object(), __name__)
 
 
 def test_policy_payload_covers_functions_builtins_descriptors_callable_state_and_owners() -> None:

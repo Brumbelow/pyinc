@@ -5154,7 +5154,7 @@ class Database:
             return (
                 fn.__module__,
                 fn.__qualname__,
-                self._code_definition_payload(fn.__code__),
+                self._code_definition_payload(fn.__code__, fn.__module__),
                 tuple(
                     self._captured_dependency_digest(
                         f"default[{index}]",
@@ -5285,7 +5285,7 @@ class Database:
                 "annotation-evaluator-v3",
                 evaluator.__module__,
                 evaluator.__qualname__,
-                self._code_definition_payload(evaluator.__code__),
+                self._code_definition_payload(evaluator.__code__, evaluator.__module__),
                 tuple(
                     (
                         scope,
@@ -5455,8 +5455,47 @@ class Database:
             f"Unsupported annotation value {type(value).__module__}.{type(value).__qualname__}."
         )
 
-    def _code_definition_payload(self, code: CodeType) -> Any:
-        """Return a refcount-independent, typed encoding of a code object."""
+    def _code_location_payload(self, filename: str, module_name: str | None) -> Any:
+        """Fold where a definition sits inside its package, not on this machine.
+
+        `co_filename` is the absolute path the source file had when the module
+        was imported, so folding it verbatim binds every identity to the
+        checkout, container or virtualenv the code was installed into: two
+        byte-identical trees at different prefixes then share no fingerprint at
+        all. What the fold needs is which file INSIDE ITS PACKAGE the code was
+        compiled from, and the import system already answers that without
+        touching the filesystem -- the defining module's dotted name encodes
+        its package position, namespace parents included, and the basename
+        separates `pkg/mod.py` from `pkg/mod/__init__.py`.
+
+        A `co_filename` that is not an absolute path is not a location at all
+        -- `<string>` for exec'd and dataclass-generated code, `<stdin>`,
+        `<frozen importlib._bootstrap>` -- and is folded verbatim, so generated
+        code can never take a real module's identity. An absolute path whose
+        basename is not the defining module's own file is code compiled with a
+        filename of someone's choosing; it is folded verbatim beside the module
+        name rather than being allowed to answer to that module's location.
+        """
+
+        if not os.path.isabs(filename):
+            return ("code-origin-verbatim-v4", filename)
+        module = sys.modules.get(module_name) if module_name is not None else None
+        module_file = vars(module).get("__file__") if module is not None else None
+        basename = os.path.basename(filename)
+        if isinstance(module_file, str) and os.path.basename(module_file) == basename:
+            return ("code-origin-module-v4", module_name, basename)
+        return ("code-origin-foreign-v4", module_name, filename)
+
+    def _code_definition_payload(self, code: CodeType, module_name: str | None) -> Any:
+        """Return a refcount-independent, typed encoding of a code object, in the
+        package position its defining module gives it.
+
+        `module_name` is that module's dotted name -- `fn.__module__` at the
+        outer call sites, inherited by every nested code constant -- and is what
+        `_code_location_payload` folds in place of the absolute source path; it
+        is required rather than defaulted so a call site that forgets to thread
+        it is a type error rather than a silent fallback to that path.
+        """
         return (
             "code-v3",
             code.co_argcount,
@@ -5466,20 +5505,20 @@ class Database:
             code.co_stacksize,
             code.co_flags,
             code.co_code,
-            tuple(self._code_constant_payload(value) for value in code.co_consts),
+            tuple(self._code_constant_payload(value, module_name) for value in code.co_consts),
             tuple(code.co_names),
             tuple(code.co_varnames),
             tuple(code.co_freevars),
             tuple(code.co_cellvars),
             code.co_exceptiontable,
             code.co_linetable,
-            code.co_filename,
+            self._code_location_payload(code.co_filename, module_name),
             code.co_name,
             code.co_qualname,
             code.co_firstlineno,
         )
 
-    def _code_constant_payload(self, value: Any) -> Any:
+    def _code_constant_payload(self, value: Any, module_name: str | None) -> Any:
         if value is None:
             return ("none",)
         if value is Ellipsis:
@@ -5505,10 +5544,10 @@ class Database:
         if isinstance(value, tuple):
             return (
                 "tuple",
-                tuple(self._code_constant_payload(item) for item in value),
+                tuple(self._code_constant_payload(item, module_name) for item in value),
             )
         if isinstance(value, frozenset):
-            items = tuple(self._code_constant_payload(item) for item in value)
+            items = tuple(self._code_constant_payload(item, module_name) for item in value)
             return (
                 "frozenset",
                 tuple(sorted(items, key=fingerprint_snapshot)),
@@ -5516,12 +5555,12 @@ class Database:
         if isinstance(value, slice):
             return (
                 "slice",
-                self._code_constant_payload(value.start),
-                self._code_constant_payload(value.stop),
-                self._code_constant_payload(value.step),
+                self._code_constant_payload(value.start, module_name),
+                self._code_constant_payload(value.stop, module_name),
+                self._code_constant_payload(value.step, module_name),
             )
         if isinstance(value, CodeType):
-            return ("code", self._code_definition_payload(value))
+            return ("code", self._code_definition_payload(value, module_name))
         raise TypeError(
             f"Unsupported code constant {type(value).__module__}.{type(value).__qualname__}."
         )
@@ -7125,7 +7164,7 @@ class Database:
             function.__module__,
             function.__qualname__,
             self._module_identity_payload(defining_module),
-            self._code_definition_payload(function.__code__),
+            self._code_definition_payload(function.__code__, function.__module__),
             tuple(
                 self._captured_dependency_digest(
                     f"default[{index}]",
