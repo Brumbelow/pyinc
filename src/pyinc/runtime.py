@@ -203,17 +203,34 @@ def _build_runtime_build_payload() -> tuple[Any, ...]:
         tuple(sys.version_info),
         (
             "flags",
-            tuple(sys.flags),
-            sys.flags.optimize,
-            sys.flags.debug,
-            sys.flags.dont_write_bytecode,
-            sys.flags.hash_randomization,
-            sys.flags.utf8_mode,
-            sys.flags.isolated,
-            sys.flags.no_site,
-            getattr(sys.flags, "safe_path", 0),
-            getattr(sys.flags, "int_max_str_digits", -1),
-            getattr(sys.flags, "gil", 1),
+            # `hash_randomization` is deliberately excluded. It separates a
+            # PYTHONHASHSEED=0 process from every other process while giving no
+            # protection against the hazard it looks like it covers: two
+            # default-seed processes carry the same flag and different hash
+            # orders, so folding it cannot separate a hash-order-dependent body
+            # from a stable one. All it buys is that a checkpoint written under
+            # a pinned seed -- CI, the benchmark harness, the documentation
+            # runner -- can never warm an ordinary process. Route hash-order
+            # dependence through an `Input` or a `Resource`.
+            #
+            # The names come from `dir(sys.flags)` rather than a literal list,
+            # so a flag a future interpreter adds is folded the day it appears;
+            # the three `structseq` metadata attributes and the two sequence
+            # methods are not flags and are excluded by name.
+            tuple(
+                (flag_name, getattr(sys.flags, flag_name))
+                for flag_name in sorted(dir(sys.flags))
+                if not flag_name.startswith("_")
+                and flag_name
+                not in {
+                    "count",
+                    "hash_randomization",
+                    "index",
+                    "n_fields",
+                    "n_sequence_fields",
+                    "n_unnamed_fields",
+                }
+            ),
             sys.platform,
             os.name,
             sys.byteorder,

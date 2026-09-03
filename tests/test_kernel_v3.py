@@ -560,7 +560,25 @@ def test_runtime_build_payload_covers_full_release_and_abi(
     flags = next(
         item for item in original if isinstance(item, tuple) and item and item[0] == "flags"
     )
-    assert tuple(sys.flags) in flags
+    folded_flags = next(item for item in flags if isinstance(item, tuple))
+    assert all(isinstance(pair, tuple) and len(pair) == 2 for pair in folded_flags)
+    # Computed from `dir(sys.flags)`, never from a literal: the field set grows
+    # with each CPython release, so a literal list would break on the next one.
+    excluded_flag_names = {
+        "count",
+        "hash_randomization",
+        "index",
+        "n_fields",
+        "n_sequence_fields",
+        "n_unnamed_fields",
+    }
+    expected_flag_names = {
+        name for name in dir(sys.flags) if not name.startswith("_")
+    } - excluded_flag_names
+    folded_flag_names = {name for name, _ in folded_flags}
+    assert folded_flag_names == expected_flag_names
+    assert "hash_randomization" not in folded_flag_names
+    assert all(value == getattr(sys.flags, name) for name, value in folded_flags)
     abi = next(item for item in original if isinstance(item, tuple) and item and item[0] == "abi")
     assert struct.calcsize("P") * 8 in abi
     assert sys.version in abi
