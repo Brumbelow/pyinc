@@ -163,9 +163,10 @@ def _child_env(module_dir: str, seed: str | None) -> dict[str, str]:
     ``TMPDIR`` and, on Windows, ``SYSTEMROOT``. Bytecode caching is off in every
     child: a ``.pyc`` records the absolute path of the source it was built from,
     which the install-path test below would otherwise measure instead of the
-    identity. A phase that wants no pinned seed *deletes* ``PYTHONHASHSEED``
-    rather than setting it to the empty string, which is read as a request for
-    randomization rather than as "unset" on some interpreters.
+    identity. A row that wants no pinned seed *deletes* ``PYTHONHASHSEED``
+    rather than setting it to the empty string: CPython reads an empty value as
+    absent, so the two are one configuration -- the one users actually run --
+    and setting it would only prove that they are read alike.
     """
 
     env = {

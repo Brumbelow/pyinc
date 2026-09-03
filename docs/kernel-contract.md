@@ -590,11 +590,12 @@ it. The mechanisms that earn this:
   not itself name a path. Two things still name one: a body that reads
   `__file__` or passes a path as an argument folds that path as it always did,
   and code whose compiled filename is not its defining module's own file — a
-  module imported without a `__file__`, or a sourceless `.pyc` whose recorded
-  filename is the source it was built from — falls back to folding that
-  filename verbatim beside the module name, so it can never take a real
-  module's location. Code compiled without a source file at all (`<string>`,
-  `<stdin>`) is folded verbatim for the same reason.
+  module imported without a `__file__`, a sourceless `.pyc` whose recorded
+  filename is the source it was built from, or a wrapper `functools.wraps`
+  gave another module's name — falls back to folding that filename verbatim
+  beside the module name, so it can never take a real module's location. Code
+  compiled without a source file at all (`<string>`, `<stdin>`) is folded
+  verbatim for the same reason.
 - **Inputs and dependency edges verify exactly.** Warmed records carry their
   real dependency edges; each input and sub-query dependency is re-checked
   against the live graph by digest before the record is trusted. Input policy
@@ -640,8 +641,12 @@ reached through statically resolvable attribute chains. A standard-library
 module — and any built-in or frozen module — contributes none of its namespace
 wholesale: the interpreter/build identity already pins the build those values
 come from, and some of them the interpreter rebuilds from one process to the
-next. What it contributes from that namespace is the constants on the attribute
-paths a capturing query's own code reads off it, folded beside the capture.
+next. A module counts as the standard library's when the interpreter installed
+it in one of its own library directories — plural, because some builds keep
+their extension modules in a directory beside the pure-Python ones rather than
+under them. What it contributes from that namespace is the constants on the
+attribute paths a capturing query's own code reads off it, folded beside the
+capture.
 Re-exported functions and submodules pin their defining modules transitively;
 dynamic access to a custom module is rejected when the behavior cannot be
 proven. A third-party version bump, a source-file edit, or a namespace write
@@ -690,16 +695,16 @@ Rebinding is the other half of that landing: when a class such a container
 carries stops being its defining module's live binding, a warm database still
 serves the stored answer while a fresh computation refuses loudly instead of
 moving identity. And a captured standard-library module folds the names of the
-paths read off it rather than the behavior behind them, and only the constants
-on those paths are folded, so patching a stdlib function or class it reaches
-(`json.dumps = other`) is not detected at all, warm or fresh; a stdlib type is
-pinned by its name anchor — its own name beside the identity of the module
-that defines it — and by the runtime build, so the type's own namespace is
-never walked. A path read dynamically — through `getattr` with a computed
-name — contributes no path, so the constant it lands on is folded only if the
-same body also names that path statically; a namespace write to what a purely
-dynamic read returns is not detected, warm or fresh. Route such mutable state
-through an `Input` or a custom `Resource`.
+paths read off it rather than the behavior behind them — of what those paths
+land on, only the constants are folded — so patching a stdlib function or
+class it reaches (`json.dumps = other`) is not detected at all, warm or fresh;
+a stdlib type is pinned by its name anchor — its own name beside the identity
+of the module that defines it — and by the runtime build, so the type's own
+namespace is never walked. A path read dynamically — through `getattr` with
+a computed name — contributes no path, so the constant it lands on is folded
+only if the same body also names that path statically; a namespace write to
+what a purely dynamic read returns is not detected, warm or fresh. Route such
+mutable state through an `Input` or a custom `Resource`.
 
 Outside the standard library a captured module still contributes its
 module-level constants, so a package that stores a process id, an import

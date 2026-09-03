@@ -125,9 +125,11 @@ _DEFAULT_SEMANTIC_EQUALITY_VERSION = 1
 _MISSING_SNAPSHOT = object()
 _EMPTY_CELL_OBSERVATION = object()
 _UNBOUND_GLOBAL_OBSERVATION = object()
-# Answer for a captured module attribute that has vanished. No target a memo
-# recorded can be this object, so the guard falls through to the recompute that
-# reports the missing attribute.
+# Answer for a captured module attribute that is not bound. One object, so the
+# guard's identity comparison is stable while the path stays empty and fails
+# the moment anything is bound there: a chain the accessed-path fold found
+# empty records this, and a chain whose attribute later vanishes can match no
+# target a memo recorded from a real value.
 _MISSING_MODULE_ATTRIBUTE = object()
 # Not a hexadecimal digest, so it can never equal a stored one and always
 # forces the memo guard to fall through to a full recompute.
@@ -252,23 +254,53 @@ def _build_runtime_build_payload() -> tuple[Any, ...]:
 _RUNTIME_BUILD_PAYLOAD = _build_runtime_build_payload()
 
 
-def _stdlib_directory_prefix() -> str:
-    """The directory this interpreter's standard library was installed in.
+def _stdlib_directory_prefixes() -> tuple[str, ...]:
+    """The directories this interpreter's standard library was installed in.
 
-    Returned with a trailing separator, so a prefix test against it cannot
-    match a sibling directory whose name merely begins the same way.
-    `sysconfig` answers for every ordinary installation; the directory holding
-    `os` is the fallback for an interpreter that reports no `stdlib` path.
+    Plural, because the library is not one directory on every platform.
+    `sysconfig`'s `stdlib` and `platstdlib` answer for the pure-Python and the
+    platform-specific halves of an ordinary installation. A Windows build keeps
+    its extension modules -- `_ctypes.pyd` and about twenty siblings -- in
+    `DLLs`, a sibling of `Lib` that no `sysconfig` path names, and an
+    embeddable build imports the whole pure-Python half out of
+    `python3XY.zip`; both are named by construction. Naming them on every
+    platform costs nothing: a directory the interpreter does not use is a
+    prefix no origin begins with.
+
+    Each is returned with a trailing separator, so a prefix test against it
+    cannot match a sibling directory whose name merely begins the same way. The
+    directory holding `os` is the fallback for an interpreter that reports no
+    path at all.
     """
 
-    directory = sysconfig.get_path("stdlib") or os.path.dirname(
-        getattr(os, "__file__", "") or ""
+    reported = [
+        directory
+        for directory in (
+            sysconfig.get_path("stdlib"),
+            sysconfig.get_path("platstdlib"),
+        )
+        if directory
+    ]
+    if not reported:
+        fallback = os.path.dirname(getattr(os, "__file__", "") or "")
+        if not fallback:
+            # Nothing to compare against: keep the narrower answer, so a module
+            # is treated as the caller's rather than silently losing its
+            # constants.
+            return ("\x00 no stdlib directory",)
+        reported.append(fallback)
+    reported.append(os.path.join(sys.base_exec_prefix, "DLLs"))
+    reported.append(
+        os.path.join(
+            sys.base_prefix,
+            f"python{sys.version_info.major}{sys.version_info.minor}.zip",
+        )
     )
-    if not directory:
-        # Nothing to compare against: keep the narrower answer, so a module is
-        # treated as the caller's rather than silently losing its constants.
-        return "\x00 no stdlib directory"
-    return os.path.join(os.path.abspath(directory), "")
+    return tuple(
+        dict.fromkeys(
+            os.path.join(os.path.abspath(directory), "") for directory in reported
+        )
+    )
 
 
 _REFLECTIVE_NAMESPACE_BUILTINS = frozenset({"eval", "exec", "globals", "locals", "vars"})
@@ -1112,8 +1144,8 @@ class Database:
     # Held here, not as a module constant: `_module_constants_payload` folds
     # this module's own module-level bindings when a query captures it, and an
     # installation path has no business inside a fingerprint. A class attribute
-    # is skipped by that fold, and this value is only ever compared against.
-    _STDLIB_DIRECTORY_PREFIX: ClassVar[str] = _stdlib_directory_prefix()
+    # is skipped by that fold, and these values are only ever compared against.
+    _STDLIB_DIRECTORY_PREFIXES: ClassVar[tuple[str, ...]] = _stdlib_directory_prefixes()
 
     def __init__(
         self,
@@ -6939,12 +6971,24 @@ class Database:
         chain and compares the target by identity. That is exact for these
         values -- every shape the constant payload accepts is immutable, so the
         same object always folds to the same payload, and the guard can only be
-        too strict, never too lax.
+        too strict, never too lax. A path that names nothing yet is recorded
+        too, against the sentinel the resolver answers with: a constant bound
+        there after the identity was built moves a fresh fold, and this is the
+        only landing that lets a memoized one follow.
         """
 
         folded: list[tuple[tuple[str, ...], Any]] = []
         for path in paths:
             target = self._resolve_module_path_target(module, path)
+            if target is _MISSING_MODULE_ATTRIBUTE:
+                # Nothing to fold, but the memo must still learn the path was
+                # empty: a constant bound there later moves a fresh fold, and
+                # the guard's identity check against the sentinel is what sees
+                # it. Without the recording the module is pinned, the stamp
+                # carries no constants, and the stored digest answers a
+                # question a fresh database answers differently.
+                self._record_module_path_target(module, path, target)
+                continue
             try:
                 payload = self._module_constant_payload(target, set())
             except UnsupportedValueError:
@@ -7286,13 +7330,17 @@ class Database:
         """True for a module the runtime build identity already pins.
 
         A built-in or frozen module has no source file of its own, and a module
-        installed with the standard library arrives with the interpreter: the
-        runtime build payload every fingerprint folds already names the
-        implementation, the version and the flags such a module came with, so
-        its namespace tells an identity nothing the build identity has not said
-        -- while carrying values the interpreter rebuilds per process. A
-        distribution installed beside the standard library is the caller's code
-        however deep it sits, which is what the last clause excludes.
+        the interpreter installed in one of its own library directories arrives
+        with the interpreter: the runtime build payload every fingerprint folds
+        already names the implementation, the version and the flags such a
+        module came with, so its namespace tells an identity nothing the build
+        identity has not said -- while carrying values the interpreter rebuilds
+        per process. The directories are plural because the library is: a
+        Windows build keeps its extension modules beside the pure-Python ones
+        rather than under them, and a module of the standard library's is one
+        wherever the interpreter put it. A distribution installed beside the
+        standard library is the caller's code however deep it sits, which is
+        what the last clause excludes.
         """
 
         origin = specification.origin
@@ -7310,7 +7358,10 @@ class Database:
         # therefore run on a normalised copy; `os.path.normcase` is the identity
         # on POSIX, so no behaviour moves there.
         normalised = os.path.normcase(origin.replace(os.altsep or os.sep, os.sep))
-        if not normalised.startswith(os.path.normcase(Database._STDLIB_DIRECTORY_PREFIX)):
+        if not any(
+            normalised.startswith(os.path.normcase(prefix))
+            for prefix in Database._STDLIB_DIRECTORY_PREFIXES
+        ):
             return False
         # A distribution installed into the base interpreter's own
         # site-packages sits UNDER the standard library's directory and is
@@ -7509,8 +7560,10 @@ class Database:
 
         Walks exactly as `_captured_module_path_payload` does: attribute by
         attribute through module namespaces, stopping at the first non-module
-        value (whose payload is what the fingerprint folded). A vanished
-        attribute resolves to a sentinel no recorded target can be.
+        value (whose payload is what the fingerprint folded). An attribute that
+        is not bound resolves to a sentinel, which is also what a path the
+        accessed-path fold found empty records: the guard then holds while the
+        path stays empty and fails as soon as a value is bound there.
         """
 
         current: Any = module

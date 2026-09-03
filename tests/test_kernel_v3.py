@@ -1117,6 +1117,42 @@ def test_dynamic_capture_of_a_caller_module_named_for_the_stdlib_is_refused(
             sys.modules["graphlib"] = saved
 
 
+def test_a_stdlib_module_under_any_library_directory_is_runtime_pinned() -> None:
+    # The standard library is not one directory. A Windows build keeps
+    # `_ctypes.pyd` and about twenty sibling extension modules in `DLLs`, a
+    # sibling of `Lib` rather than a child of it; an embeddable build imports
+    # the whole pure-Python half out of `python3XY.zip`; and `sysconfig` names
+    # a second, platform-specific directory wherever the two halves differ. A
+    # module classified as the caller's there would have its whole namespace
+    # folded, and `_ctypes` publishes process-varying addresses at module
+    # scope. The directories are named rather than discovered on disk, so
+    # every runner exercises every arm whatever its own layout is.
+    def _spec(*parts: str) -> importlib.machinery.ModuleSpec:
+        return importlib.machinery.ModuleSpec("_ctypes", None, origin=os.path.join(*parts))
+
+    module = ModuleType("_ctypes")
+    directories = (
+        sysconfig.get_path("stdlib"),
+        sysconfig.get_path("platstdlib"),
+        os.path.join(sys.base_exec_prefix, "DLLs"),
+        os.path.join(
+            sys.base_prefix, f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+        ),
+    )
+    answers = {
+        directory: (
+            Database._is_runtime_pinned_module(module, _spec(directory, "_ctypes.pyd")),
+            # A distribution installed beside the standard library is still the
+            # caller's code however deep under one of these it sits.
+            Database._is_runtime_pinned_module(
+                module, _spec(directory, "site-packages", "vendor", "_ctypes.pyd")
+            ),
+        )
+        for directory in directories
+    }
+    assert answers == dict.fromkeys(directories, (True, False))
+
+
 def test_dynamic_module_cannot_spoof_builtin_or_file_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1423,6 +1459,19 @@ def test_two_copies_of_one_module_at_different_paths_share_one_identity(
 
     assert origins[0] != origins[1]
     assert digests[0] == digests[1]
+
+
+def test_code_compiled_under_a_borrowed_filename_never_takes_a_module_location() -> None:
+    db = Database()
+    # The third arm of the location fold, which nothing this tree ships
+    # reaches: an absolute compiled filename whose basename is not the named
+    # module's own file. It is folded verbatim beside the module name, and the
+    # property that matters is what it must NOT do -- a regression that
+    # answered with the module's own location would let code compiled under a
+    # borrowed filename take a real module's identity.
+    borrowed = db._code_location_payload("/totally/elsewhere/other.py", "pyinc.runtime")
+    assert borrowed[0] == "code-origin-foreign-v4"
+    assert borrowed != db._code_location_payload(runtime_module.__file__, "pyinc.runtime")
 
 
 def test_the_module_stamp_folds_exactly_what_the_identity_folds(
@@ -3007,6 +3056,32 @@ def test_constants_outside_a_captured_stdlib_module_move_no_fingerprint(
     memoized, truth = _memo_and_truth(db, letters)
     assert memoized == truth == before
     assert Database()._query_fingerprint(letters) == before
+
+
+def test_a_stdlib_constant_bound_after_the_fingerprint_is_seen_warm_and_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @query(key="memo-stdlib-later-bound-constant")
+    def guarded(db: Database) -> int:
+        try:
+            return cast(int, string.PYINC_LATER_CONSTANT)  # type: ignore[attr-defined]
+        except AttributeError:
+            return -1
+
+    db = Database()
+    assert db.get(guarded) == -1
+    before = db._query_fingerprint(guarded)
+    # The compatibility idiom: a body that names an attribute the standard
+    # library may not have yet. The path was empty when the identity was built,
+    # so nothing was folded for it -- and a module the runtime build identity
+    # pins carries no constants in its stamp either, which leaves the recorded
+    # landing as the only thing that can see a constant bound there afterwards.
+    # Without it the memo answers -1 while a fresh database answers 7.
+    monkeypatch.setattr(string, "PYINC_LATER_CONSTANT", 7, raising=False)
+    memoized, truth = _memo_and_truth(db, guarded)
+    assert memoized == truth
+    assert memoized != before
+    assert db.get(guarded) == 7
 
 
 def test_memoized_fingerprint_reuses_the_memo_for_a_stdlib_accessed_path_capture() -> None:

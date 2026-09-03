@@ -51,9 +51,10 @@ def _child_env(seed: str | None) -> dict[str, str]:
     child: a ``.pyc`` records the absolute path of the source it was built from,
     which is exactly the kind of per-installation value these cells are here to
     prove is not folded. A row that wants no pinned seed *deletes*
-    ``PYTHONHASHSEED`` rather than setting it to the empty string -- unset is
-    the configuration users actually run, and an empty string is read as a
-    request for randomization rather than as "unset" on some interpreters.
+    ``PYTHONHASHSEED`` rather than setting it to the empty string: CPython
+    reads an empty value as absent, so the two are one configuration -- the one
+    users actually run -- and setting it would only prove that they are read
+    alike.
     """
 
     env = {
@@ -363,10 +364,16 @@ def test_every_shipped_identity_is_the_same_in_every_process(tmp_path: Path) -> 
         runs.append(_run([sys.executable, str(script)], _child_env(seed)))
     elapsed = time.perf_counter() - started
 
-    keys = set().union(*(set(run) for run in runs))
-    assert keys == set(_SHIPPED_IDENTITY_INVENTORY), (
-        "the fixture child and the inventory disagree about the population"
-    )
+    keys = set(_SHIPPED_IDENTITY_INVENTORY)
+    for seed, run in zip(seeds, runs, strict=True):
+        # Per child rather than over the union of the three: a key one child
+        # never printed would otherwise reach the disagreement check below and
+        # be reported as an identity that differs between processes, when what
+        # happened is that the population drifted.
+        assert set(run) == keys, (
+            f"the fixture child at seed {seed!r} and the inventory disagree "
+            "about the population"
+        )
 
     raised = sorted(
         key

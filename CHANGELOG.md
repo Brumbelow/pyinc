@@ -1101,7 +1101,8 @@ decided at release time.
 - The kernel contract says what a captured standard-library module contributes
   to an identity: only the constants on the attribute paths a query's own code
   names statically, and a path read dynamically contributes none, so a
-  namespace write to what such a read returns is not detected, warm or fresh.
+  namespace write to what a purely dynamic read returns is not detected, warm
+  or fresh.
   It says what the code encoding pins about location — where a definition sits
   inside its package rather than where the package sits on the machine — and
   which two shapes still name a path. It states the rule the interpreter build
