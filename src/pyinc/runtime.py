@@ -252,6 +252,25 @@ def _build_runtime_build_payload() -> tuple[Any, ...]:
 _RUNTIME_BUILD_PAYLOAD = _build_runtime_build_payload()
 
 
+def _stdlib_directory_prefix() -> str:
+    """The directory this interpreter's standard library was installed in.
+
+    Returned with a trailing separator, so a prefix test against it cannot
+    match a sibling directory whose name merely begins the same way.
+    `sysconfig` answers for every ordinary installation; the directory holding
+    `os` is the fallback for an interpreter that reports no `stdlib` path.
+    """
+
+    directory = sysconfig.get_path("stdlib") or os.path.dirname(
+        getattr(os, "__file__", "") or ""
+    )
+    if not directory:
+        # Nothing to compare against: keep the narrower answer, so a module is
+        # treated as the caller's rather than silently losing its constants.
+        return "\x00 no stdlib directory"
+    return os.path.join(os.path.abspath(directory), "")
+
+
 _REFLECTIVE_NAMESPACE_BUILTINS = frozenset({"eval", "exec", "globals", "locals", "vars"})
 _REFLECTIVE_ATTRIBUTE_BUILTINS = frozenset({"delattr", "getattr", "setattr"})
 
@@ -1090,6 +1109,11 @@ class Database:
         | _QUERY_HANDLE_SIBLING_NAMES
         | frozenset({"__doc__", "__module__", "__name__", "__qualname__", "__type_params__"})
     )
+    # Held here, not as a module constant: `_module_constants_payload` folds
+    # this module's own module-level bindings when a query captures it, and an
+    # installation path has no business inside a fingerprint. A class attribute
+    # is skipped by that fold, and this value is only ever compared against.
+    _STDLIB_DIRECTORY_PREFIX: ClassVar[str] = _stdlib_directory_prefix()
 
     def __init__(
         self,
@@ -4566,9 +4590,10 @@ class Database:
 
         A module is covered by three memo arms instead, because this walk never
         enters one: `_module_observation_stamp` re-derives its file bytes,
-        import metadata and module-level constants; each statically accessed
-        attribute chain is re-resolved and its target compared by identity; and
-        the definitions behind the chain landings whose payloads read one live
+        import metadata and, outside the runtime-pinned modules, its
+        module-level constants; each statically accessed attribute chain is
+        re-resolved and its target compared by identity; and the definitions
+        behind the chain landings whose payloads read one live
         -- functions, wraps-decorated callable objects, query handles, inputs,
         type aliases, type parameters and resources, whose globals, defaults,
         policies, evaluators, instance and handle state the payload folds live
@@ -6807,17 +6832,26 @@ class Database:
         owner: FunctionType,
         seen_functions: builtins.set[int],
     ) -> Any:
-        """Pin the statically accessed behavior behind a captured module."""
+        """Pin the statically accessed behavior behind a captured module, and
+        — for a module the runtime build identity pins — the constants those
+        accesses land on.
+        """
 
         base_identity = self._module_identity_payload(module)
         paths, dynamic = self._module_access_paths(owner, capture_name)
-        if module.__name__.partition(".")[0] in sys.stdlib_module_names:
+        # `_module_identity_payload` has already refused this module unless its
+        # `__spec__` is a `ModuleSpec`, so the subscript cannot raise. One
+        # predicate decides which branch a module takes and whether its
+        # constants are folded, so the two answers cannot disagree.
+        specification = vars(module)["__spec__"]
+        if self._is_runtime_pinned_module(module, specification):
             return (
-                "captured-stdlib-module-v3",
+                "captured-stdlib-module-v4",
                 module.__name__,
                 base_identity,
                 paths,
                 dynamic,
+                self._accessed_path_constants_payload(module, paths),
             )
         if dynamic or not paths:
             raise UnsupportedValueError(
@@ -6848,6 +6882,37 @@ class Database:
             )
         finally:
             self._module_capture_stack.reset(token)
+
+    def _accessed_path_constants_payload(
+        self, module: ModuleType, paths: tuple[tuple[str, ...], ...]
+    ) -> tuple[tuple[tuple[str, ...], Any], ...]:
+        """Fold the constants a captured standard-library module's accessed
+        paths name.
+
+        The identity payload no longer folds a runtime-pinned namespace
+        wholesale, so a constant the query's own code names would otherwise
+        stop moving the fingerprint. Only the paths `_module_access_paths`
+        already computed are read, and only values the constant payload folds
+        are kept: a function or a class landing is pinned by name anchor and
+        runtime build, exactly as before.
+
+        Each folded landing is recorded for the memo, which re-resolves the
+        chain and compares the target by identity. That is exact for these
+        values -- every shape the constant payload accepts is immutable, so the
+        same object always folds to the same payload, and the guard can only be
+        too strict, never too lax.
+        """
+
+        folded: list[tuple[tuple[str, ...], Any]] = []
+        for path in paths:
+            target = self._resolve_module_path_target(module, path)
+            try:
+                payload = self._module_constant_payload(target, set())
+            except UnsupportedValueError:
+                continue
+            self._record_module_path_target(module, path, target)
+            folded.append((path, payload))
+        return tuple(folded)
 
     def _module_access_paths(
         self, owner: FunctionType, capture_name: str
@@ -7175,6 +7240,48 @@ class Database:
             tuple(anchors),
         )
 
+    @staticmethod
+    def _is_runtime_pinned_module(
+        module: ModuleType, specification: importlib.machinery.ModuleSpec
+    ) -> bool:
+        """True for a module the runtime build identity already pins.
+
+        A built-in or frozen module has no source file of its own, and a module
+        installed with the standard library arrives with the interpreter: the
+        runtime build payload every fingerprint folds already names the
+        implementation, the version and the flags such a module came with, so
+        its namespace tells an identity nothing the build identity has not said
+        -- while carrying values the interpreter rebuilds per process. A
+        distribution installed beside the standard library is the caller's code
+        however deep it sits, which is what the last clause excludes.
+        """
+
+        origin = specification.origin
+        if origin in {"built-in", "frozen"}:
+            return True
+        if module.__name__.partition(".")[0] not in sys.stdlib_module_names:
+            return False
+        if not isinstance(origin, str):
+            return False
+        # On Windows an origin may carry `/` for `os.sep` -- the path finder
+        # produces one whenever the `sys.path` entry it joined was spelled that
+        # way -- and may differ in case from `sysconfig`'s answer. Either
+        # difference would otherwise put a third-party module on the pinned
+        # side, where a namespace write to it stops being detected. Both tests
+        # therefore run on a normalised copy; `os.path.normcase` is the identity
+        # on POSIX, so no behaviour moves there.
+        normalised = os.path.normcase(origin.replace(os.altsep or os.sep, os.sep))
+        if not normalised.startswith(os.path.normcase(Database._STDLIB_DIRECTORY_PREFIX)):
+            return False
+        # A distribution installed into the base interpreter's own
+        # site-packages sits UNDER the standard library's directory and is
+        # still the caller's code. Naming both spellings keeps the test the
+        # same on every platform.
+        return not any(
+            f"{os.sep}{directory}{os.sep}" in normalised
+            for directory in ("site-packages", "dist-packages")
+        )
+
     def _module_identity_payload(self, module: ModuleType) -> Any:
         """Compute a structural digest for a captured module.
 
@@ -7189,9 +7296,13 @@ class Database:
           modules are pinned through the runtime-build identity;
         * a sorted `__all__` tuple when declared, capturing the module's
           publicly promised surface;
-        * the module-level stable constants, read live by
+        * outside the modules the runtime build identity pins, the
+          module-level stable constants, read live by
           `_module_constants_payload` — so a namespace write to one of them
-          moves this payload without any file changing.
+          moves this payload without any file changing. A module that identity
+          pins contributes none of them here; the constants a capturing
+          query's own code reads off such a module are folded beside the
+          capture, by `_accessed_path_constants_payload`.
 
         The behavior behind statically accessed attribute chains is folded
         elsewhere, by `_captured_module_path_payload`. Before reusing a digest
@@ -7304,7 +7415,15 @@ class Database:
         else:
             raise UnsupportedValueError(f"Captured module {module_name!r} has an unsafe __all__.")
 
-        constants_payload = self._module_constants_payload(module)
+        # Elided for the modules the runtime build identity already pins: a
+        # standard-library namespace holds values CPython rebuilds per process
+        # -- `tokenize.ContStr` and its seven siblings are regexes joined from
+        # a set -- so folding them would make this payload process-varying.
+        constants_payload = (
+            ()
+            if self._is_runtime_pinned_module(module, specification)
+            else self._module_constants_payload(module)
+        )
 
         if origin in {"built-in", "frozen"}:
             return (
@@ -7369,9 +7488,9 @@ class Database:
         """Return the invalidation token for a memoized module identity.
 
         Re-derives what `_module_identity_payload` folded: import metadata,
-        `__version__`, `__all__`, the file bytes, and the module-level
-        constants. Anything that payload reads and this does not would be a
-        change the memo could hide.
+        `__version__`, `__all__`, the file bytes, and, outside the modules the
+        runtime build identity pins, the module-level constants. Anything that
+        payload reads and this does not would be a change the memo could hide.
         """
 
         namespace = vars(module)
@@ -7428,10 +7547,16 @@ class Database:
             version_payload,
             all_payload,
             source_observation,
-            # The identity payload folds these live for every captured module,
-            # including the stdlib branch, and a namespace write moves them
-            # without touching the file bytes above.
-            self._module_constants_payload(module),
+            # Guarded by the same expression `_module_identity_payload` uses,
+            # so the stamp folds exactly what the identity folded: nothing for
+            # a module the runtime build identity pins, and every module-level
+            # constant otherwise, which a namespace write moves without
+            # touching the file bytes above.
+            (
+                ()
+                if self._is_runtime_pinned_module(module, specification)
+                else self._module_constants_payload(module)
+            ),
         )
 
     def _module_constants_payload(self, module: ModuleType) -> tuple[tuple[str, Any], ...]:
@@ -7443,6 +7568,11 @@ class Database:
         skipped rather than refused: functions, modules and types are reached
         through their own payloads, and anything else the constant payload
         cannot fold is left to whichever chain reaches it.
+
+        A runtime-pinned module's constants on an owner's accessed paths are
+        folded separately, by `_accessed_path_constants_payload`, and
+        re-checked by the memo's chain arm, which re-resolves each landing and
+        compares it by identity rather than re-deriving it through this read.
         """
 
         stable_constants: list[tuple[str, Any]] = []

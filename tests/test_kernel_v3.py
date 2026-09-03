@@ -1057,6 +1057,50 @@ def test_dynamic_module_without_stable_source_is_rejected(
         Database().get(answer)
 
 
+_SHADOW_ATTRIBUTE = "SETTING"
+
+
+def test_dynamic_capture_of_a_caller_module_named_for_the_stdlib_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A module of the caller's that answers to a standard-library name is the
+    # caller's code whatever the standard library calls it. The runtime build
+    # identity pins nothing about it, so the kernel refuses to fingerprint a
+    # dynamic read of it -- exactly as it does for any other module of theirs
+    # -- rather than pinning nothing and serving a warm answer a fresh
+    # database would contradict.
+    #
+    # The read has to be dynamic for this to witness anything. A static
+    # `module.SETTING` leaves an access path, and the constants on an accessed
+    # path are folded even when the module is misclassified as runtime-pinned,
+    # so a static variant of this cell stays green under the mutation that
+    # reverts the predicate to a name-only test.
+    (tmp_path / "graphlib.py").write_text(f"{_SHADOW_ATTRIBUTE} = 11\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    saved = sys.modules.pop("graphlib", None)
+    try:
+        module = importlib.import_module("graphlib")
+        # Before anything else: a cell that reached the real graphlib would be
+        # asking a different question and would answer it wrongly.
+        assert Path(cast(str, module.__file__)).parent == tmp_path
+
+        @query(key="shadow-stdlib-dynamic-capture")
+        def setting(db: Database) -> int:
+            return cast(int, getattr(module, _SHADOW_ATTRIBUTE))
+
+        with pytest.raises(UnsupportedValueError):
+            Database()._query_fingerprint(setting)
+    finally:
+        # Popping is the load-bearing half: graphlib is imported by neither
+        # pyinc nor the harness, so there is usually nothing to restore and a
+        # restore-only teardown would leave the planted module bound for every
+        # later test in this worker.
+        sys.modules.pop("graphlib", None)
+        if saved is not None:
+            sys.modules["graphlib"] = saved
+
+
 def test_dynamic_module_cannot_spoof_builtin_or_file_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
