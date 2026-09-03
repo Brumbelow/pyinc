@@ -156,6 +156,30 @@ def _run(args: list[str], env: dict[str, str]) -> dict[str, Any]:
     return payload
 
 
+def _child_env(module_dir: str, seed: str | None) -> dict[str, str]:
+    """A child environment whose hash seed is an axis the caller chooses.
+
+    ``{**os.environ, ...}`` rather than a bare dict, so the child still inherits
+    ``TMPDIR`` and, on Windows, ``SYSTEMROOT``. Bytecode caching is off in every
+    child: a ``.pyc`` records the absolute path of the source it was built from,
+    which the install-path test below would otherwise measure instead of the
+    identity. A phase that wants no pinned seed *deletes* ``PYTHONHASHSEED``
+    rather than setting it to the empty string, which is read as a request for
+    randomization rather than as "unset" on some interpreters.
+    """
+
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([_src_dir(), module_dir]),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    if seed is None:
+        env.pop("PYTHONHASHSEED", None)
+    else:
+        env["PYTHONHASHSEED"] = seed
+    return env
+
+
 @dataclass
 class CrossProcessEnv:
     python: str
@@ -483,3 +507,316 @@ def test_dep_query_behind_wrapped_class_reexecutes_across_processes(tmp_path: Pa
     loaded = _run([sys.executable, str(script), str(store_dir), "load"], env)
     assert loaded["results"] == [9, 8]
     assert loaded["recomputes"] == ["reused", "executed"]
+
+
+# The two fixtures below both ask the shipped source-text query directly and
+# again through a caller's own queries stacked above it. Every caller reaches the
+# shipped query and the shipped source resource as OBJECTS -- imported by name,
+# never as ``python_source.source_text`` or ``python_source._FILES``. That is
+# load-bearing: a module attribute in the captured chain is something the warm
+# path cannot pin, so the query below it would be executed to verify it while
+# every caller above still reported a reuse, and the row would be measuring the
+# warm gate rather than the identity it is here to hold open.
+SEEDED_FIXTURE_SCRIPT = '''\
+"""Cross-process checkpoint fixture for the hash-seed axis. Everything is
+defined at module level so identities are reproducible across processes."""
+
+import json
+import sys
+from pathlib import Path
+
+from pyinc import Database, FileSystemArtifactStore, query
+from pyinc.integrations.python_source import _FILES, source_text
+
+store_dir = sys.argv[1]
+phase = sys.argv[2]
+
+root_dir = Path(store_dir).parent
+source_path = str(root_dir / "sample.py")
+key_path = root_dir / "seeded.key"
+
+
+@query
+def caller_leaf(db, path):
+    return len(source_text(db, path)) + len(_FILES.read(db, path)[0])
+
+
+@query
+def caller_parent(db, path):
+    return caller_leaf(db, path)
+
+
+@query
+def caller_grandparent(db, path):
+    return caller_parent(db, path) + 1
+
+
+ROOTS = (
+    ("shipped", source_text),
+    ("parent", caller_parent),
+    ("grandparent", caller_grandparent),
+)
+
+
+def main():
+    db = Database(store=FileSystemArtifactStore(store_dir))
+    if phase == "save":
+        results = [db.get(root, source_path) for _, root in ROOTS]
+        key_path.write_text(db.save_checkpoint(), encoding="utf-8")
+        print(json.dumps({"results": results}))
+        return
+
+    db.load_checkpoint(key_path.read_text(encoding="utf-8"))
+    results = [db.get(root, source_path) for _, root in ROOTS]
+    recomputes = {
+        name: db.inspect(root, source_path).last_recompute for name, root in ROOTS
+    }
+    print(
+        json.dumps(
+            {
+                "results": results,
+                "recomputes": recomputes,
+                "executions": db.statistics().query_executions,
+            }
+        )
+    )
+
+
+main()
+'''
+
+CROSSPATH_HELPER_SOURCE = """\
+from pyinc import query
+from pyinc.integrations.python_source import _FILES, source_text
+
+
+@query
+def caller_leaf(db, path):
+    return len(source_text(db, path)) + len(_FILES.read(db, path)[0])
+
+
+@query
+def caller_root(db, path):
+    return caller_leaf(db, path) + 1
+"""
+
+CROSSPATH_FIXTURE_SCRIPT = '''\
+"""Cross-process checkpoint fixture for the install-path axis. The caller's
+module is imported by name, so each phase picks up whichever byte-identical copy
+its own PYTHONPATH names."""
+
+import json
+import sys
+from pathlib import Path
+
+from pyinc import Database, FileSystemArtifactStore
+from pyinc.integrations.python_source import source_text
+
+from cxp_crosspath_caller import caller_root
+
+store_dir = sys.argv[1]
+phase = sys.argv[2]
+source_path = sys.argv[3]
+
+key_path = Path(store_dir).parent / "crosspath.key"
+
+ROOTS = (("shipped", source_text), ("root", caller_root))
+
+
+def main():
+    db = Database(store=FileSystemArtifactStore(store_dir))
+    if phase == "save":
+        results = [db.get(root, source_path) for _, root in ROOTS]
+        key_path.write_text(db.save_checkpoint(), encoding="utf-8")
+        print(json.dumps({"results": results}))
+        return
+
+    db.load_checkpoint(key_path.read_text(encoding="utf-8"))
+    results = [db.get(root, source_path) for _, root in ROOTS]
+    recomputes = {
+        name: db.inspect(root, source_path).last_recompute for name, root in ROOTS
+    }
+    print(
+        json.dumps(
+            {
+                "results": results,
+                "recomputes": recomputes,
+                "executions": db.statistics().query_executions,
+            }
+        )
+    )
+
+
+main()
+'''
+
+# The file the roots analyse. Its content never moves between the two phases, so
+# it is never the axis; only the seed and the install prefix are.
+SAMPLE_SOURCE = '"""sample"""\n\n\ndef f(x):\n    return x + 1\n'
+
+SEEDED_ROOTS = ("shipped", "parent", "grandparent")
+CROSSPATH_ROOTS = ("shipped", "root")
+
+
+def _assert_warm_across_processes(
+    saved: dict[str, Any],
+    loaded: dict[str, Any],
+    roots: tuple[str, ...],
+    label: str,
+) -> None:
+    """Every root answered from the checkpoint, and nothing executed underneath.
+
+    The executed-query count is asserted as well as the decision because
+    ``last_recompute`` alone under-reports the work: a dependency the warm path
+    cannot pin is executed to verify it, and the caller above it still reports a
+    reuse. A row that only read the decision would pass with real work happening.
+    """
+
+    assert loaded["results"] == saved["results"], label
+    assert loaded["recomputes"] == {name: "reused" for name in roots}, label
+    assert loaded["executions"] == 0, label
+
+
+def _seeded_round_trip(
+    tmp_path: Path, save_seed: str | None, load_seed: str | None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Save under one hash seed and load under another, same tree, same paths."""
+
+    script = tmp_path / "seeded_fixture.py"
+    script.write_text(SEEDED_FIXTURE_SCRIPT, encoding="utf-8")
+    (tmp_path / "sample.py").write_text(SAMPLE_SOURCE, encoding="utf-8")
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    saved = _run(
+        [sys.executable, str(script), str(store_dir), "save"],
+        _child_env(str(tmp_path), save_seed),
+    )
+    loaded = _run(
+        [sys.executable, str(script), str(store_dir), "load"],
+        _child_env(str(tmp_path), load_seed),
+    )
+    return saved, loaded
+
+
+# There is deliberately no (0, non-zero) row here. ``PYTHONHASHSEED=0`` does not
+# pick a seed: it turns hash randomization off, which is a difference in how the
+# interpreter was configured rather than in the order anything was hashed -- so a
+# row crossing it would not be evidence about the seed at all. The randomization
+# flag has a cell of its own below, and
+# ``test_cross_process_optimize_flag_reexecutes`` above is the tree's existing
+# cell for a build-configuration difference that still, deliberately, misses.
+@pytest.mark.parametrize(
+    ("save_seed", "load_seed", "label"),
+    [
+        ("1", "1", "control_one_pinned_seed_on_both_sides"),
+        ("0", "0", "control_randomization_off_on_both_sides"),
+        ("1", "2", "two_different_non_zero_seeds"),
+        ("3", "4", "two_further_different_non_zero_seeds"),
+        (None, None, "no_pinned_seed_at_all_what_users_run"),
+    ],
+)
+def test_cross_process_reuse_survives_a_differing_hash_seed(
+    tmp_path: Path, save_seed: str | None, load_seed: str | None, label: str
+) -> None:
+    """A checkpoint written under one hash seed warms a process under another.
+
+    The two same-seed rows are the controls: they say the round trip works at
+    all, so a red on one of the other three is about the seed and nothing else.
+    The last row pins no seed on either side, which is what an ordinary run does
+    -- two such processes carry the same flags and different hash orders, so it
+    is the row that fails first when anything a query's identity folds depends on
+    the order a set or a dict was built in.
+    """
+
+    saved, loaded = _seeded_round_trip(tmp_path, save_seed, load_seed)
+    _assert_warm_across_processes(saved, loaded, SEEDED_ROOTS, label)
+
+
+@pytest.mark.parametrize(
+    ("save_seed", "load_seed", "label"),
+    [
+        ("0", None, "randomization_off_when_written_on_when_read"),
+        (None, "0", "randomization_on_when_written_off_when_read"),
+    ],
+)
+def test_cross_process_reuse_survives_the_hash_randomization_flag(
+    tmp_path: Path, save_seed: str | None, load_seed: str | None, label: str
+) -> None:
+    """The build-identity axis, not the hash-order one.
+
+    ``PYTHONHASHSEED=0`` turns hash randomization off, and whether it is off is a
+    property of how the interpreter was set up rather than of the order any
+    particular dict was built in. The configurations that pin it are the ones
+    that most want a shared cache -- a benchmark harness, a documentation runner,
+    a CI job asking for a reproducible run -- so a checkpoint one of them writes
+    has to warm an ordinary process and the other way round. This pair is kept
+    out of the seed test above so that a red here reads as what it is.
+    """
+
+    saved, loaded = _seeded_round_trip(tmp_path, save_seed, load_seed)
+    _assert_warm_across_processes(saved, loaded, SEEDED_ROOTS, label)
+
+
+def _crosspath_round_trip(
+    tmp_path: Path,
+    arm: str,
+    script: Path,
+    source_path: Path,
+    save_dir: Path,
+    load_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Save with one copy of the caller's module on the path, load with another.
+
+    The seed is pinned to the same value in both children so the absolute prefix
+    the caller's module was imported from is the only axis moving.
+    """
+
+    store_dir = tmp_path / arm / "store"
+    store_dir.mkdir(parents=True)
+    saved = _run(
+        [sys.executable, str(script), str(store_dir), "save", str(source_path)],
+        _child_env(str(save_dir), "1"),
+    )
+    loaded = _run(
+        [sys.executable, str(script), str(store_dir), "load", str(source_path)],
+        _child_env(str(load_dir), "1"),
+    )
+    return saved, loaded
+
+
+def test_cross_process_reuse_survives_a_different_install_path(tmp_path: Path) -> None:
+    """A checkpoint written at one absolute prefix warms a load from another.
+
+    The two directories hold byte-identical copies of the caller's module and
+    differ only in name -- and in name *length*, so a payload that folded the
+    path would differ in more than a substitution. This is the shape a container
+    image, a second virtualenv or a second CI runner produces: the same
+    distribution, installed somewhere else.
+    """
+
+    short_dir = tmp_path / "lib"
+    long_dir = tmp_path / "lib-under-a-considerably-longer-name"
+    for directory in (short_dir, long_dir):
+        directory.mkdir()
+        (directory / "cxp_crosspath_caller.py").write_text(
+            CROSSPATH_HELPER_SOURCE, encoding="utf-8"
+        )
+    script = tmp_path / "crosspath_fixture.py"
+    script.write_text(CROSSPATH_FIXTURE_SCRIPT, encoding="utf-8")
+    source_path = tmp_path / "sample.py"
+    source_path.write_text(SAMPLE_SOURCE, encoding="utf-8")
+
+    # The control comes first: the same copy on both sides. It is what makes the
+    # cross-path arm below evidence about the prefix rather than about the round
+    # trip refusing everything.
+    saved, loaded = _crosspath_round_trip(
+        tmp_path, "control", script, source_path, short_dir, short_dir
+    )
+    _assert_warm_across_processes(saved, loaded, CROSSPATH_ROOTS, "same install path")
+
+    saved, loaded = _crosspath_round_trip(
+        tmp_path, "moved", script, source_path, short_dir, long_dir
+    )
+    _assert_warm_across_processes(
+        saved, loaded, CROSSPATH_ROOTS, "different install path"
+    )
