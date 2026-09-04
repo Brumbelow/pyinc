@@ -43,7 +43,9 @@ jobs:
           done
 
       - name: Run test suite
-        run: pytest -q -n auto --dist load --ignore=tests/test_properties.py
+        # The process tests check the repository as shipped and do not vary by
+        # platform, so the quality job runs them once instead of twelve times.
+        run: pytest -q -n auto --dist load -m 'not process' --ignore=tests/test_properties.py
 
   test-properties:
     name: Properties (${{ matrix.os }}, Python ${{ matrix.python-version }}, ${{ matrix.shard }})

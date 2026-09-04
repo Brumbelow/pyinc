@@ -77,6 +77,7 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q --tb=no"
 markers = [
+  "process: checks the repository as shipped rather than the program; run once in the quality job",
   "real_site_packages: needs the real site-packages instead of the empty fake every test gets",
 ]
 
