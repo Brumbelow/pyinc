@@ -127,6 +127,10 @@ def _work(
 # digest-sorted verification order, and for codegen removal where that order can
 # execute either 8 or 12 nodes. Execution ceilings remain far below a cold/full
 # graph, so deterministic over-recomputation fails the release gate.
+#
+# The comment-only rows carry one execution since the calc and codegen source
+# reads started answering with the text they compared (measured on ecd8abe,
+# 2026-09-04): the read re-executes, and the parse instances above it backdate.
 PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("synthetic", "cold"): _work(7, 0, 0, 0, 14, 7, 18, 18),
     ("synthetic", "unchanged"): _work(0, 7, 0, 0, 14, 0, 18, 0),
@@ -136,7 +140,7 @@ PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("calc", "cold"): _work(15, 23, 0, 2, 17, 17, 22, 22),
     ("calc", "unchanged"): _work(0, 38, 0, 0, 17, 0, 22, 0),
     ("calc", "unreferenced_file_edit"): _work(0, 38, 0, 0, 17, 0, 22, 0),
-    ("calc", "comment_only_referenced_edit"): _work(0, 37, 1, 1, 17, 0, 22, 0),
+    ("calc", "comment_only_referenced_edit"): _work(1, 37, 1, 1, 17, 0, 22, 0),
     ("calc", "localized_semantic_edit"): _work(5, (38, 39), 5, 1, 17, 0, 22, 0),
     ("calc", "high_fanout_shared_edit"): _work(7, (42, 43), 4, 1, 17, 0, 22, 0),
     ("calc", "removed_emitted_artifact"): _work(4, (28, 29), 4, 1, 17, 0, 22, 0),
@@ -144,7 +148,7 @@ PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("calc", "checkpoint_restore"): _work(0, 3, 0, 0, 15, 15, 19, 19),
     ("codegen", "cold"): _work(29, 175, 0, 1, 30, 30, 43, 43),
     ("codegen", "unchanged"): _work(0, 204, 0, 0, 30, 0, 43, 0),
-    ("codegen", "comment_only_referenced_edit"): _work(0, 203, 1, 1, 30, 0, 43, 0),
+    ("codegen", "comment_only_referenced_edit"): _work(1, 203, 10, 1, 30, 0, 43, 0),
     ("codegen", "localized_semantic_edit"): _work(6, (201, 209), 10, 1, 30, 0, 43, 0),
     ("codegen", "high_fanout_shared_edit"): _work(6, (212, 220), 14, 1, 30, 0, 43, 0),
     ("codegen", "removed_emitted_artifact"): _work(

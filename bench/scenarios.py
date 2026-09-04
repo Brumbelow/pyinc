@@ -101,11 +101,15 @@ def _expect_incremental_work(target: str, scenario: str, work: WorkMetrics) -> N
             f"{target}/{scenario} performed {work.query_executions} query executions"
         )
     if scenario == "comment_only_referenced_edit" and (
-        work.query_executions != 0 or work.query_backdates < 1
+        work.query_executions > work.resource_loads or work.query_backdates < 1
     ):
+        # The source read answers with the text it compared, so it executes on
+        # every edit; the only executions allowed here are those reloads. The
+        # parse above each one must re-run equal and backdate.
         raise AssertionError(
             f"{target}/{scenario} did not backdate cleanly: "
-            f"executions={work.query_executions}, backdates={work.query_backdates}"
+            f"executions={work.query_executions}, resource_loads={work.resource_loads}, "
+            f"backdates={work.query_backdates}"
         )
     if scenario == "localized_semantic_edit" and work.query_executions == 0:
         raise AssertionError(f"{target}/{scenario} did not execute the affected query path")
