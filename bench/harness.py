@@ -123,14 +123,16 @@ def _work(
 
 
 # These envelopes are the reviewed deterministic-work contract for the release
-# harness. Ranges are used only for call-level reuse counts affected by
-# digest-sorted verification order, and for codegen removal where that order can
-# execute either 8 or 12 nodes. Execution ceilings remain far below a cold/full
-# graph, so deterministic over-recomputation fails the release gate.
+# harness. Every count is exact: the worker keys its files by relative path, so
+# the digest-sorted verification order that used to move the call-level reuse
+# counts with the scratch location no longer can. Execution ceilings remain far
+# below a cold/full graph, so deterministic over-recomputation fails the gate.
 #
-# The comment-only rows carry one execution since the calc and codegen source
-# reads started answering with the text they compared (measured on ecd8abe,
-# 2026-09-04): the read re-executes, and the parse instances above it backdate.
+# Values measured on ecd8abe, 2026-09-04, identical on CPython 3.14.4 and
+# 3.14.7 and across scratch locations. The comment-only rows carry one
+# execution since the calc and codegen source reads started answering with
+# the text they compared: the read re-executes, and the parse instances above
+# it backdate.
 PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("synthetic", "cold"): _work(7, 0, 0, 0, 14, 7, 18, 18),
     ("synthetic", "unchanged"): _work(0, 7, 0, 0, 14, 0, 18, 0),
@@ -141,19 +143,17 @@ PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("calc", "unchanged"): _work(0, 38, 0, 0, 17, 0, 22, 0),
     ("calc", "unreferenced_file_edit"): _work(0, 38, 0, 0, 17, 0, 22, 0),
     ("calc", "comment_only_referenced_edit"): _work(1, 37, 1, 1, 17, 0, 22, 0),
-    ("calc", "localized_semantic_edit"): _work(5, (38, 39), 5, 1, 17, 0, 22, 0),
-    ("calc", "high_fanout_shared_edit"): _work(7, (42, 43), 4, 1, 17, 0, 22, 0),
-    ("calc", "removed_emitted_artifact"): _work(4, (28, 29), 4, 1, 17, 0, 22, 0),
+    ("calc", "localized_semantic_edit"): _work(5, 38, 5, 1, 17, 0, 22, 0),
+    ("calc", "high_fanout_shared_edit"): _work(7, 43, 4, 1, 17, 0, 22, 0),
+    ("calc", "removed_emitted_artifact"): _work(4, 28, 4, 1, 17, 0, 22, 0),
     ("calc", "tampered_generated_output"): _work(0, 29, 0, 0, 17, 0, 22, 0),
     ("calc", "checkpoint_restore"): _work(0, 3, 0, 0, 15, 15, 19, 19),
     ("codegen", "cold"): _work(29, 175, 0, 1, 30, 30, 43, 43),
     ("codegen", "unchanged"): _work(0, 204, 0, 0, 30, 0, 43, 0),
     ("codegen", "comment_only_referenced_edit"): _work(1, 203, 10, 1, 30, 0, 43, 0),
-    ("codegen", "localized_semantic_edit"): _work(6, (201, 209), 10, 1, 30, 0, 43, 0),
-    ("codegen", "high_fanout_shared_edit"): _work(6, (212, 220), 14, 1, 30, 0, 43, 0),
-    ("codegen", "removed_emitted_artifact"): _work(
-        (8, 12), (150, 158), 7, 1, 30, 0, 40, -3
-    ),
+    ("codegen", "localized_semantic_edit"): _work(6, 205, 10, 1, 30, 0, 43, 0),
+    ("codegen", "high_fanout_shared_edit"): _work(6, 210, 14, 1, 30, 0, 43, 0),
+    ("codegen", "removed_emitted_artifact"): _work(8, 154, 7, 1, 30, 0, 40, -3),
     ("codegen", "tampered_generated_output"): _work(0, 154, 0, 0, 30, 0, 40, 0),
     ("codegen", "checkpoint_restore"): _work(0, 37, 0, 0, 24, 24, 33, 33),
     ("action", "cold"): _work(3, 0, 0, 0, 5, 3, 3, 3),
@@ -353,20 +353,10 @@ def validate_repetitions(
         raise AssertionError(
             f"benchmark requires {REPETITIONS} isolated repetitions, got {len(repetitions)}"
         )
+    # Every row is pinned to an exact value per repetition, so five passing
+    # repetitions are five equal ones; there is no drift left to compare.
     for results in repetitions:
         validate_repetition(results, targets)
-
-    for row_index, expected_key in enumerate(_expected_rows(targets)):
-        first = repetitions[0][row_index]
-        signature = (_key(first), first.matches_fresh, _work_values(first))
-        for repetition, results in enumerate(repetitions[1:], start=2):
-            current = results[row_index]
-            current_signature = (_key(current), current.matches_fresh, _work_values(current))
-            if current_signature != signature:
-                raise AssertionError(
-                    f"non-deterministic work counts for {expected_key!r} in repetition "
-                    f"{repetition}: expected={signature!r}, actual={current_signature!r}"
-                )
 
 
 def aggregate_repetitions(

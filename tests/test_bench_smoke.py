@@ -146,24 +146,6 @@ def test_report_artifacts_contain_raw_and_summarized_samples(
     assert json.loads(metadata_path.read_text(encoding="utf-8")) == metadata
 
 
-def test_repetition_validation_rejects_work_count_drift() -> None:
-    repetitions = [_valid_matrix() for _ in range(harness.REPETITIONS)]
-    index = next(
-        index
-        for index, row in enumerate(repetitions[-1])
-        if row.target == "codegen"
-        and row.scenario == "localized_semantic_edit"
-        and row.engine == "pyinc"
-    )
-    original = repetitions[-1][index]
-    assert original.query_reuses is not None
-    repetitions[-1][index] = replace(
-        original, query_reuses=original.query_reuses + 1
-    )
-    with pytest.raises(AssertionError, match="non-deterministic work counts"):
-        harness.validate_repetitions(repetitions)
-
-
 @pytest.mark.parametrize(
     ("target", "scenario", "inflated_executions"),
     (

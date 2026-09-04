@@ -108,9 +108,15 @@ def _write_worker_result(path: Path, scratch: Path) -> None:
     if scratch.exists():
         shutil.rmtree(scratch)
     scratch.mkdir(parents=True)
+    # The scenarios key their files by the path they are given, and the
+    # digest-sorted verification order follows those bytes, so run them from
+    # inside the scratch: a relative key reads the same on every machine and
+    # under any --output, where an absolute one moved the reuse counts.
+    os.chdir(scratch)
     try:
-        results = run_scenarios(ALL_TARGETS, out_dir=scratch, comparators=comparators)
+        results = run_scenarios(ALL_TARGETS, out_dir=Path(), comparators=comparators)
     finally:
+        os.chdir(_ROOT)
         shutil.rmtree(scratch)
     validate_repetition(results)
     path.write_text(
