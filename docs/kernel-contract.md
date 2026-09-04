@@ -1,226 +1,184 @@
-# Kernel Contract — Soundness Envelope
+# Kernel Contract
 
 `pyinc` is a correctness-first, in-memory incremental query kernel. This
-document defines the guarantee it makes and the exact conditions under which the
+document defines the guarantee it makes and the conditions under which the
 guarantee holds; it is the stable semver contract for `src/pyinc`.
 
 ## The Guarantee
 
-pyinc guarantees **from-scratch consistency** — the result of incremental
-evaluation matches a fresh evaluation on the same declared inputs and resources —
-provided the three conditions below hold. Outside those conditions no
-guarantee is made.
+pyinc guarantees **from-scratch consistency**: the result of incremental
+evaluation matches a fresh evaluation on the same declared inputs and
+resources, provided the three conditions below hold. Outside those conditions
+no guarantee is made.
 
-When a recomputed value is canonically equal to the previously stored value,
-the record is **backdated** (also called **early cutoff**): its `changed_at`
-revision is not advanced, so downstream dependents remain green and avoid
-unnecessary recomputation. The default equality decision is
-**canonical-encoding equality** over the stored snapshots: two values are
-equal exactly when their canonical snapshot encodings are byte-identical, so
-`1`, `1.0`, and `True` are three different values, `0.0` differs from `-0.0`,
-and a canonical NaN equals a canonical NaN. The same relation decides default
-input updates, resource probe comparisons, checkpoint probe hints, and the
-token comparison behind a `cutoff=` policy, and it is identical in `strict`,
-`checked`, and `fast`; an `eq=` policy decides under its own relation instead,
-over the detached operands described below.
+When a recomputed value is canonically equal to the stored value, the record is
+**backdated** (early cutoff): its `changed_at` revision does not advance, so
+dependents stay green and are not recomputed.
+
+The default equality decision is **canonical-encoding equality** over stored
+snapshots: two values are equal exactly when their canonical snapshot encodings
+are byte-identical. `1`, `1.0`, and `True` are three different values, `0.0`
+differs from `-0.0`, and a canonical NaN equals a canonical NaN. The same
+relation decides default input updates, resource probe comparisons, checkpoint
+probe hints, and the token comparison behind a `cutoff=` policy, in every mode.
+An `eq=` policy decides under its own relation instead.
 
 ## Conditions for From-Scratch Consistency
 
-**1. Value boundary ownership.**
-All values crossing cached boundaries (query arguments, query return values,
-`Input` values) must be snapshot-safe: either immutable scalars, containers
-that `freeze` can deep-convert to owned snapshot representations, or values
-handled by registered `ValueAdapter` instances. `freeze` converts
-`list` → `FrozenList`, `dict` → `FrozenDict`, `set` → `FrozenSet`
-(kind `"set"`), `frozenset` → `FrozenSet` (kind `"frozenset"`), and
-dataclasses → `FrozenRecord`; tuples are a native member of the `Snapshot`
-union and are frozen element-wise.
+### 1. Value boundary ownership
 
-Frozen mappings hold their entries in a canonical order derived from each key's
-snapshot digest — deterministic across processes and platforms, but neither
-insertion order nor sorted order — and `thaw` and every mode's boundary
-exposure preserve that canonical order. `FrozenSet` members are ordered by the
-same digest rule applied to the members themselves, with the narrower reach the
-mode exposures below state: that order belongs to the snapshot and to `strict`'s
-view of it, and a thawed `set` carries none of it. Sequences are not
-reordered: a `FrozenList` keeps its element order and a `FrozenRecord` its field
-declaration order. The canonical order is part of this contract and does not
-move: every digest, store key and checkpoint is derived from an encoding that
-reads entries in the order they are stored.
+Every value crossing a cached boundary — query arguments, query results,
+`Input` values — must be snapshot-safe: an immutable scalar, a container
+`freeze` can deep-convert, or a value handled by a registered `ValueAdapter`.
+`freeze` converts `list` → `FrozenList`, `dict` → `FrozenDict`, `set` →
+`FrozenSet` (kind `"set"`), `frozenset` → `FrozenSet` (kind `"frozenset"`), and
+dataclasses → `FrozenRecord`; tuples are native members of the `Snapshot` union
+and are frozen element-wise.
 
-Dataclasses thaw to dictionaries because the kernel does not import and
-reconstruct arbitrary user classes. The kernel tags such a snapshot with the
-class's `__qualname__` alone, so two same-named dataclasses defined in
-different modules produce the same tag, and instances whose ordered fields and
-encoded values match serialize to identical bytes. Its own resource snapshot
-types are the exception: a `Database` registers built-in adapters for them, so
-`FileStatSnapshot` is rebuilt as itself at every boundary in every mode.
-`BUILTIN_ADAPTERS` names those entries, and registering an adapter for one of
-those types replaces the built-in rather than colliding with it. A dataclass, a
-wrapper that thaws to a mutable container, or a composite containing one cannot
-therefore be used as a mapping key or set member; `freeze` rejects such
-positions before they can produce a snapshot that later fails to thaw. A
-`ValueAdapter` that reconstructs a hashable value is necessary to carry such a
-value into a hash position, but it is not sufficient, for two independent
-reasons. First, an adapted value whose payload contains a `FrozenGraph` is
-refused, registered adapter or not: the shared or cyclic state such a payload
-rebuilds stays mutable after the value is inserted, so nothing at the boundary
-can establish that its hash is stable. (That refusal reuses the general
-message and asks for a `ValueAdapter` even where one is registered; the fix is
-to keep the cycle out of the payload, not to register another adapter.) That
-check runs where `freeze` builds a hash position out of a live mapping or set,
-so it is the live route that is closed; a snapshot already carrying such a key
-is not refused — `freeze`, `serialize_snapshot`, and `deserialize_snapshot` all
-accept a hand-assembled or byte-decoded one. Second, an independent gate —
-the snapshot validator every entry point runs — rejects hash positions that
-are distinct under the snapshot encoding but collapse under Python `==`/`hash`
-after thaw. `FrozenDict` keys and `FrozenSet` members such as `1` beside
-`1.0`, `True` beside `1`, or `0.0` beside `-0.0` raise `UnsupportedValueError`
-from `freeze`, `thaw`, `serialize_snapshot`, and `deserialize_snapshot` alike,
-with the collapsing pair named in the error; two positions carrying the same
-adapter key are refused as soon as their payloads collapse, because the
-encoding cannot ask the adapter whether the values it rebuilds would still
-differ. Where the encoding cannot see the answer the gate is deliberately
-conservative rather than nondeterministic: every canonical NaN is one class,
-so a live `dict` keyed by `(1, nan)` and `(1.0, nan)` with distinct NaN
-objects — two keys to Python, which hashes a NaN by identity — is rejected,
-both halves of the key having collapsed at once: `1` with `1.0` under the
-numeric rule, the two NaNs under the one-class rule. Keys that stay apart
-somewhere, `(2, nan)` beside `(3, nan)`, are accepted. A container that would
-silently change cardinality on thaw is refused at the boundary instead of
-being stored, whether `freeze` built it from live values or it arrived
-hand-assembled or decoded from bytes — for every adapter that satisfies the
-semantic round-trip law below. An adapter that thaws two distinct payloads
-into equal values breaks that law, and this gate, which reads payload
-encodings rather than running the adapter, cannot see it coming.
+**Canonical order.** A frozen mapping holds its entries in a canonical order
+derived from each key's snapshot digest: deterministic across processes and
+platforms, but neither insertion order nor sorted order. `thaw` and every
+mode's boundary exposure preserve that order, so a mapping iterates in the
+stored order in all three modes. `FrozenSet` members are ordered by the same
+rule, but that order belongs to the snapshot and to `strict`'s view of it; a
+thawed `set` or `frozenset` is an ordinary unordered Python container. Sequences
+are not reordered: a `FrozenList` keeps its element order and a `FrozenRecord`
+its field declaration order. The canonical order is part of this contract:
+every digest, store key, and checkpoint is derived from an encoding that reads
+entries in stored order.
 
-`freeze()` and `thaw()` are boundary utilities, not a general object
-serializer. Passing an adapter registry to `freeze()` does not embed executable
-reconstruction logic in the snapshot; the matching registry must also be
-available to `thaw()`. Without an adapter, a dataclass's class identity is not
-reconstructed. The built-in registry is a `Database`'s, not the helpers': these
-two take the registry they are handed and nothing else, so thawing a
+**Dataclasses and adapters.** A dataclass thaws to a dictionary, because the
+kernel does not import and reconstruct arbitrary user classes; its snapshot is
+tagged with the class's `__qualname__` alone, so same-named dataclasses in
+different modules share a tag. The kernel's own resource snapshot types are the
+exception: every `Database` registers `BUILTIN_ADAPTERS`, so a
+`FileStatSnapshot` is rebuilt as itself at every boundary in every mode, and
+registering an adapter for one of those types replaces the built-in entry.
+`freeze()` and `thaw()` take only the registry they are handed, so thawing a
 database-produced `FileStatSnapshot` outside a database means passing
-`adapters=dict(BUILTIN_ADAPTERS)`. Omitting it raises `UnsupportedValueError`
-naming the adapter key rather than returning a mapping.
+`adapters=dict(BUILTIN_ADAPTERS)`; omitting it raises `UnsupportedValueError`
+naming the adapter key.
 
-The kernel stores frozen snapshots internally. `strict` exposes `Frozen*`
-views of those snapshots (a query receives, for example, a `FrozenDict` where
-the other modes hand it a `dict`); `checked` and `fast` expose owned thawed
-values (the exposed shape differs, a mapping's canonical entry order described
-above does not — all three modes iterate a mapping in the stored snapshot's
-order). Those views are frozen dataclasses: they reject ordinary attribute and
-item writes, but they are not immutable at the capability level —
-`object.__setattr__` still rebinds a field on the view a query or a caller was
-handed. That is why the kernel rebuilds a view for every exposure instead of
-relying on view immutability: rebinding a field that way changes the view
-alone, the stored record is untouched, and the next request answers from the
-record. A set's canonical member order is carried by the snapshot and by
-`strict`'s `FrozenSet` view; a thawed `set` or `frozenset` is an ordinary
-unordered Python container, so `checked` and `fast` carry no member order out
-of the boundary, and their iteration order is Python's, which varies between
-processes. A value with a registered adapter is the exception in every mode: it
-is reconstructed through that adapter, so a query argument, a query result and
-an `eq=`/`cutoff=` policy operand carry the adapted type whichever mode is in
-force. No external alias to a value that crossed the boundary can influence
-the stored snapshot. This holds in both directions: `freeze` returns a
-snapshot the kernel owns outright — an already-frozen wrapper is cloned rather
-than passed through by identity, a tree-shaped one into a structurally
-identical, identically fingerprinted copy and an aliased or cyclic one into
-the same canonical graph encoding the equivalent raw structure produces — so
-nothing done through the object you passed in can influence a stored record, a
-stored resource probe, or a mapping key or set member. Leaf scalars and
-all-leaf tuples are still shared with the clone, deliberately: no `Frozen*`
-shell is, and nothing reflective can rebind a leaf.
+**Hash positions.** A mapping key or set member must stay a hashable value with
+a stable hash after thaw. `freeze` raises `UnsupportedValueError` for three
+shapes in such a position. The first is a dataclass, a wrapper that thaws to a
+mutable container, or a composite holding one. The second is an adapted value
+whose payload contains a `FrozenGraph`, registered adapter or not, since the
+state it rebuilds stays mutable after insertion. The third is a pair of
+positions that are distinct under the snapshot encoding but collapse under
+Python `==`/`hash` after thaw — `1` beside `1.0`, `True` beside `1`, `0.0`
+beside `-0.0`, two adapter positions with the same key and collapsing payloads
+— with the pair named in the error; `thaw`, `serialize_snapshot`, and
+`deserialize_snapshot` refuse that case alike. Every canonical NaN is one class
+for this purpose. The gate reads
+payload encodings rather than running the adapter, so an adapter that thaws two
+distinct payloads into equal values breaks the round-trip law under
+[Escape Hatches](#escape-hatches) and is not caught here.
 
-Cyclic and shared object graphs are supported via the `FrozenGraph` /
-`FrozenRef` snapshot variants: `freeze` memoizes mutable containers (`list`,
+**Exposure by mode.** The kernel stores frozen snapshots. `strict` exposes
+`Frozen*` views of them; `checked` and `fast` expose owned thawed values. The
+views reject ordinary writes, but `object.__setattr__` still rebinds a field on
+a view, so the kernel rebuilds a view for every exposure: rebinding changes the
+view alone, and the next request answers from the stored record. A value with
+a registered adapter is reconstructed through that adapter in every mode. No
+external alias to a value that crossed the boundary can influence the stored
+snapshot, in either direction: `freeze` returns a snapshot the kernel owns
+outright, cloning an already-frozen wrapper rather than passing it through by
+identity. Leaf scalars and all-leaf tuples are shared with the clone, since
+nothing reflective can rebind a leaf.
+
+**Shared and cyclic graphs.** `freeze` memoizes mutable containers (`list`,
 `dict`, `set`, dataclass) by id and emits a `FrozenGraph(nodes, root)` envelope
-when shared identity or back-edges are detected. `thaw` reconstructs identity
-faithfully via two-pass allocate-then-fill so a list-with-itself round-trips to
-an actual self-referential list. Pure trees avoid the envelope, not the freeze:
-they keep the bare snapshot shape rather than the `FrozenGraph` envelope, and
-the deep freeze is paid in full — one `Frozen*` shell per container at every
-level, so no external alias to a container in the source can influence the
-snapshot.
+when shared identity or a back-edge is detected; `thaw` rebuilds identity with
+a two-pass allocate-then-fill, so a list containing itself round-trips. A pure
+tree keeps the bare snapshot shape and still pays the deep freeze at every
+level. Memoization covers exactly those four container types: a value crossing
+through a `ValueAdapter`, a `tuple`, or a `frozenset` cannot be the target of a
+back-edge, `freeze` rejects such a graph with `UnsupportedValueError`, and
+`FrozenAdapterValue` is not a legal `FrozenGraph` node. A cyclic adapted object
+must route its cycle through one of the four container types, or be decomposed
+by its adapter into one, within the mode-shaped payloads law under
+[Escape Hatches](#escape-hatches).
 
-Memoization is by **mutable container** identity, so the graph support above
-covers exactly those four types. Values crossing through a `ValueAdapter`, a
-`tuple`, or a `frozenset` are not memoized and cannot be the target of a
-back-edge: `freeze` rejects such a graph with `UnsupportedValueError` rather
-than emitting a node, and `FrozenAdapterValue` is not a legal `FrozenGraph`
-node. A cyclic adapted object (for example `obj.child.parent is obj`) must
-therefore route its cycle through a `list`, `dict`, `set`, or dataclass — or be
-decomposed by the adapter into one. A payload routed that way meets the
-reconstruction limit the adapter laws below record: once the graph encoding
-would hold the payload as a node of its own, the payload cannot be handed back
-whole, and `freeze` refuses the value. The mode-shaped-payloads law states that
-refusal and what an adapter returns instead.
+### 2. Tracked ambient reads
 
-**2. Tracked ambient reads.**
-All reads of external state within a query must go through the Resource API
-(`FileResource`, `BinaryFileResource`, `FileStatResource`, `EnvResource`,
-`DirectoryResource`, `ResolvedPathResource`) or a user-defined `Resource`. The public hooks are `read`,
-`probe`, `load`, `probe_and_load`, `identity`, and `label`; built-ins derive
-probe/value pairs from one observed state. On a warm request the kernel may
-first check for an unchanged world with `probe` alone and calls
-`probe_and_load` only when that probe misses or the record cannot answer, so a
-resource's `probe` and the probe component of its `probe_and_load` must agree
-on an unchanged world; stored probe/value pairs always originate from one
+Every read of external state inside a query goes through the Resource API: a
+built-in resource (`FileResource`, `BinaryFileResource`, `FileStatResource`,
+`EnvResource`, `DirectoryResource`, `ResolvedPathResource`) or a user-defined
+`Resource`. The public hooks are `read`, `probe`, `load`, `probe_and_load`,
+`identity`, and `label`. On a warm request the kernel may check for an
+unchanged world with `probe` alone and call `probe_and_load` only when the
+probe misses, so `probe` and the probe component of `probe_and_load` must agree
+on an unchanged world; a stored probe/value pair always comes from one
 `probe_and_load` observation.
 
-A resource hook observes the outside world and only the outside world. Raw I/O
-is what `probe`, `load` and `probe_and_load` are for, so the interception below
-is lifted for their extent — but they may not read back into the `Database`
-they are observing for. `get`, `read_input` and `read_resource` raise
-`ReentrantDatabaseError` when a hook calls them, as does every administrative
-and observational entry point; the refusal is on the position, not the
-argument, so it reaches a `probe` that holds a database of its own just as it
-reaches a `load` that was handed one. What such a read would produce is
-invisible to the graph: the node records the probe and the value and never what
-the hook read to build them, so a warm request that answers from an unchanged
-probe reuses a value no fresh database would produce. Database-derived values
-reach a resource through its **key** — the reading query reads them, declaring
-its edges, and passes them in.
-(See: `test_resource_hook_reading_the_database_raises_a_typed_error`,
-`test_resource_hook_calling_set_raises_without_a_live_frame`,
-`test_rejected_hook_read_is_not_a_load_failure`,
-`test_thread_spawned_inside_a_hook_reads_raw_files_freely`)
+Resource identity includes the resource's configuration, the implementations of
+`probe`, `load`, `probe_and_load`, and `identity`, and the interpreter/build
+identity. A resource that keeps observation state of its own must define
+`identity()` to return the configuration that distinguishes it. A configuration
+that changes between two reads leaves the resource undefined: a change written
+into a list, dict, or set the resource holds is refused at the read that
+observes it, and a value rebound anywhere else makes the capturing query
+re-fingerprint on every request, executing cold each time.
 
-The kernel intercepts the following during query execution and raises
-`UntrackedReadError` if they are called outside a resource scope:
+A resource hook observes the outside world and only the outside world. The
+interception below is lifted for the extent of `probe`, `load`, and
+`probe_and_load`, but a hook may not read back into the `Database` it is
+observing for ([Reentrancy](#reentrancy)). Database-derived values reach a
+resource through its **key**: the reading query reads them, declaring its
+edges, and passes them in.
+
+While a query runs, the kernel intercepts these calls and raises
+`UntrackedReadError` when they happen outside a resource hook:
 
 - `builtins.open` and `io.open`
 - `os.getenv` and `os.environ` access
 - `os.listdir` and `os.scandir`
 - `Path.iterdir`
 
-Reads not intercepted by this mechanism (see limitation 1) must be declared
-via `db.report_untracked_read()` ([Escape Hatches](#escape-hatches)).
+Reads this mechanism does not see (limitation 1) must be declared with
+`db.report_untracked_read(reason)` ([Escape Hatches](#escape-hatches)). A
+module imported for the first time inside a query body runs its module-scope
+code inside that query's boundary, so a read performed while it initializes is
+treated exactly as one written in the query body. Import at module scope.
 
-A module imported for the first time inside a query body runs its module-scope
-code inside that query's boundary. A read performed while the module is
-initializing is therefore treated exactly as one written in the query body:
-refused if it is on the list above, silently untracked if it is not. Import at
-module scope instead, so the initialization has already run by the time a query
-body reaches the name.
+### 3. Deterministic queries
 
-**3. Deterministic queries w.r.t. tracked dependencies.**
-Given the same tracked inputs, resources, and sub-query results, a query function
-must return a semantically equal value. Nondeterminism (timestamps, random
-numbers, process state) must either be routed through a Resource or declared via
+Given the same tracked inputs, resources, and sub-query results, a query
+returns a semantically equal value. Nondeterminism — timestamps, random
+numbers, process state — is routed through a Resource or declared with
 `report_untracked_read()`. Query bodies and equality/cutoff policies must have
-fingerprintable implementations and snapshot-safe captures. Dynamically scoped
-local classes are rejected; define stable implementation types at module scope.
+fingerprintable implementations and snapshot-safe captures: immutable constants
+and explicit `Input`, resource, and query handles are accepted; mutable closure
+or global data, dynamically scoped local classes, and reflective namespace
+reads are rejected before the first execution.
 
-Custom `eq=`/`cutoff=` policies must also be **substitutive** for every
-dependent computation: when a policy reports two values unchanged, each
-dependent must produce a semantically equal result from either value. A
-coarser policy is permitted, but the guarantee it buys is correspondingly
-coarser — backdating keeps dependents at results computed from the earlier
-representative, so from-scratch consistency then holds *modulo the declared
-equivalence* rather than on exact values.
-(See: `test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative`)
+The reflective rule is a conservative static read of the bytecode of the query
+function and of every callable folded into its identity. `globals()`,
+`locals()`, `vars()`, `eval`, `exec`, and a `__globals__` load are refused on
+their own. `getattr`, `setattr`, `delattr`, and a `__dict__` load are refused
+beside a handle that can reach a module namespace: a `modules` attribute load,
+the string `"modules"` beside one of those builtins, an `import_module`
+attribute load, or a global load of `importlib`. Reaching a module namespace is
+not itself refused — `sys.modules[name]` and `import_module(name)` with no
+reflective builtin beside them are accepted, and neither reaches identity
+(limitation 5). `pyinc.explain_query_captures(fn)` previews how each capture is
+classified before the first `db.get()`.
+
+`Input` keys and `@query`/`Query` keys are exactly `str` and non-empty; the
+default query key is `module:qualname`. A `str` subclass, a `StrEnum` member
+included, is rejected at construction with a message naming the plain string
+to pass instead, because a key is stored as node identity and formatted into
+labels and the checkpoint manifest. `Resource.label()` must likewise return
+exactly `str`. Coroutine and generator queries are rejected at decoration time.
+
+Custom `eq=`/`cutoff=` policies must be **substitutive** for every dependent:
+when a policy reports two values unchanged, each dependent must produce a
+semantically equal result from either value. A coarser policy is permitted, and
+the guarantee it buys is correspondingly coarser. Backdating keeps dependents
+at results computed from the earlier representative, so from-scratch
+consistency then holds *modulo the declared equivalence* rather than on exact
+values.
 
 ## Mode-Specific Enforcement
 
@@ -235,1060 +193,474 @@ equivalence* rather than on exact values.
 
 ## Failing Resource Loads
 
-A resource whose `load` (or `probe_and_load`) raises is an **observation**, not
-the absence of one. The kernel stores a *failure record* for that resource node,
-carrying the probe observed alongside the failure, and lets the ordinary
-probe-comparison machinery drive invalidation:
+A resource whose `load` (or `probe_and_load`) raises is an observation, not the
+absence of one. The kernel stores a **failure record** for that node, carrying
+the probe observed alongside the failure, and ordinary probe comparison drives
+invalidation, identically in every mode:
 
-- The reading query records its dependency edge on the failing resource before
-  the exception propagates, so a later `get()` re-checks that node instead of
-  treating the reader as dependency-free.
-- The exception surfaces **inside the query body**, where the query's own
-  `try`/`except` can see it. An exception no query body handles **propagates
-  out of `db.get()`** — including one raised while a dependent is being
-  verified. The caller sees the exception the load raised; the kernel does not
-  replace it with an error type of its own. The record-keeping is unaffected
-  either way: the failing node still reports `failed` for both `last_decision`
-  and `last_recompute`, with a reason naming the load failure (see
-  [Node Record Fields](#node-record-fields)).
+- The reading query records its edge on the failing resource before the
+  exception propagates, so a later `get()` re-checks that node.
+- The exception surfaces inside the query body, where the query's own
+  `try`/`except` can see it; one no body handles propagates out of `db.get()`
+  unchanged, including one raised while a dependent is being verified. Either
+  way the node reports `failed` for `last_decision` and `last_recompute`.
 - An unchanged failing probe does not move the revision, so a query that handled
-  the failure stays green across repeated requests. A changed probe — or a
-  transition between success and failure in either direction — invalidates the
-  readers.
-- A failure record never satisfies a read with a value — it holds none. The
-  first read in a request re-runs the load, so the exception is a live one; the
-  reads that follow it *within that request* re-raise the exception that load
-  produced, exactly as a successful load's value is reused for the rest of the
-  request. A failing resource costs one load per request, not one per reader.
-  The exception is dropped when that request ends — nothing outside it may
-  re-raise it — so a node that keeps failing never pins the frames, or the
-  allocations, of the load that raised. A `request_span` moves the request
-  boundary with it: a failing load's exception is re-raised by reads
-  throughout the span and dropped when the outermost span closes, exactly as
-  it is for a single `get`.
-  (See: `test_failing_resource_loads_once_per_request_across_a_fan_out`,
-  `test_repeated_failing_reads_within_one_query_body_load_once`,
-  `test_failing_load_exception_is_reused_only_inside_its_own_request`,
-  `test_failing_load_frames_are_released_when_the_request_ends`)
-- A `ReentrantDatabaseError` from a hook that read back into the database is
-  **not** one of these. It observes nothing about the outside world, so no
-  failure record is written and no probe is stored for a later read to match. A
-  node with no record still has none, so there is no edge for a reader to
-  publish either: a query body that catches the refusal is marked untracked
-  instead, carrying a reason that names the resource, so it re-executes on
-  every request and is kept out of checkpoints along with everything above it.
-  Without that it would commit a fallback resting on nothing the graph
-  describes and go on serving it once the hook was rewritten to stop reading
-  the database, where a fresh `Database` returns the value. A node that already
-  held one keeps
-  exactly the record its last real observation wrote — not failed, still
-  carrying that observation's probe — and is marked *unconfirmed*: the state a
-  `probe` that raises leaves behind (Two boundaries apply, below), and left for
-  the same reason, since without it a probe that came back to the recorded
-  value would answer warm from a hook that can no longer run. So the next read
-  re-runs the hook and is refused on its own account rather than answered from
-  a record, and entering that state moves the revision exactly as it does for a
-  raising probe.
-  (See: `test_rejected_hook_read_is_not_a_load_failure`,
-  `test_query_catching_a_refused_hook_read_is_marked_impure`,
-  `test_refused_hook_read_on_a_recorded_resource_retires_its_probe`)
-- Behaviour is identical in `strict`, `checked`, and `fast`.
+  the failure stays green. A changed probe, or a transition between success and
+  failure in either direction, invalidates the readers.
+- A failure record holds no value. The first read in a request (or in the
+  enclosing `request_span`) re-runs the load, later reads re-raise the same
+  exception, and the exception is dropped when the request ends, so a node that
+  keeps failing pins neither frames nor allocations.
 
 Optional external state is therefore from-scratch consistent: a query that
 returns a default when a file is missing returns the file's contents once it
-appears, and the default again once it is removed, matching a fresh `Database`
-at every step.
-(See: `test_appearing_resource_invalidates_the_query_that_handled_its_absence`,
-`test_disappearing_resource_raises_inside_the_query_body`,
-`test_optional_resource_queries_match_fresh_recomputation`)
+appears, and the default again once it is removed. Two boundaries apply:
 
-Two boundaries apply:
+- **The probe must be total.** `probe()` models failure instead of raising:
+  `FileResource.probe` returns `("missing",)` for an absent file, and a pipe,
+  socket, or device answers as an absent path does. A resource whose `probe`
+  also raises is outside the contract. With no record yet, the exception
+  propagates unchanged and a query that catches it is cached as if it had no
+  dependency at all: nothing in that process re-checks it, though it is still
+  refused a checkpoint. With a record present, the node is reported as
+  *changed* and marked *unconfirmed*, and its stored probe is retired until a
+  real observation rewrites the record. Its direct readers re-execute and see
+  the exception again; their dependents re-run only when the handled value
+  differs. Entering that state moves the revision once per transition, not
+  once per request, so `revision` settles while a resource stays unprobeable,
+  and `inspect()` shows the node as its last real observation. A `load` that
+  can raise different exceptions for one probe value must fold that
+  distinction into the probe: invalidation compares probes, never messages.
+- **Failures are not checkpointed.** A failure record, a failure the kernel
+  could not record, and every record that transitively depends on either are
+  omitted from a checkpoint and re-execute against live state after
+  `load_checkpoint`.
 
-- **The probe must be total.** This rests on `probe()` modelling failure instead
-  of raising — `FileResource.probe` returns `("missing",)` for an absent file. A
-  path that names a pipe, a socket or a device answers the way an absent path
-  does, so a read of one is bounded in time and gives the same answer warm and
-  fresh. A resource whose `probe` *also* raises is outside the contract, and
-  what the kernel does then depends on what it already knows about that node.
+`inspect()` and `explain()` show a failure node with decision `failed` and a
+reason naming the exception; it counts in `resource_count`, a load that raised
+is not a `resource_load`, and re-running a load on an unchanged failing probe
+is not a `resource_probe_hit`. Unless the resource overrides `probe_and_load`,
+the probe stored with a failure is taken just after it, so a `failed` node can
+display a probe describing an already-healed world until the next request.
 
-  - **No record yet:** the read is the node's first, nothing is recorded, the
-    exception propagates unchanged, and a query that catches it is cached as if
-    it had no dependency at all — a later `get()` in that same process does not
-    re-check it, and neither does anything that depends on it (it is still
-    refused a checkpoint, see below).
-  - **Record present:** an earlier success, or an earlier recorded failure,
-    describes a world the kernel can no longer confirm, so the node is reported
-    as *changed*: the queries that read it directly re-execute and the exception
-    surfaces inside their query bodies again. The record is also marked
-    unconfirmed, which retires its stored probe until a real observation
-    rewrites the record: a world that returns to exactly the state that probe
-    describes — an undo, a branch switch back — re-loads instead of reusing, and
-    the readers that consumed the raise re-execute rather than staying green on
-    a value only the failure explains. A permission denial that neither the
-    probe nor the load survives is the ordinary way to reach this state; the
-    shipped file and listing resources read a path whose kind changed as a
-    missing file or an absent listing rather than raising.
-  - **Revision accounting:** entering that unconfirmed state **moves the
-    revision**, exactly as a recorded failure does. A direct reader that handles
-    the exception is otherwise the end of the story: it would return at the
-    revision its own dependents had already verified, so nothing above it would
-    ever learn that the world moved, and a transitive dependent would keep a
-    pre-failure value permanently. The bump is per *transition* — one on the way
-    in, one on the way out — plus one for each re-executed query whose
-    recomputed value actually changed, never one per observation or request, so
-    `revision` settles while a resource stays unprobeable instead of churning on
-    every `get()`, and a resource that heals and breaks again bumps again. That
-    stays consistent with a fresh `Database` throughout, and it settles as soon
-    as a load succeeds again; while the probe keeps raising, the queries that
-    read it directly re-run every request, and *their* dependents re-run only
-    when the handled value actually differs.
+A `ReentrantDatabaseError` from a hook that read back into the database is not
+a failure: it observes nothing, so no failure record and no probe is written. A
+query that catches the refusal on a resource this `Database` has never loaded
+is marked untracked with a reason naming the resource; a node that already held
+a record keeps it and is marked unconfirmed, exactly as for a raising probe.
 
-  The probe contract extends to failures for the same reason it covers values: a
-  resource whose `load` can raise *different* exceptions for one probe value must
-  fold that distinction into the probe. Invalidation compares probes only, never
-  exception messages, which are frequently nondeterministic.
-  (See: `test_failed_resource_loads_are_recorded_only_when_the_probe_is_total`,
-  `test_file_replaced_by_a_directory_matches_a_fresh_database`,
-  `test_directory_replaced_by_a_file_matches_a_fresh_database`,
-  `test_missing_file_replaced_by_a_directory_matches_a_fresh_database`,
-  `test_module_replaced_by_a_package_matches_a_fresh_database`,
-  `test_directory_restored_after_a_kind_swap_matches_a_fresh_database`,
-  `test_handled_unrecordable_failure_invalidates_a_transitive_reader`,
-  `test_handled_unrecordable_failure_propagates_more_than_one_hop`,
-  `test_permanently_unrecordable_failure_settles_the_revision`)
-- **Failures are not checkpointed.** A failure record holds no value, and a
-  reader that handled a failure is only reproducible while the load keeps
-  failing. The failure record and every record that transitively depends on it
-  are omitted from a checkpoint, so they re-execute against live state after
-  `load_checkpoint`. A failure the kernel could not record is excluded the same
-  way, and it has to be: the resource record an unprobeable raise contradicted
-  still carries the probe and digest from before that raise, which verify against
-  a world that healed back into exactly that state, and the reader that consumed
-  the raise carries a handled-failure value no record explains. Both are dropped,
-  and with them every record above them.
-  (See: `test_checkpoints_omit_failed_resource_records_and_their_readers`,
-  `test_checkpoints_omit_readers_of_an_unrecordable_failure`)
+## Reentrancy
 
-`inspect()` and `explain()` show the failure node with decision `failed` and a
-reason naming the exception; it counts in `DatabaseStatistics.resource_count`
-like any other resource node. A load that raised is not counted as a
-`resource_load`, and re-running a load on an unchanged failing probe is not
-counted as a `resource_probe_hit`. Unless the resource overrides
-`probe_and_load` to observe both from one read, the probe stored with a failure
-is taken just after it, so a `failed` node can display a probe describing an
-already-healed world; the next request re-runs the load and clears it.
+`Database` splits in two at the query boundary. Inside a query body the reading
+surface is open, and only that: `get`, `read_input`, `read_resource`,
+`report_untracked_read`, and a `request_span` that joins the request the
+execution already opened. Everything else raises `ReentrantDatabaseError`
+before doing anything at all: the administrative calls `set`, `set_many`,
+`save_checkpoint`, `load_checkpoint`, `reset_statistics`,
+`request_inputs_changed`, and `observe`; the observational `statistics`,
+`query_profile`, `dependency_graph`, `explain`, `inspect`, `inspect_fresh`, and
+the `revision` property; and `Subscription.unsubscribe`. An administrative call
+would move state the running execution derives from; an observational one
+answers with a function of the database's own history, which is exactly what a
+query result may not depend on.
 
-A failure the kernel could **not** record writes no record at all, so there is
-nothing for `inspect()` to relabel: the node keeps the decision, probe, digest,
-and `changed_at` of its last real observation, which is now older than the
-database `revision`. Read a resource node that way — as the last observation the
-kernel could describe, not as a claim about the world right now. Invalidation
-does not consult that stale `changed_at`: the unconfirmed mark reports the node
-changed on every refresh and retires its probe until a real observation replaces
-it.
-
-## Request Spans
-
-`db.request_span()` is a context manager that holds one request open across
-several top-level `get` / `inspect` / `inspect_fresh` / `read_resource`
-calls, so once-per-request work — resource validation above all — happens
-once for the whole batch.
-
-Entering a span declares that the world the database reads from does not
-change until the span closes; a caller that changes it mid-span must declare
-the change with `db.request_inputs_changed()`, which rolls the span onto a
-fresh request so the next read of each node re-validates instead of answering
-from the span's earlier observation. The declaration is instance-wide: a
-change committed by any thread rolls the span. `db.set(...)` and
-`db.set_many(...)` declare their own changes — inside a span an input update
-that actually changed something rolls the request exactly as
-`request_inputs_changed()` does, so later gets re-derive from the new inputs,
-while an update the equality decision ignores rolls nothing.
-
-Outside a span `db.request_inputs_changed()` is a no-op — every top-level
-call already opens its own request. Spans are reentrant: an inner span, or
-one opened inside a `get`, joins the enclosing request, and only the
-outermost close ends it.
-
-```python docs-check
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
-from pyinc import Database, FileResource, Input, query
-
-NOTES = FileResource()
-SUFFIX = Input[str]("span.suffix")
-
-
-@query
-def line_count(db: Database, path: str) -> int:
-    return len(NOTES.read(db, path).splitlines())
-
-
-@query
-def summary(db: Database, path: str) -> str:
-    return f"{line_count(db, path)}{SUFFIX.read(db)}"
-
-
-with TemporaryDirectory() as directory:
-    path = str(Path(directory, "notes.txt"))
-    Path(path).write_text("first\nsecond\n", encoding="utf-8")
-
-    db = Database()
-    db.set(SUFFIX, " lines")
-    assert db.get(summary, path) == "2 lines"
-
-    before = db.statistics()
-    with db.request_span():
-        assert db.get(line_count, path) == 2       # validates the file once
-        assert db.get(summary, path) == "2 lines"  # answers from that pass
-        assert db.inspect(summary, path).last_decision == "reused"
-        db.set(SUFFIX, " rows")                    # a real change rolls the span
-        assert db.get(summary, path) == "2 rows"   # re-validates against it
-    after = db.statistics()
-
-    # Four calls, two requests: one per declared world, not one per call.
-    assert after.total_requests - before.total_requests == 2
-    assert after.resource_probe_hits - before.resource_probe_hits == 2
-```
-
-Without the span those same four calls open four requests and re-probe the
-file on three of them.
+Inside a resource hook there is no open half: every call back into the
+`Database`, the reading surface included, raises `ReentrantDatabaseError`
+naming the hook, whether or not a query is running. A thread started inside a
+query body or a resource hook stands where its parent does and is refused
+rather than left to wait on the lock ([Thread Safety](#thread-safety)).
 
 ## Explicit Limitations
 
-These fall **outside** the soundness envelope. The kernel does not guarantee
-from-scratch consistency when any of these apply, except where the entry itself
-says otherwise: the durable-cache entry states the conditions under which the
+These fall **outside** the soundness envelope, except where an entry says
+otherwise: the durable-cache entry states the conditions under which the
 guarantee survives into a later process, and the eviction and caught-failure
 entries hold it in-process at the cost of incrementality.
 
-**1. Unintercepted ambient reads.**
-The condition 2 guard covers an enumerated set of entry points, not a category of
-behaviour. Everything else that observes external state bypasses it and silently
-violates condition 2 unless declared via `db.report_untracked_read(reason)`:
-`os.open()` (the low-level syscall), C-extension I/O, subprocess output, network
-calls, `ctypes` memory access, and similar.
-(See: `test_os_open_bypasses_untracked_read_guard`,
-`test_condition_two_entry_points_stay_guarded`)
+**1. Unintercepted ambient reads.** The condition 2 guard covers an enumerated
+set of entry points, not a category of behaviour. Everything else that observes
+external state bypasses it silently unless declared with
+`db.report_untracked_read(reason)`: `os.open()`, C-extension I/O, subprocess
+output, network calls, `ctypes` memory access, and similar. Four gaps sit close
+enough to the guarded set to be named:
 
-Four of those gaps sit close enough to the guarded set to be named individually.
-
-- **File metadata.** The guard sees file *contents* and directory *listings*; it
-  does not see `stat`. `os.stat`, `os.lstat`, `os.access`, `Path.stat`,
+- *File metadata.* `os.stat`, `os.lstat`, `os.access`, `Path.stat`,
   `Path.exists`, `Path.is_file`, `Path.is_dir`, `Path.resolve`, and the
-  `os.path` helpers built on them (`exists`, `isfile`, `getsize`, `getmtime`)
-  each reach the live filesystem from inside a query and return normally. A
-  query that asks whether a file exists, or how large or how recently modified
-  it is, rather than opening it, is therefore silently untracked: no dependency
-  edge is recorded, so the query is reused unchanged after that file appears,
-  disappears, or is rewritten, while a fresh `Database` reports the new state.
-  Route the observation through `FileStatResource`, whose probe covers
-  existence, size, and mtime, or through `ResolvedPathResource` when the
-  observation is where a path canonicalizes to: either one makes the
-  observation tracked, so a query that depends on it is invalidated when the
-  metadata moves. Declaring the read with `db.report_untracked_read(reason)`
-  does not make it tracked. It removes stale reuse for the declaring node
-  alone, which then re-executes on every request; another query that observes
-  the same metadata without declaring it is still reused unchanged.
-  (See: `test_file_metadata_reads_bypass_untracked_read_guard`,
-  `test_stat_only_query_is_never_invalidated_by_the_file_it_stats`,
-  `test_report_untracked_read_stops_memo_reuse_for_a_stat_only_query`,
-  `test_file_stat_resource_tracks_metadata_changes`,
-  `test_resolved_path_resource_tracks_symlink_retargeting`)
-- **The byte-oriented environment.** `os.getenv` and `os.environ` are
-  intercepted; `os.getenvb` and `os.environb` — the same process environment
-  under a second name where `os.supports_bytes_environ` holds — are not.
-  (See: `test_byte_environment_views_bypass_untracked_read_guard`)
-- **The working directory.** `os.getcwd` and `Path.cwd` are not intercepted, so
-  a query whose result varies with the process working directory is untracked.
-  Pass absolute paths as query arguments instead.
-  (See: `test_working_directory_reads_bypass_untracked_read_guard`)
-- **Threads the query did not start.** The guard reaches a thread by running it
-  in the context that started it, so it covers threads a query body starts, at
-  any depth of descent, and nothing else. A thread that already existed when
-  the query began — a pre-warmed pool, an executor built at module scope, a
-  reused `ThreadPoolExecutor` worker — never passes through that boundary, so a
-  query that hands its file or environment reads to one of them is untracked
-  just as if it had called `os.open` directly, and a query that waits on such
-  a worker while the worker waits on the state lock deadlocks rather than being
-  refused. Hand the work to a thread the query starts, or declare it. The
-  threads that are covered hold the context they inherited on the thread object
-  itself, so what bounds that retention is the lifetime of the thread object,
-  not the lifetime of the query.
-  (See: `test_untracked_read_still_enforced_per_thread`,
-  `test_query_spawned_thread_raw_reads_stay_guarded`,
-  `test_query_spawned_thread_calling_into_the_database_fails_fast`,
-  `test_thread_outliving_its_spawning_query_reads_freely_afterward`)
+  `os.path` helpers built on them return normally from inside a query, so a
+  query that asks whether a file exists, or how large or how recent it is,
+  records no edge and is reused unchanged after the file changes. Route the
+  observation through `FileStatResource` or `ResolvedPathResource`. Declaring
+  it removes stale reuse for the declaring node alone.
+- *The byte-oriented environment.* `os.getenvb` and `os.environb` are not
+  intercepted.
+- *The working directory.* `os.getcwd` and `Path.cwd` are not intercepted; pass
+  absolute paths as query arguments instead.
+- *Threads the query did not start.* The guard covers threads a query body
+  starts, at any depth, and nothing else. A pre-warmed pool, an executor built
+  at module scope, or a reused `ThreadPoolExecutor` worker is untracked, and a
+  query that waits on such a worker while the worker waits on the state lock
+  deadlocks rather than being refused. Hand the work to a thread the query
+  starts, or declare it.
 
-**2. Custom `eq=`/`cutoff=` with side effects.**
-If `eq=` or `cutoff=` callbacks perform ambient reads or mutations, the
-equivalence check itself becomes a hidden dependency. The kernel cannot detect
-this. These callbacks must be deterministic and side-effect-free; the kernel will
-continue to function but may make incorrect backdating decisions if they are not.
-This limitation does not relax identity validation: policy captures and callable
-instance state still have to be snapshot-safe.
-(See: `test_custom_eq_with_side_effect_does_not_corrupt_graph`)
+**2. Custom `eq=`/`cutoff=` with side effects.** If a policy callback performs
+ambient reads or mutations, the equivalence check itself becomes a hidden
+dependency the kernel cannot detect, and it may then make incorrect backdating
+decisions. Policy captures and callable instance state must still be
+snapshot-safe.
 
-**3. Mutation in `fast` mode.**
-`fast` mode does not detect mutation of boundary values inside queries. The frozen
-snapshot stored by the kernel is safe (it was deep-copied at set time), but a
-mutating query may observe corrupted intermediate state. Use `checked` or `strict`
-for mutation safety.
-(See: `test_fast_mode_uses_owned_values_without_mutation_detection`)
+**3. Mutation in `fast` mode.** `fast` does not detect mutation of boundary
+values inside queries. The stored snapshot is safe, but a mutating query may
+observe corrupted intermediate state. Use `checked` or `strict`.
 
-**4. Durable cross-run cache (trusted, under stated conditions).**
-The kernel is in-memory, but a durable `ArtifactStore` checkpoint (see
-[Checkpoint Save and Load](#checkpoint-save-and-load) for the API) is trusted
-for from-scratch consistency across processes and runs when **all** of the
-following hold:
+**4. Durable cross-run cache (trusted, under stated conditions).** A durable
+`ArtifactStore` checkpoint ([Checkpoint Save and Load](#checkpoint-save-and-load))
+is trusted for from-scratch consistency across processes and runs when **all**
+of the following hold:
 
 - **(i)** every `Input` the checkpoint depends on is set before
   `load_checkpoint`, uses the same explicit non-empty key across runs, and has
   the same equality or cutoff policy; compatible aliases resolve to one logical
   input, and a database rejects aliases with divergent policies;
-- **(ii)** resources satisfy the probe contract across runs — a resource's
-  probe changes whenever its `load` result changes, and probe values are
+- **(ii)** resources satisfy the probe contract across runs: a resource's probe
+  changes whenever its `load` result changes, and probe values are
   snapshot-safe and process-independent;
-- **(iii)** adapters for any adapted snapshot type are registered in the
-  loading process with unchanged `freeze`/`thaw` implementations;
+- **(iii)** adapters for any adapted snapshot type are registered in the loading
+  process with unchanged `freeze`/`thaw` implementations;
 - **(iv)** the checkpoint key and the store it loads from come from a trusted
   channel. Content addressing proves that bytes match the key they were asked
-  for by — it does not authenticate where the key came from. A coherent
-  attacker-selected key names a coherent attacker-selected manifest, so keys
-  and store contents must be produced by a prior trusted `save_checkpoint`,
-  not accepted from an untrusted input (see `SECURITY.md`);
-- **(v)** the loading database runs in the same mode as the database that saved
-  the checkpoint. The manifest records the saving mode, and a `load_checkpoint`
-  into a database running a different mode refuses with `CheckpointModeError`
-  before staging any record.
+  for by; it does not authenticate where the key came from, and an
+  attacker-selected key names an attacker-selected manifest (see
+  [SECURITY.md](../SECURITY.md));
+- **(v)** the loading database runs in the same mode as the one that saved the
+  checkpoint. The manifest records the saving mode, and a load into another
+  mode refuses with `CheckpointModeError` before staging any record.
 
 Under these conditions `load_checkpoint(key)` followed by `db.get(query)`
-returns the value a fresh recomputation on the same declared state would in that
-same mode. The guarantee is per-mode by construction: what a query computes —
-and so what a checkpoint persists — can depend on the mode that computed it, so
-a persisted value is trusted only by a database running the mode that produced
-it. The mechanisms that earn this:
+returns the value a fresh recomputation on the same declared state would in
+that mode. A checkpoint record warms when every pinned object and every
+statically captured module chain the record depends on is unchanged, and a
+record the kernel cannot verify is re-executed. Identities are recomputed live
+in the loading process, edges are re-checked by digest, resources are re-probed
+against the real world, and every snapshot loaded from the store is rejected
+unless `sha256` of its bytes equals the digest it was keyed by. Query subgraphs
+reached only through a runtime import or dynamic dispatch, records marked
+untracked, corrupted or missing store bytes, and adapter mismatches are skipped
+and re-executed. A tampered, truncated, wrong-version, wrong-kernel-fingerprint,
+or wrong-mode manifest is a property of the manifest as a whole, so the load is
+refused outright with a typed `CheckpointError` subclass and stages nothing.
 
-- **Query identities are recomputed live in the loading process.** A query's
-  identity pins the interpreter/build identity (see
-  [Interpreter and Build Identity](#interpreter-and-build-identity)) and the
-  full function-definition payload — a canonical typed code-object encoding,
-  defaults, keyword defaults, the function's own metadata (docstring,
-  annotations, name and qualified name, type parameters, and anything else
-  written on the function object), and the definitions of transitively
-  captured queries, functions, and modules — beside the comparator policies
-  and the `Query` handle's own state, so a body, policy or handle edit
-  anywhere in the captured graph, or a build-configuration change, produces a
-  different identity and the stale record simply misses. This encoding never
-  depends on object reference counts and supports nested code and slice
-  constants.
-  It pins where a definition sits inside its package — the defining module's
-  dotted name and its source file's basename — rather than the absolute path
-  that package was installed at, so two byte-identical installations of the
-  same distribution at different prefixes agree about every identity that does
-  not itself name a path. Two things still name one: a body that reads
-  `__file__` or passes a path as an argument folds that path as it always did,
-  and code whose compiled filename is not its defining module's own file — a
-  module imported without a `__file__`, a sourceless `.pyc` whose recorded
-  filename is the source it was built from, or a wrapper `functools.wraps`
-  gave another module's name — falls back to folding that filename verbatim
-  beside the module name, so it can never take a real module's location. Code
-  compiled without a source file at all (`<string>`, `<stdin>`) is folded
-  verbatim for the same reason.
-- **Inputs and dependency edges verify exactly.** Warmed records carry their
-  real dependency edges; each input and sub-query dependency is re-checked
-  against the live graph by digest before the record is trusted. Input policy
-  digests independently include the interpreter/build identity.
-- **Resources are re-probed or re-executed live.** A checkpoint dependency that
-  is a resource is re-probed against the real world; a sub-query dependency that
-  cannot be warmed is re-executed from its pinned code (the execute-to-verify
-  frontier) and its result digest compared to the manifest. Resource identity
-  is pinned as described under
-  [Additional Kernel Properties](#additional-kernel-properties).
-- **Bytes verify against their content addresses.** Every snapshot loaded from
-  the store is rejected unless `sha256` of its raw bytes equals the digest it was
-  keyed by, and the manifest itself is re-hashed against the checkpoint key
-  before anything is parsed out of it.
+Identities do not depend on the hash seed or the install path. A checkpoint
+written under one `PYTHONHASHSEED` warms a process running under another, and
+one written from one installation warms a byte-identical installation unpacked
+at another prefix, because identity pins where a definition sits in its
+package rather than the absolute path. A body that reads `__file__` or takes a
+path argument still folds that path, and code compiled without a source file
+of its own (`<string>`, a sourceless `.pyc`) folds its filename verbatim. A
+checkpoint does not survive an interpreter or build-configuration change; such
+records miss safely.
 
-Anything that cannot be verified is skipped and re-executed rather than trusted:
-query subgraphs reached only through a runtime import or dynamic dispatch (their
-code is not pinned into any identity), records marked untracked via
-`report_untracked_read()`, corrupted or missing store bytes, and adapter
-mismatches. A tampered, truncated, wrong-version, wrong-kernel-fingerprint, or
-wrong-mode manifest is rejected loudly with a typed `CheckpointError` subclass.
-The difference is what the failure is a property of: an individual record that
-cannot be verified is skipped and its query re-executes, but these are
-properties of the manifest as a whole, and there is no sound remainder to keep
-warming from — so the load is refused outright and stages nothing.
+**5. Ambient module or class monkey-patching.** Captured modules contribute
+their `__version__`, a SHA-256 digest of their source or compiled file bytes,
+their declared `__all__`, and — outside the standard library — their
+module-level stable constants read live and the behavior reached through
+statically resolvable attribute chains. A standard-library, built-in, or frozen
+module contributes only the constants on the attribute paths the capturing
+query's own code reads off it; the interpreter/build identity already pins the
+build. Re-exported functions and submodules pin their defining modules
+transitively; dynamic access to a custom module is rejected when the behavior
+cannot be proven. Rebinding a statically captured module attribute, or an
+entry in a directly captured class body, moves query identity at the next
+request, warm or fresh alike. Where the interpreter exposes no Python evaluator
+to observe (a `type` alias before 3.14, a runtime-constructed `TypeVar`'s
+bound) the payload anchors each class it reaches to its live module binding,
+and rebinding such a binding, a base, a metaclass, or a directly bound body
+class refuses loudly instead of moving identity.
 
-Residual limitations that stay outside the envelope: the stdlib-module gap of
-limitation 5 applies across runs exactly as it does in-process; and a
-checkpoint does not survive an interpreter or build-configuration change — such
-records miss safely (they re-execute) rather than being trusted. The hash seed
-is not part of that build configuration: a checkpoint written by a process
-running under one `PYTHONHASHSEED` warms one running under another, and a
-process that pinned the seed to zero shares a cache with one that left it
-unset. Neither is the absolute prefix the tree was installed at: by the
-location rule the code encoding follows, a checkpoint written from one
-installation warms a byte-identical installation unpacked somewhere else.
+Three shapes stay outside that envelope; route such state through an `Input`
+or a `Resource`:
 
-**5. Ambient module or class monkey-patching.**
-Captured modules contribute their `__version__`, a SHA-256 digest of their
-source or compiled file bytes, declared `__all__`, and — outside the standard
-library — their module-level stable constants read live and the behavior
-reached through statically resolvable attribute chains. A standard-library
-module — and any built-in or frozen module — contributes none of its namespace
-wholesale: the interpreter/build identity already pins the build those values
-come from, and some of them the interpreter rebuilds from one process to the
-next. A module counts as the standard library's when the interpreter installed
-it in one of its own library directories — plural, because some builds keep
-their extension modules in a directory beside the pure-Python ones rather than
-under them. What it contributes from that namespace is the constants on the
-attribute paths a capturing query's own code reads off it, folded beside the
-capture.
-Re-exported functions and submodules pin their defining modules transitively;
-dynamic access to a custom module is rejected when the behavior cannot be
-proven. A third-party version bump, a source-file edit, or a namespace write
-to a captured module's constant invalidates cached results that capture that
-module; for a standard-library module, that last case means a write to a
-constant on an attribute path the capturing query's own code reads. Query
-definitions are weakly memoized per `Database` for high-cardinality calls, and
-before a memoized fingerprint is reused the memo rechecks the runtime build,
-the observed definition objects, each captured module's file bytes and the
-constants it contributes, each captured resource's configuration digest, and
-each statically captured attribute chain — re-resolving the chain and
-observing the definitions behind the landings whose payloads read one live:
-functions, wraps-decorated callables, `Query` handles, `Input`s, type aliases,
-type parameters and resources, whose globals, defaults, policies, evaluators,
-instance and handle state the fold reads at fingerprint time. Rebinding a
-statically captured module attribute, or an entry in a directly captured class
-body, therefore moves query identity at the next request, warm or fresh alike
-— and so does a rebinding one of those landings' definitions reads, such as
-the module-level function an `Input`'s `eq` policy calls, the class a
-chain-landed type alias resolves to, or the function a chain-landed resource's
-`load` calls. Where the interpreter exposes no Python evaluator to observe — a
-`type` alias before 3.14, or a runtime-constructed `TypeVar`'s bound on every
-interpreter — the payload resolves the value eagerly and anchors each class it
-reaches to its live module binding, and the warm path carries the anchors for
-every class and carrier type the value names: rebinding such a binding then
-refuses loudly, warm and fresh alike, instead of moving identity. The further
-anchors a class's own definition contributes — its bases, its metaclass, the
-classes its body binds directly — are carried warm as well as fresh, because
-the warm path follows each anchored class's definition closure: rebinding a
-base, a metaclass or a directly bound body class refuses on both paths too. A
-class the body holds inside one of the immutable containers the payload
-accepts, rather than binding directly, stays outside that closure, and
-rebinding it leaves the memo answering with the stored fingerprint while a
-fresh computation moves or refuses. That descent stops at builtin and
-stdlib-rooted types, which are pinned by name anchor and runtime build rather
-than by a walk of their contents.
+- A chain that lands on a class or a frozen dataclass instance, named directly
+  or held inside an immutable container, is compared by the landing's identity,
+  so what its members hold or read moves a fresh fold but not a memoized one:
+  `foo.Model.flag = True` is seen by a fresh `Database` and not by a warm one.
+  When such a class stops being its module's live binding, a warm database
+  serves the stored answer while a fresh computation refuses.
+- A captured standard-library module folds the names of the paths read off it,
+  not the behavior behind them, so patching a stdlib function or class
+  (`json.dumps = other`) is not detected, warm or fresh. A path read through
+  `getattr` with a computed name contributes no path.
+- Outside the standard library, a module that stores a process id, an import
+  timestamp, or anything derived from them at module scope makes every
+  identity that captures it process-varying.
 
-Two shapes stay outside that envelope by design. A chain that lands on a class
-or a frozen dataclass instance — named directly, or held inside an immutable
-container the payload accepts, such as a tuple, a `NamedTuple` or a
-`frozenset` — is compared by that landing's identity, so what its members hold
-or read — a plain method, `staticmethod`, `classmethod`, `property` and
-`cached_property` alike — moves a fresh fold but not a memoized one:
-`foo.Model.flag = True` is seen by a fresh `Database` and not by a warm one.
-Rebinding is the other half of that landing: when a class such a container
-carries stops being its defining module's live binding, a warm database still
-serves the stored answer while a fresh computation refuses loudly instead of
-moving identity. And a captured standard-library module folds the names of the
-paths read off it rather than the behavior behind them — of what those paths
-land on, only the constants are folded — so patching a stdlib function or
-class it reaches (`json.dumps = other`) is not detected at all, warm or fresh;
-a stdlib type is pinned by its name anchor — its own name beside the identity
-of the module that defines it — and by the runtime build, so the type's own
-namespace is never walked. A path read dynamically — through `getattr` with
-a computed name — contributes no path, so the constant it lands on is folded
-only if the same body also names that path statically; a namespace write to
-what a purely dynamic read returns is not detected, warm or fresh. Route such
-mutable state through an `Input` or a custom `Resource`.
+**6. LRU eviction under active dependencies.** `Database(max_query_nodes=...)`
+bounds query memo nodes only, evicting at top-level request boundaries; inputs
+and resources stay resident. If an intermediate query is evicted while a
+dependent is still active, the dependent re-executes it on its next request:
+correct, but slower. Eviction also removes the node's call snapshot, timing
+profile, and unused registry entry.
 
-Outside the standard library a captured module still contributes its
-module-level constants, so a package that stores a process id, an import
-timestamp or anything derived from them at module scope makes every identity
-that captures it process-varying. It is rare per module and not rare per
-distribution — a survey of a 765-module environment found three such modules,
-in three of its twenty-two distributions — and the rule is deliberately about
-where a module came from rather than what its constants hold, because a
-process id is an `int` and a timestamp a `float`. Route such state through an
-`Input` or a `Resource`.
-
-**6. LRU eviction under active dependencies.**
-If `max_query_nodes` is set low enough that an intermediate query is evicted while
-a dependent is still active, the dependent will re-execute the intermediate from
-scratch on its next request. This is correct but may degrade performance.
-(See: `test_rewiring_with_lru_eviction`)
-
-**7. Catching an exception raised by a child query.**
-The edge a failing *resource* read publishes before its exception propagates has
-no query-side equivalent: a query's record and dependency edges publish only
-after it returns, so a query that catches an exception raised by a sub-query is
-left holding a value with no edge to what produced it. Except for the one shape
-the next paragraph names, that value is not carried into a later request. The
-catching query is marked untracked — the same mark `db.report_untracked_read`
-records, carrying a reason that names the sub-query whose exception was caught
-— so it re-executes on every request (a second ask *within* one request still
-reuses what that request already settled) and never backdates, and its record
-is kept out of checkpoints as well, together with everything above it. A later
-change that makes the sub-query succeed therefore reaches the caller, matching
-a fresh `Database`; what is lost is the incrementality — that query's body runs
-on every request, and the nodes above it re-verify, backdating only where their
-own results are unchanged. Model a failure the caller means to handle as a
-returned value, or route it through a `Resource`, to keep the caller
-incremental.
-
-A query refused for asking for *itself* is the one exception. That `CycleError`
-is the kernel refusing a shape before any work starts: nothing was executed
-below the refusal, so nothing was read into a frame that is now gone, and the
-refused request stays pinned to the registration the outer execution of that
-same node already owns. Catching that **in the query that asked for itself**
-leaves an ordinary reusable record; the exemption goes no further than that
-query, and a *parent* that catches a child's self-cycle is marked like any
-other caught failure, because the child read whatever it read before it asked
-for itself and its frame is discarded with those reads in it. A cycle that
-reaches back through *another* query is not that shape either — the branch
-that reached back read whatever it read before it did — so catching one of
-those marks the catcher too.
-(See: `test_caught_query_failure_does_not_publish_a_dependency_edge`,
-`test_caught_sub_query_failure_marks_the_catching_parent_impure`,
-`test_caught_sub_query_failure_excludes_the_parent_from_checkpoints`,
-`test_query_catching_its_own_cycle_keeps_committed_registries`,
-`test_caught_cycle_does_not_mark_the_catcher_impure`,
-`test_self_cycle_caught_by_the_parent_marks_the_parent_impure`,
-`test_cycle_caught_through_another_query_marks_the_catcher_impure`)
+**7. Catching an exception raised by a child query.** A query's record and
+edges publish only after it returns, so a failed or cyclic evaluation keeps an
+earlier record usable and cannot leave a dangling edge, and a query that
+catches an exception raised by a sub-query holds a value with no edge to what
+produced it. The catching query is marked untracked with a reason naming the
+sub-query, so it re-executes on every request, never backdates, and is kept
+out of checkpoints with everything above it. A later change that makes the
+sub-query succeed therefore reaches the caller, matching a fresh `Database`;
+what is lost is incrementality. Model a failure the caller means to handle as
+a returned value, or route it through a `Resource`. One shape is exempt: a
+query refused for asking for *itself* raises `CycleError` before any work
+starts, so catching that in the query that asked for itself leaves an ordinary
+reusable record. A parent catching a child's self-cycle, or a cycle that
+reaches back through another query, is marked like any other caught failure.
 
 ## Escape Hatches
 
-- **`db.report_untracked_read(reason)`** — marks the current query as impure;
-  forces re-execution on every request and disables backdating for that node.
-  Downstream consumers re-verify but can still backdate if their own results are
-  unchanged. The kernel applies the same mark on its own account wherever it
-  knows a value rests on something no record describes: a query that catches an
-  exception raised by a sub-query is marked with a reason naming that sub-query,
-  and — since that failure is not in the graph at all — kept out of checkpoints
-  as well; a query that catches a hook refusal from a resource this `Database`
-  has never loaded is marked the same way, with a reason naming the resource.
-  Limitation 7 states the one refusal that mark does not follow.
-  (See: `test_report_untracked_read_forces_reexecution_on_every_request`,
-  `test_impure_child_prevents_parent_backdating_unless_result_unchanged`)
+- **`db.report_untracked_read(reason)`** marks the current query as untracked:
+  it re-executes on every request and never backdates; dependents re-verify
+  but can still backdate when their own results are unchanged. The kernel
+  applies the same mark on its own account wherever a value rests on something
+  no record describes: a caught sub-query exception (limitation 7) and a caught
+  hook refusal on a never-loaded resource
+  ([Failing Resource Loads](#failing-resource-loads)).
 
-- **`ValueAdapter`** — allows custom types to participate in freeze/thaw by
-  implementing `freeze` and `thaw`. Adapters extend the condition 1 value
-  boundary, so the boundary's obligations extend to them as laws.
+- **`ValueAdapter`** lets a custom type participate in freeze/thaw. Adapters
+  extend the condition 1 boundary, so its obligations extend to them as laws:
+  - *Deterministic, side-effect-free hooks.* `freeze` and `thaw` are pure
+    functions of their arguments. Adapter work at query boundaries runs under
+    the condition 2 guard, so an intercepted read raises `UntrackedReadError`.
+  - *Owned results.* `freeze` returns a payload sharing no mutable state with
+    the live value; `thaw` returns a value the caller owns outright.
+  - *Semantic round-trip.* `thaw(freeze(x))` is semantically equal to `x`
+    wherever the adapted type is consumed.
+  - *Mode-shaped payloads.* `thaw` runs at every boundary in every mode. Its
+    first argument is the payload as the snapshot holds it; its second, the
+    recursive callable, yields values the way that mode exposes them, so one
+    implementation serves all three modes. A payload that freezes to a `list`,
+    `dict`, `set`, or dataclass inside a shared or cyclic value, or a tuple
+    holding such a container, cannot be handed back whole, so `freeze` refuses
+    the value with `UnsupportedValueError`; an adapter with a container to
+    carry decomposes it into tuples and scalars.
+  - *Pinned adapter state.* Adapter instance configuration is immutable for the
+    registered lifetime: it is digested at construction and re-derived on every
+    top-level request, and `AdapterContractError` names the adapter key whose
+    digest moved or can no longer be derived. Implementations and configuration
+    participate in checkpoint identity, not in a query's definition
+    fingerprint. An adapter whose configuration cannot be digested contributes
+    no digest, is skipped by the in-process check, and is refused trust by
+    checkpoints.
 
-  Every `Database` starts from the kernel's own adapters for its own value
-  types, published as `BUILTIN_ADAPTERS`: a stateless `FileStatAdapter`
-  registered for `FileStatSnapshot`, so a stat reading crosses every boundary
-  as the type the resource declares. Registering an adapter for one of those
-  types replaces the built-in entry rather than colliding with it, and the
-  replacement is a caller adapter in every respect the laws below describe.
-  The built-ins themselves are exempt from one: they hold no instance
-  configuration for the pinned-state check to watch, and their
-  implementations ship with the kernel and so cannot move while it runs. Their
-  implementation digests are therefore derived once per process rather than at
-  every trust boundary, and a second `Database` reads back what the first
-  derived. A registered adapter of your own is digested at every boundary
-  crossing, as before.
+  The built-in adapters (`BUILTIN_ADAPTERS`: a stateless `FileStatAdapter` for
+  `FileStatSnapshot`) hold no instance configuration and ship with the kernel,
+  so their digests are derived once per process rather than at every boundary.
 
-  The laws:
-
-  - **Deterministic, side-effect-free hooks.** `freeze` and `thaw` are pure
-    functions of their arguments; neither reads ambient state. Adapter work
-    at query boundaries runs under the condition 2 guard, so an intercepted
-    read raises `UntrackedReadError` there.
-  - **Owned results.** `freeze` returns a payload sharing no mutable state
-    with the live value; `thaw` returns a value the caller owns outright.
-  - **Semantic round-trip.** For any accepted value, `thaw(freeze(x))` is
-    semantically equal to `x` wherever the adapted type is consumed.
-  - **Mode-shaped payloads.** `thaw` runs at every boundary in every mode. Its
-    first argument is the payload as the snapshot holds it — a rebuilt view of
-    that payload under `strict`, the raw stored payload under `checked` and
-    `fast` — so a mapping payload arrives as a `Mapping` and a tuple payload as
-    a tuple whichever mode is in force. What is mode-shaped is the second
-    argument, the recursive callable: it yields values the way that mode
-    exposes values, `Frozen*` views under `strict` and thawed containers under
-    `checked` and `fast`. One implementation therefore serves all three modes.
-
-    The exception is a payload the graph encoding would hold as a node of its
-    own, which is what happens when the payload freezes to a `list`, `dict`,
-    `set` or dataclass inside a shared or cyclic value. Such a payload cannot
-    be handed back to `thaw` whole: `checked` and `fast` would pass the
-    unresolved `FrozenRef` in its place, and `strict` would pass a container
-    whose contents at that instant follow the order the kernel fills its nodes
-    in. So `freeze` refuses the value with `UnsupportedValueError` rather than
-    producing a snapshot that answers differently by mode and by where the
-    adapted value sat. The refusal reaches whatever the payload reaches. A
-    payload that freezes to a tuple or a scalar is written inline and is never
-    held as a node, which is why the kernel's own adapters take positional
-    payloads — but a tuple is inline only as far as its own elements, so a
-    tuple holding a shared or cyclic container carries a reference into the
-    node table and is refused on the same terms. A tree-shaped adapted value
-    is unaffected in every payload shape, because nothing in it is held as a
-    node. An adapter that has a container to carry across the boundary
-    decomposes it into tuples and scalars, which the encoding returns whole
-    wherever the adapted value sits.
-  - **Pinned adapter state.** Adapter instance configuration is immutable for
-    the registered lifetime, and the kernel enforces the law in-process: each
-    adapter's instance configuration is digested at construction, every
-    top-level request re-derives those digests, and `AdapterContractError`
-    names the adapter key it is raised for — the key whose digest moved, or,
-    when an adapter's configuration has stopped being fingerprintable, the
-    key whose digest can no longer be re-derived, with the underlying refusal
-    chained. Implementations and configuration participate in checkpoint
-    identity; neither reaches a query's definition fingerprint, though an
-    adapted value passed as an argument reaches that call's `args_digest`
-    like any other argument. An adapter whose configuration cannot be
-    digested at construction — slot state, or instance state the snapshot
-    machinery refuses — contributes no digest and is skipped by the
-    in-process check on its own account: every other adapter in the same
-    registry is still re-derived and still raises on drift, and checkpoints
-    refuse to trust the skipped adapter's records.
-
-  (See: `test_adapter_freeze_of_a_query_result_runs_under_the_guard`,
-  `test_adapter_thaw_of_query_arguments_runs_under_the_guard`)
-
-- **`eq=` / `cutoff=`** on `Input` and `@query` — allows custom equivalence.
-  `eq=` compares detached operands, so nothing a comparator does to them can
-  reach the stored snapshot: a recomputed query result reaches the comparator
-  as thawed values in `checked` and `fast` and as detached `Frozen*` views in
-  `strict` (a graph-shaped result as shared/cyclic views, not as the
-  `FrozenGraph` envelope), while an input update reaches it as thawed values
-  in every mode. `cutoff=` derives its snapshot-safe tokens from those same
-  detached operands, and the tokens are compared under the canonical relation.
-  A cyclic operand is handed over as the cycle it is, so a comparator or token
-  function that walks it structurally recurses forever: `left == right` over
-  cyclic operands raises `RecursionError` identically in `strict`, `checked`,
-  and `fast`, and a policy declared on a query that can return a cyclic result
-  must be cycle-aware.
-  These are mutually exclusive. Cutoff tokens must be snapshot-safe, and the
-  declared equivalence must be substitutive for dependents (condition 3) for
-  the guarantee to hold on exact values.
-  (See: `test_input_cutoff_suppresses_equal_updates`,
-  `test_query_cutoff_backdates_and_skips_downstream`,
-  `test_custom_eq_over_a_graph_shaped_result_sees_the_graph`,
-  `test_structural_eq_over_cyclic_operands_raises_in_every_mode`)
+- **`eq=` / `cutoff=`** on `Input` and `@query` declare a custom equivalence;
+  they are mutually exclusive. `eq=` compares detached operands, so nothing a
+  comparator does to them reaches the stored snapshot: a recomputed result
+  arrives as thawed values in `checked` and `fast` and as detached `Frozen*`
+  views in `strict`, an input update as thawed values in every mode. `cutoff=`
+  derives snapshot-safe tokens from those same operands, compared under the
+  canonical relation. A cyclic operand is handed over as the cycle it is, so a
+  structural `left == right` raises `RecursionError` in every mode; a policy on
+  a query that can return a cyclic result must be cycle-aware. The declared
+  equivalence must be substitutive (condition 3) for the guarantee to hold on
+  exact values.
 
 ## Output Reconciliation (Actions)
 
-Queries are pure and never write. The separate **action layer** (`@action`,
+Queries are pure and never write. The separate action layer (`@action`,
 `Output`, `ReconcileResult`; see [action-contract.md](action-contract.md))
-reconciles a query-derived desired-output set against the filesystem: atomic
-writes, content-hash change/tamper detection, ownership-ledger orphan deletion,
-and dry-run planning. Reconciliation runs at top level only — never inside a
-query — so it does not change query semantics, the value membrane,
-untracked-read enforcement, or the `strict`/`checked`/`fast` modes. The
-kernel's from-scratch guarantee lifts to owned output files under the
-conditions the action contract's Soundness boundary states: for successfully
-completing reconciles, an incremental sequence yields the same owned output
-files as a single reconcile from a fresh `Database` into an empty directory.
-
-## Additional Kernel Properties
-
-- Query identity includes the function-definition payload — supported captured
-  values and the full definition payloads of transitively captured queries, so
-  a body edit to a dependency query moves the parent's identity — plus the
-  interpreter/build identity (see
-  [Interpreter and Build Identity](#interpreter-and-build-identity)). A
-  `functools.wraps`-decorated callable object is fingerprinted by its
-  implementation type, its `__call__` definition and its instance state, with
-  `__wrapped__` folded as additive information rather than as a substitute for
-  them, and a class carrying a `__wrapped__` attribute is fingerprinted as a
-  class; acceptance and state sensitivity are the same whether such a value is
-  captured directly or reached as a module attribute. The `Query` handle's own
-  attributes and metadata are folded beside the function, so writing one
-  reparameterizes the query instead of changing it behind its records.
-  Module-level types are pinned through their defining module identity.
-- Mutable closure/global captures and local or dynamically unbound type
-  objects are rejected, and so are reflective namespace reads. `globals()`,
-  `locals()`, `vars()`, `eval`, `exec` and a `__globals__` attribute load are
-  refused on their own; `getattr`/`setattr`/`delattr` and a `__dict__` load
-  are refused beside a handle that can reach a module namespace — a `modules`
-  attribute load, which survives whatever name `sys` was imported under, the
-  string `"modules"` beside one of those builtins, which is how `getattr`
-  spells the same reach, an `import_module` attribute load, which survives an
-  aliased or body-scope `importlib` the same way, or a global load of the name
-  `importlib`. That rule is a conservative static read of the bytecode of the
-  query's own function and of every callable folded into its identity,
-  including an evaluator reached through a handle's `__annotate__`, so a
-  legitimate `getattr` beside a module-namespace handle is rejected too. Its
-  edges are drawn deliberately rather than left implied: reaching a module
-  namespace is not itself an offense, so `sys.modules[name]` and
-  `import_module(name)` with no reflective builtin beside them are accepted.
-  Neither read reaches identity: the module a table lookup or an
-  `import_module` call hands back at run time is not a capture, and `sys` and
-  `importlib` are themselves standard-library modules, whose captures fold the
-  names of the paths read off them rather than the behavior behind them
-  (limitation 5). Route such state through an `Input` or a `Resource`. Use
-  `pyinc.explain_query_captures(fn)` to preview how each capture will be
-  classified before the first `db.get()`; it also reports reflective namespace
-  reads, and given a `Query` it covers the handle's own state.
-- `Query` is public, and `@query(key=...)` accepts an explicit stable key; the
-  default is `module:qualname`. Coroutine and generator queries are rejected at
-  decoration time.
-- `Input` keys and `@query`/`Query` keys are exactly `str` and non-empty. A
-  `str` subclass — including a `StrEnum` member and a `str`-mixin `Enum`
-  member — is rejected at construction, and the refusal names the plain string
-  to pass instead (`member.value` for an Enum key). A key is stored as node
-  identity and formatted into node labels, query identities and the checkpoint
-  manifest, so a subclass would let its own equality, formatting and
-  truthiness decide what the kernel records. `Resource.label()` must likewise
-  return exactly `str`, because its return value becomes the node's label.
-  Exactness is decided before emptiness at all three boundaries, so no value's
-  own dunders answer the non-empty check.
-- `Resource[KeyT, ValueT, ProbeT]` and `Database.read_resource(...)` are public.
-  Resource identity includes the resource's configuration, the implementations
-  of every state-observation hook (`probe`, `load`, `probe_and_load`, and
-  `identity`), and the interpreter/build identity. A configuration that changes
-  between two reads leaves the resource undefined. Where the change is written
-  into a list, dict or set the resource holds — a read log or a cache kept in
-  one — the read that observes it is refused, naming the resource. A change made
-  anywhere else is not refused: a value rebound on the resource, or rebound
-  inside another object it holds, is what the query's own definition check sees
-  instead, so the query re-fingerprints on every request as it always has,
-  executing cold each time and reusing nothing. Either way a resource that keeps
-  observation state of its own must define `identity()` to return the
-  configuration that distinguishes it. The built-in resources (condition 2)
-  cover text, binary, environment, stat, directory, and path-resolution
-  observation.
-- `Database.inspect(...)` exposes the last recorded provenance tree as structured
-  data. `Database.explain(...)` formats it for humans. Inspection is
-  observational and does not force an extra verification pass;
-  `Database.inspect_fresh(...)` runs verification first and then returns the
-  provenance tree.
-- `Database(max_query_nodes=...)` enables bounded memoization. Eviction happens
-  at top-level request boundaries and affects query nodes only. Per-node timing
-  uses fixed-size count/total/min/max/last aggregates; eviction also removes the
-  node's call snapshot, timing profile, and unused query registry entry.
-- Query labels consist of the query key, a short argument digest, and the query
-  function's name — nothing else; formatting a graph or profile never calls
-  argument `repr` or embeds argument values.
-- Query records and dependency rewiring publish only after successful execution.
-  A failed or cyclic evaluation keeps an earlier record usable and cannot leave a
-  dangling dependency edge.
-- The distributed package is PEP 561 typed via `py.typed`.
+reconciles a query-derived desired-output set against the filesystem with
+atomic writes, content-hash change and tamper detection, ownership-ledger
+orphan deletion, and dry-run planning. Reconciliation runs at top level only,
+never inside a query, so it changes nothing about query semantics, the value
+membrane, untracked-read enforcement, or the modes. The from-scratch guarantee
+lifts to owned output files under the action contract's soundness boundary.
 
 ## Interpreter and Build Identity
 
 Query identities, input policy digests, resource identities, and adapter
-digests each embed a common interpreter/build identity. Its components include
-the Python implementation, the full version tuple (including the prerelease
-level), the platform, `os.name`, the byte order, the API/ABI tag, the
-multiarch/platform tag, the extension suffix, the build string, the pointer
-width, and every field of `sys.flags` this interpreter exposes except
-`hash_randomization` — folded by name rather than by position, so a flag a
-future interpreter adds is folded the day it appears and no flag can shift the
-meaning of another's slot.
-
-Hash randomization is deliberately not among them. Two processes that leave
+digests embed one interpreter/build identity: the implementation, the full
+version tuple, the platform, `os.name`, the byte order, the API/ABI tag, the
+multiarch tag, the extension suffix, the build string, the pointer width, and
+every `sys.flags` field except `hash_randomization`, folded by name. Hash
+randomization is excluded deliberately: two processes that leave
 `PYTHONHASHSEED` unset carry the same flag and different hash orders, so
-folding it would separate a `PYTHONHASHSEED=0` process from every other one
-without separating anything a query's answer can depend on. Route a dependence
-on hash order through an `Input` or a `Resource`.
+folding it would separate nothing a query's answer can depend on. Route a
+dependence on hash order through an `Input` or a `Resource`. A free-threaded
+build, another minor version, or another platform derives different identities
+and misses safely.
 
 ## Thread Safety
 
-Within a process, `Database` is thread-safe for concurrent use both across
-independent instances and on a single shared instance. Each `Database` holds
-a `threading.RLock` that serialises every public state read and mutation,
-including queries, resources, inputs, statistics, profiles, dependency graphs,
-resets, checkpoint operations, and subscriptions. A thread that is outside
-every query of that instance waits its turn on that lock and lands as soon as
-the running work releases it, whatever that work is.
+Within a process, `Database` is thread-safe both across independent instances
+and on one shared instance. Each `Database` holds a `threading.RLock` that
+serialises every public read and mutation. Threads sharing one instance
+serialise on its lock; threads holding separate instances do not contend. That
+is not parallelism: on a default build CPU-bound Python work does not run in
+parallel across threads, and parallel speedup needs separate processes. The
+ambient-read guard is installed globally exactly once and dispatches per
+context through a `ContextVar` stack of active databases, so threads inside
+queries on different instances do not disturb each other's enforcement, and
+raw I/O from a thread that is not inside any query is unaffected.
 
-The ambient-read guard is installed globally exactly once and dispatches
-per-context via a `ContextVar` stack of active databases — two threads inside
-queries on different `Database` instances do not stomp each other's
-enforcement, and raw I/O from a thread that is *not* inside any query continues
-to work unaffected. If many threads share a single `Database`, work serialises
-on the per-instance lock; threads holding separate `Database` instances do not
-contend on each other's lock. That is not parallelism: on a default build,
-CPU-bound Python work does not run in parallel across threads, and threading
-such work can be slower than not threading it at all. Parallel speedup for that
-work needs separate processes.
-
-A thread that a query body **starts** is one case that does not simply
-wait: it inherits the boundary of the query that started it. Its undeclared
-ambient reads raise `UntrackedReadError` exactly as they would on the
-executing thread, and its calls back into that same `Database` raise
-`ReentrantDatabaseError` instead of waiting for the lock — the reading surface
-`get`, `read_input`, `read_resource`, `request_span` and
-`report_untracked_read`, `Subscription.unsubscribe`, and every
-administrative and observational entry point beside them (the outside-only
-set, enumerated under Public Surface below). Nothing a descendant can reach
-waits on the lock. Waiting is what they must not do: the query body holds
-the lock for the whole of its execution, so a child that blocks on it while
-the body waits for the child is a deadlock, and the refusal is what turns
-that pair into an error the caller can read. The boundary ends when the query
-does — a thread that outlives its spawning query is an ordinary thread again,
-and both its reads and its calls are allowed.
-
-A thread that a **resource hook** starts is covered too, and this holds with no
-query running at all: a `read_resource` made at top level holds the state lock
-across the whole hook while opening no execution, so a child that inherited
-nothing would block on that lock until its parent returned — never, if the
-parent joins it. Such a child's calls raise `ReentrantDatabaseError` naming the
-hook. What it inherits is a hook's standing and not a query's, and the two
-differ in both directions. Its raw reads are **allowed**: a hook carries
-raw-read permission for its extent and the child inherits that with the rest,
-so observing files, the environment and directory listings is what such a child
-is for, exactly as it is for the hook itself — only its calls back into the
-`Database` refuse. In the other direction, a hook's boundary is a depth rather
-than a frame, and a depth carries no completion flag, so a thread started
-inside a hook that *outlives* that hook keeps reporting itself inside one and
-stays refused, where a survivor of a query returns to normal. Either survivor's
-context holds the `Database` itself for as long as the thread object lives, and
-a thread the survivor starts in turn stands where the survivor does.
-
-Threads that already existed when the query began — a pre-warmed pool, an
-executor built at module scope, a reused `ThreadPoolExecutor` worker — are
-outside that boundary. Their ambient reads are not intercepted, so a query
-that farms one out to such a worker records no dependency for it
-(limitation 1), and their calls into the database are not refused, so a query
-that waits on such a worker while the worker waits on the lock still
-deadlocks. Hand the work to a thread the query itself starts, or keep the
-I/O in a declared read.
+A thread a **query body** starts inherits the boundary of that query. Its
+undeclared ambient reads raise `UntrackedReadError`, and its calls back into
+the same `Database` raise `ReentrantDatabaseError` instead of waiting for the
+lock, which the query body holds for its whole execution; a child that waited
+while the body waited for it would deadlock. The boundary ends when the query
+does. A thread a **resource hook** starts inherits the hook's standing, with or
+without a query running: its raw reads are allowed, and only its calls back
+into the `Database` refuse. A hook's boundary is a depth rather than a frame,
+so a thread that outlives its hook stays refused, where a survivor of a query
+returns to normal. Threads that already existed when the query began are
+outside every boundary (limitation 1).
 
 ## Snapshot Serialization and Store Keys
 
-The kernel derives deterministic content keys from the `Snapshot` union
-(scalars, `FrozenList`, `FrozenDict`, `FrozenSet`, `FrozenRecord`,
-`FrozenAdapterValue`, `FrozenGraph`, `FrozenRef`, and tuples of the same). The
-length-prefixed, type-tagged byte grammar is stable across supported CPython
-minor versions. Its digest helper is internal and is intentionally not exported
-from `pyinc`; consumers use the `ArtifactStore` and checkpoint APIs rather than
-constructing store keys themselves.
-
-The public `serialize_snapshot` and `deserialize_snapshot` functions round-trip
-the full snapshot grammar, including `FrozenGraph` / `FrozenRef`. Serialized
-snapshots contain data only; adapted values still require the matching adapter
-registry when they are thawed. A byte-grammar change is a cache-key break, so
-older persisted records are rejected rather than silently reused.
-
-The grammar requires the canonical order rather than recording whatever order
-it is given: a hand-assembled `FrozenDict` whose entries or `FrozenSet` whose
-members sit in any other order is rejected with `UnsupportedValueError` by
-`freeze`, `thaw`, `serialize_snapshot` and `deserialize_snapshot` alike. Two
-snapshots that a caller means to be the same value therefore cannot encode to
-different bytes through an ordering difference — the alternative would let one
-value hold two store keys.
+The kernel derives deterministic content keys from the `Snapshot` union —
+scalars, `FrozenList`, `FrozenDict`, `FrozenSet`, `FrozenRecord`,
+`FrozenAdapterValue`, `FrozenGraph`, `FrozenRef`, and tuples of the same — using
+a length-prefixed, type-tagged byte grammar that is stable across supported
+CPython minor versions. The digest helper is internal; consumers use the
+`ArtifactStore` and checkpoint APIs rather than constructing store keys.
+`serialize_snapshot` and `deserialize_snapshot` round-trip the full grammar;
+serialized snapshots contain data only, so adapted values still need the
+matching adapter registry when thawed. A byte-grammar change is a cache-key
+break: older persisted records are rejected rather than reused. The grammar
+requires the canonical order rather than recording whatever order it is given,
+so a hand-assembled `FrozenDict` or `FrozenSet` in any other order is rejected
+with `UnsupportedValueError` by `freeze`, `thaw`, `serialize_snapshot`, and
+`deserialize_snapshot` alike, and one value cannot hold two store keys.
 
 ## Checkpoint Save and Load
 
-An outbound `ArtifactStore` (`InMemoryArtifactStore` /
-`FileSystemArtifactStore`) optionally accepts every snapshot the kernel
-freezes, keyed by its internally derived content digest, via `Database(store=...)`.
-Snapshot bytes use the encoding described in
-[Snapshot Serialization and Store Keys](#snapshot-serialization-and-store-keys).
-
-An implementation owes three things. `get` returns `None` for a digest the
-store does not hold and never raises for a missing one. `put` is idempotent for
-equal bytes under the same digest and raises `ValueError` when a digest would
-be rebound to different bytes, because silently keeping either value would mask
-corruption. `contains` reports whether a digest is present, defaulting to
+An `ArtifactStore` (`InMemoryArtifactStore`, `FileSystemArtifactStore`) passed
+as `Database(store=...)` receives every snapshot the kernel freezes, keyed by
+its content digest. An implementation owes three things: `get` returns `None`
+for a digest it does not hold and never raises for one; `put` is idempotent for
+equal bytes under the same digest and raises `ValueError` when a digest would be
+rebound to different bytes; `contains` reports presence, defaulting to
 `get(...) is not None`. Every store handed to `Database(store=...)`,
-`save_checkpoint(store=...)` or `load_checkpoint(..., store=...)` is validated
-against the protocol at that call: one missing `get`, `put` or `contains`, or
-one that explicitly subclasses the protocol without implementing `get` and
-`put`, raises `TypeError` at injection rather than failing further downstream.
-A store validated at construction is not re-validated per call.
-`InMemoryArtifactStore` adds a `keys()` accessor outside the protocol; it
-returns a read-only mapping view of the store's contents rather than the
-backing dictionary, so a stored payload cannot be rebound or dropped through it
-behind the collision guard.
+`save_checkpoint(store=...)`, or `load_checkpoint(..., store=...)` is validated
+against the protocol at that call, and a missing method, or an explicit
+protocol subclass implementing neither `get` nor `put`, raises `TypeError` at
+injection. `InMemoryArtifactStore.keys()` returns a read-only view.
 
-On top of this, `Database.save_checkpoint(store=None) -> str` serialises the
-current query and resource records — their snapshot bytes, call snapshots,
-resource parameters, dependency edges, and per-adapter implementation digests —
-into a content-addressed manifest (schema v8), returning a key prefixed with
-`"ck"`. The manifest also records the mode the saving database ran in, so a
-checkpoint is attributable to exactly one mode; loading it into a database
-running another is refused under condition (v) of limitation 4. Adapter digests
-include `freeze`/`thaw` code, snapshot-safe instance configuration, and the
-interpreter/build identity. Saving rejects an adapter whose captures or state
-cannot be pinned; loading under such an adapter safely misses and re-executes
-instead of thawing checkpoint bytes across an unverifiable implementation
-boundary. Records whose cached value no longer matches the live graph (a
-"dirty" save with no intervening `get`) are omitted rather than persisted
-stale, so a reload never warms a value a fresh run would not produce.
+`Database.save_checkpoint(store=None) -> str` serialises the current query and
+resource records — snapshot bytes, call snapshots, resource parameters,
+dependency edges, per-adapter implementation digests, and the saving mode —
+into a content-addressed manifest (schema v8) and returns a key prefixed with
+`"ck"`. Saving rejects an adapter whose captures or state cannot be pinned.
+Records whose cached value no longer matches the live graph (a dirty save with
+no intervening `get`) are omitted, so a reload never warms a value a fresh run
+would not produce.
 
-`Database.load_checkpoint(key, store=None)` validates every record, dependency,
-input policy, probe, and referenced content address before atomically staging
-any records; the manifest and byte-level checks that gate this are part of the
-trust envelope described under limitation 4. The next `db.get(query)` verifies
-dependencies as described there and reuses the stored result without
-re-executing when everything checks out, or re-executes the affected query
-otherwise. Both methods accept an optional `store=` kwarg for call-site store
-injection; the store passed to `load_checkpoint` is also used for subsequent
-snapshot loading if the `Database` was not constructed with a `store=`
-argument.
+`Database.load_checkpoint(key, store=None)` re-hashes the manifest against the
+key, validates every record, dependency, input policy, probe, and content
+address, and only then stages records atomically, under the trust rules of
+limitation 4. The store passed to `load_checkpoint` is also used for later
+snapshot loads if the `Database` was constructed without one. Manifest schema
+v8 rejects older manifests with `CheckpointVersionError`; stale checkpoints are
+re-saved, never migrated. A store found holding different bytes under a digest
+the kernel is publishing is an integrity fault: `save_checkpoint` raises, and a
+value re-executed because the load skipped those bytes meets the same refusal
+when it is persisted again. Recovery is removing the corrupt object or
+supplying a clean store.
 
-A store found holding different bytes under a digest the kernel is publishing
-is a real integrity fault rather than a condition to route around:
-`save_checkpoint` raises, and a value re-executed because the load skipped
-those same bytes meets the same refusal when a database writing through that
-store persists it. Recovery is removing the corrupt object or supplying a clean
-store; the kernel never silently recomputes around one.
+### FileSystemArtifactStore
 
-Manifest schema v8 rejects v1-v7 manifests with `CheckpointVersionError`; stale
-checkpoints are re-saved, never migrated.
-
-## FileSystemArtifactStore
-
-`FileSystemArtifactStore` accepts only digest-shaped keys, serializes each
+`FileSystemArtifactStore` accepts only digest-shaped keys, serialises each
 digest with an OS-native process lock, and publishes flushed same-directory
-temporary files atomically.
-
-On POSIX it uses no-follow directory-relative operations, reopens the expected
-parent and verifies its filesystem identity immediately before publication, and
-rejects a directory rename it observes. POSIX cannot portably exclude a hostile
-rename in the final interval between that check and the mutation, so store
-roots must not be concurrently renamed by non-cooperating processes.
-
-On Windows it pins every non-reparse directory component with a handle that
-denies delete sharing, publishes from the temporary-file handle, and deletes
-only through a validated file handle. Lock files retain the same protected
-directory handle chain for the lock's lifetime.
-
-Unsafe object, directory, or lock paths surface a typed `ArtifactStoreError`;
-lock timeouts surface `ArtifactStoreLockError`.
+temporary files atomically. On POSIX it uses no-follow directory-relative
+operations and verifies the parent's filesystem identity immediately before
+publication; POSIX cannot exclude a hostile rename in the final interval, so
+store roots must not be concurrently renamed by non-cooperating processes. On
+Windows it pins every directory component with a handle that denies delete
+sharing and publishes from the temporary-file handle. Unsafe paths surface
+`ArtifactStoreError`; lock timeouts surface `ArtifactStoreLockError`.
 
 ## Push Observers
 
 `Database.observe(callback, query, *args, **kwargs)` registers a callback that
-fires when the identified query node's stored value moves. It returns a
-`Subscription` whose `unsubscribe()` method detaches exactly the registration
-that produced it; repeated unsubscribes are no-ops, and no change committed
-after `unsubscribe()` returns reaches that registration. Each `observe` call is
-its own registration: registering the same callable twice delivers twice, and
-each handle detaches only its own. Both `observe` and
-`Subscription.unsubscribe` are outside-only — reached from a query body, a
-resource hook, or a thread spawned inside a running execution they raise
-`ReentrantDatabaseError` (Thread Safety, above): a subscriber list must not be
-a function of which executions the kernel happened to run.
+fires when the identified query node's stored value moves, and returns a
+`Subscription` whose `unsubscribe()` detaches exactly that registration;
+repeated unsubscribes are no-ops, and no change committed after `unsubscribe()`
+returns reaches it. Each `observe` call is its own registration. Both calls are
+outside-only ([Reentrancy](#reentrancy)).
 
-Fires exactly when the node's stored value **moved** during a top-level
-`get` / `inspect` / `inspect_fresh` / `explain` call, or during the calls
-inside a `request_span`:
+A callback fires exactly when the node's stored value moved during a top-level
+`get` / `inspect` / `inspect_fresh` / `explain` call or inside a
+`request_span`: a cold execution, or a re-execution that advanced `changed_at`.
+It does not fire on a backdate, a reuse, a re-execution that landed a
+byte-identical value on an untracked node, or `db.set` / `db.set_many` alone;
+input mutation executes nothing, and observers fire on the next `get`. An
+untracked node forfeits its `eq=`/`cutoff=` policy for events as it does for
+backdating: a byte-different value its policy would call equal still fires.
 
-- a cold execution (no prior record), or
-- a re-execution that advanced the node's `changed_at` — it landed a value
-  the kernel did not equate with the previous one.
-
-Does **not** fire on:
-
-- `"backdated"` — the recomputation was backdated (see
-  [The Guarantee](#the-guarantee));
-- `"reused"` — dependencies were unchanged so no recomputation happened;
-- a re-execution that landed a byte-identical value on a node marked
-  untracked: the node re-ran — `last_recompute` stays `"executed"` — but
-  there is no new value to deliver;
-- `db.set(...)` / `db.set_many(...)` — input mutation alone does not
-  execute any query. Observers fire on the next `get` that triggers
-  dependent re-execution.
-
-A node marked untracked forfeits its `eq=` / `cutoff=` policy for events
-exactly as it does for backdating: a re-execution that lands a byte-different
-value its policy would call equal still moves the value and still fires. Only
-the byte-identical case above stays silent.
-
-Dispatch model:
-
-- Events are buffered on the outermost request scope and delivered **after**
-  the kernel lock is released. A callback may therefore re-enter the
-  database (e.g. call `db.get(...)`) without risk of deadlock. Inside a
-  `request_span` the outermost request scope is the span itself: events
-  buffered by the calls inside the span are delivered when the outermost span
-  closes — on a clean close and when the span body raises — and an inner
-  span's close delivers nothing.
-- For each event, the callback list for that node is snapshotted once at
-  event time — when the change commits, under the state lock — and checked
-  once against live membership as delivery begins, then dispatched
-  lock-free. A subscription added after the change, even inside the same
-  request, does not receive it; one removed before delivery begins receives
-  nothing; one removed during dispatch will still receive events already
-  snapshotted.
-- Exceptions raised by a callback are routed to the
-  `observer_error_hook` passed to `Database(...)` (default: a one-line
-  stderr log) and do not suppress sibling callbacks for the same event.
-- Subscriptions survive LRU eviction of their node: if the evicted node is
-  later re-executed, the callback fires normally — as a cold execution,
-  whose event can carry the same `changed_at` as one delivered before the
-  eviction; the stream does not promise strictly climbing `changed_at`
-  values.
-
-`QueryChangeEvent` is a frozen dataclass carrying the node's `query_id`,
-`args_digest`, the decision that produced the move — always `"executed"`,
-since backdates and reuses never fire — and the `changed_at` /
-`verified_at` revisions at the time of execution.
+Events are buffered on the outermost request scope (inside a `request_span`,
+the span itself, delivered when the outermost span closes, cleanly or by
+raising) and delivered after the kernel lock is released, so a callback may
+re-enter the database. The callback list is snapshotted when the change commits:
+a subscription added after the change does not receive it, one removed before
+delivery begins receives nothing, and one removed during dispatch still
+receives events already snapshotted. Callback exceptions go to the
+`observer_error_hook` passed to `Database(...)` (default: a one-line stderr
+log) and do not suppress sibling callbacks. Subscriptions survive LRU eviction
+of their node; a re-execution after eviction fires as a cold execution, and the
+stream does not promise strictly climbing `changed_at` values.
+`QueryChangeEvent` carries the node's `query_id`, `args_digest`, the decision
+that produced the move (always `"executed"`), and the `changed_at` /
+`verified_at` revisions at execution time.
 
 ## Node Record Fields
 
-An `inspect()` or `explain()` report carries the kernel's decision history for
-every node it shows — the query asked about, and the queries, inputs and
-resources beneath it — in four fields. The first two answer different questions
-and routinely disagree, so both are defined here rather than left to be
-inferred from a report.
+`Database.inspect(...)` returns the last recorded provenance tree as structured
+data and `Database.explain(...)` formats it; neither runs a verification pass,
+and neither advances a node's decision fields. `Database.inspect_fresh(...)`
+verifies first. Inspecting a node that has no record executes it, and every
+inspection opens a request or joins the enclosing span. Query labels consist
+of the query key, a short argument digest, and the function name; formatting a
+graph or profile never calls argument `repr`. Each node in a report carries
+four decision fields:
 
 - **`last_decision`** — what the most recent request that *touched* this node
-  concluded about it: `executed`, `reused`, `backdated` or `failed`, and
-  `pending` before any request has recorded a decision against it. Touching
-  includes the cheap case: when one request reaches the same node a second
-  time, that reach is recorded as `reused` without re-checking anything, so a
-  node that re-ran and backdated earlier in the same request reads `reused`
-  afterwards.
-- **`last_recompute`** — the outcome of the last time this node's query body
-  actually ran: `executed`, `backdated` or `failed`, and `never` before it ever
-  has. An input node records the set that gave it its value the same way, and a
-  resource node records its load. **A reuse does not advance it** — neither the
-  second reach above nor an ordinary warm reuse across requests, which
-  re-verifies the node's dependencies without running it. A node reporting
-  `last_decision` `reused` may therefore still report `last_recompute`
-  `backdated`: the reuse is what the latest request concluded, the backdate is
-  what the last run produced. The one exception is a checkpoint restore, which
-  stamps **both** fields `reused` on a node this database never ran.
-- **`reason`** — a short phrase describing why that decision was reached,
-  written for a reader. The definitions here are stated in terms of the
-  decisions, not those phrases.
-- **`untracked_reasons`** — the reasons recorded during this node's **most
-  recent run**, in the order that run recorded them and **not deduplicated**: a
-  reason recorded twice in the run appears twice. The list is rebuilt from the
-  run rather than accumulated across runs, so what an earlier run recorded is
-  gone. It holds the reasons a query passed to `db.report_untracked_read(...)`
-  and the ones the kernel recorded on its own account — catching an exception
-  raised by a sub-query, and catching a hook refusal from a resource this
-  `Database` has never loaded, the two cases [Escape Hatches](#escape-hatches)
-  describes. Each reason the kernel records names the sub-query or the resource
-  it caught.
-
-Inspecting a node that already has a record advances neither decision field:
-both read the same before and after. It is not free of accounting, though: it
-opens a request like any other call, so outside a `request_span` each call
-moves `total_requests`, and inside one it joins the span. And inspecting a node
-that has no record executes it.
+  concluded: `executed`, `reused`, `backdated`, or `failed`, and `pending`
+  before any request recorded one. A second reach within one request is
+  recorded as `reused` without re-checking anything.
+- **`last_recompute`** — the outcome of the last time the node's body actually
+  ran: `executed`, `backdated`, or `failed`, and `never` before it ever has. An
+  input node records the set that gave it its value; a resource node its load.
+  A reuse does not advance it, so a node may read `last_decision` `reused` and
+  `last_recompute` `backdated`. A checkpoint restore stamps both fields
+  `reused` on a node this database never ran.
+- **`reason`** — a short phrase for a reader; the definitions here are stated
+  in terms of the decisions, not the phrases.
+- **`untracked_reasons`** — the reasons recorded during the node's most recent
+  run, in order and not deduplicated, rebuilt from that run rather than
+  accumulated: the reasons passed to `db.report_untracked_read(...)` plus the
+  ones the kernel recorded on its own account, each naming the sub-query or
+  resource it caught.
 
 ## Public Surface
 
 Everything `pyinc` exports, and nothing else, is inside the semver contract
-this document defines. `pyinc.integrations` states its own stable surface in
-[integration-contract.md](integration-contract.md); the consumer packages
-`pyinc_tools` and `pyinc_codegen` are **unstable** — see
-[SECURITY.md](../SECURITY.md).
-
-The offline documentation check compares these tables against
-`pyinc.__all__` in both directions.
+this document defines; the package is PEP 561 typed. `pyinc.integrations`
+states its own stable surface in [integration-contract.md](integration-contract.md);
+`pyinc_tools` and `pyinc_codegen` are unstable — see
+[SECURITY.md](../SECURITY.md). `scripts/check_docs.py` compares these tables
+against `pyinc.__all__` in both directions.
 
 Core:
 
 | Name | What it is |
 |---|---|
-| `Database` | The incremental query database: `get`, `set`, `set_many`, `inspect`, `inspect_fresh`, `explain`, `observe`, `request_span`, `request_inputs_changed`, checkpoint save/load. Its administrative and observational entry points are outside-only: reached from a query body they raise `ReentrantDatabaseError` instead of answering (see below). |
+| `Database` | The incremental query database: `get`, `set`, `set_many`, `inspect`, `inspect_fresh`, `explain`, `observe`, `request_span`, `request_inputs_changed`, checkpoint save/load. Its administrative and observational entry points are outside-only: reached from a query body they raise `ReentrantDatabaseError` instead of answering (see [Reentrancy](#reentrancy)). |
 | `Input` | A declared, keyed input whose values enter through `db.set`. |
 | `query` | Decorator declaring a pure incremental query. |
 | `Query` | The declared-query object `@query` returns; readable from other queries and from `db.get`. Handle attributes are part of query identity: writing one moves the query's identity, so records stored under the old one no longer answer. |
-| `Resource` | Base class for tracked external values; see the Resource hooks above. |
+| `Resource` | Base class for tracked external values; the hooks are listed under condition 2. |
 | `FileResource` | Text-file resource: content-hash probe, decoded string value. |
 | `BinaryFileResource` | Byte-file resource: content-hash probe, raw bytes value. |
 | `FileStatResource` | Stat-signature resource for existence/shape checks without content reads. |
@@ -1298,47 +670,6 @@ Core:
 | `EnvResource` | Environment-variable resource. |
 | `DirectoryResource` | Directory-listing resource. |
 | `ResolvedPathResource` | Symlink-aware path canonicalization as a tracked value. |
-
-`Database` splits in two at the query boundary. Inside a query body the reading
-surface is open, and only that: `get`, `read_input`, `read_resource`,
-`report_untracked_read`, and a `request_span` that joins the
-request the execution already opened. Everything else on
-`Database` is outside-only and raises `ReentrantDatabaseError` when a body
-reaches it — the administrative calls `set`, `set_many`, `save_checkpoint`,
-`load_checkpoint`, `reset_statistics`, `request_inputs_changed` and `observe`,
-and the observational `statistics`, `query_profile`, `dependency_graph`,
-`explain`, `inspect`, `inspect_fresh` and the `revision` property.
-
-The two halves are refused for related reasons. An administrative call moves
-state the running execution is deriving from, so the body reads back a world
-its own caller never declared and the warm answer stops matching what a fresh
-database produces from the same inputs. `observe` is administrative because it
-writes, but what it writes is not state any execution derives from; its ground
-is the observational one instead — registration is per call and a body runs
-only when the kernel decides to execute it, so subscribing from one would make
-the subscriber list a function of cache history. `Subscription.unsubscribe` —
-a `Subscription` method rather than one of `Database`'s own entry points — is
-refused on the same ground in the other direction: an in-body teardown would
-land zero or one time per request, decided by the kernel's reuse decisions
-rather than by its caller. That is what the observational
-half rests on throughout: each of those entry points answers with a function of
-the database's own history rather than of the query's declared inputs — how
-many executions have run, what was reused, which decision a node last took,
-and, for `revision`, every change the database has recorded since it was built
-— which is exactly what a query result may not depend on. `inspect` and
-`inspect_fresh` also publish no dependency edge for the node they report on, so
-a body reading one would depend on it undeclaredly. Each refusal is raised
-before its call does anything at all: no input is registered, no iterable is
-drained, no artifact store or lock file is touched, and no checkpoint is
-staged. The same set is refused from a thread a query body started, with the
-message naming the descent instead (Thread Safety, above).
-
-Inside a resource hook there is no open half at all: `probe`, `load` and
-`probe_and_load` observe the outside world, and every call back into the
-`Database` — the reading surface as well as the outside-only set — raises
-`ReentrantDatabaseError` naming the hook (Condition 2, above). That holds
-whether or not a query is running: a `read_resource` made at top level opens no
-execution, and its hook is refused all the same.
 
 Values and snapshots:
 
@@ -1413,52 +744,15 @@ Errors:
 
 ## Verification
 
-The from-scratch consistency guarantee is exercised by property-based
-differential tests that compare incremental results against fresh-database
-recomputation for the same declared state, across all three modes and
-with/without LRU eviction. Finite tests are evidence, not a formal proof —
-which is one reason the guarantee is stated with explicit conditions and
-limitations:
-
-- `test_incremental_results_match_fresh_recomputation` (basic query graph)
-- `test_resource_backed_queries_match_fresh_recomputation` (file resources)
-- `test_workspace_queries_match_fresh_recomputation` (integration-level)
-- `test_multi_level_rewiring_matches_fresh_recomputation` (diamond + multi-level switching)
-
-The rewiring torture suite (`test_diamond_dependency_with_rewiring`,
-`test_multi_level_switching`, `test_sharing_pattern_backdates_when_rewired_result_is_equal`,
-`test_swapping_pattern_two_queries_exchange_deps`, `test_rewiring_with_lru_eviction`)
-verifies that dynamic dependency changes correctly drop stale edges and maintain
-correctness across sharing, switching, and swapping patterns.
-
-The mutation adversarial suite (`test_external_alias_mutation_after_boundary_crossing`,
-`test_deeply_nested_mutation_detection`, `test_mutation_of_query_return_value_does_not_corrupt_memo`,
-`test_two_queries_reading_same_input_get_independent_copies`) verifies that the
-value membrane protects cached state from external mutation, deep mutation, and
-cross-query aliasing.
-
-The durable cross-run guarantee (limitation 4) is checked by the same
-fresh-recomputation equivalence, extended to the checkpoint path:
-
-- `test_checkpoint_reload_matches_fresh_recomputation` (property test in
-  `tests/test_properties.py`) — reloads a checkpoint in each of the three modes,
-  with/without LRU eviction, comparing `load_checkpoint` + `get()` against a
-  fresh, cache-free run over the same edit sequence, and exercises the
-  dirty-graph save path directly. Every run is homogeneous in the mode: the
-  saving database, the reloading one and the fresh comparison all run the same
-  one. Cross-mode loads are refused by design (condition (v) of limitation 4)
-  and are pinned by the cross-mode suite in `tests/test_checkpoint_trust.py`.
-- `tests/test_checkpoint_cross_process.py` — a subprocess matrix that saves in
-  one process and reloads in another, checking that identities and digests
-  line up across processes, under differing hash seeds and at differing
-  install prefixes.
-- `tests/test_fingerprint_process_stability.py` — every shipped query and
-  resource handle is fingerprinted in three processes running under different
-  hash seeds and the digests compared, and no module the tree imports is left
-  carrying an identity that varies from one process to the next.
-- `tests/test_checkpoint_trust.py` — the adversarial store and trust suite:
-  bit-flipped and truncated snapshot bytes, tampered and wrong-version
-  manifests, all six ordered cross-mode load pairings, changed
-  query/adapter/resource implementations, and runtime-import-reached
-  dependencies each fall back to safe re-execution or a loud `ValueError`
-  rather than serving a stale or tampered value.
+The guarantee is exercised by property-based differential tests that compare
+incremental results against fresh-database recomputation over the same edit
+sequences, across all three modes and with and without LRU eviction
+(`tests/test_properties.py`), and by dedicated suites for dependency rewiring,
+boundary mutation, and the checkpoint path: `tests/test_checkpoint_trust.py`
+(tampered bytes and manifests, all six cross-mode load pairings, changed
+implementations), `tests/test_checkpoint_cross_process.py` (save in one
+process, reload in another, under differing hash seeds and install prefixes),
+and `tests/test_fingerprint_process_stability.py` (every shipped identity is
+the same in three processes under different hash seeds). Finite tests are
+evidence, not a proof, which is one reason the guarantee is stated with
+explicit conditions and limitations.
