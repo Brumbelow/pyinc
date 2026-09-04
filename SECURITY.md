@@ -2,19 +2,18 @@
 
 ## Supported versions
 
-Fixes land on the latest published minor version; the previous minor receives
-security fixes only. `pyinc` follows semantic versioning. Everything `pyinc` and
-`pyinc.integrations` export, and nothing else, carries that contract.
-`pyinc_tools` and `pyinc_codegen` ship in the same distribution and are
-documented in full, but they are **unstable**: their exported names, the fields
-of their result types, the `pyinc-tools` command-line surface and the LSP wire
-behavior may change in any release, including a minor one.
+Only the current release line is maintained: every fix, security fixes included,
+lands on it and on nothing older. `pyinc` follows semantic versioning.
+Everything `pyinc` and `pyinc.integrations` export, and nothing else, carries
+that contract. `pyinc_tools` and `pyinc_codegen` ship in the same distribution
+and are documented in full, but they are **unstable**: their exported names, the
+fields of their result types, the `pyinc-tools` command-line surface and the LSP
+wire behavior may change in any release, including a minor one.
 
 | Version | Supported |
 |---|---|
-| 3.1.x | Yes |
-| 3.0.x | Security fixes only |
-| < 3.0 | No |
+| 4.0.x | Yes |
+| < 4.0 | No |
 
 ## Reporting a vulnerability
 
