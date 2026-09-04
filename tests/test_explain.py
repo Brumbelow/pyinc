@@ -614,3 +614,64 @@ def test_invalid_type_parameters_on_a_query_handle_are_rejected_by_explain_and_k
     assert "invalid type parameters" in info.rejection_reason
     with pytest.raises(UnsupportedValueError, match="invalid type parameters"):
         Database().get(holds_type_parameters)
+
+
+class _Outer:
+    class Nested:
+        pass
+
+
+def test_explain_reports_defaults_kwdefaults_attributes_and_type_parameters() -> None:
+    def configured(
+        db: Database,
+        value: tuple[int, ...] = (1, 2),
+        *,
+        window: range = range(3),
+    ) -> int:
+        return value[0] + len(window)
+
+    configured_metadata = cast(Any, configured)
+    configured_metadata.helper = len
+    configured_metadata.captured_type = _Outer.Nested
+    configured_metadata.__type_params__ = (int,)
+
+    infos = explain_query_captures(configured)
+    by_name = {info.name: info for info in infos}
+    assert by_name["default[0]"].origin == "default"
+    assert by_name["kwdefault[window]"].origin == "kwdefault"
+    assert by_name["attribute[helper]"].kind == "builtin"
+    assert by_name["attribute[captured_type]"].kind == "type"
+    assert by_name["type_parameter[0]"].kind == "annotation"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="lazy annotations require Python 3.14")
+def test_explain_falls_back_to_lazy_annotation_evaluator() -> None:
+    namespace: dict[str, object] = {}
+    code = compile(
+        "def annotated(value: MissingType): return value",
+        "<lazy-annotation-test>",
+        "exec",
+        dont_inherit=True,
+    )
+    exec(code, namespace)
+    annotated = cast(Any, namespace["annotated"])
+
+    infos = explain_query_captures(annotated)
+    assert len(infos) == 1
+    assert infos[0].name == "annotations"
+    assert infos[0].origin == "annotation_evaluator"
+    assert infos[0].kind == "annotation"
+    assert infos[0].accepted
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="lazy annotations require Python 3.14")
+def test_explain_ignores_nonfunction_lazy_annotation_evaluator() -> None:
+    class BrokenAnnotations:
+        def __call__(self, format: int) -> object:
+            raise RuntimeError(format)
+
+    def target() -> None:
+        return None
+
+    cast(Any, target).__annotate__ = BrokenAnnotations()
+    assert explain_query_captures(target) == ()

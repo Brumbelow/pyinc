@@ -7,8 +7,10 @@ import multiprocessing
 import os
 import queue
 import shutil
+import stat
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -31,13 +33,19 @@ from pyinc import (
 )
 from pyinc._locking import FileLock
 from pyinc.action import (
+    Action,
     Output,
     ReconcileResult,
+    _action_lock_directory,
     _atomic_write,
     _content_hash,
+    _holds_only_desired_outputs,
     _lock_path,
     _manifest_path,
     _normalize_rel,
+    _orphan_cannot_exist,
+    _safe_target,
+    _unprunable_entry,
     action,
 )
 
@@ -2241,3 +2249,216 @@ def test_equal_cross_process_actions_converge_to_create_then_noop(tmp_path: Path
     classifications = sorted((outcome[1], outcome[4]) for outcome in outcomes)
     assert classifications == [((), ("result.txt",)), (("result.txt",), ())]
     assert (tmp_path / "result.txt").read_bytes() == b"same"
+
+
+def test_action_supports_direct_decorator_form() -> None:
+    def emit(_db: Database) -> tuple[Output, ...]:
+        return (Output("result", b"payload"),)
+
+    declared = action(emit, tool="direct-form")
+
+    assert isinstance(declared, Action)
+    assert declared.fn is emit
+
+
+def test_action_lock_directory_resolves_a_symlinked_temporary_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_temporary_directory = tmp_path / "real"
+    real_temporary_directory.mkdir()
+    temporary_alias = tmp_path / "alias"
+    try:
+        temporary_alias.symlink_to(real_temporary_directory, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink support is unavailable")
+    monkeypatch.setattr(action_module.tempfile, "gettempdir", lambda: os.fspath(temporary_alias))
+
+    directory = _action_lock_directory()
+
+    getuid = getattr(os, "getuid", None)
+    uid = getuid() if getuid is not None else None
+    identity = (
+        str(uid)
+        if uid is not None
+        else action_module.hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
+    )
+    assert directory == real_temporary_directory.resolve() / f"pyinc-action-locks-{identity}"
+    assert directory.is_dir()
+
+
+def test_action_lock_directory_rejects_a_non_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    identity = (
+        str(uid)
+        if uid is not None
+        else action_module.hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
+    )
+    lock_path = tmp_path / f"pyinc-action-locks-{identity}"
+    lock_path.write_bytes(b"hostile")
+    monkeypatch.setattr(action_module.tempfile, "gettempdir", lambda: os.fspath(tmp_path))
+
+    with pytest.raises(ActionPathError, match="not a directory"):
+        _action_lock_directory()
+
+
+def test_action_lock_directory_rejects_a_symlinked_private_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    identity = (
+        str(uid)
+        if uid is not None
+        else action_module.hashlib.sha256(os.fsencode(Path.home())).hexdigest()[:16]
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    lock_path = tmp_path / f"pyinc-action-locks-{identity}"
+    try:
+        lock_path.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink support is unavailable")
+    monkeypatch.setattr(action_module.tempfile, "gettempdir", lambda: os.fspath(tmp_path))
+
+    with pytest.raises(ActionPathError, match="not a directory"):
+        _action_lock_directory()
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX ownership metadata")
+def test_action_lock_directory_rejects_foreign_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    uid = os.getuid()
+    directory = tmp_path / f"pyinc-action-locks-{uid}"
+    directory.mkdir()
+    real_lstat = Path.lstat
+
+    def foreign_lstat(path: Path) -> object:
+        metadata = real_lstat(path)
+        return SimpleNamespace(st_mode=metadata.st_mode, st_uid=uid + 1)
+
+    monkeypatch.setattr(action_module.tempfile, "gettempdir", lambda: os.fspath(tmp_path))
+    monkeypatch.setattr(Path, "lstat", foreign_lstat)
+
+    with pytest.raises(ActionPathError, match="owned by another user"):
+        _action_lock_directory()
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX directory modes")
+def test_action_lock_directory_repairs_permissive_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / f"pyinc-action-locks-{os.getuid()}"
+    directory.mkdir(mode=0o755)
+    directory.chmod(0o755)
+    monkeypatch.setattr(action_module.tempfile, "gettempdir", lambda: os.fspath(tmp_path))
+
+    assert _action_lock_directory() == directory
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("outcome", ("raise", "outside"))
+def test_safe_target_rejects_resolved_parent_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    root = tmp_path / "root"
+    calls = 0
+
+    def commonpath(_paths: object) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return os.fspath(root)
+        if outcome == "raise":
+            raise ValueError("different drives")
+        return os.fspath(tmp_path / "outside")
+
+    monkeypatch.setattr(action_module.os.path, "commonpath", commonpath)
+    with pytest.raises(ActionPathError, match="escapes the action root"):
+        _safe_target(root, "parent/child")
+    assert calls == 2
+
+
+def test_action_rechecks_target_type_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    raced_directory = root / "owned"
+    raced_directory.mkdir()
+    metadata = raced_directory.stat()
+    calls = 0
+
+    def target_state(_root: Path, _relative: str) -> tuple[Path, os.stat_result | None]:
+        nonlocal calls
+        calls += 1
+        return (raced_directory, None if calls == 1 else metadata)
+
+    declared = Action(lambda _db: (), tool="write-race")
+    monkeypatch.setattr(action_module, "_read_manifest", lambda *_args: (False, {}, False))
+    monkeypatch.setattr(action_module, "_safe_target", target_state)
+
+    with pytest.raises(ActionPathError, match="not a regular file"):
+        declared._reconcile_locked(
+            {"owned": b"payload"},
+            root=root,
+            state_dir=root,
+            dry_run=False,
+        )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
+@pytest.mark.parametrize(
+    ("probe", "condition"),
+    (
+        ("unprunable-entry", "missing"),
+        ("unprunable-entry", "unlistable"),
+        ("holds-only-desired", "missing"),
+        ("holds-only-desired", "unlistable"),
+        ("orphan-cannot-exist", "missing"),
+        ("orphan-cannot-exist", "unsearchable-parent"),
+    ),
+)
+def test_preflight_probes_answer_missing_and_refuse_unanswerable(
+    tmp_path: Path, probe: str, condition: str
+) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("EACCES does not bite as root")
+    if condition == "missing":
+        # A genuinely missing path is a benign, complete answer.
+        missing = tmp_path / "missing"
+        if probe == "unprunable-entry":
+            assert _unprunable_entry(missing, "missing", set(), {}) is None
+        elif probe == "holds-only-desired":
+            assert _holds_only_desired_outputs(missing, "missing", {"missing/model.py"}) is False
+        else:
+            assert _orphan_cannot_exist(tmp_path, "missing/file.txt") is False
+        return
+    if condition == "unlistable":
+        # scandir needs read permission; --wx removes exactly that.
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        (blocked / "entry.txt").write_text("held", encoding="utf-8")
+        blocked.chmod(0o300)
+        try:
+            with pytest.raises(PermissionError):
+                if probe == "unprunable-entry":
+                    _unprunable_entry(blocked, "blocked", set(), {})
+                else:
+                    _holds_only_desired_outputs(blocked, "blocked", {"blocked/entry.txt"})
+        finally:
+            blocked.chmod(0o700)
+        return
+    # lstat needs search permission on the parent: an 0o600 ancestor makes
+    # a component two levels down unanswerable.
+    outer = tmp_path / "outer"
+    (outer / "d").mkdir(parents=True)
+    outer.chmod(0o600)
+    try:
+        with pytest.raises(PermissionError):
+            _orphan_cannot_exist(tmp_path, "outer/d/f.txt")
+    finally:
+        outer.chmod(0o700)

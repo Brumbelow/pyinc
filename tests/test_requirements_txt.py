@@ -1407,3 +1407,38 @@ def test_a_reloaded_checkpoint_restores_the_reference_existence_record(
         f"the payload nodes were not reused across the reload | mode={mode} | "
         f"profile={[(entry.query_label, entry.execution_count) for entry in profile]}"
     )
+
+
+def test_deep_requirements_reports_cycles_duplicates_and_escape(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    root = project / "requirements.txt"
+    first = project / "first.txt"
+    second = project / "second.txt"
+    shared = project / "shared.txt"
+    absolute = project / "absolute.txt"
+    outside = tmp_path / "outside.txt"
+
+    root.write_text(
+        f"-r first.txt\n-r second.txt\n-r {absolute}\n-r ../outside.txt\nroot-pkg\n",
+        encoding="utf-8",
+    )
+    first.write_text(f"-r {root}\n-r shared.txt\nfirst-pkg\n", encoding="utf-8")
+    second.write_text("-r shared.txt\nsecond-pkg\n", encoding="utf-8")
+    shared.write_text("shared-pkg\n", encoding="utf-8")
+    absolute.write_text("absolute-pkg\n", encoding="utf-8")
+    outside.write_text("outside-pkg\n", encoding="utf-8")
+
+    analysis = deep_requirements_analysis(Database(), root)
+
+    assert {requirement.name for requirement in analysis.requirements} == {
+        "absolute_pkg",
+        "first_pkg",
+        "root_pkg",
+        "second_pkg",
+        "shared_pkg",
+    }
+    assert any(code == "cycle" for code, _message in analysis.diagnostics)
+    assert any("outside project" in message for _code, message in analysis.diagnostics)

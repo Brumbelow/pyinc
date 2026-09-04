@@ -32,7 +32,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -1244,3 +1244,27 @@ def test_every_driver_still_calls_the_thing_it_drives() -> None:
         if subject not in called.get(driver, frozenset())
     )
     assert silent == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "contents", "analyze"),
+    (
+        ("data.csv", "name,value\na,1\n", workspace_csv_analysis),
+        (".env", "NAME=value\n", workspace_env_analysis),
+        ("package.json", "{}\n", workspace_json_analysis),
+        ("requirements.txt", "example>=1\n", workspace_requirements_analysis),
+        ("pyproject.toml", "[project]\n", workspace_config_analysis),
+        ("pom.xml", "<project />\n", workspace_xml_analysis),
+    ),
+    ids=("csv", "env", "json", "requirements", "toml", "xml"),
+)
+def test_workspace_scans_past_unrelated_entries(
+    tmp_path: Path,
+    filename: str,
+    contents: str,
+    analyze: Any,
+) -> None:
+    (tmp_path / "!unrelated").write_text("noise", encoding="utf-8")
+    (tmp_path / filename).write_text(contents, encoding="utf-8")
+
+    assert analyze(Database(), tmp_path) is not None

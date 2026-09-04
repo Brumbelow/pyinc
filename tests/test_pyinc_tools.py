@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import shutil
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
 import pytest
+from _hostile_paths import within_budget
 
 import pyinc_tools
 import pyinc_tools.cli as cli
@@ -9046,3 +9048,87 @@ def test_pyinc_tools_exports_only_stable_api() -> None:
     # module imports three `pyinc_tools` submodules at its head, and each of
     # those imports binds the submodule as a package attribute, so what is
     # reachable here depends on import order rather than on the export list.
+
+
+def test_file_deletion_coalesces_adjacent_aliases_into_one_edit(tmp_path: Path) -> None:
+    for name in ("one", "two", "three", "four"):
+        (tmp_path / f"{name}.py").write_text(f"value = {name!r}\n", encoding="utf-8")
+    importer = tmp_path / "user.py"
+    source = "import one, two, three, four\n"
+    importer.write_text(source, encoding="utf-8")
+
+    with WorkspaceSession(tmp_path) as session:
+        edits = session.import_edits_for_file_deletions(
+            [tmp_path / "two.py", tmp_path / "three.py"]
+        )
+
+    importer_edits = [edit for edit in edits if edit.path == str(importer)]
+    assert len(importer_edits) == 1
+    edit = importer_edits[0]
+    assert edit.range.start == SourcePosition(0, 12)
+    assert edit.range.end == SourcePosition(0, 24)
+    repaired = source[: edit.range.start.character] + source[edit.range.end.character :]
+    assert repaired == "import one, four\n"
+
+
+def test_workspace_session_rejects_invalid_roots_and_close_is_idempotent(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="not an existing workspace"):
+        WorkspaceSession(tmp_path / "missing")
+    regular_file = tmp_path / "file"
+    regular_file.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(ValueError, match="not an existing workspace"):
+        WorkspaceSession(regular_file)
+
+    session = WorkspaceSession(tmp_path)
+    session.close()
+    session.close()
+
+
+def test_workspace_refresh_deduplicates_paths_and_preserves_overlays(tmp_path: Path) -> None:
+    target = tmp_path / "mod.py"
+    target.write_text("disk = 1\n", encoding="utf-8")
+    with WorkspaceSession(tmp_path) as session:
+        session.set_overlay(target, "overlay = 2\n")
+        target.write_text("disk = 3\n", encoding="utf-8")
+
+        assert session.refresh_paths([target, target]) == (str(target),)
+        assert session.source_text(target) == "overlay = 2\n"
+
+
+def test_workspace_source_text_answers_a_pipe_rather_than_waiting_on_it(tmp_path: Path) -> None:
+    # A workspace is a directory the editor pointed at, so anything at all can
+    # be sitting inside it. Reading a source decodes it, which means opening it
+    # and waiting for bytes -- and a pipe with no writer never sends one. The
+    # kind is asked first so a source that is not a file reads as no source,
+    # which is the same answer this already gave for one that cannot be decoded.
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("os.mkfifo is unavailable on this platform")
+    target = tmp_path / "mod.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+
+    with WorkspaceSession(tmp_path) as session:
+        assert session.source_text(target) == "value = 1\n"
+
+        target.unlink()
+        os.mkfifo(target)
+
+        assert within_budget(lambda: session.source_text(target)) == "returned"
+        assert session.source_text(target) is None
+
+
+def test_workspace_navigation_methods_reject_non_python_targets(tmp_path: Path) -> None:
+    text = tmp_path / "data.txt"
+    text.write_text("value", encoding="utf-8")
+    symbol = SymbolId(str(text), "module", "value", _range(0, 0, 0, 1))
+    position = SourcePosition(0, 0)
+
+    with WorkspaceSession(tmp_path) as session:
+        calls: list[Callable[[], object]] = [
+            lambda: session.symbol_at(text, position),
+            lambda: session.find_references(symbol),
+            lambda: session.find_document_highlights(text, symbol),
+            lambda: session.signature_help_at(text, 0, 0),
+        ]
+        for call in calls:
+            with pytest.raises(FileNotFoundError):
+                call()

@@ -22,7 +22,6 @@ from pyinc import (
 )
 from pyinc.errors import InputKeyError
 from pyinc.resources import Resource
-from pyinc.runtime import _default_observer_error_hook, _GuardedEnviron
 
 
 @dataclass(frozen=True)
@@ -37,30 +36,6 @@ class _EchoResource(Resource[str, str, str]):
 
     def label(self, key: str) -> str:
         return f"echo[{key}]"
-
-
-@dataclass(frozen=True)
-class _FailingResource(Resource[str, str, str]):
-    def probe(self, key: str) -> str:
-        return key
-
-    def load(self, db: Database, key: str) -> str:
-        raise RuntimeError(f"cannot load {key}")
-
-    def label(self, key: str) -> str:
-        return f"failing[{key}]"
-
-
-@dataclass(frozen=True)
-class _UnprobeableResource(Resource[str, str, str]):
-    def probe(self, key: str) -> str:
-        raise RuntimeError(f"cannot probe {key}")
-
-    def load(self, db: Database, key: str) -> str:
-        raise AssertionError("load must not run")
-
-    def label(self, key: str) -> str:
-        return f"unprobeable[{key}]"
 
 
 @pytest.mark.parametrize("key", ["", 0, None])
@@ -276,24 +251,6 @@ def test_base_resource_contract_and_default_probe_and_load() -> None:
         abstract.label("x")
 
 
-def test_failed_resource_read_leaves_no_binding_without_a_record_behind_it() -> None:
-    db = Database()
-    resource = _FailingResource()
-    with pytest.raises(RuntimeError, match="cannot load x"):
-        resource.read(db, "x")
-    key = db._resource_key(resource, "x")
-    assert db._records[key].is_failed
-    # The binding is retained deliberately: it is what lets a later request
-    # re-check the failure record. A binding with no record behind it would be
-    # the stale one, and a load whose probe raises leaves neither.
-    assert set(db._resource_objects()) == {key}
-
-    with pytest.raises(RuntimeError, match="cannot probe y"):
-        _UnprobeableResource().read(db, "y")
-    assert set(db._resource_objects()) == {key}
-    assert set(db._records) == {key}
-
-
 def test_text_and_binary_file_resources_cover_present_and_missing_paths(
     tmp_path: Path,
 ) -> None:
@@ -401,46 +358,6 @@ def test_directory_resource_covers_present_empty_sorted_and_missing_paths(
     assert resource.probe_and_load(db, missing) == ((False, ()), ())
 
 
-def test_guarded_environ_checks_every_read_but_allows_mutation() -> None:
-    wrapped = {"A": "1", "B": "2"}
-    reads: list[None] = []
-    environ = _GuardedEnviron(wrapped, lambda: reads.append(None))
-
-    environ["C"] = "3"
-    del environ["C"]
-    assert reads == []
-
-    assert environ["A"] == "1"
-    assert list(environ) == ["A", "B"]
-    assert len(environ) == 2
-    assert environ.get("missing", "fallback") == "fallback"
-    assert list(environ.keys()) == ["A", "B"]
-    assert list(environ.items()) == [("A", "1"), ("B", "2")]
-    assert list(environ.values()) == ["1", "2"]
-    assert environ.copy() == wrapped
-    assert "A" in environ
-    assert len(reads) == 10
-
-
-def test_guarded_environ_union_operators_read_through_the_guard() -> None:
-    wrapped = {"A": "1"}
-    reads: list[None] = []
-    environ = _GuardedEnviron(wrapped, lambda: reads.append(None))
-
-    assert environ | {"B": "2"} == {"A": "1", "B": "2"}
-    assert reads
-    reads.clear()
-
-    assert {"A": "0", "B": "2"} | environ == {"A": "1", "B": "2"}
-    assert reads
-    reads.clear()
-
-    environ |= {"B": "2"}
-    environ |= [("C", "3")]
-    assert wrapped == {"A": "1", "B": "2", "C": "3"}
-    assert reads == []
-
-
 def test_environ_union_operators_return_plain_dicts_after_database_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -489,15 +406,6 @@ def test_environ_raw_data_mapping_stays_hidden_after_database_construction() -> 
     Database()
     with pytest.raises(AttributeError, match="_data"):
         _ = os.environ._data  # type: ignore[attr-defined]
-
-
-def test_default_observer_error_hook_writes_a_concise_message(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _default_observer_error_hook(ValueError("broken callback"))
-    assert capsys.readouterr().err == (
-        "pyinc: observer callback raised ValueError: broken callback\n"
-    )
 
 
 def test_unsubscribe_is_idempotent() -> None:

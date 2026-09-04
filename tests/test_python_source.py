@@ -1307,3 +1307,9 @@ def test_package_swapped_for_a_module_matches_a_fresh_database(mode: str, tmp_pa
 
     after = workspace_analysis(db, str(tmp_path))
     assert after == workspace_analysis(Database(mode=mode), str(tmp_path))
+
+
+def test_workspace_python_files_non_directory(tmp_path: Path) -> None:
+    file_path = tmp_path / "plain.py"
+    file_path.write_text("value = 1\n", encoding="utf-8")
+    assert workspace_python_files(Database(), str(file_path)) == ()

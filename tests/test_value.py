@@ -6,11 +6,14 @@ import random
 import re
 import struct
 import sys
+from collections.abc import Iterator
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from pyinc import (
     Database,
@@ -28,11 +31,14 @@ from pyinc import (
     thaw,
 )
 from pyinc.value import (
+    _KERNEL_FINGERPRINT_PREFIX,
     FrozenDict,
     FrozenList,
     FrozenRecord,
     FrozenSet,
+    _adapter_key,
     _AdapterRegistry,
+    _encode_snapshot,
     assert_not_mutated,
     fingerprint,
     fingerprint_snapshot,
@@ -1764,3 +1770,437 @@ def test_an_adapted_payload_comes_back_whole_or_is_refused(
     assert statistics.total_requests == requests + 2
     assert statistics.query_count == 0
     assert statistics.query_reuses == 0
+
+
+@dataclass(frozen=True)
+class _AdaptedValue:
+    value: int
+
+
+class _AdaptedValueAdapter:
+    def freeze(self, value: _AdaptedValue, freeze_value: Any) -> object:
+        return freeze_value(value.value)
+
+    def thaw(self, snapshot: Any, thaw_value: Any) -> _AdaptedValue:
+        return _AdaptedValue(thaw_value(snapshot))
+
+
+class _IterableOnly:
+    def __iter__(self) -> Iterator[int]:
+        return iter((1, 2, 3))
+
+
+def _invalid_order(values: tuple[Any, ...]) -> tuple[Any, ...]:
+    ordered = tuple(sorted(values, key=fingerprint_snapshot))
+    return tuple(reversed(ordered))
+
+
+def test_adapter_registry_rejects_duplicate_type_identifiers() -> None:
+    first = type("Duplicate", (), {"__module__": "duplicate", "__qualname__": "Duplicate"})
+    second = type("Duplicate", (), {"__module__": "duplicate", "__qualname__": "Duplicate"})
+    adapter = _AdaptedValueAdapter()
+    with pytest.raises(ValueError, match="duplicate type identifiers"):
+        _AdapterRegistry({first: adapter, second: adapter})
+    # A Database builds the same key-indexed registry once, up front, so the
+    # collision is reported where the registry was written rather than at the
+    # first value boundary that happens to need it.
+    with pytest.raises(ValueError, match="duplicate type identifiers"):
+        Database(adapters={first: adapter, second: adapter})
+
+
+def test_freeze_rejects_snapshot_wrapper_subclasses_and_iterable_only_values() -> None:
+    class FrozenListSubclass(FrozenList):
+        pass
+
+    with pytest.raises(UnsupportedValueError, match="Snapshot wrapper subclass"):
+        freeze(FrozenListSubclass(()))
+    with pytest.raises(UnsupportedValueError, match="materialize"):
+        freeze(_IterableOnly())
+
+
+def test_snapshot_validation_rejects_deep_direct_cycle_and_noncanonical_scalars() -> None:
+    nested: object = None
+    for _ in range(202):
+        nested = (nested,)
+    with pytest.raises(UnsupportedValueError, match="nesting exceeds"):
+        serialize_snapshot(cast(Any, nested))
+
+    cyclic = FrozenList(())
+    object.__setattr__(cyclic, "items", (cyclic,))
+    with pytest.raises(UnsupportedValueError, match="direct Python object cycles"):
+        serialize_snapshot(cyclic)
+
+    noncanonical_nan = struct.unpack(">d", bytes.fromhex("7ff8000000000001"))[0]
+    with pytest.raises(UnsupportedValueError, match="complex NaNs"):
+        serialize_snapshot(complex(noncanonical_nan, 0))
+    with pytest.raises(UnsupportedValueError, match="valid Unicode"):
+        serialize_snapshot("\ud800")
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        FrozenList(cast(Any, [])),
+        FrozenDict(cast(Any, [])),
+        FrozenDict(cast(Any, (("key", 1, 2),))),
+        FrozenDict((("key", 1), ("key", 2))),
+        FrozenSet("invalid", ()),
+        FrozenSet("set", cast(Any, [])),
+        FrozenSet("set", (1, 1)),
+        FrozenRecord("Record", cast(Any, [])),
+        FrozenRecord("Record", cast(Any, (("field", 1, 2),))),
+        FrozenRecord("Record", (("field", 1), ("field", 2))),
+        FrozenGraph((FrozenSet("frozenset", ()),), FrozenRef(0)),
+        FrozenGraph((FrozenList(()), FrozenList(())), FrozenRef(0)),
+        object(),
+    ],
+)
+def test_snapshot_validation_rejects_malformed_wrapper_shapes(snapshot: object) -> None:
+    with pytest.raises(UnsupportedValueError):
+        serialize_snapshot(cast(Any, snapshot))
+
+
+def test_snapshot_validation_rejects_noncanonical_dict_and_set_order() -> None:
+    first, second = _invalid_order((1, 2))
+    with pytest.raises(UnsupportedValueError, match="keys are not in canonical order"):
+        serialize_snapshot(FrozenDict(((first, "first"), (second, "second"))))
+    with pytest.raises(UnsupportedValueError, match="members are not in canonical order"):
+        serialize_snapshot(FrozenSet("set", (first, second)))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"K2;X;",
+        b"K2;N:",
+        b"K2;s1x",
+        b"K2;t1x",
+        b"K2;i1:a;",
+    ],
+)
+def test_deserialize_rejects_malformed_tags_delimiters_and_lengths(payload: bytes) -> None:
+    with pytest.raises(UnsupportedValueError):
+        deserialize_snapshot(payload)
+
+
+def test_snapshot_equality_helper_returns_a_real_bool() -> None:
+    assert snapshots_equal(FrozenList((1,)), FrozenList((1,))) is True
+    assert snapshots_equal(FrozenList((1,)), FrozenList((2,))) is False
+    # The relation is canonical-encoding equality, not Python ==: the numeric
+    # tower does not unify, and a canonical NaN equals a canonical NaN.
+    assert snapshots_equal(FrozenList((1,)), FrozenList((1.0,))) is False
+    assert snapshots_equal(FrozenList((True,)), FrozenList((1,))) is False
+    nan = float.fromhex("nan")
+    assert snapshots_equal(FrozenList((nan,)), FrozenList((nan,))) is True
+
+
+def _ordered_entries(*keys: object) -> tuple[tuple[object, str], ...]:
+    return tuple(sorted(((key, "v") for key in keys), key=lambda e: fingerprint_snapshot(e[0])))
+
+
+def _ordered_members(*members: object) -> tuple[object, ...]:
+    return tuple(sorted(members, key=fingerprint_snapshot))
+
+
+_COLLIDING_KEY_PAIRS: tuple[tuple[object, object], ...] = (
+    (1, 1.0),
+    (True, 1),
+    (1, 1 + 0j),
+    (0, False),
+    (0.0, -0.0),
+)
+
+
+@pytest.mark.parametrize(("left", "right"), _COLLIDING_KEY_PAIRS)
+def test_thaw_colliding_dict_keys_are_rejected(left: object, right: object) -> None:
+    wrapper = FrozenDict(cast(Any, _ordered_entries(left, right)))
+    with pytest.raises(UnsupportedValueError, match="collapse") as raised:
+        freeze(wrapper)
+    # Name the pair, not just the fault: a caller holding a large mapping has
+    # to be told which two keys to separate.
+    assert repr(left) in str(raised.value)
+    assert repr(right) in str(raised.value)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        serialize_snapshot(wrapper)
+
+
+@pytest.mark.parametrize("kind", ["set", "frozenset"])
+@pytest.mark.parametrize(("left", "right"), _COLLIDING_KEY_PAIRS)
+def test_thaw_colliding_set_members_are_rejected(kind: str, left: object, right: object) -> None:
+    wrapper = FrozenSet(kind, _ordered_members(left, right))
+    with pytest.raises(UnsupportedValueError, match="collapse") as raised:
+        freeze(wrapper)
+    assert repr(left) in str(raised.value)
+    assert repr(right) in str(raised.value)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        serialize_snapshot(wrapper)
+
+
+def test_thaw_colliding_frozenset_in_mapping_key_position_is_rejected() -> None:
+    collider = FrozenSet("frozenset", _ordered_members(1, 1.0))
+    # A hand-built wrapper is reached by the recursive walk under freeze's own
+    # _validate_snapshot call; a live dict/set key is reached by the separate
+    # _validate_snapshot call inside _freeze_hash_position. Both routes must
+    # refuse the collider, so neither needs a check of its own.
+    wrapper = FrozenDict(((collider, "v"),))
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(wrapper)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze({collider: "v"})
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze({collider})
+
+
+def test_deserialize_rejects_thaw_colliding_bytes() -> None:
+    # The exact byte string measured in the audit: a FrozenDict carrying the
+    # keys 1.0 and 1, whose thaw fabricated the pairing {1.0: 'a'}.
+    payload = b"K2;D2:f20:0x1.0000000000000p+0;s1:b;i1:1;s1:a;;"
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        deserialize_snapshot(payload)
+
+
+def test_nan_bearing_positions_are_refused_because_the_encoding_cannot_see_them() -> None:
+    nan = float.fromhex("nan")
+    # These two snapshots carry byte-identical encodings, yet thawing them
+    # produces a colliding pair or a distinct pair depending only on whether
+    # one NaN float object was shared: tuple equality takes an identity
+    # shortcut per element, and NaN is unequal to itself otherwise.
+    shared = FrozenList(((1, nan), (1.0, nan)))
+    unshared = FrozenList(((1, float.fromhex("nan")), (1.0, float.fromhex("nan"))))
+    assert serialize_snapshot(shared) == serialize_snapshot(unshared)
+    shared_left, shared_right = thaw(shared)
+    unshared_left, unshared_right = thaw(unshared)
+    assert shared_left == shared_right
+    assert unshared_left != unshared_right
+    # A validator that reads only the encoding cannot tell those two apart, so
+    # every canonical NaN is one class and the key position is refused.
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(FrozenDict(cast(Any, _ordered_entries((1, nan), (1.0, nan)))))
+
+
+def test_live_values_carrying_distinct_nan_objects_are_rejected() -> None:
+    first = float("nan")
+    second = float("nan")
+    assert first is not second
+    # Nothing hand-built here: NaN hashes by object identity, so a live dict
+    # and a live set both keep these two entries apart and hand freeze two
+    # keys. The one-NaN-class rule refuses them anyway, and that refusal is
+    # deliberate -- both cases encode to the same bytes as the shared-NaN
+    # version, which does collapse on thaw, so accepting these would make
+    # acceptance depend on object sharing the encoding cannot express.
+    # Freezing ordinary values can therefore be rejected by this rule.
+    live_dict = {(1, first): "a", (1.0, second): "b"}
+    assert len(live_dict) == 2
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(live_dict)
+    live_set = {(1, first), (1.0, second)}
+    assert len(live_set) == 2
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(live_set)
+
+
+def test_distinct_after_thaw_positions_stay_accepted() -> None:
+    accepted = [
+        FrozenDict(cast(Any, _ordered_entries(1, 2.5))),
+        FrozenDict(cast(Any, _ordered_entries("1", 1))),
+        FrozenSet("frozenset", _ordered_members(1, "1", b"1")),
+        # Infinities key by sign rather than by exact value; asking for the
+        # exact value of an infinite float would raise instead of rejecting.
+        FrozenSet("frozenset", _ordered_members(float("inf"), float("-inf"), 1e300)),
+        # Exactly the pair a float cast loses: float(2**53 + 1) is float(2**53),
+        # so a float-keyed class would refuse two keys a live dict keeps apart.
+        FrozenDict(cast(Any, _ordered_entries(2**53 + 1, float(2**53)))),
+        FrozenSet("frozenset", _ordered_members(2**53 + 1, float(2**53))),
+    ]
+    for wrapper in accepted:
+        snapshot = freeze(wrapper)
+        thawed = thaw(snapshot)
+        assert len(thawed) == len(cast(Any, wrapper))
+        assert fingerprint_snapshot(freeze(thawed)) == fingerprint_snapshot(snapshot)
+
+
+def test_store_warm_paths_funnel_through_deserialize_validation() -> None:
+    # The outlet of the store-warm funnel: every checkpoint/store load decodes
+    # through deserialize_snapshot, which validates before returning, so bytes
+    # carrying a thaw-colliding snapshot cannot be warmed back into a live
+    # Database even though their digest is stable. The Database side of that
+    # funnel is pinned in tests/test_runtime.py.
+    payload = b"K2;D2:f20:0x1.0000000000000p+0;s1:b;i1:1;s1:a;;"
+    with pytest.raises(UnsupportedValueError):
+        deserialize_snapshot(payload)
+
+
+def _raw_snapshot_bytes(snapshot: object) -> bytes:
+    # Encode WITHOUT validation: serialize_snapshot now refuses colliding
+    # wrappers, so the untrusted-bytes matrix must build its payloads from the
+    # raw encoder, exactly as a hostile store would.
+    buffer = bytearray(_KERNEL_FINGERPRINT_PREFIX)
+    _encode_snapshot(snapshot, buffer)
+    return bytes(buffer)
+
+
+@pytest.mark.parametrize(("left", "right"), _COLLIDING_KEY_PAIRS)
+def test_deserialize_rejects_each_thaw_colliding_key_pair(left: object, right: object) -> None:
+    payload = _raw_snapshot_bytes(FrozenDict(cast(Any, _ordered_entries(left, right))))
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        deserialize_snapshot(payload)
+
+
+@pytest.mark.parametrize("kind", ["set", "frozenset"])
+@pytest.mark.parametrize(("left", "right"), _COLLIDING_KEY_PAIRS)
+def test_deserialize_rejects_each_thaw_colliding_member_pair(
+    kind: str, left: object, right: object
+) -> None:
+    payload = _raw_snapshot_bytes(FrozenSet(kind, _ordered_members(left, right)))
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        deserialize_snapshot(payload)
+
+
+@settings(max_examples=100, deadline=None)
+@given(
+    keys=st.lists(
+        st.sampled_from(
+            [0, 1, -7, True, False, 0.0, -0.0, 2.5, 1 + 0j, "1", "k", b"1", None, (1, 2)]
+        ),
+        min_size=1,
+        max_size=4,
+    ),
+    shape=st.sampled_from(["dict", "set", "frozenset"]),
+)
+def test_every_accepted_hash_position_round_trips_with_stable_cardinality(
+    keys: list[object], shape: str
+) -> None:
+    # The round-trip law: for every snapshot the validator ACCEPTS, thaw
+    # preserves cardinality and freeze(thaw(s)) preserves the fingerprint.
+    # Pairs the validator rejects are covered by the rejection matrices above.
+    wrapper: object
+    if shape == "dict":
+        wrapper = FrozenDict(cast(Any, _ordered_entries(*keys)))
+    else:
+        wrapper = FrozenSet(shape, _ordered_members(*keys))
+    try:
+        snapshot = freeze(wrapper)
+    except UnsupportedValueError:
+        return
+    thawed = thaw(snapshot)
+    assert len(cast(Any, thawed)) == len(cast(Any, wrapper))
+    assert fingerprint_snapshot(freeze(thawed)) == fingerprint_snapshot(snapshot)
+
+
+@dataclass(frozen=True)
+class _OtherAdaptedValue:
+    value: int
+
+
+class _OtherAdaptedValueAdapter:
+    def freeze(self, value: _OtherAdaptedValue, freeze_value: Any) -> object:
+        return freeze_value(value.value)
+
+    def thaw(self, snapshot: Any, thaw_value: Any) -> _OtherAdaptedValue:
+        return _OtherAdaptedValue(thaw_value(snapshot))
+
+
+_ADAPTED_KEY = _adapter_key(_AdaptedValue)
+
+
+_OTHER_ADAPTED_KEY = _adapter_key(_OtherAdaptedValue)
+
+
+def _hash_position_wrapper(kind: str, left: object, right: object) -> object:
+    if kind == "dict":
+        return FrozenDict(cast(Any, _ordered_entries(left, right)))
+    return FrozenSet(kind, _ordered_members(left, right))
+
+
+@pytest.mark.parametrize("kind", ["dict", "set", "frozenset"])
+def test_same_adapter_with_equivalent_payloads_is_refused(kind: str) -> None:
+    # An adapter that mirrors its payload -- the shape _AdaptedValueAdapter
+    # has, and the common one -- inherits the payload's collapse: these two
+    # adapted values are equal and hash alike, so a thawed dict or set built
+    # from both keeps exactly one of them.
+    assert _AdaptedValue(cast(Any, 1)) == _AdaptedValue(cast(Any, 1.0))
+    assert hash(_AdaptedValue(cast(Any, 1))) == hash(_AdaptedValue(cast(Any, 1.0)))
+    wrapper = _hash_position_wrapper(
+        kind,
+        FrozenAdapterValue(_ADAPTED_KEY, 1),
+        FrozenAdapterValue(_ADAPTED_KEY, 1.0),
+    )
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(wrapper)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        serialize_snapshot(wrapper)
+    # Same refusal from untrusted bytes: the validator cannot consult the
+    # adapter registry on either path, so it decides from the encoding alone
+    # and decides the same way on both.
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        deserialize_snapshot(_raw_snapshot_bytes(wrapper))
+
+
+@pytest.mark.parametrize("kind", ["dict", "set", "frozenset"])
+def test_adapter_hash_positions_that_stay_distinct_are_accepted(kind: str) -> None:
+    registry = {
+        _AdaptedValue: _AdaptedValueAdapter(),
+        _OtherAdaptedValue: _OtherAdaptedValueAdapter(),
+    }
+    accepted = [
+        # One payload, two adapter keys: the rule refuses only within a single
+        # adapter, because whether two adapters produce equal values is not
+        # written in the encoding.
+        (
+            FrozenAdapterValue(_ADAPTED_KEY, 1),
+            FrozenAdapterValue(_OTHER_ADAPTED_KEY, 1),
+        ),
+        # One adapter, payloads that do not share an equivalence class.
+        (
+            FrozenAdapterValue(_ADAPTED_KEY, 1),
+            FrozenAdapterValue(_ADAPTED_KEY, 2),
+        ),
+    ]
+    for left, right in accepted:
+        wrapper = _hash_position_wrapper(kind, left, right)
+        snapshot = freeze(wrapper)
+        restored = deserialize_snapshot(serialize_snapshot(snapshot))
+        assert fingerprint_snapshot(restored) == fingerprint_snapshot(snapshot)
+        thawed = thaw(snapshot, adapters=cast(Any, registry))
+        assert len(cast(Any, thawed)) == 2
+
+
+class _IdentityAdapted:
+    # An adapted type whose values compare by identity rather than by payload.
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+
+class _IdentityAdaptedAdapter:
+    def freeze(self, value: _IdentityAdapted, freeze_value: Any) -> object:
+        return freeze_value(value.value)
+
+    def thaw(self, snapshot: Any, thaw_value: Any) -> _IdentityAdapted:
+        return _IdentityAdapted(thaw_value(snapshot))
+
+
+def test_identity_equal_adapted_values_are_refused_though_they_would_not_collapse() -> None:
+    adapters: dict[type[Any], Any] = {_IdentityAdapted: _IdentityAdaptedAdapter()}
+    left = _IdentityAdapted(1)
+    right = _IdentityAdapted(1.0)
+    # Nothing hand-built here, and this is the live route for adapted hash
+    # positions -- each key or member is frozen through _freeze_hash_position
+    # and the pair is judged when the finished wrapper is validated. These two
+    # compare by identity, so a live dict and a live set each keep both, and
+    # thawing would keep both as well: the adapter builds a fresh object per
+    # position.
+    assert left != right
+    live_dict = {left: "x", right: "y"}
+    assert len(live_dict) == 2
+    live_set = {left, right}
+    assert len(live_set) == 2
+    # Refused anyway, and deliberately. The payloads 1 and 1.0 already share a
+    # post-thaw equivalence class, and the same-adapter rule refuses on that
+    # alone: the validator decides from the encoding and never runs the
+    # adapter, so it cannot see the __eq__ that would keep these apart.
+    # Over-rejecting is the safe direction -- loosening the rule later only
+    # accepts more snapshots, which breaks nothing.
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(live_dict, adapters=adapters)
+    with pytest.raises(UnsupportedValueError, match="collapse"):
+        freeze(live_set, adapters=adapters)

@@ -1251,3 +1251,109 @@ def test_filesystem_store_reports_exhausted_open_retries_as_lock_timeout(
     store = FileSystemArtifactStore(tmp_path, lock_timeout=0)
     with pytest.raises(ArtifactStoreLockError):
         store.put("f" * 64, b"payload")
+
+
+def test_in_memory_store_rejects_nonbytes_and_exposes_keys() -> None:
+    store = InMemoryArtifactStore()
+    with pytest.raises(TypeError, match="must be bytes"):
+        store.put("digest", cast(Any, bytearray(b"payload")))
+
+    store.put("digest", b"payload")
+    assert store.keys() == {"digest": b"payload"}
+
+
+def test_filesystem_store_root_and_payload_type(tmp_path: Path) -> None:
+    store = FileSystemArtifactStore(tmp_path / "store")
+    assert store.root == (tmp_path / "store").resolve()
+    with pytest.raises(TypeError, match="must be bytes"):
+        store.put("a" * 64, cast(Any, memoryview(b"payload")))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow behavior")
+def test_posix_safe_fs_handles_missing_and_nonregular_targets(tmp_path: Path) -> None:
+    missing = tmp_path / "missing" / "file.bin"
+    assert safe_fs_module.read_regular_file(missing) is None
+    assert not safe_fs_module.unlink_regular_file(missing)
+
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    assert safe_fs_module.read_regular_file(parent / "absent") is None
+    assert not safe_fs_module.unlink_regular_file(parent / "absent")
+
+    directory = parent / "directory"
+    directory.mkdir()
+    with pytest.raises(safe_fs_module.UnsafeFilesystemPathError, match="regular file"):
+        safe_fs_module.read_regular_file(directory)
+    with pytest.raises(safe_fs_module.UnsafeFilesystemPathError, match="non-regular"):
+        safe_fs_module.unlink_regular_file(directory)
+    with pytest.raises(safe_fs_module.UnsafeFilesystemPathError, match="lock file"):
+        safe_fs_module.open_lock_file(directory)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow behavior")
+def test_identity_read_and_identity_checked_unlink(tmp_path: Path) -> None:
+    target = tmp_path / "file.bin"
+    target.write_bytes(b"payload")
+    read = safe_fs_module.read_regular_file_with_identity(target)
+    assert read is not None
+    data, identity = read
+    metadata = target.stat()
+    assert data == b"payload"
+    assert identity == (metadata.st_dev, metadata.st_ino)
+    assert safe_fs_module.read_regular_file_with_identity(tmp_path / "absent") is None
+
+    # A stale identity refuses and leaves the file in place.
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(b"payload")
+    os.replace(replacement, target)
+    assert safe_fs_module.unlink_regular_file(target, expected_identity=identity) is False
+    assert target.read_bytes() == b"payload"
+
+    # The current identity unlinks.
+    fresh = safe_fs_module.read_regular_file_with_identity(target)
+    assert fresh is not None
+    assert safe_fs_module.unlink_regular_file(target, expected_identity=fresh[1]) is True
+    assert not target.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX temporary-file behavior")
+def test_posix_atomic_write_reports_exhausted_temporary_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "output.bin"
+    token = "0" * 16
+    collision = tmp_path / f".tmp-{os.getpid()}-{token}"
+    collision.write_bytes(b"occupied")
+    monkeypatch.setattr(cast(Any, safe_fs_module).secrets, "token_hex", lambda _length: token)
+
+    with pytest.raises(OSError, match="allocate a temporary file"):
+        safe_fs_module.atomic_write(target, b"new")
+
+    assert not target.exists()
+    assert collision.read_bytes() == b"occupied"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-descriptor behavior")
+def test_remove_empty_directory_branches_on_missing_nondirectory_and_populated(
+    tmp_path: Path,
+) -> None:
+    assert not safe_fs_module.remove_empty_directory(tmp_path / "absent-parent" / "child")
+    assert not safe_fs_module.remove_empty_directory(tmp_path / "missing")
+
+    regular = tmp_path / "regular"
+    regular.write_bytes(b"data")
+    with pytest.raises(safe_fs_module.UnsafeFilesystemPathError, match="non-directory"):
+        safe_fs_module.remove_empty_directory(regular)
+    assert regular.read_bytes() == b"data"
+
+    populated = tmp_path / "populated"
+    populated.mkdir()
+    (populated / "entry.txt").write_bytes(b"entry")
+    with pytest.raises(OSError):
+        safe_fs_module.remove_empty_directory(populated)
+    assert (populated / "entry.txt").read_bytes() == b"entry"
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert safe_fs_module.remove_empty_directory(empty)
+    assert not empty.exists()

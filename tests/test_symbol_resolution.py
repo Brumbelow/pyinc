@@ -2804,3 +2804,17 @@ def test_a_scope_tree_of_a_null_path_is_refused_by_type(tmp_path: Path) -> None:
         scope_tree(db, nul_path(tmp_path))
 
     assert _ordinary_bindings(db, tmp_path) == {"VALUE"}
+
+
+def test_find_references_rejects_a_non_symbol_id(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="SymbolId"):
+        find_references_by_id(Database(), tmp_path, "not-a-symbol")  # type: ignore[arg-type]
+
+
+def test_class_model_deduplicates_missing_bases(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "module.py"
+    path.write_text("value = 1\nclass C(Missing, Missing):\n    pass\n", encoding="utf-8")
+    model = class_model(Database(), root, path, "C")
+    assert model.unresolved_bases == ("Missing",)

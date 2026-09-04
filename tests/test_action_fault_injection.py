@@ -1549,20 +1549,20 @@ FAULT_REGISTRY: dict[tuple[str, str], tuple[int, tuple[str, ...]]] = {
     )),
     ("_action_lock_directory", "resolve"): (1, (
         "test_an_unwritable_lock_directory_base_fails_before_any_root_work",
-        "test_action_store_branches.py::test_action_lock_directory_resolves_a_symlinked_temporary_base",
+        "test_action.py::test_action_lock_directory_resolves_a_symlinked_temporary_base",
     )),
     ("_action_lock_directory", "mkdir"): (1, (
         "test_an_unwritable_lock_directory_base_fails_before_any_root_work",
         "test_a_lock_directory_creation_fault_fails_before_any_root_work",
     )),
     ("_action_lock_directory", "lstat"): (1, (
-        "test_action_store_branches.py::test_action_lock_directory_rejects_a_non_directory",
-        "test_action_store_branches.py::test_action_lock_directory_rejects_a_symlinked_private_directory",
-        "test_action_store_branches.py::test_action_lock_directory_rejects_foreign_owner",
+        "test_action.py::test_action_lock_directory_rejects_a_non_directory",
+        "test_action.py::test_action_lock_directory_rejects_a_symlinked_private_directory",
+        "test_action.py::test_action_lock_directory_rejects_foreign_owner",
     )),
     ("_action_lock_directory", "chmod"): (1, (
         "test_a_lock_directory_mode_repair_fault_fails_before_any_root_work",
-        "test_action_store_branches.py::test_action_lock_directory_repairs_permissive_mode",
+        "test_action.py::test_action_lock_directory_repairs_permissive_mode",
     )),
     ("_read_manifest", "read_regular_file"): (1, (
         "test_an_unreadable_ledger_refuses_before_mutation_warm_and_reloaded",
@@ -1591,30 +1591,30 @@ FAULT_REGISTRY: dict[tuple[str, str], tuple[int, tuple[str, ...]]] = {
     )),
     ("_reconcile_locked", "_orphan_cannot_exist"): (1, (
         "test_an_unsearchable_orphan_parent_refuses_during_preflight",
-        "test_action_store_branches.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
+        "test_action.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
     )),
     ("_orphan_cannot_exist", "lstat"): (1, (
         "test_an_unsearchable_orphan_parent_refuses_during_preflight",
-        "test_action_store_branches.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
+        "test_action.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
     )),
     ("_reconcile_locked", "_holds_only_desired_outputs"): (1, (
         "test_an_unlistable_released_directory_refuses_during_preflight",
-        "test_action_store_branches.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
+        "test_action.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
     )),
     ("_holds_only_desired_outputs", "scandir"): (1, (
         "test_an_unlistable_released_directory_refuses_during_preflight",
-        "test_action_store_branches.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
+        "test_action.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
     )),
     ("_reconcile_locked", "_safe_target"): (6, (
         "test_a_target_inspection_fault_refuses_typed_before_any_write",
         "test_a_non_regular_node_at_an_orphan_path_refuses_and_survives",
-        "test_action_store_branches.py::test_action_rechecks_target_type_before_writing",
+        "test_action.py::test_action_rechecks_target_type_before_writing",
     )),
     ("_safe_target", "lstat"): (1, (
         "test_a_target_inspection_fault_refuses_typed_before_any_write",
     )),
     ("_safe_target", "resolve"): (1, (
-        "test_action_store_branches.py::test_safe_target_rejects_resolved_parent_escape",
+        "test_action.py::test_safe_target_rejects_resolved_parent_escape",
     )),
     ("_reconcile_locked", "read_regular_file"): (2, (
         # Two sites share this pair: the orphan-ownership read and the
@@ -1631,7 +1631,7 @@ FAULT_REGISTRY: dict[tuple[str, str], tuple[int, tuple[str, ...]]] = {
     )),
     ("_unprunable_entry", "scandir"): (1, (
         "test_action.py::test_reconcile_refuses_an_unlistable_migration_directory_before_deleting",
-        "test_action_store_branches.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
+        "test_action.py::test_preflight_probes_answer_missing_and_refuse_unanswerable",
     )),
     ("_reconcile_locked", "read_regular_file_with_identity"): (1, (
         "test_an_orphan_that_vanishes_in_the_deletion_window_is_not_reported_deleted",
@@ -1677,27 +1677,27 @@ SAFE_FS_SEAMS: dict[str, tuple[str, ...]] = {
         "test_a_ledger_read_fault_refuses_typed_with_the_tree_and_ledger_intact",
         "test_an_orphan_ownership_read_fault_refuses_with_nothing_mutated",
         "test_a_desired_state_read_fault_refuses_with_nothing_mutated",
-        "test_safe_fs_locking_branches.py::test_posix_safe_fs_handles_missing_and_nonregular_targets",
+        "test_store.py::test_posix_safe_fs_handles_missing_and_nonregular_targets",
     ),
     "read_regular_file_with_identity": (
         "test_an_orphan_that_vanishes_in_the_deletion_window_is_not_reported_deleted",
         "test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touched",
-        "test_safe_fs_locking_branches.py::test_identity_read_and_identity_checked_unlink",
+        "test_store.py::test_identity_read_and_identity_checked_unlink",
     ),
     "unlink_regular_file": (
         "test_an_undeletable_orphan_stops_the_run_and_the_next_run_deletes_it",
         "test_an_unlink_fault_stops_the_run_with_the_orphan_and_ledger_intact",
         "test_a_byte_identical_window_survivor_in_a_plain_deletion_is_durably_safe",
-        "test_safe_fs_locking_branches.py::test_identity_read_and_identity_checked_unlink",
+        "test_store.py::test_identity_read_and_identity_checked_unlink",
     ),
     "remove_empty_directory": (
         "test_a_prune_fault_after_deletions_is_typed_and_the_next_run_converges",
-        "test_safe_fs_locking_branches.py::test_remove_empty_directory_branches_on_missing_nondirectory_and_populated",
+        "test_store.py::test_remove_empty_directory_branches_on_missing_nondirectory_and_populated",
     ),
     "atomic_write": (
         "test_a_publication_fault_leaves_no_temporary_and_the_next_run_converges",
         "test_a_ledger_write_fault_leaves_outputs_published_and_the_next_run_converges",
-        "test_safe_fs_locking_branches.py::test_posix_atomic_write_reports_exhausted_temporary_names",
+        "test_store.py::test_posix_atomic_write_reports_exhausted_temporary_names",
     ),
     "open_lock_file": (
         "test_a_lock_acquisition_fault_is_typed_and_touches_nothing",

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import ast
 import tokenize
 from typing import Any, cast
 
 import pytest
 
 from pyinc._python_lexing import identifier_tokens
-from pyinc.integrations import DocumentMap, SourcePosition, SourceRange
+from pyinc.integrations import DocumentMap, SourcePosition, SourceRange, source_geometry
 
 
 @pytest.mark.parametrize(
@@ -115,3 +116,55 @@ def test_identifier_tokens_repair_python_311_split_tokens(
         ("℘1", (1, 4), (1, 6)),
         ("tail", (1, 9), (1, 13)),
     ]
+
+
+def test_source_geometry_rejects_invalid_coordinates_and_boundaries() -> None:
+    with pytest.raises(TypeError):
+        DocumentMap("x").line(True)
+    with pytest.raises(TypeError):
+        DocumentMap("x").from_ast(1, True)
+    with pytest.raises(ValueError):
+        DocumentMap("x").from_ast(0, 0)
+    with pytest.raises(ValueError):
+        DocumentMap("x").from_ast(1, -1)
+    with pytest.raises(ValueError):
+        DocumentMap("x").from_ast(1, 2)
+    with pytest.raises(ValueError, match="UTF-8 boundary"):
+        DocumentMap("é").from_ast(1, 1)
+    with pytest.raises(ValueError, match="complete source range"):
+        DocumentMap("x").ast_range(ast.Load())
+
+    document = DocumentMap("😀")
+    with pytest.raises(ValueError, match="beyond"):
+        document.to_codepoint(SourcePosition(0, 2), "utf-32")
+    with pytest.raises(ValueError, match="splits"):
+        document.to_codepoint(SourcePosition(0, 1), "utf-16")
+    with pytest.raises(ValueError, match="beyond"):
+        document.to_codepoint(SourcePosition(0, 5), "utf-8")
+    with pytest.raises(ValueError, match="beyond"):
+        document.from_codepoint(SourcePosition(0, 2), "utf-16")
+
+
+def test_source_geometry_range_helpers_and_identifier_fallbacks() -> None:
+    document = DocumentMap("a😀b")
+    codepoints = SourceRange(SourcePosition(0, 1), SourcePosition(0, 2))
+    encoded = document.range_from_codepoint(codepoints, "utf-16")
+    assert encoded == SourceRange(SourcePosition(0, 1), SourcePosition(0, 3))
+    assert document.range_to_codepoint(encoded, "utf-16") == codepoints
+
+    expression = ast.parse("x + x", mode="eval").body
+    assert source_geometry.ast_range("x + x", expression) == SourceRange(
+        SourcePosition(0, 0), SourcePosition(0, 5)
+    )
+    assert source_geometry.identifier_range("x + x", expression, "x", reverse=True) == (
+        SourceRange(SourcePosition(0, 4), SourcePosition(0, 5))
+    )
+
+    malformed = ast.Name(id="missing")
+    malformed.lineno = 1
+    malformed.col_offset = 0
+    malformed.end_lineno = 1
+    malformed.end_col_offset = 3
+    assert source_geometry.identifier_range('"""', malformed, "missing") == SourceRange(
+        SourcePosition(0, 0), SourcePosition(0, 0)
+    )

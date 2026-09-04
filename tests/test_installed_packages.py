@@ -709,3 +709,19 @@ def test_environment_index_returns_stdlib_and_package_data(
 def test_environment_index_not_in_integrations_namespace() -> None:
     """environment_index is a composition query, not re-exported from integrations."""
     assert "environment_index" not in integrations.__all__
+
+
+def test_empty_distribution_metadata_produces_a_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    (site_dir / "empty-1.0.dist-info").mkdir(parents=True)
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    analysis = installed_packages_analysis(Database())
+
+    assert analysis.packages == ()
+    assert analysis.diagnostics[0][0] == "metadata-parse-failed"

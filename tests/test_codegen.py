@@ -18,9 +18,15 @@ from pyinc_codegen import (
     generate,
     schema_analysis,
 )
+from pyinc_codegen.models import DiagnosticPayload
 from pyinc_codegen.schema import (
+    _IGNORED_KEYWORDS,
+    definition_model,
     definition_names,
+    definition_pointer,
     definition_raw,
+    document_diagnostics,
+    index_init,
     model_doc,
     model_python,
     schema_text,
@@ -2106,3 +2112,191 @@ def test_codegen_exports_only_stable_api() -> None:
     assert not hasattr(pyinc_codegen, "schema_text")
     assert not hasattr(pyinc_codegen, "model_python")
     assert not hasattr(pyinc_codegen, "definition_names")
+
+
+def _codes(diagnostics: tuple[DiagnosticPayload, ...]) -> set[str]:
+    return {diagnostic[0] for diagnostic in diagnostics}
+
+
+def _analyze(tmp_path: Path, schema: object) -> SchemaAnalysis:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(schema_path, schema)
+    return schema_analysis(Database(), str(schema_path))
+
+
+def _generate(tmp_path: Path, schema: object) -> None:
+    schema_path = tmp_path / "schema.json"
+    _write_schema(schema_path, schema)
+    generate(Database(), str(schema_path), tmp_path / "generated")
+
+
+def test_document_queries_cover_invalid_roots_sections_duplicates_and_empty_indexes(
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    db = Database()
+
+    _write_schema(schema_path, [1, 2])
+    assert _codes(document_diagnostics(db, str(schema_path))) == {"invalid-schema-root"}
+
+    _write_schema(schema_path, {"$defs": []})
+    assert _codes(document_diagnostics(db, str(schema_path))) == {"invalid-definitions"}
+
+    _write_schema(
+        schema_path,
+        {
+            "description": 1,
+            "$id": 2,
+            "$defs": {"Same": {}},
+            "definitions": {"Same": {}},
+        },
+    )
+    codes = _codes(document_diagnostics(db, str(schema_path)))
+    assert {"invalid-description", "invalid-annotation", "duplicate-definition"} <= codes
+
+    _write_schema(
+        schema_path,
+        {"oneOf": [{"type": "string"}], "type": "object", "properties": {}, "default": 1},
+    )
+    root = document_diagnostics(db, str(schema_path))
+    assert [(code, pointer) for code, _message, _severity, pointer in root] == [
+        ("ignored-constraint", "/default"),
+        ("unsupported-construct", "/oneOf"),
+        ("unsupported-root-schema", ""),
+    ]
+    assert "'properties', 'type'" in root[2][1]
+
+    _write_schema(schema_path, {})
+    assert index_init(db, str(schema_path)) == "__all__: list[str] = []\n"
+
+
+_ROOT_IGNORED_VALUES: dict[str, object] = {
+    "additionalProperties": False,
+    "default": 1,
+    "deprecated": True,
+    "examples": [1],
+    "exclusiveMaximum": 10,
+    "exclusiveMinimum": 0,
+    "format": "email",
+    "maxItems": 5,
+    "maxLength": 5,
+    "maximum": 10,
+    "minItems": 1,
+    "minLength": 1,
+    "minimum": 0,
+    "multipleOf": 2,
+    "pattern": "^a$",
+    "readOnly": True,
+    "uniqueItems": True,
+    "writeOnly": True,
+}
+
+
+def test_ignored_keywords_at_the_document_root_warn_without_blocking(tmp_path: Path) -> None:
+    assert set(_ROOT_IGNORED_VALUES) == set(_IGNORED_KEYWORDS)
+    schema_path = tmp_path / "schema.json"
+    db = Database()
+    defs = {"$defs": {"K": {"type": "object", "properties": {"a": {"type": "string"}}}}}
+
+    for keyword, value in _ROOT_IGNORED_VALUES.items():
+        _write_schema(schema_path, {**defs, keyword: value})
+        assert [
+            (code, severity, pointer)
+            for code, _message, severity, pointer in document_diagnostics(db, str(schema_path))
+        ] == [("ignored-constraint", "warning", f"/{keyword}")]
+
+    # A model keyword and an unrecognized keyword state the same rule once,
+    # against the whole document, and do block.
+    _write_schema(schema_path, {**defs, "type": "object", "wibble": 1})
+    assert [
+        (code, severity, pointer)
+        for code, _message, severity, pointer in document_diagnostics(db, str(schema_path))
+    ] == [("unsupported-root-schema", "error", "")]
+
+
+def test_reordering_definition_keys_keeps_incremental_document_diagnostics_identical_to_fresh(
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    fragments: dict[str, Any] = {
+        "Class": {"type": "string"},
+        "Import": {"type": "integer"},
+    }
+    states: tuple[dict[str, Any], ...] = (
+        {"$defs": {name: fragments[name] for name in ("Class", "Import")}},
+        {"$defs": {name: fragments[name] for name in ("Import", "Class")}},
+    )
+
+    incremental_db = Database()
+    for state in states:
+        _write_schema(schema_path, state)
+        incremental = document_diagnostics(incremental_db, str(schema_path))
+        fresh = document_diagnostics(Database(), str(schema_path))
+        assert incremental == fresh
+
+
+def test_definition_queries_return_safe_fallbacks_for_malformed_and_missing_data(
+    tmp_path: Path,
+) -> None:
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text("not json", encoding="utf-8")
+    db = Database()
+    assert definition_names(db, str(schema_path)) == ()
+    assert definition_raw(db, str(schema_path), "Missing") == ""
+    assert definition_pointer(db, str(schema_path), "Missing") == ""
+
+    _write_schema(schema_path, {"$defs": {"Present": {"type": "string"}}})
+    assert definition_raw(db, str(schema_path), "Missing") == ""
+    assert definition_pointer(db, str(schema_path), "Missing") == ""
+    missing = definition_model(db, str(schema_path), "Missing")
+    assert _codes(missing[7]) == {"missing-definition"}
+
+
+def test_two_definition_pure_alias_cycle_is_diagnosed_on_each_member(tmp_path: Path) -> None:
+    schema = {
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"$ref": "#/$defs/A"},
+        }
+    }
+    analysis = _analyze(tmp_path, schema)
+    cycle_diags = [d for d in analysis.diagnostics if d.code == "alias-cycle"]
+    assert len(cycle_diags) == 2
+    assert all(d.severity is DiagnosticSeverity.ERROR for d in cycle_diags)
+    assert all("A -> B -> A" in d.message for d in cycle_diags)
+
+
+def test_alias_cycle_blocks_generation(tmp_path: Path) -> None:
+    schema = {
+        "$defs": {
+            "A": {"$ref": "#/$defs/B"},
+            "B": {"$ref": "#/$defs/A"},
+        }
+    }
+    with pytest.raises(SchemaGenerationError):
+        _generate(tmp_path, schema)
+
+
+def test_recursion_through_a_container_is_not_a_cycle(tmp_path: Path) -> None:
+    schema = {
+        "$defs": {
+            "Tree": {
+                "type": "object",
+                "properties": {"children": {"type": "array", "items": {"$ref": "#/$defs/Node"}}},
+            },
+            "Node": {"$ref": "#/$defs/Tree"},
+        }
+    }
+    analysis = _analyze(tmp_path, schema)
+    assert not any(d.code == "alias-cycle" for d in analysis.diagnostics)
+
+
+def test_nullable_alias_edges_still_form_a_cycle(tmp_path: Path) -> None:
+    schema = {
+        "$defs": {
+            "A": {"anyOf": [{"$ref": "#/$defs/B"}, {"type": "null"}]},
+            "B": {"$ref": "#/$defs/A"},
+        }
+    }
+    analysis = _analyze(tmp_path, schema)
+    assert sum(d.code == "alias-cycle" for d in analysis.diagnostics) == 2

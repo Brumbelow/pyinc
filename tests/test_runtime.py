@@ -21,6 +21,8 @@ from pyinc import (
     BUILTIN_ADAPTERS,
     AdapterContractError,
     BinaryFileResource,
+    CheckpointIntegrityError,
+    CheckpointManifestError,
     CycleError,
     Database,
     DatabaseStatistics,
@@ -39,6 +41,7 @@ from pyinc import (
     FrozenSet,
     InMemoryArtifactStore,
     Input,
+    InputKeyError,
     InspectionNode,
     MutationError,
     PyIncError,
@@ -9275,3 +9278,232 @@ def test_reentrant_database_error_is_public_and_catchable_as_pyinc_error() -> No
     assert "ReentrantDatabaseError" in pyinc.__all__
     with pytest.raises(PyIncError):
         raise ReentrantDatabaseError("re-entered")
+
+
+_DIGEST = "a" * 64
+
+
+def _tallied(key: str) -> str:
+    calls = Path(f"{key}.calls")
+    return calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
+@dataclass(frozen=True)
+class _InvalidLabelResource(Resource[str, str, str]):
+    label_value: object
+
+    def probe(self, key: str) -> str:
+        return key
+
+    def load(self, db: Database, key: str) -> str:
+        return key
+
+    def label(self, key: str) -> Any:
+        return self.label_value
+
+
+class _TaggedLabel(str):
+    pass
+
+
+class _TrappedLabel(str):
+    def __len__(self) -> int:
+        raise AssertionError("no user dunder runs before the exactness check")
+
+    def __bool__(self) -> bool:
+        raise AssertionError("no user dunder runs before the exactness check")
+
+
+@dataclass(frozen=True)
+class _SubclassLabelResource(Resource[str, str, str]):
+    """Builds its label rather than storing one, so the label check is reached.
+
+    A `str` subclass held as resource *configuration* is refused earlier, by the
+    resource-identity freeze; only a label computed inside `label()` reaches the
+    label boundary.
+    """
+
+    def probe(self, key: str) -> str:
+        return key
+
+    def load(self, db: Database, key: str) -> str:
+        return key
+
+    def label(self, key: str) -> Any:
+        if key == "trapped":
+            return _TrappedLabel("")
+        return _TaggedLabel(f"tagged[{key}]")
+
+
+@dataclass(frozen=True)
+class _TallyingFailingResource(Resource[str, str, tuple[str, ...]]):
+    """Never loads, appending one character per call to ``<key>.calls``.
+
+    The tally lives beside the resource's own key because a query's capture set
+    may not contain mutable state -- a counter attribute or module global is
+    rejected before the first ``get()``.
+    """
+
+    def _tally(self, key: str, event: str) -> None:
+        with open(f"{key}.calls", "a", encoding="utf-8") as handle:
+            handle.write(event)
+
+    def probe(self, key: str) -> tuple[str, ...]:
+        self._tally(key, "p")
+        return ("missing",)
+
+    def load(self, db: Database, key: str) -> str:
+        self._tally(key, "l")
+        raise FileNotFoundError(key)
+
+    def label(self, key: str) -> str:
+        return f"tallying[{key}]"
+
+
+class _NonBytesStore:
+    def get(self, digest: str) -> Any:
+        return "not bytes"
+
+    def put(self, digest: str, payload: bytes) -> None:
+        return None
+
+    def contains(self, digest: str) -> bool:
+        return True
+
+
+def test_database_public_validation_errors_are_specific() -> None:
+    with pytest.raises(ValueError, match="strict, checked, fast"):
+        Database(mode="unknown")
+
+    db = Database()
+    with pytest.raises(TypeError, match="db.set"):
+        db.set(cast(Any, "input"), 1)
+    with pytest.raises(TypeError, match="db.get"):
+        db.get(cast(Any, lambda: None))
+    with pytest.raises(TypeError, match="db.explain"):
+        db.explain(cast(Any, lambda: None))
+    with pytest.raises(TypeError, match="db.inspect"):
+        db.inspect(cast(Any, lambda: None))
+    with pytest.raises(RuntimeError, match="while a query is executing"):
+        db.report_untracked_read("outside")
+    with pytest.raises(ValueError, match="requires an ArtifactStore"):
+        db.save_checkpoint()
+    with pytest.raises(ValueError, match="requires an ArtifactStore"):
+        db.load_checkpoint("ck" + _DIGEST)
+
+
+def test_set_many_rejects_malformed_pairs_and_duplicate_keys_transactionally() -> None:
+    db = Database()
+    value = Input[int]("set-many-edge")
+
+    with pytest.raises(TypeError, match="iterable of .* pairs"):
+        db.set_many([cast(Any, (value, 1, 2))])
+    with pytest.raises(TypeError, match="expects .* pairs"):
+        db.set_many([(cast(Any, "not-input"), 1)])
+    with pytest.raises(InputKeyError, match="duplicate input key"):
+        db.set_many([(value, 1), (value, 2)])
+    assert db.revision == 0
+
+
+def test_resource_labels_must_be_exact_nonempty_strings() -> None:
+    db = Database()
+    with pytest.raises(TypeError, match="must return a string"):
+        _InvalidLabelResource(1).read(db, "value")
+    with pytest.raises(ValueError, match="non-empty string"):
+        _InvalidLabelResource("").read(db, "value")
+    # A label becomes a node label, so it carries the same exactness rule as an
+    # input or query key -- and the resource boundary answers for it by name,
+    # rather than letting the node table's generic refusal surface instead.
+    with pytest.raises(TypeError, match=r"Resource\.label\(\) must return exactly str"):
+        _SubclassLabelResource().read(db, "value")
+    # Exactness is decided before emptiness here too, so a label lying about
+    # its own emptiness is refused as a subclass without its dunders running.
+    with pytest.raises(TypeError, match=r"Resource\.label\(\) must return exactly str"):
+        _SubclassLabelResource().read(db, "trapped")
+
+
+def test_failing_resource_loads_once_per_request_across_a_fan_out(tmp_path: Path) -> None:
+    resource = _TallyingFailingResource()
+    target = str(tmp_path / "target")
+
+    @query
+    def reader(db: Database, key: str, index: int) -> str:
+        try:
+            return resource.read(db, key)
+        except FileNotFoundError:
+            return f"<default-{index}>"
+
+    @query
+    def fan_out(db: Database, key: str) -> tuple[str, ...]:
+        return tuple(reader(db, key, index) for index in range(20))
+
+    db = Database()
+    assert db.get(fan_out, target)[0] == "<default-0>"
+    # One load per request, however many readers observe it. The probe either
+    # side of it is probe_and_load's default implementation followed by the
+    # second observation taken alongside the failure.
+    assert _tallied(target) == "plp"
+    revision = db.revision
+    executions = db.statistics().query_executions
+
+    for _ in range(10):
+        assert len(db.get(fan_out, target)) == 20
+
+    assert _tallied(target) == "plp" * 11
+    assert db.revision == revision
+    assert db.statistics().query_executions == executions
+
+
+def test_repeated_failing_reads_within_one_query_body_load_once(tmp_path: Path) -> None:
+    resource = _TallyingFailingResource()
+    target = str(tmp_path / "target")
+
+    @query
+    def read_repeatedly(db: Database, key: str, times: int) -> int:
+        handled = 0
+        for _ in range(times):
+            try:
+                resource.read(db, key)
+            except FileNotFoundError:
+                handled += 1
+        return handled
+
+    db = Database()
+    assert db.get(read_repeatedly, target, 50) == 50
+    assert _tallied(target) == "plp"
+
+
+def test_checkpoint_public_load_rejects_invalid_missing_and_nonbytes_manifests() -> None:
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+
+    with pytest.raises(CheckpointIntegrityError, match="lowercase SHA-256"):
+        db.load_checkpoint("not-a-checkpoint")
+    with pytest.raises(KeyError, match="not found"):
+        db.load_checkpoint("ck" + _DIGEST)
+
+    nonbytes_db = Database(store=cast(Any, _NonBytesStore()))
+    with pytest.raises(CheckpointIntegrityError, match="payload is not bytes"):
+        nonbytes_db.load_checkpoint("ck" + _DIGEST)
+
+    duplicate = b'{"field":1,"field":2}'
+    duplicate_key = "ck" + hashlib.sha256(duplicate).hexdigest()
+    store.put(duplicate_key, duplicate)
+    with pytest.raises(CheckpointManifestError, match="duplicate JSON field"):
+        db.load_checkpoint(duplicate_key)
+
+
+def test_default_observer_hook_is_used_when_callback_raises(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    @query
+    def observed(db: Database) -> int:
+        return 1
+
+    def fail(event: object) -> None:
+        raise RuntimeError("observer failed")
+
+    db = Database()
+    db.observe(fail, observed)
+    assert db.get(observed) == 1
+    assert "observer callback raised RuntimeError: observer failed" in capsys.readouterr().err
