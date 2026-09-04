@@ -19,7 +19,7 @@ Existing API, escape hatches, or workarounds you have already used.
 
 The kernel stays domain-agnostic; consumer concerns live in `pyinc_tools` and
 `pyinc_codegen`. See
-[the architecture overview](https://github.com/Brumbelow/pyinc/blob/main/docs/architecture.md).
+[the package map](https://github.com/Brumbelow/pyinc/blob/main/docs/README.md#packages).
 
 - [ ] `pyinc` kernel — this would widen the kernel contract
 - [ ] `pyinc.integrations` — a new or extended integration

@@ -118,5 +118,5 @@ seriousness, and that document says what to include.
 ---
 
 The [documentation index](docs/README.md) maps each document to the one job it
-does; [`docs/architecture.md`](docs/architecture.md) is the shortest path to how
-the packages fit together.
+does, and its [package map](docs/README.md#packages) is the shortest path to
+how the packages fit together.

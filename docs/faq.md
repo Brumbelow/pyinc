@@ -10,7 +10,13 @@ pyinc borrows its vocabulary — demand-driven queries, red-green verification,
 early cutoff — from Salsa, the Rust incremental-computation framework that
 rust-analyzer is built on. It is not a port of Salsa, shares no code with it,
 and does not implement Adapton's algorithm. The lineage is in the idea, not the
-implementation.
+implementation, and the idea has a Python history of its own:
+[IncPy](https://www.usenix.org/conference/tapp-10/towards-practical-incremental-recomputation-scientists-implementation-python)
+explored it in 2010, [Adapton](https://matthewhammer.org/adapton/) listed a
+Python implementation, and [Loman](https://pypi.org/project/loman/),
+[Darl](https://pypi.org/project/darl/), and
+[Cascade Query](https://github.com/hmatt1/cascade-query) each cover parts of
+this ground.
 
 The differences that matter are not in the graph algorithm, which is the
 familiar one. They are in what a Python implementation has to enforce at
@@ -26,26 +32,25 @@ runtime:
   `FrozenRecord`, with registered `ValueAdapter`s for everything else. That is
   condition 1 of the guarantee, and it exists because the language does not
   provide it. One visible consequence: a mapping that crosses a boundary comes
-  back in a canonical order derived from each key's snapshot digest —
-  deterministic across processes and platforms, but neither insertion order nor
-  sorted order — because the order is what makes one value one cache key. Sets
-  are ordered by the same rule inside the snapshot, but a thawed `set` is an
-  ordinary unordered Python set and carries no order back out.
+  back in a [canonical order](kernel-contract.md#1-value-boundary-ownership)
+  that is neither insertion order nor sorted order, because the order is what
+  makes one value one cache key.
 - **Ambient reads.** Reading a file or an environment variable directly inside
   a query, rather than through a declared input, silently breaks any
   incremental engine in any language. pyinc does not only document the rule:
-  while a query runs it intercepts `builtins.open`, `io.open`, `os.getenv`,
-  `os.environ`, `os.listdir`, `os.scandir`, and `Path.iterdir`, and raises
-  `UntrackedReadError` when the read is not inside a `Resource`. That is
-  condition 2. The reads the guard cannot see are enumerated in
+  while a query runs it intercepts the calls
+  [condition 2](kernel-contract.md#2-tracked-ambient-reads) enumerates — file
+  opens, environment access, directory listings — and raises
+  `UntrackedReadError` when the read is not inside a `Resource`. The reads the
+  guard cannot see are enumerated in
   [Explicit Limitations](kernel-contract.md#explicit-limitations) rather than
   left implied.
 
 rust-analyzer is the reason this model is widely known, and it is a *consumer*
 of Salsa rather than part of it. The same split holds here: the kernel in
 `src/pyinc` is domain-agnostic, and the language-server, watcher, and CLI live
-in `pyinc_tools`, built on the public integration surface. See
-[Architecture](architecture.md).
+in `pyinc_tools`, built on the public integration surface. See the
+[package map](README.md#packages).
 
 pyinc also persists a graph beyond one process: `save_checkpoint` writes a
 content-addressed manifest that a later process can load, with the trust
@@ -142,11 +147,28 @@ it misses safely and recomputes rather than reusing a record — or a checkpoint
 — written under a different build.
 
 **Processes.** There is no built-in worker pool, scheduler, or distributed
-execution; that is [out of scope](architecture.md#scope) by design. Separate
+execution; that is [out of scope](#what-is-out-of-scope) by design. Separate
 processes hold separate databases and run fully in parallel, and they can share
 completed work through checkpoints and a `FileSystemArtifactStore`: save in one
 process, load in another. That path is exercised by a cross-process test
 matrix.
+
+## What is out of scope?
+
+`Database` is synchronous and serialized, with explicit keyed inputs, queries,
+and resources. Built-in query scheduling, worker pools, async queries,
+distributed execution, and interception of every possible ambient read stay
+out of scope. Custom equality policy purity and `fast`-mode mutation hazards
+remain caller contracts.
+
+The shipped Python analysis is conservative and declaration-driven, not a type
+checker or a formatter: an unsupported attribute shape produces no navigation
+or refactoring result rather than a guess. Remote JSON Schema references,
+combinators beyond the two spellings the codegen guide names, conditionals,
+and instance validation stay outside the code generator's narrow subset.
+Watcher loops, mirror workspaces, protocol-position conversion, and the
+LSP/JSON-RPC adapter belong to `pyinc_tools`; JSON Schema analysis belongs to
+`pyinc_codegen`; neither widens the domain-agnostic kernel contract.
 
 ## When should I not use pyinc?
 
@@ -169,7 +191,5 @@ matrix.
   impossible under the three conditions. Without that requirement, a simpler
   cache is cheaper.
 
-Separately, the shipped Python analysis in `pyinc.integrations` is conservative
-and declaration-driven. It is not a type checker, and it returns no result
-rather than guessing; the
-[integration contract](integration-contract.md) states the limits.
+The [integration contract](integration-contract.md) states the limits of the
+shipped analysis.
