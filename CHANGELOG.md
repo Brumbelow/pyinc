@@ -118,6 +118,11 @@ decided at release time.
 
 ### Fixed
 
+- A checkpoint now warms a query that reaches a child query or a resource as a
+  module attribute (`import pkg.queries as q` then `q.thing(db, x)`) exactly as
+  it warms one that captured the object by name. The warm gate counted only
+  direct captures as pinned, so the parent always re-executed, and a caller
+  above it reported a reuse while that execution happened underneath.
 - A failed `db.set` or `db.read_input` no longer leaves a half-registered
   input behind. Every step that can fail — the conflicting-policy check, the
   freeze, the caller's `eq=`/`cutoff=` comparator, the store write — now runs
