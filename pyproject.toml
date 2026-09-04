@@ -76,6 +76,9 @@ include = [
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q --tb=no"
+markers = [
+  "real_site_packages: needs the real site-packages instead of the empty fake every test gets",
+]
 
 [tool.coverage.run]
 branch = true

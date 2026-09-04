@@ -1038,6 +1038,7 @@ def test_workspace_analysis_matches_fresh_recomputation_over_changes(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_site_packages
 def test_import_resolution_classifies_stdlib_and_installed(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()

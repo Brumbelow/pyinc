@@ -204,6 +204,7 @@ def test_codegen_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "removed_def_deleted=('color.py', 'docs/color.md')" in output
 
 
+@pytest.mark.real_site_packages
 def test_undeclared_imports_reports_the_promised_finding(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
