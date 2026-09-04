@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import site
 import tempfile
 from collections.abc import Callable
@@ -75,6 +76,13 @@ WorkspaceState = tuple[str, str, bool]
 CheckpointOp = tuple[str, object]
 
 
+def _examples(default: int) -> int:
+    # PYINC_PROPERTY_MAX_EXAMPLES caps every row's budget so one quick job can
+    # run the file; unset, each row keeps the budget written beside it.
+    cap = os.environ.get("PYINC_PROPERTY_MAX_EXAMPLES", "")
+    return min(default, int(cap)) if cap else default
+
+
 def boundary_scalars() -> st.SearchStrategy[object]:
     # The numeric pool behind operation_sequences and checkpoint_op_sequences,
     # so it feeds test_incremental_results_match_fresh_recomputation and
@@ -98,7 +106,7 @@ def operation_sequences() -> st.SearchStrategy[list[Operation]]:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("max_query_nodes", [None, 2])
-@settings(max_examples=50, deadline=None)
+@settings(max_examples=_examples(50), deadline=None)
 @given(steps=operation_sequences())
 def test_incremental_results_match_fresh_recomputation(
     mode: str,
@@ -231,7 +239,7 @@ def _consumer_source(variant: str) -> str:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("max_query_nodes", [None, 2])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(contents=file_contents())
 def test_resource_backed_queries_match_fresh_recomputation(
     mode: str,
@@ -270,7 +278,7 @@ def optional_file_contents() -> st.SearchStrategy[list[str | None]]:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("max_query_nodes", [None, 2])
-@settings(max_examples=20, deadline=None)
+@settings(max_examples=_examples(20), deadline=None)
 @given(contents=optional_file_contents())
 def test_optional_resource_queries_match_fresh_recomputation(
     mode: str,
@@ -307,7 +315,7 @@ def test_optional_resource_queries_match_fresh_recomputation(
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("max_query_nodes", [None, 2])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(states=workspace_states())
 def test_workspace_queries_match_fresh_recomputation(
     mode: str,
@@ -346,7 +354,7 @@ def test_workspace_queries_match_fresh_recomputation(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=40, deadline=None)
+@settings(max_examples=_examples(40), deadline=None)
 @given(
     values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=20),
     prefrozen=st.booleans(),
@@ -387,7 +395,7 @@ def test_aliasing_mutation_boundaries_behave_by_mode(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=20, deadline=None)
+@settings(max_examples=_examples(20), deadline=None)
 @given(values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=10))
 def test_shared_identity_preserved_across_boundary_in_fast_mode(
     mode: str, values: list[int]
@@ -436,7 +444,7 @@ def multi_level_rewiring_steps() -> st.SearchStrategy[list[tuple[str, str, int, 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("max_query_nodes", [None, 3])
-@settings(max_examples=40, deadline=None)
+@settings(max_examples=_examples(40), deadline=None)
 @given(steps=multi_level_rewiring_steps())
 def test_multi_level_rewiring_matches_fresh_recomputation(
     mode: str,
@@ -513,7 +521,7 @@ def checkpoint_op_sequences() -> st.SearchStrategy[list[CheckpointOp]]:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("max_query_nodes", [None, 2])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(steps=checkpoint_op_sequences())
 def test_checkpoint_reload_matches_fresh_recomputation(
     mode: str,
@@ -616,7 +624,7 @@ def test_checkpoint_reload_matches_fresh_recomputation(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=40, deadline=None)
+@settings(max_examples=_examples(40), deadline=None)
 @given(values=st.lists(st.integers(min_value=-20, max_value=20), min_size=1, max_size=8))
 def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
     mode: str, values: list[int]
@@ -871,7 +879,7 @@ def _python_entrypoint_values(db: Database, root: str, path: str) -> dict[str, o
 # the warm database into a cold one and makes warm == fresh true for the wrong
 # reason.
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=python_source_documents())
 def test_python_source_entrypoints_match_fresh_recomputation(
     mode: str, documents: list[str]
@@ -914,7 +922,7 @@ def test_python_source_entrypoints_match_fresh_recomputation(
 # enough to afford the higher count; the python_source row, at ten times the
 # cost per step, is not.
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=notebook_documents())
 def test_notebook_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
     # notebook_analysis reads the raw text directly, to place its diagnostic
@@ -999,7 +1007,7 @@ def _notebook_run_document(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=15, deadline=None)
+@settings(max_examples=_examples(15), deadline=None)
 @given(
     source=st.sampled_from(_NOTEBOOK_CELL_SOURCES),
     revisions=st.lists(
@@ -1063,7 +1071,7 @@ _PYTHON_COMMENTS = (
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=15, deadline=None)
+@settings(max_examples=_examples(15), deadline=None)
 @given(
     base=st.sampled_from(_PYTHON_COMMENT_BASES),
     comments=st.lists(st.sampled_from(_PYTHON_COMMENTS), min_size=2, max_size=4, unique=True),
@@ -1123,7 +1131,7 @@ def _python_checkpoint_values(db: Database, path: str) -> dict[str, object]:
 # recompute marker, because a reloaded record reports "reused" or "executed"
 # either way.
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=python_source_documents())
 def test_python_source_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1150,7 +1158,7 @@ def test_python_source_checkpoint_reload_matches_fresh(mode: str, documents: lis
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=notebook_documents())
 def test_notebook_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
     # Same ordering, same reasons, same two rules: edit before save, compare
@@ -1381,7 +1389,7 @@ def _csv_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=_sampled_documents(_CSV_DOCUMENTS))
 def test_csv_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
     _assert_entrypoints_match_fresh(
@@ -1390,7 +1398,7 @@ def test_csv_entrypoints_match_fresh_recomputation(mode: str, documents: list[st
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=_sampled_documents(_CSV_DOCUMENTS))
 def test_csv_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
     _assert_reload_after_an_edit_after_the_save_matches_fresh(
@@ -1424,7 +1432,7 @@ def _env_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=_sampled_documents(_ENV_DOCUMENTS))
 def test_env_file_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
     _assert_entrypoints_match_fresh(
@@ -1433,7 +1441,7 @@ def test_env_file_entrypoints_match_fresh_recomputation(mode: str, documents: li
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=_sampled_documents(_ENV_DOCUMENTS))
 def test_env_file_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
     _assert_reload_after_an_edit_after_the_save_matches_fresh(
@@ -1469,7 +1477,7 @@ def _json_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=_sampled_documents(_JSON_DOCUMENTS))
 def test_json_config_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
     _assert_entrypoints_match_fresh(
@@ -1478,7 +1486,7 @@ def test_json_config_entrypoints_match_fresh_recomputation(mode: str, documents:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=_sampled_documents(_JSON_DOCUMENTS))
 def test_json_config_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
     _assert_reload_after_an_edit_before_the_save_matches_fresh(
@@ -1516,7 +1524,7 @@ def _toml_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=_sampled_documents(_TOML_DOCUMENTS))
 def test_toml_config_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
     _assert_entrypoints_match_fresh(
@@ -1525,7 +1533,7 @@ def test_toml_config_entrypoints_match_fresh_recomputation(mode: str, documents:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=_sampled_documents(_TOML_DOCUMENTS))
 def test_toml_config_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
     _assert_reload_after_an_edit_before_the_save_matches_fresh(
@@ -1559,7 +1567,7 @@ def _xml_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=_sampled_documents(_XML_DOCUMENTS))
 def test_xml_config_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
     _assert_entrypoints_match_fresh(
@@ -1568,7 +1576,7 @@ def test_xml_config_entrypoints_match_fresh_recomputation(mode: str, documents: 
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=30, deadline=None)
+@settings(max_examples=_examples(30), deadline=None)
 @given(documents=_sampled_documents(_XML_DOCUMENTS))
 def test_xml_config_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
     _assert_reload_after_an_edit_after_the_save_matches_fresh(
@@ -1661,7 +1669,7 @@ def _requirements_evaluation_entrypoints(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_REQUIREMENTS_DOCUMENTS))
 def test_requirements_entrypoints_match_fresh_recomputation(
     mode: str, documents: list[str]
@@ -1675,7 +1683,7 @@ def test_requirements_entrypoints_match_fresh_recomputation(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_REQUIREMENTS_DOCUMENTS))
 def test_requirements_evaluation_entrypoints_match_fresh_recomputation(
     mode: str, documents: list[str]
@@ -1689,7 +1697,7 @@ def test_requirements_evaluation_entrypoints_match_fresh_recomputation(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_REQUIREMENTS_DOCUMENTS))
 def test_requirements_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
     _assert_reload_after_an_edit_before_the_save_matches_fresh(
@@ -1701,7 +1709,7 @@ def test_requirements_checkpoint_reload_matches_fresh(mode: str, documents: list
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_REQUIREMENTS_DOCUMENTS))
 def test_requirements_evaluation_checkpoint_reload_matches_fresh(
     mode: str, documents: list[str]
@@ -1849,14 +1857,14 @@ def _reload_the_pth_pool_against_fresh(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_PTH_DOCUMENTS))
 def test_pth_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
     _walk_the_pth_pool_against_fresh(mode, documents, _pth_entrypoints)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_PTH_DOCUMENTS))
 def test_pth_import_resolution_matches_fresh_recomputation(
     mode: str, documents: list[str]
@@ -1865,14 +1873,14 @@ def test_pth_import_resolution_matches_fresh_recomputation(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_PTH_DOCUMENTS))
 def test_pth_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
     _reload_the_pth_pool_against_fresh(mode, documents, _pth_entrypoints)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_PTH_DOCUMENTS))
 def test_pth_import_resolution_checkpoint_reload_matches_fresh(
     mode: str, documents: list[str]
@@ -1999,7 +2007,7 @@ def _metadata_entrypoints(db: Database, root: str, path: str) -> dict[str, objec
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_METADATA_DOCUMENTS))
 def test_installed_packages_entrypoints_match_fresh_recomputation(
     mode: str, documents: list[str]
@@ -2057,7 +2065,7 @@ def _reload_the_metadata_pool_against_fresh(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_METADATA_DOCUMENTS))
 def test_installed_packages_checkpoint_reload_matches_fresh(
     mode: str, documents: list[str]
@@ -2066,7 +2074,7 @@ def test_installed_packages_checkpoint_reload_matches_fresh(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_METADATA_DOCUMENTS))
 def test_dependency_check_checkpoint_reload_matches_fresh(
     mode: str, documents: list[str]
@@ -2075,7 +2083,7 @@ def test_dependency_check_checkpoint_reload_matches_fresh(
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_METADATA_DOCUMENTS))
 def test_workspace_dependency_check_checkpoint_reload_matches_fresh(
     mode: str, documents: list[str]
@@ -2142,7 +2150,7 @@ def _generated_tree(root: Path) -> dict[str, bytes]:
 # arm writing into an empty one differ there by construction. Each arm therefore
 # gets its own output root.
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_SCHEMA_DOCUMENTS))
 def test_schema_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2182,7 +2190,7 @@ def test_schema_entrypoints_match_fresh_recomputation(mode: str, documents: list
 # a counterexample row, and what would falsify a regression here is the
 # hand-written row in tests/test_codegen.py that chooses its own semantic edit.
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
-@settings(max_examples=10, deadline=None)
+@settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_SCHEMA_DOCUMENTS))
 def test_schema_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
