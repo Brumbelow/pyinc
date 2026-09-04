@@ -660,8 +660,15 @@ def test_filesystem_store_refuses_cross_process_conflicting_bytes(tmp_path: Path
 def test_filesystem_store_lock_timeout_is_typed(tmp_path: Path) -> None:
     digest = "c" * 64
     store = FileSystemArtifactStore(tmp_path, lock_timeout=0)
-    with FileLock(store._lock_path_for(digest), timeout=0), pytest.raises(ArtifactStoreLockError):
+    with (
+        FileLock(store._lock_path_for(digest), timeout=0),
+        pytest.raises(ArtifactStoreLockError) as excinfo,
+    ):
         store.put(digest, b"payload")
+    # The chained cause names the lock that was contended.
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, TimeoutError)
+    assert "waiting for lock" in str(cause)
 
 
 def test_filesystem_store_rejects_nonregular_lock_path_with_typed_error(
@@ -712,6 +719,12 @@ def test_filesystem_store_interrupted_publish_leaves_no_partial_object(
 def test_filesystem_store_rejects_nonfinite_lock_timeout(tmp_path: Path, timeout: float) -> None:
     with pytest.raises(ValueError, match="finite"):
         FileSystemArtifactStore(tmp_path, lock_timeout=timeout)
+
+
+@pytest.mark.parametrize("timeout", (True, "1", None, object()))
+def test_lock_timeout_rejects_non_numeric_values(tmp_path: Path, timeout: object) -> None:
+    with pytest.raises(TypeError, match="real number"):
+        FileSystemArtifactStore(tmp_path, lock_timeout=cast(Any, timeout))
 
 
 def test_filesystem_store_rejects_symlinked_object_fanout(tmp_path: Path) -> None:
@@ -1288,6 +1301,18 @@ def test_posix_safe_fs_handles_missing_and_nonregular_targets(tmp_path: Path) ->
         safe_fs_module.unlink_regular_file(directory)
     with pytest.raises(safe_fs_module.UnsafeFilesystemPathError, match="lock file"):
         safe_fs_module.open_lock_file(directory)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow behavior")
+def test_posix_lock_file_rejects_a_symlink_target(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.lock"
+    outside.write_bytes(b"outside")
+    link = tmp_path / "link.lock"
+    link.symlink_to(outside)
+
+    with pytest.raises(safe_fs_module.UnsafeFilesystemPathError, match="safely open lock"):
+        safe_fs_module.open_lock_file(link)
+    assert outside.read_bytes() == b"outside"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow behavior")

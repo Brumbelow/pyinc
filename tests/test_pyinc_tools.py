@@ -1121,6 +1121,137 @@ def test_language_server_declaration_overlay_sees_edit(tmp_path: Path) -> None:
             server._session.close()
 
 
+def _workspace_symbol_names(server: LanguageServer, query: str) -> set[str]:
+    return {item["name"] for item in server._handle_request("workspace/symbol", {"query": query})}
+
+
+def _published_diagnostics(out: io.BytesIO) -> list[tuple[str, tuple[str, ...]]]:
+    # Every publishDiagnostics frame the server has written so far, in order.
+    out.seek(0)
+    published: list[tuple[str, tuple[str, ...]]] = []
+    while (message := read_message(out)) is not None:
+        if message.get("method") == "textDocument/publishDiagnostics":
+            params = message["params"]
+            codes = tuple(item["code"] for item in params["diagnostics"])
+            published.append((params["uri"], codes))
+    return published
+
+
+def test_lsp_close_and_watched_file_notifications_refresh_diagnostics(tmp_path: Path) -> None:
+    # didClose drops the editor buffer so the disk text answers again, and
+    # didChangeWatchedFiles pulls a disk edit in without the poller; each one
+    # republishes diagnostics, while an empty change list and an unknown
+    # notification are accepted silently.
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "mod.py"
+    on_disk = "def helper() -> int:\n    return 1\n"
+    _write(target, on_disk)
+    uri = target.as_uri()
+
+    out = io.BytesIO()
+    server = LanguageServer(out_stream=out, default_root=str(root))
+    try:
+        server._handle_request(
+            "initialize",
+            {
+                "rootUri": root.as_uri(),
+                "initializationOptions": {"pyinc.watcher.enabled": False},
+            },
+        )
+        assert server._handle_notification(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "python",
+                    "version": 1,
+                    "text": "import nonexistent_xyz\n\ndef extra() -> int:\n    return 2\n",
+                }
+            },
+        )
+        assert _workspace_symbol_names(server, "extra") == {"extra"}
+        assert _published_diagnostics(out) == [(uri, ("missing-import",))]
+
+        assert server._handle_notification("textDocument/didClose", {"textDocument": {"uri": uri}})
+        assert _workspace_symbol_names(server, "extra") == set()
+        assert _workspace_symbol_names(server, "helper") == {"helper"}
+        assert target.read_text(encoding="utf-8") == on_disk
+        assert _published_diagnostics(out) == [(uri, ("missing-import",)), (uri, ())]
+
+        _write(
+            target,
+            "import nonexistent_xyz\n\n" + on_disk + "\ndef watched() -> int:\n    return 3\n",
+        )
+        # No watcher: the session still answers the text it last read.
+        assert _workspace_symbol_names(server, "watched") == set()
+        assert server._handle_notification(
+            "workspace/didChangeWatchedFiles",
+            {"changes": [{"type": 2}, {"uri": uri, "type": 2}]},
+        )
+        assert _workspace_symbol_names(server, "watched") == {"watched"}
+        assert _published_diagnostics(out) == [
+            (uri, ("missing-import",)),
+            (uri, ()),
+            (uri, ("missing-import",)),
+        ]
+
+        assert server._handle_notification("workspace/didChangeWatchedFiles", {"changes": []})
+        assert server._handle_notification("unknown/notification", {})
+        assert len(_published_diagnostics(out)) == 3
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+
+def test_lsp_workspace_root_fallback_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # rootUri wins over workspaceFolders, which win over rootPath; with none
+    # of them the server falls back to its default root, then to the process
+    # working directory. Each candidate holds one marker symbol so the
+    # workspace/symbol answer names the root that was chosen.
+    candidates = {
+        name: tmp_path / name for name in ("root_uri", "folder", "root_path", "default", "cwd")
+    }
+    for name, path in candidates.items():
+        _write(path / "marker.py", f"def in_{name}() -> None:\n    pass\n")
+    root_uri, folder, root_path, default, cwd = candidates.values()
+    quiet = {"pyinc.watcher.enabled": False}
+
+    cases: list[tuple[dict[str, Any], str]] = [
+        (
+            {
+                "rootUri": root_uri.as_uri(),
+                "workspaceFolders": [{"uri": folder.as_uri()}],
+                "rootPath": str(root_path),
+            },
+            "in_root_uri",
+        ),
+        (
+            {"workspaceFolders": [{"uri": folder.as_uri()}], "rootPath": str(root_path)},
+            "in_folder",
+        ),
+        ({"workspaceFolders": [None], "rootPath": str(root_path)}, "in_root_path"),
+        ({"workspaceFolders": []}, "in_default"),
+    ]
+    for params, expected in cases:
+        server = LanguageServer(default_root=str(default))
+        try:
+            server._handle_request("initialize", {**params, "initializationOptions": quiet})
+            assert _workspace_symbol_names(server, "in_") == {expected}, params
+        finally:
+            if server._session is not None:
+                server._session.close()
+
+    monkeypatch.chdir(cwd)
+    without_default = LanguageServer()
+    try:
+        without_default._handle_request("initialize", {"initializationOptions": quiet})
+        assert _workspace_symbol_names(without_default, "in_") == {"in_cwd"}
+    finally:
+        if without_default._session is not None:
+            without_default._session.close()
+
+
 def test_language_server_document_symbol_surfaces_every_symbol_kind(
     tmp_path: Path,
 ) -> None:

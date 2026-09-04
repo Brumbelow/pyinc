@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import site
 from pathlib import Path
 from typing import Literal
 
@@ -725,3 +726,53 @@ def test_empty_distribution_metadata_produces_a_diagnostic(
 
     assert analysis.packages == ()
     assert analysis.diagnostics[0][0] == "metadata-parse-failed"
+
+
+def test_import_resolution_checks_later_installed_packages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A name owned by the second listed distribution resolves to it: the
+    # search does not stop at the first distribution it sees.
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _make_dist_info(site_dir, "first", "1", top_level="first")
+    _make_dist_info(site_dir, "second", "2", top_level="second")
+    monkeypatch.setattr(
+        "pyinc.integrations.installed_packages._get_site_packages_dirs",
+        lambda: (str(site_dir),),
+    )
+
+    db = Database()
+    assert [p.distribution_name for p in installed_packages_analysis(db).packages] == [
+        "first",
+        "second",
+    ]
+
+    result = resolve_import_name(db, "second.child")
+    assert result.origin == "installed"
+    assert result.distribution_name == "second"
+    assert result.distribution_version == "2"
+
+
+def test_site_package_discovery_ignores_duplicates_missing_paths_and_nonstring_user_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Discovery goes through ``site``: a directory listed twice is scanned
+    # once, a missing entry is dropped, and a user site that is not a string
+    # is ignored rather than raising.
+    existing = tmp_path / "site-packages"
+    existing.mkdir()
+    _make_dist_info(existing, "only", "1.0", top_level="only")
+    missing = tmp_path / "missing"
+
+    monkeypatch.setattr(
+        site,
+        "getsitepackages",
+        lambda *args, **kwargs: [str(existing), str(existing), str(missing)],
+    )
+    monkeypatch.setattr(site, "getusersitepackages", lambda *args, **kwargs: (str(existing),))
+
+    analysis = installed_packages_analysis(Database())
+
+    assert [p.distribution_name for p in analysis.packages] == ["only"]
+    assert analysis.diagnostics == ()
