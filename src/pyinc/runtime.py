@@ -6794,12 +6794,13 @@ class Database:
 
         Walks the same capture set as ``_function_definition_payload``
         (defaults, kwdefaults, closure nonlocals, globals), recursing through
-        captured functions, bound methods, queries, and immutable container
-        shapes. Returns ``(query_id -> Query object, resource identity ->
-        resource object)``; a query or resource reached only via a runtime import
-        or dynamic dispatch is *not* captured and never appears here. The maps
-        let the warm path re-run a pinned leaf (execute-to-verify) and re-probe a
-        pinned resource (probe-hint) by their manifest identities.
+        captured functions, bound methods, queries, immutable container shapes,
+        and the static attribute chains spelled on a captured module. Returns
+        ``(query_id -> Query object, resource identity -> resource object)``; a
+        query or resource reached only via a runtime import or dynamic dispatch
+        is *not* captured and never appears here. The maps let the warm path
+        re-run a pinned leaf (execute-to-verify) and re-probe a pinned resource
+        (probe-hint) by their manifest identities.
         """
         from .core import Input, Query
 
@@ -6816,11 +6817,35 @@ class Database:
             closure_vars = inspect.getclosurevars(target)
             values: list[Any] = list(target.__defaults__ or ())
             values.extend((target.__kwdefaults__ or {}).values())
-            values.extend(closure_vars.nonlocals.values())
-            values.extend(closure_vars.globals.values())
             values.extend(vars(target).values())
             for value in values:
                 walk_value(value)
+            for mapping in (closure_vars.nonlocals, closure_vars.globals):
+                for name, value in mapping.items():
+                    if isinstance(value, ModuleType):
+                        walk_module(target, name, value)
+                    else:
+                        walk_value(value)
+
+        def walk_module(owner: FunctionType, capture_name: str, module: ModuleType) -> None:
+            # The fingerprint folds the behaviour behind every static attribute
+            # chain the owner spells on a captured module, so a query or a
+            # resource such a chain lands on is code-pinned exactly as a direct
+            # capture is; `q.thing(db, x)` must warm as `thing(db, x)` does. The
+            # chains are the ones `_captured_module_payload` records, resolved
+            # the way its memo guard re-resolves them. A standard-library module
+            # is skipped as it is there: its functions are pinned by name anchor
+            # only, and nothing in it is a query or a resource.
+            specification = vars(module).get("__spec__")
+            if isinstance(
+                specification, importlib.machinery.ModuleSpec
+            ) and self._is_runtime_pinned_module(module, specification):
+                return
+            paths, _dynamic = self._module_access_paths(owner, capture_name)
+            for path in paths:
+                target = self._resolve_module_path_target(module, path)
+                if target is not _MISSING_MODULE_ATTRIBUTE:
+                    walk_value(target)
 
         def walk_value(value: Any) -> None:
             if isinstance(value, Query):

@@ -821,3 +821,139 @@ def test_cross_process_reuse_survives_a_different_install_path(tmp_path: Path) -
     _assert_warm_across_processes(
         saved, loaded, CROSSPATH_ROOTS, "different install path"
     )
+
+
+# A package whose parent reaches its child as a module attribute -- the spelling
+# `import pkg.queries as q` produces -- beside the `from pkg.queries import thing`
+# control. The two callers live in separate modules on purpose: on 3.11
+# ``inspect.getclosurevars`` reports an attribute name that is also a global of
+# the same module as a captured global, so one module holding both spellings
+# would pin the child through the control's import and measure nothing.
+MODATTR_QUERIES_SOURCE = """\
+from pyinc import query
+from pyinc.integrations.python_source import _FILES, source_text
+
+
+@query
+def thing(db, path):
+    return len(source_text(db, path)) + len(_FILES.read(db, path)[0])
+"""
+
+MODATTR_VIA_MODULE_SOURCE = """\
+from pyinc import query
+
+import cxp_pkg.queries as q
+
+
+@query
+def parent_via_module(db, path):
+    return q.thing(db, path) + 1
+
+
+@query
+def grandparent_via_module(db, path):
+    return parent_via_module(db, path) + 1
+"""
+
+MODATTR_VIA_NAME_SOURCE = """\
+from pyinc import query
+
+from cxp_pkg.queries import thing
+
+
+@query
+def parent_via_name(db, path):
+    return thing(db, path) + 1
+"""
+
+MODATTR_FIXTURE_SCRIPT = '''\
+"""Cross-process checkpoint fixture for the module-attribute reach. The save
+phase asks every root; a load phase asks ONE root, named by argv, so nothing an
+earlier request established in the same process can stand in for the pin."""
+
+import json
+import sys
+from pathlib import Path
+
+from pyinc import Database, FileSystemArtifactStore
+
+from cxp_pkg.via_module import grandparent_via_module, parent_via_module
+from cxp_pkg.via_name import parent_via_name
+
+store_dir = sys.argv[1]
+phase = sys.argv[2]
+root_name = sys.argv[3]
+
+root_dir = Path(store_dir).parent
+source_path = str(root_dir / "sample.py")
+key_path = root_dir / "modattr.key"
+
+ROOTS = {
+    "parent_via_module": parent_via_module,
+    "grandparent_via_module": grandparent_via_module,
+    "parent_via_name": parent_via_name,
+}
+
+
+def main():
+    db = Database(store=FileSystemArtifactStore(store_dir))
+    if phase == "save":
+        results = {name: db.get(root, source_path) for name, root in ROOTS.items()}
+        key_path.write_text(db.save_checkpoint(), encoding="utf-8")
+        print(json.dumps({"results": results}))
+        return
+
+    db.load_checkpoint(key_path.read_text(encoding="utf-8"))
+    root = ROOTS[root_name]
+    result = db.get(root, source_path)
+    print(
+        json.dumps(
+            {
+                "result": result,
+                "recompute": db.inspect(root, source_path).last_recompute,
+                "executions": db.statistics().query_executions,
+            }
+        )
+    )
+
+
+main()
+'''
+
+
+@pytest.mark.parametrize(
+    "root",
+    ["parent_via_module", "grandparent_via_module", "parent_via_name"],
+)
+def test_cross_process_reuse_through_a_module_attribute(tmp_path: Path, root: str) -> None:
+    """A parent that calls its child as ``q.thing(db, x)`` warms like one that
+    calls ``thing(db, x)``.
+
+    The fingerprint folds the child behind a static module-attribute chain
+    into the parent's identity, so the chain pins the child as a direct capture
+    does and the warm gate must count it. The grandparent row is the shape that
+    hid the defect: its own record warmed while the parent underneath was
+    executed to verify, so ``last_recompute`` alone read as a reuse. Every row
+    asserts the execution count for that reason. The last row is the control.
+    """
+
+    package = tmp_path / "cxp_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "queries.py").write_text(MODATTR_QUERIES_SOURCE, encoding="utf-8")
+    (package / "via_module.py").write_text(MODATTR_VIA_MODULE_SOURCE, encoding="utf-8")
+    (package / "via_name.py").write_text(MODATTR_VIA_NAME_SOURCE, encoding="utf-8")
+    script = tmp_path / "modattr_fixture.py"
+    script.write_text(MODATTR_FIXTURE_SCRIPT, encoding="utf-8")
+    (tmp_path / "sample.py").write_text(SAMPLE_SOURCE, encoding="utf-8")
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+
+    # The seed is pinned on both sides so the spelling of the edge is the only
+    # axis; the seed has cells of its own above.
+    env = _child_env(str(tmp_path), "1")
+    saved = _run([sys.executable, str(script), str(store_dir), "save", root], env)
+    loaded = _run([sys.executable, str(script), str(store_dir), "load", root], env)
+    assert loaded["result"] == saved["results"][root], root
+    assert loaded["recompute"] == "reused", root
+    assert loaded["executions"] == 0, root
