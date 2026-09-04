@@ -957,3 +957,139 @@ def test_cross_process_reuse_through_a_module_attribute(tmp_path: Path, root: st
     assert loaded["result"] == saved["results"][root], root
     assert loaded["recompute"] == "reused", root
     assert loaded["executions"] == 0, root
+
+
+# A package whose module captures form a cycle: `top` reaches `q.child`, `q`
+# reaches `q2.leaf`, and `q2` reaches back into `q` for `helper`. The
+# fingerprint folds a module already being folded on the same chain by
+# identity and chain names only, so `helper`'s body is not part of `parent`'s
+# identity. It lives in its own module on purpose: editing it moves neither
+# `q`'s nor `q2`'s file digest, so the parent's saved record is found and only
+# the pinned walk and the dep warm stand between the load and a stale answer.
+MODCYCLE_TOP_SOURCE = """\
+from pyinc import query
+
+import cxp_cycle.q as q
+
+
+@query
+def parent(db, path):
+    return q.child(db, path) + 100
+"""
+
+MODCYCLE_Q_SOURCE = """\
+from pyinc import query
+
+import cxp_cycle.q2 as q2
+from cxp_cycle.h import helper  # noqa: F401  (reached as q.helper from q2)
+
+
+@query
+def child(db, path):
+    return q2.leaf(db, path) + 1
+"""
+
+MODCYCLE_Q2_SOURCE = """\
+from pyinc import query
+
+import cxp_cycle.q as q
+
+
+@query
+def leaf(db, path):
+    return q.helper(db, path) * 10
+"""
+
+MODCYCLE_HELPER_SOURCE_V1 = """\
+from pyinc import query
+from pyinc.integrations.python_source import source_text
+
+
+@query
+def helper(db, path):
+    return len(source_text(db, path)) + 5000
+"""
+
+MODCYCLE_HELPER_SOURCE_V2 = MODCYCLE_HELPER_SOURCE_V1.replace("+ 5000", "+ 50000")
+
+MODCYCLE_FIXTURE_SCRIPT = '''\
+"""Cross-process checkpoint fixture for the module-capture cycle. The load
+phase also asks a database with no store, whose answer is the fresh one by
+construction."""
+
+import json
+import sys
+from pathlib import Path
+
+from pyinc import Database, FileSystemArtifactStore
+
+from cxp_cycle.top import parent
+
+store_dir = sys.argv[1]
+phase = sys.argv[2]
+
+root_dir = Path(store_dir).parent
+source_path = str(root_dir / "sample.py")
+key_path = root_dir / "modcycle.key"
+
+
+def main():
+    db = Database(store=FileSystemArtifactStore(store_dir))
+    if phase == "save":
+        result = db.get(parent, source_path)
+        key_path.write_text(db.save_checkpoint(), encoding="utf-8")
+        print(json.dumps({"result": result}))
+        return
+
+    db.load_checkpoint(key_path.read_text(encoding="utf-8"))
+    result = db.get(parent, source_path)
+    print(
+        json.dumps(
+            {
+                "result": result,
+                "recompute": db.inspect(parent, source_path).last_recompute,
+                "executions": db.statistics().query_executions,
+                "fresh": Database().get(parent, source_path),
+            }
+        )
+    )
+
+
+main()
+'''
+
+
+def test_cross_process_module_capture_cycle_reexecutes_an_edited_leaf(tmp_path: Path) -> None:
+    """A query reached only around a module-capture cycle is not pinned, and
+    an edit to it re-executes the parent in a fresh process.
+
+    The parent's identity is unchanged by the edit, so its saved record is
+    found and the deps decide. The cell fails when the pinned walk descends
+    the module the fold declined to descend: every dep then warms from its old
+    record and the parent is served with zero executions. The answer must be
+    the fresh one, not merely different from the saved one, and the recompute
+    must be an execution, so a warm that re-ran nothing cannot pass by luck.
+    """
+
+    package = tmp_path / "cxp_cycle"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "top.py").write_text(MODCYCLE_TOP_SOURCE, encoding="utf-8")
+    (package / "q.py").write_text(MODCYCLE_Q_SOURCE, encoding="utf-8")
+    (package / "q2.py").write_text(MODCYCLE_Q2_SOURCE, encoding="utf-8")
+    helper_path = package / "h.py"
+    helper_path.write_text(MODCYCLE_HELPER_SOURCE_V1, encoding="utf-8")
+    script = tmp_path / "modcycle_fixture.py"
+    script.write_text(MODCYCLE_FIXTURE_SCRIPT, encoding="utf-8")
+    (tmp_path / "sample.py").write_text(SAMPLE_SOURCE, encoding="utf-8")
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+
+    env = _child_env(str(tmp_path), "1")
+    saved = _run([sys.executable, str(script), str(store_dir), "save"], env)
+    helper_path.write_text(MODCYCLE_HELPER_SOURCE_V2, encoding="utf-8")
+    loaded = _run([sys.executable, str(script), str(store_dir), "load"], env)
+    assert loaded["fresh"] != saved["result"]
+    assert loaded["result"] == loaded["fresh"]
+    assert loaded["recompute"] == "executed"
+    assert loaded["executions"] >= 1

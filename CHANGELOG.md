@@ -51,6 +51,9 @@ internal review surfaced the consistency issues fixed below. Do not use the tag.
 - A checkpoint warms a query that reaches a child query or a resource as a
   module attribute (`import pkg.queries as q` then `q.thing(db, x)`); the warm
   gate counted only direct captures as pinned, so the parent always re-executed.
+  The pinned walk stops where the fingerprint fold stops, so a query reached
+  only around a module-capture cycle is not counted as pinned, and a dependency
+  record is restored only when its live identity equals the saved one.
 - Identities no longer fold a captured module's whole namespace or a code
   object's absolute source path, so a checkpoint written under one hash seed or
   at one install prefix warms a process running under another. Captured-module

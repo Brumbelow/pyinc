@@ -2692,14 +2692,31 @@ class Database:
         self._call_snapshots()[key] = call_snapshot
         return True
 
-    def _warm_checkpoint_dep_query(self, dep_key: NodeKey) -> bool:
-        """Warm a checkpoint query dep without having its Query callable."""
+    def _warm_checkpoint_dep_query(self, dep: dict[str, Any], dep_key: NodeKey) -> bool:
+        """Warm a checkpoint query dep from its saved record.
+
+        The record is restored under its saved key, so it is served only when
+        the dep's live identity is that key's identity: the pinned object with
+        the dep's definition is fingerprinted afresh and compared to the saved
+        identity, and a mismatch or a missing object declines the warm. The
+        pinned-set gate argues the same thing from the root's fold; this check
+        holds even where that argument does not.
+        """
         if dep_key in self._records:
             return True
         ckpt = self._checkpoint_query_records.get(dep_key)
         if ckpt is None:
             return False
         if ckpt.get("is_untracked"):
+            return False
+        pinned_objects = self._checkpoint_root_pinned_query_objects
+        if pinned_objects is None:
+            return False
+        query_obj = pinned_objects.get(dep["query_id"])
+        if query_obj is None:
+            return False
+        live_identity = f"{query_obj.key}:{self._query_fingerprint(query_obj)}"
+        if live_identity != dep_key.identity:
             return False
         # Same adapter-trust gate as the root warm: a dep record frozen under a
         # since-changed adapter must not be served from the checkpoint.
@@ -2838,7 +2855,7 @@ class Database:
         # resources come back via probe hints). If the subtree can't be warmed
         # -- e.g. it reaches a resource unresolvable from the pinned captures --
         # verify the dep by re-execution instead.
-        if self._warm_checkpoint_dep_query(dep_key):
+        if self._warm_checkpoint_dep_query(dep, dep_key):
             return self._records[dep_key].digest == expected_digest
         return self._execute_to_verify_query_dep(dep, dep_key, expected_digest)
 
@@ -6808,6 +6825,9 @@ class Database:
         resource_objects: dict[str, Any] = {}
         seen_functions: set[int] = set()
         seen_values: set[int] = set()
+        # The modules whose chains are being descended on the current path,
+        # the counterpart of `_module_capture_stack` in the fingerprint fold.
+        module_stack: list[int] = []
 
         def walk_function(target: FunctionType) -> None:
             fn_id = id(target)
@@ -6833,19 +6853,39 @@ class Database:
             # resource such a chain lands on is code-pinned exactly as a direct
             # capture is; `q.thing(db, x)` must warm as `thing(db, x)` does. The
             # chains are the ones `_captured_module_payload` records, resolved
-            # the way its memo guard re-resolves them. A standard-library module
-            # is skipped as it is there: its functions are pinned by name anchor
-            # only, and nothing in it is a query or a resource.
+            # the way its memo guard re-resolves them.
+            #
+            # Invariant: everything this walk pins is folded into the root's
+            # identity. The warm path restores a pinned dep's record by its
+            # saved key on the strength of that fold, so the walk must stop
+            # exactly where the fold stops. A standard-library module is
+            # skipped as it is there: its functions are pinned by name anchor
+            # only, and nothing in it is a query or a resource. A module that
+            # is already being descended on this path is skipped as the
+            # `recursive-captured-module` arm skips it: the fold records that
+            # module's identity and the chain names, not the behaviour behind
+            # the chains, so a query reached only around such a cycle is not
+            # part of the root's identity and must not be pinned. The pytest
+            # assertion-rewrite module is pinned by identity alone as well.
+            if capture_name == "@pytest_ar" and module.__name__ == "_pytest.assertion.rewrite":
+                return
             specification = vars(module).get("__spec__")
             if isinstance(
                 specification, importlib.machinery.ModuleSpec
             ) and self._is_runtime_pinned_module(module, specification):
                 return
+            module_id = id(module)
+            if module_id in module_stack:
+                return
             paths, _dynamic = self._module_access_paths(owner, capture_name)
-            for path in paths:
-                target = self._resolve_module_path_target(module, path)
-                if target is not _MISSING_MODULE_ATTRIBUTE:
-                    walk_value(target)
+            module_stack.append(module_id)
+            try:
+                for path in paths:
+                    target = self._resolve_module_path_target(module, path)
+                    if target is not _MISSING_MODULE_ATTRIBUTE:
+                        walk_value(target)
+            finally:
+                module_stack.pop()
 
         def walk_value(value: Any) -> None:
             if isinstance(value, Query):
