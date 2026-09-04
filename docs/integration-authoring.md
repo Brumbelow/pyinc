@@ -35,11 +35,9 @@ in a loop over discovered Python files.
 
 **Layer 3 -- High-level entrypoints.** Non-query functions that call `db.get()` and
 decode tuple payloads into frozen dataclasses. These are the public API. Examples:
-`file_analysis` and `workspace_analysis`. They are called from outside a query: a
-query body that reaches a high-level entrypoint is refused before the entrypoint
-runs, raising `CompositionError` where the call is reached and
-`UnsupportedValueError` where the kernel rejects what the query captured before
-its body starts. Both derive from `PyIncError`.
+`file_analysis` and `workspace_analysis`. They are called from outside a query;
+the [integration contract](integration-contract.md#composition-and-experimental-helpers)
+states how a query body that reaches one is refused.
 
 **Why this layering?** The kernel caches and compares tuple payloads efficiently (they are
 snapshot-safe and hashable by default). The decode layer converts to ergonomic dataclasses
@@ -92,8 +90,8 @@ self-documenting.
 ## Resources
 
 All reads of external state inside a query must go through the Resource API. The kernel
-intercepts `open()`, `os.getenv`, `os.listdir`, `os.scandir`, and `Path.iterdir` during
-query execution and raises `UntrackedReadError` otherwise.
+intercepts the calls [condition 2](kernel-contract.md#2-tracked-ambient-reads) enumerates
+during query execution and raises `UntrackedReadError` otherwise.
 
 **Built-in resources:** `FileResource`, `BinaryFileResource`, `FileStatResource`,
 `EnvResource`, `DirectoryResource`, and `ResolvedPathResource` cover common cases.
@@ -273,10 +271,9 @@ query's result changes, the downstream query is re-verified and re-executed as n
   No special wiring is required beyond calling `db.get()` on the imported query (or
   calling it directly inside another `@query`, which the kernel intercepts). That is
   the query layer only. A high-level entrypoint is not a query and is not available
-  inside one: a query body that reaches an entrypoint is refused before it runs,
-  raising `CompositionError` where the call is reached and `UnsupportedValueError`
-  where the kernel rejects what the query captured first. Compose with the payload
-  query the entrypoint decodes, or call the entrypoint outside the query.
+  inside one ([composition](integration-contract.md#composition-and-experimental-helpers)):
+  compose with the payload query the entrypoint decodes, or call the entrypoint
+  outside the query.
 - Composition queries are public `@query` functions but are intentionally **not**
   re-exported from `pyinc.integrations`. They exist for query-layer use, not as
   user-facing entrypoints.

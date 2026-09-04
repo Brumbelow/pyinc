@@ -85,11 +85,12 @@ with TemporaryDirectory() as directory:
     assert db.get(nonempty_lines, str(path)) == ("Ada", "Linus")
 ```
 
-Inside a query, raw `open()`, `io.open()`, environment access, directory
-listing, and `Path.iterdir()` are intercepted outside resource scope and raise
-`UntrackedReadError`. For ambient reads the guard cannot intercept—such as
+Inside a query, the raw reads
+[condition 2](kernel-contract.md#2-tracked-ambient-reads) enumerates — file
+opens, environment access, directory listings — raise `UntrackedReadError`
+outside a resource. For ambient reads the guard cannot intercept, such as
 `os.open()`, subprocess output, time, random values, network calls, or C
-extensions—call `db.report_untracked_read(reason)`. That node then executes on
+extensions, call `db.report_untracked_read(reason)`. That node then executes on
 every request and cannot backdate.
 
 A custom resource implements `probe`, `load`, and `label`; `read`,
@@ -116,22 +117,11 @@ ambient-read tracking.
 Start with `Database(mode="strict")`. Move a measured workload to `checked` or
 `fast` only when code genuinely needs ordinary containers at a boundary.
 
-`freeze()` is a snapshot conversion, not a general object serializer. Lists,
-mappings, sets, and dataclass instances become their corresponding `Frozen*`
-records; tuples stay tuples. A frozen mapping's entries are held in a canonical
-order derived from each key's snapshot digest — deterministic across processes
-and platforms, but neither insertion order nor sorted order — and `thaw()` and
-every mode's boundary exposure preserve it, so a dict that round-trips through
-a boundary comes back equal without necessarily iterating in the order you
-built it in. Shared or cyclic mutable graphs use
-`FrozenGraph`/`FrozenRef`. `thaw()` reconstructs ordinary containers and graph
-identity, but a dataclass becomes a dictionary unless a matching
-`ValueAdapter` explicitly reconstructs its type. The kernel's own resource
-snapshot types are the exception: every `Database` registers `BUILTIN_ADAPTERS`,
-so a `FileStatResource` reading is a `FileStatSnapshot` in all three modes. The
-module-level `freeze()`/`thaw()` take only the registry you hand them, so
-reconstructing one of those outside a database means
-`thaw(snapshot, adapters=dict(BUILTIN_ADAPTERS))`.
+`freeze()` is a snapshot conversion, not a general object serializer: a
+mapping comes back in a canonical order, a dataclass thaws to a dictionary
+unless a `ValueAdapter` reconstructs it, and the rules are stated under
+[condition 1](kernel-contract.md#1-value-boundary-ownership) of the kernel
+contract.
 
 ## 4. Inspect what happened
 
@@ -165,9 +155,11 @@ print(db.query_profile())
 ```
 
 Hold a batch of reads inside `db.request_span()` when they should all see one
-world: the batch shares a single resource-validation pass, and a `db.set` inside
-it rolls the span so later reads re-derive. See
-[Request Spans](kernel-contract.md#request-spans) for a worked example.
+world: the batch shares a single resource-validation pass, and a `db.set`
+inside it that actually changes something rolls the span so later reads
+re-derive. A caller that changes the world some other way declares it with
+`db.request_inputs_changed()`, which is a no-op outside a span. Spans nest, and
+only the outermost close ends the request.
 
 Use `dependency_graph()` for a machine-readable graph. `statistics()` reports
 work counts and cache decisions; `query_profile()` reports timing aggregates.
@@ -223,4 +215,4 @@ before sharing an output root between tools.
 - Analyze source and configuration: [Integration contract](integration-contract.md)
 - Generate a file set: [Codegen guide](codegen-guide.md)
 - Run analysis or connect an editor: [`pyinc-tools` guide](pyinc-tools-guide.md)
-- Understand package boundaries: [Architecture](architecture.md)
+- Understand package boundaries: the [package map](README.md#packages)
