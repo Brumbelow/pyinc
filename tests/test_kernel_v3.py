@@ -1461,15 +1461,20 @@ def test_two_copies_of_one_module_at_different_paths_share_one_identity(
     assert digests[0] == digests[1]
 
 
-def test_code_compiled_under_a_borrowed_filename_never_takes_a_module_location() -> None:
+def test_code_compiled_under_a_borrowed_filename_never_takes_a_module_location(
+    tmp_path: Path,
+) -> None:
     db = Database()
     # The third arm of the location fold, which nothing this tree ships
     # reaches: an absolute compiled filename whose basename is not the named
     # module's own file. It is folded verbatim beside the module name, and the
     # property that matters is what it must NOT do -- a regression that
     # answered with the module's own location would let code compiled under a
-    # borrowed filename take a real module's identity.
-    borrowed = db._code_location_payload("/totally/elsewhere/other.py", "pyinc.runtime")
+    # borrowed filename take a real module's identity. The path is built under
+    # tmp_path so it is absolute on every platform: since Python 3.13 a bare
+    # leading slash is not an absolute path on Windows.
+    borrowed_file = str(tmp_path / "elsewhere" / "other.py")
+    borrowed = db._code_location_payload(borrowed_file, "pyinc.runtime")
     assert borrowed[0] == "code-origin-foreign-v4"
     assert borrowed != db._code_location_payload(runtime_module.__file__, "pyinc.runtime")
 
