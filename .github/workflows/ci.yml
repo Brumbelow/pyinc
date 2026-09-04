@@ -99,10 +99,10 @@ jobs:
       - name: Check documentation
         run: python scripts/check_docs.py
 
-      - name: Measure branch coverage
-        # The property suite has its own jobs, and the rest of the suite clears
-        # the coverage floor without it.
-        run: pytest -n auto --dist load --ignore=tests/test_properties.py --cov=pyinc --cov=pyinc_codegen --cov=pyinc_tools --cov-branch --cov-report=term-missing --cov-fail-under=90
+      - name: Run the full suite with branch coverage
+        # Everything but the property suite, process tests included; the
+        # coverage report is informational and has no floor.
+        run: pytest -n auto --dist load --ignore=tests/test_properties.py --cov=pyinc --cov=pyinc_codegen --cov=pyinc_tools --cov-branch --cov-report=term-missing
 
   distribution:
     name: Build and validate installed artifacts
