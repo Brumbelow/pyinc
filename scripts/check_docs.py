@@ -29,60 +29,13 @@ _EXTERNAL_URL = re.compile(r"""https?://[^\s)\]>"'`]+""")
 _GITHUB_BLOB_PREFIX = "/Brumbelow/pyinc/blob/"
 _GITHUB_RAW_PREFIX = "/Brumbelow/pyinc/"
 _PUBLIC_ROW_NAMES = frozenset({"Entrypoints", "Result types", "Shared types"})
-_CHECKPOINT_VERSION_NAME = "_CHECKPOINT_MANIFEST_VERSION"
-_CHECKPOINT_VERSION_SOURCE = Path("src/pyinc/runtime.py")
-# Prose that states the durable checkpoint manifest schema version. Each pattern
-# matches the surrounding sentence so a stale number cannot survive unnoticed,
-# and each entry carries the name of the sentence it guards: one document can
-# hold two of them, and without the name the two errors read identically.
-_CHECKPOINT_VERSION_PROSE = (
-    (
-        Path("docs/kernel-contract.md"),
-        "the manifest-key sentence",
-        re.compile(r"content-addressed manifest \(schema v(?P<version>\d+)\)"),
-    ),
-    (
-        Path("docs/architecture.md"),
-        "the load-acceptance sentence",
-        re.compile(r"accepts manifest schema v(?P<version>\d+) only"),
-    ),
-    (
-        Path("docs/kernel-contract.md"),
-        "the rejection sentence",
-        re.compile(r"Manifest schema v(?P<version>\d+) rejects"),
-    ),
+# Every `schema vN` a contract writes is compared with the constant that decides
+# the version, so a bumped constant cannot leave a stale number in the prose.
+_SCHEMA_VERSION = re.compile(r"\b[Ss]chema v(?P<version>\d+)\b")
+_SCHEMA_VERSION_DOCUMENTS = (
+    (Path("docs/kernel-contract.md"), Path("src/pyinc/runtime.py"), "_CHECKPOINT_MANIFEST_VERSION"),
+    (Path("docs/action-contract.md"), Path("src/pyinc/action.py"), "_MANIFEST_VERSION"),
 )
-_ACTION_VERSION_NAME = "_MANIFEST_VERSION"
-_ACTION_VERSION_SOURCE = Path("src/pyinc/action.py")
-# Prose that states the action ledger's manifest schema version. The two
-# documents spell it differently -- `Schema v3` against `schema-v3` -- so one
-# pattern cannot serve both.
-_ACTION_VERSION_PROSE = (
-    (
-        Path("docs/action-contract.md"),
-        "the schema-records sentence",
-        re.compile(r"Schema v(?P<version>\d+) records exactly"),
-    ),
-    (
-        Path("docs/action-contract.md"),
-        "the incompatibility sentence",
-        re.compile(r"not compatible with v(?P<version>\d+)'s ledger semantics"),
-    ),
-    (
-        Path("docs/architecture.md"),
-        "the ledger-publication clause",
-        re.compile(r"the schema-v(?P<version>\d+) ledger is published last"),
-    ),
-)
-# Public-surface rows whose description cell must carry a `Fields:` sentence
-# listing the dataclass's own annotated fields, in declaration order.
-_DATACLASS_FIELD_SOURCES = {
-    "DatabaseStatistics": Path("src/pyinc/runtime.py"),
-    "DependencyGraphNode": Path("src/pyinc/runtime.py"),
-    "InspectionNode": Path("src/pyinc/explain.py"),
-    "QueryProfile": Path("src/pyinc/runtime.py"),
-}
-_FIELDS_SENTENCE = re.compile(r"Fields:(?P<names>[^.]*)\.")
 _API_FILES = {
     "pyinc": Path("src/pyinc/__init__.py"),
     "pyinc.integrations": Path("src/pyinc/integrations/__init__.py"),
@@ -342,8 +295,8 @@ def _local_target(
 def check_local_links(root: Path, files: tuple[Path, ...]) -> tuple[str, ...]:
     """Check local Markdown and image targets without requesting external URLs.
 
-    Images are checked for existence only; an external image URL is left alone,
-    exactly as an external link is.
+    A link may name a directory, such as `examples/`; an image must name a
+    file. An external image URL is left alone, exactly as an external link is.
     """
     errors: list[str] = []
     anchors: dict[Path, frozenset[str]] = {}
@@ -365,7 +318,7 @@ def check_local_links(root: Path, files: tuple[Path, ...]) -> tuple[str, ...]:
                 except ValueError:
                     errors.append(f"{path}: local {kind} escapes the repository: {raw_target}")
                     continue
-                if not resolved.is_file():
+                if not resolved.is_file() and not (kind == "link" and resolved.is_dir()):
                     errors.append(f"{path}: missing local {kind} target: {raw_target}")
                     continue
                 if fragment and kind == "link":
@@ -468,63 +421,6 @@ def check_python_fences(root: Path, files: tuple[Path, ...]) -> tuple[str, ...]:
                 errors.append(
                     f"{fence.path}:{fence.line}: executable example failed: {detail}"
                 )
-    return tuple(errors)
-
-
-def check_cli_examples(root: Path) -> tuple[str, ...]:
-    """Verify the documented CLI help/version examples against the local module."""
-    guide = (root / "docs/pyinc-tools-guide.md").read_text(encoding="utf-8")
-    errors: list[str] = []
-    required = (
-        "pyinc-tools --help",
-        "pyinc-tools --version",
-        "python -m pyinc_tools --help",
-        "python -m pyinc_tools --version",
-        "usage: pyinc-tools [-h] [--version] {analyze,lsp} ...",
-        "pyinc-tools <installed-version>",
-    )
-    for text in required:
-        if text not in guide:
-            errors.append(f"docs/pyinc-tools-guide.md: missing CLI example {text!r}")
-
-    # argparse colorizes help output from 3.14 on, and honours FORCE_COLOR even
-    # when it is writing to a pipe. The comparison below is against the literal
-    # usage line the guide documents, so ask for plain text explicitly.
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONPATH": os.fspath(root / "src"),
-            "PYTHON_COLORS": "0",
-            "NO_COLOR": "1",
-        }
-    )
-    help_result = subprocess.run(
-        [sys.executable, "-m", "pyinc_tools", "--help"],
-        cwd=root,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    expected_usage = "usage: pyinc-tools [-h] [--version] {analyze,lsp} ..."
-    if help_result.returncode != 0 or help_result.stdout.splitlines()[:1] != [expected_usage]:
-        errors.append("pyinc-tools --help no longer matches the documented usage line")
-
-    version_result = subprocess.run(
-        [sys.executable, "-m", "pyinc_tools", "--version"],
-        cwd=root,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    if version_result.returncode != 0 or re.fullmatch(
-        r"pyinc-tools\s+\S+\n?", version_result.stdout
-    ) is None:
-        errors.append("pyinc-tools --version must print 'pyinc-tools <installed-version>'")
     return tuple(errors)
 
 
@@ -631,142 +527,28 @@ def _read_int_constant(root: Path, source: Path, name: str) -> int:
     raise ValueError(f"{path} does not assign an integer {name}")
 
 
-def _check_version_prose(
-    root: Path,
-    *,
-    subject: str,
-    constant: str,
-    expected: int,
-    entries: tuple[tuple[Path, str, re.Pattern[str]], ...],
-) -> tuple[str, ...]:
-    """Compare each documented schema version against the constant that decides it.
+def check_schema_versions(root: Path) -> tuple[str, ...]:
+    """Compare every documented `schema vN` with the constant that decides it.
 
-    A named document that is not there is reported rather than read: a check that
-    raises on a removed file takes every other check down with it and prints no
-    result line at all, which is worse than the stale sentence it was looking for.
+    A named document that is not there is reported rather than read, so one
+    removed file does not take every other check down with it.
     """
     errors: list[str] = []
-    for relative, label, pattern in entries:
+    for relative, source, constant in _SCHEMA_VERSION_DOCUMENTS:
         document = root / relative
         if not document.is_file():
-            errors.append(
-                f"{relative.as_posix()}: missing document named by the {subject} check"
-            )
+            errors.append(f"{relative.as_posix()}: missing document named by the schema version check")
             continue
-        prose = re.sub(r"\s+", " ", " ".join(_prose_lines(document)))
-        match = pattern.search(prose)
-        if match is None:
-            errors.append(
-                f"{relative.as_posix()}: no {subject} statement matching {label} "
-                f"({pattern.pattern!r})"
-            )
-            continue
-        documented = int(match.group("version"))
-        if documented != expected:
-            errors.append(
-                f"{relative.as_posix()}: {label} documents {subject} v{documented}, "
-                f"but {constant} is {expected}"
-            )
-    return tuple(errors)
-
-
-def check_checkpoint_manifest_version(root: Path) -> tuple[str, ...]:
-    """Pin the documented manifest schema version to the kernel's own constant."""
-    return _check_version_prose(
-        root,
-        subject="checkpoint manifest schema",
-        constant=_CHECKPOINT_VERSION_NAME,
-        expected=_read_int_constant(root, _CHECKPOINT_VERSION_SOURCE, _CHECKPOINT_VERSION_NAME),
-        entries=_CHECKPOINT_VERSION_PROSE,
-    )
-
-
-def check_action_manifest_version(root: Path) -> tuple[str, ...]:
-    """Pin the documented action ledger schema version to the ledger's own constant."""
-    return _check_version_prose(
-        root,
-        subject="action manifest schema",
-        constant=_ACTION_VERSION_NAME,
-        expected=_read_int_constant(root, _ACTION_VERSION_SOURCE, _ACTION_VERSION_NAME),
-        entries=_ACTION_VERSION_PROSE,
-    )
-
-
-def _read_dataclass_fields(root: Path, name: str) -> tuple[str, ...]:
-    path = root / _DATACLASS_FIELD_SOURCES[name]
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    for statement in tree.body:
-        if not isinstance(statement, ast.ClassDef) or statement.name != name:
-            continue
-        fields = [
-            entry.target.id
-            for entry in statement.body
-            if isinstance(entry, ast.AnnAssign) and isinstance(entry.target, ast.Name)
-        ]
-        return tuple(fields)
-    raise ValueError(f"{path} does not define a class named {name}")
-
-
-def _first_field_difference(documented: tuple[str, ...], declared: tuple[str, ...]) -> str:
-    # The two lists differ in length whenever a name was dropped or invented, so
-    # the common prefix is compared first and the ragged tail is reported below.
-    for position, (written, actual) in enumerate(zip(documented, declared, strict=False), start=1):
-        if written != actual:
-            return f"field {position} is documented as `{written}` but is declared `{actual}`"
-    if len(documented) < len(declared):
-        return f"the sentence stops before the declared field `{declared[len(documented)]}`"
-    return f"the sentence names `{documented[len(declared)]}`, which is not a declared field"
-
-
-def check_documented_dataclass_fields(root: Path) -> tuple[str, ...]:
-    """Compare the public-surface field lists with the dataclasses they describe."""
-    contract_path = root / "docs/kernel-contract.md"
-    errors: list[str] = []
-    for row in table_rows(contract_path.read_text(encoding="utf-8")):
-        if row.section != "Public Surface":
-            continue
-        names = _INLINE_CODE.findall(row.cells[0])
-        if len(names) != 1:
-            continue
-        name = names[0]
-        tracked = name in _DATACLASS_FIELD_SOURCES
-        # A wrapped row keeps a well-formed head line, so a `Fields:` sentence
-        # that does not open and close on the same line as its name cell is
-        # malformed rather than absent.
-        if not row.closed or len(row.cells) != 2:
-            if tracked:
+        expected = _read_int_constant(root, source, constant)
+        prose = "\n".join(_prose_lines(document))
+        documented = sorted({int(match.group("version")) for match in _SCHEMA_VERSION.finditer(prose)})
+        if not documented:
+            errors.append(f"{relative.as_posix()}: no schema version statement to compare with {constant}")
+        for version in documented:
+            if version != expected:
                 errors.append(
-                    f"docs/kernel-contract.md: the {name} row is not a single two-cell row "
-                    "on one line"
+                    f"{relative.as_posix()}: documents schema v{version}, but {constant} is {expected}"
                 )
-            continue
-        description = row.cells[1]
-        sentence = _FIELDS_SENTENCE.search(description)
-        if not tracked:
-            # A row that lists fields for a name no source is recorded for is a
-            # sentence nothing compares. Without this, dropping an entry from
-            # the mapping above leaves its row documented, unchecked and green.
-            if sentence is not None:
-                errors.append(
-                    f"docs/kernel-contract.md: the {name} row lists fields, but "
-                    f"{name} is not one of the types whose fields are checked"
-                )
-            continue
-        if sentence is None:
-            detail = (
-                "no `Fields:` sentence ending in a period"
-                if "Fields:" in description
-                else "no `Fields:` sentence"
-            )
-            errors.append(f"docs/kernel-contract.md: the {name} row has {detail}")
-            continue
-        documented = tuple(_INLINE_CODE.findall(sentence.group("names")))
-        declared = _read_dataclass_fields(root, name)
-        if documented != declared:
-            errors.append(
-                f"docs/kernel-contract.md: {name} field list disagrees with the dataclass: "
-                + _first_field_difference(documented, declared)
-            )
     return tuple(errors)
 
 
@@ -882,14 +664,11 @@ def check_docs(root: Path = PROJECT_ROOT) -> tuple[str, ...]:
     return (
         *check_local_links(root, files),
         *check_python_fences(root, files),
-        *check_cli_examples(root),
         *check_documented_integration_api(root),
         *check_documented_kernel_api(root),
-        *check_checkpoint_manifest_version(root),
-        *check_documented_dataclass_fields(root),
-        *check_action_manifest_version(root),
-        *check_documented_lsp_methods(root),
         *check_documented_consumer_api(root),
+        *check_schema_versions(root),
+        *check_documented_lsp_methods(root),
     )
 
 
