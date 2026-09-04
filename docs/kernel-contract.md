@@ -336,9 +336,11 @@ of the following hold:
   mode refuses with `CheckpointModeError` before staging any record.
 
 Under these conditions `load_checkpoint(key)` followed by `db.get(query)`
-returns the value a fresh recomputation on the same declared state would in
-that mode. A checkpoint record warms when every pinned object and every
-statically captured module chain the record depends on is unchanged, and a
+returns the value a fresh recomputation on the same declared state would in that
+mode. A checkpoint record warms when every pinned object and every statically
+captured module chain the record depends on is unchanged — a sub-query or
+resource reached through a statically captured module attribute is pinned
+exactly as a directly captured one is, and warms on the same terms — and a
 record the kernel cannot verify is re-executed. Identities are recomputed live
 in the loading process, edges are re-checked by digest, resources are re-probed
 against the real world, and every snapshot loaded from the store is rejected

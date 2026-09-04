@@ -37,9 +37,10 @@ surfaces on the push that introduces it rather than at the next release.
 
 **Release metadata.**
 [`scripts/verify_release_metadata.py`](../scripts/verify_release_metadata.py)
-requires the tag name to equal the `pyproject.toml` version, and requires
+requires the tag name to equal the `pyproject.toml` version, requires
 exactly one non-empty `CHANGELOG.md` section for that version whose heading
-carries a real calendar date in `YYYY-MM-DD` form.
+carries a real calendar date in `YYYY-MM-DD` form, and requires that version's
+release link at the foot of the changelog.
 
 **The gates.** The full test matrix — Python 3.11–3.14 on Linux, macOS, and
 Windows — plus static analysis, branch coverage, the documentation check,
@@ -88,7 +89,7 @@ published to PyPI. The commands below take the release from `VERSION`, so set it
 to the one you are checking, without the leading `v`:
 
 ```console
-VERSION=...
+VERSION=4.0.0
 gh release download "v$VERSION" --repo Brumbelow/pyinc
 sha256sum --check SHA256SUMS
 ```
