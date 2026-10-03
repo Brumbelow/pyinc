@@ -13,7 +13,8 @@ keyed inputs and pure queries, and it records the dependency graph while your
 code runs. On the next request it reuses unaffected work, recomputes affected
 queries, and backdates semantically equal results so downstream work stays
 valid. It is pure Python, stdlib-only, with zero runtime dependencies; Python
-3.11–3.14 are tested on Linux, macOS, and Windows. It exists so that the
+3.11–3.14 and the free-threaded 3.14t build are tested on Linux, macOS, and
+Windows. It exists so that the
 cache-invalidation bugs of a hand-rolled caching layer — the editor still
 underlining an error you fixed a minute ago — have somewhere to be caught.
 

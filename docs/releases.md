@@ -42,8 +42,9 @@ exactly one non-empty `CHANGELOG.md` section for that version whose heading
 carries a real calendar date in `YYYY-MM-DD` form, and requires that version's
 release link at the foot of the changelog.
 
-**The gates.** The full test matrix — Python 3.11–3.14 on Linux, macOS, and
-Windows — plus static analysis, branch coverage, the documentation check,
+**The gates.** The full test matrix — Python 3.11–3.14 and the free-threaded
+3.14t build on Linux, macOS, and Windows — plus static analysis, the full suite
+under branch coverage (reported, with no floor), the documentation check,
 CodeQL, and a five-repetition run of the correctness and work-count benchmark
 must all pass before anything is built.
 
@@ -80,7 +81,8 @@ is manually dispatched (`workflow_dispatch`) with the published version — it
 does not trigger automatically. It downloads the distributions from
 both PyPI and the GitHub Release, checks each against `SHA256SUMS` and against
 the hashes the two services report, and then installs that exact version from
-PyPI across all twelve supported operating-system and Python combinations.
+PyPI across all fifteen supported operating-system and Python combinations,
+the free-threaded 3.14t build with the GIL disabled among them.
 
 ## Verifying a download yourself
 

@@ -521,7 +521,9 @@ randomization is excluded deliberately: two processes that leave
 folding it would separate nothing a query's answer can depend on. Route a
 dependence on hash order through an `Input` or a `Resource`. A free-threaded
 build, another minor version, or another platform derives different identities
-and misses safely.
+and misses safely. On a free-threaded build `sys.flags.gil` is `None`, `0`, or
+`1` as `PYTHON_GIL` is unset, `0`, or `1`, so a checkpoint written under one
+setting misses under another.
 
 ## Thread Safety
 
@@ -530,7 +532,9 @@ and on one shared instance. Each `Database` holds a `threading.RLock` that
 serialises every public read and mutation. Threads sharing one instance
 serialise on its lock; threads holding separate instances do not contend. That
 is not parallelism: on a default build CPU-bound Python work does not run in
-parallel across threads, and parallel speedup needs separate processes. The
+parallel across threads, and parallel speedup needs separate processes. On a
+free-threaded build, threads holding separate instances can run at the same
+time; one instance still serialises on its lock. The
 ambient-read guard is installed globally exactly once and dispatches per
 context through a `ContextVar` stack of active databases, so threads inside
 queries on different instances do not disturb each other's enforcement, and

@@ -45,7 +45,7 @@ jobs:
       max-parallel: 5
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.11', '3.12', '3.13', '3.14']
+        python-version: ['3.11', '3.12', '3.13', '3.14', '3.14t']
     steps:
       - name: Check out the exact release tag
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -56,6 +56,13 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Run the free-threaded build with the GIL off
+        if: endsWith(matrix.python-version, 't')
+        # As in ci.yml: only the free-threaded cells, since a default build
+        # refuses PYTHON_GIL=0 at startup.
+        shell: bash
+        run: echo "PYTHON_GIL=0" >> "$GITHUB_ENV"
 
       - name: Install exact version from PyPI
         env:
@@ -76,3 +83,21 @@ jobs:
           PYINC_VERSION: ${{ inputs.version }}
         shell: bash
         run: python scripts/validate_install.py --expected-version "$PYINC_VERSION"
+
+      - name: Confirm the installed release runs without the GIL
+        if: endsWith(matrix.python-version, 't')
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys, sysconfig
+          assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1, "not a free-threaded build"
+          assert os.environ.get("PYTHON_GIL") == "0" and sys.flags.gil == 0, "PYTHON_GIL=0 is not in effect"
+          import pyinc, pyinc.integrations, pyinc_codegen, pyinc_tools
+          assert not sys._is_gil_enabled(), "the GIL is enabled"
+          # The published wheel is pure Python: importing it without the
+          # override must leave the GIL off on its own.
+          env = {key: value for key, value in os.environ.items() if key != "PYTHON_GIL"}
+          probe = "import sys, pyinc, pyinc.integrations, pyinc_codegen, pyinc_tools; sys.exit(sys._is_gil_enabled())"
+          subprocess.run([sys.executable, "-c", probe], env=env, check=True)
+          print(sys.version)
+          PY

@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.11', '3.12', '3.13', '3.14']
+        python-version: ['3.11', '3.12', '3.13', '3.14', '3.14t']
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -28,10 +28,37 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Run the free-threaded build with the GIL off
+        if: endsWith(matrix.python-version, 't')
+        # Only on the free-threaded cells: a default build refuses PYTHON_GIL=0
+        # at startup. Forcing it keeps an extension that would quietly re-enable
+        # the GIL from turning these cells back into ordinary ones.
+        shell: bash
+        run: echo "PYTHON_GIL=0" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev]'
+
+      - name: Confirm the interpreter runs without the GIL
+        if: endsWith(matrix.python-version, 't')
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys, sysconfig
+          assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1, "not a free-threaded build"
+          assert os.environ.get("PYTHON_GIL") == "0" and sys.flags.gil == 0, "PYTHON_GIL=0 is not in effect"
+          import hypothesis, pytest, xdist
+          import pyinc, pyinc.integrations, pyinc_codegen, pyinc_tools
+          assert not sys._is_gil_enabled(), "the GIL is enabled"
+          # pyinc is pure Python: importing it without the override must leave
+          # the GIL off on its own.
+          env = {key: value for key, value in os.environ.items() if key != "PYTHON_GIL"}
+          probe = "import sys, pyinc, pyinc.integrations, pyinc_codegen, pyinc_tools; sys.exit(sys._is_gil_enabled())"
+          subprocess.run([sys.executable, "-c", probe], env=env, check=True)
+          print(sys.version)
+          PY
 
       - name: Probe artifact-store process contention
         if: runner.os == 'macOS'
@@ -44,7 +71,7 @@ jobs:
 
       - name: Run test suite
         # The process tests check the repository as shipped and do not vary by
-        # platform, so the quality job runs them once instead of twelve times.
+        # platform, so the quality job runs them once instead of fifteen times.
         run: pytest -q -n auto --dist load -m 'not process' --ignore=tests/test_properties.py
 
   test-properties:

@@ -41,10 +41,12 @@ python3 scripts/check_docs.py
 `pytest -q tests/test_properties.py::test_incremental_results_match_fresh_recomputation`.
 
 `check_docs.py` executes the Python examples embedded in the Markdown docs, so a
-documented snippet that no longer runs is a build failure. Branch coverage must
-stay at or above 90%.
+documented snippet that no longer runs is a build failure. CI measures branch
+coverage and prints the report, but it has no floor: the number is for reading,
+not a gate.
 
-The full matrix is Python 3.11–3.14 on Linux, macOS, and Windows. Windows is the
+The full matrix is Python 3.11–3.14, plus the free-threaded 3.14t build with the
+GIL disabled, on Linux, macOS, and Windows. Windows is the
 platform most likely to surface a path or file-locking difference; if you touch
 the artifact store, the action layer, or the watcher, expect to iterate there.
 

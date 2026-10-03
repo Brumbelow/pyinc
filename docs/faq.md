@@ -137,14 +137,27 @@ on one `Database` does not disturb enforcement on another, and raw I/O from a
 thread that is not inside a query is unaffected. See
 [Thread Safety](kernel-contract.md#thread-safety).
 
-**Free-threaded builds.** The test matrix covers CPython 3.11–3.14 on the
-default build; it does not currently include a free-threaded build, so pyinc
-does not claim to be verified there. What is guaranteed is that the two are
-never confused. Query, resource, adapter, and input identities all embed an
-interpreter and build payload that includes `sys.flags.gil`, `sys.abiflags`,
-and the SOABI tag, so a free-threaded interpreter derives different identities:
-it misses safely and recomputes rather than reusing a record — or a checkpoint
-— written under a different build.
+**Free-threaded builds.** The test matrix runs the suite, and nightly the
+property suite, on the free-threaded CPython 3.14t build with the GIL disabled
+(`PYTHON_GIL=0`), on Linux, macOS, and Windows. The rules above do not change:
+one `Database` still serializes on its lock, while threads holding separate
+instances can now execute at the same time. No speedup is claimed; measure it
+for your workload. The package metadata says as much with the
+`Programming Language :: Python :: Free Threading :: 2 - Beta` classifier:
+free-threaded use is supported and tested, and since the support is new, the
+constraints documented so far may not be complete. From 3.14, a free-threaded build starts every thread
+with a copy of its starter's context (`sys.flags.thread_inherit_context`), and a request — a `request_span` included — belongs to
+the thread that opened it, so the copy never lets one thread answer from
+another's validation.
+
+The two builds are never confused. Query, resource, adapter, and input
+identities all embed an interpreter and build payload that includes
+`sys.flags.gil`, `sys.abiflags`, and the SOABI tag, so a free-threaded
+interpreter derives different identities: it misses safely and recomputes
+rather than reusing a record — or a checkpoint — written under a different
+build. On a free-threaded build `sys.flags.gil` is `None`, `0`, or `1` as
+`PYTHON_GIL` is unset, `0`, or `1`, so those three settings miss each other's
+checkpoints as well.
 
 **Processes.** There is no built-in worker pool, scheduler, or distributed
 execution; that is [out of scope](#what-is-out-of-scope) by design. Separate

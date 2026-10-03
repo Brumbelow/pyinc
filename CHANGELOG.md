@@ -51,6 +51,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in ten hit it. The reference now lasts until the thread has exited, and a
   stopped watcher can still be started again.
 
+### Changed
+
+- CI runs the test suite, and nightly the property suite, on the free-threaded
+  CPython 3.14t build with the GIL disabled, on Linux, macOS, and Windows. The
+  release workflow gates on it with the rest of the matrix, and the FAQ no
+  longer says free-threaded builds are unverified.
+- The package declares `Programming Language :: Python :: Free Threading ::
+  2 - Beta`, and the post-release check installs the published wheel on 3.14t
+  with the GIL disabled too, making fifteen operating-system and Python
+  combinations.
+- CONTRIBUTING no longer says branch coverage must stay at or above 90%. The
+  floor was dropped earlier; CI reports coverage without gating on it.
+
 ## [4.0.0] - 2026-09-04
 
 v3.1.1 was tagged but never published: its release run was cancelled after an
