@@ -341,9 +341,10 @@ class ResolvedPathResource(Resource[str | os.PathLike[str], str | None, tuple[st
     """Symlink-aware canonicalization of one path, tracked as a dependency.
 
     The semantic value is the fully resolved path string, so retargeting any
-    link along the chain invalidates readers. `Path.resolve` reaches the live
-    filesystem untracked (kernel contract, limitation 1); containment and
-    visited-set decisions inside queries route through this resource instead.
+    link along the chain invalidates readers. `Path.resolve` of a fully
+    qualified path reaches the live filesystem untracked (kernel contract,
+    limitation 1); containment and visited-set decisions inside queries route
+    through this resource instead.
     """
 
     def read(self, db: _runtime.Database, key: str | os.PathLike[str]) -> str | None:

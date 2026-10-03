@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeAlias, cast
 
+from pyinc._path_identity import is_fully_qualified
 from pyinc.core import query
 from pyinc.integrations.installed_packages import environment_index
 from pyinc.resources import DirectoryResource, FileStatResource, ResolvedPathResource
@@ -164,7 +165,11 @@ def _get_sys_path_entries() -> tuple[str, ...]:
     seen: set[str] = set()
     result: list[str] = []
     for raw in sys.path:
-        if not isinstance(raw, str) or not raw:
+        # An empty, relative or (on Windows) rooted entry names a directory
+        # through the working directory, which a query may not read; the
+        # analysis resolves only the fully qualified entries the interpreter
+        # itself puts on the path.
+        if not isinstance(raw, str) or not raw or not is_fully_qualified(raw, os.path):
             continue
         real = os.path.realpath(raw)
         if real in seen:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ntpath
 from pathlib import PurePath
+from types import ModuleType
 
 
 def is_stdlib_path(value: object) -> bool:
@@ -12,4 +14,28 @@ def is_stdlib_path(value: object) -> bool:
     }
 
 
-__all__ = ["is_stdlib_path"]
+def is_fully_qualified(path: str | bytes, path_module: ModuleType) -> bool:
+    r"""Return whether ``path`` names one place whatever the working directory.
+
+    On POSIX that is an absolute path. On Windows it is decided by Windows' own
+    path types rather than by ``ntpath.isabs`` or ``ntpath.splitdrive``, whose
+    answers moved between versions: a drive with a root (``C:\x``), a UNC or
+    device path (``\\server\share``, ``\\?\...``, ``\\.\...``), or the null
+    device, which ``realpath`` answers before it anchors anything. A
+    drive-relative ``C:x`` depends on that drive's working directory and a
+    rooted ``\x`` on the working directory's drive, so neither qualifies.
+    """
+
+    normalized = path_module.normpath(path)
+    if path_module is not ntpath:
+        return bool(path_module.isabs(normalized))
+    is_bytes = isinstance(normalized, bytes)
+    sep = b"\\" if is_bytes else "\\"
+    if normalized.startswith(sep * 2):
+        return True
+    if path_module.normcase(normalized) == (b"nul" if is_bytes else "nul"):
+        return True
+    return bool(normalized[:1] != sep and normalized[1:3] == (b":\\" if is_bytes else ":\\"))
+
+
+__all__ = ["is_fully_qualified", "is_stdlib_path"]

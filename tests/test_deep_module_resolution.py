@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -80,6 +82,51 @@ def test_sys_path_entries_appear_in_analysis(
     paths = {entry.path for entry in analysis.entries}
     assert str(site.resolve()) in paths
     assert all(isinstance(entry, ModulePathEntry) for entry in analysis.entries)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_relative_sys_path_entries_are_skipped_rather_than_read_through_the_cwd(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative entry names a directory through the working directory.
+
+    A query may not read the working directory, so the walk skips such an
+    entry beside the empty one instead of resolving it -- and instead of
+    refusing the whole analysis.
+    """
+    site = tmp_path / "site"
+    site.mkdir()
+    relative = tmp_path / "relative"
+    relative.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "path", ["relative", str(site), *sys.path])
+
+    analysis = deep_module_resolution_analysis(Database(mode=mode))
+
+    paths = {entry.path for entry in analysis.entries}
+    assert str(site.resolve()) in paths
+    assert str(relative.resolve()) not in paths
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a rooted path with no drive is a Windows path type")
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_rooted_sys_path_entries_are_skipped_on_windows(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rooted entry with no drive resolves on the working directory's drive.
+
+    Before 3.13 `ntpath.isabs` called it absolute; the walk skips it on every
+    version rather than letting the guard refuse the whole analysis.
+    """
+    site = tmp_path / "site"
+    site.mkdir()
+    monkeypatch.setattr(sys, "path", ["\\pyinc-rooted-entry", "/pyinc-rooted-entry", str(site), *sys.path])
+
+    analysis = deep_module_resolution_analysis(Database(mode=mode))
+
+    paths = {entry.path for entry in analysis.entries}
+    assert str(site.resolve()) in paths
+    assert not any(path.lower().endswith("pyinc-rooted-entry") for path in paths)
 
 
 # ---------------------------------------------------------------------------

@@ -14,8 +14,14 @@ from one.
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import io
+import ntpath
 import os
+import pickle
+import posixpath
+import sys
 import threading
 import time
 from pathlib import Path
@@ -24,6 +30,8 @@ from typing import Any
 import pytest
 
 from pyinc import Database, UntrackedReadError, query
+from pyinc._path_identity import is_fully_qualified
+from pyinc.runtime import _CWD_READ_UNUSED, _cwd_anchoring_realpath
 
 _UNGUARDED_METADATA_READS = (
     "os.stat",
@@ -85,39 +93,6 @@ def test_file_metadata_reads_bypass_untracked_read_guard(tmp_path: Path, reader:
 
     # None of these raise — they are outside the guard.
     assert Database().get(observe) is True
-
-
-@pytest.mark.skipif(not os.supports_bytes_environ, reason="requires os.environb")
-@pytest.mark.parametrize("reader", ["os.environb", "os.getenvb"])
-def test_byte_environment_views_bypass_untracked_read_guard(
-    monkeypatch: pytest.MonkeyPatch, reader: str
-) -> None:
-    """Documents that the byte-oriented environment is NOT intercepted.
-
-    `os.environ` is replaced by a guarded mapping and `os.getenv` by a guarded
-    function; `os.environb` and `os.getenvb` are a second, unwrapped view of the
-    same process environment.
-    """
-    monkeypatch.setenv("PYINC_UNGUARDED_ENV", "value")
-
-    @query(key=f"byte-env-read:{reader}")
-    def read_env(db: Database) -> bytes | None:
-        if reader == "os.environb":
-            return os.environb[b"PYINC_UNGUARDED_ENV"]
-        return os.getenvb(b"PYINC_UNGUARDED_ENV")
-
-    assert Database().get(read_env) == b"value"
-
-
-@pytest.mark.parametrize("reader", ["os.getcwd", "Path.cwd"])
-def test_working_directory_reads_bypass_untracked_read_guard(reader: str) -> None:
-    """Documents that the process working directory is NOT intercepted."""
-
-    @query(key=f"cwd-read:{reader}")
-    def read_cwd(db: Database) -> str:
-        return os.getcwd() if reader == "os.getcwd" else str(Path.cwd())
-
-    assert Database().get(read_cwd) == os.getcwd()
 
 
 def test_stat_only_query_is_never_invalidated_by_the_file_it_stats(tmp_path: Path) -> None:
@@ -204,14 +179,23 @@ def test_report_untracked_read_leaves_a_clock_reading_unreproducible(mode: str) 
     assert node.last_decision == "executed"
 
 
+_requires_environb = pytest.mark.skipif(
+    not os.supports_bytes_environ, reason="requires os.environb"
+)
+
 _GUARDED_ENTRY_POINTS = (
     "builtins.open",
     "io.open",
     "os.getenv",
     "os.environ",
+    pytest.param("os.getenvb", marks=_requires_environb),
+    pytest.param("os.environb", marks=_requires_environb),
     "os.listdir",
     "os.scandir",
     "iterdir",
+    "os.getcwd",
+    "os.getcwdb",
+    "Path.cwd",
 )
 
 
@@ -231,6 +215,16 @@ def _guarded_read(reader: str, path: Path, directory: Path) -> object:
         return os.getenv("PYINC_GUARDED_ENV")
     if reader == "os.environ":
         return os.environ["PYINC_GUARDED_ENV"]
+    if reader == "os.getenvb":
+        return os.getenvb(b"PYINC_GUARDED_ENV")
+    if reader == "os.environb":
+        return os.environb[b"PYINC_GUARDED_ENV"]
+    if reader == "os.getcwd":
+        return os.getcwd()
+    if reader == "os.getcwdb":
+        return os.getcwdb()
+    if reader == "Path.cwd":
+        return str(Path.cwd())
     if reader == "os.listdir":
         return tuple(sorted(os.listdir(directory)))
     if reader == "os.scandir":
@@ -253,6 +247,280 @@ def test_condition_two_entry_points_stay_guarded(
 
     with pytest.raises(UntrackedReadError, match="untracked"):
         Database().get(observe)
+
+
+@pytest.mark.parametrize("reader", ["os.getcwd", "os.getcwdb", "Path.cwd"])
+def test_a_working_directory_refusal_says_how_to_pass_the_path(reader: str) -> None:
+    @query(key=f"cwd-advice:{reader}")
+    def read_cwd(db: Database) -> object:
+        return _guarded_read(reader, Path(), Path())
+
+    with pytest.raises(UntrackedReadError, match="Pass an absolute path as a query argument"):
+        Database().get(read_cwd)
+
+
+_PATH_RESOLVERS = (
+    "os.path.abspath",
+    "os.path.realpath",
+    "os.path.realpath(bytes)",
+    "Path.resolve",
+    "Path.absolute",
+)
+
+
+def _resolve(reader: str, path: str) -> str:
+    if reader == "os.path.abspath":
+        return os.path.abspath(path)
+    if reader == "os.path.realpath":
+        return os.path.realpath(path)
+    if reader == "os.path.realpath(bytes)":
+        return os.fsdecode(os.path.realpath(os.fsencode(path)))
+    if reader == "Path.resolve":
+        return str(Path(path).resolve())
+    return str(Path(path).absolute())
+
+
+@pytest.mark.parametrize("reader", _PATH_RESOLVERS)
+def test_resolving_a_relative_path_reads_the_working_directory(reader: str) -> None:
+    """The working-directory guard reaches the helpers that anchor a relative path.
+
+    `posixpath`, Windows' `ntpath.realpath` and `pathlib` call `os.getcwd` (or
+    `os.getcwdb`) to anchor a relative path, so resolving one is refused with
+    it. The one helper that does not is Windows' `ntpath.abspath`, which
+    resolves through `nt._getfullpathname`, where the guard does not see it.
+    """
+
+    @query(key=f"relative-path:{reader}")
+    def resolve_relative(db: Database) -> str:
+        return _resolve(reader, "relative")
+
+    if os.name == "nt" and reader == "os.path.abspath":
+        assert Database().get(resolve_relative).endswith("relative")
+    else:
+        with pytest.raises(UntrackedReadError, match="untracked"):
+            Database().get(resolve_relative)
+
+
+@pytest.mark.parametrize("reader", _PATH_RESOLVERS)
+def test_resolving_an_absolute_path_never_reads_the_working_directory(
+    tmp_path: Path, reader: str
+) -> None:
+    """An absolute path does not depend on the working directory, on any platform.
+
+    Windows' `realpath` reads the working directory for an absolute path too,
+    without using it, and the guard lets that read through; the cells below pin
+    the rule it lets it through by.
+    """
+
+    @query(key=f"absolute-path:{reader}")
+    def resolve_absolute(db: Database, path: str) -> str:
+        return _resolve(reader, path)
+
+    resolved = Database().get(resolve_absolute, str(tmp_path / "sample.txt"))
+    assert Path(resolved).name == "sample.txt"
+
+
+@pytest.mark.parametrize(
+    ("path", "read_unused"),
+    [
+        ("C:\\data\\sample.txt", True),
+        ("C:\\data\\..\\data\\sample.txt", True),
+        ("\\\\server\\share\\sample.txt", True),
+        ("\\\\?\\C:\\data\\sample.txt", True),
+        ("NUL", True),
+        (b"C:\\data\\sample.txt", True),
+        (b"nul", True),
+        ("relative\\sample.txt", False),
+        ("C:relative", False),
+        ("\\data\\sample.txt", False),
+        ("/data/sample.txt", False),
+        ("/:data", False),
+        ("\\:data", False),
+        (b"relative", False),
+    ],
+)
+def test_the_windows_realpath_read_is_let_through_only_where_realpath_ignores_it(
+    path: str | bytes, read_unused: bool
+) -> None:
+    """Pins, on every platform, the rule the guard's Windows `realpath` wrapper uses.
+
+    Through Python 3.13.15 and 3.14.7, `ntpath.realpath` reads the working
+    directory before it looks at its argument, and the answer matters only for
+    a path that is not fully qualified: neither drive-and-root, UNC, nor
+    `\\\\?\\`-prefixed, and not the null device. The stand-in reads it the same
+    way. A drive-relative `C:relative` is anchored to that drive's working
+    directory, and a rooted `\\data` to the working directory's drive -- which
+    `ntpath.isabs` called absolute before 3.13 -- so neither read is unused.
+    """
+    seen: list[tuple[bool, bool]] = []
+
+    def reads_the_working_directory_first(target: Any, *, strict: bool = False) -> Any:
+        seen.append((_CWD_READ_UNUSED.get(), strict))
+        return target
+
+    wrapped = _cwd_anchoring_realpath(reads_the_working_directory_first, ntpath)
+
+    assert wrapped(path, strict=True) == path
+    assert seen == [(read_unused, True)]
+    assert _CWD_READ_UNUSED.get() is False
+    assert is_fully_qualified(path, ntpath) is read_unused
+
+
+@pytest.mark.parametrize(
+    ("path", "qualified"),
+    [("/data/sample.txt", True), ("/", True), (b"/data", True), ("relative", False), ("", False)],
+)
+def test_a_posix_path_is_fully_qualified_when_it_is_absolute(
+    path: str | bytes, qualified: bool
+) -> None:
+    assert is_fully_qualified(path, posixpath) is qualified
+
+
+def test_the_read_is_let_through_on_windows_only_and_never_around_caller_code() -> None:
+    """Nothing but realpath's own read of the working directory may run unguarded.
+
+    POSIX's realpath never reads the directory for a fully qualified path, so
+    there is nothing to let through. On Windows a `strict` with a `__bool__` of
+    its own is settled before the read is let through.
+    """
+    windows_reads: list[bool] = []
+    posix_reads: list[bool] = []
+    settled_at: list[bool] = []
+
+    class Strict:
+        def __bool__(self) -> bool:
+            settled_at.append(_CWD_READ_UNUSED.get())
+            return True
+
+    def windows_realpath(target: Any, *, strict: bool = False) -> Any:
+        windows_reads.append(_CWD_READ_UNUSED.get())
+        assert strict is True
+        return target
+
+    def posix_realpath(filename: Any, *, strict: bool = False) -> Any:
+        posix_reads.append(_CWD_READ_UNUSED.get())
+        return filename
+
+    _cwd_anchoring_realpath(windows_realpath, ntpath)("C:\\data", strict=Strict())
+    _cwd_anchoring_realpath(posix_realpath, posixpath)("/data", strict=True)
+
+    assert settled_at == [False]
+    assert windows_reads == [True]
+    assert posix_reads == [False]
+
+
+def test_the_realpath_wrapper_refuses_a_relative_path_it_cannot_see_anchored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The wrapper refuses an anchored path itself, however realpath reaches the directory.
+
+    From Python 3.14.8, `ntpath.realpath` anchors a relative path through
+    `abspath`, which reads the working directory in C, so no `os.getcwd` call is
+    left for the guard to refuse. The stand-in never reads the directory at
+    all, so only the wrapper can refuse here. An absolute path still answers.
+    """
+    monkeypatch.setattr(
+        os.path, "realpath", _cwd_anchoring_realpath(lambda target, **_: target, os.path)
+    )
+
+    @query(key="realpath-anchored-out-of-sight")
+    def resolve(db: Database, path: str) -> str:
+        return os.fspath(os.path.realpath(path))
+
+    with pytest.raises(UntrackedReadError, match="relative path inside a query is untracked"):
+        Database().get(resolve, "relative")
+    absolute = str(tmp_path / "sample.txt")
+    assert Database().get(resolve, absolute) == absolute
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symbolic links need a privilege on Windows")
+@pytest.mark.parametrize("reader", ["os.path.realpath", "Path.resolve"])
+def test_a_relative_path_through_an_absolute_link_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reader: str
+) -> None:
+    """Which directory `link` is found in is the working directory's call.
+
+    Before 3.13, `posixpath.realpath` resolves `link/sample.txt` without calling
+    `os.getcwd` when `link` points somewhere absolute, so only the wrapper sees
+    that the answer depends on the working directory.
+    """
+    target = tmp_path / "target"
+    target.mkdir()
+    (tmp_path / "link").symlink_to(target)
+    monkeypatch.chdir(tmp_path)
+
+    @query(key=f"relative-through-link:{reader}")
+    def resolve_through_link(db: Database) -> str:
+        if reader == "os.path.realpath":
+            return os.path.realpath("link/sample.txt")
+        return str(Path("link/sample.txt").resolve())
+
+    with pytest.raises(UntrackedReadError, match="untracked"):
+        Database().get(resolve_through_link)
+
+
+def test_the_wrapped_realpath_still_pickles_and_keeps_its_signature() -> None:
+    """`os.path.realpath` is replaced for the whole process, so it has to stay a good citizen.
+
+    A process pool pickles a function it is handed by reference, and feature
+    detection reads its signature.
+    """
+    Database()  # installs the guard
+
+    assert pickle.loads(pickle.dumps(os.path.realpath)) is os.path.realpath
+    parameters = inspect.signature(os.path.realpath).parameters
+    assert "strict" in parameters
+    # Its first parameter is still accepted by the name it advertises
+    # (`filename` on POSIX, `path` on Windows).
+    first = next(iter(parameters))
+    assert os.path.realpath(**{first: os.path.abspath(os.sep)}) == os.path.realpath(os.sep)
+
+
+def test_the_kernel_resolves_a_captured_module_file_outside_the_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Checking a captured module's file against its import spec is the kernel's work.
+
+    A module whose `__file__` is relative resolves it against the working
+    directory. The check ran under the calling query's guard, so a query that
+    captures such a module answered from top level and was refused when first
+    asked for from inside another query.
+    """
+    (tmp_path / "pyinc_guard_relative_file.py").write_text("VALUE = 7\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    module = importlib.import_module("pyinc_guard_relative_file")
+    monkeypatch.setattr(module, "__file__", "pyinc_guard_relative_file.py")
+    try:
+
+        @query(key="captures-relative-file-module")
+        def captured(db: Database) -> int:
+            return int(module.VALUE)
+
+        @query(key="asks-from-inside")
+        def outer(db: Database) -> int:
+            return captured(db) + 1
+
+        assert Database().get(outer) == 8
+    finally:
+        sys.modules.pop("pyinc_guard_relative_file", None)
+
+
+@_requires_environb
+def test_byte_environment_writes_stay_allowed_inside_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only reads are guarded, in the byte view exactly as in `os.environ`."""
+    # Set first so the monkeypatch records the variable and removes it again.
+    monkeypatch.setenv("PYINC_BYTE_WRITE", "before")
+
+    @query(key="byte-env-write")
+    def write_env(db: Database) -> bool:
+        os.environb[b"PYINC_BYTE_WRITE"] = b"value"
+        return True
+
+    assert Database().get(write_env) is True
+    assert os.environ["PYINC_BYTE_WRITE"] == "value"
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

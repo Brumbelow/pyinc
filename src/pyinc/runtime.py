@@ -8,6 +8,7 @@ import importlib.machinery
 import inspect
 import io
 import json
+import ntpath
 import os
 import struct
 import sys
@@ -36,9 +37,9 @@ from types import (
     UnionType,
     WrapperDescriptorType,
 )
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, ParamSpec, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, AnyStr, ClassVar, Literal, ParamSpec, TypeVar, cast, overload
 
-from ._path_identity import is_stdlib_path
+from ._path_identity import is_fully_qualified, is_stdlib_path
 from ._safe_fs import read_regular_file_following_links
 from .errors import (
     AdapterContractError,
@@ -873,6 +874,10 @@ def _default_observer_error_hook(exc: Exception) -> None:
 
 
 _ACTIVE_GUARDS: ContextVar[tuple[Database, ...]] = ContextVar("pyinc_active_guards", default=())
+# Set while a `realpath` that reads the working directory without using it runs
+# on a path the read cannot reach: see `_cwd_anchoring_realpath`.
+_CWD_READ_UNUSED: ContextVar[bool] = ContextVar("pyinc_cwd_read_unused", default=False)
+_CWD_ADVICE = "Pass an absolute path as a query argument, or read it through a Resource."
 _GUARD_INSTALLED = False
 _GUARD_INSTALL_LOCK = threading.Lock()
 
@@ -891,6 +896,60 @@ def _raise_if_guarded(message: str) -> None:
     for db in _ACTIVE_GUARDS.get():
         if db._current_frame() is not None and not db._allow_raw_reads.get():
             raise UntrackedReadError(message)
+
+
+def _cwd_anchoring_realpath(
+    realpath: Callable[..., Any], path_module: ModuleType
+) -> Callable[..., Any]:
+    """Wrap `os.path.realpath` so the working directory decides nothing silently.
+
+    `realpath` anchors a path that is not fully qualified to the working
+    directory, and how it reads the directory is an implementation detail
+    that moves between versions. Windows' `ntpath.realpath` called
+    `os.getcwd()` for every path, fully qualified ones included, until 3.13.16
+    and 3.14.8, and from those releases anchors through `abspath`, which reads
+    the directory in C where no guard sees it. On POSIX before 3.13, a relative
+    path that reaches an absolute symlink is resolved without consulting
+    `os.getcwd` at all. So the wrapper asks the question itself, on the path
+    realpath will see: a path the directory anchors is refused inside a query,
+    whatever the version; any other path resolves, and on Windows the read of
+    the directory it cannot use is let through.
+    """
+    windows = path_module is ntpath
+    # The wrapped function's own name for its first parameter (`filename` on
+    # POSIX, `path` on Windows), so a caller passing it by keyword still can.
+    first = next(iter(inspect.signature(realpath).parameters))
+    allow_missing = getattr(path_module, "ALLOW_MISSING", None)
+
+    @functools.wraps(realpath)
+    def guarded_realpath(*args: Any, **kwargs: Any) -> Any:
+        if not args and first not in kwargs:
+            return realpath(*args, **kwargs)
+        path = args[0] if args else kwargs.pop(first)
+        args = args[1:]
+        # One `__fspath__` call, so the decision and the resolution see the
+        # same path.
+        target = os.fspath(path)
+        if not is_fully_qualified(target, path_module):
+            _raise_if_guarded(
+                "Raw os.path.realpath() of a relative path inside a query is untracked: "
+                f"it reads the working directory. {_CWD_ADVICE}"
+            )
+            return realpath(target, *args, **kwargs)
+        if not windows:
+            return realpath(target, *args, **kwargs)
+        # Let through the read Windows' realpath makes without using it, and
+        # nothing else: `strict` is settled first, so no caller code runs
+        # while the read is let through.
+        if "strict" in kwargs and kwargs["strict"] is not allow_missing:
+            kwargs["strict"] = bool(kwargs["strict"])
+        token = _CWD_READ_UNUSED.set(True)
+        try:
+            return realpath(target, *args, **kwargs)
+        finally:
+            _CWD_READ_UNUSED.reset(token)
+
+    return guarded_realpath
 
 
 def _install_guards_once() -> None:
@@ -915,6 +974,9 @@ def _install_guards_once() -> None:
         original_os_scandir = os.scandir
         original_path_iterdir = Path.iterdir
         original_environ = os.environ
+        original_os_getcwd = os.getcwd
+        original_os_getcwdb = os.getcwdb
+        original_path_cwd = Path.cwd.__func__  # type: ignore[attr-defined]
 
         def guarded_open(*args: Any, **kwargs: Any) -> Any:
             _raise_if_guarded("Raw open() inside a query is untracked. Use FileResource.read().")
@@ -954,6 +1016,28 @@ def _install_guards_once() -> None:
                 "Raw os.environ access inside a query is untracked. Use EnvResource.read()."
             ),
         )
+
+        # The working directory is ambient state like the environment: a
+        # relative path means something different after a chdir. Resolving a
+        # relative path with `os.path.realpath`, `Path.resolve` or
+        # `Path.absolute` reaches these and is refused with them, as is
+        # `os.path.abspath` on POSIX; Windows' `ntpath.abspath` resolves through
+        # `nt._getfullpathname`, which is not intercepted. `Path.cwd` is wrapped
+        # in its own right so the refusal does not depend on how pathlib
+        # reaches the directory.
+        def guarded_getcwd() -> str:
+            if not _CWD_READ_UNUSED.get():
+                _raise_if_guarded(f"Raw os.getcwd() inside a query is untracked. {_CWD_ADVICE}")
+            return original_os_getcwd()
+
+        def guarded_getcwdb() -> bytes:
+            if not _CWD_READ_UNUSED.get():
+                _raise_if_guarded(f"Raw os.getcwdb() inside a query is untracked. {_CWD_ADVICE}")
+            return original_os_getcwdb()
+
+        def guarded_path_cwd(cls: type[Path]) -> Path:
+            _raise_if_guarded(f"Raw Path.cwd() inside a query is untracked. {_CWD_ADVICE}")
+            return original_path_cwd(cls)  # type: ignore[no-any-return]
 
         original_thread_start = threading.Thread.start
 
@@ -1005,26 +1089,56 @@ def _install_guards_once() -> None:
         os.scandir = guarded_scandir
         os.environ = guarded_environ  # type: ignore[assignment]  # noqa: B003
         Path.iterdir = guarded_path_iterdir  # type: ignore[assignment, method-assign]
+        os.getcwd = guarded_getcwd
+        os.getcwdb = guarded_getcwdb
+        Path.cwd = classmethod(guarded_path_cwd)  # type: ignore[assignment, method-assign]
+        # `pathlib` and pyinc reach `realpath` through `os.path`; a module
+        # that bound it before the guard was installed (`sysconfig`) keeps the
+        # original.
+        os.path.realpath = _cwd_anchoring_realpath(os.path.realpath, os.path)
+        if sys.platform != "win32":
+            # The byte-oriented view of the same process environment, and the
+            # lookup that reads through it. Windows has neither.
+            original_environb = os.environb
+            original_os_getenvb = os.getenvb
+
+            def guarded_getenvb(key: bytes, default: bytes | None = None) -> bytes | None:
+                _raise_if_guarded(
+                    "Raw os.getenvb() inside a query is untracked. Use EnvResource.read()."
+                )
+                return original_os_getenvb(key, default)
+
+            os.environb = _GuardedEnviron(  # type: ignore[assignment]
+                original_environb,
+                lambda: _raise_if_guarded(
+                    "Raw os.environb access inside a query is untracked. Use EnvResource.read()."
+                ),
+            )
+            os.getenvb = guarded_getenvb  # type: ignore[assignment]
         threading.Thread.start = guarded_thread_start  # type: ignore[assignment, method-assign]
         _GUARD_INSTALLED = True
 
 
-class _GuardedEnviron(MutableMapping[str, str]):
-    def __init__(self, wrapped: MutableMapping[str, str], check_read: Callable[[], None]) -> None:
-        self._wrapped = wrapped
+class _GuardedEnviron(MutableMapping[AnyStr, AnyStr]):
+    """`os.environ`, or on POSIX `os.environb`, with every read checked."""
+
+    def __init__(
+        self, wrapped: MutableMapping[AnyStr, AnyStr], check_read: Callable[[], None]
+    ) -> None:
+        self._wrapped: MutableMapping[AnyStr, AnyStr] = wrapped
         self._check_read = check_read
 
-    def __getitem__(self, key: str) -> str:
+    def __getitem__(self, key: AnyStr) -> AnyStr:
         self._check_read()
         return self._wrapped[key]
 
-    def __setitem__(self, key: str, value: str) -> None:
+    def __setitem__(self, key: AnyStr, value: AnyStr) -> None:
         self._wrapped[key] = value
 
-    def __delitem__(self, key: str) -> None:
+    def __delitem__(self, key: AnyStr) -> None:
         del self._wrapped[key]
 
-    def __iter__(self) -> Iterator[str]:
+    def __iter__(self) -> Iterator[AnyStr]:
         self._check_read()
         return iter(self._wrapped)
 
@@ -1033,15 +1147,15 @@ class _GuardedEnviron(MutableMapping[str, str]):
         return len(self._wrapped)
 
     @overload
-    def get(self, key: str, default: None = None) -> str | None: ...
+    def get(self, key: AnyStr, default: None = None) -> AnyStr | None: ...
 
     @overload
-    def get(self, key: str, default: str = ...) -> str: ...
+    def get(self, key: AnyStr, default: AnyStr = ...) -> AnyStr: ...
 
     @overload
-    def get(self, key: str, default: DefaultT) -> str | DefaultT: ...
+    def get(self, key: AnyStr, default: DefaultT) -> AnyStr | DefaultT: ...
 
-    def get(self, key: str, default: DefaultT | None = None) -> str | DefaultT | None:
+    def get(self, key: AnyStr, default: DefaultT | None = None) -> AnyStr | DefaultT | None:
         self._check_read()
         return self._wrapped.get(key, default)
 
@@ -1057,7 +1171,7 @@ class _GuardedEnviron(MutableMapping[str, str]):
         self._check_read()
         return self._wrapped.values()
 
-    def copy(self) -> dict[str, str]:
+    def copy(self) -> dict[AnyStr, AnyStr]:
         self._check_read()
         return dict(self._wrapped)
 
@@ -1069,14 +1183,14 @@ class _GuardedEnviron(MutableMapping[str, str]):
     # working after the guard is installed. Both `|` directions build their dict
     # from `self`, so the reads go through the guarded `keys`/`__getitem__`;
     # `|=` only writes, matching the unguarded `__setitem__`.
-    def __or__(self, other: object) -> dict[str, str]:
+    def __or__(self, other: object) -> dict[AnyStr, AnyStr]:
         if not isinstance(other, Mapping):
             return NotImplemented
         new = dict(self)
         new.update(other)
         return new
 
-    def __ror__(self, other: object) -> dict[str, str]:
+    def __ror__(self, other: object) -> dict[AnyStr, AnyStr]:
         if not isinstance(other, Mapping):
             return NotImplemented
         new = dict(other)
@@ -1084,8 +1198,8 @@ class _GuardedEnviron(MutableMapping[str, str]):
         return new
 
     def __ior__(  # type: ignore[misc]  # `|=` accepts pair iterables that `|` does not, as in os._Environ
-        self, other: Mapping[str, str] | Iterable[tuple[str, str]]
-    ) -> _GuardedEnviron:
+        self, other: Mapping[AnyStr, AnyStr] | Iterable[tuple[AnyStr, AnyStr]]
+    ) -> _GuardedEnviron[AnyStr]:
         self.update(other)
         return self
 
@@ -7611,10 +7725,14 @@ class Database:
             raise UnsupportedValueError(
                 f"Captured module {module_name!r} has no stable source identity."
             )
-        if Path(file_path).resolve() != Path(origin).resolve():
-            raise UnsupportedValueError(
-                f"Captured module {module_name!r} file does not match its import spec."
-            )
+        # The kernel resolving its own capture is not the query reading the
+        # working directory, so this runs where raw reads are allowed, as the
+        # byte read below does.
+        with self._allow_raw_reads_scope():
+            if Path(file_path).resolve() != Path(origin).resolve():
+                raise UnsupportedValueError(
+                    f"Captured module {module_name!r} file does not match its import spec."
+                )
 
         # The identity is the bytes, hashed on every derivation. Stat-shaped
         # shortcuts (size, mtime, ctime, device, inode) are not collision-free:

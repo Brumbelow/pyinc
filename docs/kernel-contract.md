@@ -132,9 +132,31 @@ While a query runs, the kernel intercepts these calls and raises
 `UntrackedReadError` when they happen outside a resource hook:
 
 - `builtins.open` and `io.open`
-- `os.getenv` and `os.environ` access
+- `os.getenv` and `os.environ` access, and on POSIX `os.getenvb` and
+  `os.environb` access
 - `os.listdir` and `os.scandir`
 - `Path.iterdir`
+- `os.getcwd`, `os.getcwdb`, and `Path.cwd`
+
+Writes to the environment are not reads and stay allowed. Resolving a path
+that is not fully qualified reads the working directory too. `os.path.realpath`
+is wrapped, so it and `Path.resolve` refuse such a path on every platform and
+version, however the interpreter reaches the directory: Windows' `realpath`
+read it through `os.getcwd` for every path until 3.13.16 and 3.14.8 and in C
+since, and POSIX's skips `os.getcwd` before 3.13 for a relative path that
+reaches an absolute link. On Windows a rooted path with no drive (`\data`)
+counts as anchored, since it resolves on the working directory's drive. A fully
+qualified path resolves everywhere. `Path.absolute` of a relative path and, on
+POSIX, `os.path.abspath` reach `os.getcwd` and are refused with it. Pass
+absolute paths as query arguments.
+
+Other code that reaches the working directory through these entry points is
+refused the same way, wherever it runs: the first import inside a query body
+of a module that reads it at import time (`multiprocessing`, and so
+`concurrent.futures`' process pool), `contextlib.chdir`, and, on POSIX,
+`inspect`'s frame helpers when a frame they look at has a file name that is not
+absolute -- a program started with `python -m`, or `exec`'d or generated code.
+A read that does not go through these names is not seen (limitation 1).
 
 Reads this mechanism does not see (limitation 1) must be declared with
 `db.report_untracked_read(reason)` ([Escape Hatches](#escape-hatches)). A
@@ -281,20 +303,27 @@ entries hold it in-process at the cost of incrementality.
 set of entry points, not a category of behaviour. Everything else that observes
 external state bypasses it silently unless declared with
 `db.report_untracked_read(reason)`: `os.open()`, C-extension I/O, subprocess
-output, network calls, `ctypes` memory access, and similar. Four gaps sit close
+output, network calls, `ctypes` memory access, and similar. Three gaps sit close
 enough to the guarded set to be named:
 
 - *File metadata.* `os.stat`, `os.lstat`, `os.access`, `Path.stat`,
-  `Path.exists`, `Path.is_file`, `Path.is_dir`, `Path.resolve`, and the
-  `os.path` helpers built on them return normally from inside a query, so a
+  `Path.exists`, `Path.is_file`, `Path.is_dir`, `Path.resolve` of a fully
+  qualified path, and the `os.path` helpers built on them return normally from
+  inside a query, so a
   query that asks whether a file exists, or how large or how recent it is,
   records no edge and is reused unchanged after the file changes. Route the
   observation through `FileStatResource` or `ResolvedPathResource`. Declaring
   it removes stale reuse for the declaring node alone.
-- *The byte-oriented environment.* `os.getenvb` and `os.environb` are not
-  intercepted.
-- *The working directory.* `os.getcwd` and `Path.cwd` are not intercepted; pass
-  absolute paths as query arguments instead.
+- *`os.path.abspath` on Windows.* `ntpath.abspath` resolves a relative path
+  through `nt._getfullpathname` rather than `os.getcwd`, so on Windows it,
+  `os.path.relpath` built on it, and from 3.12 `Path.absolute` of a
+  drive-relative path (`C:data`) read the working directory without being
+  refused. Pass absolute paths as query arguments.
+- *The working directory outside the guarded names.* The import system resolves
+  an empty or relative `sys.path` entry with the interpreter's own `getcwd`; a
+  name bound before the first `Database` is created (`from os import getcwd`)
+  keeps the unguarded function; and a system call given a relative path
+  (`os.stat("data")`) reads the directory itself. None of these is refused.
 - *Threads the query did not start.* The guard covers threads a query body
   starts, at any depth, and nothing else. A pre-warmed pool, an executor built
   at module scope, or a reused `ThreadPoolExecutor` worker is untracked, and a

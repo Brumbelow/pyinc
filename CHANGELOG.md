@@ -6,6 +6,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- `os.getcwd`, `os.getcwdb` and `Path.cwd` inside a query body raise
+  `UntrackedReadError`, and so, on POSIX, do `os.getenvb` and `os.environb`
+  reads. Both were named gaps in the kernel contract: a query that read the
+  working directory or the byte view of the environment recorded no edge and
+  was reused after either moved. Resolving a path that is not fully qualified
+  reads the working directory and is refused with it: `os.path.realpath` and
+  `Path.resolve` on every platform and version (`os.path.realpath` is wrapped
+  to make that hold), `Path.absolute`, and `os.path.abspath` on POSIX. Fully
+  qualified paths resolve on every platform, as before, and environment writes
+  stay allowed. Other code that reaches the working directory through these
+  names inside a query body is refused with it: the first import of a module
+  that reads it at import time (`multiprocessing`), `contextlib.chdir`, and on
+  POSIX `inspect`'s frame helpers on a frame whose file name is not absolute
+  (`python -m`, `exec`'d or generated code).
+- `deep_module_resolution_analysis` and `resolve_module_path` skip a relative
+  `sys.path` entry, and on Windows a rooted one with no drive, as they already
+  skipped the empty one, instead of resolving it against the working directory.
+
+| Symbol or behaviour | Before | After | What to do |
+|---|---|---|---|
+| `os.getcwd()`, `Path.cwd()`, resolving a relative path in a query body | answered | `UntrackedReadError` | pass an absolute path as a query argument, or read it through a `Resource` |
+| `os.environb`, `os.getenvb()` in a query body | answered | `UntrackedReadError` | `EnvResource.read()`, then `os.fsencode` |
+| First import of `multiprocessing` or a process pool, `contextlib.chdir` in a query body; on POSIX `inspect.stack()` there when a frame's file name is not absolute | answered | `UntrackedReadError` | import at module scope; keep directory changes and frame inspection outside queries |
+| Relative (or, on Windows, rooted) `sys.path` entry in deep module resolution | resolved against the working directory | ignored | put a fully qualified path on `sys.path` |
+
 ### Fixed
 
 - A thread that carries a `request_span`'s context no longer joins the span's

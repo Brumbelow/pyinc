@@ -50,7 +50,7 @@ below sets out.
 | Entrypoints | `deep_module_resolution_analysis`, `resolve_module_path` |
 | Result types | `DeepModuleResolutionAnalysis`, `ModulePathEntry`, `NamespacePackage`, `PthDirective`, `ResolvedModuleLocation` |
 | Supported shapes | Existing directory entries from the live `sys.path`; direct `.pth` files in those entries; simple path lines; `.py` modules; packages with `__init__.py`; and PEP 420 namespace directories. |
-| Key limits | The live mutable `sys.path` is declared untracked and scanned again rather than treated as durable state. Empty, non-string, missing, and duplicate entries are ignored. `.pth` import lines are recorded and diagnosed but never executed. Zip imports, extension modules, legacy eggs, editable-install pointer formats, path hooks, and meta-path finders are not resolved. |
+| Key limits | The live mutable `sys.path` is declared untracked and scanned again rather than treated as durable state. Empty, non-string, missing, duplicate, relative, and (on Windows) rooted driveless entries are ignored. `.pth` import lines are recorded and diagnosed but never executed. Zip imports, extension modules, legacy eggs, editable-install pointer formats, path hooks, and meta-path finders are not resolved. |
 
 ## Dependency checking
 

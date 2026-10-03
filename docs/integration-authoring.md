@@ -231,10 +231,11 @@ When your integration traverses directory trees or recursive structures:
 
 - Track a `visited` set of canonical (resolved) paths.
 - Canonicalize through `ResolvedPathResource`, never through a raw
-  `Path.resolve()`: resolution is an ambient read the guard cannot intercept
-  (kernel contract, limitation 1), so an untracked call records no dependency
-  edge and a retargeted symlink leaves warm containment and visited-set
-  decisions stale while a fresh database recomputes them.
+  `Path.resolve()`: resolving a fully qualified path is an ambient read the
+  guard cannot intercept (kernel contract, limitation 1), so an untracked call
+  records no dependency edge and a retargeted symlink leaves warm containment
+  and visited-set decisions stale while a fresh database recomputes them. A
+  path that is not fully qualified is refused outright.
 - Check root containment before recursing to prevent escaping the workspace.
 - Reference: `_collect_python_files` uses `visited_directories`, a tracked
   resolution read, and `_is_within_root` for safe traversal.
