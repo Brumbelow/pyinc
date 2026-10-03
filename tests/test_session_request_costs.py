@@ -9,8 +9,10 @@ it on every increment (see `tests/test_source_ranges_caching.py`).
 
 from __future__ import annotations
 
+import contextvars
 import gc
 import sys
+import threading
 import weakref
 from collections.abc import Callable
 from pathlib import Path
@@ -21,7 +23,7 @@ import pytest
 
 import pyinc_tools.session as session_module
 from pyinc import Database
-from pyinc.integrations import _decoding
+from pyinc.integrations import _decoding, request_scope
 from pyinc.integrations.python_source import workspace_analysis
 from pyinc.integrations.scope_resolution import _decode_scope_tree, scope_tree
 from pyinc.integrations.symbol_resolution import (
@@ -269,6 +271,46 @@ def test_entrypoints_outside_a_session_still_see_edits(tmp_path: Path) -> None:
     after = module_symbol_table(db, tmp_path, alpha)
     assert sorted(symbol.qualified_name for symbol in after.symbols) == ["one", "three", "two"]
     assert len(scope_tree(db, alpha).bindings) == 3
+
+
+def test_a_context_copied_inside_a_request_scope_does_not_answer_from_its_memo(
+    tmp_path: Path,
+) -> None:
+    """The memo is the declaring thread's, for as long as its scope is open.
+
+    A copied context still holds the scope: every `threading.Thread` started on
+    a free-threaded 3.14 build copies its starter's, as `asyncio.to_thread` does
+    on every build. The copy is made by hand here so the cell holds everywhere.
+    """
+
+    _write_workspace(tmp_path)
+    db = Database(mode="strict")
+    alpha = tmp_path / "alpha.py"
+    three = "def one():\n    return 1\n\n\ndef two():\n    return 2\n\n\ndef three():\n    return 3\n"
+
+    def bindings_in_thread(context: contextvars.Context) -> int:
+        box: list[int] = []
+        worker = threading.Thread(
+            target=context.run,
+            args=(lambda: box.append(len(scope_tree(db, alpha).bindings)),),
+        )
+        worker.start()
+        worker.join()
+        return box[0]
+
+    with request_scope(db):
+        assert len(scope_tree(db, alpha).bindings) == 2
+        carried = contextvars.copy_context()
+        alpha.write_text(three, encoding="utf-8")
+        # The scope's promise is its own thread's: another thread holding the
+        # context computes for itself and sees the edit ...
+        assert bindings_in_thread(carried) == 3
+        # ... while the declaring thread answers from the memo, as it promised.
+        assert len(scope_tree(db, alpha).bindings) == 2
+
+    alpha.write_text(three + "\n\ndef four():\n    return 4\n", encoding="utf-8")
+    # Closed, the scope answers nobody -- not even its own thread through a copy.
+    assert len(carried.run(scope_tree, db, alpha).bindings) == 4
 
 
 def test_decode_memo_is_skipped_when_payload_identity_is_unstable(tmp_path: Path) -> None:

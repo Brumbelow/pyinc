@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- A thread that carries a `request_span`'s context no longer joins the span's
+  request. Every thread started on a free-threaded 3.14 build copies its
+  starter's context, as `asyncio.to_thread` and `Thread(context=...)` do on any
+  build, so such a thread answered from validation done for the span -- after
+  the span had closed, from a world that had since moved, disagreeing with a
+  fresh `Database` -- and queued its observer events on a list already
+  delivered. A request now belongs to the thread that opened it and ends when
+  its scope does; `pyinc.integrations.request_scope` follows the same rule for
+  its `once_per_request` memo.
+
 ## [4.0.0] - 2026-09-04
 
 v3.1.1 was tagged but never published: its release run was cancelled after an

@@ -24,7 +24,7 @@ releases every payload and decoded value it pinned; the entry bound applies
 per database.
 
 `once_per_request` keys on the call itself, and lives only for the span a caller
-declares with `request_scope`. A `WorkspaceSession` holds its lock for the whole of
+declares with `request_scope`, on the thread that declared it. A `WorkspaceSession` holds its lock for the whole of
 each public method and its inputs cannot change while it is held, so an
 entrypoint asked the same question twice inside one method must answer the same
 both times. Outside such a span the memo does not exist, so a caller driving the
@@ -35,10 +35,12 @@ does rewrite the mirror inside one of its own methods calls
 
 from __future__ import annotations
 
+import threading
 import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pyinc.errors import CompositionError
@@ -60,9 +62,32 @@ _CACHES: weakref.WeakKeyDictionary[
     Database, dict[tuple[Any, ...], tuple[tuple[Any, ...], Any]]
 ] = weakref.WeakKeyDictionary()
 
-_REQUEST: ContextVar[tuple[Database, dict[Any, Any]] | None] = ContextVar(
-    "pyinc_integration_request", default=None
-)
+
+@dataclass
+class _Request:
+    """One `request_scope` span: the database it promises about, and its memo.
+
+    It travels in a `ContextVar`, so a context copied while it is open -- every
+    `threading.Thread` started on a free-threaded 3.14 build, `asyncio.to_thread`
+    -- keeps a reference to it after the span has closed and its promise with
+    it. So a span belongs to the thread that opened it and ends when it closes,
+    as the kernel's own request does.
+    """
+
+    db: Database
+    memo: dict[Any, Any] = field(default_factory=dict)
+    thread_ident: int = field(default_factory=threading.get_ident)
+    ended: bool = False
+
+
+_REQUEST: ContextVar[_Request | None] = ContextVar("pyinc_integration_request", default=None)
+
+
+def _live_request() -> _Request | None:
+    request = _REQUEST.get()
+    if request is None or request.ended or request.thread_ident != threading.get_ident():
+        return None
+    return request
 
 
 def decoded(
@@ -100,10 +125,12 @@ def request_scope(db: Database) -> Iterator[None]:
     Repeated entrypoint calls inside the span answer from the first one.
     """
 
-    token = _REQUEST.set((db, {}))
+    request = _Request(db)
+    token = _REQUEST.set(request)
     try:
         yield
     finally:
+        request.ended = True
         _REQUEST.reset(token)
 
 
@@ -118,10 +145,10 @@ def request_inputs_changed() -> None:
     re-runs against the moved inputs.
     """
 
-    scope = _REQUEST.get()
-    if scope is not None:
-        scope[1].clear()
-        scope[0].request_inputs_changed()
+    request = _live_request()
+    if request is not None:
+        request.memo.clear()
+        request.db.request_inputs_changed()
 
 
 def once_per_request(
@@ -129,10 +156,10 @@ def once_per_request(
 ) -> _T:
     """Return ``compute()``, answering from this request if it already ran."""
 
-    scope = _REQUEST.get()
-    if scope is None or scope[0] is not db:
+    request = _live_request()
+    if request is None or request.db is not db:
         return compute()
-    memo = scope[1]
+    memo = request.memo
     key = (kind, args)
     if key in memo:
         return memo[key]  # type: ignore[no-any-return]

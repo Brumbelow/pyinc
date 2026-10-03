@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import hashlib
 import math
@@ -8477,6 +8478,91 @@ def test_cross_thread_request_inputs_changed_reopens_the_span(tmp_path: Path) ->
         declarer.start()
         declarer.join()
         assert db.get(read_text) == "new!"
+
+
+# A context copied while a span is open carries the span's request with it:
+# every `threading.Thread` started on a free-threaded 3.14 build does this, as
+# do `asyncio.to_thread` and `Thread(context=...)` everywhere. These cells copy
+# the context by hand, so they hold on every build in the matrix.
+
+
+def _run_in_thread(context: contextvars.Context, call: Callable[[], object]) -> object:
+    box: list[object] = []
+    worker = threading.Thread(target=context.run, args=(lambda: box.append(call()),))
+    worker.start()
+    worker.join()
+    return box[0]
+
+
+def test_a_context_copied_inside_a_span_does_not_reuse_it_after_close(tmp_path: Path) -> None:
+    resource = _SpanTalliedResource()
+    target = str(tmp_path / "data.txt")
+    Path(target).write_text("old", encoding="utf-8")
+
+    @query
+    def read_text(db: Database) -> str:
+        return resource.read(db, target)
+
+    db = Database()
+    with db.request_span():
+        assert db.get(read_text) == "old"
+        carried = contextvars.copy_context()
+    Path(target).write_text("new!", encoding="utf-8")
+
+    # The span that validated `read_text` is over. A call made through its
+    # copied context opens a request of its own, re-probes, and agrees with a
+    # fresh database -- from another thread and from this one alike.
+    assert _run_in_thread(carried, lambda: db.get(read_text)) == "new!"
+    Path(target).write_text("newer", encoding="utf-8")
+    assert carried.run(db.get, read_text) == "newer"
+    assert Database().get(read_text) == "newer"
+
+
+def test_a_thread_carrying_an_open_span_context_opens_its_own_request(tmp_path: Path) -> None:
+    resource = _SpanTalliedResource()
+    target = str(tmp_path / "data.txt")
+    Path(target).write_text("old", encoding="utf-8")
+
+    @query
+    def read_text(db: Database) -> str:
+        return resource.read(db, target)
+
+    db = Database()
+    assert db.get(read_text) == "old"
+    with db.request_span():
+        assert db.get(read_text) == "old"
+        Path(target).write_text("new!", encoding="utf-8")
+        requests_before = db.statistics().total_requests
+        # A span is its own thread's promise. Another thread does not join it
+        # however it came by the context, so it validates as a plain thread
+        # would -- the same answer on every build.
+        carried = contextvars.copy_context()
+        assert _run_in_thread(carried, lambda: db.get(read_text)) == "new!"
+        assert db.statistics().total_requests == requests_before + 1
+
+
+def test_a_change_seen_through_a_closed_span_context_is_still_delivered() -> None:
+    number = Input[int]("carried-number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 1)
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+
+    with db.request_span():
+        assert db.get(doubled) == 2
+        carried = contextvars.copy_context()
+    assert len(events) == 1
+
+    db.set(number, 5)
+    # Joining the closed span would queue this event on a list that was already
+    # delivered, and it would never arrive.
+    assert _run_in_thread(carried, lambda: db.get(doubled)) == 10
+    assert [event.decision for event in events] == ["executed", "executed"]
 
 
 def _held_wrapper() -> FrozenList:

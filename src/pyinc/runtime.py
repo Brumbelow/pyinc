@@ -760,6 +760,32 @@ class ExecutionFrame:
     completed: bool = False
 
 
+@dataclass
+class _RequestScope:
+    """One open request: the id its reads are checked in, and what dies with it.
+
+    It travels in a `ContextVar`, so every context copied while it is open
+    holds it too: each `threading.Thread` started on a free-threaded 3.14
+    build, `asyncio.to_thread`, `Thread(context=...)`, a `copy_context()` run
+    later. A copy that joined it would answer from validation done before the
+    copy ran -- after the request ended, from a world that has since moved.
+    So a request belongs to the thread that opened it and ends when its scope
+    exits, and `Database._live_request` sees no request anywhere else.
+    """
+
+    request_id: int
+    pending_events: list[_PendingObserverEvent] = field(default_factory=list)
+    # Resource nodes whose failure record holds this request's exception, so
+    # the scope can drop it (and the frames it pins) on the way out.
+    failures: list[NodeKey] = field(default_factory=list)
+    # Set on the request a `request_span` opened, with the span epoch it last
+    # caught up to.
+    span: bool = False
+    span_epoch_seen: int = 0
+    thread_ident: int = field(default_factory=threading.get_ident)
+    ended: bool = False
+
+
 @dataclass(frozen=True)
 class DatabaseStatistics:
     node_count: int
@@ -1219,11 +1245,9 @@ class Database:
         self._resource_hook_depth: ContextVar[int] = ContextVar(
             "pyinc_resource_hook_depth", default=0
         )
-        self._request_token: ContextVar[int | None] = ContextVar(
-            "pyinc_request_token", default=None
+        self._request: ContextVar[_RequestScope | None] = ContextVar(
+            "pyinc_request", default=None
         )
-        self._span_active: ContextVar[bool] = ContextVar("pyinc_span_active", default=False)
-        self._span_epoch_seen: ContextVar[int] = ContextVar("pyinc_span_epoch_seen", default=0)
         self._policy_fingerprint_stack: ContextVar[tuple[int, ...]] = ContextVar(
             "pyinc_policy_fingerprint_stack", default=()
         )
@@ -1296,14 +1320,6 @@ class Database:
         self._observer_token_counter = 0
         self._observer_error_hook: ObserverErrorHook = (
             observer_error_hook if observer_error_hook is not None else _default_observer_error_hook
-        )
-        self._pending_events: ContextVar[list[_PendingObserverEvent] | None] = ContextVar(
-            "pyinc_pending_events", default=None
-        )
-        # Resource nodes whose failure record holds this request's exception, so
-        # the request scope can drop it (and the frames it pins) on the way out.
-        self._request_failures: ContextVar[list[NodeKey] | None] = ContextVar(
-            "pyinc_request_failures", default=None
         )
         # Scope-B: checkpoint records loaded from a durable store for cross-run reuse.
         self._checkpoint_query_records: dict[NodeKey, dict[str, Any]] = {}
@@ -1769,16 +1785,19 @@ class Database:
         when the outermost span closes -- cleanly or on an exception --
         exactly as they are for a single ``get``. Spans are reentrant -- an
         inner span, or one opened inside a ``get``, joins the enclosing
-        request and its close does nothing.
+        request and its close does nothing. A span is its own thread's: a call
+        from another thread opens a request of its own, even through a context
+        copied from inside the span.
         """
         self._reject_reentrant_read("db.request_span()")
         scope = self._request_scope()
         with self._state_lock:
             pending = scope.__enter__()
-            span_token = self._span_active.set(True) if pending is not None else None
-            epoch_token = (
-                self._span_epoch_seen.set(self._span_epoch) if pending is not None else None
-            )
+            # A fresh request (rather than one joined) is the span's own.
+            opened = self._request.get() if pending is not None else None
+            if opened is not None:
+                opened.span = True
+                opened.span_epoch_seen = self._span_epoch
         body_exc: BaseException | None = None
         try:
             yield
@@ -1787,10 +1806,6 @@ class Database:
             raise
         finally:
             with self._state_lock:
-                if span_token is not None:
-                    self._span_active.reset(span_token)
-                if epoch_token is not None:
-                    self._span_epoch_seen.reset(epoch_token)
                 scope.__exit__(None, None, None)
             # Deliver outside the lock, exactly as a single get does. Work the
             # span committed keeps its notifications even when a later part of
@@ -1827,9 +1842,9 @@ class Database:
         Callers hold the state lock. The change is declared instance-wide by
         bumping the span epoch: a span held by another thread catches up at
         its next request boundary, where the epoch is compared before any
-        dedupe. A span on the calling thread moves immediately. Resetting the
-        span's token and seen epoch at exit restores the pre-span values, so
-        the intermediate ids need no bookkeeping.
+        dedupe. A span on the calling thread moves immediately. The span's id
+        and seen epoch live on its request scope and end with it, so the
+        intermediate ids need no bookkeeping.
         """
         self._span_epoch += 1
         # A declared change is the one thing that may move a resource's
@@ -1849,13 +1864,14 @@ class Database:
         id moves exactly as it does for a same-thread declaration and the
         span's next reads re-validate against the committed state.
         """
-        if not self._span_active.get():
+        request = self._live_request()
+        if request is None or not request.span:
             return
-        if self._span_epoch_seen.get() == self._span_epoch:
+        if request.span_epoch_seen == self._span_epoch:
             return
         self._request_counter += 1
-        self._request_token.set(self._request_counter)
-        self._span_epoch_seen.set(self._span_epoch)
+        request.request_id = self._request_counter
+        request.span_epoch_seen = self._span_epoch
 
     def observe(
         self,
@@ -3316,9 +3332,10 @@ class Database:
         subscribed = self._observers.get(key)
         if not subscribed:
             return
-        pending = self._pending_events.get()
-        if pending is None:
+        request = self._live_request()
+        if request is None:
             return
+        pending = request.pending_events
         # The recipients of an event are the subscriptions that existed
         # when the change committed, minus any that end before delivery
         # starts -- membership is re-checked once at dispatch entry.
@@ -3737,7 +3754,8 @@ class Database:
             changed_at = self._revision
         # Outside a request nothing can re-raise this exception, so holding it
         # (and the load frame its traceback pins) would buy nothing.
-        pending = self._request_failures.get()
+        request = self._live_request()
+        pending = request.failures if request is not None else None
         retained = exc if pending is not None else None
         retained_traceback = exc.__traceback__ if pending is not None else None
         if record is None:
@@ -8404,8 +8422,7 @@ class Database:
     def _request_scope(
         self,
     ) -> Iterator[list[_PendingObserverEvent] | None]:
-        current = self._request_token.get()
-        if current is not None:
+        if self._live_request() is not None:
             # A span's request id must reflect every change committed while
             # the span thread held no lock; catching up here, at the boundary
             # of each call joining the span, is what keeps a cross-thread
@@ -8415,23 +8432,32 @@ class Database:
             return
         self._verify_registered_adapters()
         self._request_counter += 1
-        token = self._request_token.set(self._request_counter)
-        pending: list[_PendingObserverEvent] = []
-        events_token = self._pending_events.set(pending)
-        failures: list[NodeKey] = []
-        failures_token = self._request_failures.set(failures)
+        request = _RequestScope(request_id=self._request_counter)
+        token = self._request.set(request)
         # Lives for exactly this request, so a resource's configuration is
         # re-read once per request rather than once per memo guard.
         self._request_resource_digests = {}
         try:
-            yield pending
+            yield request.pending_events
         finally:
+            # First, so a context copied from this one stops joining it before
+            # anything else the request owned is released.
+            request.ended = True
             self._request_resource_digests = None
-            self._pending_events.reset(events_token)
-            self._release_failure_exceptions(failures)
-            self._request_failures.reset(failures_token)
-            self._request_token.reset(token)
+            self._release_failure_exceptions(request.failures)
+            self._request.reset(token)
             self._evict_query_nodes_if_needed()
+
+    def _live_request(self) -> _RequestScope | None:
+        """The request this thread has open, if any.
+
+        A request seen through a copied context -- one another thread opened,
+        or one that has since ended -- is not live: see `_RequestScope`.
+        """
+        request = self._request.get()
+        if request is None or request.ended or request.thread_ident != threading.get_ident():
+            return None
+        return request
 
     def _mark_query_used(self, key: NodeKey) -> None:
         self._query_touch_counter += 1
@@ -8478,10 +8504,10 @@ class Database:
             self._query_objects().pop(key.identity, None)
 
     def _current_request_id(self) -> int:
-        current = self._request_token.get()
-        if current is None:
+        request = self._live_request()
+        if request is None:
             return -1
-        return current
+        return request.request_id
 
     def _current_frame(self) -> ExecutionFrame | None:
         # The innermost execution still running. On the thread that owns the

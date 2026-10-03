@@ -519,6 +519,15 @@ so a thread that outlives its hook stays refused, where a survivor of a query
 returns to normal. Threads that already existed when the query began are
 outside every boundary (limitation 1).
 
+A request, and a `request_span` holding one open, belongs to the thread that
+opened it. A call from any other thread opens a request of its own, even when
+that thread carries the opener's context -- as every thread started on a
+free-threaded 3.14 build does, and as `asyncio.to_thread` does everywhere --
+and a context copied while a request was open joins nothing once it has ended.
+So validation done for one thread's request is never reused by another's, and
+the answer does not depend on whether the interpreter copies contexts into new
+threads.
+
 ## Snapshot Serialization and Store Keys
 
 The kernel derives deterministic content keys from the `Snapshot` union —
