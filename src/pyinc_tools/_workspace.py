@@ -688,7 +688,7 @@ class PollingWorkspaceWatcher:
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         with self._lifecycle_lock:
-            if self._thread is not None:
+            if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("PollingWorkspaceWatcher is already running.")
             effective_interval = (
                 interval_s if interval_s is not None else max(self._debounce_seconds / 2.0, 0.05)
@@ -745,10 +745,14 @@ class PollingWorkspaceWatcher:
             unregister(self)
 
     def _finish_current_thread(self) -> None:
+        # The thread keeps its own reference: it is still running here and
+        # until it returns, and `stop()` has to be able to join it. Cleared,
+        # a stop arriving in that window found nothing to join and returned
+        # while the thread was alive -- so `WorkspaceSession.close` removed
+        # the mirror under it. `is_running` asks the thread itself.
         with self._lifecycle_lock:
             if self._thread is not threading.current_thread():
                 return
-            self._thread = None
             self._on_change = None
             self._on_error = None
         self._unregister_from_session()

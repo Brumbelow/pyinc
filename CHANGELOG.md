@@ -44,6 +44,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   delivered. A request now belongs to the thread that opened it and ends when
   its scope does; `pyinc.integrations.request_scope` follows the same rule for
   its `once_per_request` memo.
+- `WorkspaceSession.close()` no longer removes the mirror while a watcher
+  thread is still running. A `PollingWorkspaceWatcher` thread dropped its own
+  reference as it wound down, so a `stop()` arriving in that window found
+  nothing to join and returned early; on a free-threaded build about one close
+  in ten hit it. The reference now lasts until the thread has exited, and a
+  stopped watcher can still be started again.
 
 ## [4.0.0] - 2026-09-04
 

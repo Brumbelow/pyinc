@@ -4,6 +4,7 @@ import errno
 import hashlib
 import os
 import shutil
+import threading
 import tokenize
 from pathlib import Path
 from types import SimpleNamespace
@@ -931,6 +932,67 @@ def test_watcher_stop_reports_a_thread_that_does_not_finish(
 
     assert "thread did not stop within timeout" in capsys.readouterr().err
     assert watcher._thread is not None
+
+
+def test_watcher_stop_waits_for_a_thread_that_has_finished_its_loop(tmp_path: Path) -> None:
+    """`stop()` joins the thread it started even once that thread is winding down.
+
+    The thread clears its callbacks and unregisters in its own `finally`, and it
+    used to forget its own reference there too. A stop arriving in that window
+    found nothing to join and returned with the thread still alive, so
+    `WorkspaceSession.close` removed the mirror under it -- about one close in
+    ten on a free-threaded build. The fake holds the thread inside that window.
+    """
+    unregistering = threading.Event()
+    release = threading.Event()
+
+    class HeldDriver(_Driver):
+        def _unregister_watcher(self, _watcher: object) -> None:
+            unregistering.set()
+            release.wait(10)
+
+    watcher = workspace.PollingWorkspaceWatcher(HeldDriver(tmp_path))
+    watcher.start(lambda _paths: None, interval_s=60.0)
+    thread = watcher._thread
+    assert thread is not None
+    watcher._request_stop()
+    assert unregistering.wait(10)
+
+    stopped = threading.Event()
+
+    def stop() -> None:
+        watcher.stop(timeout=10)
+        stopped.set()
+
+    stopper = threading.Thread(target=stop)
+    stopper.start()
+    try:
+        # Held in its `finally`, the thread is alive, so stop() must still be
+        # waiting for it rather than returning past it.
+        assert not stopped.wait(0.2)
+        assert thread.is_alive()
+    finally:
+        release.set()
+        stopper.join(10)
+    assert stopped.is_set()
+    assert not thread.is_alive()
+    assert watcher.is_running is False
+
+
+def test_a_stopped_watcher_can_be_started_again(tmp_path: Path) -> None:
+    watcher = workspace.PollingWorkspaceWatcher(_Driver(tmp_path))
+    watcher.start(lambda _paths: None, interval_s=60.0)
+    watcher.stop(timeout=10)
+    assert watcher.is_running is False
+
+    watcher.start(lambda _paths: None, interval_s=60.0)
+    try:
+        assert watcher.is_running is True
+        with pytest.raises(RuntimeError, match="already running"):
+            watcher.start(lambda _paths: None)
+    finally:
+        watcher.stop(timeout=10)
+    assert watcher.is_running is False
 
 
 def test_watcher_error_handler_uses_callback_or_stderr(
