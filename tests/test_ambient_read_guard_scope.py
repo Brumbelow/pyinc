@@ -422,6 +422,8 @@ def test_the_realpath_wrapper_refuses_a_relative_path_it_cannot_see_anchored(
     left for the guard to refuse. The stand-in never reads the directory at
     all, so only the wrapper can refuse here. An absolute path still answers.
     """
+    # Installs the guard around the real realpath before the stand-in replaces it.
+    Database()
     monkeypatch.setattr(
         os.path, "realpath", _cwd_anchoring_realpath(lambda target, **_: target, os.path)
     )

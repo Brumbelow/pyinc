@@ -1346,6 +1346,8 @@ def test_listing_probe_follows_the_read_where_a_path_under_a_file_reads_absent(
             raise FileNotFoundError(2, "The system cannot find the path specified", nested)
         return real_iterdir(self)
 
+    # Installs the guard around the real Path.iterdir before the stand-in replaces it.
+    Database()
     monkeypatch.setattr(Path, "iterdir", iterdir)
 
     assert directories.probe(nested) == (False, ())

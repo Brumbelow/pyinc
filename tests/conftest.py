@@ -36,6 +36,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(pytest.mark.process)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _install_the_guard() -> None:
+    """Install the ambient-read guard before any test runs.
+
+    The guard wraps whatever each guarded name holds when the first `Database`
+    is built, once per process. A test that patches a guarded name and then
+    builds the first `Database` would leave that name unguarded for every
+    later test once its patch is undone.
+    """
+    from pyinc import Database
+
+    Database()
+
+
 @pytest.fixture(scope="session")
 def _fake_site_packages(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return tmp_path_factory.mktemp("site-packages")
