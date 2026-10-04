@@ -343,7 +343,7 @@ entries hold it in-process at the cost of incrementality.
 set of entry points, not a category of behaviour. Everything else that observes
 external state bypasses it silently unless declared with
 `db.report_untracked_read(reason)`: `os.open()`, C-extension I/O, subprocess
-output, network calls, `ctypes` memory access, and similar. Three gaps sit close
+output, network calls, `ctypes` memory access, and similar. Four gaps sit close
 enough to the guarded set to be named:
 
 - *File metadata.* `os.stat`, `os.lstat`, `os.access`, `Path.stat`,
@@ -367,6 +367,13 @@ enough to the guarded set to be named:
   query that waits on such a worker while the worker waits on the state lock
   deadlocks rather than being refused. Hand the work to a thread the query
   starts, or declare it.
+- *A guarded name put back.* The guard replaces each name once, when the first
+  `Database` is created, and wraps whatever holds the name then. A name
+  assigned afterwards holds what it was given: a `mock.patch` or
+  `monkeypatch.setattr` of a guarded name that is active when the first
+  `Database` is created puts the unguarded original back when it ends, and
+  that name is not refused for the rest of the process. Create the first
+  `Database` outside such a patch.
 
 **2. Custom `eq=`/`cutoff=` with side effects.** If a policy callback performs
 ambient reads or mutations, the equivalence check itself becomes a hidden
