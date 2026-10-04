@@ -23,6 +23,14 @@ The memo is keyed per database through a weak reference, so a dropped database
 releases every payload and decoded value it pinned; the entry bound applies
 per database.
 
+Two threads can use the integrations on one database at the same time when they
+drive it directly rather than through a `WorkspaceSession`, whose lock
+serializes its methods. So every read and write of the memo holds
+`_CACHES_LOCK`, and a decode two threads raced to compute is stored once: the
+one stored first is the one both get back. The lock is never held while a
+decode runs. A decode reads queries, and a thread that holds the database's
+lock, or a session's, may be the next one to ask for this lock.
+
 `once_per_request` keys on the call itself, and lives only for the span a caller
 declares with `request_scope`, on the thread that declared it. A `WorkspaceSession` holds its lock for the whole of
 each public method and its inputs cannot change while it is held, so an
@@ -30,7 +38,8 @@ entrypoint asked the same question twice inside one method must answer the same
 both times. Outside such a span the memo does not exist, so a caller driving the
 integrations directly around a file edit still sees the edit. A session that
 does rewrite the mirror inside one of its own methods calls
-`request_inputs_changed` when it does.
+`request_inputs_changed` when it does. Only the thread that opened a span ever
+sees it, so its memo needs no lock.
 """
 
 from __future__ import annotations
@@ -61,6 +70,14 @@ _MAX_ENTRIES = 8192
 _CACHES: weakref.WeakKeyDictionary[
     Database, dict[tuple[Any, ...], tuple[tuple[Any, ...], Any]]
 ] = weakref.WeakKeyDictionary()
+# Held for every read and write of `_CACHES` and of the dicts it holds, and for
+# nothing else. Unguarded, two threads could each find no dict for a database
+# and install one of their own, and the second install dropped every entry the
+# first thread stored. The weak reference's callback, which drops a collected
+# database's entry, runs on whatever thread collects it, possibly one that
+# already holds this lock, so it does not take the lock. It deletes one key in
+# a single dict operation, and no key a live database owns.
+_CACHES_LOCK = threading.Lock()
 
 
 @dataclass
@@ -90,6 +107,25 @@ def _live_request() -> _Request | None:
     return request
 
 
+_MISSING = object()
+
+
+def _lookup(
+    cache: dict[tuple[Any, ...], tuple[tuple[Any, ...], Any]],
+    key: tuple[Any, ...],
+    sources: tuple[Any, ...],
+) -> Any:
+    """Return the value ``cache`` holds for ``sources``, or ``_MISSING``."""
+
+    entry = cache.get(key)
+    if entry is None:
+        return _MISSING
+    held, value = entry
+    if all(left is right for left, right in zip(held, sources, strict=True)):
+        return value
+    return _MISSING
+
+
 def decoded(
     db: Database, kind: str, sources: tuple[Any, ...], decode: Callable[[], _T]
 ) -> _T:
@@ -101,20 +137,25 @@ def decoded(
 
     if db.mode != "strict":
         return decode()
-    cache = _CACHES.get(db)
-    if cache is None:
-        cache = {}
-        _CACHES[db] = cache
     key = (kind, *(id(source) for source in sources))
-    entry = cache.get(key)
-    if entry is not None:
-        held, value = entry
-        if all(left is right for left, right in zip(held, sources, strict=True)):
-            return value  # type: ignore[no-any-return]
+    with _CACHES_LOCK:
+        cache = _CACHES.get(db)
+        if cache is None:
+            cache = {}
+            _CACHES[db] = cache
+        held_value = _lookup(cache, key, sources)
+    if held_value is not _MISSING:
+        return held_value  # type: ignore[no-any-return]
     value = decode()
-    if len(cache) >= _MAX_ENTRIES:
-        cache.clear()
-    cache[key] = (sources, value)
+    with _CACHES_LOCK:
+        # Another thread may have stored this decode while ours ran. Answer
+        # with the one already stored, so every caller gets the same object.
+        held_value = _lookup(cache, key, sources)
+        if held_value is not _MISSING:
+            return held_value  # type: ignore[no-any-return]
+        if len(cache) >= _MAX_ENTRIES:
+            cache.clear()
+        cache[key] = (sources, value)
     return value
 
 

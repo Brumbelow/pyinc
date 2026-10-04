@@ -20,6 +20,7 @@ from types import FrameType
 from typing import Any
 
 import pytest
+from _rendezvous import Rendezvous, run_in_threads
 
 import pyinc_tools.session as session_module
 from pyinc import Database
@@ -385,3 +386,78 @@ def test_decode_memo_still_hits_within_a_live_database() -> None:
     second = _decoding.decoded(db, "kind", (payload,), decode)
     assert first == second == "value"
     assert calls["count"] == 1
+
+
+class _RendezvousCaches(weakref.WeakKeyDictionary[Any, Any]):
+    """The memo's per-database map, holding a lookup at the race's window.
+
+    It answers from before the hold, as a thread preempted there would.
+    """
+
+    def __init__(self, rendezvous: Rendezvous) -> None:
+        super().__init__()
+        self._rendezvous = rendezvous
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        value = super().get(key, default)
+        self._rendezvous.point()
+        return value
+
+
+def test_decode_memo_keeps_both_threads_entries_for_a_new_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two threads that find no memo for a database must end up sharing one.
+
+    Unguarded, both found none and each installed its own, and the second
+    install dropped the entry the first thread stored, so the next call decoded
+    again. Driving one `Database` from two threads directly, without a
+    `WorkspaceSession` to serialize them, is enough to lose it.
+    """
+
+    rendezvous = Rendezvous()
+    monkeypatch.setattr(_decoding, "_CACHES", _RendezvousCaches(rendezvous))
+    monkeypatch.setattr(_decoding, "_CACHES_LOCK", rendezvous.lock(), raising=False)
+    db = Database(mode="strict")
+    payload = _WeakrefablePayload(["payload"])
+    calls = {"alpha": 0, "beta": 0}
+
+    def decode(kind: str) -> Callable[[], str]:
+        def run() -> str:
+            calls[kind] += 1
+            return kind
+
+        return run
+
+    run_in_threads(
+        lambda: _decoding.decoded(db, "alpha", (payload,), decode("alpha")),
+        lambda: _decoding.decoded(db, "beta", (payload,), decode("beta")),
+    )
+
+    assert _decoding.decoded(db, "alpha", (payload,), decode("alpha")) == "alpha"
+    assert _decoding.decoded(db, "beta", (payload,), decode("beta")) == "beta"
+    assert calls == {"alpha": 1, "beta": 1}
+
+
+def test_decode_memo_hands_racing_threads_the_decode_it_stored() -> None:
+    """Two threads that decode one payload at once get back one object.
+
+    The decode runs outside the memo's lock, so both may run it; whichever
+    stored first is what both answer with, and what the memo keeps.
+    """
+
+    rendezvous = Rendezvous()
+    db = Database(mode="strict")
+    payload = _WeakrefablePayload(["payload"])
+
+    def decode() -> list[str]:
+        rendezvous.point()
+        return ["decoded"]
+
+    first, second = run_in_threads(
+        lambda: _decoding.decoded(db, "kind", (payload,), decode),
+        lambda: _decoding.decoded(db, "kind", (payload,), decode),
+    )
+
+    assert first is second
+    assert _decoding.decoded(db, "kind", (payload,), decode) is first

@@ -59,6 +59,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exists (`from os import getcwd`) is fingerprinted again, as in 4.0. The
   working-directory guard put a wrapper in their place, a closure over
   pyinc's own state that fingerprinting refused with `UnsupportedValueError`.
+- Threads that call the integrations on one `strict` `Database` directly,
+  without a `WorkspaceSession` to serialize them, no longer lose each other's
+  decoded results. Two of them could each find no decode memo for a new
+  database and install their own, and the second install dropped what the
+  first had stored, so the next call decoded again; on a free-threaded build
+  about one such race in three lost an entry. The memo is read and written
+  under a lock that is never held while a decode runs, and threads that
+  decode the same payload at once all get back the one result stored first.
 
 ### Changed
 

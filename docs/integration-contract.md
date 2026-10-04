@@ -11,7 +11,8 @@ values. High-level entrypoints decode cached tuple payloads into those records;
 the payload queries and decoding helpers in individual modules are not part of
 this contract. A high-level entrypoint is called from outside a query: a query
 body that reaches one is refused rather than served, as the composition section
-below sets out.
+below sets out. Several threads may call the entrypoints at once, on one
+`Database` or on several; the memo of decoded records they share is locked.
 
 ## Shared source geometry
 
