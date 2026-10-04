@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from dataclasses import fields
 from pathlib import Path
 
@@ -333,6 +334,8 @@ def test_workspace_mirror_rejects_in_root_file_symlink(tmp_path: Path) -> None:
 def test_workspace_mirror_rejects_nonregular_source_without_blocking(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     os.mkfifo(tmp_path / "pipe.py")
     with pytest.raises(ValueError, match="not a regular file"):
         WorkspaceSession(tmp_path)

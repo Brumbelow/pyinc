@@ -8,6 +8,7 @@ import os
 import queue
 import shutil
 import stat
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -1750,6 +1751,8 @@ def test_a_dry_run_reports_the_post_adoption_prediction_and_writes_nothing(
 def test_reconcile_refuses_an_unlistable_migration_directory_before_deleting(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -1784,6 +1787,8 @@ def test_reconcile_refuses_an_unlistable_migration_directory_before_deleting(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
 def test_plan_refuses_an_unlistable_migration_directory(tmp_path: Path) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -2329,6 +2334,8 @@ def test_action_lock_directory_rejects_a_symlinked_private_directory(
 def test_action_lock_directory_rejects_foreign_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     uid = os.getuid()
     directory = tmp_path / f"pyinc-action-locks-{uid}"
     directory.mkdir()
@@ -2349,6 +2356,8 @@ def test_action_lock_directory_rejects_foreign_owner(
 def test_action_lock_directory_repairs_permissive_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     directory = tmp_path / f"pyinc-action-locks-{os.getuid()}"
     directory.mkdir(mode=0o755)
     directory.chmod(0o755)
@@ -2425,6 +2434,8 @@ def test_action_rechecks_target_type_before_writing(
 def test_preflight_probes_answer_missing_and_refuse_unanswerable(
     tmp_path: Path, probe: str, condition: str
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     if condition == "missing":

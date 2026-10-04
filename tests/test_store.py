@@ -1351,7 +1351,7 @@ def test_filesystem_store_reports_exhausted_open_retries_as_lock_timeout(
 ) -> None:
     def always_contended(path: Path) -> object:
         error = OSError(13, "transient contention")
-        error.winerror = 32  # type: ignore[attr-defined]
+        cast(Any, error).winerror = 32
         raise error
 
     monkeypatch.setattr("pyinc._locking.open_lock_file", always_contended)

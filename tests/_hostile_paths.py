@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import signal
 import socket
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -94,6 +95,8 @@ def within_budget(call: Callable[[], Any], *, budget: float = BUDGET_SECONDS) ->
     is deliberately not returned: a cell that needs the value asserts it in
     the parent, on a shape that cannot block.
     """
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if not hasattr(os, "fork"):
         pytest.skip("os.fork is unavailable on this platform")
     read_fd, write_fd = os.pipe()

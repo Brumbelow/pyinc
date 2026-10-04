@@ -27,11 +27,12 @@ pyinc_tools` is equivalent.
 
 ## What CI will check
 
-Run all four locally before pushing:
+Run these locally before pushing:
 
 ```console
 pytest -q
 python3 -m mypy src tests bench scripts examples
+python3 -m mypy --platform win32 src tests bench scripts examples
 python3 -m ruff check src tests bench scripts examples
 python3 scripts/check_docs.py
 ```

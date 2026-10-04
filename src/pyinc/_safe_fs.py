@@ -18,6 +18,7 @@ import os
 import secrets
 import stat
 import struct
+import sys
 import threading
 from pathlib import Path, PureWindowsPath
 from typing import Any, BinaryIO, cast
@@ -194,7 +195,7 @@ class _WindowsApi:
     def _error(action: str, path: str, code: int) -> OSError:
         error = OSError(code, f"{action} failed with Windows error {code}", path)
         with contextlib.suppress(AttributeError):
-            error.winerror = code  # type: ignore[attr-defined]
+            cast(Any, error).winerror = code
         return error
 
     def open_handle(
@@ -508,7 +509,7 @@ def read_regular_file_following_links(path: Path) -> bytes | None:
     failure a caller must see -- a permission denial on an ordinary file
     keeps propagating, exactly as a plain read does.
     """
-    if os.name == "nt":
+    if sys.platform == "win32":
         return _read_regular_file_following_links_windows(path)
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:

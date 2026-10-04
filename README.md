@@ -86,6 +86,7 @@ python3 -m venv .venv
 python3 -m pip install -e '.[dev]'
 python3 scripts/check_docs.py
 pytest -q
-python3 -m mypy src tests bench scripts
-python3 -m ruff check src tests bench scripts
+python3 -m mypy src tests bench scripts examples
+python3 -m mypy --platform win32 src tests bench scripts examples
+python3 -m ruff check src tests bench scripts examples
 ```

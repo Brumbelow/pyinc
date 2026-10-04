@@ -26,6 +26,7 @@ import json
 import os
 import socket
 import stat
+import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -311,6 +312,8 @@ def make_nonregular_node(path: Path, kind: str) -> None:
     make_node = getattr(os, "mknod", None)
     if make_node is None:
         pytest.skip("os.mknod is unavailable on this platform")
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     try:
         make_node(path, mode=node_type | 0o600, device=os.makedev(1, 3))
     except OSError as error:

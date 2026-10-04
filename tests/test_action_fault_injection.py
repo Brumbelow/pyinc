@@ -8,6 +8,7 @@ import importlib
 import json
 import os
 import stat
+import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -44,6 +45,8 @@ action_module = importlib.import_module("pyinc.action")
 def test_an_unreadable_ledger_refuses_before_mutation_warm_and_reloaded(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -171,6 +174,8 @@ def test_a_root_inspection_fault_is_typed_and_touches_nothing(
 def test_an_unwritable_lock_directory_base_fails_before_any_root_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -228,6 +233,8 @@ def test_a_lock_directory_creation_fault_fails_before_any_root_work(
 def test_a_lock_directory_mode_repair_fault_fails_before_any_root_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("lock directory mode repair does not bite as root")
     root = tmp_path / "root"
@@ -401,6 +408,8 @@ def test_a_root_identity_fault_is_tolerated_and_the_run_converges(
 def test_an_unsearchable_orphan_parent_refuses_during_preflight(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -447,6 +456,8 @@ def test_an_unsearchable_orphan_parent_refuses_during_preflight(
 def test_an_unlistable_released_directory_refuses_during_preflight(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -543,6 +554,8 @@ def test_a_target_inspection_fault_refuses_typed_before_any_write(
 def test_an_unreadable_orphan_refuses_typed_during_preflight(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -622,6 +635,8 @@ def test_an_orphan_ownership_read_fault_refuses_with_nothing_mutated(
 def test_an_unreadable_output_refuses_typed_during_preflight(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -782,6 +797,8 @@ def test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touche
 def test_an_undeletable_orphan_stops_the_run_and_the_next_run_deletes_it(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -867,6 +884,8 @@ def test_an_unlink_fault_stops_the_run_with_the_orphan_and_ledger_intact(
 def test_a_mid_set_deletion_fault_preserves_the_performed_order_across_runs(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -950,6 +969,8 @@ def test_a_prune_fault_after_deletions_is_typed_and_the_next_run_converges(
 def test_an_unwritable_root_stops_publication_with_the_stale_bytes_intact(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -987,6 +1008,8 @@ def test_an_unwritable_root_stops_publication_with_the_stale_bytes_intact(
 def test_an_unwritable_root_stops_parent_creation_with_nothing_created(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"
@@ -1046,6 +1069,8 @@ def test_a_publication_fault_leaves_no_temporary_and_the_next_run_converges(
 def test_a_read_only_state_directory_leaves_outputs_published_and_the_ledger_old(
     tmp_path: Path,
 ) -> None:
+    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+        pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     root = tmp_path / "root"

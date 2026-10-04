@@ -120,6 +120,10 @@ jobs:
       - name: Type check
         run: python -m mypy src tests bench scripts examples
 
+      - name: Type check for Windows
+        # Catches a POSIX-only call before it reaches a Windows runner.
+        run: python -m mypy --platform win32 src tests bench scripts examples
+
       - name: Lint
         run: python -m ruff check src tests bench scripts examples
 
