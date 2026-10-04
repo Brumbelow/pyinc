@@ -120,6 +120,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   callable, a function the kernel pins by its source because it reads a
   mutable module global, and, in a query that reads its own annotations back,
   an annotation the kernel folds as a capture.
+- Every name the ambient-read guard replaces pickles by reference again once a
+  `Database` exists. The wrappers for `open`, `io.open`, `os.getenv`,
+  `os.getenvb`, `os.listdir`, `os.scandir`, `os.getcwd`, `os.getcwdb`,
+  `Path.iterdir`, `Path.cwd` and `Thread.start` were local functions pickle
+  could not find, so handing one to a process pool failed. Each wrapper now
+  carries the module and name of the callable it replaces.
 
 ### Changed
 

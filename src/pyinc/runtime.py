@@ -971,6 +971,24 @@ def _standard_library_name(original: Any) -> tuple[str, str] | None:
     return (module_name, qualname) if current is original else None
 
 
+def _name_as_installed(
+    wrapper: Callable[..., Any], module: str, qualname: str, original: Any
+) -> None:
+    """Give `wrapper` the module and name it is installed under.
+
+    Pickle saves a function as a reference to its module and qualified name.
+    A guard wrapper takes the place of a standard-library callable, so it takes
+    that place's name too, and a process pool can still pickle `os.getcwd`
+    once the guard is in.
+    """
+    wrapper.__module__ = module
+    wrapper.__qualname__ = qualname
+    wrapper.__name__ = qualname.rpartition(".")[2]
+    doc = getattr(original, "__doc__", None)
+    if isinstance(doc, str):
+        wrapper.__doc__ = doc
+
+
 def _first_parameter_name(function: Callable[..., Any], default: str) -> str:
     """`function`'s name for its first parameter, or `default` when it has no signature.
 
@@ -1303,6 +1321,24 @@ def _install_guards_once() -> None:
                 ),
             )
             installed.append((guarded_getenvb, original_os_getenvb))
+            _name_as_installed(guarded_getenvb, "os", "getenvb", original_os_getenvb)
+        # Each wrapper is named after the place it is installed, so it pickles
+        # by reference as the callable it replaces did.
+        path_module = Path.__module__
+        path_qualname = Path.__qualname__
+        for wrapper, module, qualname, original in (
+            (guarded_open, "builtins", "open", original_builtins_open),
+            (guarded_io_open, "io", "open", original_io_open),
+            (guarded_getenv, "os", "getenv", original_os_getenv),
+            (guarded_listdir, "os", "listdir", original_os_listdir),
+            (guarded_scandir, "os", "scandir", original_os_scandir),
+            (guarded_getcwd, "os", "getcwd", original_os_getcwd),
+            (guarded_getcwdb, "os", "getcwdb", original_os_getcwdb),
+            (guarded_path_iterdir, path_module, f"{path_qualname}.iterdir", original_path_iterdir),
+            (guarded_path_cwd, path_module, f"{path_qualname}.cwd", original_path_cwd),
+            (guarded_thread_start, "threading", "Thread.start", original_thread_start),
+        ):
+            _name_as_installed(wrapper, module, qualname, original)
         # Named before anything is replaced: everything that can fail runs
         # here, so the guard goes in whole or not at all, and is marked
         # installed as soon as it is in.

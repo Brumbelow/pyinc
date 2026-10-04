@@ -17,10 +17,12 @@ from __future__ import annotations
 import importlib
 import inspect
 import io
+import json
 import ntpath
 import os
 import pickle
 import posixpath
+import subprocess
 import sys
 import tempfile
 import threading
@@ -475,6 +477,71 @@ def test_the_wrapped_realpath_still_pickles_and_keeps_its_signature() -> None:
     # (`filename` on POSIX, `path` on Windows).
     first = next(iter(parameters))
     assert os.path.realpath(**{first: os.path.abspath(os.sep)}) == os.path.realpath(os.sep)
+
+
+_PICKLE_EVERY_GUARDED_NAME = """
+import builtins, io, json, os, pickle, sys, threading
+from pathlib import Path
+
+NAMES = {
+    "builtins.open": lambda: builtins.open,
+    "io.open": lambda: io.open,
+    "os.getenv": lambda: os.getenv,
+    "os.listdir": lambda: os.listdir,
+    "os.scandir": lambda: os.scandir,
+    "os.getcwd": lambda: os.getcwd,
+    "os.getcwdb": lambda: os.getcwdb,
+    "Path.iterdir": lambda: Path.iterdir,
+    "Path.cwd": lambda: Path.cwd,
+    "os.path.realpath": lambda: os.path.realpath,
+    "os.path.abspath": lambda: os.path.abspath,
+    "threading.Thread.start": lambda: threading.Thread.start,
+}
+if sys.platform != "win32":
+    NAMES["os.getenvb"] = lambda: os.getenvb
+
+
+def round_trips():
+    result = {}
+    for name, read in NAMES.items():
+        value = read()
+        try:
+            back = pickle.loads(pickle.dumps(value))
+        except Exception as exc:
+            result[name] = type(exc).__name__
+        else:
+            result[name] = back is value or back == value
+    return result
+
+
+before = round_trips()
+from pyinc import Database
+
+Database()
+after = round_trips()
+print("JSON " + json.dumps({"before": before, "after": after}))
+"""
+
+
+def test_every_guarded_name_still_pickles_by_reference(tmp_path: Path) -> None:
+    """Each wrapper the guard installs pickles as the callable it replaced did.
+
+    A process pool pickles a function by reference, so `submit(os.getcwd)` and
+    friends must keep working once a `Database` exists. A fresh process is the
+    only place where the guard is not installed yet.
+    """
+    script = tmp_path / "pickle_every_guarded_name.py"
+    script.write_text(_PICKLE_EVERY_GUARDED_NAME, encoding="utf-8")
+    src = str(Path(pyinc_runtime.__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": src, "PYTHONDONTWRITEBYTECODE": "1"}
+    proc = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, env=env, check=False
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    line = [ln for ln in proc.stdout.splitlines() if ln.startswith("JSON ")][-1]
+    out = json.loads(line[len("JSON ") :])
+    assert all(value is True for value in out["before"].values()), out["before"]
+    assert out["after"] == out["before"]
 
 
 def _anchor(reader: str, path: str, start: str) -> str:
