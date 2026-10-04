@@ -18,7 +18,7 @@ import weakref
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from ._locking import FileLock, _validate_lock_timeout
 from ._safe_fs import (
@@ -76,7 +76,9 @@ class InMemoryArtifactStore:
     different bytes went unrefused. `keys` copies under the same lock, so its
     snapshot can be iterated while other threads store. `get` and `contains`
     are one dict operation each and need no lock. A child forked while another
-    thread held the lock gets a new one: see `_new_store_locks_in_child`.
+    thread held the lock gets a new one: see `_new_store_locks_in_child`. A
+    copy, shallow or deep, and a pickle round trip hold their own items under
+    a lock of their own.
     """
 
     def __init__(self) -> None:
@@ -109,6 +111,22 @@ class InMemoryArtifactStore:
 
         with self._lock:
             return MappingProxyType(dict(self._items))
+
+    def __getstate__(self) -> dict[str, Any]:
+        # A lock cannot be pickled or copied, so the state leaves it out. The
+        # items are copied under it, so a put on another thread cannot change
+        # them while they are read, and a copy never shares them with this
+        # store.
+        with self._lock:
+            state = dict(self.__dict__)
+            state["_items"] = dict(self._items)
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+        _LIVE_STORES.add(self)
 
 
 # Every store still alive, so a forked child can reach each one's lock. Weak, so

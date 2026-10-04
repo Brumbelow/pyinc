@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import copy
 import errno
 import multiprocessing
 import os
+import pickle
 import struct
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from queue import Empty
 from typing import Any, TypeAlias, cast
@@ -30,6 +33,7 @@ from pyinc import (
 from pyinc import (
     _safe_fs as safe_fs_module,
 )
+from pyinc import store as store_module
 from pyinc._locking import FileLock
 from pyinc._safe_fs import (
     _WIN_FILE_SHARE_DELETE,
@@ -327,6 +331,44 @@ def test_in_memory_store_keys_can_be_iterated_while_another_thread_stores() -> N
 
     assert seen == ["0" * 64, "1" * 64]
     assert set(store.keys()) == {"0" * 64, "1" * 64, "2" * 64}
+
+
+def _pickle_round_trip(store: InMemoryArtifactStore) -> InMemoryArtifactStore:
+    return cast(InMemoryArtifactStore, pickle.loads(pickle.dumps(store)))
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [copy.copy, copy.deepcopy, _pickle_round_trip],
+    ids=["copy", "deepcopy", "pickle"],
+)
+def test_in_memory_store_copies_keep_payloads_and_get_their_own_lock(
+    duplicate: Callable[[InMemoryArtifactStore], InMemoryArtifactStore],
+) -> None:
+    """A copy holds the same payloads, in items and under a lock of its own.
+
+    The store's lock made `pickle` and `copy.deepcopy` refuse it with "cannot
+    pickle '_thread.lock' object", and `copy.copy` shared the original's items
+    and lock. A copy that shared the items under a lock of its own would let
+    two puts race again.
+    """
+
+    store = InMemoryArtifactStore()
+    store.put("a" * 64, b"payload")
+
+    duplicate_store = duplicate(store)
+
+    assert dict(duplicate_store.keys()) == {"a" * 64: b"payload"}
+    with pytest.raises(ValueError, match="collision"):
+        duplicate_store.put("a" * 64, b"different")
+    duplicate_store.put("b" * 64, b"only in the copy")
+    assert not store.contains("b" * 64)
+    # The copy's lock is free while the original's is held.
+    with store._lock:
+        assert duplicate_store._lock.acquire(blocking=False)
+        duplicate_store._lock.release()
+    # A forked child gives the copy a new lock too.
+    assert duplicate_store in store_module._LIVE_STORES
 
 
 # ---------------------------------------------------------------------------

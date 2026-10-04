@@ -97,6 +97,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   or `keys` on that store waited forever. About half of the children forked
   while another thread decoded hung, on 3.11 and on 3.14t. The child now gets
   a new lock for each.
+- `InMemoryArtifactStore` can be pickled and deep copied again, as in 4.0. Its
+  lock made both raise `TypeError`. A copy, shallow or deep, now holds its own
+  items under a lock of its own, so each store sees only its own puts.
 - On Windows, threads whose first store, action or lock-file operation lands at
   the same moment share one Win32 boundary. Each that found none built its
   own, loading `kernel32` and declaring its function prototypes again, and
