@@ -506,7 +506,8 @@ reaches back through another query, is marked like any other caught failure.
 
   The built-in adapters (`BUILTIN_ADAPTERS`: a stateless `FileStatAdapter` for
   `FileStatSnapshot`) hold no instance configuration and ship with the kernel,
-  so their digests are derived once per process rather than at every boundary.
+  so each one's digest is published once per process, and every database uses
+  that one, rather than derived at every boundary.
 
 - **`eq=` / `cutoff=`** on `Input` and `@query` declare a custom equivalence;
   they are mutually exclusive. `eq=` compares detached operands, so nothing a

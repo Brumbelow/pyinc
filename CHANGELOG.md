@@ -67,6 +67,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   about one such race in three lost an entry. The memo is read and written
   under a lock that is never held while a decode runs, and threads that
   decode the same payload at once all get back the one result stored first.
+- Databases constructed at the same moment on several threads use the one
+  digest of the kernel's own adapters that the process memoizes. Each that
+  found none memoized derived its own and kept it, while the memo kept
+  whichever was written last. The derivation is deterministic, so the copies
+  agreed, but an out-of-contract rewrite of the adapter between two
+  derivations would have left databases in one process disagreeing. The first
+  digest published is now the one every database uses.
 
 ### Changed
 

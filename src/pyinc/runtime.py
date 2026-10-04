@@ -164,6 +164,13 @@ _UNREADABLE_RESOURCE_DIGEST = "unreadable-resource"
 # rewrite of a fixed adapter's own methods was already invisible to every
 # database already built; it is now invisible to databases built afterwards too.
 # A source-level change still moves the digest, because it needs a new process.
+#
+# Databases constructed at once on several threads can each find no digest and
+# derive one. The first to finish publishes it with `dict.setdefault`, a single
+# operation, and every database uses the published digest rather than its own,
+# so all of them agree with the memo whatever order the derivations finish in.
+# That needs no lock, so no thread waits while another derives; the price is
+# that databases constructed at the same moment may each derive the digest.
 _FIXED_ADAPTER_IMPLEMENTATION_DIGESTS: dict[tuple[str, type[Any]], str] = {}
 
 
@@ -1436,7 +1443,8 @@ class Database:
         #
         # Because the built-in entries are always present, that partition needs
         # their implementation digests at every construction -- derived on the
-        # first construction in the process and read back after it, see
+        # first construction in the process (or on each of several made at
+        # once), published once, and read back after it, see
         # `_FIXED_ADAPTER_IMPLEMENTATION_DIGESTS`. That derivation is un-guarded
         # on purpose: a built-in that stopped fingerprinting cleanly would raise
         # out of `Database(...)` itself rather than be demoted to a caller
@@ -1605,7 +1613,7 @@ class Database:
 
         A fixed adapter carries no instance state and its implementation lives
         in this package, so nothing an in-contract process can do moves its
-        implementation digest. Those digests are therefore taken once per
+        implementation digest. Those digests are therefore published once per
         process, and the trust boundary reads them back instead of re-deriving
         them at each of its call sites -- the difference between a dict lookup
         and a fingerprint walk over two method bodies per boundary crossing.
@@ -1635,8 +1643,10 @@ class Database:
                 # fixed adapter that stopped fingerprinting cleanly raises out of
                 # every construction in a fresh process, because nothing is
                 # memoized until a derivation succeeds.
-                digest = self._adapter_implementation_digest(adapter)
-                _FIXED_ADAPTER_IMPLEMENTATION_DIGESTS[memo_key] = digest
+                derived = self._adapter_implementation_digest(adapter)
+                # Another construction may have published one meanwhile; use
+                # whichever the memo holds, never a private copy.
+                digest = _FIXED_ADAPTER_IMPLEMENTATION_DIGESTS.setdefault(memo_key, derived)
             self._static_adapter_digests[key] = digest
 
     @property
@@ -6030,7 +6040,7 @@ class Database:
         instance state, so those digests are recomputed at each checkpoint trust
         boundary. The kernel's own fixed adapters are exempt: they carry no
         instance state and their implementations ship in this package, so their
-        digests -- taken once per process -- cannot have moved, and this serves
+        digests -- published once per process -- cannot have moved, and this serves
         them from that memo. Every registered key still appears, so the
         map a checkpoint manifest is written from is unchanged.
         """

@@ -16,6 +16,7 @@ from typing import Any, ClassVar, cast
 
 import pytest
 from _hostile_paths import make_symlink_loop, nul_path
+from _rendezvous import Rendezvous, run_in_threads
 
 import pyinc
 from pyinc import (
@@ -7077,6 +7078,46 @@ def test_builtin_adapter_implementation_digests_are_taken_once_per_process() -> 
     assert set(digests) == {key}
     assert digests[key] == first._static_adapter_digests[key]
     assert len(digests[key]) == 64
+
+
+def test_databases_constructed_at_once_use_the_digest_the_memo_publishes() -> None:
+    """Two first constructions that race both derive, and both use the memo's digest.
+
+    Each used to keep the digest it derived while the memo kept whichever was
+    written last, so two derivations that differed -- an out-of-contract
+    rewrite of the adapter between them -- left databases in one process
+    disagreeing with each other and with the memo. Here the two derivations
+    run at the same time and answer differently, as such a rewrite would make
+    them.
+    """
+
+    rendezvous = Rendezvous()
+    original = Database._adapter_implementation_digest
+    labels = iter(("one", "two"))
+    labels_lock = threading.Lock()
+    memo: dict[tuple[str, type[Any]], str] = {}
+
+    def deriving(self: Database, adapter: Any) -> str:
+        digest = original(self, adapter)
+        with labels_lock:
+            label = next(labels)
+        rendezvous.point()
+        return f"{label}:{digest}"
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Database, "_adapter_implementation_digest", deriving)
+        patch.setattr("pyinc.runtime._FIXED_ADAPTER_IMPLEMENTATION_DIGESTS", memo)
+        first, second = run_in_threads(
+            lambda: Database(adapters=_builtin_file_stat_registry()),
+            lambda: Database(adapters=_builtin_file_stat_registry()),
+        )
+
+    assert isinstance(first, Database)
+    assert isinstance(second, Database)
+    key = _adapter_key(FileStatSnapshot)
+    published = memo[(key, FileStatAdapter)]
+    assert first._static_adapter_digests == {key: published}
+    assert second._static_adapter_digests == {key: published}
 
 
 def test_the_memo_covers_the_kernel_entries_and_stops_there() -> None:
