@@ -527,6 +527,44 @@ def test_the_capture_preview_agrees_with_the_kernel(
     _outcome(module.q, str(sample_directory))
 
 
+@pytest.mark.parametrize(("label", "route"), _CAPTURES)
+def test_the_capture_preview_accepts_a_wrapper_on_every_route_the_kernel_does(
+    module_factory: Callable[[str], ModuleType],
+    sample_directory: Path,
+    label: str,
+    route: str,
+) -> None:
+    """The preview reports every capture of a query accepted when the kernel fingerprints it.
+
+    The preview used to fold a container member with a stricter walk than
+    the kernel's and a helper without the kernel's fallback to its source,
+    so a wrapper held in a tuple, or returned by a helper that reads a
+    mutable global, was reported refused while the kernel fingerprinted the
+    query.
+    """
+    binding, call, _spelled = _GUARDED[label]
+    binding_module = module_factory("from pyinc import query\n" + binding + "\n")
+    module = module_factory(
+        _PRELUDE
+        + binding
+        + "\n\nKEY = "
+        + repr(f"guarded-preview:{label}:{route}")
+        + "\n\n\n"
+        + _ROUTES[route].format(
+            call=call.format(f=_ROUTE_HANDLES[route]), binding_module=binding_module.__name__
+        )
+    )
+    refused = [
+        (info.name, info.rejection_reason)
+        for info in explain_query_captures(module.q)
+        if not info.accepted
+    ]
+    assert refused == []
+    # The kernel agrees: the query answers or is refused by the guard, never
+    # with `UnsupportedValueError`.
+    _outcome(module.q, str(sample_directory))
+
+
 def test_a_standard_library_function_that_calls_a_wrapper_by_name_fingerprints(
     module_factory: Callable[[str], ModuleType], sample_directory: Path
 ) -> None:

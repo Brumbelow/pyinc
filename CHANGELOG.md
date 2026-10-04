@@ -114,6 +114,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fingerprinting with `RecursionError`. Such a function fingerprints now, and
   one with a global nothing can fold, such as `glob.glob`, whose helper reads
   a compiled pattern, is refused with `UnsupportedValueError`.
+- `explain_query_captures` accepts a capture exactly when the kernel's
+  fingerprint does, judging each with the fold the kernel gives it. It used to
+  report as refused a tuple, a frozenset or a frozen dataclass holding any
+  callable, a function the kernel pins by its source because it reads a
+  mutable module global, and, in a query that reads its own annotations back,
+  an annotation the kernel folds as a capture.
 
 ### Changed
 

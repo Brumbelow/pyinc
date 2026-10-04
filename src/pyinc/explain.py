@@ -1,20 +1,9 @@
 from __future__ import annotations
 
 import inspect as _inspect
-import os
-import sys
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass
 from types import BuiltinFunctionType, FunctionType, MethodType, ModuleType
 from typing import Any, cast
-
-from ._path_identity import is_stdlib_path
-from .value import (
-    FrozenAdapterValue,
-    FrozenDict,
-    FrozenList,
-    FrozenRecord,
-    FrozenSet,
-)
 
 
 @dataclass(frozen=True)
@@ -69,156 +58,6 @@ def _is_resource_handle(value: Any) -> bool:
     return all(callable(getattr(value, name, None)) for name in ("label", "probe", "load"))
 
 
-def _type_capture_rejection(value_type: type[Any]) -> str:
-    if value_type.__module__ == "builtins":
-        return ""
-    if "<locals>" in value_type.__qualname__:
-        return "Local type definitions cannot be fingerprinted safely."
-    module = sys.modules.get(value_type.__module__)
-    current: Any = (
-        vars(module).get(value_type.__qualname__.split(".", 1)[0]) if module is not None else None
-    )
-    for part in value_type.__qualname__.split(".")[1:]:
-        current = vars(current).get(part) if isinstance(current, type) else None
-    if current is not value_type:
-        return "Type is not the live binding in its defining module."
-    return ""
-
-
-def _instance_slots(value_type: type[Any]) -> set[str]:
-    slots: set[str] = set()
-    for cls in value_type.__mro__:
-        declared = cls.__dict__.get("__slots__", ())
-        if isinstance(declared, str):
-            declared = (declared,)
-        slots.update(slot for slot in declared if slot not in {"__dict__", "__weakref__"})
-    return slots
-
-
-def _instance_dict(value: Any) -> dict[str, Any]:
-    try:
-        state = object.__getattribute__(value, "__dict__")
-    except (AttributeError, TypeError):
-        return {}
-    return state if isinstance(state, dict) else {}
-
-
-def _classify_instance_dict(value: Any, seen: set[int]) -> tuple[bool, str]:
-    for item in _instance_dict(value).values():
-        accepted, reason = _classify_value_capture(item, seen)
-        if not accepted:
-            return False, reason
-    return True, ""
-
-
-def _classify_value_capture(value: Any, seen: set[int]) -> tuple[bool, str]:
-    scalar_types = (str, bytes, int, float, bool, type(None), complex)
-    if type(value) in scalar_types:
-        return True, ""
-    if isinstance(value, type):
-        reason = _type_capture_rejection(value)
-        return not reason, reason
-    if isinstance(value, scalar_types):
-        reason = _type_capture_rejection(type(value))
-        if reason:
-            return False, reason
-        if _instance_slots(type(value)):
-            return False, "Scalar subclass slot state cannot be fingerprinted safely."
-        return _classify_instance_dict(value, seen)
-    if type(value) in {
-        FrozenList,
-        FrozenDict,
-        FrozenSet,
-        FrozenRecord,
-        FrozenAdapterValue,
-    }:
-        return True, ""
-    if isinstance(value, os.PathLike):
-        reason = _type_capture_rejection(type(value))
-        if reason:
-            return False, reason
-        if is_stdlib_path(value):
-            return True, ""
-        if _instance_slots(type(value)):
-            return False, "Path-like slot state cannot be fingerprinted safely."
-        return _classify_instance_dict(value, seen)
-    if isinstance(value, range):
-        return True, ""
-    if isinstance(value, tuple):
-        if type(value) is not tuple:
-            reason = _type_capture_rejection(type(value))
-            if reason:
-                return False, reason
-            if _instance_slots(type(value)):
-                return False, "Tuple subclass slot state cannot be fingerprinted safely."
-        object_id = id(value)
-        if object_id in seen:
-            return False, "Cyclic ambient values are not supported."
-        seen.add(object_id)
-        try:
-            for item in value:
-                accepted, reason = _classify_value_capture(item, seen)
-                if not accepted:
-                    return False, reason
-            if type(value) is not tuple:
-                return _classify_instance_dict(value, seen)
-            return True, ""
-        finally:
-            seen.discard(object_id)
-    if isinstance(value, frozenset):
-        if type(value) is not frozenset:
-            reason = _type_capture_rejection(type(value))
-            if reason:
-                return False, reason
-            if _instance_slots(type(value)):
-                return False, "Frozenset subclass slot state cannot be fingerprinted safely."
-        object_id = id(value)
-        if object_id in seen:
-            return False, "Cyclic ambient values are not supported."
-        seen.add(object_id)
-        try:
-            for item in value:
-                accepted, reason = _classify_value_capture(item, seen)
-                if not accepted:
-                    return False, reason
-            if type(value) is not frozenset:
-                return _classify_instance_dict(value, seen)
-            return True, ""
-        finally:
-            seen.discard(object_id)
-    if is_dataclass(value) and not isinstance(value, type):
-        params = getattr(type(value), "__dataclass_params__", None)
-        if params is None or not params.frozen:
-            return False, "Mutable dataclass values cannot be captured ambiently."
-        reason = _type_capture_rejection(type(value))
-        if reason:
-            return False, reason
-        field_names = {item.name for item in fields(value)}
-        if _instance_slots(type(value)) - field_names:
-            return False, "Frozen dataclass non-field slot state cannot be fingerprinted safely."
-        object_id = id(value)
-        if object_id in seen:
-            return False, "Cyclic ambient values are not supported."
-        seen.add(object_id)
-        try:
-            for f in fields(value):
-                accepted, reason = _classify_value_capture(
-                    object.__getattribute__(value, f.name), seen
-                )
-                if not accepted:
-                    return False, reason
-            for name, item in _instance_dict(value).items():
-                if name in field_names:
-                    continue
-                accepted, reason = _classify_value_capture(item, seen)
-                if not accepted:
-                    return False, reason
-            return True, ""
-        finally:
-            seen.discard(object_id)
-    return False, "Unsupported ambient capture."
-
-
 def _unbound_capture_owner() -> None:
     """Stand-in for the query of a capture classified on its own.
 
@@ -230,84 +69,95 @@ def _unbound_capture_owner() -> None:
     """
 
 
+def _capture_kind(value: Any) -> str:
+    """The kind a capture is reported as, in the order the kernel dispatches it.
+
+    `Database._captured_dependency_digest` tests the same shapes in the same
+    order, so the label names the arm whose verdict the report gives.
+    """
+    from .core import Input, Query
+    from .runtime import _is_guarded_name
+
+    if _is_guarded_name(value):
+        # A wrapper the ambient-read guard installed in place of a
+        # standard-library callable (`from os import getcwd` once a Database
+        # exists): the kernel pins it by the name it guards before any other
+        # arm sees it.
+        return "guarded"
+    if isinstance(value, Query):
+        return "query"
+    if isinstance(value, Input):
+        return "input"
+    if _is_resource_handle(value):
+        return "resource"
+    if isinstance(value, ModuleType):
+        return "module"
+    if isinstance(value, FunctionType):
+        return "function"
+    if isinstance(value, MethodType):
+        # Above the __wrapped__ probe, as in the kernel, so a wraps-decorated
+        # method is the method it is rather than a callable object.
+        return "method"
+    if isinstance(value, BuiltinFunctionType):
+        return "builtin"
+    if isinstance(value, type):
+        return "type"
+    if callable(value) and isinstance(getattr(value, "__wrapped__", None), FunctionType):
+        # Last of the callable shapes: what reaches here is a callable object
+        # whose behavior lives in __call__ and instance state.
+        return "callable"
+    return "value"
+
+
 def _classify_capture(
     name: str, value: Any, origin: str, *, owner: FunctionType | None = None
 ) -> CaptureInfo:
-    from .core import Input, Query
-    from .runtime import Database, _is_guarded_name
+    """Report one capture with the verdict of the arm the kernel folds it with.
+
+    The kernel folds a query function's defaults, closure cells, globals and
+    custom attributes with `_captured_dependency_digest`, while the function
+    itself is on the stack of functions being folded; its annotations as
+    annotations, unless the body reads them back, when they are folded as the
+    other captures are. Each verdict here is that call's, made the same way,
+    so the report accepts what the kernel accepts -- a function the kernel
+    pins by its source, a container or a frozen dataclass holding a callable
+    -- and refuses what it refuses. Two arms are called one level down, at
+    the payload builder the kernel's digest wraps, because the digest only
+    reframes their refusals around the capture's name: the report keeps the
+    builder's own reason, such as a mutable dataclass's.
+    """
+    from .runtime import Database
 
     type_name = type(value).__qualname__
     database = Database()
     kind = "value"
     owner_function = owner if owner is not None else cast(FunctionType, _unbound_capture_owner)
+    # The query function is being folded while its captures are.
+    seen_functions = {id(owner)} if owner is not None else set()
     try:
-        if origin in {"annotation", "type_parameter"}:
+        if origin == "type_parameter" or (
+            origin == "annotation"
+            and not (owner is not None and Database._reads_its_own_annotations(owner))
+        ):
             kind = "annotation"
             database._freeze_annotation_capture(value, set())
         elif origin == "annotation_evaluator" and isinstance(value, FunctionType):
             kind = "annotation"
             database._annotation_evaluator_payload(value, set())
-        elif _is_guarded_name(value):
-            # A wrapper the ambient-read guard installed in place of a
-            # standard-library callable (`from os import getcwd` once a
-            # Database exists): the kernel pins it by the name it guards
-            # before any other arm sees it.
-            kind = "guarded"
-            database._captured_dependency_digest(name, value, set(), owner=owner_function)
-        elif isinstance(value, Query):
-            kind = "query"
-            database._query_fingerprint(value)
-        elif isinstance(value, Input):
-            kind = "input"
-            database._input_policy_digest(value)
-        elif _is_resource_handle(value):
-            kind = "resource"
-            database._resource_identity_payload(value)
-        elif isinstance(value, ModuleType):
-            # A module's identity payload is half of what the kernel folds for
-            # a captured module: beside it go the attribute paths the owning
-            # query reads off the capture statically, and a non-stdlib module
-            # reached any other way is refused there. Routing this through the
-            # kernel's own capture arm keeps that verdict -- and the carve-outs
-            # it makes -- this report's verdict too.
-            kind = "module"
-            database._captured_dependency_digest(name, value, set(), owner=owner_function)
-        elif isinstance(value, FunctionType):
-            kind = "function"
-            database._function_definition_payload(value, set())
-        elif isinstance(value, MethodType):
-            # The kernel dispatches a bound method here, above its __wrapped__
-            # probe, so a wraps-decorated method must be fingerprinted as the
-            # method it is rather than falling to the callable branch below.
-            kind = "method"
-            database._bound_python_method_payload(
-                value,
-                capture_name=name,
-                owner=owner_function,
-                seen_functions=set(),
-            )
-        elif isinstance(value, BuiltinFunctionType):
-            kind = "builtin"
-            database._builtin_function_payload(value)
-        elif isinstance(value, type):
-            kind = "type"
-            database._type_definition_payload(value)
-        elif callable(value) and isinstance(getattr(value, "__wrapped__", None), FunctionType):
-            # Last of the callable shapes, as in the kernel: functions, bound
-            # methods and classes are dispatched above, so what reaches here is
-            # a callable object whose behavior lives in __call__ and instance
-            # state. The verdict is the kernel's own payload builder's rather
-            # than a restatement of its rules.
-            kind = "callable"
-            database._wrapped_callable_payload(
-                name,
-                value,
-                value.__wrapped__,
-                set(),
-                owner=owner_function,
-            )
         else:
-            database._freeze_static_capture(value, set())
+            kind = "annotation" if origin == "annotation" else _capture_kind(value)
+            if kind == "value":
+                database._freeze_captured_immutable(
+                    name, value, seen_functions, owner=owner_function, active_ids=set()
+                )
+            elif kind == "callable":
+                database._wrapped_callable_payload(
+                    name, value, value.__wrapped__, seen_functions, owner=owner_function
+                )
+            else:
+                database._captured_dependency_digest(
+                    name, value, seen_functions, owner=owner_function
+                )
     except Exception as exc:
         reason = str(exc) or type(exc).__qualname__
         if reason.startswith("Captured local type"):

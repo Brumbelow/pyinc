@@ -189,7 +189,9 @@ attribute load, or a global load of `importlib`. Reaching a module namespace is
 not itself refused — `sys.modules[name]` and `import_module(name)` with no
 reflective builtin beside them are accepted, and neither reaches identity
 (limitation 5). `pyinc.explain_query_captures(fn)` previews how each capture is
-classified before the first `db.get()`.
+classified before the first `db.get()`, judging each with the fold the kernel
+gives it, so a capture it accepts is one the fingerprint accepts, and a capture
+it refuses is one the fingerprint refuses.
 
 A query may capture a callable the condition 2 guard replaced. Bound once a
 `Database` exists (`from os import getcwd`, `from os.path import realpath`,

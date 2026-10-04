@@ -5470,12 +5470,9 @@ class Database:
             # _function_metadata_payload folds annotation values as ambient
             # captures when the body reads its own annotations back, and as
             # annotation captures otherwise; the observation follows the switch.
-            reflects_annotations = any(
-                name in {"__annotations__", "get_annotations", "get_type_hints"}
-                for code in self._walk_code_objects(fn.__code__)
-                for name in code.co_names
+            observe_entry = (
+                observe_value if self._reads_its_own_annotations(fn) else observe_annotation
             )
-            observe_entry = observe_value if reflects_annotations else observe_annotation
             try:
                 annotations = fn.__annotations__
             except Exception:
@@ -5627,11 +5624,7 @@ class Database:
                 raise UnsupportedValueError(
                     f"Function {fn.__module__}.{fn.__qualname__} has invalid annotations."
                 )
-            reflects_annotations = any(
-                name in {"__annotations__", "get_annotations", "get_type_hints"}
-                for code in self._walk_code_objects(fn.__code__)
-                for name in code.co_names
-            )
+            reflects_annotations = self._reads_its_own_annotations(fn)
             annotations_payload = tuple(
                 (
                     name,
@@ -7205,6 +7198,19 @@ class Database:
         if callable(factory):
             return ("callable", self._policy_definition_payload(factory))
         raise UnsupportedValueError(f"Dataclass default factory {factory!r} is not callable.")
+
+    @staticmethod
+    def _reads_its_own_annotations(fn: FunctionType) -> bool:
+        """Whether `fn`'s code can read its annotations back as values.
+
+        Such a function's annotations are folded as ambient captures rather
+        than as annotations, since the body may call what they hold.
+        """
+        return any(
+            name in {"__annotations__", "get_annotations", "get_type_hints"}
+            for code in Database._walk_code_objects(fn.__code__)
+            for name in code.co_names
+        )
 
     @staticmethod
     def _walk_code_objects(code: CodeType) -> tuple[CodeType, ...]:

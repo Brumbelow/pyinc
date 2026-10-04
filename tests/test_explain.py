@@ -4,6 +4,7 @@ import functools
 import importlib
 import os
 import sys
+import uuid
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
 from types import ModuleType
@@ -675,3 +676,98 @@ def test_explain_ignores_nonfunction_lazy_annotation_evaluator() -> None:
 
     cast(Any, target).__annotate__ = BrokenAnnotations()
     assert explain_query_captures(target) == ()
+
+
+# Values a query may capture, each bound to `V` in a module of its own, and
+# the routes a capture takes into the query. The preview must accept a query
+# exactly when the kernel fingerprints it, whatever the value and the route.
+_PARITY_VALUES: dict[str, str] = {
+    "function": "def V(x=None):\n    return 1\n",
+    "source-pinned function": "CACHE = {'k': 1}\n\n\ndef V():\n    return CACHE['k']\n",
+    "recursive source-pinned function": (
+        "CACHE = {'k': 1}\n\n\ndef V(n=0):\n    return V(n - 1) if n else CACHE['k']\n"
+    ),
+    "reflective function": "def V():\n    return globals()\n",
+    "builtin": "V = len\n",
+    "stdlib function": "from posixpath import join as V\n",
+    "glob": "from glob import glob as V\n",
+    "guard wrapper": "from os import getcwd as V\n",
+    "bound guard wrapper": "from pathlib import Path\n\nV = Path.cwd\n",
+    "tuple of a function": "def f():\n    return 1\n\n\nV = (f, 1)\n",
+    "tuple of a source-pinned function": (
+        "CACHE = {'k': 1}\n\n\ndef f():\n    return CACHE['k']\n\n\nV = (f, 1)\n"
+    ),
+    "nested tuple": "V = ((len,),)\n",
+    "frozenset": "V = frozenset([len])\n",
+    "frozen dataclass": (
+        "import dataclasses\n\n\n@dataclasses.dataclass(frozen=True)\n"
+        "class Box:\n    f: object\n\n\nV = Box(len)\n"
+    ),
+    "mutable dataclass": (
+        "import dataclasses\n\n\n@dataclasses.dataclass\n"
+        "class Box:\n    f: object\n\n\nV = Box(len)\n"
+    ),
+    "dict": "V = {'k': 1}\n",
+    "list": "V = [len]\n",
+    "partial": "import functools\n\nV = functools.partial(len)\n",
+    "pattern": "import re\n\nV = re.compile('x')\n",
+    "class": "class V:\n    X = 1\n",
+    "int": "V = 3\n",
+}
+_PARITY_ROUTES: dict[str, str] = {
+    "global": "@query(key=KEY)\ndef q(db):\n    return V is not None\n",
+    "default": "@query(key=KEY)\ndef q(db, f=V):\n    return f is not None\n",
+    "kwdefault": "@query(key=KEY)\ndef q(db, *, f=V):\n    return f is not None\n",
+    "closure": (
+        "def make():\n    f = V\n\n    @query(key=KEY)\n    def q(db):\n"
+        "        return f is not None\n\n    return q\n\n\nq = make()\n"
+    ),
+    "attribute": "def body(db):\n    return 1\n\n\nbody.f = V\nq = query(key=KEY)(body)\n",
+    "annotation": "@query(key=KEY)\ndef q(db, x: V = None):\n    return 1\n",
+    # A body that reads its annotations back has them folded as captures.
+    "reflected annotation": (
+        "@query(key=KEY)\ndef q(db, x: V = None):\n    return len(q.fn.__annotations__)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("route", sorted(_PARITY_ROUTES))
+@pytest.mark.parametrize("value", sorted(_PARITY_VALUES))
+def test_the_preview_accepts_a_query_exactly_when_the_kernel_fingerprints_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, route: str
+) -> None:
+    """Every capture's verdict is the one the kernel's fold of that capture reaches.
+
+    The preview used to fold a value with a walk stricter than the kernel's,
+    which refused any callable inside a tuple, a frozenset or a frozen
+    dataclass; to fold a function without the kernel's fallback to pinning
+    it by its source; and to fold annotations as annotations even when the
+    body reads them back, where the kernel folds them as captures. Each
+    refused a query the kernel fingerprints.
+    """
+    Database()  # so a guarded name binds the guard's wrapper
+    name = f"pyinc_explain_parity_{uuid.uuid4().hex}"
+    (tmp_path / f"{name}.py").write_text(
+        "from pyinc import query\n"
+        + _PARITY_VALUES[value]
+        + f"\nKEY = {name!r}\n\n\n"
+        + _PARITY_ROUTES[route],
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(name)
+    try:
+        preview = [
+            (info.name, info.rejection_reason)
+            for info in explain_query_captures(module.q)
+            if not info.accepted
+        ]
+        try:
+            Database()._query_fingerprint(module.q)
+        except UnsupportedValueError as exc:
+            assert preview, f"the kernel refuses: {exc}"
+        else:
+            assert preview == []
+    finally:
+        sys.modules.pop(name, None)
