@@ -898,6 +898,60 @@ def test_byte_environment_writes_stay_allowed_inside_queries(
     assert os.environ["PYINC_BYTE_WRITE"] == "value"
 
 
+def _environment_views() -> list[str]:
+    return ["os.environ", "os.environb"] if sys.platform != "win32" else ["os.environ"]
+
+
+@pytest.mark.parametrize("view", _environment_views())
+def test_clearing_the_environment_is_a_write_inside_queries(view: str) -> None:
+    """`clear()` empties the environment without reading it, so a query may call it."""
+    saved = dict(os.environ)
+
+    @query(key=f"clear-environment:{view}")
+    def clear_environment(db: Database) -> bool:
+        if view == "os.environ":
+            os.environ.clear()
+        elif sys.platform != "win32":
+            os.environb.clear()
+        return True
+
+    try:
+        assert Database().get(clear_environment) is True
+        assert dict(os.environ) == {}
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+@pytest.mark.parametrize("view", _environment_views())
+@pytest.mark.parametrize("call", ["pop", "popitem", "setdefault"])
+def test_environment_calls_that_return_a_value_are_refused_inside_queries(
+    monkeypatch: pytest.MonkeyPatch, view: str, call: str
+) -> None:
+    """`pop`, `popitem` and `setdefault` return what they read, so they are reads."""
+    monkeypatch.setenv("PYINC_ENV_RETURNS", "value")
+
+    @query(key=f"environment-returns:{view}:{call}")
+    def read_back(db: Database) -> object:
+        mapping: Any
+        key: Any
+        if view == "os.environ":
+            mapping, key = os.environ, "PYINC_ENV_RETURNS"
+        elif sys.platform != "win32":  # the byte view is not collected on Windows
+            mapping, key = os.environb, b"PYINC_ENV_RETURNS"
+        else:
+            return None
+        if call == "pop":
+            return mapping.pop(key)
+        if call == "popitem":
+            return mapping.popitem()
+        return mapping.setdefault(key, key)
+
+    with pytest.raises(UntrackedReadError, match="untracked"):
+        Database().get(read_back)
+    assert os.environ["PYINC_ENV_RETURNS"] == "value"
+
+
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("reader", _GUARDED_ENTRY_POINTS)
 def test_query_spawned_thread_raw_reads_stay_guarded(

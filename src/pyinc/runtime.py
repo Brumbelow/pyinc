@@ -1387,6 +1387,11 @@ class _GuardedEnviron(MutableMapping[AnyStr, AnyStr]):
     def __delitem__(self, key: AnyStr) -> None:
         del self._wrapped[key]
 
+    def clear(self) -> None:
+        # A write. The inherited clear() reads every key first, through the
+        # guarded iterator.
+        self._wrapped.clear()
+
     def __iter__(self) -> Iterator[AnyStr]:
         self._check_read()
         return iter(self._wrapped)

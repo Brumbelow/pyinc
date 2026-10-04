@@ -138,7 +138,9 @@ While a query runs, the kernel intercepts these calls and raises
 - `Path.iterdir`
 - `os.getcwd`, `os.getcwdb`, and `Path.cwd`
 
-Writes to the environment are not reads and stay allowed. Resolving a path
+Writes to the environment stay allowed: assignment, `del`, `update` and
+`clear`. `pop`, `popitem` and `setdefault` return what they read, so they are
+refused like other reads. Resolving a path
 that is not fully qualified reads the working directory too.
 `os.path.realpath` and `os.path.abspath` are wrapped, so they refuse such a
 path on every platform and version, however the interpreter reaches the

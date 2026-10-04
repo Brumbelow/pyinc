@@ -133,6 +133,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `os.environ.clear()` and `os.environb.clear()` are allowed inside a query,
+  like the other environment writes. The inherited `clear()` read every key
+  first, so the guard refused it. `pop`, `popitem` and `setdefault` return
+  what they read and stay refused.
 - A query may capture any callable the ambient-read guard replaces -- `open`,
   `io.open`, `os.getenv`, `os.getenvb`, `os.listdir`, `os.scandir`,
   `os.getcwd`, `os.getcwdb`, `os.path.realpath`, `os.path.abspath`,
