@@ -908,9 +908,11 @@ def _cwd_anchoring_realpath(
     that moves between versions. Windows' `ntpath.realpath` called
     `os.getcwd()` for every path, fully qualified ones included, until 3.13.16
     and 3.14.8, and from those releases anchors through `abspath`, which reads
-    the directory in C where no guard sees it. On POSIX before 3.13, a relative
-    path that reaches an absolute symlink is resolved without consulting
-    `os.getcwd` at all. So the wrapper asks the question itself, on the path
+    the directory in C; the `abspath` wrapper refuses that call too, but only
+    because `ntpath.realpath` happens to reach `abspath` through its module's
+    namespace. On POSIX before 3.13, a relative path that reaches an absolute
+    symlink is resolved without consulting `os.getcwd` at all. So the wrapper
+    asks the question itself, on the path
     realpath will see: a path the directory anchors is refused inside a query,
     whatever the version; any other path resolves, and on Windows the read of
     the directory it cannot use is let through.
@@ -950,6 +952,52 @@ def _cwd_anchoring_realpath(
             _CWD_READ_UNUSED.reset(token)
 
     return guarded_realpath
+
+
+def _cwd_anchoring_abspath(
+    abspath: Callable[..., Any], path_module: ModuleType
+) -> Callable[..., Any]:
+    """Wrap `os.path.abspath` so a path the working directory anchors is refused.
+
+    `posixpath.abspath` anchors a relative path with `os.getcwd`, which the
+    guard refuses, but Windows' `ntpath.abspath` asks `nt._getfullpathname`,
+    which reads the working directory in C where no guard sees it. On Windows
+    that let through `abspath`, `relpath` (which anchors both of its arguments
+    with it) and, from 3.12, `Path.absolute` of a drive-relative path, which
+    anchors the drive with it. So the wrapper decides on the path itself, by
+    the rule the `realpath` wrapper uses: a path that is not fully qualified
+    is refused inside a query, on every platform, and any other path goes
+    straight through. On POSIX that is exactly when `abspath` would have read
+    `os.getcwd`, so only the message changes there.
+    """
+    # The wrapped function's own name for its parameter (`path` on both
+    # platforms), so a caller passing it by keyword still can.
+    first = next(iter(inspect.signature(abspath).parameters))
+
+    @functools.wraps(abspath)
+    def guarded_abspath(*args: Any, **kwargs: Any) -> Any:
+        if len(args) + len(kwargs) != 1 or (kwargs and first not in kwargs):
+            # A call `abspath` refuses: let it raise its own TypeError.
+            return abspath(*args, **kwargs)
+        # One `__fspath__` call, so the decision and the answer see the same
+        # path; a bad argument raises the TypeError `abspath` raises for it.
+        target = os.fspath(args[0] if args else kwargs[first])
+        try:
+            qualified = is_fully_qualified(target, path_module)
+        except ValueError:
+            # A path `normpath` cannot read (bytes Windows cannot decode) is one
+            # `abspath` goes on to anchor with the working directory after its
+            # own `normpath` fails, so it is refused like any relative path.
+            # Outside a query `abspath` raises its own error for it.
+            qualified = False
+        if not qualified:
+            _raise_if_guarded(
+                "Raw os.path.abspath() of a relative path inside a query is untracked: "
+                f"it reads the working directory. {_CWD_ADVICE}"
+            )
+        return abspath(target)
+
+    return guarded_abspath
 
 
 def _install_guards_once() -> None:
@@ -1018,13 +1066,11 @@ def _install_guards_once() -> None:
         )
 
         # The working directory is ambient state like the environment: a
-        # relative path means something different after a chdir. Resolving a
-        # relative path with `os.path.realpath`, `Path.resolve` or
-        # `Path.absolute` reaches these and is refused with them, as is
-        # `os.path.abspath` on POSIX; Windows' `ntpath.abspath` resolves through
-        # `nt._getfullpathname`, which is not intercepted. `Path.cwd` is wrapped
-        # in its own right so the refusal does not depend on how pathlib
-        # reaches the directory.
+        # relative path means something different after a chdir. `Path.cwd` is
+        # wrapped in its own right so the refusal does not depend on how
+        # pathlib reaches the directory, and `os.path.realpath` and
+        # `os.path.abspath` below so it does not depend on how the platform's
+        # path module does.
         def guarded_getcwd() -> str:
             if not _CWD_READ_UNUSED.get():
                 _raise_if_guarded(f"Raw os.getcwd() inside a query is untracked. {_CWD_ADVICE}")
@@ -1092,10 +1138,14 @@ def _install_guards_once() -> None:
         os.getcwd = guarded_getcwd
         os.getcwdb = guarded_getcwdb
         Path.cwd = classmethod(guarded_path_cwd)  # type: ignore[assignment, method-assign]
-        # `pathlib` and pyinc reach `realpath` through `os.path`; a module
-        # that bound it before the guard was installed (`sysconfig`) keeps the
+        # `pathlib` and pyinc reach `realpath` and `abspath` through
+        # `os.path`, and the path module's own functions (`relpath`,
+        # `ismount`, Windows' `realpath`) through its namespace, which is the
+        # same object; a module that bound one of them by name before the
+        # guard was installed (`sysconfig` binds `realpath`) keeps the
         # original.
         os.path.realpath = _cwd_anchoring_realpath(os.path.realpath, os.path)
+        os.path.abspath = _cwd_anchoring_abspath(os.path.abspath, os.path)
         if sys.platform != "win32":
             # The byte-oriented view of the same process environment, and the
             # lookup that reads through it. Windows has neither.

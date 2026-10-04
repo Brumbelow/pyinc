@@ -139,24 +139,28 @@ While a query runs, the kernel intercepts these calls and raises
 - `os.getcwd`, `os.getcwdb`, and `Path.cwd`
 
 Writes to the environment are not reads and stay allowed. Resolving a path
-that is not fully qualified reads the working directory too. `os.path.realpath`
-is wrapped, so it and `Path.resolve` refuse such a path on every platform and
-version, however the interpreter reaches the directory: Windows' `realpath`
-read it through `os.getcwd` for every path until 3.13.16 and 3.14.8 and in C
-since, and POSIX's skips `os.getcwd` before 3.13 for a relative path that
-reaches an absolute link. On Windows a rooted path with no drive (`\data`)
-counts as anchored, since it resolves on the working directory's drive. A fully
-qualified path resolves everywhere. `Path.absolute` of a relative path and, on
-POSIX, `os.path.abspath` reach `os.getcwd` and are refused with it. Pass
-absolute paths as query arguments.
+that is not fully qualified reads the working directory too.
+`os.path.realpath` and `os.path.abspath` are wrapped, so they refuse such a
+path on every platform and version, however the interpreter reaches the
+directory, and so does what is built on them: `Path.resolve`,
+`os.path.relpath`, which anchors both its arguments and whose default start is
+the working directory, and `Path.absolute`, which reaches `abspath`,
+`os.getcwd` or, on 3.11, `Path.cwd`. Windows' `realpath` read the directory
+through `os.getcwd` for every path until 3.13.16 and 3.14.8 and in C since,
+Windows' `abspath` reads it in C through `nt._getfullpathname`, and POSIX's
+`realpath` skips `os.getcwd` before 3.13 for a relative path that reaches an
+absolute link. On Windows a rooted path with no drive (`\data`) and a
+drive-relative one (`C:data`) count as anchored, since they resolve on the
+working directory's drive or on that drive's own working directory. A fully
+qualified path resolves everywhere. Pass absolute paths as query arguments.
 
 Other code that reaches the working directory through these entry points is
 refused the same way, wherever it runs: the first import inside a query body
 of a module that reads it at import time (`multiprocessing`, and so
-`concurrent.futures`' process pool), `contextlib.chdir`, and, on POSIX,
-`inspect`'s frame helpers when a frame they look at has a file name that is not
-absolute -- a program started with `python -m`, or `exec`'d or generated code.
-A read that does not go through these names is not seen (limitation 1).
+`concurrent.futures`' process pool), `contextlib.chdir`, and `inspect`'s frame
+helpers when a frame they look at has a file name that is not fully qualified
+-- a program started with `python -m`, or `exec`'d or generated code. A read
+that does not go through these names is not seen (limitation 1).
 
 Reads this mechanism does not see (limitation 1) must be declared with
 `db.report_untracked_read(reason)` ([Escape Hatches](#escape-hatches)). A
@@ -314,11 +318,6 @@ enough to the guarded set to be named:
   records no edge and is reused unchanged after the file changes. Route the
   observation through `FileStatResource` or `ResolvedPathResource`. Declaring
   it removes stale reuse for the declaring node alone.
-- *`os.path.abspath` on Windows.* `ntpath.abspath` resolves a relative path
-  through `nt._getfullpathname` rather than `os.getcwd`, so on Windows it,
-  `os.path.relpath` built on it, and from 3.12 `Path.absolute` of a
-  drive-relative path (`C:data`) read the working directory without being
-  refused. Pass absolute paths as query arguments.
 - *The working directory outside the guarded names.* The import system resolves
   an empty or relative `sys.path` entry with the interpreter's own `getcwd`; a
   name bound before the first `Database` is created (`from os import getcwd`)

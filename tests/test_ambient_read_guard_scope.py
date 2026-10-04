@@ -22,16 +22,19 @@ import os
 import pickle
 import posixpath
 import sys
+import tempfile
 import threading
 import time
+import types
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from pyinc import Database, UntrackedReadError, query
+from pyinc import runtime as pyinc_runtime
 from pyinc._path_identity import is_fully_qualified
-from pyinc.runtime import _CWD_READ_UNUSED, _cwd_anchoring_realpath
+from pyinc.runtime import _CWD_READ_UNUSED, _cwd_anchoring_abspath, _cwd_anchoring_realpath
 
 _UNGUARDED_METADATA_READS = (
     "os.stat",
@@ -215,9 +218,10 @@ def _guarded_read(reader: str, path: Path, directory: Path) -> object:
         return os.getenv("PYINC_GUARDED_ENV")
     if reader == "os.environ":
         return os.environ["PYINC_GUARDED_ENV"]
-    if reader == "os.getenvb":
+    # Windows has no byte environment; its cells are skipped there.
+    if sys.platform != "win32" and reader == "os.getenvb":
         return os.getenvb(b"PYINC_GUARDED_ENV")
-    if reader == "os.environb":
+    if sys.platform != "win32" and reader == "os.environb":
         return os.environb[b"PYINC_GUARDED_ENV"]
     if reader == "os.getcwd":
         return os.getcwd()
@@ -284,21 +288,18 @@ def _resolve(reader: str, path: str) -> str:
 def test_resolving_a_relative_path_reads_the_working_directory(reader: str) -> None:
     """The working-directory guard reaches the helpers that anchor a relative path.
 
-    `posixpath`, Windows' `ntpath.realpath` and `pathlib` call `os.getcwd` (or
-    `os.getcwdb`) to anchor a relative path, so resolving one is refused with
-    it. The one helper that does not is Windows' `ntpath.abspath`, which
-    resolves through `nt._getfullpathname`, where the guard does not see it.
+    `os.path.realpath` and `os.path.abspath` are wrapped and refuse such a path
+    themselves, and `pathlib` reaches one of them or `os.getcwd`, on every
+    platform: Windows' `ntpath.abspath` reads the directory in C, through
+    `nt._getfullpathname`, so before its wrapper it answered here.
     """
 
     @query(key=f"relative-path:{reader}")
     def resolve_relative(db: Database) -> str:
         return _resolve(reader, "relative")
 
-    if os.name == "nt" and reader == "os.path.abspath":
-        assert Database().get(resolve_relative).endswith("relative")
-    else:
-        with pytest.raises(UntrackedReadError, match="untracked"):
-            Database().get(resolve_relative)
+    with pytest.raises(UntrackedReadError, match="untracked"):
+        Database().get(resolve_relative)
 
 
 @pytest.mark.parametrize("reader", _PATH_RESOLVERS)
@@ -476,6 +477,284 @@ def test_the_wrapped_realpath_still_pickles_and_keeps_its_signature() -> None:
     assert os.path.realpath(**{first: os.path.abspath(os.sep)}) == os.path.realpath(os.sep)
 
 
+def _anchor(reader: str, path: str, start: str) -> str:
+    """Call the named helper that anchors through `os.path.abspath`."""
+    if reader == "os.path.abspath":
+        return os.path.abspath(path)
+    if reader == "os.path.abspath(path=)":
+        return os.path.abspath(path=path)
+    if reader == "os.path.abspath(bytes)":
+        return os.fsdecode(os.path.abspath(os.fsencode(path)))
+    if reader == "os.path.relpath(path)":
+        return os.path.relpath(path, start)
+    if reader == "os.path.relpath(start)":
+        return os.path.relpath(start, path)
+    return os.path.relpath(path)
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        "os.path.abspath",
+        "os.path.abspath(path=)",
+        "os.path.abspath(bytes)",
+        "os.path.relpath(path)",
+        "os.path.relpath(start)",
+        "os.path.relpath(default start)",
+    ],
+)
+def test_a_relative_abspath_is_refused_by_name_on_every_platform(
+    tmp_path: Path, reader: str
+) -> None:
+    """`os.path.abspath` refuses a path the working directory anchors, wherever it runs.
+
+    POSIX's `abspath` anchored such a path with `os.getcwd` and was refused in
+    that function's name, while Windows' read the directory through
+    `nt._getfullpathname` and answered, and so did `relpath`, which anchors
+    both of its arguments with it -- its default start is the working
+    directory itself. The wrapper refuses in `abspath`'s own name, keyword
+    argument and bytes alike.
+    """
+
+    @query(key=f"relative-abspath:{reader}")
+    def anchor(db: Database, start: str) -> str:
+        return _anchor(reader, "relative", start)
+
+    with pytest.raises(
+        UntrackedReadError, match=r"os\.path\.abspath\(\) of a relative path .* Pass an absolute"
+    ):
+        Database().get(anchor, str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        "os.path.abspath",
+        "os.path.abspath(path=)",
+        "os.path.abspath(bytes)",
+        "os.path.relpath(path)",
+        "os.path.relpath(start)",
+    ],
+)
+def test_a_fully_qualified_abspath_still_answers(tmp_path: Path, reader: str) -> None:
+    """A fully qualified path never consults the working directory, so it resolves."""
+    path = str(tmp_path / "sample.txt")
+
+    @query(key=f"qualified-abspath:{reader}")
+    def anchor(db: Database, path: str, start: str) -> str:
+        return _anchor(reader, path, start)
+
+    assert Database().get(anchor, path, str(tmp_path)) == _anchor(reader, path, str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("path", "qualified"),
+    [
+        ("C:\\data\\sample.txt", True),
+        ("C:/data/../data/sample.txt", True),
+        ("\\\\server\\share\\sample.txt", True),
+        ("\\\\?\\C:\\data\\sample.txt", True),
+        ("NUL", True),
+        (b"C:\\data\\sample.txt", True),
+        ("relative\\sample.txt", False),
+        ("", False),
+        ("C:relative", False),
+        # What `Path("C:data").absolute()` asks `abspath` for from 3.12.
+        ("C:", False),
+        (b"C:", False),
+        ("\\data\\sample.txt", False),
+        ("/data/sample.txt", False),
+        ("\\:data", False),
+        (b"relative", False),
+    ],
+)
+def test_the_abspath_wrapper_refuses_by_windows_rules_on_windows(
+    monkeypatch: pytest.MonkeyPatch, path: str | bytes, qualified: bool
+) -> None:
+    """Pins, on every platform, the rule the `abspath` wrapper applies under `ntpath`.
+
+    Windows' `abspath` anchors a drive-relative `C:relative` to that drive's
+    working directory and a rooted `\\data` to the working directory's drive,
+    so neither is let through; a drive with a root, a UNC or device path, and
+    the null device are. Whatever it decides, the wrapper hands `abspath` the
+    one string it decided on.
+    """
+    refusals: list[str] = []
+    seen: list[str | bytes] = []
+    monkeypatch.setattr(pyinc_runtime, "_raise_if_guarded", refusals.append)
+
+    def windows_abspath(path: Any) -> Any:
+        seen.append(path)
+        return path
+
+    wrapped = _cwd_anchoring_abspath(windows_abspath, ntpath)
+
+    assert wrapped(path) == path
+    assert wrapped(path=path) == path
+    assert seen == [path, path]
+    assert len(refusals) == (0 if qualified else 2)
+    assert all("os.path.abspath()" in message for message in refusals)
+
+
+def test_the_abspath_wrapper_reads_its_argument_once_and_keeps_its_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One `__fspath__` call decides and answers; a call `abspath` refuses still raises.
+
+    A path `normpath` cannot read -- bytes Windows cannot decode -- is one
+    `abspath` would go on to anchor, so it is refused inside a query and left
+    to `abspath`'s own error outside one.
+    """
+    refusals: list[str] = []
+    monkeypatch.setattr(pyinc_runtime, "_raise_if_guarded", refusals.append)
+    handed: list[Any] = []
+
+    def recording_abspath(path: Any) -> Any:
+        handed.append(path)
+        return path
+
+    class OncePath:
+        calls = 0
+
+        def __fspath__(self) -> str:
+            OncePath.calls += 1
+            return "C:\\data" if OncePath.calls == 1 else "relative"
+
+    wrapped = _cwd_anchoring_abspath(recording_abspath, ntpath)
+    assert wrapped(OncePath()) == "C:\\data"
+    assert (OncePath.calls, handed, refusals) == (1, ["C:\\data"], [])
+
+    with pytest.raises(TypeError, match="not NoneType"):
+        wrapped(None)
+    # Call shapes `abspath` refuses are handed to it whole, so its own
+    # message comes back.
+    with pytest.raises(TypeError, match=r"recording_abspath\(\) got an unexpected keyword"):
+        wrapped(p="x")
+    with pytest.raises(TypeError, match=r"recording_abspath\(\) missing 1 required"):
+        wrapped()
+    assert handed == ["C:\\data"]
+
+    unreadable = types.ModuleType("unreadable_paths")
+
+    def normpath(path: Any) -> Any:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    unreadable.normpath = normpath  # type: ignore[attr-defined]
+    assert _cwd_anchoring_abspath(recording_abspath, unreadable)(b"\xff") == b"\xff"
+    assert len(refusals) == 1
+
+
+def test_the_wrapped_abspath_still_pickles_and_keeps_its_signature(tmp_path: Path) -> None:
+    """`os.path.abspath` is replaced for the whole process, so outside a query it is unchanged.
+
+    It still pickles by reference, advertises and accepts its own parameter
+    name, anchors a relative path where no query runs, and raises a TypeError
+    wherever the original does -- the original's own, word for word, for a
+    call it refuses by shape. A bad argument is refused by `os.fspath`, whose
+    message Windows' 3.14 `abspath` words differently, from its C `normpath`.
+    """
+    Database()  # installs the guard
+    wrapped: Any = os.path.abspath
+    original: Any = getattr(wrapped, "__wrapped__", wrapped)
+
+    assert pickle.loads(pickle.dumps(os.path.abspath)) is os.path.abspath
+    assert list(inspect.signature(os.path.abspath).parameters) == ["path"]
+    assert os.path.abspath(path=str(tmp_path)) == str(tmp_path)
+    assert os.path.abspath("relative") == original("relative")
+    assert os.path.abspath(b"relative") == original(b"relative")
+    with pytest.raises(TypeError):
+        wrapped(None)
+    with pytest.raises(TypeError):
+        original(None)
+    calls: tuple[tuple[tuple[Any, ...], dict[str, Any]], ...] = (
+        ((), {}),
+        (("a", "b"), {}),
+        ((), {"p": "a"}),
+        (("a",), {"path": "a"}),
+    )
+    for args, kwargs in calls:
+        with pytest.raises(TypeError) as wrapped_error:
+            wrapped(*args, **kwargs)
+        with pytest.raises(TypeError) as original_error:
+            original(*args, **kwargs)
+        assert str(wrapped_error.value) == str(original_error.value)
+
+
+def test_the_realpath_and_abspath_wrappers_compose(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A realpath that anchors through `abspath`, as 3.14.8's Windows one does, still works.
+
+    The `realpath` wrapper decides first, so a relative path is refused in
+    `realpath`'s name; a fully qualified one reaches `abspath`, which lets it
+    through. Outside a query neither wrapper stands in the way.
+    """
+    Database()  # installs the guard
+
+    def anchors_through_abspath(path: Any, *, strict: bool = False) -> Any:
+        return os.path.abspath(path)
+
+    monkeypatch.setattr(
+        os.path, "realpath", _cwd_anchoring_realpath(anchors_through_abspath, os.path)
+    )
+
+    @query(key="realpath-through-abspath")
+    def resolve(db: Database, path: str) -> str:
+        return os.fspath(os.path.realpath(path))
+
+    absolute = str(tmp_path / "sample.txt")
+    assert Database().get(resolve, absolute) == absolute
+    with pytest.raises(UntrackedReadError, match=r"os\.path\.realpath\(\) of a relative path"):
+        Database().get(resolve, "relative")
+    assert os.path.realpath("relative") == os.path.join(os.getcwd(), "relative")
+
+
+def test_standard_library_callers_of_abspath_still_answer_for_qualified_paths(
+    tmp_path: Path,
+) -> None:
+    """Library code that hands `abspath` a fully qualified path is not refused.
+
+    `ismount` (through `realpath` on POSIX and `abspath` on Windows),
+    `tempfile.mkdtemp` (which returns `abspath` of what it made from 3.12),
+    and `inspect` on code whose file name is absolute all reach a wrapper here
+    and answer.
+    """
+
+    @query(key="qualified-abspath-callers")
+    def callers(db: Database, directory: str) -> tuple[bool, bool, str, str]:
+        made = tempfile.mkdtemp(dir=directory)
+        return (
+            os.path.ismount(directory),
+            os.path.isabs(made),
+            inspect.getabsfile(_anchor),
+            os.path.basename(inspect.getsourcefile(_anchor) or ""),
+        )
+
+    assert Database().get(callers, str(tmp_path)) == (
+        False,
+        True,
+        os.path.normcase(os.path.abspath(_anchor.__code__.co_filename)),
+        os.path.basename(_anchor.__code__.co_filename),
+    )
+
+
+def test_inspect_on_a_generated_file_name_is_refused_on_every_platform() -> None:
+    """`inspect` anchors a file name that is not fully qualified, and that reads the directory.
+
+    Code compiled under a name such as `<generated>` has no file the working
+    directory does not decide, so `inspect.getabsfile` of it anchors the name
+    with `abspath`: refused through `os.getcwd` on POSIX, and on Windows, where
+    it answered, through the wrapper.
+    """
+
+    @query(key="inspect-generated-file-name")
+    def locate(db: Database) -> str:
+        return inspect.getabsfile(compile("pass\n", "<generated>", "exec"))
+
+    with pytest.raises(UntrackedReadError, match="untracked"):
+        Database().get(locate)
+
+
 def test_the_kernel_resolves_a_captured_module_file_outside_the_guard(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -516,7 +795,8 @@ def test_byte_environment_writes_stay_allowed_inside_queries(
 
     @query(key="byte-env-write")
     def write_env(db: Database) -> bool:
-        os.environb[b"PYINC_BYTE_WRITE"] = b"value"
+        if sys.platform != "win32":  # the cell is skipped there
+            os.environb[b"PYINC_BYTE_WRITE"] = b"value"
         return True
 
     assert Database().get(write_env) is True
