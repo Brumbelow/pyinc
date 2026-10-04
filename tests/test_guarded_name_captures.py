@@ -404,6 +404,50 @@ def test_a_guard_wrapper_folds_one_payload_naming_the_original(label: str) -> No
         assert payloads[0] == guarded
 
 
+def test_only_a_captured_pyinc_object_folds_a_file_of_pyincs(
+    module_factory: Callable[[str], ModuleType], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The contract's account of which identities move with pyinc's own code.
+
+    An annotation evaluated to `Database` folds `pyinc.runtime`, and a
+    captured resource the module its type is defined in and those its code
+    reaches, by those files' bytes, as any captured module is folded. A
+    captured guard wrapper folds no module of pyinc's, so it moves with
+    pyinc's code no more than the same call spelled through `os` does.
+    """
+    module = module_factory(
+        "import os\nfrom os import getcwd\n\nfrom pyinc import Database, FileResource, query\n\n"
+        "files = FileResource()\n\n\n"
+        "@query(key='kernel-identity:annotated')\n"
+        "def annotated(db: Database, x: int) -> int:\n    return x\n\n\n"
+        "@query(key='kernel-identity:resource')\n"
+        "def resource(db, x):\n    return files.read(db, x)\n\n\n"
+        "@query(key='kernel-identity:guarded')\n"
+        "def guarded(db, x):\n    return getcwd is not None and x\n\n\n"
+        "@query(key='kernel-identity:through-os')\n"
+        "def through_os(db, x):\n    return os.getcwd() if x else os.path.realpath('/')\n"
+    )
+    folded: list[str] = []
+    identity = Database._module_identity_payload
+
+    def recording(self: Database, value: ModuleType) -> Any:
+        folded.append(value.__name__)
+        return identity(self, value)
+
+    monkeypatch.setattr(Database, "_module_identity_payload", recording)
+
+    def pyinc_modules_folded(query: Any) -> set[str]:
+        db = Database()
+        folded.clear()
+        db._query_fingerprint(query)
+        return {name for name in folded if name.partition(".")[0] == "pyinc"}
+
+    assert pyinc_modules_folded(module.annotated) == {"pyinc.runtime"}
+    assert "pyinc.resources" in pyinc_modules_folded(module.resource)
+    assert pyinc_modules_folded(module.guarded) == set()
+    assert pyinc_modules_folded(module.through_os) == set()
+
+
 def _live_wrappers() -> dict[str, Any]:
     """Each guarded callable where the guard installed it, as a capture reads it."""
     Database()

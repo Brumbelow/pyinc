@@ -6825,13 +6825,19 @@ class Database:
         identity, and the interpreter build. Every route that folds a capture
         lands here and folds the same payload.
 
-        Nothing in it moves with pyinc's own code, and nothing else in an
-        identity does either: an identity folds the code a query captures,
-        never pyinc's version or the kernel's source, and the kernel marks a
+        It folds no file of pyinc's, by design. Nothing folds pyinc's version
+        or the kernel as a whole into every identity: the kernel marks a
         change to its own encoding and rules with versions it bumps by hand --
         `_KERNEL_FINGERPRINT_VERSION`, the `K2;` prefix every digest carries,
-        and the checkpoint manifest version. A change to the guard that a
-        stored identity must not outlive bumps the tag below the same way.
+        and the checkpoint manifest version. pyinc's own code reaches an
+        identity only where a query captures a pyinc object -- an annotation
+        evaluated to `Database`, a resource -- through the bytes of the module
+        that defines it, as any captured module's code does, so such an
+        identity moves with any edit to that module. A wrapper is not folded
+        that way: a capture of one moves with pyinc's code no more than the
+        same call spelled through its module (`os.getcwd()`) does, and a change
+        to the guard that a stored identity must not outlive bumps the tag
+        below instead.
         """
 
         entry = _guarded_name(value)

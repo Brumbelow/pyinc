@@ -209,11 +209,21 @@ call through its module is, and a fully qualified `realpath` or `abspath`
 still answers. `explain_query_captures` reports such a capture with kind
 `guarded`. The environment mappings the guard installs are state rather than
 callables: a capture of `os.environ` or `os.environb` itself is refused, as it
-always was. The pin does not move with the guard's implementation, as no
-identity moves with the kernel's own code: an identity folds the code a query
-captures, pyinc's resource types included, never pyinc's version or the
-kernel itself, whose encoding and rules are marked by the kernel fingerprint
-version every digest carries.
+always was.
+
+Nothing folds pyinc's version, or the kernel as a whole, into every identity.
+The kernel marks a change to its own encoding and rules by hand, with the `K2`
+prefix every digest carries and the kernel fingerprint version a checkpoint
+records. pyinc's own code reaches an identity only where a query captures a
+pyinc object, and is folded there as any captured module is, by the bytes of
+the file that defines it: an annotation evaluated to a pyinc type
+(`db: Database` without `from __future__ import annotations`) folds
+`pyinc/runtime.py`, and a captured resource folds the file its type is defined
+in and those its code reaches, so such an identity moves with any edit to those
+files. The guard's pin folds no file of pyinc's, by design: a capture of a
+wrapper moves with pyinc's code no more than the same call spelled through its
+module (`os.getcwd()`) does, and a change to the guard moves it only when the
+pin's versioned tag is bumped.
 
 `Input` keys and `@query`/`Query` keys are exactly `str` and non-empty; the
 default query key is `module:qualname`. A `str` subclass, a `StrEnum` member
