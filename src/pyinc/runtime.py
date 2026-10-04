@@ -915,6 +915,7 @@ class _GuardedName:
     `module` and `qualname` are the original's own `__module__` and
     `__qualname__` -- `posix.getcwd`, `posixpath.realpath`, `pathlib.Path.cwd`
     -- which is what a capture of the wrapper is fingerprinted by.
+    `_standard_library_name` has checked that they name the original.
     """
 
     wrapper: Callable[..., Any]
@@ -933,8 +934,56 @@ class _GuardedName:
 # once it has installed the guard, sees all of it. The entries keep the
 # wrappers alive, so no id here is ever reused. The two environment mappings
 # the guard installs are not callables and are not here: a captured mapping is
-# state, refused as `os.environ` itself is.
+# state, refused as `os.environ` itself is. Nor is a wrapper around anything a
+# caller put in a guarded name's place before the guard was installed (a mock,
+# a `functools.partial`, a function of its own): no standard-library name
+# describes what that wrapper calls, so a capture of it is refused as any
+# closure over pyinc's state is.
 _GUARDED_NAMES: dict[int, _GuardedName] = {}
+
+
+def _standard_library_name(original: Any) -> tuple[str, str] | None:
+    """The module and qualified name `original` is bound under in the standard library, or None.
+
+    A capture of a guard wrapper is pinned by the callable it replaced, so the
+    pin is only as true as that callable's own `__module__` and
+    `__qualname__`. They are trusted when the module is part of the standard
+    library and the qualified name, read back through it, reaches `original`
+    itself, as a standard-library type's anchor must. Anything else that held
+    a guarded name when the guard was installed -- a mock, which has no
+    `__qualname__`; a `functools.partial`, which has neither; a function of
+    the caller's own -- gets None. Called before the guard replaces anything,
+    since it replaces `posixpath.realpath` in its own module's namespace.
+    """
+    module_name = getattr(original, "__module__", None)
+    qualname = getattr(original, "__qualname__", None)
+    if not isinstance(module_name, str) or not isinstance(qualname, str):
+        return None
+    if module_name.partition(".")[0] not in sys.stdlib_module_names:
+        return None
+    current: Any = sys.modules.get(module_name)
+    for part in qualname.split("."):
+        if not isinstance(current, (ModuleType, type)):
+            return None
+        current = vars(current).get(part)
+        if isinstance(current, (classmethod, staticmethod)):
+            current = current.__func__
+    return (module_name, qualname) if current is original else None
+
+
+def _first_parameter_name(function: Callable[..., Any], default: str) -> str:
+    """`function`'s name for its first parameter, or `default` when it has no signature.
+
+    A callable put in a guarded name's place may have no signature to read --
+    a C function, or an object that refuses one -- and the guard still has to
+    install around it; the standard library's own name for the parameter is
+    what a caller passing it by keyword would use.
+    """
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return default
+    return next(iter(parameters), default)
 
 
 def _guarded_name(value: Any) -> _GuardedName | None:
@@ -991,7 +1040,7 @@ def _cwd_anchoring_realpath(
     windows = path_module is ntpath
     # The wrapped function's own name for its first parameter (`filename` on
     # POSIX, `path` on Windows), so a caller passing it by keyword still can.
-    first = next(iter(inspect.signature(realpath).parameters))
+    first = _first_parameter_name(realpath, "path" if windows else "filename")
     allow_missing = getattr(path_module, "ALLOW_MISSING", None)
 
     @functools.wraps(realpath)
@@ -1043,7 +1092,7 @@ def _cwd_anchoring_abspath(
     """
     # The wrapped function's own name for its parameter (`path` on both
     # platforms), so a caller passing it by keyword still can.
-    first = next(iter(inspect.signature(abspath).parameters))
+    first = _first_parameter_name(abspath, "path")
 
     @functools.wraps(abspath)
     def guarded_abspath(*args: Any, **kwargs: Any) -> Any:
@@ -1095,7 +1144,16 @@ def _install_guards_once() -> None:
         original_environ = os.environ
         original_os_getcwd = os.getcwd
         original_os_getcwdb = os.getcwdb
-        original_path_cwd = Path.cwd.__func__  # type: ignore[attr-defined]
+        # Read as the class stores it: a classmethod, unless something else was
+        # patched onto the class before the guard was installed (a mock has no
+        # `__func__`), which is then called as `Path.cwd()` would call it.
+        path_cwd_attribute = inspect.getattr_static(Path, "cwd")
+        bind_path_cwd = getattr(type(path_cwd_attribute), "__get__", None)
+        original_path_cwd: Any = (
+            path_cwd_attribute.__func__
+            if isinstance(path_cwd_attribute, classmethod)
+            else path_cwd_attribute
+        )
 
         def guarded_open(*args: Any, **kwargs: Any) -> Any:
             _raise_if_guarded("Raw open() inside a query is untracked. Use FileResource.read().")
@@ -1154,7 +1212,9 @@ def _install_guards_once() -> None:
 
         def guarded_path_cwd(cls: type[Path]) -> Path:
             _raise_if_guarded(f"Raw Path.cwd() inside a query is untracked. {_CWD_ADVICE}")
-            return original_path_cwd(cls)  # type: ignore[no-any-return]
+            if bind_path_cwd is None:
+                return original_path_cwd()  # type: ignore[no-any-return]
+            return bind_path_cwd(path_cwd_attribute, None, cls)()  # type: ignore[no-any-return]
 
         original_thread_start = threading.Thread.start
 
@@ -1224,6 +1284,33 @@ def _install_guards_once() -> None:
             (guarded_abspath, original_abspath),
             (guarded_thread_start, original_thread_start),
         ]
+        if sys.platform != "win32":
+            # The byte-oriented view of the same process environment, and the
+            # lookup that reads through it. Windows has neither.
+            original_environb = os.environb
+            original_os_getenvb = os.getenvb
+
+            def guarded_getenvb(key: bytes, default: bytes | None = None) -> bytes | None:
+                _raise_if_guarded(
+                    "Raw os.getenvb() inside a query is untracked. Use EnvResource.read()."
+                )
+                return original_os_getenvb(key, default)
+
+            guarded_environb = _GuardedEnviron(
+                original_environb,
+                lambda: _raise_if_guarded(
+                    "Raw os.environb access inside a query is untracked. Use EnvResource.read()."
+                ),
+            )
+            installed.append((guarded_getenvb, original_os_getenvb))
+        # Named before anything is replaced: everything that can fail runs
+        # here, so the guard goes in whole or not at all, and is marked
+        # installed as soon as it is in.
+        entries: dict[int, _GuardedName] = {}
+        for wrapper, original in installed:
+            name = _standard_library_name(original)
+            if name is not None:
+                entries[id(wrapper)] = _GuardedName(wrapper, original, *name)
 
         builtins.open = guarded_open
         io.open = guarded_io_open
@@ -1238,30 +1325,10 @@ def _install_guards_once() -> None:
         os.path.realpath = guarded_realpath
         os.path.abspath = guarded_abspath
         if sys.platform != "win32":
-            # The byte-oriented view of the same process environment, and the
-            # lookup that reads through it. Windows has neither.
-            original_environb = os.environb
-            original_os_getenvb = os.getenvb
-
-            def guarded_getenvb(key: bytes, default: bytes | None = None) -> bytes | None:
-                _raise_if_guarded(
-                    "Raw os.getenvb() inside a query is untracked. Use EnvResource.read()."
-                )
-                return original_os_getenvb(key, default)
-
-            os.environb = _GuardedEnviron(  # type: ignore[assignment]
-                original_environb,
-                lambda: _raise_if_guarded(
-                    "Raw os.environb access inside a query is untracked. Use EnvResource.read()."
-                ),
-            )
+            os.environb = guarded_environb  # type: ignore[assignment]
             os.getenvb = guarded_getenvb  # type: ignore[assignment]
-            installed.append((guarded_getenvb, original_os_getenvb))
         threading.Thread.start = guarded_thread_start  # type: ignore[assignment, method-assign]
-        for wrapper, original in installed:
-            _GUARDED_NAMES[id(wrapper)] = _GuardedName(
-                wrapper, original, original.__module__, original.__qualname__
-            )
+        _GUARDED_NAMES.update(entries)
         _GUARD_INSTALLED = True
 
 

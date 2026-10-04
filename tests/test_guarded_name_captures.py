@@ -598,3 +598,191 @@ def test_a_name_bound_before_the_first_database_keeps_the_unguarded_original(
         "getenv": ["unsupported", False],
         "getcwd_payload": "builtin",
     }
+
+
+_REPLACED_BEFORE_THE_FIRST_DATABASE = '''\
+"""Put something else in guarded names' places, then create the first two Databases."""
+
+import functools
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+directory = tempfile.mkdtemp()
+with open(os.path.join(directory, "sample.txt"), "w", encoding="utf-8") as handle:
+    handle.write("hello")
+os.environ["PYINC_GUARDED_NAME"] = "value"
+real_getenv, real_listdir, real_cwd = os.getenv, os.listdir, Path.cwd
+real_realpath = os.path.realpath
+# The standard library's own name for realpath's parameter.
+keyword = "path" if os.name == "nt" else "filename"
+
+
+def own_getcwd():
+    return directory
+
+
+class Opaque:
+    """A callable with no signature to read, as a C function may have none."""
+
+    def __init__(self, function):
+        self.function = function
+
+    def __call__(self, *args, **kwargs):
+        return self.function(*args, **kwargs)
+
+    @property
+    def __signature__(self):
+        raise ValueError("no signature")
+
+
+# Each is what a test suite or a tool might hold in a guarded name's place: a
+# mock has no __qualname__, a partial has neither name, a function of the
+# caller's own is no standard-library callable, Path.cwd patched on the class
+# is no classmethod, and `Opaque` has no signature to read a keyword name from.
+replacements = {
+    "os.getenv": mock.MagicMock(side_effect=real_getenv),
+    "os.listdir": functools.partial(real_listdir),
+    "os.getcwd": own_getcwd,
+    "Path.cwd": mock.MagicMock(side_effect=real_cwd),
+    "os.path.realpath": Opaque(real_realpath),
+}
+os.getenv = replacements["os.getenv"]
+os.listdir = replacements["os.listdir"]
+os.getcwd = replacements["os.getcwd"]
+Path.cwd = replacements["Path.cwd"]
+os.path.realpath = replacements["os.path.realpath"]
+sys.path.insert(0, directory)
+
+from pyinc import Database, UnsupportedValueError, UntrackedReadError, query
+from pyinc import runtime
+
+out = {}
+try:
+    Database()
+    out["first"] = "constructed"
+except Exception as exc:
+    out["first"] = type(exc).__name__ + ": " + str(exc)
+out["installed"] = runtime._GUARD_INSTALLED
+Database()
+
+live = {
+    "os.getenv": os.getenv,
+    "os.listdir": os.listdir,
+    "os.getcwd": os.getcwd,
+    "Path.cwd": vars(Path)["cwd"].__func__,
+    "os.path.realpath": os.path.realpath,
+}
+
+
+def closed_over(function):
+    return [cell.cell_contents for cell in function.__closure__ or ()]
+
+
+# Wrapped once, around the replacement itself, and never recorded as a
+# standard-library callable; the names nobody replaced still are.
+out["wrapped_once"] = {
+    label: function.__code__.co_filename == runtime.__file__
+    and any(item is replacements[label] for item in closed_over(function))
+    and not any(
+        getattr(getattr(item, "__code__", None), "co_filename", None) == runtime.__file__
+        for item in closed_over(function)
+    )
+    for label, function in live.items()
+}
+out["recorded"] = {label: runtime._guarded_name(function) is not None for label, function in live.items()}
+out["recorded_untouched"] = [
+    runtime._guarded_name(os.scandir) is not None,
+    runtime._guarded_name(os.path.abspath) is not None,
+    runtime._guarded_name(vars(Path)["iterdir"]) is not None,
+]
+out["registry_size"] = len(runtime._GUARDED_NAMES)
+
+
+@query(key="replaced:calls")
+def calls(db, name):
+    try:
+        if name == "os.getenv":
+            os.getenv("PYINC_GUARDED_NAME")
+        elif name == "os.listdir":
+            os.listdir(directory)
+        elif name == "os.getcwd":
+            os.getcwd()
+        elif name == "Path.cwd":
+            Path.cwd()
+        else:
+            os.path.realpath(**{keyword: "relative"})
+    except UntrackedReadError:
+        return "refused"
+    return "answered"
+
+
+db = Database()
+out["inside"] = {label: db.get(calls, label) for label in live}
+out["outside"] = [
+    os.getenv("PYINC_GUARDED_NAME"),
+    os.listdir(directory),
+    os.getcwd() == directory,
+    Path.cwd() == real_cwd(),
+    os.path.realpath(**{keyword: "relative"}) == real_realpath("relative"),
+]
+
+with open(os.path.join(directory, "captures_replaced.py"), "w", encoding="utf-8") as handle:
+    handle.write(
+        "from os import getenv\\n"
+        "from pyinc import query\\n"
+        "@query(key='replaced:capture')\\n"
+        "def q(db):\\n    return getenv is not None\\n"
+    )
+import captures_replaced
+
+try:
+    db.get(captures_replaced.q)
+    out["capture"] = "fingerprinted"
+except UnsupportedValueError:
+    out["capture"] = "refused"
+print("JSON " + json.dumps(out))
+'''
+
+
+def test_the_guard_installs_whole_around_whatever_holds_a_guarded_name(tmp_path: Path) -> None:
+    """A mock, a partial or a caller's function in a guarded name's place is wrapped once, and not pinned.
+
+    Recording the replaced callable read its `__qualname__` after every
+    wrapper was in place and before the guard was marked installed, so a
+    replacement without one failed the first `Database` with `AttributeError`
+    and the next one wrapped every name a second time; `Path.cwd` replaced by
+    anything but a classmethod failed it on its missing `__func__`, and a
+    `realpath` without a signature on its parameters. Now the guard installs
+    whole around what it finds, still refuses the call inside a query, and
+    records a wrapper only around the standard-library callable its module
+    and qualified name name, so a capture of a wrapper around anything else
+    is refused as before. A fresh process is the only place no `Database`
+    exists yet.
+    """
+    script = tmp_path / "replaced_before_first_database.py"
+    script.write_text(_REPLACED_BEFORE_THE_FIRST_DATABASE, encoding="utf-8")
+    src = str(Path(pyinc.__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": src, "PYTHONDONTWRITEBYTECODE": "1"}
+    proc = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, env=env, check=False
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    line = [ln for ln in proc.stdout.splitlines() if ln.startswith("JSON ")][-1]
+    out = json.loads(line[len("JSON ") :])
+    labels = ["os.getenv", "os.listdir", "os.getcwd", "Path.cwd", "os.path.realpath"]
+    assert out["first"] == "constructed"
+    assert out["installed"] is True
+    assert out["wrapped_once"] == dict.fromkeys(labels, True)
+    assert out["recorded"] == dict.fromkeys(labels, False)
+    assert out["recorded_untouched"] == [True, True, True]
+    assert out["registry_size"] == len(_GUARDED) - len(labels)
+    assert out["inside"] == dict.fromkeys(labels, "refused")
+    assert out["outside"][0] == "value"
+    assert out["outside"][1] == ["sample.txt"]
+    # The keyword is the standard library's name for the parameter.
+    assert out["outside"][2:] == [True, True, True]
+    assert out["capture"] == "refused"

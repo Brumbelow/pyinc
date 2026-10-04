@@ -197,7 +197,11 @@ A query may capture a callable the condition 2 guard replaced. Bound once a
 folds a captured callable it pins the wrapper as the standard-library callable
 it guards -- by that callable's module and qualified name, its module's
 identity, and the interpreter build, as it pins a standard-library type --
-never by the wrapper's own code. A standard-library function that calls one
+never by the wrapper's own code. The guard wraps whatever holds a guarded name
+when it is installed, but pins only a wrapper around the standard-library
+callable that its own module and qualified name lead back to: a capture of a
+wrapper around a mock, a `functools.partial` or a function of the caller's own
+put there earlier is refused. A standard-library function that calls one
 through its module's namespace, such as `os.path.relpath` or
 `os.path.ismount`, is folded as the function it is, with the wrapper among its
 globals. Calling a captured wrapper inside a query is refused exactly as the

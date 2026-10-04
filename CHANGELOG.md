@@ -127,7 +127,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `explain_query_captures` reports such a capture with kind `guarded`. A name
   bound before the first `Database` still holds the unguarded original and
   fingerprints as before, and a capture of `os.environ` or `os.environb`
-  itself is still refused.
+  itself is still refused. So is a capture of the wrapper around a mock, a
+  `functools.partial` or a function of your own that held a guarded name when
+  the first `Database` was created: no standard-library name describes what it
+  calls.
 - CI runs the test suite, and nightly the property suite, on the free-threaded
   CPython 3.14t build with the GIL disabled, on Linux, macOS, and Windows. The
   release workflow gates on it with the rest of the matrix, and the FAQ no
