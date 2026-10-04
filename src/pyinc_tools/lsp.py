@@ -405,13 +405,23 @@ class LanguageServer:
         self._published_paths: set[str] = set()
         self._published_signatures: dict[str, tuple[tuple[Any, ...], ...]] = {}
         # The watcher callback publishes diagnostics from its polling thread
-        # while the request loop writes responses, so both the output stream
-        # (each frame is two writes plus a flush) and the published-diagnostics
-        # bookkeeping need serializing. Reentrant because publishing sends
-        # notifications while holding the lock. `_session` is set and cleared
-        # under it too, so a publish that holds it knows whether the session it
-        # analyzed is still the server's. It is never held while a session is
-        # closed or a watcher joined: the watcher thread may be waiting for it.
+        # while the request loop writes responses and publishes too. These
+        # locks keep them apart. A thread that holds more than one takes them
+        # in this order: the publish lock, then the session's lock (taken by an
+        # analysis and by reading document text), then the write lock.
+        #
+        # The publish lock is held for a whole publish, from before the
+        # analysis until the last notification is sent. Publishes therefore
+        # reach the client in the order their analyses ran. It also guards the
+        # published-diagnostics bookkeeping. Teardown never takes it, because
+        # the watcher thread may hold it while teardown joins that thread.
+        #
+        # The write lock keeps each frame on the output stream whole (a frame
+        # is two writes plus a flush). `_session` is set and cleared under it
+        # too, so a send that holds it knows whether the session it analyzed
+        # is still the server's. It is never held while a session is closed or
+        # a watcher joined, because the watcher thread may be waiting for it.
+        self._publish_lock = threading.RLock()
         self._write_lock = threading.RLock()
 
     def serve(self) -> int:
@@ -647,49 +657,61 @@ class LanguageServer:
         return True
 
     def publish_workspace_diagnostics(self) -> None:
-        # The watcher thread calls this while the request loop may be tearing
-        # the session down, so the session is read once: a second read could
-        # find None. A session torn down meanwhile is closed, and what its
-        # analysis found is no longer the server's to publish.
-        session = self._session
-        if session is None:
-            return
-        try:
-            result = session.analyze_workspace()
-        except RuntimeError as exc:
-            if str(exc) == SESSION_CLOSED_MESSAGE and self._session is not session:
+        # The publish lock is held from before the analysis until the last
+        # send. A watcher publish whose analysis ran before an edit therefore
+        # sends before the request loop publishes that edit, and the client
+        # ends with the diagnostics of the latest analysis.
+        with self._publish_lock:
+            # The watcher thread calls this while the request loop may be
+            # tearing the session down, so the session is read once: a second
+            # read could find None. A session torn down meanwhile is closed, and
+            # what its analysis found is no longer the server's to publish.
+            session = self._session
+            if session is None:
                 return
-            raise
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for diagnostic in result.diagnostics:
-            grouped.setdefault(diagnostic.path, []).append(
-                self._analysis_diagnostic_to_lsp(diagnostic)
-            )
+            try:
+                result = session.analyze_workspace()
+            except RuntimeError as exc:
+                if str(exc) == SESSION_CLOSED_MESSAGE and self._session is not session:
+                    return
+                raise
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for diagnostic in result.diagnostics:
+                grouped.setdefault(diagnostic.path, []).append(
+                    self._analysis_diagnostic_to_lsp(diagnostic)
+                )
 
-        current_paths = set(grouped)
-        # Analysis above runs unlocked; the compare-update-send below holds the
-        # write lock so a publish from the watcher thread and one from the
-        # request loop cannot interleave their bookkeeping or notifications.
-        with self._write_lock:
-            if self._session is not session:
-                return
-            for path in sorted(current_paths | self._published_paths):
+            for path in sorted(set(grouped) | self._published_paths):
                 diagnostics = grouped.get(path, [])
                 signature = tuple(_diagnostic_signature(item) for item in diagnostics)
                 if self._published_signatures.get(path) == signature:
                     continue
-                self._published_signatures[path] = signature
-                self._send_notification(
-                    "textDocument/publishDiagnostics",
-                    {
-                        "uri": _path_to_uri(path),
-                        "diagnostics": diagnostics,
-                    },
-                )
-            for stale_path in self._published_paths - current_paths:
-                # Clear the cached signature so a future reappearance republishes.
-                self._published_signatures.pop(stale_path, None)
-            self._published_paths = current_paths
+                try:
+                    sent = self._send_notification(
+                        "textDocument/publishDiagnostics",
+                        {
+                            "uri": _path_to_uri(path),
+                            "diagnostics": diagnostics,
+                        },
+                        session=session,
+                    )
+                except InvalidParams:
+                    # Positions are converted against the live document text.
+                    # An edit made after the analysis can leave a range outside
+                    # that text. The path is skipped and left unrecorded, and
+                    # the publish that follows the edit sends the diagnostics
+                    # the edit produced.
+                    continue
+                if not sent:
+                    return
+                # Recorded only once the client has the notification, so the
+                # bookkeeping always describes what the client was sent.
+                if diagnostics:
+                    self._published_signatures[path] = signature
+                    self._published_paths.add(path)
+                else:
+                    self._published_signatures.pop(path, None)
+                    self._published_paths.discard(path)
 
     def _document_diagnostic(self, params: Any) -> dict[str, Any]:
         document = params["textDocument"]
@@ -774,7 +796,7 @@ class LanguageServer:
         )
         try:
             session = WorkspaceSession(root, exclude_globs=exclude_globs)
-            with self._write_lock:
+            with self._publish_lock, self._write_lock:
                 self._session = session
                 self._published_paths.clear()
                 self._published_signatures.clear()
@@ -895,7 +917,8 @@ class LanguageServer:
         # Detached before it is closed, and under the write lock, so a publish
         # still running on the watcher thread (its join can time out) or on a
         # caller's thread sees that the session is gone instead of reading it
-        # closed, or reading None where it had just found a session.
+        # closed, or reading None where it had just found a session. The
+        # publish lock is left alone: that publish may still hold it.
         with self._write_lock:
             session = self._session
             self._session = None
@@ -1705,7 +1728,22 @@ class LanguageServer:
             }
         )
 
-    def _send_notification(self, method: str, params: dict[str, Any]) -> None:
+    def _send_notification(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        session: WorkspaceSession | None = None,
+    ) -> bool:
+        """Send a notification and return whether it was written.
+
+        Positions are converted before the write lock is taken. The conversion
+        reads document text under the session's lock, which comes before the
+        write lock in the lock order. Given a session, the notification is
+        written only while that session is still the server's. The check and
+        the write share one hold of the write lock, so teardown detaches the
+        session either before both or after both.
+        """
         converted = convert_payload_positions(
             params,
             encoding=self._position_encoding,
@@ -1713,4 +1751,8 @@ class LanguageServer:
             source_for_uri=self._source_for_uri,
             uri=params.get("uri") if isinstance(params.get("uri"), str) else None,
         )
-        self._send({"jsonrpc": "2.0", "method": method, "params": converted})
+        with self._write_lock:
+            if session is not None and self._session is not session:
+                return False
+            self._send({"jsonrpc": "2.0", "method": method, "params": converted})
+        return True

@@ -11,7 +11,7 @@ from typing import Any, BinaryIO, cast
 
 import pytest
 from _hostile_paths import within_budget
-from _rendezvous import Rendezvous
+from _rendezvous import Rendezvous, run_in_threads
 
 import pyinc_tools
 import pyinc_tools.cli as cli
@@ -2581,6 +2581,161 @@ def test_publish_whose_session_was_torn_down_during_analysis_sends_nothing(
     server.publish_workspace_diagnostics()
 
     assert out.getvalue() == b""
+
+
+def _diagnostic_publications(out: io.BytesIO) -> list[tuple[str, list[str]]]:
+    """Each diagnostics notification on ``out``, as its URI and its codes."""
+
+    replay = io.BytesIO(out.getvalue())
+    publications: list[tuple[str, list[str]]] = []
+    while (message := read_message(replay)) is not None:
+        if message.get("method") == "textDocument/publishDiagnostics":
+            params = message["params"]
+            codes = [item["code"] for item in params["diagnostics"]]
+            publications.append((params["uri"], codes))
+    return publications
+
+
+def _did_change(server: LanguageServer, path: Path, text: str) -> None:
+    server._handle_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": {"uri": path.as_uri(), "version": 1},
+                "contentChanges": [{"text": text}],
+            },
+        }
+    )
+
+
+def _race_watcher_publish_with_edit(server: LanguageServer, path: Path, text: str) -> list[str]:
+    """Hold a watcher publish after its analysis while the request loop edits.
+
+    A watcher-like thread publishes and stops right after its analysis. The
+    request loop then handles a didChange of ``path`` to ``text``. Before the
+    fix, the edit's publish ran beside the held one and finished first. The
+    request loop then reached the rendezvous, which let the held publish go on
+    to send. After the fix, the edit's publish queues on the publish lock, and
+    queueing there lets the held publish finish first. Returns what the watcher
+    publish raised.
+    """
+
+    session = server._session
+    assert session is not None
+    rendezvous = Rendezvous()
+    server._publish_lock = rendezvous.lock(threading.RLock())  # type: ignore[assignment]
+    original_analyze = session.analyze_workspace
+    watcher_analyzed = threading.Event()
+    on_watcher = threading.local()
+    errors: list[str] = []
+
+    def analyze_then_hold_the_watcher() -> Any:
+        result = original_analyze()
+        if getattr(on_watcher, "active", False):
+            watcher_analyzed.set()
+            rendezvous.point()
+        return result
+
+    def watcher_publish() -> None:
+        on_watcher.active = True
+        try:
+            server.publish_workspace_diagnostics()
+        except Exception as exc:  # recorded: the watcher reports it on stderr
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    def request_loop_edit() -> None:
+        assert watcher_analyzed.wait(10)
+        _did_change(server, path, text)
+        rendezvous.point()
+
+    session.analyze_workspace = analyze_then_hold_the_watcher  # type: ignore[method-assign]
+    try:
+        run_in_threads(watcher_publish, request_loop_edit)
+    finally:
+        session.analyze_workspace = original_analyze  # type: ignore[method-assign]
+    return errors
+
+
+@pytest.mark.parametrize(
+    "fixed_text",
+    [
+        pytest.param("x = 1  # this line is longer than the import was\n", id="range-fits"),
+        pytest.param("x = 1\n", id="range-overruns-line"),
+    ],
+)
+def test_publishes_reach_the_client_in_the_order_their_analyses_ran(
+    tmp_path: Path, fixed_text: str
+) -> None:
+    """The client ends with the diagnostics of the latest edit.
+
+    The watcher's publish analyzed the broken file, and then the request loop
+    published the fix. The watcher's publish used to send after that and put
+    the stale diagnostic back. Where the stale range overran the edited line,
+    its send raised after the signature was recorded, so breaking the file
+    again sent nothing.
+    """
+
+    root = tmp_path / "workspace"
+    out = io.BytesIO()
+    server = _initialized_server(root, out)
+    try:
+        path = root / "a.py"
+        uri = path.resolve().as_uri()
+        server.publish_workspace_diagnostics()
+        assert _diagnostic_publications(out) == [(uri, ["missing-import"])]
+
+        errors = _race_watcher_publish_with_edit(server, path, fixed_text)
+
+        assert _diagnostic_publications(out) == [(uri, ["missing-import"]), (uri, [])]
+        _did_change(server, path, "from . import missing\n")
+        assert _diagnostic_publications(out)[2:] == [(uri, ["missing-import"])]
+        assert errors == []
+    finally:
+        server._teardown_session()
+
+
+def test_diagnostic_skipped_for_a_stale_range_is_sent_when_it_comes_back(
+    tmp_path: Path,
+) -> None:
+    """A path skipped for a stale range is published by a later publish.
+
+    The watcher's analysis found a new diagnostic in a.py after b.py changed
+    on disk. The request loop shortened a.py before that publish sent it, so
+    the range overran the edited line and its conversion raised. The publish
+    used to record the signature first. When an edit brought the same
+    diagnostic back, it counted as sent and the client never received it.
+    """
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    path = root / "a.py"
+    broken = "from b import name\nprint(name)\n"
+    _write(path, broken)
+    _write(root / "b.py", "name = 1\n")
+    out = io.BytesIO()
+    server = LanguageServer(in_stream=io.BytesIO(), out_stream=out, default_root=str(root))
+    server._handle_request(
+        "initialize",
+        {"rootUri": root.as_uri(), "initializationOptions": {"pyinc.watcher.enabled": False}},
+    )
+    try:
+        session = server._session
+        assert session is not None
+        server.publish_workspace_diagnostics()
+        assert _diagnostic_publications(out) == []
+        _write(root / "b.py", "other = 1\n")
+        session.refresh_paths([str(root / "b.py")])
+
+        errors = _race_watcher_publish_with_edit(server, path, "x = 1\n")
+
+        assert _diagnostic_publications(out) == []
+        _did_change(server, path, broken)
+        uri = path.resolve().as_uri()
+        assert _diagnostic_publications(out) == [(uri, ["unresolved-symbol"])]
+        assert errors == []
+    finally:
+        server._teardown_session()
 
 
 def test_session_helpers_use_the_session_they_checked(tmp_path: Path) -> None:

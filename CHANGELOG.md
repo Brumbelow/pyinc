@@ -159,6 +159,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   query refuse a path such as `/:/data`. Those versions normalise it to
   `/:\data`, which Windows resolves on the working directory's drive, and the
   full-qualification check took it for a drive with a root.
+- The language server sends diagnostics in the order its analyses ran. A
+  publish on the watcher thread analyzed outside the server's locks, so it
+  could send after the request loop had published a newer edit and bring
+  stale diagnostics back. A publish now holds one lock from before its
+  analysis until its last send. A publish also recorded each document as sent
+  before sending it. When an edit left a stale range past the end of its line,
+  the send raised, and the same diagnostics were later skipped as already
+  sent. The server now records a document once its notification is written. A
+  document whose range falls outside the edited text is skipped, and the
+  publish that follows the edit sends it.
 
 ### Changed
 
