@@ -29,7 +29,8 @@ serializes its methods. So every read and write of the memo holds
 `_CACHES_LOCK`, and a decode two threads raced to compute is stored once: the
 one stored first is the one both get back. The lock is never held while a
 decode runs. A decode reads queries, and a thread that holds the database's
-lock, or a session's, may be the next one to ask for this lock.
+lock, or a session's, may be the next one to ask for this lock. A child forked
+while another thread held the lock gets a new one.
 
 `once_per_request` keys on the call itself, and lives only for the span a caller
 declares with `request_scope`, on the thread that declared it. A `WorkspaceSession` holds its lock for the whole of
@@ -44,6 +45,7 @@ sees it, so its memo needs no lock.
 
 from __future__ import annotations
 
+import os
 import threading
 import weakref
 from collections.abc import Callable, Iterator
@@ -79,6 +81,23 @@ _CACHES: weakref.WeakKeyDictionary[
 # already holds this lock, so it does not take the lock. It deletes one key in
 # a single dict operation, and no key a live database owns.
 _CACHES_LOCK = threading.Lock()
+
+
+def _new_caches_lock_in_child() -> None:
+    """Give a forked child a lock of its own for the memo.
+
+    A thread that held the lock when another thread forked does not exist in
+    the child, so the child would wait on the lock forever, even for a new
+    database. The memo itself is whole at the fork: each step taken under the
+    lock leaves it consistent.
+    """
+
+    global _CACHES_LOCK
+    _CACHES_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_new_caches_lock_in_child)
 
 
 @dataclass

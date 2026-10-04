@@ -616,6 +616,11 @@ checks and stores a digest in one step -- `InMemoryArtifactStore` under a lock,
 `FileSystemArtifactStore` under a per-digest file lock -- so a digest rebound
 to different bytes raises `ValueError` however two puts interleave.
 
+A process forked while another thread holds an `InMemoryArtifactStore`'s lock
+gives the child a new lock for that store, so the child can go on using it. A
+`Database` that another thread was using at the fork can stay locked in the
+child, so create the child's databases after the fork.
+
 ## Snapshot Serialization and Store Keys
 
 The kernel derives deterministic content keys from the `Snapshot` union —

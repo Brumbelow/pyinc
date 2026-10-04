@@ -14,6 +14,7 @@ import os
 import re
 import stat
 import threading
+import weakref
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -74,12 +75,14 @@ class InMemoryArtifactStore:
     absent and the second overwrote the first, so a digest rebound to
     different bytes went unrefused. `keys` copies under the same lock, so its
     snapshot can be iterated while other threads store. `get` and `contains`
-    are one dict operation each and need no lock.
+    are one dict operation each and need no lock. A child forked while another
+    thread held the lock gets a new one: see `_new_store_locks_in_child`.
     """
 
     def __init__(self) -> None:
         self._items: dict[str, bytes] = {}
         self._lock = threading.Lock()
+        _LIVE_STORES.add(self)
 
     def get(self, digest: str) -> bytes | None:
         return self._items.get(digest)
@@ -106,6 +109,28 @@ class InMemoryArtifactStore:
 
         with self._lock:
             return MappingProxyType(dict(self._items))
+
+
+# Every store still alive, so a forked child can reach each one's lock. Weak, so
+# being listed here keeps no store alive.
+_LIVE_STORES: weakref.WeakSet[InMemoryArtifactStore] = weakref.WeakSet()
+
+
+def _new_store_locks_in_child() -> None:
+    """Give every store a forked child inherits a lock of its own.
+
+    A thread that held a store's lock when another thread forked does not exist
+    in the child, so the child would wait on that lock forever in `put` or
+    `keys`. The items are whole at the fork: each step taken under the lock
+    leaves them consistent.
+    """
+
+    for store in list(_LIVE_STORES):
+        store._lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_new_store_locks_in_child)
 
 
 class FileSystemArtifactStore:

@@ -90,6 +90,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under the store's lock. `keys()` returns a snapshot copied under that lock
   rather than a live view, which raised `RuntimeError` when iterated while
   another thread stored; call it again to see later puts.
+- A process forked while another thread holds the integrations' decode memo
+  lock, or an `InMemoryArtifactStore`'s lock, can go on using them. The child
+  inherited the lock held, with no thread left to release it, so its next
+  entrypoint call on a `strict` `Database`, even a new one, or its next `put`
+  or `keys` on that store waited forever. About half of the children forked
+  while another thread decoded hung, on 3.11 and on 3.14t. The child now gets
+  a new lock for each.
 - On Windows, threads whose first store, action or lock-file operation lands at
   the same moment share one Win32 boundary. Each that found none built its
   own, loading `kernel32` and declaring its function prototypes again, and
