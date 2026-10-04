@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import stat
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -66,10 +67,19 @@ class ArtifactStore(Protocol):
 
 class InMemoryArtifactStore:
     """In-process dict-backed store. Useful for tests and for retaining values
-    beyond `Database(max_query_nodes=...)` LRU eviction within a single run."""
+    beyond `Database(max_query_nodes=...)` LRU eviction within a single run.
+
+    Databases on several threads may share one. `put` checks and stores under
+    the store's lock: unlocked, two puts of one digest could both find it
+    absent and the second overwrote the first, so a digest rebound to
+    different bytes went unrefused. `keys` copies under the same lock, so its
+    snapshot can be iterated while other threads store. `get` and `contains`
+    are one dict operation each and need no lock.
+    """
 
     def __init__(self) -> None:
         self._items: dict[str, bytes] = {}
+        self._lock = threading.Lock()
 
     def get(self, digest: str) -> bytes | None:
         return self._items.get(digest)
@@ -77,21 +87,25 @@ class InMemoryArtifactStore:
     def put(self, digest: str, payload: bytes) -> None:
         if type(payload) is not bytes:
             raise TypeError("Artifact payloads must be bytes.")
-        existing = self._items.get(digest)
-        if existing is not None:
-            if existing != payload:
-                raise ValueError(
-                    f"Digest collision in InMemoryArtifactStore for {digest!r}: refusing to "
-                    "overwrite existing payload with different bytes."
-                )
-            return
-        self._items[digest] = payload
+        with self._lock:
+            existing = self._items.get(digest)
+            if existing is None:
+                self._items[digest] = payload
+                return
+        if existing != payload:
+            raise ValueError(
+                f"Digest collision in InMemoryArtifactStore for {digest!r}: refusing to "
+                "overwrite existing payload with different bytes."
+            )
 
     def contains(self, digest: str) -> bool:
         return digest in self._items
 
     def keys(self) -> Mapping[str, bytes]:
-        return MappingProxyType(self._items)
+        """A read-only snapshot of the stored payloads, by digest."""
+
+        with self._lock:
+            return MappingProxyType(dict(self._items))
 
 
 class FileSystemArtifactStore:

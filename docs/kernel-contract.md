@@ -584,6 +584,11 @@ So validation done for one thread's request is never reused by another's, and
 the answer does not depend on whether the interpreter copies contexts into new
 threads.
 
+Databases on several threads may share one artifact store. Each shipped store
+checks and stores a digest in one step -- `InMemoryArtifactStore` under a lock,
+`FileSystemArtifactStore` under a per-digest file lock -- so a digest rebound
+to different bytes raises `ValueError` however two puts interleave.
+
 ## Snapshot Serialization and Store Keys
 
 The kernel derives deterministic content keys from the `Snapshot` union —
@@ -613,7 +618,8 @@ rebound to different bytes; `contains` reports presence, defaulting to
 `save_checkpoint(store=...)`, or `load_checkpoint(..., store=...)` is validated
 against the protocol at that call, and a missing method, or an explicit
 protocol subclass implementing neither `get` nor `put`, raises `TypeError` at
-injection. `InMemoryArtifactStore.keys()` returns a read-only view.
+injection. `InMemoryArtifactStore.keys()` returns a read-only snapshot of the
+stored payloads by digest; call it again to see later puts.
 
 `Database.save_checkpoint(store=None) -> str` serialises the current query and
 resource records — snapshot bytes, call snapshots, resource parameters,

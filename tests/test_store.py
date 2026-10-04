@@ -10,6 +10,7 @@ from queue import Empty
 from typing import Any, TypeAlias, cast
 
 import pytest
+from _rendezvous import Rendezvous, run_in_threads
 
 from pyinc import (
     ArtifactStore,
@@ -261,6 +262,71 @@ def test_in_memory_store_keys_view_is_read_only() -> None:
     with pytest.raises(ValueError, match="collision"):
         store.put(digest, b"different")
     assert store.get(digest) == payload
+
+
+class _HeldItems(dict[str, bytes]):
+    """The store's backing map, holding a lookup at the race's window.
+
+    It answers from before the hold, as a thread preempted there would.
+    """
+
+    def __init__(self, rendezvous: Rendezvous) -> None:
+        super().__init__()
+        self._rendezvous = rendezvous
+
+    def get(self, key: str, default: Any = None) -> Any:
+        value = super().get(key, default)
+        self._rendezvous.point()
+        return value
+
+
+def test_in_memory_store_refuses_a_conflicting_put_that_races_the_first() -> None:
+    """Two puts of one digest with different bytes: exactly one is refused.
+
+    Unlocked, both found the digest absent, both stored, and the second
+    overwrote the first, so the rebinding the protocol requires `put` to
+    refuse went through silently.
+    """
+
+    rendezvous = Rendezvous()
+    store = InMemoryArtifactStore()
+    store._items = _HeldItems(rendezvous)
+    store._lock = rendezvous.lock()  # type: ignore[assignment]
+    digest = "a" * 64
+
+    def put(payload: bytes) -> str:
+        try:
+            store.put(digest, payload)
+        except ValueError:
+            return "refused"
+        return "stored"
+
+    outcomes = run_in_threads(lambda: put(b"one"), lambda: put(b"two"))
+
+    assert sorted(cast(list[str], outcomes)) == ["refused", "stored"]
+    winner = b"one" if outcomes[0] == "stored" else b"two"
+    assert store.get(digest) == winner
+
+
+def test_in_memory_store_keys_can_be_iterated_while_another_thread_stores() -> None:
+    """`keys()` is a snapshot, so a put made during the iteration cannot break it.
+
+    It used to be a live view of the backing dict, and iterating it while
+    another thread stored raised "dictionary changed size during iteration".
+    """
+
+    store = InMemoryArtifactStore()
+    store.put("0" * 64, b"zero")
+    store.put("1" * 64, b"one")
+
+    snapshot = store.keys()
+    seen = []
+    for digest in snapshot:
+        seen.append(digest)
+        run_in_threads(lambda: store.put("2" * 64, b"two"))
+
+    assert seen == ["0" * 64, "1" * 64]
+    assert set(store.keys()) == {"0" * 64, "1" * 64, "2" * 64}
 
 
 # ---------------------------------------------------------------------------

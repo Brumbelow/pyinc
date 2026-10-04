@@ -74,6 +74,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   agreed, but an out-of-contract rewrite of the adapter between two
   derivations would have left databases in one process disagreeing. The first
   digest published is now the one every database uses.
+- `InMemoryArtifactStore` refuses a digest rebound to different bytes even
+  when two threads put it at once. `put` looked for the digest and stored it
+  in two steps, so two puts could both find it absent and the second
+  overwrote the first without the `ValueError` the store protocol requires;
+  on a free-threaded build, eight threads putting one digest let a
+  conflicting put through in 186 rounds of 2000. `put` now looks and stores
+  under the store's lock. `keys()` returns a snapshot copied under that lock
+  rather than a live view, which raised `RuntimeError` when iterated while
+  another thread stored; call it again to see later puts.
 
 ### Changed
 
