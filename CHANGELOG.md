@@ -49,13 +49,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   delivered. A request now belongs to the thread that opened it and ends when
   its scope does; `pyinc.integrations.request_scope` follows the same rule for
   its `once_per_request` memo. The thread is told by a token that dies with it,
-  not by its ident, which a later thread can be given once it exits.
-- `WorkspaceSession.close()` no longer removes the mirror while a watcher
-  thread is still running. A `PollingWorkspaceWatcher` thread dropped its own
-  reference as it wound down, so a `stop()` arriving in that window found
-  nothing to join and returned early; on a free-threaded build about one close
-  in ten hit it. The reference now lasts until the thread has exited, and a
-  stopped watcher can still be started again.
+  not by its ident, which a later thread can be given once it exits. On every
+  build, a thread that a query body starts and that outlives the query also
+  stops joining the query's ended request.
+- `WorkspaceSession.close()` waits for a watcher thread that is still finishing
+  before it removes the mirror. A `PollingWorkspaceWatcher` thread dropped its
+  own reference as it wound down, so a `stop()` in that window found nothing
+  to join, and `close()` removed the mirror under a live thread. On a
+  free-threaded build about one close in ten hit this. The thread now keeps
+  its reference until it exits, and `start()` refuses while the previous
+  thread is alive. That also fixes a restart that raced the old thread's exit
+  and left the watcher out of the session, so `close()` never stopped it. A
+  stopped watcher can still be started again. A callback that runs past
+  `stop()`'s five-second join still outlives `close()`, which prints a warning.
 - A query that captures `os.getcwd` or `os.getcwdb` by name once a `Database`
   exists (`from os import getcwd`) is fingerprinted again, as in 4.0. The
   working-directory guard put a wrapper in their place, a closure over
