@@ -29,7 +29,6 @@ from typing import Any
 
 import pytest
 
-import pyinc
 from pyinc import Database, InMemoryArtifactStore, UntrackedReadError, explain_query_captures
 from pyinc import runtime as pyinc_runtime
 from pyinc.runtime import _GUARDED_NAMES, _guarded_name, _GuardedEnviron, _is_guarded_name
@@ -705,7 +704,7 @@ def test_a_name_bound_before_the_first_database_keeps_the_unguarded_original(
     """
     script = tmp_path / "bound_early_fixture.py"
     script.write_text(_BEFORE_THE_FIRST_DATABASE, encoding="utf-8")
-    src = str(Path(pyinc.__file__).resolve().parent.parent)
+    src = str(Path(pyinc_runtime.__file__).resolve().parent.parent)
     env = {**os.environ, "PYTHONPATH": src, "PYTHONDONTWRITEBYTECODE": "1"}
     env["PYINC_GUARDED_NAME"] = "value"
     proc = subprocess.run(
@@ -885,7 +884,7 @@ def test_the_guard_installs_whole_around_whatever_holds_a_guarded_name(tmp_path:
     """
     script = tmp_path / "replaced_before_first_database.py"
     script.write_text(_REPLACED_BEFORE_THE_FIRST_DATABASE, encoding="utf-8")
-    src = str(Path(pyinc.__file__).resolve().parent.parent)
+    src = str(Path(pyinc_runtime.__file__).resolve().parent.parent)
     env = {**os.environ, "PYTHONPATH": src, "PYTHONDONTWRITEBYTECODE": "1"}
     proc = subprocess.run(
         [sys.executable, str(script)], capture_output=True, text=True, env=env, check=False
@@ -1121,7 +1120,7 @@ def test_a_guarded_name_put_back_after_the_first_database_is_guarded_again(
     """
     script = tmp_path / "patched_while_first_database_is_created.py"
     script.write_text(_PATCHED_WHILE_THE_FIRST_DATABASE_IS_CREATED, encoding="utf-8")
-    src = str(Path(pyinc.__file__).resolve().parent.parent)
+    src = str(Path(pyinc_runtime.__file__).resolve().parent.parent)
     env = {**os.environ, "PYTHONPATH": src, "PYTHONDONTWRITEBYTECODE": "1"}
     proc = subprocess.run(
         [sys.executable, str(script)], capture_output=True, text=True, env=env, check=False
