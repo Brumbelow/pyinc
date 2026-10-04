@@ -692,6 +692,34 @@ def test_windows_directory_handles_stay_open_until_operation_finishes() -> None:
     assert api.closed == [4, 3, 2, 1]
 
 
+def test_threads_asking_at_once_share_one_windows_api_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Threads that find no Win32 boundary at once all get the one built.
+
+    Each used to build its own, and the threads could go on using different
+    ones. The boundary here is a stand-in, so the cell runs on every platform.
+    """
+
+    rendezvous = Rendezvous()
+    built: list[object] = []
+
+    class _Boundary:
+        def __init__(self) -> None:
+            rendezvous.point()
+            built.append(self)
+
+    monkeypatch.setattr(safe_fs_module, "_WindowsApi", _Boundary)
+    monkeypatch.setattr(safe_fs_module, "_WINDOWS_API", None)
+    monkeypatch.setattr(safe_fs_module, "_WINDOWS_API_LOCK", rendezvous.lock(), raising=False)
+
+    first, second = run_in_threads(safe_fs_module._windows_api, safe_fs_module._windows_api)
+
+    assert len(built) == 1
+    assert first is built[0]
+    assert second is built[0]
+
+
 def test_worker_exception_diagnostics_preserve_operating_system_details() -> None:
     cause = OSError(errno.EMFILE, "too many open files", "store.lock")
     error = ArtifactStoreError("outer failure")

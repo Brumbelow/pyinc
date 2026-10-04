@@ -83,6 +83,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under the store's lock. `keys()` returns a snapshot copied under that lock
   rather than a live view, which raised `RuntimeError` when iterated while
   another thread stored; call it again to see later puts.
+- On Windows, threads whose first store, action or lock-file operation lands at
+  the same moment share one Win32 boundary. Each that found none built its
+  own, loading `kernel32` and declaring its function prototypes again, and
+  the threads could go on using different ones; it is now built once, under a
+  lock.
 
 ### Changed
 

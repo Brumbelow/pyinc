@@ -18,6 +18,7 @@ import os
 import secrets
 import stat
 import struct
+import threading
 from pathlib import Path, PureWindowsPath
 from typing import Any, BinaryIO, cast
 
@@ -287,13 +288,22 @@ class _WindowsApi:
 
 
 _WINDOWS_API: _WindowsApi | None = None
+# Built under a lock so that threads asking at once share one boundary. Without
+# it, each thread that found none built its own, loading kernel32 and setting
+# up its function prototypes again, and the threads could go on using
+# different ones.
+_WINDOWS_API_LOCK = threading.Lock()
 
 
 def _windows_api() -> _WindowsApi:
     global _WINDOWS_API
-    if _WINDOWS_API is None:
-        _WINDOWS_API = _WindowsApi()
-    return _WINDOWS_API
+    api = _WINDOWS_API
+    if api is not None:
+        return api
+    with _WINDOWS_API_LOCK:
+        if _WINDOWS_API is None:
+            _WINDOWS_API = _WindowsApi()
+        return _WINDOWS_API
 
 
 def _windows_error_code(error: OSError) -> int | None:
