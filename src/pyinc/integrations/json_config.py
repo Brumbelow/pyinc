@@ -92,39 +92,39 @@ class _JsonSurrogateKeyError(ValueError):
     pass
 
 
-# Object and array nesting is capped before parsing because every section re-emits
-# the dot path of all its ancestors: `json_sections_payload` grows with the square
-# of the nesting depth, so this cap is what bounds the depth-driven growth of the
-# *cache*, not just the parse. `xml_config` caps `_MAX_XML_DEPTH` for the same
-# reason and against the same budget — at the key length that budget is stated for,
-# a document at the cap must not cache more than ~1 MiB. Width at shallow depth is
-# bounded by none of that: a document of many sibling objects two levels deep is
-# accepted and can cache past the budget.
+# Object and array nesting is capped before parsing. Every section re-emits the
+# dot path of all its ancestors, so `json_sections_payload` grows with the square
+# of the nesting depth. The cap bounds the depth-driven growth of the cache as
+# well as the parse. `xml_config` caps `_MAX_XML_DEPTH` for the same reason and
+# against the same budget: at the key length the budget is stated for, a document
+# at the cap caches at most ~1 MiB. Width at shallow depth stays unbounded. A
+# document of many sibling objects two levels deep is accepted and can cache past
+# the budget.
 #
-# The budget is what puts the cap at 200: measured with 20-character keys, a
-# document at this cap caches 832 KB of section payload text (422 KB of it section
-# names); at 256 levels, the cap `xml_config` carries, the same document would
-# cache 1.33 MiB, over budget. XML sits higher under one budget because an XML
-# element emits its path once where a JSON object emits it twice, as its own
-# section name and again in its parent's `subsections`. What gets cached is a flat
-# tuple of `(name, keys, subsections)` triples whose own nesting does not grow with
-# the document's, so nesting costs cache size and nothing else. 200 is an order of
+# The budget sets the cap at 200. Measured with 20-character keys, a document at
+# this cap caches 832 KB of section payload text (422 KB of it section names). At
+# 256 levels, the cap `xml_config` carries, the same document would cache
+# 1.33 MiB, over budget. XML sits higher under one budget because an XML element
+# emits its path once. A JSON object emits it twice: as its own section name and
+# again in its parent's `subsections`. The cache holds a flat tuple of
+# `(name, keys, subsections)` triples that stays flat however deep the document
+# goes, so nesting costs cache size and nothing else. 200 is an order of
 # magnitude deeper than any real configuration document.
 _MAX_JSON_DEPTH = 200
 
-# Every byte that cannot change the nesting depth, so that only quotes and brackets
-# are left to walk. Backslash escape pairs go first, separately: dropping just the
-# escaped character would let a `\uXXXX` key leave a bare `\"` behind and swallow
-# the quote that ends the string.
+# Every byte other than quotes and brackets. Deleting them leaves only the bytes
+# that change the nesting depth. Backslash escape pairs are removed first, as
+# whole pairs. Dropping only the escaped character would let a `\uXXXX` key leave
+# a bare `\"` behind, which swallows the quote that ends the string.
 _NON_STRUCTURAL = bytes(byte for byte in range(256) if byte not in b'{}[]"')
 
 
 def _text_nesting_depth(text: str) -> int:
     """Report the deepest object/array nesting in `text` without recursing.
 
-    Well-formed JSON yields the exact depth the scanner would descend to. Input
-    that is not well-formed yields an estimate, and is rejected either way; what
-    matters is that neither answer depends on the caller's remaining stack.
+    For well-formed JSON this is the depth the scanner would descend to. For
+    malformed input it is an estimate, and that input is rejected anyway. Both
+    answers are independent of the caller's remaining stack.
     """
     encoded = text.encode("utf-8", "surrogatepass")
     unescaped = re.sub(rb"\\.", b"", encoded, flags=re.DOTALL)
@@ -165,9 +165,9 @@ def _json_object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise _DuplicateJsonKeyError(f"duplicate JSON object key {key!r}")
         if not _is_unicode_text(key):
             # An object key reaches the cached payload verbatim, as its own
-            # section name and inside every descendant's dot path, where a lone
-            # surrogate is not a value `freeze` can snapshot. Values are safe
-            # because they reach the payload through `repr`, which escapes one.
+            # section name and inside every descendant's dot path. `freeze`
+            # refuses a lone surrogate there. Values are safe because they reach
+            # the payload through `repr`, which escapes a surrogate.
             raise _JsonSurrogateKeyError(f"JSON object key {key!r} contains an unpaired surrogate")
         result[key] = value
     return result
@@ -176,8 +176,8 @@ def _json_object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _is_unicode_text(value: str) -> bool:
     """Report whether `value` is made only of Unicode scalar values.
 
-    The ASCII test is the fast path an overwhelming majority of keys take; only
-    a key that leaves it pays for an encode.
+    Most keys are ASCII and take the fast path. Only a non-ASCII key pays for an
+    encode.
     """
     if value.isascii():
         return True
@@ -206,20 +206,20 @@ def _load_json(text: str) -> Any:
 # Helpers
 # ---------------------------------------------------------------------------
 
-# CPython's JSON scanner checks the interpreter's recursion budget, so which frame
-# runs out — and so which message it raises — depends on how much stack the caller
-# had already spent, not on the file. The same document reports "...while decoding
-# a JSON object..." or "...while decoding a JSON array..." from different call
-# depths. This payload is cached, so a fixed string is emitted instead.
+# CPython's JSON scanner checks the interpreter's recursion budget. Which frame
+# runs out, and so which message it raises, depends on how much stack the caller
+# had already spent. The same document reports "...while decoding a JSON
+# object..." or "...while decoding a JSON array..." from different call depths.
+# This payload is cached, so it carries a fixed string.
 #
-# `_MAX_JSON_DEPTH` is measured off the text rather than by descending, so runaway
-# nesting is rejected as a decode error before the scanner ever runs, and a
+# `_MAX_JSON_DEPTH` is checked with a flat scan of the text, so runaway nesting
+# is rejected as a decode error before the scanner runs. A
 # RecursionError here means only that the caller entered with its stack nearly
-# spent. That closes the message axis, not the outcome axis: the scanner still
-# descends once per container level, so whether a document within the cap parses
-# at all remains a property of the call site as well as of the file. The residual
-# is disclosed in `docs/integration-contract.md`. `xml_config` emits the same shape
-# for the same reason and carries the same residual.
+# spent. The fixed string settles the message. The outcome stays open: the
+# scanner still descends once per container level, so whether a document within
+# the cap parses depends on the call site as well as the file.
+# `docs/integration-contract.md` discloses this residual. `xml_config` emits the
+# same shape for the same reason and has the same residual.
 _STACK_EXHAUSTED_DIAGNOSTIC = "JSON parsing exhausted the interpreter stack"
 
 
@@ -249,13 +249,12 @@ def _walk_sections(
 ) -> list[JsonSectionPayload]:
     """Collect every object in sorted pre-order, deepest nesting included.
 
-    Keys are visited in sorted order at every level rather than in the order the
-    document wrote them, so a file that writes `"b"` before `"a"` still yields
-    `<root>`, `a`, `b`.
+    Keys are visited in sorted order at every level, whatever order the document
+    wrote them in. A file that writes `"b"` before `"a"` still yields `<root>`,
+    `a`, `b`.
 
-    The traversal keeps its own stack rather than recursing, so the payload a
-    document produces depends only on the document — never on how much of the
-    interpreter's recursion budget the caller has already spent.
+    The traversal keeps an explicit stack, so the payload depends only on the
+    document, whatever recursion budget the caller has left.
     """
     sections: list[JsonSectionPayload] = []
     pending: list[tuple[dict[str, Any], str]] = [(data, prefix)]
@@ -300,7 +299,7 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: Payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -333,7 +332,7 @@ def json_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition
+# Layer 2: Composition
 # ---------------------------------------------------------------------------
 
 
@@ -345,7 +344,7 @@ def json_analysis_payload(db: Database, path: str) -> JsonAnalysisPayload:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: Entrypoints
 # ---------------------------------------------------------------------------
 
 

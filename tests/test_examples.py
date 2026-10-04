@@ -18,9 +18,9 @@ def _run_example(name: str) -> None:
 def _load_example(name: str) -> dict[str, Any]:
     """The example's module namespace, without running the body under its __main__ guard.
 
-    The run name is the file's own stem rather than "__main__", so the guard at
-    the foot of the file does not run the demo; the module body still runs,
-    which is what defines `main` and the queries it uses.
+    The run name is the file's own stem, so the `__main__` guard at the foot of
+    the file skips the demo. The module body still runs and defines `main` and
+    the queries it uses.
     """
     return runpy.run_path(str(EXAMPLES_DIR / name), run_name=Path(name).stem)
 
@@ -28,8 +28,9 @@ def _load_example(name: str) -> dict[str, Any]:
 def _make_dist_info(site_dir: Path, name: str, version: str, *, top_level: str) -> Path:
     """The metadata an installer leaves in site-packages for one distribution.
 
-    Written here rather than imported from the dependency-check tests: the two
-    files would then share a collection and a future, for nine lines.
+    Written here instead of imported from the dependency-check tests. An
+    import would tie the two files' collection and maintenance together, for
+    nine lines.
     """
     dist_info = site_dir / f"{name}-{version}.dist-info"
     dist_info.mkdir(parents=True, exist_ok=True)
@@ -46,8 +47,7 @@ def _examples_tree() -> dict[str, tuple[int, int]]:
 
     Bytecode caches are left out. Another example puts this directory on the
     import path and imports the package beside it, which writes a cache here on
-    every run; counting those would report that example's write rather than
-    this one's.
+    every run. Counting those caches would blame this example for that write.
     """
     return {
         str(path.relative_to(EXAMPLES_DIR)): (path.stat().st_size, path.stat().st_mtime_ns)
@@ -60,9 +60,9 @@ def _emitted(root: Path) -> dict[str, bytes]:
     """The files an action reconciled into a root, without its ledger.
 
     The ledger's name is a digest of the tool, so a warm root and a fresh root
-    each hold one -- but its contents carry a digest of the output root's path
-    and the directory's own inode, so two roots never produce equal ledger bytes
-    and comparing them would report a difference that is not one.
+    each hold one. Its contents carry a digest of the output root's path and
+    the directory's own inode, so the ledger bytes of two roots always differ.
+    Comparing them would report a false difference.
     """
     return {
         str(path.relative_to(root)): path.read_bytes()
@@ -93,11 +93,10 @@ def test_untracked_escape_hatch_demo_runs(capsys: pytest.CaptureFixture[str]) ->
     output = capsys.readouterr().out
     assert "first=" in output
     assert "second=" in output
-    # The two clock values are deliberately not compared. The clock this example
-    # reads is coarser than the gap between the two calls on some platforms, so
-    # a difference is not something to assert. What the example proves is that
-    # the second call ran instead of reusing the first, and that the reason it
-    # reported is carried on the node.
+    # The two clock values stay uncompared. On some platforms the example's
+    # clock is coarser than the gap between the two calls, so the values may
+    # be equal. The example proves that the second call ran instead
+    # of reusing the first, and that the node carries the reason it reported.
     assert "last_decision=executed" in output
     assert "untracked_reasons=('time.monotonic_ns()',)" in output
 
@@ -156,10 +155,9 @@ def test_checkpoint_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "run3_last_recompute=executed" in output
     assert "run3_executions=1" in output
 
-    # The two labels above name the field the demo reads, and the values they
-    # print are equal to `last_decision` at both runs -- so the assertions on
-    # the output alone hold just as well if the reads are switched. These pin
-    # the reads themselves.
+    # The two labels above name the field the demo reads. The values they print
+    # equal `last_decision` at both runs, so the output assertions would still
+    # pass if the reads were switched. These lines pin the reads themselves.
     source = (EXAMPLES_DIR / "checkpoint_demo.py").read_text(encoding="utf-8")
     assert "node2.last_recompute" in source
     assert "node3.last_recompute" in source
@@ -184,9 +182,9 @@ def test_calc_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
     assert "unrelated_edit_executions=0" in output
     reuses = re.search(r"unrelated_edit_reuses=(\d+)", output)
     assert reuses is not None
-    # The count itself is a kernel counter and has moved before now. What the
-    # example claims is that the reconcile did real work without running a
-    # query body, and any reuse at all witnesses that.
+    # The count is a kernel counter and has changed before. The example claims
+    # that the reconcile did real work without running a query body, and any
+    # reuse at all shows that.
     assert int(reuses.group(1)) > 0
     assert "comment_edit_backdated=True" in output
     assert "removed_emit_deleted=('base.out',)" in output
@@ -208,8 +206,8 @@ def test_codegen_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
 def test_undeclared_imports_reports_the_promised_finding(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The example exists to name an import the environment has and the project does not declare."""
-    # Returning at all is half the witness: the example raises SystemExit when
+    """The example names an import the environment has and the project leaves undeclared."""
+    # Returning at all is half the witness. The example raises SystemExit when
     # it cannot produce the finding, so reaching the assertions below means it
     # produced one.
     _run_example("undeclared_imports.py")
@@ -221,7 +219,7 @@ def test_undeclared_imports_reports_the_promised_finding(
 def test_undeclared_imports_fails_when_the_environment_cannot_answer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An example that cannot show its finding says so, rather than reporting that it found nothing and exiting 0."""
+    """An example that cannot show its finding says so and exits nonzero."""
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     _make_dist_info(site_dir, "unrelated", "1.0", top_level="unrelated")
@@ -237,7 +235,7 @@ def test_undeclared_imports_fails_when_the_environment_cannot_answer(
 def test_mini_analyzer_prints_named_fields_and_leaves_the_tree_alone(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The example analyzes a workspace it builds, not the directory it lives in."""
+    """The example analyzes a workspace it builds and leaves its own directory unchanged."""
     before = _examples_tree()
 
     _run_example("mini_analyzer.py")
@@ -251,22 +249,22 @@ def test_mini_analyzer_prints_named_fields_and_leaves_the_tree_alone(
 
 
 def test_correctness_demo_runs(capsys: pytest.CaptureFixture[str]) -> None:
-    """Phase 2 is the point: equal counts backdate, so the query above them is reused."""
+    """Phase 2 shows the key behaviour: equal counts backdate, so the query above them is reused."""
     _run_example("correctness_demo.py")
     output = capsys.readouterr().out
 
-    # The comment-only edit changed the bytes, so read_source ran again; both
-    # counts recomputed the same numbers and were backdated, which is why the
-    # query above them was reused. All four nodes are read in both fields --
-    # the decision and the last recompute -- because the two can move apart.
-    # None of these substrings carries the temporary path or the per-arguments
-    # identity tag, both of which differ on every run.
+    # The comment-only edit changed the bytes, so read_source ran again. Both
+    # counts recomputed the same numbers and were backdated, so the query above
+    # them was reused. All four nodes are read in both fields (the decision and
+    # the last recompute) because the two can differ. These substrings leave
+    # out the temporary path and the per-arguments identity tag, which change
+    # on every run.
     assert "summary decision: reused" in output
     assert "summary(): reused [last_recompute=executed]" in output
     assert "count_functions(): backdated [last_recompute=backdated]" in output
     assert "count_imports(): backdated [last_recompute=backdated]" in output
     assert "read_source(): reused [last_recompute=executed]" in output
-    # Phase 3: a structural edit does make the counts run again.
+    # Phase 3: a structural edit makes the counts run again.
     assert "Result: 2 functions, 3 imports" in output
     # Phases 4 and 5 end in refusals, and each prints the error it caught.
     assert "Caught UntrackedReadError:" in output
@@ -280,11 +278,10 @@ def test_symbol_lookup_follows_the_whole_re_export_chain(
     _run_example("symbol_lookup.py")
     output = capsys.readouterr().out
 
-    # Only the file name is read: the example writes its modules into a
-    # temporary directory whose path is different on every run. The capture is
-    # everything to the end of the line rather than the first run of
-    # non-whitespace, because a temporary path is allowed to contain a space
-    # and truncating it there would name a different file.
+    # Only the file name is read, because the example writes its modules into a
+    # temporary directory with a new path on every run. The capture runs to the
+    # end of the line because a temporary path may contain a space, and
+    # stopping at the first whitespace would name a different file.
     match = re.search(r"Defining path:\s+(.+)", output)
     assert match is not None
     assert Path(match.group(1).strip()).name == "origin.py"
@@ -298,26 +295,25 @@ def test_symbol_lookup_follows_the_whole_re_export_chain(
 def test_applicable_requirements_evaluates_the_markers(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The markers are evaluated against the interpreter that is running, not a fixed table."""
+    """The markers are evaluated against the running interpreter."""
     _run_example("applicable_requirements.py")
     output = capsys.readouterr().out
 
-    # Derived from the running interpreter rather than written down, so these
-    # two read the same on every version the project supports.
+    # Derived from the running interpreter, so these two hold on every version
+    # the project supports.
     assert f"python_version = {sys.version_info.major}.{sys.version_info.minor}" in output
     assert f"Active interpreter: {sys.version.split()[0]}" in output
-    # The marker arithmetic is the effect this example exists to show. Both of
-    # these markers are false on every interpreter the project supports
-    # (requires-python is >=3.11), and the two requirements whose markers hold
-    # are reported applicable.
+    # The example exists to show the marker arithmetic. Both of these markers
+    # are false on every interpreter the project supports (requires-python is
+    # >=3.11), and the two requirements whose markers hold are reported
+    # applicable.
     assert re.search(r"backports-zoneinfo\s+False\s+not_applicable", output) is not None
     assert re.search(r"tomli\s+False\s+not_applicable", output) is not None
     assert re.search(r"requests\s+True\s+", output) is not None
     assert re.search(r"packaging\s+True\s+", output) is not None
-    # Not read, deliberately: the Status and the Detail of an applicable
-    # requirement. Those report what the surrounding environment happens to
-    # have installed -- a version that differs between environments, and an
-    # absence that depends on which extras were installed.
+    # The Status and Detail of an applicable requirement stay unchecked. They
+    # report what the environment has installed: a version that varies between
+    # environments, and an absence that depends on which extras were installed.
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -339,9 +335,8 @@ def test_calc_demo_warm_matches_fresh(
     )
 
     # The warm database reconciles once, then the included file changes a value
-    # every emitted output depends on. A comment-only edit would not do: it
-    # backdates, so both roots would hold the same bytes however badly the warm
-    # database had failed to notice it.
+    # every emitted output depends on. A comment-only edit would backdate, so
+    # both roots would hold the same bytes even if the warm database missed it.
     warm_out = tmp_path / "warm"
     warm = database(mode=mode)
     calc_emit.reconcile(warm, str(root), root=warm_out)
@@ -352,7 +347,7 @@ def test_calc_demo_warm_matches_fresh(
     fresh = database(mode=mode)
     calc_emit.reconcile(fresh, str(root), root=fresh_out)
 
-    # Two empty roots would compare equal, so the fresh root must not be empty.
+    # Two empty roots would compare equal, so check that the fresh root has files.
     assert _emitted(fresh_out)
     assert _emitted(warm_out) == _emitted(fresh_out)
 
@@ -373,7 +368,7 @@ def test_action_reconcile_demo_warm_matches_fresh(
     src = tmp_path / "src.txt"
     src.write_text("hi", encoding="utf-8")
 
-    # The warm root reaches the final state through an intermediate one: the
+    # The warm root reaches the final state through an intermediate one. The
     # source changed and a declared name was replaced, so the warm root must
     # both rewrite alpha.txt and delete the beta.txt it once owned.
     warm_out = tmp_path / "warm"
@@ -389,7 +384,7 @@ def test_action_reconcile_demo_warm_matches_fresh(
     fresh.set(names, ("alpha", "gamma"))
     emit.reconcile(fresh, str(src), root=fresh_out)
 
-    # Two empty roots would compare equal, so the fresh root must not be empty.
+    # Two empty roots would compare equal, so check that the fresh root has files.
     assert _emitted(fresh_out)
     assert _emitted(warm_out) == _emitted(fresh_out)
 
@@ -404,10 +399,9 @@ def test_checkpoint_demo_reload_matches_fresh(
 ) -> None:
     """A reloaded database answers what a from-scratch one answers, without running the queries."""
     # runpy reuses this interpreter, so the save and the reload below happen in
-    # one process. What this reads is the reload: the same values, without the
-    # queries running again. Carrying a checkpoint across a real process
-    # boundary is what tests/test_checkpoint_cross_process.py exercises, and it
-    # says so in its own words.
+    # one process. This test checks the reload: the same values, with no query
+    # running again. tests/test_checkpoint_cross_process.py covers carrying a
+    # checkpoint across a real process boundary.
     namespace = _load_example("checkpoint_demo.py")
     database = namespace["Database"]
     store = namespace["FileSystemArtifactStore"](str(tmp_path / "store"))
@@ -420,8 +414,8 @@ def test_checkpoint_demo_reload_matches_fresh(
     saver.get(scaled, str(data))
     key = saver.save_checkpoint()
 
-    # Saved and loaded in one mode: a checkpoint warms only a database running
-    # the mode that wrote it, and loading across modes is refused outright.
+    # Saved and loaded in one mode. A checkpoint warms only a database running
+    # the mode that wrote it, and a load across modes is refused.
     reloaded = database(mode, store=store)
     reloaded.set(multiplier, 3)
     reloaded.load_checkpoint(key)
@@ -439,4 +433,4 @@ def test_checkpoint_demo_reload_matches_fresh(
     printed = capsys.readouterr().out
     assert "run2_result=15" in printed
     assert "run3_result=50" in printed
-    # checkpoint_key is content-addressed and differs on every run: never pinned.
+    # checkpoint_key is content-addressed and differs on every run, so it stays unpinned.

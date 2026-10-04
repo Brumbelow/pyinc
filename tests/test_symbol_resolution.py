@@ -552,9 +552,9 @@ def test_comment_only_edit_backdates_symbol_table(tmp_path: Path) -> None:
     second = module_symbol_table(db, root, path)
 
     assert first == second
-    # `last_recompute` is the discriminating half: `changed_at` is unmoved
+    # `last_recompute` is the discriminating check. `changed_at` stays put
     # whether or not the read below this node compares by a coarser token, so
-    # the marker is what says the payload -- not the read -- absorbed the edit.
+    # only the marker can tell whether the payload or the read absorbed the edit.
     record = db.inspect(module_symbol_table_payload, str(path))
     assert record.last_recompute == "backdated", (
         f"last_recompute={record.last_recompute} | an equal table across a "
@@ -591,8 +591,8 @@ def test_signature_change_triggers_downstream_reresolution(tmp_path: Path) -> No
 
 
 def _module_scope_end(tree: ScopeTree) -> SourcePosition:
-    # The module scope is the one scope without a parent. `scopes` carries no
-    # documented ordering, so indexing it would be an assumption, not a lookup.
+    # The module scope is the one scope without a parent. `scopes` has no
+    # documented order, so search for it by that property.
     return next(scope for scope in tree.scopes if scope.parent_id is None).range.end
 
 
@@ -640,11 +640,12 @@ def test_blank_line_edit_scope_tree_matches_fresh(mode: str, tmp_path: Path) -> 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_trailing_space_edit_scope_tree_matches_fresh(mode: str, tmp_path: Path) -> None:
-    # Neither document ends in a newline, and that is what makes the cell
-    # discriminating. `DocumentMap` splits on `\r\n?|\n`, so a file that does end
-    # in one carries a trailing empty element and the module scope ends at
-    # `(line, 0)` whatever spaces precede it -- written as `x = 1\n` -> `x = 1   \n`
-    # the two ends are equal before the fix and the cell proves nothing.
+    # Both documents lack a trailing newline, which makes the cell
+    # discriminating. `DocumentMap` splits on `\r\n?|\n`, so a file ending in a
+    # newline carries a trailing empty element, and its module scope ends at
+    # `(line, 0)` whatever spaces precede it. Written as `x = 1\n` -> `x = 1   \n`,
+    # the two ends would match even before the fix and the cell would prove
+    # nothing.
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "a.py"
@@ -891,11 +892,11 @@ def test_resolve_symbol_matches_fresh_recomputation_over_edits(mode: str, tmp_pa
         assert resolve_symbol(incremental, root, b, "foo") == resolve_symbol(fresh, root, b, "foo")
 
 
-# The repo's own `addopts = "-q --tb=no"` allows one line per failure, and both
-# node ids below are longer than that line on their own: measured, a red in
-# either prints `FAILED <node id>` and none of the message beneath it. The
-# messages are still written single-line and discriminator-first, and reading
-# one off a failure means re-running that node with `-o addopts="" --tb=long`.
+# The repo's `addopts = "-q --tb=no"` allows one line per failure, and each
+# node id below is longer than that line by itself. Measured: a failure in
+# either prints `FAILED <node id>` and drops the message beneath it. The
+# messages are still single-line and discriminator-first. To read one, re-run
+# that node with `-o addopts="" --tb=long`.
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -908,19 +909,17 @@ def test_scope_tree_matches_fresh_recomputation_over_edits(mode: str, tmp_path: 
     contents = (
         # Every neighbouring pair below parses to the same tree while the
         # document geometry moves, except at the two steps marked as controls.
-        # The controls are what keep the row from exercising only the shapes a
-        # parse cannot see.
+        # The controls make the row also exercise shapes a parse can see.
         "def foo() -> int:\n    return 1\n",
         "def foo() -> int:\n    return 1\n# trailing comment\n",
         "def foo() -> int:\n    return 1\n",
         "def foo() -> int:\n    return 1\n\n\n",
         "def foo() -> int:\n    return 2\n",  # control: the body changes
         "def foo() -> int:\n    return 2",
-        # Neither this document nor the one above it ends in a newline, and
-        # that is what makes the step discriminating: `DocumentMap` splits on
-        # `\r\n?|\n`, so a document that does end in one carries a trailing
-        # empty element and the module scope ends at `(line, 0)` whatever
-        # spaces precede it.
+        # This document and the one above both lack a trailing newline, which
+        # makes the step discriminating. `DocumentMap` splits on `\r\n?|\n`,
+        # so a document ending in a newline carries a trailing empty element,
+        # and its module scope ends at `(line, 0)` whatever spaces precede it.
         "def foo() -> int:\n    return 2   ",
         "def foo(x: int) -> int:\n    return x   ",  # control: the signature changes
     )
@@ -937,20 +936,19 @@ def test_scope_tree_matches_fresh_recomputation_over_edits(mode: str, tmp_path: 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_scope_tree_matches_the_text_it_is_built_from(mode: str, tmp_path: Path) -> None:
-    # The pair guarded here is (lexical, source): the ranges memo is keyed on a
-    # scope tree and a source text read within one request, which is what the
+    # This guards the (lexical, source) pair. The ranges memo is keyed on a
+    # scope tree and a source text read within one request, which the
     # `request_scope` below reproduces. A value-level divergence between the
-    # two is not reachable today -- an exhaustive position sweep over six
-    # parse-invisible edit shapes in three modes, 18 sweeps, found 0
-    # divergences, because the module scope's end is the only range derived
-    # from document geometry and the range builder derives every range it
-    # returns from the parse -- bindings, plus star-import aliases -- so the
-    # range that moves never reaches an answer. What is reachable is the pair
-    # being drawn from two revisions of the file, which is what comparing the
-    # tree against the text this same request returned rules out. Comparing
-    # that text against the bytes on disk would not: it matches either way,
-    # because the fresh snapshot is stored before the comparison decides
-    # anything.
+    # two is unreachable today. An exhaustive position sweep over six
+    # parse-invisible edit shapes in three modes (18 sweeps) found 0
+    # divergences. The module scope's end is the only range derived from
+    # document geometry. The range builder derives every range it returns from
+    # the parse (bindings plus star-import aliases), so the range that moves
+    # never reaches an answer. What can happen is the pair coming from
+    # two revisions of the file. Comparing the tree against the text this same
+    # request returned rules that out. Comparing that text against the bytes on
+    # disk would match either way, because the fresh snapshot is stored before
+    # the comparison decides anything.
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "a.py"
@@ -1072,12 +1070,14 @@ def test_find_references_crosses_re_export(tmp_path: Path) -> None:
 def test_find_references_resolves_attribute_chain_on_imported_module(
     tmp_path: Path,
 ) -> None:
-    """``import a; a.foo()`` is counted as a reference to ``foo``: the
-    occurrence walker remembers that ``foo`` is the rightmost attribute of a
-    ``Name``-LHS access, and the verifier resolves the LHS through the
+    """``import a; a.foo()`` counts as a reference to ``foo``.
+
+    The occurrence walker records that ``foo`` is the rightmost attribute of a
+    ``Name``-LHS access. The verifier resolves the LHS through the
     ``import_alias`` to the target's defining module before checking the
-    attribute name. Only the ``foo`` portion is reported, with offsets that
-    point at the attribute span (not the leading ``a.``)."""
+    attribute name. Only the ``foo`` portion is reported, with offsets on the
+    attribute span after the leading ``a.``.
+    """
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text(
@@ -1093,16 +1093,18 @@ def test_find_references_resolves_attribute_chain_on_imported_module(
     assert len(non_decl) == 1
     ref = non_decl[0]
     assert ref.range.start.line == 2
-    # ``a.foo()`` — the ``foo`` portion is at cols 2-5.
+    # In ``a.foo()``, the ``foo`` portion is at cols 2-5.
     assert (ref.range.start.character, ref.range.end.character) == (2, 5)
 
 
 def test_find_references_resolves_attribute_chain_on_aliased_import(
     tmp_path: Path,
 ) -> None:
-    """``import a as alias`` followed by ``alias.foo()`` is counted: the LHS
-    ``alias`` resolves through ``import_alias`` (with `import_source_module="a"`)
-    to module ``a``."""
+    """``import a as alias`` followed by ``alias.foo()`` counts as a reference.
+
+    The LHS ``alias`` resolves through ``import_alias`` (with
+    `import_source_module="a"`) to module ``a``.
+    """
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text(
@@ -1118,16 +1120,19 @@ def test_find_references_resolves_attribute_chain_on_aliased_import(
     assert len(non_decl) == 1
     ref = non_decl[0]
     assert ref.range.start.line == 2
-    # ``alias.foo()`` — the ``foo`` portion is at cols 6-9.
+    # In ``alias.foo()``, the ``foo`` portion is at cols 6-9.
     assert (ref.range.start.character, ref.range.end.character) == (6, 9)
 
 
 def test_find_references_attribute_chain_through_module_re_export(
     tmp_path: Path,
 ) -> None:
-    """When the LHS module re-exports the target via ``from c import foo``,
-    ``M.foo()`` still resolves: the verifier resolves ``foo`` *inside* the LHS
-    module (so it follows ``from_import_alias`` to the original definition)."""
+    """``M.foo()`` resolves when the LHS module re-exports the target.
+
+    The re-export is ``from c import foo``. The verifier resolves ``foo``
+    *inside* the LHS module, so it follows ``from_import_alias`` to the
+    original definition.
+    """
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "c.py").write_text(
@@ -1141,11 +1146,11 @@ def test_find_references_attribute_chain_through_module_re_export(
     result = find_references(db, root, root / "c.py", "foo")
 
     non_decl = [r for r in result.references if not r.is_declaration]
-    # The `from c import foo` line in m.py is not represented as a Name in
-    # the AST (it's an ast.alias under ast.ImportFrom), so it contributes no
-    # occurrence. The reference comes solely from ``m.foo()`` in b.py — the
-    # verifier resolves ``m`` to module m, then resolves ``foo`` inside m,
-    # which follows the from-import re-export back to the canonical c.foo.
+    # The `from c import foo` line in m.py is an ast.alias under
+    # ast.ImportFrom in the AST, with no Name node, so it contributes no
+    # occurrence. The one reference is ``m.foo()`` in b.py. The verifier
+    # resolves ``m`` to module m, then resolves ``foo`` inside m, which follows
+    # the from-import re-export back to the canonical c.foo.
     assert len(non_decl) == 1
     ref = non_decl[0]
     assert ref.path.endswith("b.py")
@@ -1156,10 +1161,12 @@ def test_find_references_attribute_chain_through_module_re_export(
 def test_find_references_does_not_match_attribute_on_unrelated_module(
     tmp_path: Path,
 ) -> None:
-    """``import other; other.foo()`` is NOT a reference to ``a.foo`` even when
-    ``other`` also defines a top-level ``foo`` — the verification resolves
-    ``foo`` inside ``other``'s module and the resulting definition site doesn't
-    match the search target."""
+    """``import other; other.foo()`` is excluded from ``a.foo``'s references.
+
+    This holds even when ``other`` also defines a top-level ``foo``. The
+    verifier resolves ``foo`` inside ``other``'s module, and that definition
+    site differs from the search target.
+    """
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text(
@@ -1182,10 +1189,12 @@ def test_find_references_does_not_match_attribute_on_unrelated_module(
 def test_find_references_skips_attribute_on_non_module_local(
     tmp_path: Path,
 ) -> None:
-    """``x = SomeClass(); x.foo()`` is not a reference to a module-level
-    ``foo`` — the LHS ``x`` resolves to a definition site (not a module), so
-    the verifier ignores the attribute access (no false positive on the
-    rightmost attr name)."""
+    """``x = SomeClass(); x.foo()`` is excluded from a module-level ``foo``'s references.
+
+    The LHS ``x`` resolves to a definition site. The verifier checks attribute
+    access only on modules, so it ignores this one, and the rightmost
+    attribute name yields no false positive.
+    """
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text(
@@ -1243,9 +1252,10 @@ def test_find_references_excludes_shadowing_locals(
 def test_find_references_includes_forward_ref_strings_in_param_and_return_annotation(
     tmp_path: Path,
 ) -> None:
-    """Forward-reference strings in parameter and return annotations are
-    parsed and walked; the inner names are reported as references with
-    offsets that point inside the quotes."""
+    """Forward-reference strings in parameter and return annotations are parsed and walked.
+
+    The inner names are reported as references, with offsets inside the quotes.
+    """
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
@@ -1263,7 +1273,7 @@ def test_find_references_includes_forward_ref_strings_in_param_and_return_annota
         key=lambda r: (r.path, r.range.start),
     )
     assert len(non_decl) == 2
-    # `def g(a: 'Foo') -> 'Foo':` — opening quotes at col 9 and 19.
+    # `def g(a: 'Foo') -> 'Foo':` has opening quotes at cols 9 and 19.
     param_ref, return_ref = non_decl
     assert param_ref.range.start.line == 2
     assert (param_ref.range.start.character, param_ref.range.end.character) == (10, 13)
@@ -1315,7 +1325,7 @@ def test_find_references_includes_forward_ref_strings_in_class_variable_annotati
     assert len(non_decl) == 1
     ref = non_decl[0]
     assert ref.range.start.line == 3
-    # `    x: 'Foo'` — opening quote at col 7, name at cols 8-11.
+    # `    x: 'Foo'` has its opening quote at col 7 and the name at cols 8-11.
     assert (ref.range.start.character, ref.range.end.character) == (8, 11)
 
 
@@ -1384,17 +1394,18 @@ def test_find_references_includes_forward_ref_strings_in_union(
     assert len(non_decl) == 1
     ref = non_decl[0]
     assert ref.range.start.line == 2
-    # `def g(a: 'Foo | None') -> None:` — opening quote at col 9, name at 10-13.
+    # `def g(a: 'Foo | None') -> None:` has the quote at col 9, the name at 10-13.
     assert (ref.range.start.character, ref.range.end.character) == (10, 13)
 
 
 def test_find_references_resolves_attribute_chain_in_string_annotation(
     tmp_path: Path,
 ) -> None:
-    """``import a; def g(x: 'a.Foo'): ...`` counts as a reference to
-    ``a.Foo``: the string-annotation walker emits a hint=``"a"`` occurrence,
-    and the same import-aware verification used for unquoted attribute access
-    accepts it."""
+    """``import a; def g(x: 'a.Foo'): ...`` counts as a reference to ``a.Foo``.
+
+    The string-annotation walker emits a hint=``"a"`` occurrence, and the
+    import-aware verification used for unquoted attribute access accepts it.
+    """
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
@@ -1410,7 +1421,7 @@ def test_find_references_resolves_attribute_chain_in_string_annotation(
     assert len(non_decl) == 1
     ref = non_decl[0]
     assert ref.range.start.line == 2
-    # `def g(x: 'a.Foo') -> None:` — inside the string, `Foo` is at cols 12-15.
+    # In `def g(x: 'a.Foo') -> None:`, the `Foo` in the string is at cols 12-15.
     assert (ref.range.start.character, ref.range.end.character) == (12, 15)
 
 
@@ -1437,8 +1448,10 @@ def test_find_references_includes_forward_ref_strings_double_quoted(
 
 
 def test_find_references_skips_malformed_string_annotation(tmp_path: Path) -> None:
-    """A string annotation that doesn't parse as an expression is silently
-    skipped — the call doesn't raise, and no spurious reference is emitted."""
+    """A string annotation that fails to parse as an expression is silently skipped.
+
+    The call completes without raising and emits no spurious reference.
+    """
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
@@ -1452,8 +1465,8 @@ def test_find_references_skips_malformed_string_annotation(tmp_path: Path) -> No
     result = find_references(db, root, root / "a.py", "Foo")
 
     non_decl = [r for r in result.references if not r.is_declaration]
-    # Only the unquoted `Foo()` on line 4 is reported; the malformed
-    # annotation contributes nothing (and doesn't crash).
+    # Only the unquoted `Foo()` on line 4 is reported. The malformed
+    # annotation adds no reference and raises no error.
     assert len(non_decl) == 1
     assert non_decl[0].range.start.line == 3
 
@@ -1461,9 +1474,11 @@ def test_find_references_skips_malformed_string_annotation(tmp_path: Path) -> No
 def test_find_references_skips_string_annotation_with_escape_sequence(
     tmp_path: Path,
 ) -> None:
-    """A string annotation containing an escape sequence is intentionally
-    skipped — the source span and decoded value lengths differ, so offset
-    reconstruction would be ambiguous. Documented limitation."""
+    """A string annotation containing an escape sequence is skipped.
+
+    The source span and the decoded value differ in length, so offset
+    reconstruction would be ambiguous. This is a documented limitation.
+    """
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
@@ -1519,17 +1534,19 @@ def test_find_references_skips_implicit_string_concatenation_annotation(
     result = find_references(db, root, root / "a.py", "Foo")
 
     non_decl = [r for r in result.references if not r.is_declaration]
-    # The implicitly-concatenated literal collapses to `'Foo'` at the AST
-    # level but the source span is longer than the decoded value; we bail.
+    # The implicitly concatenated literal collapses to `'Foo'` in the AST, but
+    # the source span is longer than the decoded value, so the walker skips it.
     assert non_decl == []
 
 
 def test_find_references_finds_type_checking_imported_name_in_string_annotation(
     tmp_path: Path,
 ) -> None:
-    """TYPE_CHECKING-imported names referenced by string annotations work:
-    the existing TYPE_CHECKING import collection plus the new string scan
-    compose without special wiring."""
+    """References in string annotations resolve names imported under TYPE_CHECKING.
+
+    The TYPE_CHECKING import collection and the string scan compose with no
+    special wiring.
+    """
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "a.py").write_text("class Foo:\n    pass\n", encoding="utf-8")
@@ -1550,7 +1567,7 @@ def test_find_references_finds_type_checking_imported_name_in_string_annotation(
     assert len(non_decl) == 1
     ref = non_decl[0]
     assert ref.range.start.line == 5
-    # `    x: 'Foo'` on line 6 — opening quote at col 7, name at 8-11.
+    # `    x: 'Foo'` on line 6 has the quote at col 7 and the name at 8-11.
     assert (ref.range.start.character, ref.range.end.character) == (8, 11)
 
 
@@ -1937,9 +1954,10 @@ def test_class_model_captures_class_body_and_init_members(mode: str, tmp_path: P
         assert member.defining_path == str(path)
         assert member.defining_class == "Widget"
 
-    # A single base is recorded but not followed in Stage 1.
+    # Stage 1 records a single base without following it.
     assert model.unresolved_bases == ("Base",)
-    # An unresolvable base name is not a depth-cap truncation.
+    # An unresolvable base counts as unresolved, so `truncated_bases` stays
+    # empty.
     assert model.truncated_bases == ()
 
 
@@ -1980,7 +1998,7 @@ def test_class_model_self_attrs_dedup_lowest_lineno_wins(tmp_path: Path) -> None
     model = class_model(Database(mode="strict"), root, path, "C")
     by_name = {member.name: member for member in model.members}
     assert by_name["x"].kind == "instance_variable"
-    assert by_name["x"].range.start.line == 2  # __init__ occurrence, not reset()
+    assert by_name["x"].range.start.line == 2  # the __init__ occurrence wins over reset()
     assert by_name["y"].range.start.line == 5
 
 
@@ -1995,7 +2013,7 @@ def test_class_model_requires_literal_self_first_param(tmp_path: Path) -> None:
 
     model = class_model(Database(mode="strict"), root, path, "C")
     names = {member.name for member in model.members}
-    assert names == {"m"}  # `this.z` is not an instance attribute
+    assert names == {"m"}  # `this.z` is skipped: the first parameter is `this`
 
 
 def test_class_model_skips_nested_def_and_class(tmp_path: Path) -> None:
@@ -2160,8 +2178,8 @@ def test_comment_only_edit_backdates_class_models(tmp_path: Path) -> None:
     second = class_model(db, root, path, "Widget")
 
     assert first == second
-    # `last_recompute` is the discriminating half here too; `changed_at` alone
-    # is unmoved either way.
+    # As above, `last_recompute` is the discriminating check. `changed_at`
+    # alone stays put either way.
     record = db.inspect(class_models_for_file, str(path))
     assert record.last_recompute == "backdated", (
         f"last_recompute={record.last_recompute} | an equal set of models "
@@ -2174,9 +2192,9 @@ def test_comment_only_edit_backdates_class_models(tmp_path: Path) -> None:
 
 
 def test_class_model_member_carries_no_class_kind(tmp_path: Path) -> None:
-    # Instance attributes must never leak into the module symbol table; the two
-    # views stay disjoint. A nested class in the body is not a `class_model`
-    # member kind.
+    # Instance attributes stay out of the module symbol table, so the two views
+    # stay disjoint. `class_model` has no member kind for a nested class in the
+    # body.
     root = tmp_path / "workspace"
     root.mkdir()
     path = root / "widget.py"
@@ -2194,7 +2212,7 @@ def test_class_model_member_carries_no_class_kind(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# class_model (inheritance flattening — Stage 3)
+# class_model (inheritance flattening, Stage 3)
 # ---------------------------------------------------------------------------
 
 
@@ -2240,7 +2258,7 @@ def test_class_model_inherits_members_from_workspace_base(tmp_path: Path) -> Non
     assert by_name["base_attr"].kind == "instance_variable"
     assert by_name["base_attr"].defining_class == "Base"
 
-    # A followed workspace base does not linger in unresolved_bases.
+    # A followed workspace base leaves unresolved_bases empty.
     assert model.unresolved_bases == ()
 
 
@@ -2262,7 +2280,7 @@ def test_class_model_derived_shadows_base(tmp_path: Path) -> None:
 
     model = class_model(Database(mode="strict"), root, derived, "Derived")
     renders = [m for m in model.members if m.name == "render"]
-    # First-definition-wins: exactly one `render`, the derived override.
+    # First definition wins: one `render`, the derived override.
     assert len(renders) == 1
     assert renders[0].range.start.line == 4  # def render in derived.py
     assert renders[0].defining_class == "Derived"
@@ -2282,7 +2300,7 @@ def test_class_model_non_workspace_base_is_unresolved(tmp_path: Path) -> None:
 
     model = class_model(Database(mode="strict"), root, path, "D")
     names = {member.name for member in model.members}
-    # No stdlib dict members leak in; only D's own members remain.
+    # Only D's own members appear. Stdlib dict members stay out.
     assert names == {"own", "x"}
     assert model.unresolved_bases == ("OrderedDict",)
 
@@ -2304,13 +2322,13 @@ def test_class_model_base_cycle_terminates(tmp_path: Path) -> None:
     names = {member.name for member in model.members}
     # Cycle guard terminates and both classes contribute their own members.
     assert names == {"am", "bm"}
-    # Nothing is lost to a cycle, so nothing is reported as truncated.
+    # A cycle loses no members, so truncated_bases stays empty.
     assert model.truncated_bases == ()
 
 
 def test_class_model_base_depth_cap(tmp_path: Path) -> None:
-    # A linear chain C0(C1(...(C9))). Traversal is bounded at MAX_BASE_DEPTH = 8:
-    # C0..C7 (depths 0..7) contribute members; C8/C9 are past the cap.
+    # A linear chain C0(C1(...(C9))). MAX_BASE_DEPTH = 8 bounds the traversal.
+    # C0..C7 (depths 0..7) contribute members, and C8 and C9 are past the cap.
     root = tmp_path / "workspace"
     path = root / "chain.py"
     lines = []
@@ -2350,7 +2368,7 @@ def test_class_model_subscripted_base_unwraps(tmp_path: Path) -> None:
     assert {m.name for m in d_model.members} == {"dm", "bm"}
     assert d_model.unresolved_bases == ()
 
-    # `*mixins` is a starred base — encoded as text, never followed.
+    # `*mixins` is a starred base, encoded as text and never followed.
     e_model = class_model(db, root, path, "E")
     assert {m.name for m in e_model.members} == {"em"}
     assert e_model.unresolved_bases == ("*mixins",)
@@ -2379,8 +2397,8 @@ def test_class_model_same_module_nested_base(tmp_path: Path) -> None:
 
 
 def test_class_model_diamond_first_definition_wins(tmp_path: Path) -> None:
-    # A(B, C); B and C both define `hit`. Depth-first, left-to-right, first wins:
-    # B's `hit` is kept (B is the first base visited).
+    # A(B, C), where B and C both define `hit`. Depth-first, left to right,
+    # first wins: B's `hit` is kept because B is the first base visited.
     root = tmp_path / "workspace"
     path = root / "diamond.py"
     _write_file(
@@ -2416,7 +2434,7 @@ def test_class_model_base_file_comment_edit_reused(tmp_path: Path) -> None:
     first = class_model(db, root, derived, "Derived")
     base_changed = db.inspect(class_models_for_file, str(base)).changed_at
 
-    # A trailing-comment edit to the BASE file leaves the AST attributes
+    # A trailing-comment edit to the base file leaves the AST attributes
     # untouched, so class_models_for_file(base) backdates and the derived
     # flattened model is reused unchanged.
     base.write_text(base_src + "# trailing comment\n", encoding="utf-8")
@@ -2454,7 +2472,7 @@ def test_class_model_unrelated_edit_leaves_model_green(tmp_path: Path) -> None:
     db = Database(mode="strict")
     first = class_model(db, root, derived, "Derived")
 
-    # Editing an unrelated file's body must not disturb the derived model.
+    # Editing an unrelated file's body leaves the derived model unchanged.
     other.write_text("def unrelated() -> int:\n    return 999\n", encoding="utf-8")
     second = class_model(db, root, derived, "Derived")
 
@@ -2485,11 +2503,11 @@ def test_class_model_subclass_never_reports_fewer_members_than_its_base(
 ) -> None:
     # `Root(L1, Mid)`. The L spine reaches `X` at depth 6, so `X`'s own base
     # chain runs out of budget and `XBase2` is cut. `Mid` reaches the same `X`
-    # at depth 2, where the whole chain fits — but recording `X` as merely
-    # "visited" on the deep reach made the shallow one a no-op. `Root` then
-    # reported strictly fewer members than `Mid`, one of its own direct bases,
-    # and said nothing about the loss. Nothing here is past the cap (see
-    # `truncated_bases` below), so `Root` must cover `Mid` exactly.
+    # at depth 2, where the whole chain fits. Recording `X` as merely "visited"
+    # on the deep reach made the shallow reach a no-op. `Root` then reported
+    # strictly fewer members than `Mid`, one of its own direct bases, and
+    # reported no loss. Everything here is within the cap (see
+    # `truncated_bases` below), so `Root` must cover all of `Mid`.
     root = tmp_path / "workspace"
     path = root / "spine.py"
     _write_file(
@@ -2525,9 +2543,10 @@ def test_class_model_revisits_only_strictly_shallower_reaches(
 ) -> None:
     # `Root(A1, B1)`. The A spine reaches `Near` at depth 7, leaving its base
     # `Deep` at the cap. A B spine of the same length reaches `Near` at depth 7
-    # again — not strictly shallower, so nothing is re-walked and the loss
-    # stands and is reported. One link shorter reaches `Near` at depth 6, where
-    # `Deep` fits, so the walk is redone and the truncation report retracted.
+    # again. That reach is at the same depth, so nothing is re-walked and the
+    # reported loss stands. A B spine one link shorter reaches `Near` at depth
+    # 6, where `Deep` fits, so the walk is redone and the truncation report
+    # retracted.
     root = tmp_path / "workspace"
     path = root / "spines.py"
     _write_file(
@@ -2549,8 +2568,7 @@ def test_class_model_revisits_only_strictly_shallower_reaches(
 
 def test_class_model_names_the_base_the_depth_cap_stopped(tmp_path: Path) -> None:
     # The same linear chain C0(C1(...(C9))) as the cap test, read from three
-    # starting points. Whatever the cap drops is named in `truncated_bases`
-    # instead of vanishing.
+    # starting points. `truncated_bases` names whatever the cap drops.
     root = tmp_path / "workspace"
     path = root / "chain.py"
     lines = []
@@ -2575,9 +2593,9 @@ def test_class_model_names_the_base_the_depth_cap_stopped(tmp_path: Path) -> Non
 
 
 def test_class_model_truncated_base_reports_the_alias_as_written(tmp_path: Path) -> None:
-    # The same chain split one class per file, each importing the next as `Up`.
-    # Like `unresolved_bases`, the report names the base expression at the edge
-    # the cap stopped — the alias, not the class it resolves to.
+    # The same chain, split one class per file, each importing the next as
+    # `Up`. Like `unresolved_bases`, the report names the base expression at
+    # the edge the cap stopped: the alias as written, before resolution.
     root = tmp_path / "workspace"
     for index in range(10):
         body = f"class C{index}:\n    def m{index}(self) -> None:\n        pass\n"
@@ -2599,7 +2617,7 @@ def test_class_model_wide_diamond_keeps_every_reachable_member(tmp_path: Path) -
     # reachable at several depths and the deepest reach comes first. Each one
     # sits within `MAX_BASE_DEPTH` of `N0` by its shortest path, so a
     # depth-aware walk recovers all twenty member sets. The recorded depth
-    # strictly decreases per revisit, which is what keeps this shape from
+    # strictly decreases on each revisit, which keeps this shape from
     # re-walking exponentially.
     levels, width = 20, 6
     root = tmp_path / "workspace"
@@ -2618,9 +2636,9 @@ def test_class_model_wide_diamond_keeps_every_reachable_member(tmp_path: Path) -
 
 
 def test_class_model_multi_class_cycle_terminates(tmp_path: Path) -> None:
-    # A three-class cycle entered from outside it, plus a self-inheriting class.
-    # The depth-aware map still cuts both: a second lap around a cycle is never
-    # strictly shallower than the first, so it is never re-walked.
+    # A three-class cycle entered from outside, plus a self-inheriting class.
+    # The depth-aware map still cuts both. A second lap around a cycle is at
+    # least as deep as the first, so the walk skips it.
     root = tmp_path / "workspace"
     path = root / "cycle.py"
     _write_file(
@@ -2646,9 +2664,10 @@ def test_class_model_multi_class_cycle_terminates(tmp_path: Path) -> None:
 def test_class_model_shallower_override_wins_over_revisited_base(tmp_path: Path) -> None:
     # `Root(A1, Repo, Widget)`. The A spine reaches `X` at depth 7, so `X`'s
     # base `Z` sits at the cap and is cut. `Repo` re-reaches `X` at depth 2, so
-    # `Z` is walked at depth 3 — ahead of `Widget` at depth 1, which overrides
-    # `save`. Arrival order alone would hand `save` to the base `Z`; the
-    # winning definition is the one at the shortest inheritance distance.
+    # `Z` is walked at depth 3. That walk comes before `Widget` at depth 1,
+    # which overrides `save`. Arrival order alone would hand `save` to the base
+    # `Z`. The winning definition is the one at the shortest inheritance
+    # distance.
     root = tmp_path / "workspace"
     path = root / "deep.py"
     _write_file(
@@ -2673,14 +2692,14 @@ def test_class_model_shallower_override_wins_over_revisited_base(tmp_path: Path)
         ),
         return_annotation="int",
     )
-    # Nothing is actually lost, so neither report fires.
+    # Every member survives, so both reports stay empty.
     assert model.truncated_bases == ()
     assert model.unresolved_bases == ()
 
 
 def test_class_model_diamond_prefers_the_nearer_definition(tmp_path: Path) -> None:
-    # A plain diamond well inside the cap: `Z.m` sits at depth 2 through `A`
-    # while `W.m` sits at depth 1, so `W` wins even though depth-first arrival
+    # A plain diamond well inside the cap. `Z.m` sits at depth 2 through `A`
+    # and `W.m` at depth 1, so `W` wins even though depth-first arrival
     # reaches `Z` first.
     root = tmp_path / "workspace"
     path = root / "diamond.py"
@@ -2707,9 +2726,9 @@ def test_class_model_diamond_prefers_the_nearer_definition(tmp_path: Path) -> No
 
 
 def test_class_model_equal_depth_tie_goes_left_to_right(tmp_path: Path) -> None:
-    # Nearest-definition-wins only reorders across depths; at equal depth the
-    # depth-first left-to-right arrival still decides, both for direct bases
-    # and for definitions one level further out.
+    # Nearest definition wins only across depths. At equal depth, depth-first
+    # left-to-right arrival still decides, for direct bases and for
+    # definitions one level further out.
     root = tmp_path / "workspace"
     path = root / "tie.py"
     _write_file(
@@ -2737,7 +2756,7 @@ def test_class_model_equal_depth_tie_goes_left_to_right(tmp_path: Path) -> None:
 def test_class_model_truncation_reports_every_stopped_edge(tmp_path: Path) -> None:
     # `Root(A1, B1)`. Both spines end one step short of the same class `Deep`,
     # each importing it under its own alias, so the cap stops two distinct
-    # edges onto one site. Both edges are named, not just the first.
+    # edges onto one site. The report names both edges.
     root = tmp_path / "workspace"
     _write_file(root / "deep.py", "class Deep:\n    def dm(self) -> None:\n        pass\n")
     for prefix, alias in (("A", "Alpha"), ("B", "Beta")):
@@ -2768,8 +2787,8 @@ def test_class_model_truncation_reports_every_stopped_edge(tmp_path: Path) -> No
 def _ordinary_bindings(db: Database, tmp_path: Path) -> set[str]:
     """Names bound by an ordinary module beside the hostile one.
 
-    A refusal is only worth pinning together with the evidence that it refused
-    the one path and left the database able to answer the next one.
+    A refusal is worth pinning only with evidence that it refused that one path
+    and left the database able to answer the next.
     """
     ordinary = tmp_path / "ordinary.py"
     ordinary.write_text("VALUE = 1\n")
@@ -2778,12 +2797,12 @@ def _ordinary_bindings(db: Database, tmp_path: Path) -> set[str]:
 
 @posix_only
 def test_a_scope_tree_of_a_looping_path_is_refused_by_type(tmp_path: Path) -> None:
-    # A link pointing at itself names no source file, and asking the platform
-    # to canonicalize it answers differently by interpreter version: the older
-    # ones raise a loop error, the newer ones hand back a path that is still a
-    # link. Canonicalizing through the tracked path makes the answer the same
-    # everywhere and the entry point refuses it in its own voice, rather than
-    # letting whatever the interpreter happened to raise reach the caller.
+    # A link pointing at itself names no source file. The platform's
+    # canonicalization of it varies by interpreter version: older versions
+    # raise a loop error, and newer ones return a path that is still a link.
+    # Canonicalizing through the tracked path gives the same answer everywhere,
+    # so the entry point raises its own refusal and the interpreter's error
+    # stays away from the caller.
     db = Database()
     looping = make_symlink_loop(tmp_path / "loop")
 
@@ -2795,9 +2814,9 @@ def test_a_scope_tree_of_a_looping_path_is_refused_by_type(tmp_path: Path) -> No
 
 @posix_only
 def test_a_scope_tree_of_a_null_path_is_refused_by_type(tmp_path: Path) -> None:
-    # A path string holding a NUL names no file either, and the sentence the
-    # platform composes for it is spelled differently again by version. The
-    # refusal is the same one the looping path gets, for the same reason.
+    # A path string holding a NUL also names no file, and the platform's
+    # message for it also varies by version. It gets the same refusal as the
+    # looping path, for the same reason.
     db = Database()
 
     with pytest.raises(UnsupportedValueError, match="Path cannot be resolved"):

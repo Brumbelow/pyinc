@@ -14,7 +14,7 @@ class UntrackedReadError(PyIncError):
 
 
 class UnsupportedValueError(PyIncError):
-    """Raised when a value cannot cross a cached boundary safely."""
+    """Raised when a value is unsafe to cross a cached boundary."""
 
 
 class AdapterContractError(PyIncError):
@@ -50,7 +50,7 @@ class CheckpointManifestError(CheckpointError, ValueError):
 
 
 class CheckpointIntegrityError(CheckpointManifestError):
-    """Raised when checkpoint bytes do not match their content address."""
+    """Raised when checkpoint bytes fail to match their content address."""
 
 
 class CheckpointModeError(CheckpointError, ValueError):
@@ -70,7 +70,7 @@ class ActionManifestError(ActionError, ValueError):
 
 
 class ActionLockTimeoutError(ActionError, TimeoutError):
-    """Raised when an action cannot acquire its filesystem lock in time."""
+    """Raised when an action times out acquiring its filesystem lock."""
 
 
 class ArtifactStoreError(PyIncError):
@@ -82,4 +82,4 @@ class ArtifactStoreKeyError(ArtifactStoreError, ValueError):
 
 
 class ArtifactStoreLockError(ArtifactStoreError, TimeoutError):
-    """Raised when an artifact-store lock cannot be acquired."""
+    """Raised when acquiring an artifact-store lock times out."""

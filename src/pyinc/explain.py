@@ -59,13 +59,13 @@ def _is_resource_handle(value: Any) -> bool:
 
 
 def _unbound_capture_owner() -> None:
-    """Stand-in for the query of a capture classified on its own.
+    """Stand-in owner for a capture classified outside a query.
 
-    The kernel's payload builders take the owning query function to resolve
-    attribute-access paths for module state held by a capture and to name the
-    query when they reject. A capture classified outside a query has no such
-    function; this one accesses nothing, so a non-stdlib module held by such a
-    capture is reported as used dynamically.
+    The kernel's payload builders take the owning query function for two jobs:
+    resolving attribute-access paths for module state a capture holds, and
+    naming the query in a refusal. A capture classified outside a query has no
+    such function. This stand-in accesses nothing, so a non-stdlib module held
+    by such a capture is reported as used dynamically.
     """
 
 
@@ -79,10 +79,10 @@ def _capture_kind(value: Any) -> str:
     from .runtime import _is_guarded_name
 
     if _is_guarded_name(value):
-        # A wrapper the ambient-read guard installed in place of a
+        # The ambient-read guard installed this wrapper in place of a
         # standard-library callable (`from os import getcwd` once a Database
-        # exists): the kernel pins it by the name it guards before any other
-        # arm sees it.
+        # exists). The kernel pins it by the name it guards, ahead of every
+        # other arm.
         return "guarded"
     if isinstance(value, Query):
         return "query"
@@ -95,15 +95,15 @@ def _capture_kind(value: Any) -> str:
     if isinstance(value, FunctionType):
         return "function"
     if isinstance(value, MethodType):
-        # Above the __wrapped__ probe, as in the kernel, so a wraps-decorated
-        # method is the method it is rather than a callable object.
+        # Checked before the __wrapped__ probe, as in the kernel, so a
+        # wraps-decorated method is reported as a method.
         return "method"
     if isinstance(value, BuiltinFunctionType):
         return "builtin"
     if isinstance(value, type):
         return "type"
     if callable(value) and isinstance(getattr(value, "__wrapped__", None), FunctionType):
-        # Last of the callable shapes: what reaches here is a callable object
+        # Last of the callable shapes. What reaches here is a callable object
         # whose behavior lives in __call__ and instance state.
         return "callable"
     return "value"
@@ -116,15 +116,15 @@ def _classify_capture(
 
     The kernel folds a query function's defaults, closure cells, globals and
     custom attributes with `_captured_dependency_digest`, while the function
-    itself is on the stack of functions being folded; its annotations as
-    annotations, unless the body reads them back, when they are folded as the
-    other captures are. Each verdict here is that call's, made the same way,
-    so the report accepts what the kernel accepts -- a function the kernel
-    pins by its source, a container or a frozen dataclass holding a callable
-    -- and refuses what it refuses. Two arms are called one level down, at
-    the payload builder the kernel's digest wraps, because the digest only
-    reframes their refusals around the capture's name: the report keeps the
-    builder's own reason, such as a mutable dataclass's.
+    itself is on the stack of functions being folded. It folds annotations as
+    annotations. When the body reads them back, they fold like the other
+    captures. Each verdict here comes from the same call, made the same way.
+    So the report accepts what the kernel accepts (a function the kernel pins
+    by its source, a container or a frozen dataclass holding a callable) and
+    refuses what it refuses. Two arms are called one level down, at the payload
+    builder the kernel's digest wraps. The digest only reframes their refusals
+    around the capture's name, so the report keeps the builder's own reason,
+    such as a mutable dataclass's.
     """
     from .runtime import Database
 
@@ -201,14 +201,15 @@ def _handle_state_entry(name: str, type_name: str, error: Exception | None) -> C
 def _classify_handle_state(query: Any) -> list[CaptureInfo]:
     """Report the state a query handle carries beyond its contract fields.
 
-    The kernel folds a handle's own dictionary into query identity, so an
-    attribute written on the handle can refuse a query whose captures are all
-    clean, and a report that only ever looks at the function would call that
-    query accepted. Every verdict here is the kernel's own: each entry outside
-    the contract fields is folded by the builder the fold uses for one entry,
-    and a refusal that builder cannot reach -- a handle given a non-string
-    name, an annotation carrier or type parameters the fold rejects -- is
-    reported against the handle itself by folding the whole of it.
+    The kernel folds a handle's own dictionary into query identity. An
+    attribute written on the handle can therefore refuse a query whose captures
+    are all clean, and a report that looked only at the function would call
+    that query accepted. Every verdict here is the kernel's own. Each entry
+    outside the contract fields is folded by the builder the fold uses for one
+    entry. Some refusals are out of that builder's reach: a handle given a
+    non-string name, or an annotation carrier or type parameters the fold
+    rejects. Those are reported against the handle itself, by folding the whole
+    handle.
     """
 
     from .runtime import Database
@@ -244,11 +245,10 @@ def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
         raise TypeError("explain_query_captures() expects a function or @query-decorated callable.")
 
     results: list[CaptureInfo] = []
-    # Ahead of the capture set, and from the kernel's own detector: these loads
-    # reach namespace state no entry below can describe, and the kernel refuses
-    # them off the body before it folds a single capture. Reporting a clean
-    # capture set for such a body would describe a query the kernel will not
-    # accept.
+    # Reported first, from the kernel's own detector. These loads reach
+    # namespace state that no entry below can describe, and the kernel refuses
+    # them from the body before it folds any capture. A clean capture set for
+    # such a body would describe a query the kernel refuses.
     for offense in _reflective_namespace_offenses(target.__code__):
         results.append(
             CaptureInfo(

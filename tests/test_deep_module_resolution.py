@@ -54,9 +54,9 @@ def test_deep_module_resolution_stable_api() -> None:
     assert hasattr(integrations, "PthDirective")
     assert hasattr(integrations, "ResolvedModuleLocation")
 
-    # Cross-integration @query must NOT be re-exported.
+    # The cross-integration @query stays out of pyinc.integrations.
     assert not hasattr(integrations, "resolve_module_location")
-    # Experimental helpers must NOT be re-exported.
+    # So do the experimental helpers.
     assert not hasattr(integrations, "_deep_analysis_payload")
     assert not hasattr(integrations, "_pth_directives_payload")
     assert not hasattr(integrations, "_effective_search_paths_payload")
@@ -91,8 +91,8 @@ def test_relative_sys_path_entries_are_skipped_rather_than_read_through_the_cwd(
     """A relative entry names a directory through the working directory.
 
     A query may not read the working directory, so the walk skips such an
-    entry beside the empty one instead of resolving it -- and instead of
-    refusing the whole analysis.
+    entry, as it skips the empty one. It leaves the entry unresolved, and the
+    rest of the analysis goes ahead.
     """
     site = tmp_path / "site"
     site.mkdir()
@@ -115,8 +115,8 @@ def test_rooted_sys_path_entries_are_skipped_on_windows(
 ) -> None:
     """A rooted entry with no drive resolves on the working directory's drive.
 
-    Before 3.13 `ntpath.isabs` called it absolute; the walk skips it on every
-    version rather than letting the guard refuse the whole analysis.
+    Before 3.13 `ntpath.isabs` called it absolute. The walk skips it on every
+    version, so the guard never refuses the whole analysis over it.
     """
     site = tmp_path / "site"
     site.mkdir()
@@ -335,15 +335,16 @@ def test_a_pth_comment_edit_backdates_the_directives_payload(
     assert first == second
 
     # `query_profile()` records executions only, and `reset_statistics()` has
-    # just cleared it, so a query that was reused has no row at all -- there is
-    # no row carrying a zero to look for. A label reads `module:name[hash] name()`
-    # and a bare-name search would alias here, because `_all_pth_directives_payload`
-    # contains `_pth_directives_payload`; anchoring on `:name[` picks out the one
-    # meant. The read executes on the new bytes and the parse re-derives an equal
-    # set of directives from them, which is where the backdating now happens; the
-    # composition above them is left reused. The search-path queries beside it are
-    # not: `_raw_sys_path_entries` reports an untracked read, so it and the two
-    # payloads over it execute on every request whatever the .pth file says.
+    # cleared it, so a query that was reused has no row at all (no row carries
+    # a zero to look for). A label reads `module:name[hash] name()`. A bare-name
+    # search would alias here, because `_all_pth_directives_payload` contains
+    # `_pth_directives_payload`, so anchoring on `:name[` picks out the one
+    # meant. The read executes on the new bytes, and the parse re-derives an
+    # equal set of directives from them. That is where the backdating now
+    # happens, and the composition above them stays reused. The search-path
+    # queries beside it re-run: `_raw_sys_path_entries` reports an untracked
+    # read, so it and the two payloads over it execute on every request
+    # whatever the .pth file says.
     executed = [profile.query_label for profile in db.query_profile()]
     for name in ("_pth_file_text", "_pth_directives_payload"):
         assert any(f":{name}[" in label for label in executed), (
@@ -358,13 +359,13 @@ def test_a_pth_comment_edit_backdates_the_directives_payload(
 # Checkpoints
 # ---------------------------------------------------------------------------
 
-# The ordering other integrations use -- edit, drive the entrypoint so a stale
-# answer forms, then save -- is unconstructible here: this read compares the text
-# it hands back, so there is no answer that disagrees with the file to save. The
-# substitute edits the file after the save, which the reload has to notice. The
-# second arm is what keeps that honest: with no edit the saved answer and a fresh
-# one agree, and the row would pass on any tree at all. The CSV, environment-file
-# and XML suites carry the same substitute for the same reason.
+# Other integrations edit, drive the entrypoint so a stale answer forms, then
+# save. That ordering cannot be built here: this read compares the text it hands
+# back, so every answer agrees with the file and no stale one exists to save.
+# The substitute edits the file after the save, which the reload has to notice.
+# The second arm guards against a vacuous pass: with no edit the saved answer
+# and a fresh one agree, and the row would pass on any tree at all. The CSV,
+# environment-file and XML suites carry the same substitute for the same reason.
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -492,8 +493,8 @@ def test_namespace_resolution_tracks_symlink_retargeting(
     first = resolve_module_path(db, "nspkg")
     assert first.kind == "namespace-package"
 
-    # Retargeting the link splits the two contributions that canonicalized
-    # onto one directory, so the visited set no longer collapses them.
+    # Retargeting the link splits the two contributions that had canonicalized
+    # onto one directory, so the visited set now keeps both.
     link.unlink()
     link.symlink_to(third_site / "nspkg", target_is_directory=True)
 

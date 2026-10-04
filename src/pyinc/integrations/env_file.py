@@ -92,7 +92,6 @@ def _parse_env_lines(
         if not line or line.startswith("#"):
             continue
 
-        # Strip optional 'export ' prefix
         line = re.sub(_EXPORT_PREFIX_PAT, "", line)
 
         m = re.match(_LINE_PAT, line)
@@ -125,7 +124,7 @@ def _parse_env_lines(
             comment_idx = raw_value.find(" #")
             value = raw_value[:comment_idx].rstrip() if comment_idx >= 0 else raw_value
 
-        # Flag interpolation references as diagnostics (conservative)
+        # ${VAR} references stay unexpanded, so a value that contains one gets a diagnostic.
         if re.search(_INTERPOLATION_PAT, value):
             diagnostics.append(
                 (
@@ -150,7 +149,7 @@ def _parse_env_lines(
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: Payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -178,7 +177,7 @@ def env_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload,
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition
+# Layer 2: Composition
 # ---------------------------------------------------------------------------
 
 
@@ -190,7 +189,7 @@ def env_analysis_payload(db: Database, path: str) -> EnvAnalysisPayload:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: Entrypoints
 # ---------------------------------------------------------------------------
 
 

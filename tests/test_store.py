@@ -173,7 +173,7 @@ def test_in_memory_store_idempotent_put_with_same_bytes() -> None:
     payload = b"K2;N;"
     digest = "abc"
     store.put(digest, payload)
-    store.put(digest, payload)  # idempotent — must not raise
+    store.put(digest, payload)  # idempotent: the repeat put succeeds
     assert store.get(digest) == payload
 
 
@@ -195,8 +195,8 @@ def test_in_memory_store_satisfies_artifact_store_protocol() -> None:
 class _MinimalProtocolStore(ArtifactStore):
     """Explicit protocol subclass implementing only `get` and `put`.
 
-    `contains` is deliberately left inherited so the protocol's documented
-    default is what gets exercised, here and through a real database.
+    `contains` is left inherited on purpose, so these tests exercise the
+    protocol's documented default, here and through a real database.
     """
 
     def __init__(self) -> None:
@@ -240,8 +240,8 @@ def test_protocol_contains_default_matches_get() -> None:
 def test_protocol_stub_get_raises_instead_of_returning_none() -> None:
     store = _ContainsOnlyStore()  # type: ignore[abstract]
 
-    # A subclass that skips `get`/`put` is broken, not empty: reading has to
-    # fail where the omission is, not hand back a plausible `None`.
+    # A subclass that skips `get`/`put` is broken. Reading has to fail where
+    # the omission is. A plausible `None` would make it look like an empty store.
     with pytest.raises(NotImplementedError):
         store.get("0" * 64)
     with pytest.raises(NotImplementedError):
@@ -284,7 +284,7 @@ class _HeldItems(dict[str, bytes]):
 
 
 def test_in_memory_store_refuses_a_conflicting_put_that_races_the_first() -> None:
-    """Two puts of one digest with different bytes: exactly one is refused.
+    """Two puts of one digest with different bytes: one stores, one is refused.
 
     Unlocked, both found the digest absent, both stored, and the second
     overwrote the first, so the rebinding the protocol requires `put` to
@@ -632,11 +632,12 @@ def test_filesystem_store_wraps_invalid_root_as_typed_error() -> None:
 def test_a_resolve_that_fails_still_produces_a_typed_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Resolving a looping path raised on the interpreters this library still
-    # supports and stopped raising on the newer ones, so the handler is driven
-    # directly rather than through a shape only some interpreters produce.
-    # Patching resolve is class-wide, so every witness is taken before it is
-    # armed and the arming lasts exactly as long as the call under test.
+    # Resolving a looping path raised on the older interpreters this library
+    # still supports and stopped raising on the newer ones. So the test drives
+    # the handler directly, through a patched resolve, and avoids a shape only
+    # some interpreters produce. Patching resolve is class-wide, so every
+    # witness is taken before it is armed, and the arming lasts only for the
+    # call under test.
     root = tmp_path / "store"
     before = sorted(entry.name for entry in tmp_path.iterdir())
 
@@ -1218,8 +1219,8 @@ def test_write_through_store_raises_on_preseeded_wrong_bytes() -> None:
     store.put(digest, b"wrong bytes")
 
     # The write-through path persists a query's result as it is produced, so
-    # the store's refusal has to surface out of `get` rather than being
-    # swallowed by a presence check on bytes that would never decode.
+    # the store's refusal has to surface out of `get`. A presence check would
+    # find the bytes, which would never decode, and swallow the refusal.
     db = Database(store=store)
     with pytest.raises(ValueError, match="Digest collision"):
         db.get(write_through_constant)
@@ -1278,9 +1279,8 @@ def test_checkpoint_store_passed_to_save_and_load_directly() -> None:
 class _DuckStore:
     """Store-shaped object missing `contains` entirely.
 
-    Not a protocol subclass and not structurally complete, so it is the case
-    the shape check has to catch before the kernel reaches for the method
-    that is not there.
+    Neither a protocol subclass nor structurally complete, so the shape check
+    has to catch it before the kernel reaches for the missing method.
     """
 
     def __init__(self) -> None:
@@ -1307,9 +1307,9 @@ def test_database_rejects_a_store_missing_required_methods(door: str) -> None:
         with pytest.raises(TypeError, match="must implement the ArtifactStore protocol"):
             db.save_checkpoint(store=cast(Any, _DuckStore()))
     else:
-        # A well-formed key that is simply absent: the shape check has to fire
-        # ahead of the lookup, or the caller learns about the missing key
-        # instead of the unusable store.
+        # A well-formed key that is absent: the shape check has to fire ahead
+        # of the lookup, so the caller is told about the unusable store. A
+        # lookup first would report only the missing key.
         with pytest.raises(TypeError, match="must implement the ArtifactStore protocol"):
             db.load_checkpoint("ck" + "0" * 64, store=cast(Any, _DuckStore()))
 
@@ -1366,8 +1366,8 @@ def test_minimal_protocol_store_puts_once_per_distinct_digest() -> None:
     # bytes, so it repeats once per save under a single key.
     assert manifest_puts == [ck_key, ck_key, ck_key]
 
-    # Every other digest is content-addressed: three identical saves write
-    # each of them exactly once, not once per save.
+    # Every other digest is content-addressed, so three identical saves write
+    # each of them once in total.
     assert snapshot_puts, "no snapshot was persisted; the count below would be vacuous"
     assert sorted(snapshot_puts) == sorted(set(snapshot_puts))
 

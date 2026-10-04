@@ -1,6 +1,6 @@
-"""The ``calc`` engine: parser + incremental query graph + output action.
+"""The ``calc`` engine: parser, incremental query graph and output action.
 
-Grammar (line-oriented; nothing beyond this):
+The complete grammar is line-oriented:
 
     # comment
     include "constants.calc"
@@ -13,11 +13,11 @@ Semantics:
 - Bindings resolve by *name* across the whole file (forward references allowed).
 - Operators: integer ``+`` and ``-`` only.
 - ``include`` reads another ``.calc`` file through the single shared
-  ``FileResource`` (the path is the resource node); only referenced includes are
-  resolved.
+  ``FileResource`` (the path is the resource node). Only referenced includes
+  are resolved.
 - A binding cycle (``let a = b`` / ``let b = a``) yields a deterministic
-  diagnostic — detected structurally before any cross-query recursion, so the
-  kernel's ``CycleError`` is never relied upon.
+  diagnostic. The engine detects cycles structurally before any cross-query
+  recursion, so it never relies on the kernel's ``CycleError``.
 
 Query graph (each layer is a kernel-cached node):
 
@@ -30,14 +30,14 @@ Query graph (each layer is a kernel-cached node):
     emit_names                           -> the root file's ``emit`` declarations
     calc_emit  (@action)                 -> one ``<name>.out`` per emit
 
-A comment-only or whitespace-only edit re-reads ``calc_source`` and reparses it;
-the payload comes back equal, so ``parse_calc`` backdates and nothing that
-depends on it re-evaluates. The exception is a line the parser rejects and quotes
-verbatim in its diagnostic: whitespace inside such a line changes the payload.
+A comment-only or whitespace-only edit re-reads ``calc_source`` and reparses it.
+The payload comes back equal, so ``parse_calc`` backdates and its dependents are
+reused. The exception is a rejected line that the parser quotes verbatim in its
+diagnostic. Whitespace inside such a line changes the payload.
 
-Regexes are inlined as string literals (not module-level ``re.Pattern``
-singletons) because the kernel walks query-reachable functions' captures and
-rejects ``Pattern`` values; the ``re`` module itself is a supported capture.
+Regexes are inlined as string literals. The kernel walks the captures of
+query-reachable functions and rejects ``re.Pattern`` values, so module-level
+compiled patterns would fail. The ``re`` module itself is a supported capture.
 """
 
 from __future__ import annotations
@@ -49,9 +49,9 @@ from typing import TypeAlias
 
 from pyinc import Database, FileResource, Output, action, query
 
-# A term is (sign, kind, value): sign in {+1, -1}; kind in {"int", "name"}; value
-# is the digit string or identifier. An expression is a flat sequence of terms
-# combined left-to-right — sufficient for integer + / - and fully snapshot-safe.
+# A term is (sign, kind, value). sign is +1 or -1, kind is "int" or "name", and
+# value is the digit string or identifier. An expression is a flat sequence of
+# terms combined left to right. That covers integer + and - and is snapshot-safe.
 _Term: TypeAlias = tuple[int, str, str]
 _Expr: TypeAlias = tuple[_Term, ...]
 
@@ -62,13 +62,13 @@ _ParsePayload: TypeAlias = tuple[
     tuple[str, ...], tuple[_Binding, ...], tuple[str, ...], tuple[_Diagnostic, ...]
 ]
 
-# evaluate_name payload: (status, value, code, message) — uniform shape so the
-# value field is always an int (0 on error) and narrowing is trivial.
+# evaluate_name payload: (status, value, code, message). The value field is
+# always an int (0 on error), so narrowing is trivial.
 _EvalResult: TypeAlias = tuple[str, int, str, str]
 
 _MAX_INCLUDE_DEPTH = 64
 
-_FILES = FileResource()  # ONE shared file resource; the path is the node key.
+_FILES = FileResource()  # One shared file resource. The path is the node key.
 
 
 @dataclass(frozen=True)
@@ -116,7 +116,7 @@ def _parse_payload(source: str) -> _ParsePayload:
 
     Comments and blank lines are dropped and every line is stripped, so a
     comment-only or whitespace-only edit maps to an equal payload and
-    ``parse_calc`` backdates — except on a line the parser rejects whose
+    ``parse_calc`` backdates. The exception is a rejected line whose
     diagnostic quotes the line verbatim.
     """
     includes: list[str] = []
@@ -159,8 +159,10 @@ def _parse_payload(source: str) -> _ParsePayload:
 
 
 def _parse(source: str) -> _Parsed:
-    """Convenience wrapper returning a named structure (test/inspection only;
-    not reachable from any ``@query``)."""
+    """Return the parse as a named structure, for tests and inspection.
+
+    No ``@query`` reaches this function.
+    """
     includes, bindings, emits, diagnostics = _parse_payload(source)
     return _Parsed(includes, bindings, emits, diagnostics)
 
@@ -171,9 +173,12 @@ def _resolve_include(current_file: str, target: str) -> str:
 
 @query
 def calc_source(db: Database, path: str) -> str:
-    """Raw text of a ``.calc`` file. Every edit re-reads it; ``parse_calc`` is
-    where a comment/whitespace-only edit lands an equal payload and backdates,
-    unless the edit falls on a line the parser rejects and quotes verbatim."""
+    """Raw text of a ``.calc`` file.
+
+    Every edit re-reads it. A comment-only or whitespace-only edit backdates at
+    ``parse_calc``, which produces an equal payload. The exception is an edit on
+    a line the parser rejects and quotes verbatim.
+    """
     return _FILES.read(db, path)
 
 
@@ -186,9 +191,9 @@ def parse_calc(db: Database, path: str) -> _ParsePayload:
 def binding_table(db: Database, root_path: str) -> tuple[_Binding, ...]:
     """Merged name->expr map over the root file and its referenced includes.
 
-    Traversed iteratively within this single query so the dependency edges are
-    exactly the root plus the includes actually reached (an unreferenced file is
-    never read). First binding of a name wins; later duplicates are dropped.
+    The traversal runs iteratively inside this one query, so its dependency
+    edges are the root plus the includes it reaches. Unreferenced files stay
+    unread. The first binding of a name wins and later duplicates are dropped.
     """
     entries: list[_Binding] = []
     seen: set[str] = set()
@@ -218,9 +223,11 @@ def binding_table(db: Database, root_path: str) -> tuple[_Binding, ...]:
 
 @query
 def binding_expr(db: Database, root_path: str, name: str) -> tuple[bool, _Expr]:
-    """One name's expression. Re-executes on any edit but backdates when this
-    name's expression is unchanged, so dependents are reused unless ``name``
-    actually changed."""
+    """One name's expression.
+
+    Re-executes on any edit and backdates when this name's expression is
+    unchanged, so dependents re-run only when ``name`` changes.
+    """
     for bound_name, expr in binding_table(db, root_path):
         if bound_name == name:
             return (True, expr)
@@ -229,8 +236,11 @@ def binding_expr(db: Database, root_path: str, name: str) -> tuple[bool, _Expr]:
 
 @query
 def binding_cycles(db: Database, root_path: str) -> tuple[str, ...]:
-    """Names that participate in a reference cycle (structural; consulted before
-    any cross-query recursion so the kernel's CycleError is never triggered)."""
+    """Names that take part in a reference cycle.
+
+    The check is structural. ``evaluate_name`` consults it before any
+    cross-query recursion, so the kernel's ``CycleError`` never fires.
+    """
     table: dict[str, _Expr] = dict(binding_table(db, root_path))
     refs: dict[str, set[str]] = {
         name: {value for _sign, kind, value in expr if kind == "name" and value in table}
@@ -295,9 +305,9 @@ def _render(result: _EvalResult) -> str:
 def calc_emit(db: Database, root_path: str) -> list[Output]:
     """Emit one ``<name>.out`` file per ``emit`` declaration in the root file.
 
-    A missing *root* file surfaces as ``FileNotFoundError`` from the resource
-    read (``emit_names`` must read the root to know what to emit); a missing
-    *include* degrades gracefully, since ``binding_table`` guards that read.
+    A missing *root* file raises ``FileNotFoundError`` from the resource read,
+    because ``emit_names`` reads the root to learn what to emit. A missing
+    *include* degrades gracefully because ``binding_table`` guards that read.
     """
     return [
         Output.text(f"{name}.out", _render(evaluate_name(db, root_path, name)) + "\n")

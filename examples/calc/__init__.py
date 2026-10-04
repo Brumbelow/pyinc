@@ -1,10 +1,9 @@
-"""``calc`` — a minimal include-aware expression language, used as the canonical
-end-to-end pyinc example.
+"""``calc``, a minimal include-aware expression language.
 
-It exercises the three-layer query pattern, cross-file dependency tracking via a
-single shared ``FileResource``, backdating of the parse when a comment/whitespace
-edit leaves its payload equal — which is every such edit except one on a line the
-parser rejects and quotes verbatim in its diagnostic — per-name incremental
-evaluation, and output reconciliation through the ``@action`` layer.
-See ``examples/calc/engine.py``.
+It is pyinc's canonical end-to-end example. It exercises the three-layer query
+pattern, cross-file dependency tracking through one shared ``FileResource``,
+per-name incremental evaluation, and output reconciliation through the
+``@action`` layer. A comment or whitespace edit backdates the parse because its
+payload stays equal. The one exception is an edit on a line the parser rejects,
+because the diagnostic quotes that line verbatim. See ``examples/calc/engine.py``.
 """

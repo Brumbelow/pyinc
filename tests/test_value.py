@@ -159,13 +159,13 @@ def test_freeze_thaw_round_trip_dict() -> None:
 
 
 def test_frozen_mapping_order_is_canonical_and_stable() -> None:
-    """Pin the canonical entry order literally, not by recomputing the digest.
+    """Pin the canonical entry order literally, without recomputing the digest.
 
     The order is documented as fixed for the byte grammar's lifetime, so these
-    sequences are the contract rather than an observation: a failure here means
-    the order moved, which invalidates every stored record and checkpoint.
-    Neither insertion nor sorted order is what the rule produces, and both
-    refutations are asserted so a change to either could not pass unnoticed.
+    sequences are the contract itself. A failure here means the order moved,
+    which invalidates every stored record and checkpoint. The rule produces
+    neither insertion order nor sorted order, and the test asserts both
+    refutations so a change to either one gets caught.
     """
 
     frozen = cast(FrozenDict, freeze({"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}))
@@ -173,10 +173,10 @@ def test_frozen_mapping_order_is_canonical_and_stable() -> None:
     assert [key for key, _ in frozen.entries] == canonical
     assert list(thaw(frozen)) == canonical
 
-    # Not insertion order.
+    # Differs from insertion order.
     assert list(thaw(freeze({"b": 1, "a": 2}))) == ["a", "b"]
 
-    # Not sorted order either.
+    # Differs from sorted order too.
     assert list(thaw(freeze({letter: index for index, letter in enumerate("abcdefgh")}))) == [
         "a",
         "h",
@@ -192,15 +192,14 @@ def test_frozen_mapping_order_is_canonical_and_stable() -> None:
 def test_frozen_set_member_order_is_canonical_and_stable() -> None:
     """Pin the canonical member order literally, on the snapshot that holds it.
 
-    Sets order members by the same digest rule mappings order keys by, so a set
-    of the mapping pin's five keys stores the identical sequence -- asserted here
-    so the two sides of one rule cannot drift apart on one of them only. A
-    failure means the order moved: STOP rather than re-pin, as above.
+    Sets order members by the same digest rule that orders mapping keys, so a
+    set of the mapping pin's five keys stores the identical sequence. The test
+    asserts both sides so one rule cannot drift on one side only. A failure
+    means the order moved: STOP instead of re-pinning, as above.
 
-    The thawed value deliberately carries no order assertion. `thaw` rebuilds an
+    The thawed value has no order assertion, on purpose. `thaw` rebuilds an
     ordinary `set`, whose iteration order is Python's and varies between
-    processes, so there is no sequence there to pin -- the snapshot and
-    `strict`'s view of it are the only places this order exists.
+    processes. This order exists only in the snapshot and `strict`'s view of it.
     """
 
     words = ("one", "two", "three", "four", "five")
@@ -218,7 +217,7 @@ def test_frozen_set_member_order_is_canonical_and_stable() -> None:
     mapping = cast(FrozenDict, freeze(dict.fromkeys(words, 1)))
     assert tuple(key for key, _ in mapping.entries) == canonical
 
-    # Content survives thaw; order is not part of what a set carries.
+    # Content survives thaw. A set carries no order.
     assert thaw(frozen) == set(words)
 
 
@@ -270,7 +269,7 @@ def test_thawing_a_dataclass_snapshot_returns_a_dict_and_not_the_class() -> None
     snapshot = freeze(Point(1, 2))
     assert isinstance(snapshot, FrozenRecord)
 
-    # The tag is the class's __qualname__ and nothing else: no module component,
+    # The tag is the class's __qualname__ alone. It has no module component and
     # no import path a thaw could resolve back to a class.
     assert snapshot.type_name == Point.__qualname__
     assert snapshot.type_name == "Point"
@@ -287,11 +286,11 @@ def _module_scope_point(
 ) -> type:
     """Import a module defining a frozen `Point` and hand back the class.
 
-    Module scope is what this needs. A class defined inside a function carries
-    a `<locals>` component in its `__qualname__`, so two of them could not
-    share a tag in the first place, and a query that captures one is refused.
-    Both modules are written under `tmp_path` and registered through
-    `monkeypatch`, so the import is undone when the test ends.
+    The class must live at module scope. A class defined inside a function has
+    a `<locals>` component in its `__qualname__`, so two such classes could
+    never share a tag, and a query that captures one is refused. Both modules
+    are written under `tmp_path` and registered through `monkeypatch`, so the
+    import is undone when the test ends.
     """
     path = directory / f"{module_name}.py"
     path.write_text(
@@ -328,9 +327,9 @@ def test_same_named_dataclasses_from_two_modules_share_one_tag(
     left_snapshot = cast(FrozenRecord, freeze(left(1, 2)))
     right_snapshot = cast(FrozenRecord, freeze(right(1, 2)))
 
-    # The tag carries no module component, so the two collapse onto one
-    # snapshot: equal, equal under the kernel's own comparison, and equal
-    # byte for byte once serialized.
+    # The tag has no module component, so the two collapse onto one snapshot:
+    # equal, equal under the kernel's own comparison, and byte-identical once
+    # serialized.
     assert left_snapshot.type_name == right_snapshot.type_name == "Point"
     assert left_snapshot == right_snapshot
     assert semantic_equal(left(1, 2), right(1, 2))
@@ -423,8 +422,8 @@ def test_freeze_already_frozen_values_are_detached_clones() -> None:
     fg = FrozenGraph(nodes=(FrozenList(items=(FrozenRef(0),)),), root=FrozenRef(0))
 
     # Frozen* shells are frozen dataclasses whose fields object.__setattr__ can
-    # rebind, so a stored snapshot must never share a shell with the caller:
-    # freeze hands back an equal, identically fingerprinted clone.
+    # rebind, so a stored snapshot keeps shells of its own. freeze hands back an
+    # equal clone with an identical fingerprint.
     for wrapper in (fl, fd, fs, fr, fa, fg):
         clone = freeze(wrapper)
         assert clone is not wrapper
@@ -448,9 +447,9 @@ def test_tampering_with_an_exposed_boundary_value_cannot_reach_the_record(mode: 
 
     if mode == "strict":
         # Strict hands out a Frozen* view. It is a frozen dataclass, so an
-        # ordinary attribute or item write is refused -- but that is a
-        # convention of the dataclass machinery, not a capability: the field
-        # rebinds under object.__setattr__ like any other.
+        # ordinary attribute or item write is refused. That refusal is only a
+        # dataclass convention: the field still rebinds under
+        # object.__setattr__ like any other.
         assert isinstance(view, FrozenDict)
         ordinary_write = cast(Any, view)
         with pytest.raises(FrozenInstanceError):
@@ -466,10 +465,9 @@ def test_tampering_with_an_exposed_boundary_value_cannot_reach_the_record(mode: 
         view["a"] = "EVIL"
         assert view == {"a": "EVIL", "b": 2}
 
-    # Either way the stored record is intact, because the kernel rebuilt the
-    # value it handed out rather than sharing the one it holds: the next
-    # request answers with the original, and a database that never saw the
-    # tampering agrees with it.
+    # Either way the stored record is intact, because the kernel handed out a
+    # rebuilt value and kept its own. The next request answers with the
+    # original, and a database that never saw the tampering agrees.
     warm = db.get(exposed)
     fresh_db = Database(mode=mode)
     fresh_db.set(payload, {"a": 1, "b": 2})
@@ -505,16 +503,16 @@ def test_freeze_clones_graph_envelopes_and_their_node_tables() -> None:
 
 
 def test_freeze_rejects_hand_built_wrapper_cycles_without_recursing() -> None:
-    # The cycle spine must be a kind="frozenset" FrozenSet: it is the one
-    # wrapper shape _wrapper_aliases_structure never descends (its walk covers
-    # only the four graph-capable types, FrozenAdapterValue, and tuples), so
-    # this cycle reaches _freeze's pass-through branch and, since freeze
-    # detaches pre-frozen wrappers, _detach_wrapper's own guard. Do NOT
-    # "simplify" the spine to a FrozenList: that shape is intercepted by the
-    # aliasing detection at value.py:266 and re-routed through
-    # _refreeze_wrapper, whose _active_guard raises a DIFFERENT message
-    # ("Cyclic values cannot cross cached boundaries through this container
-    # type.", value.py:1597-1599) and never reaches the detach.
+    # The cycle spine must be a kind="frozenset" FrozenSet. It is the one
+    # wrapper shape _wrapper_aliases_structure skips (its walk covers only the
+    # four graph-capable types, FrozenAdapterValue, and tuples). So this cycle
+    # reaches _freeze's pass-through branch and, because freeze detaches
+    # pre-frozen wrappers, _detach_wrapper's own guard. Keep the spine a
+    # FrozenSet. The aliasing detection at value.py:266 catches a FrozenList
+    # spine and re-routes it through _refreeze_wrapper. Its _active_guard
+    # raises a DIFFERENT message ("Cyclic values cannot cross cached
+    # boundaries through this container type.", value.py:1597-1599), and the
+    # detach is never reached.
     shell = FrozenSet("frozenset", ())
     holder = FrozenAdapterValue("test:T", shell)
     object.__setattr__(shell, "items", (holder,))
@@ -527,8 +525,8 @@ def test_freeze_detach_shares_leaf_tuples_and_clones_tuples_holding_shells() -> 
     mixed_tuple = (1, FrozenList((2,)))
     clone = cast(FrozenList, freeze(FrozenList((leaf_tuple, mixed_tuple))))
 
-    # An all-leaf tuple is shared: it is immutable and holds no rebindable
-    # shell, so the detach returns it unchanged rather than reallocating.
+    # An all-leaf tuple is immutable and holds no rebindable shell, so the
+    # detach shares it and returns the same object.
     assert clone.items[0] is leaf_tuple
     # A tuple holding a shell must be rebuilt, or the shell stays aliased.
     assert clone.items[1] is not mixed_tuple
@@ -538,11 +536,11 @@ def test_freeze_detach_shares_leaf_tuples_and_clones_tuples_holding_shells() -> 
 
 def test_freeze_rejects_malformed_wrapper_shells_with_the_kernel_error() -> None:
     # _detach_wrapper reads shell fields directly (unpacking entry pairs,
-    # iterating items), so the input grammar has to be checked before the
-    # clone walk. Otherwise a malformed shell either escapes as a raw
-    # ValueError -- which none of runtime.py's UnsupportedValueError boundary
-    # handlers catch -- or gets silently normalized into a well-formed
-    # snapshot, which would let an invalid wrapper enter the store.
+    # iterating items), so the input grammar is checked before the clone walk.
+    # Without that check, a malformed shell either escapes as a raw ValueError
+    # or is silently normalized into a well-formed snapshot. runtime.py's
+    # UnsupportedValueError boundary handlers miss the ValueError, and the
+    # normalized snapshot lets an invalid wrapper enter the store.
     cases: list[tuple[Any, str]] = [
         (
             FrozenDict(entries=cast(Any, (("a", 1, 2),))),
@@ -564,8 +562,8 @@ def test_freeze_rejects_malformed_wrapper_shells_with_the_kernel_error() -> None
 
 
 def test_freeze_rejects_malformed_wrapper_shells_nested_in_raw_containers() -> None:
-    # The same guard has to fire for a wrapper reached through a raw spine;
-    # inlining used to rebuild these into well-formed snapshots silently.
+    # The same guard must fire for a wrapper reached through a raw spine.
+    # Inlining used to rebuild these into well-formed snapshots silently.
     with pytest.raises(
         UnsupportedValueError, match=re.escape("FrozenList.items must be a tuple.")
     ):
@@ -593,9 +591,9 @@ def test_freeze_detaches_hash_positions() -> None:
 
 
 def test_freeze_detaches_graph_ref_cells() -> None:
-    # A FrozenRef is a frozen dataclass like every other shell, so handing one
-    # back by identity leaves the caller holding a live index into the stored
-    # node table -- rebindable long after the snapshot was validated.
+    # A FrozenRef is a frozen dataclass like every other shell. Handing one
+    # back by identity would leave the caller a live index into the stored
+    # node table, rebindable long after the snapshot was validated.
     ref = FrozenRef(0)
     graph = FrozenGraph(nodes=(FrozenList((ref,)),), root=ref)
     stored = cast(FrozenGraph, freeze(graph))
@@ -658,16 +656,16 @@ def test_semantic_equal_same_structure() -> None:
 
 
 def test_semantic_equal_different_container_types() -> None:
-    # list freezes to FrozenList, tuple stays tuple — not equal.
+    # list freezes to FrozenList and tuple stays tuple, so the two differ.
     assert not semantic_equal([1, 2], (1, 2))
-    # set vs frozenset — different kind field.
+    # set vs frozenset: the kind field differs.
     assert not semantic_equal({1, 2}, frozenset({1, 2}))
 
 
 def test_fingerprint_determinism() -> None:
     # Same value → same digest.
     assert fingerprint({"a": [1, 2], "b": 3}) == fingerprint({"a": [1, 2], "b": 3})
-    # Dict ordering doesn't matter (freeze sorts entries).
+    # Dict ordering is irrelevant (freeze sorts entries).
     assert fingerprint({"b": 3, "a": [1, 2]}) == fingerprint({"a": [1, 2], "b": 3})
     # Different values → different digests.
     assert fingerprint([1, 2]) != fingerprint([1, 3])
@@ -789,7 +787,7 @@ def test_fingerprint_snapshot_equivalence_under_freeze_normalization() -> None:
     right = freeze({"a": 2, "b": 1})
     assert fingerprint_snapshot(left) == fingerprint_snapshot(right)
 
-    # Sets freeze by canonical sort — ordering of input items does not affect digest.
+    # Sets freeze by canonical sort, so input item order leaves the digest unchanged.
     assert fingerprint_snapshot(freeze({1, 2, 3})) == fingerprint_snapshot(freeze({3, 2, 1}))
 
 
@@ -843,7 +841,7 @@ def test_adapter_registry_for_value_returns_none_for_unknown_type() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Group G: Mutable graph support — shared identity and cycles via FrozenGraph
+# Group G: Mutable graph support (shared identity and cycles via FrozenGraph)
 # ---------------------------------------------------------------------------
 
 
@@ -904,16 +902,16 @@ def test_freeze_handles_deep_mutual_graph_round_trips() -> None:
 
 
 def test_freeze_pure_tree_does_not_wrap_in_frozen_graph() -> None:
-    # Plain tree — no shared subtrees, no cycles. Existing flat shape preserved
-    # so the common case stays zero-overhead.
+    # A plain tree (no shared subtrees, no cycles) keeps the flat shape, so the
+    # common case stays zero-overhead.
     snapshot = freeze([1, [2, [3]]])
     assert isinstance(snapshot, FrozenList)
 
 
 def test_freeze_of_a_pure_tree_still_pays_the_deep_freeze() -> None:
-    # What a pure tree skips is the FrozenGraph envelope, not the freeze: every
-    # container on the way down still gets its own Frozen* shell, which is what
-    # leaves the caller holding no alias into the snapshot.
+    # A pure tree skips only the FrozenGraph wrapper. The freeze still runs:
+    # every container on the way down gets its own Frozen* shell, so the caller
+    # holds no alias into the snapshot.
     inner = [2, 3]
     source: list[Any] = [1, inner]
     snapshot = freeze(source)
@@ -922,7 +920,7 @@ def test_freeze_of_a_pure_tree_still_pays_the_deep_freeze() -> None:
     assert snapshot == FrozenList(items=(1, FrozenList(items=(2, 3))))
     assert isinstance(snapshot.items[1], FrozenList)
 
-    # Neither alias into the source reaches the snapshot afterwards.
+    # Later edits through either alias into the source leave the snapshot as is.
     inner.append(99)
     source.append(4)
 
@@ -932,9 +930,9 @@ def test_freeze_of_a_pure_tree_still_pays_the_deep_freeze() -> None:
 
 def test_freeze_reencodes_shared_wrapper_structure_as_the_raw_frozen_graph() -> None:
     # A strict-mode boundary view rebuilds a graph snapshot into wrapper
-    # objects that genuinely alias each other. Feeding such a view back into
-    # freeze must restore the graph encoding the view came from, so the
-    # round-trip lands the exact snapshot the raw structure produces.
+    # objects that alias each other. Freezing such a view must restore the
+    # graph encoding it came from, so the round-trip lands the same snapshot
+    # the raw structure produces.
     inner_raw = [1, 2]
     original = freeze([inner_raw, inner_raw])
     assert isinstance(original, FrozenGraph)
@@ -950,8 +948,8 @@ def test_freeze_reencodes_shared_wrapper_structure_as_the_raw_frozen_graph() -> 
 
 def test_freeze_reencodes_wrappers_shared_through_a_tuple_spine() -> None:
     # Sibling wrappers whose lowest common ancestor is a raw tuple alias each
-    # other exactly as they would under a list spine, and must land the same
-    # graph encoding: a tuple carries no memo slot of its own to notice it.
+    # other as they would under a list spine and must land the same graph
+    # encoding. The tuple has no memo slot of its own to notice the aliasing.
     inner_raw = [1]
     original = freeze((inner_raw, inner_raw))
     assert isinstance(original, FrozenGraph)
@@ -995,12 +993,12 @@ def test_freeze_tuple_of_unshared_wrappers_stays_a_plain_tuple() -> None:
     assert type(snapshot) is tuple
     assert snapshot == items
     # The raw tuple spine used to leak its wrapper elements by identity
-    # (freeze((w,))[0] is w); ownership now requires clones.
+    # (freeze((w,))[0] is w). Ownership requires clones.
     assert snapshot[0] is not items[0]
     assert snapshot[0] == items[0]
 
-    # Nested spines leaked identically (freeze(((w,),))[0][0] was w), so the
-    # detach must recurse through them rather than stopping at the outer tuple.
+    # Nested spines leaked the same way (freeze(((w,),))[0][0] was w), so the
+    # detach must recurse through every nested tuple, past the outer one.
     nested = cast(tuple[Any, ...], freeze(((items[0],),)))
     assert type(nested) is tuple
     assert nested[0][0] is not items[0]
@@ -1141,11 +1139,10 @@ def test_adapted_hash_positions_are_isolated_from_graph_node_order() -> None:
 
     assert freeze(left, adapters=adapters) == freeze(right, adapters=adapters)
 
-    # A hash position freezes its value on its own, and a payload that shares
-    # or cycles is refused there: the encoding holds such a payload as a node
-    # and cannot hand it back to `thaw` whole. The refusal names the payload
-    # rather than the position, which is the more specific of the two answers
-    # available for the same value.
+    # A hash position freezes its value on its own and refuses a payload that
+    # shares or cycles. The encoding holds such a payload as a node and cannot
+    # hand it back to `thaw` whole. The refusal names the payload, which is more
+    # specific than naming the position.
     shared: list[Any] = []
     shared_payload = [shared, shared]
     with pytest.raises(UnsupportedValueError, match="cannot hand back whole"):
@@ -1193,7 +1190,7 @@ def test_strict_view_of_tuple_shared_list_round_trips_through_set_and_arguments(
     assert db.get(width, view) == 2
     assert db.statistics().query_executions == executions
 
-    # Through db.set: re-encoding the view is an equal update, not a change.
+    # Through db.set: re-encoding the view counts as an equal update.
     stored = Input[object]("shared-pair")
     db.set(stored, (raw, raw))
     ignores = db.statistics().input_equal_ignores
@@ -1209,8 +1206,8 @@ def test_freeze_of_aliased_wrappers_detaches_every_member_shell() -> None:
     assert isinstance(snapshot, FrozenGraph)
     node = cast(FrozenList, snapshot.nodes[0])
     assert node is not shared
-    # The re-encode pass used to hand the frozenset member through by
-    # identity; the caller could then rebind its items inside the stored graph.
+    # The re-encode pass used to hand the frozenset member through by identity,
+    # which let the caller rebind its items inside the stored graph.
     assert node.items[0] is not member
     assert node.items[0] == member
 
@@ -1228,10 +1225,9 @@ def test_freeze_of_aliased_dict_detaches_its_keys() -> None:
 
 
 def test_freeze_of_aliased_wrappers_detaches_nested_graph_envelopes() -> None:
-    # A nested FrozenGraph is its own reference namespace, so neither the
-    # re-encode pass nor the canonical renumbering that follows it descends
-    # into one -- both used to carry the caller's envelope straight into the
-    # stored snapshot.
+    # A nested FrozenGraph is its own reference namespace, so the re-encode
+    # pass and the canonical renumbering after it both stop at one. Both used
+    # to carry the caller's FrozenGraph straight into the stored snapshot.
     spine = [1]
     inner = cast(FrozenGraph, freeze((spine, spine)))
     shared = FrozenList((inner,))
@@ -1252,9 +1248,9 @@ def test_freeze_of_aliased_dict_preserves_canonical_entry_order() -> None:
 
 
 def test_freeze_of_aliased_wrappers_rejects_malformed_nested_shells() -> None:
-    # The re-encode pass clones through _detach_wrapper as well, and that walk
-    # is shape-trusting by design: the guard has to fire in _freeze before the
-    # aliasing decision, not somewhere inside the two walks it protects.
+    # The re-encode pass also clones through _detach_wrapper, which trusts
+    # shapes by design. So the guard must fire in _freeze, before the aliasing
+    # decision and ahead of both walks it protects.
     shared = FrozenList((FrozenList(items=cast(Any, [1, 2])),))
     with pytest.raises(
         UnsupportedValueError, match=re.escape("FrozenList.items must be a tuple.")
@@ -1268,8 +1264,8 @@ def test_freeze_of_aliased_wrappers_rejects_malformed_nested_shells() -> None:
 
 
 def test_kernel_fingerprint_prefix_is_k2() -> None:
-    # The serialized byte form (which is also the digest input) must carry a
-    # version prefix so older durable caches cannot be silently accepted.
+    # The serialized byte form (also the digest input) must carry a version
+    # prefix so an older durable cache is never silently accepted.
     payload = serialize_snapshot(freeze("hello"))
     assert payload.startswith(b"K2;")
 
@@ -1421,7 +1417,7 @@ def test_scalar_subclasses_require_an_adapter_at_boundaries() -> None:
 
 
 def test_integers_past_the_int_to_str_limit_are_rejected_as_boundary_values() -> None:
-    # freeze accepts the value -- the K2 grammar has no width limit -- but the
+    # freeze accepts the value (the K2 grammar has no width limit), but the
     # encoder cannot render it, so the rejection is typed like every other one.
     huge = 10**5000
 
@@ -1449,11 +1445,11 @@ def test_nan_payloads_are_canonicalized_and_prefrozen_payloads_are_validated() -
 def test_semantic_equality_of_canonical_snapshots_matches_snapshot_equality() -> None:
     """freeze is encoding-preserving on its own outputs.
 
-    For canonical snapshots ``a`` and ``b``, re-freezing never changes the
-    canonical encoding, so ``semantic_equal(a, b)`` coincides with
+    For canonical snapshots ``a`` and ``b``, re-freezing keeps the canonical
+    encoding, so ``semantic_equal(a, b)`` coincides with
     ``snapshots_equal(a, b)``. The runtime's default backdate decision is
-    exactly ``snapshots_equal`` on the stored snapshots (no digest fallback),
-    so this reduction is what makes the one relation one.
+    ``snapshots_equal`` on the stored snapshots (no digest fallback), so this
+    reduction makes the two relations one.
     """
 
     @dataclass(frozen=True)
@@ -1527,16 +1523,16 @@ def test_semantic_equality_of_canonical_snapshots_matches_snapshot_equality() ->
         except UnsupportedValueError as refusal:
             # The generator can place an adapted value inside shared or cyclic
             # structure, where its mapping payload becomes a node of its own
-            # and the freeze refuses it. There is no snapshot for the property
-            # to compare, so the pair is skipped rather than asserted on.
+            # and the freeze refuses it. With no snapshot to compare, the pair
+            # is skipped.
             assert "cannot hand back whole" in str(refusal)
             continue
         compared += 1
         assert fingerprint_snapshot(freeze(left, adapters=adapters)) == fingerprint_snapshot(left)
         assert semantic_equal(left, right, adapters=adapters) == snapshots_equal(left, right)
-    # The refusals must not be what the loop mostly does: the seeded generator
-    # yields well over four hundred comparable pairs, and a floor well under
-    # that catches a change that quietly empties the property.
+    # Most iterations must compare a pair. The seeded generator yields well
+    # over four hundred comparable pairs, and this floor of 400 catches a
+    # change that empties the property while every assertion still passes.
     assert compared >= 400
 
 
@@ -1586,8 +1582,8 @@ def test_canonical_relation_still_equates_equal_values() -> None:
 def test_canonical_relation_refuses_values_that_are_not_snapshots() -> None:
     """The relation is defined by the encoding, so it has no `==` fallback.
 
-    A value the encoder cannot describe gets no verdict at all -- answering
-    `False` for it would be an equality claim the encoding never made.
+    A value the encoder cannot describe raises instead of getting a verdict.
+    Answering `False` would be an equality claim the encoding never made.
     """
 
     with pytest.raises(TypeError):
@@ -1638,13 +1634,13 @@ def test_thawing_a_container_where_a_hashable_value_belongs_is_refused(
 ) -> None:
     """A key or member that thaws into a container is the encoding's business.
 
-    Both positions accept whatever the snapshot puts there, and a mapping or a
-    list arriving in one of them is discovered only when the reconstructed
-    container refuses to take it. That refusal is the interpreter's, in wording
-    that has moved between releases and that says nothing about the snapshot it
-    came out of, so the boundary answers in its own words instead and names the
-    container that cannot go where it was put. Both encodings reach it: written
-    inline, and lifted into a shared node the reference resolves to.
+    Both positions accept whatever the snapshot puts there. A mapping or list in
+    one of them surfaces only when the reconstructed container refuses to take
+    it. That refusal comes from the interpreter, in wording that has changed
+    between releases and says nothing about the snapshot. The boundary answers
+    in its own words instead and names the container that cannot go where it
+    was put. Both encodings reach it: written inline, and lifted into a shared
+    node the reference resolves to.
     """
 
     with pytest.raises(UnsupportedValueError, match=expected):
@@ -1652,11 +1648,11 @@ def test_thawing_a_container_where_a_hashable_value_belongs_is_refused(
 
 
 def test_thawing_keeps_every_key_and_member_a_hashable_value_can_hold() -> None:
-    """The refusal is for the position, not for the shape reaching it.
+    """Only an unhashable value in a key or member position is refused.
 
     A tuple key holding scalars, a frozen set member, and the same containers
-    in the value position are all hashable or unconstrained, and each still
-    thaws to the value it encodes.
+    in the value position are all hashable or unconstrained. Each still thaws
+    to the value it encodes.
     """
 
     mapping = {("a", 1): [1, 2], frozenset({1, 2}): "member"}
@@ -1733,13 +1729,12 @@ def test_an_adapted_payload_comes_back_whole_or_is_refused(
 
     An adapter's `thaw` is handed the payload as the snapshot holds it. Alone,
     every payload shape is written into the value itself and comes back whole
-    in every mode. Inside shared or cyclic structure the encoding lifts the
-    containers it memoizes into nodes of their own, and a payload that reaches
-    one of them can no longer be handed back: a mapping or list payload is
-    itself the node, and a tuple payload -- inline only as far as its own
-    elements -- carries a reference to one. Every such placement is refused at
-    the freeze rather than resolved into a value that depends on the mode and
-    on where the adapted value sat.
+    in every mode. Inside shared or cyclic structure, the encoding lifts the
+    containers it memoizes into nodes of their own. A payload that reaches one
+    of them cannot be handed back whole. A mapping or list payload is itself
+    the node. A tuple payload is inline only as far as its own elements and
+    carries a reference to one. The freeze refuses every such placement, so
+    the result never depends on the mode or on where the adapted value sat.
     """
 
     source = Input[int]("adapted-payload-source")
@@ -1761,9 +1756,8 @@ def test_an_adapted_payload_comes_back_whole_or_is_refused(
     with pytest.raises(UnsupportedValueError, match="cannot hand back whole") as refusal:
         db.get(result)
     assert "_AdaptedHolder" in str(refusal.value)
-    # Nothing was kept that a second request could be served from: the refusal
-    # repeats rather than a stored value standing in for it, and the database
-    # holds no record of the query that was refused.
+    # The refusal left nothing a second request could be served from. It
+    # repeats, and the database holds no record of the refused query.
     with pytest.raises(UnsupportedValueError, match="cannot hand back whole"):
         db.get(result)
     statistics = db.statistics()
@@ -1801,9 +1795,9 @@ def test_adapter_registry_rejects_duplicate_type_identifiers() -> None:
     adapter = _AdaptedValueAdapter()
     with pytest.raises(ValueError, match="duplicate type identifiers"):
         _AdapterRegistry({first: adapter, second: adapter})
-    # A Database builds the same key-indexed registry once, up front, so the
-    # collision is reported where the registry was written rather than at the
-    # first value boundary that happens to need it.
+    # A Database builds the same key-indexed registry once, up front. The
+    # collision is reported where the registry is written, ahead of the first
+    # value boundary that needs it.
     with pytest.raises(ValueError, match="duplicate type identifiers"):
         Database(adapters={first: adapter, second: adapter})
 
@@ -1886,8 +1880,8 @@ def test_deserialize_rejects_malformed_tags_delimiters_and_lengths(payload: byte
 def test_snapshot_equality_helper_returns_a_real_bool() -> None:
     assert snapshots_equal(FrozenList((1,)), FrozenList((1,))) is True
     assert snapshots_equal(FrozenList((1,)), FrozenList((2,))) is False
-    # The relation is canonical-encoding equality, not Python ==: the numeric
-    # tower does not unify, and a canonical NaN equals a canonical NaN.
+    # The relation is canonical-encoding equality. Unlike Python ==, it keeps
+    # the numeric tower apart, and a canonical NaN equals a canonical NaN.
     assert snapshots_equal(FrozenList((1,)), FrozenList((1.0,))) is False
     assert snapshots_equal(FrozenList((True,)), FrozenList((1,))) is False
     nan = float.fromhex("nan")
@@ -1916,8 +1910,8 @@ def test_thaw_colliding_dict_keys_are_rejected(left: object, right: object) -> N
     wrapper = FrozenDict(cast(Any, _ordered_entries(left, right)))
     with pytest.raises(UnsupportedValueError, match="collapse") as raised:
         freeze(wrapper)
-    # Name the pair, not just the fault: a caller holding a large mapping has
-    # to be told which two keys to separate.
+    # The message names both keys, so a caller holding a large mapping knows
+    # which two to separate.
     assert repr(left) in str(raised.value)
     assert repr(right) in str(raised.value)
     with pytest.raises(UnsupportedValueError, match="collapse"):
@@ -1939,9 +1933,9 @@ def test_thaw_colliding_set_members_are_rejected(kind: str, left: object, right:
 def test_thaw_colliding_frozenset_in_mapping_key_position_is_rejected() -> None:
     collider = FrozenSet("frozenset", _ordered_members(1, 1.0))
     # A hand-built wrapper is reached by the recursive walk under freeze's own
-    # _validate_snapshot call; a live dict/set key is reached by the separate
+    # _validate_snapshot call. A live dict/set key is reached by the separate
     # _validate_snapshot call inside _freeze_hash_position. Both routes must
-    # refuse the collider, so neither needs a check of its own.
+    # refuse the collider, and _validate_snapshot is the only check either needs.
     wrapper = FrozenDict(((collider, "v"),))
     with pytest.raises(UnsupportedValueError, match="collapse"):
         freeze(wrapper)
@@ -1952,8 +1946,8 @@ def test_thaw_colliding_frozenset_in_mapping_key_position_is_rejected() -> None:
 
 
 def test_deserialize_rejects_thaw_colliding_bytes() -> None:
-    # The exact byte string measured in the audit: a FrozenDict carrying the
-    # keys 1.0 and 1, whose thaw fabricated the pairing {1.0: 'a'}.
+    # The byte string measured in the audit: a FrozenDict carrying the keys
+    # 1.0 and 1, whose thaw fabricated the pairing {1.0: 'a'}.
     payload = b"K2;D2:f20:0x1.0000000000000p+0;s1:b;i1:1;s1:a;;"
     with pytest.raises(UnsupportedValueError, match="collapse"):
         deserialize_snapshot(payload)
@@ -1961,10 +1955,10 @@ def test_deserialize_rejects_thaw_colliding_bytes() -> None:
 
 def test_nan_bearing_positions_are_refused_because_the_encoding_cannot_see_them() -> None:
     nan = float.fromhex("nan")
-    # These two snapshots carry byte-identical encodings, yet thawing them
-    # produces a colliding pair or a distinct pair depending only on whether
-    # one NaN float object was shared: tuple equality takes an identity
-    # shortcut per element, and NaN is unequal to itself otherwise.
+    # These two snapshots have byte-identical encodings. Thawing them gives a
+    # colliding pair or a distinct pair depending only on whether one NaN float
+    # object was shared. Tuple equality takes an identity shortcut per element,
+    # and otherwise NaN is unequal to itself.
     shared = FrozenList(((1, nan), (1.0, nan)))
     unshared = FrozenList(((1, float.fromhex("nan")), (1.0, float.fromhex("nan"))))
     assert serialize_snapshot(shared) == serialize_snapshot(unshared)
@@ -1972,7 +1966,7 @@ def test_nan_bearing_positions_are_refused_because_the_encoding_cannot_see_them(
     unshared_left, unshared_right = thaw(unshared)
     assert shared_left == shared_right
     assert unshared_left != unshared_right
-    # A validator that reads only the encoding cannot tell those two apart, so
+    # A validator that reads only the encoding sees those two as the same, so
     # every canonical NaN is one class and the key position is refused.
     with pytest.raises(UnsupportedValueError, match="collapse"):
         freeze(FrozenDict(cast(Any, _ordered_entries((1, nan), (1.0, nan)))))
@@ -1982,13 +1976,12 @@ def test_live_values_carrying_distinct_nan_objects_are_rejected() -> None:
     first = float("nan")
     second = float("nan")
     assert first is not second
-    # Nothing hand-built here: NaN hashes by object identity, so a live dict
-    # and a live set both keep these two entries apart and hand freeze two
-    # keys. The one-NaN-class rule refuses them anyway, and that refusal is
-    # deliberate -- both cases encode to the same bytes as the shared-NaN
-    # version, which does collapse on thaw, so accepting these would make
-    # acceptance depend on object sharing the encoding cannot express.
-    # Freezing ordinary values can therefore be rejected by this rule.
+    # These are live values. NaN hashes by object identity, so a live dict and
+    # a live set both keep these two entries apart and hand freeze two keys.
+    # The one-NaN-class rule refuses them anyway, by design. Both cases encode
+    # to the same bytes as the shared-NaN version, which collapses on thaw.
+    # Accepting these would make acceptance depend on object sharing the
+    # encoding cannot express. So this rule can reject freezing ordinary values.
     live_dict = {(1, first): "a", (1.0, second): "b"}
     assert len(live_dict) == 2
     with pytest.raises(UnsupportedValueError, match="collapse"):
@@ -2004,11 +1997,11 @@ def test_distinct_after_thaw_positions_stay_accepted() -> None:
         FrozenDict(cast(Any, _ordered_entries(1, 2.5))),
         FrozenDict(cast(Any, _ordered_entries("1", 1))),
         FrozenSet("frozenset", _ordered_members(1, "1", b"1")),
-        # Infinities key by sign rather than by exact value; asking for the
-        # exact value of an infinite float would raise instead of rejecting.
+        # Infinities key by sign, because asking for the exact value of an
+        # infinite float would raise instead of rejecting.
         FrozenSet("frozenset", _ordered_members(float("inf"), float("-inf"), 1e300)),
-        # Exactly the pair a float cast loses: float(2**53 + 1) is float(2**53),
-        # so a float-keyed class would refuse two keys a live dict keeps apart.
+        # The pair a float cast loses: float(2**53 + 1) is float(2**53), so a
+        # float-keyed class would refuse two keys a live dict keeps apart.
         FrozenDict(cast(Any, _ordered_entries(2**53 + 1, float(2**53)))),
         FrozenSet("frozenset", _ordered_members(2**53 + 1, float(2**53))),
     ]
@@ -2020,20 +2013,20 @@ def test_distinct_after_thaw_positions_stay_accepted() -> None:
 
 
 def test_store_warm_paths_funnel_through_deserialize_validation() -> None:
-    # The outlet of the store-warm funnel: every checkpoint/store load decodes
-    # through deserialize_snapshot, which validates before returning, so bytes
-    # carrying a thaw-colliding snapshot cannot be warmed back into a live
-    # Database even though their digest is stable. The Database side of that
-    # funnel is pinned in tests/test_runtime.py.
+    # The outlet of the store-warm funnel. Every checkpoint/store load decodes
+    # through deserialize_snapshot, which validates before returning. Bytes
+    # carrying a thaw-colliding snapshot therefore stay out of a live Database,
+    # even though their digest is stable. tests/test_runtime.py pins the
+    # Database side of that funnel.
     payload = b"K2;D2:f20:0x1.0000000000000p+0;s1:b;i1:1;s1:a;;"
     with pytest.raises(UnsupportedValueError):
         deserialize_snapshot(payload)
 
 
 def _raw_snapshot_bytes(snapshot: object) -> bytes:
-    # Encode WITHOUT validation: serialize_snapshot now refuses colliding
-    # wrappers, so the untrusted-bytes matrix must build its payloads from the
-    # raw encoder, exactly as a hostile store would.
+    # Encode WITHOUT validation. serialize_snapshot refuses colliding wrappers,
+    # so the untrusted-bytes matrix builds its payloads from the raw encoder,
+    # the way a hostile store would.
     buffer = bytearray(_KERNEL_FINGERPRINT_PREFIX)
     _encode_snapshot(snapshot, buffer)
     return bytes(buffer)
@@ -2114,10 +2107,10 @@ def _hash_position_wrapper(kind: str, left: object, right: object) -> object:
 
 @pytest.mark.parametrize("kind", ["dict", "set", "frozenset"])
 def test_same_adapter_with_equivalent_payloads_is_refused(kind: str) -> None:
-    # An adapter that mirrors its payload -- the shape _AdaptedValueAdapter
-    # has, and the common one -- inherits the payload's collapse: these two
+    # An adapter that mirrors its payload (the common shape, and the one
+    # _AdaptedValueAdapter has) inherits the payload's collapse. These two
     # adapted values are equal and hash alike, so a thawed dict or set built
-    # from both keeps exactly one of them.
+    # from both keeps only one of them.
     assert _AdaptedValue(cast(Any, 1)) == _AdaptedValue(cast(Any, 1.0))
     assert hash(_AdaptedValue(cast(Any, 1))) == hash(_AdaptedValue(cast(Any, 1.0)))
     wrapper = _hash_position_wrapper(
@@ -2129,9 +2122,9 @@ def test_same_adapter_with_equivalent_payloads_is_refused(kind: str) -> None:
         freeze(wrapper)
     with pytest.raises(UnsupportedValueError, match="collapse"):
         serialize_snapshot(wrapper)
-    # Same refusal from untrusted bytes: the validator cannot consult the
-    # adapter registry on either path, so it decides from the encoding alone
-    # and decides the same way on both.
+    # Same refusal from untrusted bytes. The validator has no access to the
+    # adapter registry on either path, so it decides from the encoding alone,
+    # the same way on both.
     with pytest.raises(UnsupportedValueError, match="collapse"):
         deserialize_snapshot(_raw_snapshot_bytes(wrapper))
 
@@ -2143,14 +2136,14 @@ def test_adapter_hash_positions_that_stay_distinct_are_accepted(kind: str) -> No
         _OtherAdaptedValue: _OtherAdaptedValueAdapter(),
     }
     accepted = [
-        # One payload, two adapter keys: the rule refuses only within a single
-        # adapter, because whether two adapters produce equal values is not
-        # written in the encoding.
+        # One payload, two adapter keys. The rule refuses only within a single
+        # adapter, because the encoding does not record whether two adapters
+        # produce equal values.
         (
             FrozenAdapterValue(_ADAPTED_KEY, 1),
             FrozenAdapterValue(_OTHER_ADAPTED_KEY, 1),
         ),
-        # One adapter, payloads that do not share an equivalence class.
+        # One adapter, payloads in different equivalence classes.
         (
             FrozenAdapterValue(_ADAPTED_KEY, 1),
             FrozenAdapterValue(_ADAPTED_KEY, 2),
@@ -2166,7 +2159,7 @@ def test_adapter_hash_positions_that_stay_distinct_are_accepted(kind: str) -> No
 
 
 class _IdentityAdapted:
-    # An adapted type whose values compare by identity rather than by payload.
+    # An adapted type whose values compare by object identity, ignoring the payload.
     def __init__(self, value: object) -> None:
         self.value = value
 
@@ -2183,22 +2176,21 @@ def test_identity_equal_adapted_values_are_refused_though_they_would_not_collaps
     adapters: dict[type[Any], Any] = {_IdentityAdapted: _IdentityAdaptedAdapter()}
     left = _IdentityAdapted(1)
     right = _IdentityAdapted(1.0)
-    # Nothing hand-built here, and this is the live route for adapted hash
-    # positions -- each key or member is frozen through _freeze_hash_position
-    # and the pair is judged when the finished wrapper is validated. These two
-    # compare by identity, so a live dict and a live set each keep both, and
-    # thawing would keep both as well: the adapter builds a fresh object per
-    # position.
+    # These are live values on the live route for adapted hash positions. Each
+    # key or member is frozen through _freeze_hash_position, and the pair is
+    # judged when the finished wrapper is validated. These two compare by
+    # identity, so a live dict and a live set each keep both. Thawing would
+    # keep both too, because the adapter builds a fresh object per position.
     assert left != right
     live_dict = {left: "x", right: "y"}
     assert len(live_dict) == 2
     live_set = {left, right}
     assert len(live_set) == 2
-    # Refused anyway, and deliberately. The payloads 1 and 1.0 already share a
+    # Refused anyway, by design. The payloads 1 and 1.0 already share a
     # post-thaw equivalence class, and the same-adapter rule refuses on that
-    # alone: the validator decides from the encoding and never runs the
-    # adapter, so it cannot see the __eq__ that would keep these apart.
-    # Over-rejecting is the safe direction -- loosening the rule later only
+    # alone. The validator decides from the encoding and never runs the
+    # adapter, so the __eq__ that would keep these apart is invisible to it.
+    # Over-rejecting is the safe direction: loosening the rule later only
     # accepts more snapshots, which breaks nothing.
     with pytest.raises(UnsupportedValueError, match="collapse"):
         freeze(live_dict, adapters=adapters)

@@ -87,9 +87,8 @@ class SchemaAnalysis:
 class SchemaGenerationError(ValueError):
     """Raised when error diagnostics make generation unsafe.
 
-    The complete non-generating analysis remains available on ``analysis`` so
-    callers can present structured diagnostics without parsing this exception's
-    message.
+    ``analysis`` holds the complete analysis, so callers can present structured
+    diagnostics without parsing this exception's message.
     """
 
     def __init__(self, analysis: SchemaAnalysis) -> None:

@@ -4,43 +4,43 @@ refusal a high-level entrypoint owes a query body.
 Two memos, with different lifetimes and different reasons to be sound.
 
 `decoded` keys on payload *identity*. A layer-3 entrypoint is a pure function of
-the payloads it reads, and the kernel already decides when a payload is stale:
-while a query's value stands it hands back the very same payload object, and
-when the value changes it hands back a different one. So a decode keyed on the
-identity of the payloads it was built from is valid for exactly as long as those
-values are, and nothing here reasons about invalidation. It holds a reference to
-every payload it keys on, which is what makes `id()` safe: an entry's payload
-cannot be collected and its address reused while the entry still refers to it.
-It is bounded so a long-running process cannot grow it without limit.
+the payloads it reads, and the kernel already decides when a payload is stale.
+While a query's value stands, the kernel hands back the very same payload
+object. When the value changes, it hands back a different one. So a decode keyed
+on the identity of the payloads it was built from is valid for as long as those
+values are, and nothing here reasons about invalidation. The memo holds a
+reference to every payload it keys on, which makes `id()` safe: while an entry
+refers to its payload, that payload stays alive and its address stays taken.
+The memo is bounded so a long-running process cannot grow it without limit.
 
-Payload identity is only stable in `strict` mode. `checked` and `fast` thaw at
-the boundary (`Database._expose_snapshot`), handing back a fresh object per
-call, so every lookup would miss and every miss would pin one more payload tree
-and decoded tree until the bound reset the whole cache. Off `strict` the memo is
-skipped outright.
+Payload identity is stable only in `strict` mode. `checked` and `fast` thaw at
+the boundary (`Database._expose_snapshot`) and hand back a fresh object per
+call. Every lookup would miss, and every miss would pin one more payload tree
+and decoded tree until the bound reset the whole cache. So outside `strict` the
+memo is skipped.
 
 The memo is keyed per database through a weak reference, so a dropped database
-releases every payload and decoded value it pinned; the entry bound applies
+releases every payload and decoded value it pinned. The entry bound applies
 per database.
 
 Two threads can use the integrations on one database at the same time when they
-drive it directly rather than through a `WorkspaceSession`, whose lock
-serializes its methods. So every read and write of the memo holds
-`_CACHES_LOCK`, and a decode two threads raced to compute is stored once: the
-one stored first is the one both get back. The lock is never held while a
-decode runs. A decode reads queries, and a thread that holds the database's
-lock, or a session's, may be the next one to ask for this lock. A child forked
-while another thread held the lock gets a new one.
+drive it directly, outside a `WorkspaceSession` (whose lock serializes its
+methods). So every read and write of the memo holds `_CACHES_LOCK`, and a
+decode two threads raced to compute is stored once. Both get back the one
+stored first. The lock is never held while a decode runs. A decode reads
+queries, and a thread that holds the database's lock, or a session's, may be
+the next one to ask for this lock. A child forked while another thread held the
+lock gets a new one.
 
-`once_per_request` keys on the call itself, and lives only for the span a caller
-declares with `request_scope`, on the thread that declared it. A `WorkspaceSession` holds its lock for the whole of
-each public method and its inputs cannot change while it is held, so an
-entrypoint asked the same question twice inside one method must answer the same
-both times. Outside such a span the memo does not exist, so a caller driving the
-integrations directly around a file edit still sees the edit. A session that
-does rewrite the mirror inside one of its own methods calls
-`request_inputs_changed` when it does. Only the thread that opened a span ever
-sees it, so its memo needs no lock.
+`once_per_request` keys on the call itself. It lives only for the span a caller
+declares with `request_scope`, on the thread that declared it. A
+`WorkspaceSession` holds its lock for the whole of each public method, and its
+inputs cannot change while it is held. So an entrypoint asked the same question
+twice inside one method must answer the same both times. Outside such a span
+the memo does not exist, so a caller driving the integrations directly around a
+file edit still sees the edit. A session that rewrites the mirror inside one of
+its own methods calls `request_inputs_changed` when it does. Only the thread
+that opened a span sees it, so its memo needs no lock.
 """
 
 from __future__ import annotations
@@ -62,12 +62,12 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T")
 
-# The bound is on entry count, not on bytes: an entry holds one decoded value,
-# and a workspace-level entry is a whole analysis rather than a small object.
-# What keeps the total in hand is that those values share substructure with the
-# query results they were decoded from, which the kernel retains anyway. Past
-# the limit the cache is cleared wholesale rather than evicted one entry at a
-# time, which keeps lookups a single dict hit.
+# The bound is an entry count, whatever each entry's size in bytes. An entry
+# holds one decoded value, and a workspace-level entry is a whole analysis. The
+# total stays in hand because those values share substructure with the query
+# results they were decoded from, which the kernel retains anyway. Past the
+# limit the whole cache is cleared at once, with no per-entry eviction, which
+# keeps lookups a single dict hit.
 _MAX_ENTRIES = 8192
 
 _CACHES: weakref.WeakKeyDictionary[
@@ -76,10 +76,10 @@ _CACHES: weakref.WeakKeyDictionary[
 # Held for every read and write of `_CACHES` and of the dicts it holds, and for
 # nothing else. Unguarded, two threads could each find no dict for a database
 # and install one of their own, and the second install dropped every entry the
-# first thread stored. The weak reference's callback, which drops a collected
-# database's entry, runs on whatever thread collects it, possibly one that
-# already holds this lock, so it does not take the lock. It deletes one key in
-# a single dict operation, and no key a live database owns.
+# first thread stored. The weak reference's callback drops a collected
+# database's entry. It runs on whatever thread collects the database, possibly
+# one that already holds this lock, so it runs without the lock. It deletes only
+# the collected database's key, in a single dict operation.
 _CACHES_LOCK = threading.Lock()
 
 
@@ -104,14 +104,15 @@ if hasattr(os, "register_at_fork"):
 class _Request:
     """One `request_scope` span: the database it promises about, and its memo.
 
-    It travels in a `ContextVar`, so a context copied while it is open -- every
-    `threading.Thread` started on a free-threaded 3.14 build, `asyncio.to_thread`
-    -- keeps a reference to it after the span has closed and its promise with
-    it. So a span belongs to the thread that opened it and ends when it closes,
-    as the kernel's own request does. When it ends it lets go of the database
-    and the memo. A copied context can live as long as its thread, and a
-    pool's worker thread lives as long as the pool, so a request that kept
-    them would keep the database and every memoized value alive with it.
+    It travels in a `ContextVar`. A context copied while it is open keeps a
+    reference to it after the span, and its promise, have closed. Every
+    `threading.Thread` started on a free-threaded 3.14 build copies one, and
+    so does `asyncio.to_thread`. So a span belongs to the thread that opened it
+    and ends when it closes, as the kernel's own request does. When it ends it
+    lets go of the database and the memo. A copied context can live as long as
+    its thread, and a pool's worker thread lives as long as the pool. So a
+    request that kept them would keep the database and every memoized value
+    alive with it.
     """
 
     # None once the request has ended.
@@ -203,18 +204,18 @@ def request_scope(db: Database) -> Iterator[None]:
 
 
 def request_inputs_changed() -> None:
-    """Drop what this request has memoized, because its inputs just moved.
+    """Drop what this request has memoized, because its inputs have moved.
 
     A caller that mutates what the integrations read part-way through its own
     request has broken the promise `request_scope` makes and must say so.
-    Saying so reaches the kernel too: when the caller also holds a
+    Saying so reaches the kernel too. When the caller also holds a
     `Database.request_span`, the span rolls onto a fresh request, so the
-    kernel's own once-per-request work -- resource validation above all --
+    kernel's own once-per-request work (resource validation above all)
     re-runs against the moved inputs.
     """
 
     request = _live_request()
-    # A live request always holds its database; the second test is for the
+    # A live request always holds its database. The second test is for the
     # type checker.
     if request is not None and request.db is not None:
         request.memo.clear()

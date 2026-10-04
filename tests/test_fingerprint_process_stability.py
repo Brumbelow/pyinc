@@ -1,24 +1,27 @@
-"""Identities that do not depend on which process asked for them.
+"""Identities that are the same whichever process asks for them.
 
-Two properties, one file. Every identity the distribution ships -- the query
-objects and the resource handles it defines -- must be the same in every
-process, whatever hash seed that process was started under. And
-no module the tree imports may carry a module identity that is not: a captured
-module's identity payload is folded into every fingerprint that captures it, so
-a payload that moves between processes moves all of them.
+This file checks two properties. First, every identity the distribution ships
+(the query objects and the resource handles it defines) must be the same in
+every process, whatever hash seed that process started under. Second, every
+module the tree imports must carry a module identity that is the same in every
+process. A captured module's identity payload is folded into every fingerprint
+that captures it, so a payload that moves between processes moves all of them.
 
 Both properties are cross-process by definition, so every cell here spawns real
-subprocesses through ``sys.executable`` and compares what they print. The idiom
-is ``tests/test_checkpoint_cross_process.py``'s, so the two files agree about
-what a child process is allowed to depend on: a fixture script written into
-``tmp_path``, ``{**os.environ, ...}`` for the child environment, an explicit
-``PYTHONPATH`` holding the source tree, bytecode caching off, and a single
-``JSON ``-prefixed line on stdout.
+subprocesses through ``sys.executable`` and compares what they print. The cells
+follow ``tests/test_checkpoint_cross_process.py``, so the two files agree about
+what a child process may depend on:
 
-The shipped population is pinned rather than discovered and trusted. A new
-query or resource handle joins the surface only through a deliberate edit to
-the inventory below, which is what keeps a new integration from inheriting a
-defect unnoticed.
+* a fixture script written into ``tmp_path``;
+* ``{**os.environ, ...}`` for the child environment;
+* an explicit ``PYTHONPATH`` holding the source tree;
+* bytecode caching off;
+* a single ``JSON ``-prefixed line on stdout.
+
+The shipped population is pinned in the inventory below, and discovery is
+checked against it. A new query or resource handle joins the surface only
+through an edit to that inventory, which keeps a new integration from
+inheriting a defect unnoticed.
 """
 
 from __future__ import annotations
@@ -46,15 +49,14 @@ def _src_dir() -> str:
 def _child_env(seed: str | None) -> dict[str, str]:
     """A child environment whose hash seed is the axis a cell chooses.
 
-    ``{**os.environ, ...}`` rather than a bare dict, so the child still inherits
+    The environment starts from ``{**os.environ, ...}`` so the child inherits
     ``TMPDIR`` and, on Windows, ``SYSTEMROOT``. Bytecode caching is off in every
-    child: a ``.pyc`` records the absolute path of the source it was built from,
-    which is exactly the kind of per-installation value these cells are here to
-    prove is not folded. A row that wants no pinned seed *deletes*
-    ``PYTHONHASHSEED`` rather than setting it to the empty string: CPython
-    reads an empty value as absent, so the two are one configuration -- the one
-    users actually run -- and setting it would only prove that they are read
-    alike.
+    child. A ``.pyc`` records the absolute path of the source it was built from,
+    the kind of per-installation value these cells prove stays out of the fold.
+    A row that wants no pinned seed *deletes* ``PYTHONHASHSEED``. CPython reads
+    an empty value as absent, so empty and absent are one configuration, the
+    one users run. Setting it to the empty string would only prove that the two
+    are read alike.
     """
 
     env = {
@@ -72,8 +74,8 @@ def _child_env(seed: str | None) -> dict[str, str]:
 def _run(args: list[str], env: dict[str, str]) -> dict[str, Any]:
     """Run a fixture child and return the payload of its last ``JSON `` line.
 
-    The prefix matters: a child that imports the whole tree may print warnings,
-    and the cells below are reading a value rather than the tail of whatever
+    The prefix matters because a child that imports the whole tree may print
+    warnings. It lets the cells below read the value itself, whatever else
     reached stdout.
     """
 
@@ -89,8 +91,7 @@ def _run(args: list[str], env: dict[str, str]) -> dict[str, Any]:
 
 #: The three packages the distribution ships (pyproject's
 #: `[tool.hatch.build.targets.wheel] packages`). `pyinc_tools` defines no query
-#: and no resource handle, and is walked anyway so that a future one cannot
-#: appear unnoticed.
+#: and no resource handle. It is walked anyway so that a future one is noticed.
 _SHIPPED_PACKAGES = ("pyinc", "pyinc_tools", "pyinc_codegen")
 
 
@@ -114,21 +115,22 @@ def _walk_modules() -> list[tuple[str, object]]:
 def _shipped_identities(db: Database) -> list[tuple[str, object]]:
     """`[(inventory key, object)]` for every shipped identity-bearing object.
 
-    Two populations, one walk:
+    One walk finds two populations:
 
     * every `pyinc.core.Query`, keyed by `Q|<query key>`;
     * every object the KERNEL calls a resource handle, keyed by
       `R|<module>.<attribute>`.
 
-    `Database._is_resource_handle` is the kernel's own predicate (a callable
-    `label`/`probe`/`load`), not `isinstance(value, pyinc.resources.Resource)`:
-    12 of the 30 shipped resource handles are duck-typed and subclass nothing,
-    so a nominal test under-counts the surface by twelve. Classes and modules
-    are excluded because an unbound method is callable off the class too.
+    The resource test is the kernel's own predicate,
+    `Database._is_resource_handle` (a callable `label`/`probe`/`load`). Twelve
+    of the 30 shipped resource handles are duck-typed and subclass nothing, so
+    `isinstance(value, pyinc.resources.Resource)` would under-count the surface
+    by twelve. Classes and modules are excluded because an unbound method is
+    callable off the class too.
 
     De-duplication is by `id()`, so a re-export (`source_text` is bound in three
-    modules) contributes ONE entry. Objects, not bindings, is the unit the
-    fingerprint has.
+    modules) contributes ONE entry. The fingerprint's unit is the object,
+    whatever names bind it.
     """
     from types import ModuleType
 
@@ -156,8 +158,8 @@ def _discovered_identity_keys() -> frozenset[str]:
 
 
 #: Every identity-bearing object the distribution ships, by key: 91 query
-#: objects and 30 resource handles. Pinned as a literal rather than
-#: discovered, so a new one joins the surface only through an edit here.
+#: objects and 30 resource handles. Pinned as a literal, so a new one joins the
+#: surface only through an edit here.
 _SHIPPED_IDENTITY_INVENTORY: frozenset[str] = frozenset((
     # ---- 91 Query objects -------------------------------------------
     "Q|pyinc.integrations.csv_data:csv_analysis_payload",
@@ -288,13 +290,13 @@ _SHIPPED_IDENTITY_INVENTORY: frozenset[str] = frozenset((
 def test_the_shipped_identity_inventory_is_exact() -> None:
     """The population the cell below guards, pinned by name.
 
-    A frozenset literal rather than a discovered set, in
-    ``tests/test_cutoff_inventory.py``'s idiom: 121 objects, 91 query objects
-    and 30 resource handles. Adding a shipped query or resource handle is
-    therefore a deliberate edit here rather than a silent widening of what the
-    stability cell has to hold for. The literal carries no per-version branch,
-    and the test matrix runs this cell on every interpreter the project
-    supports, so a surface that differed between them would be red here.
+    The inventory is a frozenset literal, as in
+    ``tests/test_cutoff_inventory.py``: 121 objects, 91 query objects and 30
+    resource handles. Adding a shipped query or resource handle therefore takes
+    an edit here, which makes every widening of what the stability cell must
+    hold for explicit. The literal is the same for every Python version, and
+    the test matrix runs this cell on every interpreter the project supports.
+    A surface that differed between them would turn this cell red.
     """
 
     found = _discovered_identity_keys()
@@ -308,9 +310,9 @@ def test_the_shipped_identity_inventory_is_exact() -> None:
     )
 
 
-# The fixture child runs the SAME discovery source as the inventory cell --
-# `inspect.getsource`, not a second copy -- so the population under test and the
-# population the inventory pins cannot drift apart.
+# The fixture child runs the SAME discovery source as the inventory cell,
+# through `inspect.getsource`. With one copy of the code, the population under
+# test and the population the inventory pins stay in step.
 IDENTITY_FIXTURE_SCRIPT = (
     '"""Print the process-stable identity digest of every shipped object."""\n'
     "import importlib\n"
@@ -346,12 +348,12 @@ print("JSON " + json.dumps(out))
 def test_every_shipped_identity_is_the_same_in_every_process(tmp_path: Path) -> None:
     """Every shipped query and resource handle digests the same in three processes.
 
-    Two different non-zero seeds and no pinned seed at all. Non-zero, because
-    ``PYTHONHASHSEED=0`` turns hash randomization off rather than choosing a
-    seed, and a row crossing that is evidence about how the interpreter was
-    configured rather than about the order anything was hashed. Three processes
-    is the minimum that separates "agrees" from "agrees by luck", and the
-    unpinned row is the configuration users actually run.
+    The processes run under two different non-zero seeds and under no pinned
+    seed. The seeds are non-zero because ``PYTHONHASHSEED=0`` chooses no seed:
+    it turns hash randomization off. A row crossing that would measure how the
+    interpreter was configured, where this cell measures the order things were
+    hashed in. Three processes is the minimum that separates "agrees" from
+    "agrees by luck". The unpinned row is the configuration users run.
     """
 
     script = tmp_path / "identity_fixture.py"
@@ -366,10 +368,10 @@ def test_every_shipped_identity_is_the_same_in_every_process(tmp_path: Path) -> 
 
     keys = set(_SHIPPED_IDENTITY_INVENTORY)
     for seed, run in zip(seeds, runs, strict=True):
-        # Per child rather than over the union of the three: a key one child
-        # never printed would otherwise reach the disagreement check below and
-        # be reported as an identity that differs between processes, when what
-        # happened is that the population drifted.
+        # Checked per child. Over the union of the three, a key one child never
+        # printed would reach the disagreement check below. It would be
+        # reported as an identity that differs between processes, when the
+        # population drifted.
         assert set(run) == keys, (
             f"the fixture child at seed {seed!r} and the inventory disagree "
             "about the population"
@@ -392,12 +394,12 @@ def test_every_shipped_identity_is_the_same_in_every_process(tmp_path: Path) -> 
     )
 
 
-# The spelling is `_module_identity_payload`, never `_module_constants_payload`.
-# The raw read still answers with whatever this process rebuilt: it is the
-# identity payload that decides which modules contribute a namespace at all, and
-# the identity payload is what a fingerprint folds. A census written against the
-# raw read would be red forever whatever the identity does, and a permanently
-# red cell is disabled within a release or two.
+# The census reads `_module_identity_payload`, never `_module_constants_payload`.
+# The raw read still answers with whatever this process rebuilt. The identity
+# payload decides which modules contribute a namespace at all, and it is what a
+# fingerprint folds. A census of the raw read would stay red whatever the
+# identity does, and a permanently red cell gets disabled within a release or
+# two.
 CENSUS_FIXTURE_SCRIPT = '''\
 """Digest `_module_identity_payload` for every module the pyinc tree imports."""
 
@@ -430,23 +432,22 @@ for name, module in sorted(sys.modules.items()):
 print("JSON " + json.dumps({"digests": out, "real": real}))
 '''
 
-#: A floor on how many modules must yield a real digest, so the census cannot
-#: pass by refusing everything. Measured at both ends of the supported
-#: interpreter range: 201 real digests of 211 imported modules on the oldest,
-#: 210 of 215 on the newest. The floor sits far below both, so a standard
-#: library reshuffle does not turn the cell red for a reason that has nothing to
-#: do with what it measures.
+#: A floor on how many modules must yield a real digest, so a census that
+#: refuses everything fails. Measured at both ends of the supported interpreter
+#: range: 201 real digests of 211 imported modules on the oldest, 210 of 215 on
+#: the newest. The floor sits far below both, so a standard library reshuffle
+#: cannot turn the cell red for a reason unrelated to what it measures.
 _MINIMUM_MODULES_WITH_A_REAL_IDENTITY = 150
 
 
 def test_no_module_the_tree_imports_carries_a_process_varying_identity(
     tmp_path: Path,
 ) -> None:
-    """No module the tree imports has an identity that moves between processes.
+    """Every module the tree imports has the same identity in every process.
 
     A captured module's identity payload is folded into the fingerprint of every
-    query that captures it, so one module whose payload is not reproducible is
-    enough to make a whole family of identities process-dependent.
+    query that captures it. One module with an unreproducible payload therefore
+    makes a whole family of identities process-dependent.
     """
 
     script = tmp_path / "census_fixture.py"
@@ -454,10 +455,9 @@ def test_no_module_the_tree_imports_carries_a_process_varying_identity(
 
     # Four children in two same-seed PAIRS. A module that disagrees INSIDE a
     # pair varies for a reason other than the hash seed (an address, a pid, a
-    # clock); one that agrees inside both pairs but disagrees between them
-    # varies with the hash order. Both are fatal to a process-stable
-    # fingerprint, and the failure message has to say which, or the fix aims at
-    # the wrong thing.
+    # clock). One that agrees inside both pairs but disagrees between them
+    # varies with the hash order. Both break a process-stable fingerprint. The
+    # failure message says which, so the fix aims at the right cause.
     started = time.perf_counter()
     a1, a2, b1, b2 = (
         _run([sys.executable, str(script)], _child_env(seed))
@@ -508,16 +508,16 @@ def test_the_runtime_build_payload_ignores_the_hash_randomization_flag(
 ) -> None:
     """The build identity is the same whether hash randomization is on or off.
 
-    This is the positive pin for the flag. The negative spelling -- asserting
-    that the payload's repr does not mention ``hash_randomization`` -- holds
-    just as well of a payload that folds the flag as a bare value at a fixed
-    position, so it is not a pin at all.
+    This is the positive pin for the flag. The negative spelling would assert
+    that the payload's repr omits ``hash_randomization``. That also holds for a
+    payload that folds the flag as a bare value at a fixed position, so it pins
+    nothing.
 
-    ``PYTHONHASHSEED=0`` is not "seed zero": it turns randomization off, which
-    is the axis this cell crosses. The third child pins a different randomized
-    seed and is asserted equal to ``randomization_on``, as the control that the
-    cell is comparing a payload two processes built rather than reading back a
-    constant.
+    ``PYTHONHASHSEED=0`` is not "seed zero". It turns randomization off, and
+    that is the axis this cell crosses. The third child pins a different
+    randomized seed and is asserted equal to ``randomization_on``. It is the
+    control showing that the cell compares a payload two processes built
+    instead of reading back a constant.
     """
 
     script = tmp_path / "build_payload_fixture.py"
@@ -612,9 +612,10 @@ def test_a_captured_guard_wrapper_has_the_same_identity_in_every_process(
     """A query that captures a guard wrapper digests the same in three processes.
 
     The wrapper's own payload names the standard-library callable it guards,
-    never the wrapper object, so it carries no address and nothing the hash
-    seed orders; the query that captures it follows. Two non-zero seeds and no
-    pinned seed, as in the cell above.
+    never the wrapper object. It carries no address and nothing the hash seed
+    orders, and the query that captures it inherits that stability. The
+    processes run under two non-zero seeds and no pinned seed, as in
+    `test_every_shipped_identity_is_the_same_in_every_process`.
     """
 
     modules = tmp_path / "modules"
@@ -631,7 +632,7 @@ def test_a_captured_guard_wrapper_has_the_same_identity_in_every_process(
     assert all(run == runs[0] for run in runs[1:]), [
         key for key in runs[0] if len({run.get(key) for run in runs}) > 1
     ]
-    # Distinct names fold distinctly; `open` and `io.open` guard one function.
+    # Distinct names fold distinctly. `open` and `io.open` guard one function.
     payloads = {key: value for key, value in runs[0].items() if key.startswith("P|")}
     assert payloads["P|builtins.open"] == payloads["P|io.open"]
     assert len(set(payloads.values())) == len(payloads) - 1

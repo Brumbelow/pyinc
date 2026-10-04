@@ -24,7 +24,7 @@ _RELEASE_LINK = "[{version}]: https://github.com/Brumbelow/pyinc/releases/tag/v{
 
 
 class ReleaseMetadataError(ValueError):
-    """The release metadata does not satisfy the release policy."""
+    """The release metadata breaks the release policy."""
 
 
 @dataclass(frozen=True)

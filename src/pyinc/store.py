@@ -48,7 +48,7 @@ class ArtifactStore(Protocol):
     * Return ``None`` from :meth:`get` for missing digests (never raise).
     * Make :meth:`put` idempotent for equal byte payloads on the same digest.
     * Raise :class:`ValueError` from :meth:`put` if a digest is rebound to
-      different bytes — silently keeping either value violates the soundness
+      different bytes. Silently keeping either value violates the soundness
       model and would mask corruption.
     """
 
@@ -70,8 +70,8 @@ class InMemoryArtifactStore:
     beyond `Database(max_query_nodes=...)` LRU eviction within a single run.
 
     Databases on several threads may share one. `put` checks and stores under
-    the store's lock: unlocked, two puts of one digest could both find it
-    absent and the second overwrote the first, so a digest rebound to
+    the store's lock. Unlocked, two puts of one digest could both find it
+    absent, and the second overwrote the first, so a digest rebound to
     different bytes went unrefused. `keys` copies under the same lock, so its
     snapshot can be iterated while other threads store. `get` and `contains`
     are one dict operation each and need no lock. Each process uses a lock of
@@ -82,11 +82,12 @@ class InMemoryArtifactStore:
 
     def __init__(self) -> None:
         self._items: dict[str, bytes] = {}
-        # One lock per process id, made on first use there. A thread that held
-        # the parent's lock at a fork does not exist in the child, so the child
-        # needs a lock of its own. The table lives on the instance: a module
-        # registry would be mutable state in the methods a query's fingerprint
-        # folds when it captures this class.
+        # One lock per process id, made on first use in that process. A thread
+        # that held the parent's lock at a fork is gone in the child, so the
+        # child needs a lock of its own. The table lives on the instance, so the
+        # methods read no mutable module state. A query that captures this
+        # class folds those methods into its fingerprint, and the fold refuses
+        # such state.
         self._locks: dict[int, threading.Lock] = {}
 
     def _process_lock(self) -> threading.Lock:
@@ -129,7 +130,7 @@ class InMemoryArtifactStore:
     def __getstate__(self) -> dict[str, Any]:
         # Locks cannot be pickled or copied, so the state leaves them out. The
         # items are copied under the lock, so a put on another thread cannot
-        # change them mid-read, and a copy never shares them with this store.
+        # change them while they are read, and a copy gets items of its own.
         with self._process_lock():
             state = dict(self.__dict__)
             state["_items"] = dict(self._items)
@@ -148,8 +149,8 @@ class FileSystemArtifactStore:
     with two-character fan-out so a workspace's worth of digests stays under
     common-filesystem directory-size limits. Per-digest process locks and
     no-follow same-directory atomic publication reject symlink and observed
-    parent-rename races. As on other POSIX filesystem APIs, callers must not let
-    non-cooperating processes rename the store root during a mutation."""
+    parent-rename races. As on other POSIX filesystem APIs, callers must keep
+    non-cooperating processes from renaming the store root during a mutation."""
 
     def __init__(self, root: str | os.PathLike[str], *, lock_timeout: float = 30.0) -> None:
         lock_timeout = _validate_lock_timeout(lock_timeout)

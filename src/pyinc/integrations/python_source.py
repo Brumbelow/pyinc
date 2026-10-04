@@ -629,11 +629,11 @@ def _collect_python_files(
 
 @query
 def source_text(db: Database, path: str) -> str:
-    # Deliberately not memoized per request: query bodies read the source
-    # through here, and answering one from an earlier call would rob the second
-    # query of the resource dependency the kernel needs to invalidate it. The
-    # kernel enforces this -- `once_per_request` closes over a ContextVar, which
-    # it refuses to source-pin, so any query that reached it would fail loudly.
+    # This stays unmemoized per request. Each query body that reads the source
+    # here needs its own resource dependency so the kernel can invalidate it.
+    # The kernel enforces this: `once_per_request` closes over a ContextVar,
+    # which the kernel refuses to source-pin, so a query that reached it would
+    # fail loudly.
     return _FILES.read(db, path)[0]
 
 
@@ -1190,9 +1190,9 @@ def _decoded_module_analysis(
 
 
 # Every payload below is declared as nested tuples of primitives, and `freeze`
-# leaves such a value as plain tuples, so what `db.get` hands back in any mode is
-# already the payload. Thawing it again only walks and copies the whole tree --
-# on a workspace-sized request that copy dominated the cost of decoding.
+# leaves such a value as plain tuples. So `db.get` returns the payload itself in
+# every mode. Thawing it again would walk and copy the whole tree, and on a
+# workspace-sized request that copy dominated the cost of decoding.
 def file_analysis(db: Database, path: str | os.PathLike[str]) -> PythonFileAnalysis:
     _reject_in_query(db, "file_analysis")
     normalized_path = _normalize_path(path)

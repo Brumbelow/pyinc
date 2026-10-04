@@ -1,8 +1,7 @@
 """Tools-local copy of the kernel's private identifier lexer.
 
-`pyinc_tools` builds only on public `pyinc` contracts; duplicating this small
-stdlib-only helper keeps that boundary intact instead of importing
-`pyinc._python_lexing`.
+`pyinc_tools` builds only on public `pyinc` contracts, so it keeps its own
+copy of this small stdlib-only helper in place of `pyinc._python_lexing`.
 """
 
 from __future__ import annotations

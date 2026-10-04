@@ -178,10 +178,10 @@ def _diagnostic_signature(diagnostic: dict[str, Any]) -> tuple[Any, ...]:
 def _diagnostics_result_id(items: list[dict[str, Any]]) -> str:
     """Content-addressed identifier for a diagnostic set.
 
-    Pure function of the diagnostic signatures, so an unchanged file yields a
-    stable id across pulls (and across processes — `hash()` is salted, so a
-    SHA-256 digest is used instead) and the server can answer with an
-    `unchanged` report when the client's `previousResultId` still matches.
+    A pure function of the diagnostic signatures, so an unchanged file yields a
+    stable id across pulls and across processes. It uses a SHA-256 digest
+    because `hash()` is salted. The server can then answer with an `unchanged`
+    report when the client's `previousResultId` still matches.
     """
     signatures = [_diagnostic_signature(item) for item in items]
     payload = json.dumps(signatures, separators=(",", ":"), sort_keys=True)
@@ -238,7 +238,7 @@ _INLAY_HINT_KIND_TO_LSP = {
 
 
 # LSP semantic-tokens legend. The order of these tuples is the protocol
-# index — `tokens[i].tokenType` is encoded as the integer index of the
+# index. `tokens[i].tokenType` is encoded as the integer index of the
 # matching entry in `tokenTypes`. The `tokenModifiers` field is a bitmask
 # over these positions.
 _SEMANTIC_TOKEN_TYPES: tuple[str, ...] = (
@@ -267,12 +267,12 @@ def _encode_semantic_tokens(
 ) -> list[int]:
     """Encode ``tokens`` into the LSP semantic-tokens wire format.
 
-    The wire format is a flat ``list[int]`` of five integers per token —
-    ``[deltaLine, deltaStart, length, tokenType, tokenModifiers]`` —
-    where ``deltaLine`` is relative to the previous token's line,
-    ``deltaStart`` is relative to the previous token's start column when
-    both tokens share a line (else absolute), and ``tokenModifiers`` is a
-    bitmask over the legend positions in ``_SEMANTIC_TOKEN_MODIFIERS``.
+    The wire format is a flat ``list[int]`` with five integers per token:
+    ``[deltaLine, deltaStart, length, tokenType, tokenModifiers]``.
+    ``deltaLine`` is relative to the previous token's line. ``deltaStart`` is
+    relative to the previous token's start column when both tokens share a
+    line, and absolute otherwise. ``tokenModifiers`` is a bitmask over the
+    legend positions in ``_SEMANTIC_TOKEN_MODIFIERS``.
     """
     data: list[int] = []
     prev_line = 0
@@ -350,7 +350,7 @@ def _type_hierarchy_item_to_lsp(item: TypeHierarchyItem) -> dict[str, Any]:
 def _type_hierarchy_identity_from_item(
     item: Any,
 ) -> tuple[str, str] | None:
-    # Shape matches `_call_hierarchy_identity_from_item`; kept separate so
+    # Shape matches `_call_hierarchy_identity_from_item`. Kept separate so
     # the two endpoint families can diverge if needed.
     if not isinstance(item, dict):
         return None
@@ -491,9 +491,9 @@ class LanguageServer:
         except (InvalidParams, KeyError, TypeError, ValueError):
             return True
         except Exception as exc:
-            # Notifications have no response to carry an error, so a failed
+            # Notifications have no response to carry an error. So a failed
             # handler (e.g. an OSError from a mirror write) is logged and the
-            # loop keeps serving, mirroring the request branch's catch-all.
+            # loop keeps serving, like the request branch's catch-all.
             print(
                 f"pyinc-tools lsp: {method} notification raised: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
@@ -663,9 +663,9 @@ class LanguageServer:
         # ends with the diagnostics of the latest analysis.
         with self._publish_lock:
             # The watcher thread calls this while the request loop may be
-            # tearing the session down, so the session is read once: a second
-            # read could find None. A session torn down meanwhile is closed, and
-            # what its analysis found is no longer the server's to publish.
+            # tearing the session down. So the session is read once, because a
+            # second read could find None. A session torn down meanwhile is
+            # closed, and the server leaves its analysis unpublished.
             session = self._session
             if session is None:
                 return
@@ -719,8 +719,8 @@ class LanguageServer:
         try:
             real_path = self._require_safe_path(document["uri"])
         except ValueError:
-            # A pull for a document outside the workspace: report no problems
-            # rather than failing the request.
+            # A pull for a document outside the workspace succeeds with an
+            # empty report.
             items: list[dict[str, Any]] = []
         else:
             result = self._require_session().analyze_file(real_path)
@@ -917,8 +917,8 @@ class LanguageServer:
         # Detached before it is closed, and under the write lock, so a publish
         # still running on the watcher thread (its join can time out) or on a
         # caller's thread sees that the session is gone instead of reading it
-        # closed, or reading None where it had just found a session. The
-        # publish lock is left alone: that publish may still hold it.
+        # closed, or reading None where a moment before it found a session. The
+        # publish lock is left alone, because that publish may still hold it.
         with self._write_lock:
             session = self._session
             self._session = None

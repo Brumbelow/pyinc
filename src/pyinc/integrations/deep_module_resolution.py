@@ -166,7 +166,7 @@ def _get_sys_path_entries() -> tuple[str, ...]:
     result: list[str] = []
     for raw in sys.path:
         # An empty, relative or (on Windows) rooted entry names a directory
-        # through the working directory, which a query may not read; the
+        # through the working directory, which a query may not read. The
         # analysis resolves only the fully qualified entries the interpreter
         # itself puts on the path.
         if not isinstance(raw, str) or not raw or not is_fully_qualified(raw, os.path):
@@ -196,7 +196,7 @@ def _directory_exists(db: Database, path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: Payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -219,7 +219,7 @@ def _pth_listing(db: Database, directory: str) -> tuple[str, ...]:
 
 @query
 def _pth_file_text(db: Database, pth_path: str) -> str:
-    """Raw text of a .pth file, exactly as written.
+    """Raw text of a .pth file, as written.
 
     Comment and whitespace edits are absorbed one layer up, by
     `_pth_directives_payload`, which re-derives an equal set of directives from
@@ -248,7 +248,7 @@ def _pth_directives_payload(db: Database, pth_path: str) -> PthParsePayload:
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition
+# Layer 2: Composition
 # ---------------------------------------------------------------------------
 
 
@@ -507,7 +507,7 @@ def _deep_analysis_payload(db: Database) -> DeepModuleResolutionAnalysisPayload:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: Entrypoints
 # ---------------------------------------------------------------------------
 
 

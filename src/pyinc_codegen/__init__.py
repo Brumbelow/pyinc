@@ -1,10 +1,9 @@
-"""``pyinc_codegen`` — a JSON-Schema -> typed-Python compiler.
+"""``pyinc_codegen``: a JSON Schema to typed Python compiler.
 
-The first useful file->file compiler built on pyinc. It consumes pyinc's PUBLIC
-API only (``pyinc`` top-level: ``@query``, ``BinaryFileResource``, the
-``@action`` output layer) and never reaches into kernel internals. Stdlib-only:
-JSON Schema is parsed with ``json`` plus dict walking — no third-party schema
-library.
+The first useful file-to-file compiler built on pyinc. It uses only pyinc's
+public API (the ``pyinc`` top level: ``@query``, ``BinaryFileResource`` and the
+``@action`` output layer) and stays out of kernel internals. It needs only the
+standard library: it parses JSON Schema with ``json`` and walks the dicts.
 
 See ``docs/codegen-guide.md`` for the supported subset and the public-API-only
 boundary.

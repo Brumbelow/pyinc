@@ -169,8 +169,8 @@ class _ObservedResourceHolder:
 
 class _ObservedPartsResource(Resource[int, int, int]):
     def __init__(self, scale: int) -> None:
-        # A list, so a write into the configuration leaves every reference an
-        # observation can pin identical and only re-reading identity() sees it.
+        # A list, so writing into the configuration keeps every reference an
+        # observation can pin identical. Only re-reading identity() sees it.
         self.parts = [scale]
 
     def identity(self) -> tuple[str, tuple[int, ...]]:
@@ -319,12 +319,12 @@ def _handle_wrapped_two(db: Database) -> int:
 def _memo_and_truth(db: Database, target: Any) -> tuple[str, str]:
     """The memoized fingerprint next to the recomputed truth for ``target``.
 
-    Callers prime the memo, apply a mutation, then compare the two: a coherent
-    memo either recomputes or was already equal; only a stale hit differs.
+    Callers prime the memo, apply a mutation, then compare the two. A coherent
+    memo either recomputes or was already equal. Only a stale hit differs.
     """
 
-    # Uncacheable queries are popped from the memo, which would make the
-    # comparison below trivially true; only memoized queries can be probed.
+    # The memo drops uncacheable queries, which would make the comparison below
+    # trivially true. Only memoized queries can be probed.
     assert target in db._query_fingerprint_memo
     memoized = db._query_fingerprint(target)
     db._query_fingerprint_memo.pop(target, None)
@@ -334,11 +334,10 @@ def _memo_and_truth(db: Database, target: Any) -> tuple[str, str]:
 def _assert_warm_matches_fresh(db: Database, mode: str, target: Any, expected: Any) -> None:
     """Pin *db*'s warm answer for *target* against a from-scratch database.
 
-    ``db`` has already answered *target* once and something the fingerprint
-    covers has changed since. The execution counter is read before the warm
-    call: a query whose identity moved with the change has no record to reuse
-    and must execute, so a warm answer that merely repeated the stored one
-    fails here instead of passing as agreement.
+    ``db`` has answered *target* once, and something the fingerprint covers has
+    changed since. The execution counter is read before the warm call. A query
+    whose identity moved with the change has no record to reuse and must
+    execute, so a warm answer that repeats the stored one fails here.
     """
 
     executions = db.statistics().query_executions
@@ -564,8 +563,8 @@ def test_runtime_build_payload_covers_full_release_and_abi(
     )
     folded_flags = next(item for item in flags if isinstance(item, tuple))
     assert all(isinstance(pair, tuple) and len(pair) == 2 for pair in folded_flags)
-    # Computed from `dir(sys.flags)`, never from a literal: the field set grows
-    # with each CPython release, so a literal list would break on the next one.
+    # Computed from `dir(sys.flags)` because the field set grows with each
+    # CPython release. A literal list would break on the next one.
     excluded_flag_names = {
         "count",
         "hash_randomization",
@@ -601,10 +600,10 @@ def test_the_kernel_fingerprint_version_mirrors_the_encoder_prefix() -> None:
     """The kernel's version constant and the prefix every digest carries agree.
 
     The encoder stamps each fingerprint with a version prefix, and the kernel
-    holds the same number as an integer it compares and reasons about. The two
-    are written in different modules and nothing in the tree made them agree,
-    so a bump applied to one and not the other would ship digests whose prefix
-    contradicts the version the kernel believes it is computing.
+    holds the same number as an integer it compares. The two live in different
+    modules, and only this test ties them together. A bump to one alone would
+    ship digests whose prefix contradicts the version the kernel thinks it is
+    computing.
     """
 
     assert int(value_module._KERNEL_FINGERPRINT_PREFIX[1:2]) == (
@@ -702,11 +701,12 @@ def test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative(
     """Pins the documented shape of consistency under a coarse policy.
 
     A cutoff that declares two values unchanged makes dependents consistent
-    modulo that equivalence: they legitimately stay at results computed from
+    modulo that equivalence. They legitimately stay at results computed from
     the earlier representative, while a fresh database starts from the later
-    one. Exact-value agreement requires a substitutive policy (condition 3).
-    The equivalence is not a within-process effect: a checkpoint saved while a
-    dependent sits at the earlier representative reloads it unchanged.
+    one.
+    Exact-value agreement requires a substitutive policy (condition 3). The
+    equivalence outlives the process: a checkpoint saved while a dependent
+    sits at the earlier representative reloads it unchanged.
     """
     coarse = Input[int]("congruence.value", cutoff=lambda _value: 0)
 
@@ -726,15 +726,15 @@ def test_non_substitutive_cutoff_keeps_dependents_at_the_earlier_representative(
     assert fresh.get(doubled) == 4
 
     # The dependent is already stale when the checkpoint is written, and the
-    # same store directory is read back with nothing edited in between.
+    # same store directory is read back with no edits in between.
     checkpoint = db.save_checkpoint()
     reloaded = Database(mode=mode, store=FileSystemArtifactStore(tmp_path))
     reloaded.set(coarse, 2)
     reloaded.load_checkpoint(checkpoint)
 
     assert reloaded.get(doubled) == 2
-    # Nothing recomputed it: the reload carried the earlier representative's
-    # result across, rather than the loader deriving 4 from the input it holds.
+    # Nothing recomputed it. The reload carried over the earlier representative's
+    # result, and the loader never derived 4 from the input it holds.
     assert reloaded.statistics().query_executions == 0
 
 
@@ -1080,17 +1080,15 @@ _SHADOW_ATTRIBUTE = "SETTING"
 def test_dynamic_capture_of_a_caller_module_named_for_the_stdlib_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A module of the caller's that answers to a standard-library name is the
-    # caller's code whatever the standard library calls it. The runtime build
-    # identity pins nothing about it, so the kernel refuses to fingerprint a
-    # dynamic read of it -- exactly as it does for any other module of theirs
-    # -- rather than pinning nothing and serving a warm answer a fresh
-    # database would contradict.
+    # A caller's module with a standard-library name is still the caller's code.
+    # The runtime build identity pins nothing about it, so the kernel refuses to
+    # fingerprint a dynamic read of it, as for any other caller module. Pinning
+    # nothing would serve a warm answer that a fresh database contradicts.
     #
-    # The read has to be dynamic for this to witness anything. A static
-    # `module.SETTING` leaves an access path, and the constants on an accessed
-    # path are folded even when the module is misclassified as runtime-pinned,
-    # so a static variant of this cell stays green under the mutation that
+    # The read must be dynamic for this to witness anything. A static
+    # `module.SETTING` leaves an access path, and constants on an accessed path
+    # are folded even when the module is misclassified as runtime-pinned. A
+    # static variant of this cell would stay green under the mutation that
     # reverts the predicate to a name-only test.
     (tmp_path / "graphlib.py").write_text(f"{_SHADOW_ATTRIBUTE} = 11\n", encoding="utf-8")
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
@@ -1098,8 +1096,8 @@ def test_dynamic_capture_of_a_caller_module_named_for_the_stdlib_is_refused(
     saved = sys.modules.pop("graphlib", None)
     try:
         module = importlib.import_module("graphlib")
-        # Before anything else: a cell that reached the real graphlib would be
-        # asking a different question and would answer it wrongly.
+        # Check this first. A cell that reached the real graphlib would ask a
+        # different question and answer it wrongly.
         assert Path(cast(str, module.__file__)).parent == tmp_path
 
         @query(key="shadow-stdlib-dynamic-capture")
@@ -1109,25 +1107,24 @@ def test_dynamic_capture_of_a_caller_module_named_for_the_stdlib_is_refused(
         with pytest.raises(UnsupportedValueError):
             Database()._query_fingerprint(setting)
     finally:
-        # Popping is the load-bearing half: graphlib is imported by neither
-        # pyinc nor the harness, so there is usually nothing to restore and a
-        # restore-only teardown would leave the planted module bound for every
-        # later test in this worker.
+        # The pop matters most. Neither pyinc nor the harness imports graphlib,
+        # so there is usually nothing to restore. A restore-only teardown would
+        # leave the planted module bound for every later test in this worker.
         sys.modules.pop("graphlib", None)
         if saved is not None:
             sys.modules["graphlib"] = saved
 
 
 def test_a_stdlib_module_under_any_library_directory_is_runtime_pinned() -> None:
-    # The standard library is not one directory. A Windows build keeps
-    # `_ctypes.pyd` and about twenty sibling extension modules in `DLLs`, a
-    # sibling of `Lib` rather than a child of it; an embeddable build imports
-    # the whole pure-Python half out of `python3XY.zip`; and `sysconfig` names
-    # a second, platform-specific directory wherever the two halves differ. A
-    # module classified as the caller's there would have its whole namespace
-    # folded, and `_ctypes` publishes process-varying addresses at module
-    # scope. The directories are named rather than discovered on disk, so
-    # every runner exercises every arm whatever its own layout is.
+    # The standard library spans several directories. A Windows build keeps
+    # `_ctypes.pyd` and about twenty sibling extension modules in `DLLs`, which
+    # sits beside `Lib`. An embeddable build imports the whole pure-Python half
+    # from `python3XY.zip`. `sysconfig` names a second, platform-specific
+    # directory wherever the two halves differ. A module there classified as
+    # the caller's would have its whole namespace folded, and `_ctypes`
+    # publishes process-varying addresses at module scope. The test hardcodes
+    # the directory names, so every runner exercises every arm whatever its
+    # own layout.
     def _spec(*parts: str) -> importlib.machinery.ModuleSpec:
         return importlib.machinery.ModuleSpec("_ctypes", None, origin=os.path.join(*parts))
 
@@ -1143,8 +1140,8 @@ def test_a_stdlib_module_under_any_library_directory_is_runtime_pinned() -> None
     answers = {
         directory: (
             Database._is_runtime_pinned_module(module, _spec(directory, "_ctypes.pyd")),
-            # A distribution installed beside the standard library is still the
-            # caller's code however deep under one of these it sits.
+            # A distribution installed beside the standard library is the
+            # caller's code, however deep under one of these it sits.
             Database._is_runtime_pinned_module(
                 module, _spec(directory, "site-packages", "vendor", "_ctypes.pyd")
             ),
@@ -1346,15 +1343,16 @@ def test_source_pinned_module_function_keeps_imported_mutable_state(
 def test_a_source_pinned_function_that_calls_itself_fingerprints(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A recursive function the kernel pins by its source folds once, not without end.
+    """A recursive function the kernel pins by its source is folded once.
 
     Reading a mutable module global refuses a function's definition fold, so
-    the kernel pins it by its source and folds each global on its own. A
-    function among its own globals -- one that calls itself, or a pair that
-    call each other -- led back into the same fallback for the same function
-    until the interpreter's recursion limit, where the definition fold marks
-    a function it is already folding. The source-pinned fold now marks it the
-    same way, and the identity still moves with the module's source.
+    the kernel pins the function by its source and folds each global on its
+    own. A function can be among its own globals: one that calls itself, or
+    one of a pair that call each other. Such a function led back into the same
+    fallback for the same function until the interpreter's recursion limit.
+    The definition fold marks a function it is already folding, and the
+    source-pinned fold now marks it the same way. The identity still moves
+    with the module's source.
     """
     module_name = "pyinc_source_pinned_recursive"
     module_path = tmp_path / f"{module_name}.py"
@@ -1394,11 +1392,11 @@ def test_a_source_pinned_function_that_calls_itself_fingerprints(
 def test_a_recursive_capture_the_kernel_cannot_fold_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A recursive function with a global nothing can fold is refused, not overflowed.
+    """A recursive function with a global nothing can fold is refused without overflowing the stack.
 
     `glob.glob` reaches `glob._iglob`, which calls itself, and `has_magic`,
-    whose compiled pattern no fold accepts; a module of the caller's own
-    with the same shape is refused the same way, with `UnsupportedValueError`
+    whose compiled pattern no fold accepts. A module of the caller's own with
+    the same shape is refused the same way. It raises `UnsupportedValueError`,
     where `RecursionError` escaped before.
     """
     module_name = "pyinc_source_pinned_recursive_refused"
@@ -1437,7 +1435,7 @@ def test_a_recursive_capture_the_kernel_cannot_fold_is_refused(
     def calls_glob(db: Database) -> bool:
         return glob is not None
 
-    # `glob` refuses on every supported version for its pattern; a version
+    # `glob` refuses on every supported version, for its pattern. A version
     # whose `glob` folds may answer, but none may overflow the stack.
     with contextlib.suppress(UnsupportedValueError):
         assert Database().get(calls_glob) is True
@@ -1480,8 +1478,8 @@ def test_module_identity_observes_rewritten_bytes_when_stat_identity_collides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A same-size rewrite can land inside one timestamp granule, leaving size,
-    # mtime, ctime, device, and inode all unchanged. Freeze the stat answer for
-    # this path to make that collision deterministic; the identity must come
+    # mtime, ctime, device, and inode all unchanged. Freezing the stat answer
+    # for this path makes that collision deterministic. The identity must come
     # from the bytes.
     path = tmp_path / "extension.bin"
     path.write_bytes(b"first-payload")
@@ -1521,13 +1519,13 @@ def test_module_identity_observes_rewritten_bytes_when_stat_identity_collides(
 def test_two_copies_of_one_module_at_different_paths_share_one_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The query is defined INSIDE the module source rather than in this test,
-    # and that is what makes the cell test anything. A module identity payload
-    # carries no path leaf at all, so the only leaf that can move when the same
-    # code is installed under a different prefix is the origin of the query's
-    # own code object -- and a query written here would carry this file's path
-    # in both halves and pass whatever the kernel folded. Hoisting the query
-    # out of the module source makes this cell vacuous.
+    # The query must be defined INSIDE the module source for this cell to test
+    # anything. A module identity payload carries no path leaf. When the same
+    # code is installed under a different prefix, the only leaf that can move
+    # is the origin of the query's own code object. A query written in
+    # this test would carry this file's path in both halves and pass whatever
+    # the kernel folded. Hoisting the query out of the module source makes
+    # this cell vacuous.
     module_name = "pyinc_install_prefix_module"
     source = (
         "from pyinc import Database, query\n"
@@ -1540,7 +1538,7 @@ def test_two_copies_of_one_module_at_different_paths_share_one_identity(
     digests: list[str] = []
     origins: list[Path] = []
     # The two directory names differ in length, so a fold that kept any part of
-    # the absolute path -- its length included -- still separates the halves.
+    # the absolute path, even its length, still separates the halves.
     for directory_name in ("short", "a_considerably_longer_directory"):
         root = tmp_path / directory_name
         root.mkdir()
@@ -1554,8 +1552,8 @@ def test_two_copies_of_one_module_at_different_paths_share_one_identity(
                 origin = Path(cast(str, module.__file__))
                 assert origin.parent == root
                 origins.append(origin)
-                # Taken before the module is popped: a query holding a module
-                # that is no longer its live binding is refused outright.
+                # Taken before the module is popped, because the kernel refuses
+                # a query holding a module that has lost its live binding.
                 digests.append(Database()._query_fingerprint(module.scaled))
             finally:
                 sys.modules.pop(module_name, None)
@@ -1568,14 +1566,14 @@ def test_code_compiled_under_a_borrowed_filename_never_takes_a_module_location(
     tmp_path: Path,
 ) -> None:
     db = Database()
-    # The third arm of the location fold, which nothing this tree ships
-    # reaches: an absolute compiled filename whose basename is not the named
-    # module's own file. It is folded verbatim beside the module name, and the
-    # property that matters is what it must NOT do -- a regression that
-    # answered with the module's own location would let code compiled under a
-    # borrowed filename take a real module's identity. The path is built under
-    # tmp_path so it is absolute on every platform: since Python 3.13 a bare
-    # leading slash is not an absolute path on Windows.
+    # The third arm of the location fold, which no shipped code in this tree
+    # reaches: an absolute compiled filename whose basename differs from the
+    # named module's own file. It is folded verbatim beside the module name.
+    # This guards against a regression that answered with the module's own
+    # location, which would let code compiled under a borrowed filename take a
+    # real module's identity. The path is built under tmp_path so it is
+    # absolute on every platform: since Python 3.13, a bare leading slash is
+    # not an absolute path on Windows.
     borrowed_file = str(tmp_path / "elsewhere" / "other.py")
     borrowed = db._code_location_payload(borrowed_file, "pyinc.runtime")
     assert borrowed[0] == "code-origin-foreign-v4"
@@ -1600,16 +1598,15 @@ def test_the_module_stamp_folds_exactly_what_the_identity_folds(
         # of this project's own, and a module the caller wrote.
         for module in (sys, frozen, string, runtime_module, planted):
             identity = db._module_identity_payload(module)
-            # The slot is read rather than assumed: both branches of the
-            # payload return a four-tuple whose last element is the constants,
-            # and the stamp carries them last.
+            # Check the slot explicitly: both branches of the payload return a
+            # four-tuple whose last element is the constants, and the stamp
+            # carries them last.
             assert len(identity) == 4
             assert identity[3] == db._module_observation_stamp(module)[-1]
-        # What the loop above holds is the elision mirror, not the constants:
-        # the three modules the runtime build identity pins contribute none, so
-        # those three rows compare an empty payload with an empty payload. The
-        # last two rows are what keeps that from being the whole cell -- they
-        # carry real constants through both derivations.
+        # The loop above checks the elision mirror. The three modules the
+        # runtime build identity pins contribute no constants, so those rows
+        # compare two empty payloads. The last two rows carry real constants
+        # through both derivations, so the cell checks more than empty payloads.
         for pinned in (sys, frozen, string):
             assert db._module_identity_payload(pinned)[3] == ()
         for folded in (runtime_module, planted):
@@ -1621,10 +1618,10 @@ def test_the_module_stamp_folds_exactly_what_the_identity_folds(
 
         db._query_fingerprint(letters)
         entry = db._query_fingerprint_memo[letters]
-        # The landings a runtime-pinned capture folds are recorded inside the
-        # query's own memo entry, not in any module payload. Which slot holds
-        # them is found by shape rather than by index, so a reordering of the
-        # entry is a failure here rather than a silently skipped assertion.
+        # The landings a runtime-pinned capture folds live in the query's own
+        # memo entry, outside every module payload. The slot holding them is
+        # found by shape, so reordering the entry fails here and cannot
+        # silently skip the assertion.
         landing_slots = [
             slot
             for slot in entry
@@ -1640,8 +1637,8 @@ def test_the_module_stamp_folds_exactly_what_the_identity_folds(
             )
         ]
         assert len(landing_slots) == 1
-        # The comprehension above is what established the shape; the annotation
-        # only carries it across to the reads below.
+        # The comprehension above establishes the shape, and the annotation
+        # carries it to the reads below.
         landings = cast(tuple[tuple[ModuleType, tuple[str, ...], Any], ...], landing_slots[0])
         assert any(landed is string for landed, _path, _target in landings)
         for landed, path, expected in landings:
@@ -1777,10 +1774,9 @@ def test_set_many_failure_leaves_all_database_state_unchanged() -> None:
 class _PutLoggingStore(InMemoryArtifactStore):
     """An in-memory store that records every digest handed to `put`.
 
-    The log is what makes a "no orphan bytes" assertion non-vacuous: it shows
-    the store was wired and receiving writes for the values that committed, so
-    the absence of the refused value's digest is a decision rather than an
-    accident of a store nothing ever reached.
+    The log makes a "no orphan bytes" assertion meaningful. It shows the store
+    was wired and received writes for the committed values, so a missing
+    digest for the refused value reflects a decision by the database.
     """
 
     def __init__(self) -> None:
@@ -1795,10 +1791,9 @@ class _PutLoggingStore(InMemoryArtifactStore):
 class _RefusingStore(InMemoryArtifactStore):
     """An in-memory store that refuses to publish one caller-named payload.
 
-    Refusing selectively rather than wholesale is what lets a test show both
-    halves at once: that the refused write left nothing behind, and that the
-    store is otherwise working, so "nothing landed" is not just a store no
-    write ever reached.
+    Refusing only one payload lets a test show both halves at once: the
+    refused write left nothing behind, and the store otherwise works and was
+    reached.
     """
 
     def __init__(self, refused: bytes) -> None:
@@ -1821,9 +1816,9 @@ def test_failed_set_leaves_all_database_state_unchanged() -> None:
     """A `set` whose value cannot be frozen declares nothing.
 
     Every fallible step runs before anything is committed, so the counters,
-    the registry and the revision are exactly where the call found them -- and
-    in particular the key is still unclaimed, so a later `set` naming it under
-    a different equality policy is a first registration and not a conflict.
+    the registry and the revision stay where the call found them. The key also
+    stays unclaimed, so a later `set` naming it under a different equality
+    policy is a first registration and raises no conflict.
     """
     db = Database()
     with pytest.raises(UnsupportedValueError):
@@ -1847,9 +1842,9 @@ def test_failed_set_leaves_all_database_state_unchanged() -> None:
 def test_failed_comparator_persists_nothing() -> None:
     """A raising comparator strands no bytes in the configured store.
 
-    Freezing succeeds here and the comparator fails after it, which is the
-    only shape that can orphan anything: the snapshot is written through on
-    commit, so a value the database refused to record is never published.
+    Freezing succeeds here and the comparator fails after it. That is the only
+    shape that could orphan bytes. The snapshot is written through on commit,
+    so a value the database refused to record is never published.
     """
 
     def explode(left: str, right: str) -> bool:
@@ -1870,23 +1865,22 @@ def test_failed_comparator_persists_nothing() -> None:
     assert key.read(db) == "first"
     assert store.get(refused_digest) is None
     assert store.puts == before_puts
-    # The store really is wired: the committed value did reach it.
+    # The store is wired: the committed value reached it.
     assert store.get(fingerprint_snapshot(freeze("first"))) is not None
 
 
 def test_set_many_failed_comparator_persists_nothing() -> None:
     """The batch path strands nothing either.
 
-    `set_many` already commits its registrations in one phase; the bytes were
-    the half that escaped, because each value reached the store as it was
-    frozen rather than when the batch was accepted.
+    `set_many` commits its registrations in one phase. The bytes used to escape
+    because each value reached the store as it was frozen, before the batch
+    was accepted.
 
-    Scope: this is the guarantee for a batch the DATABASE refuses. A batch the
-    STORE refuses part way through is a different matter and unchanged -- a
-    content-addressed store has no rollback, so bytes already published before
-    the refusal stay published while the batch as a whole does not apply. The
-    revision, the counters and the registries are still untouched; only the
-    store keeps the accepted prefix.
+    Scope: this covers a batch the DATABASE refuses. A batch the STORE refuses
+    part way through behaves as before. A content-addressed store has no
+    rollback, so bytes published before the refusal stay published while the
+    batch as a whole does not apply. The revision, the counters and the
+    registries stay untouched. Only the store keeps the accepted prefix.
     """
 
     def explode(left: int, right: int) -> bool:
@@ -1917,10 +1911,11 @@ def test_store_failure_in_set_leaves_key_free() -> None:
     """A store that refuses the write leaves the key undeclared.
 
     Publishing the frozen bytes is the last step of a `set` that can fail, so
-    it runs BEFORE the input is registered rather than after. Ordered the other
-    way round, a store failure would leave a registration with no record --
-    the same phantom a raising freeze used to leave, and just as unreclaimable
-    under a different equality policy. This pins the ordering, not the store.
+    it runs BEFORE the input is registered. In the other order, a store
+    failure would leave a registration with no record. That is the same
+    phantom a raising freeze used to leave, and equally impossible to reclaim
+    under a different equality policy. This test pins the ordering. The store
+    only triggers the failure.
     """
     store = _RefusingStore(b"REFUSED")
     db = Database(store=store)
@@ -1941,17 +1936,16 @@ def test_store_failure_in_set_leaves_key_free() -> None:
     db.set(plain, "accepted")
     assert plain.read(db) == "accepted"
     assert db.revision == 1
-    # And the store was working all along: it took the value it did not refuse.
+    # The store worked all along and stored the accepted value.
     assert store.puts == [fingerprint_snapshot(freeze("accepted"))]
 
 
 def test_store_failure_in_set_leaves_earlier_inputs_intact() -> None:
-    """A refused write does not disturb the inputs already committed.
+    """A refused write leaves the inputs already committed intact.
 
     The commit phase publishes bytes and only then declares the input, so the
-    input the store refused leaves no trace next to the one it accepted -- and
-    that refused key, too, is still free for a later differently-policied
-    `set`.
+    input the store refused leaves no trace next to the one it accepted. The
+    refused key also stays free for a later `set` with a different policy.
     """
     store = _RefusingStore(b"REFUSED")
     db = Database(store=store)
@@ -1980,9 +1974,9 @@ def test_store_failure_in_set_leaves_earlier_inputs_intact() -> None:
 def test_read_input_of_unset_key_registers_nothing() -> None:
     """Reading an input nothing has set declares nothing.
 
-    The read path resolves an existing registration; it never creates one. A
-    read mutates nothing by contract, so it has to leave the key free for a
-    later `set` to claim under whatever equality policy that `set` names.
+    The read path only resolves an existing registration. By contract a read
+    mutates nothing, so it leaves the key free for a later `set` to claim
+    under whatever equality policy that `set` names.
     """
     db = Database()
     with pytest.raises(KeyError, match="has not been set"):
@@ -2017,12 +2011,12 @@ def test_input_read_of_unset_key_registers_nothing() -> None:
 
 
 def test_read_input_with_conflicting_policy_still_raises() -> None:
-    """Resolving without registering does not cost the conflict diagnostic.
+    """Resolving without registering keeps the conflict diagnostic.
 
     Two `Input` objects naming one key under different equality policies mean
-    two different notions of "changed" for one node, which is a programming
-    error wherever it surfaces. The read path validates; it just no longer
-    mutates on the way past.
+    two notions of "changed" for one node, which is a programming error
+    wherever it surfaces. The read path validates the policy and leaves the
+    registry unchanged.
     """
 
     def other_cutoff(value: int) -> int:
@@ -2058,11 +2052,11 @@ def test_repeated_reads_with_fresh_input_objects_do_not_grow_state() -> None:
 
 
 def test_repeated_sets_with_fresh_input_objects_do_not_grow_the_registry() -> None:
-    """The registry is sized by distinct keys, not by how often they are set.
+    """The registry holds one entry per distinct key, however often it is set.
 
-    `Input` compares by identity, so a registry keyed by the object retained one
+    `Input` compares by identity, so a registry keyed by the object kept one
     entry per call and never released it. Keyed by the key string, a thousand
-    sets of one key are one entry.
+    sets of one key make one entry.
     """
     db = Database()
     for value in range(1000):
@@ -2076,11 +2070,11 @@ def test_repeated_sets_with_fresh_input_objects_do_not_grow_the_registry() -> No
 
 
 def test_the_input_registry_is_keyed_by_the_input_key_string() -> None:
-    """A second `Input` naming a set key resolves by that string, not by object.
+    """A second `Input` naming a set key resolves by the key string.
 
-    The key string is the whole of an input's identity, so the registry holds
-    one entry per distinct key and the first `Input` registered under it stays
-    as the comparand every later policy check measures against.
+    The key string is an input's whole identity, so the registry holds one
+    entry per distinct key. The first `Input` registered under a key stays as
+    the comparand for every later policy check.
     """
     db = Database()
     first = Input[int]("x")
@@ -2111,8 +2105,8 @@ def test_the_input_registry_is_keyed_by_the_input_key_string() -> None:
 def test_policy_conflicts_are_refused_across_input_object_generations() -> None:
     """One key under two notions of "changed" stays a programming error.
 
-    The registry keeps the first `Input` per key precisely so this check has
-    something to measure a later, differently-policied object against.
+    The registry keeps the first `Input` per key so this check can compare it
+    with a later object that has a different policy.
     """
 
     def cutoff(value: int) -> int:
@@ -2125,7 +2119,7 @@ def test_policy_conflicts_are_refused_across_input_object_generations() -> None:
     with pytest.raises(InputKeyError, match="conflicting"):
         db.read_input(Input[int]("k", eq=lambda left, right: left == right))
 
-    # Refused, and nothing about the committed registration moved.
+    # Refused, and the committed registration is unchanged.
     assert db.revision == 1
     assert db.read_input(Input[int]("k")) == 1
     assert set(db._input_records) == {"k"}
@@ -2157,8 +2151,8 @@ def test_caught_query_failure_does_not_publish_a_dependency_edge() -> None:
     assert db.inspect(catches_failure).dependencies == ()
     assert all("failing" not in key.label for key in db._call_snapshot_registry)
     assert all(query_obj is not failing for query_obj in db._query_registry.values())
-    # An answer resting on an edge that was never published is not reused: the
-    # catching query is marked untracked and re-runs on the next request.
+    # An answer resting on an unpublished edge must re-run: the catching query
+    # is marked untracked and executes again on the next request.
     assert db.inspect(catches_failure).untracked_reasons != ()
     executions = db.statistics().query_executions
     assert db.get(catches_failure) == 7
@@ -2206,21 +2200,21 @@ def test_caught_sub_query_failure_marks_the_catching_parent_impure(mode: str) ->
     db.set(gate, 0)
     assert db.get(parent) == "fallback"
 
-    # Nothing in the graph describes the exception the body handled -- the
-    # failing child left no record and no edge behind it -- so the answer
-    # above it is marked as resting on state the kernel does not track.
+    # The graph holds nothing about the exception the body handled, because
+    # the failing child left no record and no edge. So the answer above it is
+    # marked as resting on untracked state.
     reasons = db.inspect(parent).untracked_reasons
     assert reasons
     assert any("failing" in reason for reason in reasons)
 
-    # Which means it is re-derived on every request rather than reused.
+    # So it is re-derived on every request.
     executions = db.statistics().query_executions
     assert db.get(parent) == "fallback"
     assert db.statistics().query_executions == executions + 1
     assert db.inspect(parent).last_decision == "executed"
 
-    # And the change that makes the child succeed reaches it, exactly as it
-    # reaches a database that has never seen the failure.
+    # The change that makes the child succeed reaches it, as it reaches a
+    # database that has never seen the failure.
     db.set(gate, 42)
     executions = db.statistics().query_executions
     warm = db.get(parent)
@@ -2229,7 +2223,7 @@ def test_caught_sub_query_failure_marks_the_catching_parent_impure(mode: str) ->
     assert warm == fresh.get(parent) == "ok:42"
     # The child the parent now reaches executes beside it.
     assert db.statistics().query_executions == executions + 2
-    # A run that caught nothing is an ordinary run: the mark is not sticky.
+    # A run that caught nothing is an ordinary run, so the mark clears.
     assert db.inspect(parent).untracked_reasons == ()
 
 
@@ -2264,9 +2258,9 @@ def test_caught_sub_query_failure_excludes_the_parent_from_checkpoints() -> None
     assert db.get(grandparent) == "G:fallback"
     assert db.get(sibling) == "S"
 
-    # A handled failure is only reproducible while the load keeps failing, so
-    # the query that caught it is omitted -- and the dependency closure drops
-    # the grandparent above it too.
+    # A handled failure is reproducible only while the load keeps failing, so
+    # the checkpoint omits the query that caught it. The dependency closure
+    # drops the grandparent above it too.
     checkpoint = db.save_checkpoint()
     manifest = json.loads(cast(bytes, store.get(checkpoint)).decode("utf-8"))
     saved = {(entry["identity"], entry["args_digest"]) for entry in manifest["records"]}
@@ -2275,7 +2269,7 @@ def test_caught_sub_query_failure_excludes_the_parent_from_checkpoints() -> None
     sibling_key, _ = db._query_key(sibling, (), {})
     assert (parent_key.identity, parent_key.args_digest) not in saved
     assert (grandparent_key.identity, grandparent_key.args_digest) not in saved
-    # What the failure never touched is still persisted.
+    # Queries outside the failure's reach are still persisted.
     assert (sibling_key.identity, sibling_key.args_digest) in saved
 
     warmed = Database(store=store)
@@ -2284,7 +2278,7 @@ def test_caught_sub_query_failure_excludes_the_parent_from_checkpoints() -> None
     fresh = Database()
     fresh.set(gate, 42)
     assert warmed.get(grandparent) == fresh.get(grandparent) == "G:ok:42"
-    # Nothing was warmed on that branch: all three nodes ran.
+    # That branch started cold: all three nodes ran.
     assert warmed.statistics().query_executions == 3
 
 
@@ -2298,10 +2292,10 @@ def test_caught_cycle_does_not_mark_the_catcher_impure() -> None:
 
     db = Database()
     assert db.get(catches_cycle) == 1
-    # A query asking for itself is refused before any work starts, so nothing
-    # was read into a frame that is then discarded, and the refused request is
-    # pinned to the registration the outer execution already owns. Catching
-    # that leaves an ordinary reusable record.
+    # A query asking for itself is refused before any work starts, so no reads
+    # land in a frame that is then discarded. The refused request is pinned to
+    # the registration the outer execution already owns. Catching that leaves
+    # an ordinary reusable record.
     assert db.inspect(catches_cycle).untracked_reasons == ()
     executions = db.statistics().query_executions
     assert db.get(catches_cycle) == 1
@@ -2330,10 +2324,10 @@ def test_cycle_caught_through_another_query_marks_the_catcher_impure() -> None:
     db.set(gate, 0)
     assert db.get(parent) == "fallback"
 
-    # A cycle refused through another query is not the shape a self-cycle is:
-    # the refused branch read the gate before it reached back, and its frame is
-    # discarded with the read in it, so the catcher's answer rests on state no
-    # record describes and must be marked like any other caught failure.
+    # A cycle refused through another query differs from a self-cycle. The
+    # refused branch read the gate before it reached back, and its frame is
+    # discarded with that read in it. The catcher's answer rests on state no
+    # record describes, so it is marked like any other caught failure.
     assert db.inspect(parent).dependencies == ()
     reasons = db.inspect(parent).untracked_reasons
     assert reasons
@@ -2370,12 +2364,12 @@ def test_self_cycle_caught_by_the_parent_marks_the_parent_impure() -> None:
     db.set(gate, 0)
     assert db.get(parent) == "fallback"
 
-    # The exemption belongs to the query that asked for itself and caught its
-    # own refusal, where nothing was executed below the refusal. Here the
-    # refusal is caught a frame higher: the child read the gate before it asked
-    # for itself, and its frame is discarded with that read in it, so the
-    # parent's answer rests on state no record describes and is marked like any
-    # other caught failure.
+    # The exemption applies only to a query that asked for itself and caught
+    # its own refusal, with no execution below the refusal. Here the refusal is
+    # caught a frame higher. The child read the gate before it asked for
+    # itself, and its frame is discarded with that read in it. The parent's
+    # answer rests on state no record describes, so it is marked like any other
+    # caught failure.
     assert db.inspect(parent).dependencies == ()
     reasons = db.inspect(parent).untracked_reasons
     assert reasons
@@ -2385,8 +2379,8 @@ def test_self_cycle_caught_by_the_parent_marks_the_parent_impure() -> None:
     assert db.get(parent) == "fallback"
     assert db.statistics().query_executions == executions + 1
 
-    # And the change that stops the child recursing reaches the parent, exactly
-    # as it reaches a database that never saw the cycle.
+    # The change that stops the child recursing reaches the parent, as it
+    # reaches a database that never saw the cycle.
     db.set(gate, 1)
     executions = db.statistics().query_executions
     warm = db.get(parent)
@@ -2597,8 +2591,8 @@ def test_memoized_fingerprint_reuses_the_memo_for_an_unchanged_definition() -> N
     first = db._query_fingerprint(scaled)
     entry = db._query_fingerprint_memo[scaled]
     assert db._query_fingerprint(scaled) == first
-    # A recompute stores a freshly built memo entry, so entry identity tells a
-    # reused observation apart from one that merely recomputed the same digest.
+    # A recompute stores a freshly built memo entry, so entry identity separates
+    # a reused observation from one that recomputed the same digest.
     assert db._query_fingerprint_memo[scaled] is entry
 
 
@@ -2710,8 +2704,8 @@ def test_memoized_fingerprint_tracks_type_alias_and_type_parameter_annotations(
             return 1
 
         # An alias and a type-parameter bound both keep their content behind
-        # the annotated module's class, reached through the evaluators the
-        # fingerprint folds rather than through the alias object itself.
+        # the annotated module's class. The fingerprint reaches that class
+        # through the evaluators it folds, instead of through the alias object.
         aliased.fn.__annotations__["value"] = helper.Alias
         cast(Any, parameterized.fn).__type_params__ = helper.bounded.__type_params__
 
@@ -2744,8 +2738,8 @@ def test_memoized_fingerprint_tracks_an_alias_reached_from_body_and_annotation(
             return len(str(alias))
 
         # The body reaches the alias before the annotation entry does, so the
-        # first slot to arrive has to be the one that folds it; a shallow
-        # first look would leave the second slot with nothing left to observe.
+        # first slot to arrive must fold it. A shallow first look would leave
+        # the second slot nothing to observe.
         doubled.fn.__annotations__["value"] = alias
         db = Database()
         db._query_fingerprint(doubled)
@@ -2770,8 +2764,8 @@ def test_memoized_fingerprint_tracks_alias_and_type_parameter_captures(
         alias = helper.Alias
         parameter = helper.bounded.__type_params__[0]
 
-        # Neither query annotates with these objects: they are ordinary
-        # captures, which the fingerprint folds through the same evaluators.
+        # Here these objects are ordinary captures, used in no annotation. The
+        # fingerprint folds them through the same evaluators.
         @query(key="memo-alias-capture")
         def captures_alias(db: Database) -> int:
             return len(str(alias))
@@ -2801,8 +2795,8 @@ def test_memoized_fingerprint_tracks_annotation_types_a_reflecting_body_reads(
 
     # A body that reads annotations back makes the fingerprint fold each
     # annotated value as an ambient capture, which pins the annotated type's
-    # namespace; without that read the same type is pinned by module anchor
-    # alone, and an added attribute would move neither side.
+    # namespace. Without that read, only the module anchor pins the type, and
+    # an added attribute would move neither side.
     reflected.fn.__annotations__["store"] = InMemoryArtifactStore
     db = Database()
     db._query_fingerprint(reflected)
@@ -2818,8 +2812,9 @@ def test_memoized_fingerprint_tracks_instance_state_a_reflecting_body_reads() ->
         return len(_ObservedConsts.__annotations__)
 
     # The instance counterpart of the type case above. This shape exists only
-    # on the reflecting side of that switch: without the read, an annotated
-    # object is refused outright rather than folded field by field.
+    # when the body reads annotations back. Without the read, the kernel
+    # refuses an annotated object outright. With it, the object is folded
+    # field by field.
     reflected.fn.__annotations__["box"] = _observed_box
     db = Database()
     db._query_fingerprint(reflected)
@@ -2841,9 +2836,9 @@ def test_memoized_fingerprint_tracks_a_resource_shaped_class_in_a_captured_class
         return _ObservedShapeHolder.nested.MARKER
 
     # A class answers the label/probe/load probes that recognize a resource
-    # handle exactly as an instance does, but a class reached inside a
-    # captured class body is folded through the type payload and never
-    # through a resource identity, so the observation has to descend it.
+    # handle as an instance does. A class reached inside a captured class body
+    # is folded through the type payload, never through a resource identity,
+    # so the observation has to descend it.
     db = Database()
     db._query_fingerprint(shaped)
     monkeypatch.setattr(_ObservedResourceShape, "MARKER", 2)
@@ -2857,9 +2852,9 @@ def test_memoized_fingerprint_tracks_resource_configuration_folded_as_capture_st
     def configured(db: Database) -> int:
         return _ObservedResourceHolder.nested.scale
 
-    # Reached inside a captured class body, a resource is folded field by
-    # field like any other frozen dataclass and its identity() never runs, so
-    # this query stays memoized and the memo has to see the write.
+    # Inside a captured class body, a resource is folded field by field like
+    # any other frozen dataclass, and its identity() never runs. So this query
+    # stays memoized, and the memo has to see the write.
     db = Database()
     db._query_fingerprint(configured)
     nested = _ObservedResourceHolder.nested
@@ -2875,10 +2870,10 @@ def test_memoized_fingerprint_tracks_resource_configuration_folded_as_capture_st
 def test_resource_capturing_fingerprints_track_reconfiguration() -> None:
     class ScaledResource(Resource[int, int, int]):
         def __init__(self, scale: int) -> None:
-            # The configuration lives in a list, so rebinding nothing and
-            # writing into it in place leaves every reference the observation
-            # pins identical. Holding it in a plain attribute would let the
-            # observation catch the write and prove nothing about the digest.
+            # The configuration lives in a list, so writing into it in place
+            # keeps every reference the observation pins identical. In a plain
+            # attribute, the observation would catch the write, and the test
+            # would prove nothing about the digest.
             self.parts = [scale]
 
         def identity(self) -> tuple[str, tuple[int, ...]]:
@@ -2905,10 +2900,10 @@ def test_resource_capturing_fingerprints_track_reconfiguration() -> None:
 
     db._query_fingerprint(scaled)
     resource.parts[0] = 3
-    # identity() hands back a fresh object every call, so its value cannot be
-    # pinned by reference, and this in-place write moves nothing the
-    # observation holds. The memo carries a digest of the configuration the
-    # fold read instead, and re-reading it is what catches the change.
+    # identity() returns a fresh object on every call, so its value cannot be
+    # pinned by reference, and this in-place write leaves everything the
+    # observation holds unchanged. The memo instead carries a digest of the
+    # configuration the fold read, and re-reading it catches the change.
     memoized, truth = _memo_and_truth(db, scaled)
     assert memoized == truth
     assert memoized == Database()._query_fingerprint(scaled)
@@ -2945,9 +2940,9 @@ def test_memoized_fingerprint_reuses_the_memo_for_an_unchanged_resource_query() 
     entry = db._query_fingerprint_memo[steady]
     assert db._query_fingerprint(steady) == first
     # The counterpart of the capture-free guard, for the one shape whose memo
-    # is gated by a re-read rather than by a reference: a recompute stores a
-    # freshly built entry, so entry identity separates a served memo from one
-    # that recomputed the same digest. A configuration digest that failed to
+    # is gated by a re-read instead of a reference. A recompute stores a freshly
+    # built entry, so entry identity separates a served memo from one that
+    # recomputed the same digest. A configuration digest that failed to
     # reproduce itself would recompute here while every coherence pin stayed
     # green.
     assert db._query_fingerprint_memo[steady] is entry
@@ -3025,10 +3020,10 @@ def test_memoized_fingerprint_reuses_the_memo_for_an_unchanged_module_capture(
         entry = db._query_fingerprint_memo[scaled]
         assert db._query_fingerprint(scaled) == first
         # The counterpart of the coherence pins above, for the guard arms that
-        # re-resolve attribute chains, observe the function one of them reaches
-        # and re-derive the module constants: any of them answering with a
-        # fresh object every call would recompute here with every coherence pin
-        # still green. A recompute stores a newly built entry, so entry
+        # re-resolve attribute chains, observe the function one of them reaches,
+        # and re-derive the module constants. If any of them answered with a
+        # fresh object every call, this would recompute while every coherence
+        # pin stayed green. A recompute stores a newly built entry, so entry
         # identity separates a served memo from one that rebuilt the same
         # digest.
         assert db._query_fingerprint_memo[scaled] is entry
@@ -3046,8 +3041,8 @@ def test_memoized_fingerprint_tracks_functions_behind_a_captured_staticmethod(
     db = Database()
     db._query_fingerprint(read)
     # The class body payload unwraps the descriptor and folds the function
-    # inside it, globals and all. The descriptor object itself is untouched by
-    # this rebinding, so an observation that stops at the wrapper sees nothing.
+    # inside it, globals included. This rebinding leaves the descriptor object
+    # untouched, so an observation that stops at the wrapper misses it.
     monkeypatch.setattr(
         sys.modules[__name__], "_observed_static_source", _observed_descriptor_replacement
     )
@@ -3126,13 +3121,13 @@ def test_memoized_fingerprint_tracks_a_stdlib_constant_the_query_reads(
 
     db = Database()
     before = db._query_fingerprint(letters)
-    # The half of the pair below that says the fold still detects something. A
-    # standard-library namespace is not folded wholesale -- the runtime build
-    # identity and the module's file bytes pin it -- but the constants the
-    # query's own body names are folded beside the capture, so a write to one
-    # of them moves identity. The replacement is several characters long: a
-    # one-character string is interned, and a cell written on one can end up
-    # comparing a value with itself.
+    # The first half of a pair with the test below: the fold still detects
+    # something. The runtime build identity and the module's file bytes pin a
+    # standard-library namespace, so it is not folded wholesale. The constants
+    # the query's own body names are folded beside the capture, so a write to
+    # one of them moves identity. The replacement is several characters long
+    # because a one-character string is interned, and a cell written on one
+    # can end up comparing a value with itself.
     monkeypatch.setattr(string, "ascii_lowercase", "zyxwvu")
     memoized, truth = _memo_and_truth(db, letters)
     assert memoized != before
@@ -3152,13 +3147,13 @@ def test_constants_outside_a_captured_stdlib_module_move_no_fingerprint(
     before = db._query_fingerprint(letters)
     monkeypatch.setattr(string, "PYINC_PROBE_CONSTANT", 5, raising=False)
     executions = db.statistics().query_executions
-    # The inverse of the pin above, and the limitation it buys. A module the
+    # The inverse of the pin above, and the limitation it brings. A module the
     # runtime build identity pins is covered by that identity and by its own
-    # file bytes, so a namespace write to a constant no query reads is outside
-    # what identity covers: nothing about this query moved, the stored answer
-    # is still the right one, and it is served rather than recomputed. The
-    # execution counter is the witness -- an identity that moved would have no
-    # record to reuse and would execute here.
+    # file bytes. A namespace write to a constant no query reads falls outside
+    # identity. Nothing about this query moved, the stored answer is still
+    # right, and it is served without a recompute. The execution counter is
+    # the witness. An identity that moved would have no record to reuse and
+    # would execute here.
     assert db.get(letters) == 26
     assert db.statistics().query_executions == executions
     memoized, truth = _memo_and_truth(db, letters)
@@ -3181,10 +3176,10 @@ def test_a_stdlib_constant_bound_after_the_fingerprint_is_seen_warm_and_fresh(
     before = db._query_fingerprint(guarded)
     # The compatibility idiom: a body that names an attribute the standard
     # library may not have yet. The path was empty when the identity was built,
-    # so nothing was folded for it -- and a module the runtime build identity
-    # pins carries no constants in its stamp either, which leaves the recorded
-    # landing as the only thing that can see a constant bound there afterwards.
-    # Without it the memo answers -1 while a fresh database answers 7.
+    # so nothing was folded for it. A module the runtime build identity pins
+    # also carries no constants in its stamp. That leaves the recorded landing
+    # as the only thing that can see a constant bound there later. Without it,
+    # the memo answers -1 while a fresh database answers 7.
     monkeypatch.setattr(string, "PYINC_LATER_CONSTANT", 7, raising=False)
     memoized, truth = _memo_and_truth(db, guarded)
     assert memoized == truth
@@ -3202,12 +3197,13 @@ def test_memoized_fingerprint_reuses_the_memo_for_a_stdlib_accessed_path_capture
     entry = db._query_fingerprint_memo[scaled]
     assert db._query_fingerprint(scaled) == first
     assert db._query_fingerprint(scaled) == first
-    # The accessed-path landings a standard-library capture folds are recorded,
-    # and the guard re-resolves each chain and compares the target by identity
-    # on every memo hit. An arm that answered with a freshly built object each
-    # call would recompute here with every coherence pin still green, because a
-    # recompute stores a newly built entry that carries the same digest: entry
-    # identity is what separates a served memo from one that rebuilt it.
+    # The accessed-path landings a standard-library capture folds are recorded.
+    # On every memo hit, the guard re-resolves each chain and compares the
+    # target by identity. An arm that answered with a freshly built object each
+    # call would recompute here while every coherence pin stayed green. The
+    # pins stay green because a recompute stores a newly built entry with the
+    # same digest. Entry
+    # identity separates a served memo from one that rebuilt it.
     assert db._query_fingerprint_memo[scaled] is entry
 
 
@@ -3224,18 +3220,17 @@ def test_an_equal_but_distinct_stdlib_constant_settles_after_one_recompute(
     before = db._query_fingerprint(letters)
     entry = db._query_fingerprint_memo[letters]
     # A fresh object holding an equal value. The constant is several characters
-    # long on purpose: slicing a one-character string returns the interned
-    # original, which would make the rebinding no rebinding at all.
+    # long because slicing a one-character string returns the interned
+    # original, and the rebinding would then bind the same object.
     rebound = (string.ascii_lowercase + "x")[:-1]
     assert rebound == string.ascii_lowercase
     assert rebound is not string.ascii_lowercase
     monkeypatch.setattr(string, "ascii_lowercase", rebound)
-    # The direction of error, stated: the memo compares a recorded landing by
-    # object identity while identity folds the value, so an equal value in a
-    # new object over-invalidates and never under-invalidates. The cost is
-    # bounded at one recompute -- the digest it arrives at is the one already
-    # stored, the rebuilt entry records the new object, and the next
-    # fingerprint is served from it again.
+    # The direction of error: the memo compares a recorded landing by object
+    # identity while identity folds the value. So an equal value in a new
+    # object over-invalidates and never under-invalidates. The cost is at most
+    # one recompute. It arrives at the digest already stored, the rebuilt entry
+    # records the new object, and the next fingerprint is served from it again.
     memoized, truth = _memo_and_truth(db, letters)
     assert memoized == truth == before
     settled = db._query_fingerprint_memo[letters]
@@ -3271,10 +3266,11 @@ def test_memoized_fingerprint_tracks_functions_a_captured_module_function_calls(
 
         db = Database()
         db._query_fingerprint(scaled)
-        # The chain names helper, whose identity this rebinding leaves alone,
-        # and inner is a function rather than a constant, so neither the
-        # re-resolved target nor the module stamp moves. What the fingerprint
-        # folded is helper's globals, which is what the memo has to observe.
+        # The chain names helper, whose identity this rebinding leaves alone.
+        # The rebound inner is a function, and the constants the module stamp
+        # carries exclude functions. So neither the re-resolved target nor the
+        # module stamp moves. The fingerprint folded helper's globals, and the
+        # memo has to observe them.
         monkeypatch.setattr(module, "inner", replacement.inner)
         memoized, truth = _memo_and_truth(db, scaled)
         assert memoized == truth
@@ -3320,9 +3316,10 @@ def test_memoized_fingerprint_tracks_a_chain_landed_inputs_policy_globals(
         db.set(module.READING, 1)
         db._query_fingerprint(reading)
         # The chain lands on an Input, whose eq policy is folded as a
-        # definition: the policy's globals are read live while the Input the
-        # chain resolves to holds still, and a function is not a constant the
-        # module stamp carries.
+        # definition. The policy's globals are read live while the Input the
+        # chain resolves to stays the same. The rebound global tolerance is a
+        # function, and the constants the module stamp carries exclude
+        # functions.
         monkeypatch.setattr(module, "tolerance", module.wider_tolerance)
         memoized, truth = _memo_and_truth(db, reading)
         assert memoized == truth
@@ -3362,22 +3359,22 @@ def test_memoized_fingerprint_agrees_with_truth_when_an_alias_target_is_rebound(
 
         db = Database()
         db._query_fingerprint(aliased)
-        # The chain lands on a type alias. The alias object never moves, and a
-        # class is not a constant the module stamp carries, so what the memo
+        # The chain lands on a type alias. The alias object stays the same, and
+        # the constants the module stamp carries exclude classes. What the memo
         # owes after this rebinding depends on what the interpreter exposes.
         monkeypatch.setattr(module, "First", module.Second)
         if isinstance(getattr(module.ALIAS, "evaluate_value", None), FunctionType):
             # The payload folds the lazy evaluator as a definition, and its
-            # observation resolves the same global -- identity tracks the
+            # observation resolves the same global, so identity tracks the
             # rebinding.
             memoized, truth = _memo_and_truth(db, aliased)
             assert memoized == truth
             assert memoized == Database()._query_fingerprint(aliased)
         else:
-            # Through 3.13 there is no evaluator to fold: the payload resolved
-            # and cached __value__ at prime time, and the rebinding kills the
+            # Through 3.13 there is no evaluator to fold. The payload resolved
+            # and cached __value__ at prime time, and the rebinding removes the
             # live module binding its anchor requires. A fresh computation
-            # refuses, so the memo must refuse with it -- serving past the
+            # refuses, so the memo must refuse with it. Serving past the
             # refusal is the staleness the anchor exists to prevent.
             with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
                 db._query_fingerprint(aliased)
@@ -3420,11 +3417,11 @@ def test_memoized_fingerprint_refuses_with_truth_when_a_parameter_bound_is_rebou
         db = Database()
         db._query_fingerprint(named)
         # A runtime-constructed TypeVar stores its bound eagerly on every
-        # interpreter -- evaluate_bound, where it exists at all, is not a
-        # Python function -- so the payload anchors the bound class to its
-        # live module binding. Rebinding that global makes every fresh
-        # computation refuse; the memo must refuse with it rather than keep
-        # serving the fingerprint it stored while the binding held.
+        # interpreter (evaluate_bound, where it exists, is not a Python
+        # function). So the payload anchors the bound class to its live module
+        # binding. Rebinding that global makes every fresh computation refuse.
+        # The memo must refuse with it and stop serving the fingerprint it
+        # stored while the binding held.
         monkeypatch.setattr(module, "Bound", module.Second)
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
             db._query_fingerprint(named)
@@ -3471,7 +3468,7 @@ def test_memoized_fingerprint_refuses_with_truth_when_a_slice_carried_class_is_r
         # A runtime-constructed alias has no Python evaluator on any
         # interpreter, so the payload resolves its value eagerly, and the
         # slice arm carries the class to a live-binding anchor. Rebinding the
-        # global behind that anchor makes every fresh computation refuse; the
+        # global behind that anchor makes every fresh computation refuse. The
         # memo's sweep reaches through the same slice, so it refuses too.
         monkeypatch.setattr(module, "First", module.Second)
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
@@ -3522,11 +3519,11 @@ def test_memoized_fingerprint_refuses_with_truth_when_a_dataclass_carried_class_
 
         db = Database()
         db._query_fingerprint(carried)
-        # Same anchor, reached through a frozen dataclass field: the payload
+        # Same anchor, reached through a frozen dataclass field. The payload
         # folds Box(First) eagerly and anchors the field's class, so the
         # memo's sweep has to reach the field too. Rebinding the global makes
-        # both paths refuse together instead of the memo serving the stored
-        # fingerprint past a refusal every fresh computation raises.
+        # both paths refuse together, so the memo stops serving the stored
+        # fingerprint once every fresh computation refuses.
         monkeypatch.setattr(module, "First", module.Second)
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
             db._query_fingerprint(carried)
@@ -3596,11 +3593,11 @@ def test_memoized_fingerprint_refuses_with_truth_when_a_carrier_type_is_rebound(
         db._query_fingerprint(tagged)
         db._query_fingerprint(paired)
         db._query_fingerprint(boxed)
-        # The payload folds the carrier's own type -- the str subclass, the
-        # tuple subclass, the dataclass -- through the same anchor as the
-        # classes the carried state names, so the sweep has to contribute a
+        # The payload folds the carrier's own type (the str subclass, the
+        # tuple subclass, the dataclass) through the same anchor as the
+        # classes the carried state names. So the sweep has to contribute a
         # leaf for the carrier too. Rebinding any of the three makes every
-        # fresh computation refuse; the memo must refuse with it.
+        # fresh computation refuse, and the memo must refuse with it.
         monkeypatch.setattr(module, "Tag", module.Second)
         monkeypatch.setattr(module, "Pair", module.Second)
         monkeypatch.setattr(module, "Box", module.Second)
@@ -3652,9 +3649,9 @@ def test_memoized_fingerprint_refuses_with_truth_when_an_anchored_types_base_is_
         db = Database()
         db._query_fingerprint(anchored)
         # The alias resolves Payload eagerly, and Payload's definition payload
-        # anchors its base to the base's live module binding -- so rebinding
+        # anchors its base to the base's live module binding, so rebinding
         # Base makes every fresh computation refuse. The sweep follows the same
-        # definition closure, which is what stops the memo serving the
+        # definition closure, which stops the memo from serving the
         # fingerprint it stored while the binding held.
         monkeypatch.setattr(module, "Base", module.Other)
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
@@ -3703,9 +3700,9 @@ def test_memoized_fingerprint_refuses_with_truth_when_an_anchored_types_metaclas
 
         db = Database()
         db._query_fingerprint(anchored)
-        # Same closure, reached through the metaclass slot: the payload anchors
-        # type(Payload) exactly as it anchors a base, so rebinding Meta refuses
-        # freshly and the sweep has to reach the metaclass to refuse warm.
+        # Same closure, reached through the metaclass slot. The payload anchors
+        # type(Payload) as it anchors a base, so rebinding Meta refuses fresh,
+        # and the sweep has to reach the metaclass to refuse warm.
         monkeypatch.setattr(module, "Meta", module.Other)
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
             db._query_fingerprint(anchored)
@@ -3756,8 +3753,8 @@ def test_memoized_fingerprint_refuses_with_truth_when_a_class_body_type_is_rebou
         db._query_fingerprint(anchored)
         # The third closure slot: a class the body names. The payload walks
         # Payload's namespace and anchors Partner's class to Inner's live
-        # module binding, so rebinding Inner refuses freshly -- and the sweep
-        # walks the same namespace so the memo refuses with it.
+        # module binding, so rebinding Inner refuses fresh. The sweep walks
+        # the same namespace, so the memo refuses with it.
         monkeypatch.setattr(module, "Inner", module.Other)
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
             db._query_fingerprint(anchored)
@@ -3801,11 +3798,11 @@ def test_memoized_fingerprint_refuses_with_truth_when_an_anchored_types_base_is_
 
         db = Database()
         db._query_fingerprint(anchored)
-        # The same definition closure reached through the landing that needs no
-        # 3.12 alias: a runtime-constructed TypeVar stores its bound eagerly on
-        # every supported interpreter. Rebinding the bound class's base makes a
-        # fresh computation refuse, and the sweep follows the bound's closure so
-        # the memo refuses with it.
+        # The same definition closure, reached through a landing that works
+        # without a 3.12 alias: a runtime-constructed TypeVar stores its bound
+        # eagerly on every supported interpreter. Rebinding the bound class's
+        # base makes a fresh computation refuse, and the sweep follows the
+        # bound's closure, so the memo refuses with it.
         monkeypatch.setattr(module, "Base", module.Other)
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
             db._query_fingerprint(anchored)
@@ -3841,12 +3838,12 @@ def test_memoized_fingerprint_tracks_a_chain_landed_type_parameters_bound(
 
         db = Database()
         db._query_fingerprint(named)
-        # The chain lands on a type parameter, beside the alias above and for
-        # the same reason: the bound is read off the parameter when the payload
-        # asks for it -- through the lazy evaluator where the interpreter has
-        # one and the resolved attribute otherwise -- and the class it names is
-        # folded by its body. The parameter itself never moves, and a class is
-        # not a constant the module stamp carries.
+        # The chain lands on a type parameter, like the alias above and for the
+        # same reason. The payload reads the bound off the parameter when it
+        # needs it, through the lazy evaluator where the interpreter has one
+        # and the resolved attribute otherwise. It folds the named class by its
+        # body. The parameter itself stays the same, and the constants the
+        # module stamp carries exclude classes.
         monkeypatch.setattr(module.Bound, "marker", 9)
         memoized, truth = _memo_and_truth(db, named)
         assert memoized == truth
@@ -3897,10 +3894,10 @@ def test_memoized_fingerprint_tracks_a_chain_landed_resources_method_globals(
         db = Database()
         db._query_fingerprint(scaled)
         # The chain lands on a resource, whose probe, load and identity
-        # methods are folded as the definitions they are. The per-request
-        # configuration digest covers what identity() returns and nothing of
-        # what those method bodies read, so the rebinding moves the fresh
-        # fingerprint while the resource itself holds still.
+        # methods are folded as definitions. The per-request configuration
+        # digest covers only what identity() returns, never what those method
+        # bodies read. So the rebinding moves the fresh fingerprint while the
+        # resource itself stays the same.
         monkeypatch.setattr(module, "factor", module.larger_factor)
         memoized, truth = _memo_and_truth(db, scaled)
         assert memoized == truth
@@ -3957,11 +3954,11 @@ def test_rebound_defaults_behind_a_captured_chain_matches_fresh(
 
         db = Database(mode=mode)
         assert db.get(scaled) == 20
-        # The other half of what a chain landing on a function carries: its
-        # defaults are read live from the same definition its globals are, so
-        # rebinding them moves identity where a write inside a class the chain
+        # The other half of what a chain landing on a function carries. Its
+        # defaults are read live from the same definition as its globals, so
+        # rebinding them moves identity, which a write inside a class the chain
         # lands on does not. The landing function is the same object either
-        # way, which is what the memo compares.
+        # way, and the memo compares that object.
         module.helper.__defaults__ = (7,)
         _assert_warm_matches_fresh(db, mode, scaled, 70)
     finally:
@@ -3991,8 +3988,8 @@ def test_class_attribute_reached_from_body_and_annotation_matches_fresh(
         return _ObservedConsts.SCALE + 0
 
     # One class in two slots: the body captures it and the annotation names
-    # it. Whichever slot arrives first is the one that folds the class body,
-    # because the second finds the class already seen.
+    # it. Whichever slot arrives first folds the class body, because the
+    # second finds the class already seen.
     scaled.fn.__annotations__["value"] = _ObservedConsts
     db = Database(mode=mode)
     assert db.get(scaled) == 2
@@ -4011,9 +4008,9 @@ def test_instance_state_reached_from_default_and_body_matches_fresh(mode: str) -
     original = _observed_box.factor
     object.__setattr__(_observed_box, "factor", 5)
     try:
-        # The default value and the captured global are one instance, so a
-        # field written in place has to be seen through whichever of the two
-        # slots the walk reaches first.
+        # The default value and the captured global are one instance. A field
+        # written in place has to be seen through whichever of the two slots
+        # the walk reaches first.
         _assert_warm_matches_fresh(db, mode, boxed, 10)
     finally:
         object.__setattr__(_observed_box, "factor", original)
@@ -4030,9 +4027,9 @@ def test_slotted_instance_state_change_matches_fresh(mode: str) -> None:
     original = _observed_slotted_box.factor
     object.__setattr__(_observed_slotted_box, "factor", 3)
     try:
-        # A slotted instance carries no instance dictionary, so the state
-        # observation finds nothing to read and the dataclass-field walk is
-        # the only thing between this write and a warm answer.
+        # A slotted instance has no instance dictionary, so the state
+        # observation finds nothing to read. Only the dataclass-field walk
+        # stands between this write and a warm answer.
         _assert_warm_matches_fresh(db, mode, boxed, 30)
     finally:
         object.__setattr__(_observed_slotted_box, "factor", original)
@@ -4063,7 +4060,7 @@ def test_function_metadata_reached_from_default_and_body_matches_fresh(
     db = Database(mode=mode)
     assert db.get(documented) == 2
     # The same function object arrives as a default value and as a captured
-    # global; only one of the two folds its metadata, and the docstring has
+    # global. Only one of the two folds its metadata, and the docstring has
     # to move the verdict either way.
     monkeypatch.setattr(_observed_documented, "__doc__", "abcdef")
     _assert_warm_matches_fresh(db, mode, documented, 6)
@@ -4083,9 +4080,10 @@ def test_shared_policy_state_change_matches_fresh(mode: str) -> None:
     assert db.get(read_tolerant) == 2
     # One comparator in two slots: the input's policy, reached through the
     # captured input, and the query's own policy. A policy decides what counts
-    # as a change rather than what the query returns, so the value cannot move
-    # here; what the change owes is the recompute the counter below checks and
-    # agreement with a database that never held the earlier tolerance.
+    # as a change and leaves what the query returns alone, so the value stays
+    # the same here. The change owes a recompute, which the counter below
+    # checks, and agreement with a database that never held the earlier
+    # tolerance.
     comparator.tolerance = 5
     executions = db.statistics().query_executions
     warm = db.get(read_tolerant)
@@ -4163,10 +4161,10 @@ def test_resource_configuration_change_matches_fresh(mode: str) -> None:
     assert db.get(scaled) == 20
     resource.parts[0] = 3
     _assert_warm_matches_fresh(db, mode, scaled, 30)
-    # The resource edge re-probes on its own, so agreement on the value alone
-    # would not say the configuration reached this query's identity. The
-    # fingerprint is that identity: a warm database's answer for it has to
-    # equal what a database that never saw the earlier configuration derives.
+    # The resource edge re-probes by itself, so matching values alone leave
+    # open whether the configuration reached this query's identity. The
+    # fingerprint is that identity. A warm database's fingerprint has to equal
+    # what a database that never saw the earlier configuration derives.
     assert db._query_fingerprint(scaled) == Database(mode=mode)._query_fingerprint(scaled)
 
 
@@ -4181,9 +4179,9 @@ def test_resource_configuration_read_in_the_body_matches_fresh(mode: str) -> Non
     db = Database(mode=mode)
     assert db.get(scaled) == 20
     # The resource is captured but never read through the database, so no
-    # resource edge re-probes on this query's behalf. The configuration
-    # reaches the verdict through the fingerprint alone, which is what the
-    # recorded digest has to catch.
+    # resource edge re-probes for this query. The configuration reaches the
+    # verdict only through the fingerprint, and the recorded digest has to
+    # catch it.
     resource.parts[0] = 3
     _assert_warm_matches_fresh(db, mode, scaled, 30)
 
@@ -4238,8 +4236,8 @@ def test_module_function_reached_from_chain_and_capture_matches_fresh(
         assert db.get(scaled) == 60
         # One function in two slots: the chain names it and re-resolves it,
         # and the closure holds the same object directly. The rebinding below
-        # moves neither reference and swaps no constant the module stamp
-        # carries; what it changes is the globals behind that function.
+        # leaves both references and every constant the module stamp carries
+        # in place. It changes the globals behind that function.
         monkeypatch.setattr(module, "inner", replacement.inner)
         _assert_warm_matches_fresh(db, mode, scaled, 80)
     finally:
@@ -4269,9 +4267,9 @@ def test_rebound_function_on_a_captured_chain_matches_fresh(
 
         db = Database(mode=mode)
         assert db.get(scaled) == 10
-        # A function is no constant, so the module stamp carries nothing about
-        # this rebinding; what the chain names is a different object now, and
-        # only re-resolving it says so.
+        # The constants the module stamp carries exclude functions, so the
+        # stamp misses this rebinding. The chain now names a different object,
+        # and only re-resolving the chain reveals it.
         monkeypatch.setattr(module, "helper", replacement.helper)
         _assert_warm_matches_fresh(db, mode, scaled, 20)
     finally:
@@ -4304,10 +4302,10 @@ def test_rebound_function_behind_a_captured_chain_matches_fresh(
 
         db = Database(mode=mode)
         assert db.get(scaled) == 30
-        # The chain still names the same function and the swapped-in value is
-        # a function rather than a constant, so neither the re-resolved target
-        # nor the module stamp moves: the change lives in the globals the
-        # fingerprint folded out of the function behind the chain.
+        # The chain still names the same function, and the swapped-in value is
+        # a function, which the module stamp's constants exclude. So neither
+        # the re-resolved target nor the module stamp moves. The change lives in
+        # the globals the fingerprint folded from the function behind the chain.
         monkeypatch.setattr(module, "inner", replacement.inner)
         _assert_warm_matches_fresh(db, mode, scaled, 40)
     finally:
@@ -4334,8 +4332,8 @@ def test_constant_outside_the_captured_chain_matches_fresh(
         assert db.get(scaled) == 10
         # OTHER sits on no access path, so the result cannot move with it.
         # The fingerprint folds every constant the captured module holds, so
-        # the verdict still does: the warm read re-executes rather than
-        # answering from a record keyed under the earlier namespace.
+        # the verdict does move: the warm read re-executes because the stored
+        # record is keyed under the earlier namespace.
         monkeypatch.setattr(module, "OTHER", 9)
         _assert_warm_matches_fresh(db, mode, scaled, 10)
     finally:
@@ -4396,11 +4394,11 @@ def test_rebinding_inside_a_chain_landed_class_keeps_the_warm_verdict(
         assert db.get(scaled) == 2
         monkeypatch.setattr(module.Consts, "SCALE", 3)
         executions = db.statistics().query_executions
-        # The documented boundary of the memo, stated as behavior: where a
-        # chain lands on a class, the memo pins the landing object by
-        # reference and follows nothing inside it, so a database that already
-        # answered this query keeps answering from the earlier identity. Only
-        # a database fingerprinting it for the first time sees the rebinding.
+        # The memo's documented boundary, stated as behavior. Where a chain
+        # lands on a class, the memo pins the landing object by reference and
+        # stops there. A database that already answered this query keeps
+        # answering from the earlier identity. Only a database fingerprinting
+        # it for the first time sees the rebinding.
         assert db.get(scaled) == 2
         assert db.statistics().query_executions == executions
         assert Database().get(scaled) == 3
@@ -4430,10 +4428,10 @@ def test_rebinding_inside_a_chain_landed_class_moves_only_a_fresh_fingerprint(
         # Both halves of the residual the boundary pin above states as
         # behavior, told apart by the fingerprint itself. The write is folded:
         # a database meeting this query for the first time computes a different
-        # identity for it. What the memo cannot see is that the write happened,
-        # because the class it re-resolves is the same object it recorded, so
-        # the database that already answered keeps the identity it stored and
-        # answers from the record filed under it.
+        # identity for it. The memo misses the write because the class it
+        # re-resolves is the same object it recorded. So the database that
+        # already answered keeps the identity it stored and answers from the
+        # record filed under it.
         assert db.get(flagged) == 1
         assert db.statistics().query_executions == executions
         assert db._query_fingerprint(flagged) == before
@@ -4511,11 +4509,10 @@ def test_state_inside_a_chain_landed_container_keeps_the_warm_verdict(
         object.__setattr__(module.TABLE[0], "scale", 3)
         executions = db.statistics().query_executions
         # A tuple is an accepted landing, and the same boundary runs through
-        # it: the payload folds what the tuple holds while the memo compares
-        # the tuple by identity and follows nothing inside. So the residue is
-        # not confined to a class or an instance a chain names directly -- it
-        # reaches a frozen dataclass held in any immutable container the
-        # payload accepts.
+        # it. The payload folds what the tuple holds, while the memo compares
+        # the tuple by identity and stops there. So the residue extends past a
+        # class or an instance a chain names directly. It reaches a frozen
+        # dataclass held in any immutable container the payload accepts.
         assert db.get(scaled) == 20
         assert db.statistics().query_executions == executions
         assert Database().get(scaled) == 30
@@ -4552,16 +4549,16 @@ def test_rebinding_a_tuple_carried_class_keeps_the_warm_answer_while_fresh_refus
         assert db.get(carried) == 1
         monkeypatch.setattr(module, "First", module.Second)
         executions = db.statistics().query_executions
-        # The two halves of the chain-landed boundary told apart by a rebinding
-        # rather than by a write. The payload reaches the class the tuple
-        # carries and pins it to the name its defining module binds, so once
-        # that name moves every first-time fingerprint refuses outright instead
-        # of answering. The memo does not reach it: the tuple is the object the
-        # chain resolved to, it is compared by identity, and nothing inside it
-        # is followed -- so a database that already answered keeps serving the
-        # answer filed under the fingerprint it stored. Both halves are pinned
-        # deliberately: the refusal is the verdict a fresh computation owes, and
-        # the stored answer is what a warm one is documented to keep.
+        # The two halves of the chain-landed boundary, told apart by a
+        # rebinding this time. The payload reaches the class the tuple carries
+        # and pins it to the name its defining module binds. Once that name
+        # moves, every first-time fingerprint refuses outright. The memo stops
+        # at the tuple: it is the object the chain resolved to, it is compared
+        # by identity, and its contents are never followed. So a database that
+        # already answered keeps serving the answer filed under the fingerprint
+        # it stored. This test pins both halves. The refusal is the verdict a
+        # fresh computation owes, and the stored answer is what a warm one is
+        # documented to keep.
         assert db.get(carried) == 1
         assert db.statistics().query_executions == executions
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
@@ -4599,9 +4596,9 @@ def test_rebinding_a_frozenset_carried_class_keeps_the_warm_answer_while_fresh_r
         assert db.get(carried) == 2
         monkeypatch.setattr(module, "First", module.Second)
         executions = db.statistics().query_executions
-        # The same boundary through an unordered carrier: a frozenset offers no
-        # index for the query to read through, and it still holds the class the
-        # payload anchors, so the rebinding lands on exactly the same split.
+        # The same boundary through an unordered carrier. A frozenset has no
+        # index for the query to read through, yet it still holds the class the
+        # payload anchors, so the rebinding lands on the same split.
         assert db.get(carried) == 2
         assert db.statistics().query_executions == executions
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
@@ -4647,9 +4644,9 @@ def test_rebinding_a_named_tuple_carried_class_keeps_the_warm_answer_while_fresh
         assert db.get(carried) == 1
         monkeypatch.setattr(module, "First", module.Second)
         executions = db.statistics().query_executions
-        # And through a named carrier, whose own class the payload anchors
-        # beside the one it holds: naming the fields buys the landing no
-        # descent from the memo either, so the split is the same one again.
+        # The same boundary through a named carrier, whose own class the
+        # payload anchors beside the one it holds. With named fields the memo
+        # still stops at the landing, so the split is the same again.
         assert db.get(carried) == 1
         assert db.statistics().query_executions == executions
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
@@ -4711,11 +4708,11 @@ def test_chain_landing_the_payload_cannot_pin_is_refused(
         def sized(db: Database) -> int:
             return len(str(module.TABLE))
 
-        # The counterpart of the boundary pins above: these landings are
-        # refused when the fingerprint is built rather than folded and left to
-        # a memo that cannot follow them, so no stale answer comes from any of
-        # them. The landings that are folded, and then compared only through
-        # the landed object's identity, are what those pins document.
+        # The counterpart of the boundary pins above. These landings are
+        # refused when the fingerprint is built, instead of being folded and
+        # left to a memo that cannot follow them. So none of them yields a
+        # stale answer. Those pins document the landings that are folded and
+        # then compared only through the landed object's identity.
         with pytest.raises(UnsupportedValueError, match="cannot be fingerprinted safely"):
             Database().get(sized)
     finally:
@@ -4734,13 +4731,12 @@ def test_rebinding_a_stdlib_chain_target_function_moves_no_fingerprint(
     before = db._query_fingerprint(dumped)
     monkeypatch.setattr(json, "dumps", _stdlib_dumps_replacement)
     executions = db.statistics().query_executions
-    # The other residual, and a different one in kind from the chain-landed
-    # writes above: a captured standard-library module folds the names read off
-    # it rather than the behavior behind them, so nothing here is folded that
-    # this rebinding could move. The identity holds in both directions -- the
-    # memo keeps it and a database computing it from scratch arrives at the
-    # same bytes -- which is why the last line is the cost of the limitation
-    # rather than a disagreement between the two.
+    # The other residual, different in kind from the chain-landed writes
+    # above. A captured standard-library module folds the names read off it,
+    # without the behavior behind them, so this rebinding moves nothing that
+    # is folded. The identity holds in both directions: the memo keeps it, and
+    # a database computing it from scratch arrives at the same bytes. So the
+    # last line shows the cost of the limitation, and the two still agree.
     assert db.get(dumped) == '{"a": 1}'
     assert db.statistics().query_executions == executions
     assert db._query_fingerprint(dumped) == before
@@ -4761,9 +4757,9 @@ def test_rebinding_a_stdlib_chain_target_class_moves_no_fingerprint(
     monkeypatch.setattr(decimal, "Decimal", _StdlibDecimalReplacement)
     executions = db.statistics().query_executions
     # The class half of the same limitation. A class reached through a chain on
-    # a non-stdlib module is folded and only the memo cannot follow it; here
-    # the fold never reaches the class at all, so the rebinding is invisible to
-    # a fresh fingerprint too.
+    # a non-stdlib module is folded, and only the memo misses changes in it.
+    # Here the fold never reaches the class, so a fresh fingerprint also misses
+    # the rebinding.
     assert db.get(scaled) == "6"
     assert db.statistics().query_executions == executions
     assert db._query_fingerprint(scaled) == before
@@ -4774,9 +4770,9 @@ def test_rebinding_a_stdlib_chain_target_class_moves_no_fingerprint(
 def test_declared_mid_span_resource_reconfiguration_reaches_the_next_request() -> None:
     class SpanResource(Resource[int, int, int]):
         def __init__(self, scale: int) -> None:
-            # A list, so the observation pins the container by reference and an
-            # in-place write moves nothing it can see. Only re-reading the
-            # configuration catches this.
+            # A list, so the observation pins the container by reference and
+            # misses an in-place write. Only re-reading the configuration
+            # catches this.
             self.parts = [scale]
 
         def identity(self) -> tuple[str, tuple[int, ...]]:
@@ -4803,8 +4799,8 @@ def test_declared_mid_span_resource_reconfiguration_reaches_the_next_request() -
         before = db._query_fingerprint(scaled)
         resource.parts[0] = 3
         # A span holds the world still, so the configuration digest is read
-        # once for the whole request; declaring the change is what releases
-        # that hold, and the next read inside the span must see it.
+        # once for the whole request. Declaring the change releases that
+        # hold, and the next read inside the span must see it.
         db.request_inputs_changed()
         assert db._query_fingerprint(scaled) != before
         assert db.get(scaled) == 30
@@ -4884,11 +4880,11 @@ def test_matching_resource_implementations_share_an_identity() -> None:
 
     db = Database()
     # The control the inequality pins rest on. Each call defines its own class
-    # object, so two resources built the same way share nothing but what they
-    # are made of; an identity that folded anything unique to the class object
-    # would separate these two and still separate the differing pair below,
-    # leaving the difference in behavior unattributable -- and a stored record
-    # unreachable from the process that reads it back.
+    # object, so two resources built the same way share only what they are
+    # made of. An identity that folded anything unique to the class object
+    # would separate these two and also the differing pair below. The
+    # difference in behavior would then be unattributable, and a stored record
+    # would be unreachable from the process that reads it back.
     assert (
         db._resource_key(make_resource(1), "key").identity
         == db._resource_key(make_resource(1), "key").identity
@@ -5390,12 +5386,12 @@ def test_wrapped_callable_with_unsafe_state_is_rejected() -> None:
 def test_wrapped_callable_identity_moves_with_the_wrapped_annotations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Through 3.13 functools.wraps binds the wrapped function's own annotations
-    # dictionary into the wrapper's instance dictionary; from 3.14 it leaves
+    # Through 3.13, functools.wraps binds the wrapped function's own annotations
+    # dictionary into the wrapper's instance dictionary. From 3.14 it leaves
     # __annotate__ there instead. The instance-state fold skips that copy on the
-    # versions that place it, so what keeps the annotations inside identity on
-    # every interpreter is the wrapped function's own definition payload, and
-    # mutating the shared dictionary in place has to move the query.
+    # versions that place it, so the wrapped function's own definition payload
+    # keeps the annotations inside identity on every interpreter. Mutating the
+    # shared dictionary in place has to move the query.
     @query(key="wrapped-callable-shared-annotations")
     def scaled(db: Database) -> int:
         return _wrapped_scaler(10)
@@ -5406,10 +5402,10 @@ def test_wrapped_callable_identity_moves_with_the_wrapped_annotations(
 
 
 def test_wrapped_callable_with_rebound_annotations_is_rejected() -> None:
-    # The instance-state fold skips __annotations__ only while it is the very
-    # object functools.wraps copied off the wrapped function. A wrapper that
-    # rebinds the attribute to a dictionary of its own is holding mutable state
-    # no fold can track, and it is refused like any other captured dictionary.
+    # The instance-state fold skips __annotations__ only while it is the same
+    # object functools.wraps copied from the wrapped function. A wrapper that
+    # rebinds the attribute to its own dictionary holds mutable state no fold
+    # can track, and it is refused like any other captured dictionary.
     @query(key="wrapped-callable-rebound-annotations")
     def broken(db: Database) -> int:
         return _rebound_annotations_wrapped()
@@ -5419,10 +5415,10 @@ def test_wrapped_callable_with_rebound_annotations_is_rejected() -> None:
 
 
 def test_wrapped_callable_holding_a_reference_cycle_is_rejected() -> None:
-    # Folding the instance state is what puts a cycle within reach, and the
-    # kernel refuses cyclic ambient values rather than folding a marker for
-    # them; reaching the cycle through the callable arm must reach the same
-    # verdict instead of recursing.
+    # Folding the instance state puts a cycle within reach. The kernel refuses
+    # cyclic ambient values instead of folding a marker for them, and reaching
+    # the cycle through the callable arm must give the same verdict without
+    # recursing.
     @query(key="wrapped-callable-cycle")
     def broken(db: Database) -> int:
         return _cyclic_wrapped()
@@ -5438,8 +5434,8 @@ def test_capturing_a_cache_decorated_function_is_rejected() -> None:
 
     # A cache-decorated function is a callable object carrying __wrapped__, and
     # its cache is state no fold can read. The module-attribute route already
-    # refused the identical object; the direct capture agrees with it now
-    # instead of folding the wrapped function and calling the rest invisible.
+    # refused the same object. The direct capture now refuses it too, instead
+    # of folding the wrapped function and treating the cache as invisible.
     with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
         Database().get(broken)
 
@@ -5453,8 +5449,8 @@ def test_capturing_a_local_class_carrying_wrapped_is_rejected() -> None:
     def broken(db: Database) -> int:
         return _LocalWrappedClass.marker
 
-    # Fingerprinted as the class it is, so the local-type refusal governs it;
-    # the __wrapped__ attribute no longer routes it past that check.
+    # Fingerprinted as the class it is, so the local-type refusal applies even
+    # though it carries __wrapped__.
     with pytest.raises(UnsupportedValueError, match="Captured local type"):
         Database().get(broken)
 
@@ -5488,9 +5484,9 @@ def test_module_attribute_wrapped_callable_refusal_names_the_attribute(
         def broken(db: Database) -> int:
             return cast(int, module.unsafe())
 
-        # The shared payload refuses in its own vocabulary; this route says
-        # which module attribute the query named, so the message identifies
-        # something the reader can go and look at.
+        # The shared payload refuses in its own vocabulary. This route names
+        # the module attribute the query used, so the reader knows where to
+        # look.
         with pytest.raises(UnsupportedValueError) as raised:
             Database().get(broken)
         message = str(raised.value)
@@ -5528,8 +5524,8 @@ def test_module_attribute_and_direct_capture_agree_on_wrapped_callables(
     try:
         # The same callable object reached two ways: `import m; m.f` below and
         # the closure capture a `from m import f` produces. The two routes fold
-        # different envelopes, so their fingerprints differ; what has to agree
-        # is that both accept it and both move when its state does.
+        # it into different payloads, so their fingerprints differ. Both must
+        # accept it, and both must move when its state does.
         captured_scaler = module.scaler
 
         @query(key="wrapped-module-attribute")
@@ -5613,8 +5609,8 @@ def test_memoized_fingerprint_tracks_functions_behind_a_captured_cached_property
 def test_query_handle_attribute_change_matches_fresh(mode: str) -> None:
     # A query body may read attributes off its own handle. Writing one is a
     # supported way to reparameterize the query: identity moves with the
-    # attribute, so the stored record no longer answers and the new value is
-    # recomputed rather than served stale.
+    # attribute, so the stored record stops answering and the new value is
+    # recomputed.
     @query(key=f"handle-state-{mode}")
     def selfread(db: Database) -> int:
         return int(cast(Any, selfread).threshold)
@@ -5698,8 +5694,8 @@ def test_module_reached_query_handle_state_moves_the_parent_fingerprint(
         db._query_fingerprint(parent)
         before = Database()._query_fingerprint(parent)
         # The chain names child, whose object identity this write leaves alone,
-        # and a Query is not one of the module constants the stamp folds, so
-        # neither of those memo arms moves: the handle fold is what sees it,
+        # and a Query is outside the module constants the stamp folds. So
+        # neither of those memo arms moves. The handle fold sees the write,
         # and the observation has to follow it through the same chain.
         monkeypatch.setattr(module.child, "__doc__", "Rebound child documentation.")
         after = Database()._query_fingerprint(parent)
@@ -5721,8 +5717,8 @@ def test_query_handle_annotations_of_its_own_move_the_fingerprint() -> None:
     db._query_fingerprint(annotated)
     before = Database()._query_fingerprint(annotated)
     # The handle starts out carrying the function's own annotations, which the
-    # function payload folds; giving it annotations of its own is what this
-    # fold has to see, on either carrier the interpreter uses.
+    # function payload folds. This fold has to see the handle get annotations
+    # of its own, on either carrier the interpreter uses.
     cast(Any, annotated).__annotations__ = {"value": str, "return": int}
     with_eager = Database()._query_fingerprint(annotated)
     assert with_eager != before
@@ -5730,8 +5726,8 @@ def test_query_handle_annotations_of_its_own_move_the_fingerprint() -> None:
     assert memoized == truth
     assert memoized == with_eager
 
-    # Their content, not merely their presence: a fold that noticed only that
-    # the handle had annotations of its own would answer the same here.
+    # The fold must track their content. A fold that noticed only that the
+    # handle had annotations of its own would answer the same here.
     cast(Any, annotated).__annotations__ = {"value": bytes, "return": int}
     with_other_eager = Database()._query_fingerprint(annotated)
     assert with_other_eager not in {before, with_eager}
@@ -5758,11 +5754,11 @@ def test_reflective_annotation_evaluator_on_a_query_handle_is_rejected() -> None
     def evaluate(format: int) -> dict[str, Any]:
         return {"return": globals()["_ObservedConsts"]}
 
-    # An annotation evaluator is folded by resolving the names its code
-    # references against its globals, exactly as any other captured function
-    # is, so a read that names none of them escapes the fold here too. The
-    # same function on any other handle attribute is refused through the
-    # function-definition route; this is the third route to that fold.
+    # An annotation evaluator is folded like any other captured function, by
+    # resolving the names its code references against its globals. A read
+    # that names none of them escapes the fold here too. The same function
+    # on any other handle attribute is refused through the function-definition
+    # route. This is the third route to that fold.
     cast(Any, annotated).__annotate__ = evaluate
     with pytest.raises(UnsupportedValueError, match=r"reads a namespace reflectively \(globals\)"):
         Database()._query_fingerprint(annotated)
@@ -5771,9 +5767,8 @@ def test_reflective_annotation_evaluator_on_a_query_handle_is_rejected() -> None
 def test_rebound_wrapped_function_on_a_query_handle_matches_fresh() -> None:
     # functools.wraps points __wrapped__ at the decorated function, and a body
     # can call whatever it points at now. Rebinding it is the same kind of
-    # write as rebinding any other attribute on the handle, so it moves
-    # identity the same way -- exactly as rebinding __wrapped__ on a plain
-    # captured function does.
+    # write as rebinding any other attribute on the handle. It moves identity
+    # the same way, as rebinding __wrapped__ on a plain captured function does.
     @query(key="handle-wrapped-rebind")
     def reader(db: Database) -> int:
         return int(cast(Any, reader).__wrapped__(db))
@@ -5804,11 +5799,11 @@ def test_memoized_fingerprint_tracks_metadata_behind_a_rebound_wrapped_function(
     db = Database()
     db._query_fingerprint(reader)
     before = Database()._query_fingerprint(reader)
-    # Once __wrapped__ points somewhere other than the query's own function,
-    # the payload folds that function's definition live. The handle's
-    # reference to it does not move when its metadata does, and the module
-    # stamp carries no function metadata either, so the observation has to
-    # follow the function itself rather than pin it by reference.
+    # Once __wrapped__ points away from the query's own function, the payload
+    # folds that function's definition live. The handle's reference to it
+    # stays put when its metadata changes, and the module stamp carries no
+    # function metadata. So the observation has to follow the function itself
+    # instead of pinning it by reference.
     monkeypatch.setattr(_handle_wrapped_one, "__doc__", "Rebound helper documentation.")
     truth = Database()._query_fingerprint(reader)
     assert truth != before
@@ -5829,11 +5824,11 @@ def test_query_handles_holding_a_reference_cycle_have_finite_identity() -> None:
     def solo(db: Database) -> int:
         return 3
 
-    # A query held on another query's handle is folded as the dependency it is,
-    # so a pair holding each other -- or a handle holding itself -- is a cycle
-    # the fold has to survive. The repeat is marked, and what it would have
-    # folded is still folded by the contact that entered the handle: writing an
-    # attribute on either side of the cycle still moves the other's identity.
+    # A query held on another query's handle is folded as a dependency. A pair
+    # holding each other, or a handle holding itself, is then a cycle the fold
+    # has to survive. The repeat is marked, and the contact that entered the
+    # handle still folds what the repeat would have. Writing an attribute on
+    # either side of the cycle still moves the other's identity.
     cast(Any, first).peer = second
     cast(Any, second).peer = first
     cast(Any, solo).mine = solo
@@ -5853,8 +5848,8 @@ def test_query_handle_with_unsafe_attribute_is_rejected() -> None:
         return 1
 
     cast(Any, broken).state = {"mutable": True}
-    # Named as what it is -- state written on the handle, not a value the body
-    # closed over -- and carrying the same remedy the capture refusals give.
+    # The error names it as state written on the handle and gives the same
+    # remedy as the capture refusals.
     with pytest.raises(
         UnsupportedValueError,
         match=r"Query 'handle-unsafe' holds unsupported state 'state' of type builtins.dict",
@@ -5875,11 +5870,10 @@ def test_query_handle_with_a_non_string_attribute_name_is_refused() -> None:
     def parent(db: Database) -> int:
         return child(db) + 1
 
-    # A handle dictionary given a name that is not a string is reached by the
-    # memo observation before it is reached by the fold -- for the query being
-    # keyed and for one its body captures alike -- so the observation has to
-    # answer the fold's refusal rather than leave it to the fold. Otherwise the
-    # observation's own sort compares that name against a string first and the
+    # The memo observation reaches a handle dictionary with a non-string name
+    # before the fold does, both for the query being keyed and for one its body
+    # captures. So the observation has to raise the fold's refusal itself.
+    # Otherwise its own sort compares that name against a string first, and the
     # caller sees a raw TypeError.
     cast(dict[Any, Any], direct.__dict__)[7] = 1
     cast(dict[Any, Any], child.__dict__)[7] = 1
@@ -5917,11 +5911,11 @@ def test_module_reached_query_handle_with_a_non_string_name_is_refused(
         def parent(db: Database) -> int:
             return cast(int, module.child(db)) + 1
 
-        # The route the memo observation cannot answer for: a module is a leaf
-        # of the definition observation, so a handle reached through a module
-        # attribute chain is folded without that walk ever reaching it. The
-        # refusal here has to come out of the fold's own guard; take that guard
-        # away and the sort behind it hands the caller a raw TypeError.
+        # The route the memo observation cannot cover. A module is a leaf of
+        # the definition observation, so a handle reached through a module
+        # attribute chain is folded, and that walk never reaches it. The
+        # refusal here has to come from the fold's own guard. Without that
+        # guard, the sort behind it hands the caller a raw TypeError.
         cast(dict[Any, Any], module.child.__dict__)[7] = 1
         with pytest.raises(
             UnsupportedValueError,
@@ -6061,12 +6055,12 @@ def test_locals_and_exec_reads_are_rejected(
         def read_config(db: Database) -> str:
             return cast(str, reader())
 
-        # Neither of these needs the module-namespace handle the getattr family
-        # is judged beside: the builtin's own load is the offense. What gets
-        # read through the namespace either one hands back is chosen while the
-        # body runs, so the static walk that resolves names has nothing to
-        # resolve. Both spellings are refused in every mode, so no mode trades
-        # the refusal for a cheaper fingerprint.
+        # Unlike the getattr family, these two need no module-namespace handle
+        # beside them: loading the builtin is the offense. What is read through
+        # the namespace either one returns is chosen while the body runs, so
+        # the static walk that resolves names has nothing to resolve. Both
+        # spellings are refused in every mode, so no mode trades the refusal
+        # for a cheaper fingerprint.
         with pytest.raises(UnsupportedValueError, match=rf"reflectively \({offense}"):
             Database(mode=mode).get(read_config)
     finally:
@@ -6107,10 +6101,10 @@ def test_function_scope_import_of_sys_is_reached_through_the_module_table_load(
         def read_config(db: Database) -> str:
             return cast(str, reader())
 
-        # An import inside the body binds sys as a local, so no global load of
-        # the name exists to key on -- but the module table is still reached
-        # by an attribute load, and that is what the rule reads. The import's
-        # scope makes no difference to this spelling.
+        # An import inside the body binds sys as a local, so there is no global
+        # load of the name to key on. The module table is still reached by an
+        # attribute load, and the rule reads that load. This holds whatever
+        # the import's scope.
         with pytest.raises(UnsupportedValueError, match="reads a namespace reflectively"):
             Database().get(read_config)
     finally:
@@ -6132,11 +6126,10 @@ def test_function_scope_importlib_is_reached_through_the_import_module_load(
         def read_config(db: Database) -> str:
             return cast(str, reader())
 
-        # An import inside the body binds importlib as a local, so no global
-        # load of the name exists to key on -- but the module builder is
-        # still reached by an attribute load, and that is what the rule
-        # reads. The import's scope makes no difference to this spelling, as
-        # it makes none to the module table.
+        # An import inside the body binds importlib as a local, so there is no
+        # global load of the name to key on. The module builder is still
+        # reached by an attribute load, and the rule reads that load. As with
+        # the module table, this holds whatever the import's scope.
         with pytest.raises(UnsupportedValueError, match="reads a namespace reflectively"):
             Database().get(read_config)
     finally:
@@ -6175,10 +6168,10 @@ def test_getattr_through_an_aliased_importlib_is_rejected(
         def read_config(db: Database) -> str:
             return cast(str, reader())
 
-        # Aliasing importlib on import changes the name the reading code
-        # loads and nothing else: the call still loads import_module as an
-        # attribute, and that load is the handle the rule keys on, exactly as
-        # the modules load is for an aliased sys.
+        # Aliasing importlib on import changes only the name the reading code
+        # loads. The call still loads import_module as an attribute, and the
+        # rule keys on that load, as it keys on the modules load for an
+        # aliased sys.
         with pytest.raises(UnsupportedValueError, match="reads a namespace reflectively"):
             Database().get(read_config)
     finally:
@@ -6200,14 +6193,13 @@ def test_import_module_alone_stays_accepted(
         def read_config(db: Database) -> str:
             return cast(str, reader())
 
-        # Building a module handle marks a handle; it is the reflective
-        # builtin beside it that is refused. Calling import_module and
-        # reading an attribute off what comes back uses none of those
-        # builtins, so this shape is accepted and its read escapes capture
-        # identity -- importlib is a standard-library module, whose captured
-        # payload folds the names read off it rather than the state behind
-        # them. The boundary is recorded here so a later change to the rule
-        # has to answer for it deliberately.
+        # Building a module handle only marks a handle. The rule refuses the
+        # reflective builtin beside it. Calling import_module and reading an
+        # attribute off the result uses none of those builtins, so this shape
+        # is accepted and its read escapes capture identity. The captured
+        # payload of importlib, a standard-library module, folds the names read
+        # off it without the state behind them. This test records the boundary
+        # so a later change to the rule has to account for it.
         assert Database().get(read_config) == "A"
     finally:
         sys.modules.pop(module_name, None)
@@ -6245,14 +6237,13 @@ def test_from_imported_import_module_stays_accepted(
 
         # A from-import lifts the callable out of importlib, so the reading
         # code loads neither the name importlib nor any attribute this rule
-        # reads: the call is an ordinary global load and the getattr beside it
-        # is never armed. This is the rule's documented boundary rather than an
-        # oversight. Closing it means keying on the bare global name
-        # import_module, which arms the handle for any function that loads a
-        # global of that name beside an ordinary getattr -- whatever the
-        # callable behind the name actually is, and however unrelated to a
-        # module namespace. Recorded here so a later change to the rule has to
-        # answer for it deliberately.
+        # reads. The call is an ordinary global load, and the getattr beside it
+        # is never armed. This is the rule's documented boundary. Closing it
+        # means keying on the bare global name import_module. That would arm
+        # the handle for any function that loads a global of that name beside
+        # an ordinary getattr. It would do so whatever the callable behind the
+        # name is, however unrelated to a module namespace. This test records
+        # the boundary so a later change to the rule has to account for it.
         assert Database().get(read_config) == "A"
     finally:
         sys.modules.pop(module_name, None)
@@ -6296,10 +6287,10 @@ def test_getattr_of_the_module_table_is_rejected(
         def read_config(db: Database) -> str:
             return cast(str, reader())
 
-        # getattr(sys, "modules") is the getattr-family spelling of the very
-        # handle the rule keys on: it loads no attribute named modules, so the
-        # string it passes instead is what marks the reach. Aliasing sys on
-        # import changes the name the reading code loads and nothing else.
+        # getattr(sys, "modules") is the getattr-family spelling of the handle
+        # the rule keys on. It loads no attribute named modules, so the string
+        # it passes marks the reach. Aliasing sys on import changes only the
+        # name the reading code loads.
         with pytest.raises(UnsupportedValueError, match="reads a namespace reflectively"):
             Database().get(read_config)
     finally:
@@ -6321,14 +6312,13 @@ def test_module_table_subscripting_alone_stays_accepted(
         def read_config(db: Database) -> str:
             return cast(str, reader())
 
-        # Reaching the module table marks a handle; it is the reflective
-        # builtin beside it that is refused. Subscripting the table and
-        # reading an attribute off what comes back uses none of those
-        # builtins, so this shape is accepted and its read escapes capture
-        # identity -- sys is a standard-library module, whose captured payload
-        # folds the names read off it rather than the state behind them. The
-        # boundary is recorded here so a later change to the rule has to
-        # answer for it deliberately.
+        # Reaching the module table only marks a handle. The rule refuses the
+        # reflective builtin beside it. Subscripting the table and reading an
+        # attribute off the result uses none of those builtins, so this shape
+        # is accepted and its read escapes capture identity. The captured
+        # payload of sys, a standard-library module, folds the names read off
+        # it without the state behind them. This test records the boundary
+        # so a later change to the rule has to account for it.
         assert Database().get(read_config) == "A"
     finally:
         sys.modules.pop(module_name, None)
@@ -6362,11 +6352,11 @@ def test_reading_a_captured_functions_globals_is_rejected(
             return cast(int, module.helper.__globals__["SECRET"]["v"])
 
         # An attribute chain that lands on a function folds that function's
-        # own definition and stops there. __globals__ carries the whole
-        # defining module dictionary past the landing, so the mutable state
-        # behind it reaches the answer while moving nothing the fingerprint
-        # sees -- the same escape globals() opens from inside the module, and
-        # refused for the same reason.
+        # own definition and stops there. The __globals__ attribute carries the
+        # whole defining module dictionary past the landing, so the mutable
+        # state behind it reaches the answer while the fingerprint stays the
+        # same. Calling globals() opens the same escape from inside the module,
+        # and both are refused for the same reason.
         with pytest.raises(
             UnsupportedValueError, match=r"reads a namespace reflectively \(__globals__\)"
         ):
@@ -6378,9 +6368,9 @@ def test_reading_a_captured_functions_globals_is_rejected(
 def _with_state_entry(value: Any, key: Any, item: Any) -> Any:
     """Write an entry straight into an instance dictionary.
 
-    Nothing about a `__dict__` requires its keys to be strings once the
-    instance exists, which is why the walks that fold instance state meet the
-    shape at all; attribute assignment is not a route to it.
+    Once the instance exists, its `__dict__` accepts keys of any type, which
+    is how the walks that fold instance state meet this shape. Attribute
+    assignment cannot produce it.
     """
 
     cast(dict[Any, Any], object.__getattribute__(value, "__dict__"))[key] = item
@@ -6404,12 +6394,11 @@ _mixed_keyed_state = _with_state_entry(_with_state_entry(_TaggedInt(3), "tag", "
 def test_a_capture_whose_state_holds_a_non_string_key_answers_with_a_typed_refusal() -> None:
     """The walk over an instance dictionary decides its own order.
 
-    A dictionary is free to hold a key that is not a string, and ordering such
-    a dictionary by its keys asks an integer to compare against a string, which
-    raises rather than answering. Deciding the order at the walk lets the
-    capture reach the verdict its shape has always earned -- this one is a
-    plain class carrying mutable state -- instead of a comparison failure from
-    inside the sort.
+    A dictionary may hold a key that is not a string, and ordering such a
+    dictionary by its keys compares an integer with a string, which raises.
+    Deciding the order at the walk keeps a comparison failure from rising out
+    of the sort. The capture reaches the verdict its shape has always earned
+    (here, a plain class carrying mutable state).
     """
 
     @query(key="non-string-instance-state")
@@ -6419,9 +6408,9 @@ def test_a_capture_whose_state_holds_a_non_string_key_answers_with_a_typed_refus
     db = Database()
     with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
         db.get(broken)
-    # Nothing was recorded behind the refusal, so the answer is the same every
-    # time: the fingerprint memo is empty and the second request re-derives the
-    # verdict rather than serving a stored one.
+    # The refusal records nothing, so the answer is the same every time: the
+    # fingerprint memo stays empty, and the second request re-derives the
+    # verdict.
     assert broken not in db._query_fingerprint_memo
     with pytest.raises(UnsupportedValueError, match="captures unsupported ambient value"):
         db.get(broken)
@@ -6430,11 +6419,11 @@ def test_a_capture_whose_state_holds_a_non_string_key_answers_with_a_typed_refus
 def test_a_capture_whose_state_keys_are_not_strings_is_still_fingerprinted() -> None:
     """Deciding the order keeps the shapes that already had one.
 
-    An instance dictionary keyed entirely by integers orders itself perfectly
-    well and is fingerprinted today, so a refusal in front of the sort would
-    reject a shape that works. The order is decided instead, which keeps that
-    shape working and brings the mixed one with it -- each at one fingerprint
-    that does not move between two computations of the same unchanged value.
+    An instance dictionary keyed entirely by integers sorts fine and is
+    fingerprinted today, so a refusal in front of the sort would reject a shape
+    that works. Deciding the order keeps that shape working and adds the mixed
+    one. Each gets one fingerprint that stays stable across two computations of
+    the same unchanged value.
     """
 
     @query(key="integer-instance-state")
@@ -6459,12 +6448,12 @@ def test_a_stat_reading_survives_every_placement(
 ) -> None:
     """A stat reading comes back whole wherever it sits in a value.
 
-    The built-in adapter's payload is the positional triple of scalars, and a
-    scalar is written into the value itself rather than memoized, so no part
-    of that payload can become a node the encoding hands back as a reference.
-    A reading reached twice through one container, and a reading inside a
-    cycle, both rebuild into the dataclass a fresh read gives -- which is what
-    makes the refusal on hoisted payloads narrow enough to leave the kernel's
+    The built-in adapter's payload is the positional triple of scalars. A
+    scalar is written into the value itself instead of being memoized, so no
+    part of that payload can become a node the encoding hands back as a
+    reference. A reading reached twice through one container, and a reading
+    inside a cycle, both rebuild into the dataclass a fresh read gives. That
+    keeps the refusal on hoisted payloads narrow enough to leave the kernel's
     own adapters alone.
     """
 
@@ -6487,8 +6476,8 @@ def test_a_stat_reading_survives_every_placement(
     )
     db = Database(mode=mode)
     result = db.get(reading, str(target))
-    # The placement has to actually reach the graph encoding, or this cell
-    # proves nothing about a payload surviving one.
+    # The placement must reach the graph encoding for this cell to prove that
+    # a payload survives one.
     key, _ = db._query_key(reading, (str(target),), {})
     assert isinstance(db._records[key].snapshot, FrozenGraph)
     if placement == "shared-container":

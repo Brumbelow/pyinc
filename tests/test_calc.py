@@ -38,7 +38,7 @@ def _tree(root: Path) -> dict[str, bytes]:
 
 
 # --------------------------------------------------------------------------- #
-# Task 2A.1 — parser + parse payload
+# Task 2A.1: parser + parse payload
 # --------------------------------------------------------------------------- #
 
 
@@ -63,7 +63,7 @@ def test_parse_reports_unparseable_line() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Task 2A.2 — evaluation + diagnostics
+# Task 2A.2: evaluation + diagnostics
 # --------------------------------------------------------------------------- #
 
 
@@ -106,8 +106,8 @@ def test_missing_name_is_diagnostic(tmp_path: Path) -> None:
 
 
 def test_include_cycle_resolves_without_hanging(tmp_path: Path) -> None:
-    # Mutual includes (a -> b -> a) must not loop: binding_table's visited set
-    # dedups the include graph, so bindings still resolve across the cycle.
+    # Mutual includes (a -> b -> a) terminate: binding_table's visited set
+    # dedups the include graph, so bindings resolve across the cycle.
     a = tmp_path / "a.calc"
     b = tmp_path / "b.calc"
     _write(a, 'include "b.calc"\nlet x = y + 1\nemit x\n')
@@ -117,7 +117,7 @@ def test_include_cycle_resolves_without_hanging(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Task 2A.3 — incremental dataflow + provenance (B1, B2, B3, B5)
+# Task 2A.3: incremental dataflow + provenance (B1, B2, B3, B5)
 # --------------------------------------------------------------------------- #
 
 
@@ -129,9 +129,9 @@ def test_unrelated_file_edit_no_execution(tmp_path: Path) -> None:  # B1
     db = Database(mode="strict")
     evaluate_name(db, str(root), "a")
     db.reset_statistics()
-    _write(other, "let z = 10\n")  # unrelated, not included anywhere
+    _write(other, "let z = 10\n")  # unrelated and included nowhere
     assert evaluate_name(db, str(root), "a") == ("value", 1, "", "")
-    # The specific downstream node is reused (not just "total count unchanged").
+    # Check the downstream node itself is reused, a stronger test than an unchanged total.
     assert db.inspect(evaluate_name, str(root), "a").last_decision == "reused"
     assert db.statistics().query_executions == 0
 
@@ -143,8 +143,8 @@ def test_comment_only_edit_backdates(tmp_path: Path) -> None:  # B3
     evaluate_name(db, str(root), "a")
     _write(root, "# note\nlet a = 1 + 1\nemit a\n")
     assert evaluate_name(db, str(root), "a") == ("value", 2, "", "")
-    # The read re-runs on the new bytes; the parse is what lands an equal
-    # payload and backdates, so the evaluation is reused.
+    # The read re-runs on the new bytes. The parse produces an equal payload and
+    # backdates, so the evaluation is reused.
     assert db.inspect(calc_source, str(root)).last_recompute == "executed"
     assert db.inspect(parse_calc, str(root)).last_decision == "backdated"
     assert db.inspect(evaluate_name, str(root), "a").last_decision == "reused"
@@ -159,8 +159,8 @@ def test_referenced_edit_invalidates_only_dependent(tmp_path: Path) -> None:  # 
     _write(root, "let a = 11\nlet b = 20\nemit a\nemit b\n")  # only a changes
     assert evaluate_name(db, str(root), "a") == ("value", 11, "", "")
     assert evaluate_name(db, str(root), "b") == ("value", 20, "", "")
-    # `a` re-executes; `b`'s expression is re-validated but unchanged, so it
-    # backdates and `b`'s evaluation is reused — only the dependent changed.
+    # `a` re-executes. `b`'s expression is re-validated, is unchanged and
+    # backdates, so `b`'s evaluation is reused. Only the dependent changed.
     assert db.inspect(evaluate_name, str(root), "a").last_recompute == "executed"
     assert db.inspect(binding_expr, str(root), "b").last_recompute == "backdated"
     assert db.inspect(evaluate_name, str(root), "b").last_decision == "reused"
@@ -180,7 +180,7 @@ def test_explain_shows_root_include_and_chain(tmp_path: Path) -> None:  # B5
 
 
 # --------------------------------------------------------------------------- #
-# Task 2A.4 — action emitter, removal (B4), from-scratch (B6)
+# Task 2A.4: action emitter, removal (B4), from-scratch (B6)
 # --------------------------------------------------------------------------- #
 
 

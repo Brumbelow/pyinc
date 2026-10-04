@@ -205,7 +205,7 @@ def resolve_target(
     _visited: frozenset[tuple[str, str]] = frozenset(),
     _trail: tuple[tuple[str, str], ...] = (),
 ) -> ResolvedTarget:
-    """Resolve a declaration through only public integration contracts."""
+    """Resolve a declaration using only public integration contracts."""
 
     return once_per_request(
         db,
@@ -426,12 +426,12 @@ def _identifier_immediately_before(source: str, paren_pos: int) -> str | None:
     """Return the identifier appearing immediately before `(` at `paren_pos`.
 
     Recognises a bare identifier (``foo``) and the terminal identifier of an
-    attribute access. Returns None when the preceding token is not usable — a
-    closing bracket, a literal, a Python keyword, or the name of a `def` /
-    `class` definition header (which is not a call site). A single-dot access
-    retains its owner for compatibility with display-only callers; deeper
-    chains return their rightmost identifier because semantic resolution uses
-    the separately returned source position.
+    attribute access. Returns None when the preceding token is unusable: a
+    closing bracket, a literal, a Python keyword, or the name in a `def` /
+    `class` header (which is not a call site). A single-dot access keeps its
+    owner for compatibility with display-only callers. Deeper chains return
+    their rightmost identifier, because semantic resolution uses the
+    separately returned source position.
     """
     j = paren_pos - 1
     while j >= 0 and source[j] in " \t":
@@ -461,7 +461,7 @@ def _identifier_immediately_before(source: str, paren_pos: int) -> str | None:
             return None
         return name
     if k >= 0 and source[k] == ".":
-        # `<lhs>.name(` — capture the owner only when it is a single bare Name.
+        # `<lhs>.name(`: capture the owner only when it is a single bare Name.
         m = k - 1
         while m >= 0 and source[m] in " \t":
             m -= 1
@@ -477,7 +477,7 @@ def _identifier_immediately_before(source: str, paren_pos: int) -> str | None:
         while p >= 0 and source[p] in " \t":
             p -= 1
         if p >= 0 and source[p] == ".":
-            # A deeper chain (`a.b.name(`) — LHS is not a bare Name.
+            # A deeper chain (`a.b.name(`) has an attribute as its LHS.
             return name
         return f"{lhs}.{name}"
     return name
@@ -503,20 +503,19 @@ def _position_for_offset(source: str, offset: int) -> SourcePosition:
 def _find_call_at_position(
     source: str, line: int, character: int
 ) -> tuple[str, int, SourcePosition] | None:
-    """Locate the call-expression enclosing the cursor.
+    """Locate the call expression enclosing the cursor.
 
     Returns ``(function_name, active_parameter_index, name_position)`` or
     ``None``. ``name_position`` points at the rightmost callee identifier and
-    is suitable for public position-based symbol resolution.
+    suits public position-based symbol resolution.
 
-    The scanner runs forward over `source`, skipping comments and string
-    literals, and tracks a stack of open brackets. The topmost open `(`
-    whose preceding token is a usable identifier is the enclosing call;
-    its accumulated comma count yields the active parameter index. Bare-name
-    calls (``foo(``) and attribute calls (including ``pkg.sub.foo(``) are
-    detected. Semantic support for the receiver chain is decided later by the
-    shared position-based resolver. Subscripted calls (``factory[T](``) are
-    not detected.
+    The scanner runs forward over `source`, skips comments and string
+    literals, and tracks a stack of open brackets. The topmost open `(` whose
+    preceding token is a usable identifier is the enclosing call, and its
+    comma count gives the active parameter index. It detects bare-name calls
+    (``foo(``) and attribute calls (including ``pkg.sub.foo(``). The shared
+    position-based resolver later decides semantic support for the receiver
+    chain. Subscripted calls (``factory[T](``) are not detected.
     """
     target = _line_char_to_offset(source, line, character)
     if target is None:
@@ -576,13 +575,14 @@ def _find_call_at_position(
     return None
 
 
-# Completion is intentionally *line-local* and declaration-driven: it never
-# infers runtime types. ``CompletionContext`` is the shape the scanner hands to
-# the session, tagged by ``kind``:
-#   ("name", prefix)                 — a bare identifier being typed
-#   ("attribute", owner, prefix)     — ``owner.<prefix>`` where owner is a bare name
-#   ("from_import", module, prefix)  — ``from <module> import <prefix>``
-#   ("import_module", prefix)        — ``import <prefix>`` / ``from <prefix>``
+# Completion is *line-local* and declaration-driven by design, with no runtime
+# type inference. ``CompletionContext`` is the shape the scanner hands to the
+# session, tagged by ``kind``:
+#   ("name", prefix)                 a bare identifier being typed
+#   ("attribute", owner, prefix)     ``owner.<prefix>`` where owner is a name or a dotted
+#                                    chain of identifiers
+#   ("from_import", module, prefix)  ``from <module> import <prefix>``
+#   ("import_module", prefix)        ``import <prefix>`` / ``from <prefix>``
 CompletionContext = tuple[str, ...]
 
 _FROM_IMPORT_RE = re.compile(r"^\s*from\s+([\w.]+)\s+import\s+(.*)$")
@@ -593,9 +593,10 @@ _IMPORT_MODULE_RE = re.compile(r"^\s*import\s+(?:[\w.]+\s*,\s*)*([\w.]*)$")
 def _completion_head_in_string_or_comment(head: str) -> bool:
     """Best-effort: is the caret inside a string or line comment on this line?
 
-    Scans the pre-caret text of the current line only. Triple-quoted strings
-    spanning lines are not modelled (documented limitation); this keeps
-    completion from firing inside ordinary single-line strings and comments.
+    Scans only the pre-caret text of the current line. Triple-quoted strings
+    that span lines are outside the model (a documented limitation). The check
+    keeps completion from firing inside ordinary single-line strings and
+    comments.
     """
     quote: str | None = None
     k = 0
@@ -632,7 +633,8 @@ def _find_completion_context(source: str, line: int, character: int) -> Completi
     """Classify what the caret at ``(line, character)`` is completing.
 
     Returns ``None`` when nothing sensible can be offered (inside a string or
-    comment, or an attribute access whose owner is not a bare name)."""
+    comment, or an attribute access whose owner has an empty or non-identifier
+    part)."""
     lines = source.splitlines()
     if not (0 <= line < len(lines)):
         # Allow a caret one past the last line (empty trailing line).
@@ -651,8 +653,8 @@ def _find_completion_context(source: str, line: int, character: int) -> Completi
     if from_import is not None:
         module = from_import.group(1)
         after = from_import.group(2)
-        # The identifier currently being typed is the trailing word; anything
-        # with a dot in this position is out of scope.
+        # The identifier being typed is the trailing word. Anything with a dot
+        # in this position is out of scope.
         last = after.rsplit(",", 1)[-1].strip()
         if last and not last.replace("_", "").isalnum():
             return None
@@ -670,10 +672,9 @@ def _find_completion_context(source: str, line: int, character: int) -> Completi
     if "." in run:
         owner, _, prefix = run.rpartition(".")
         # Accept a bare name (``M.``) or a dotted owner whose every component
-        # is an identifier (``pkg.sub.``, ``pkg.sub.M.``); reject anything with
-        # an empty / numeric component (a leading dot, ``1.``, etc.). The
-        # session decides which dotted owners actually resolve to a workspace
-        # module or module-class.
+        # is an identifier (``pkg.sub.``, ``pkg.sub.M.``). Reject an empty or
+        # numeric component (a leading dot, ``1.``, etc.). The session decides
+        # which dotted owners resolve to a workspace module or module-class.
         if not all(part.isidentifier() for part in owner.split(".")):
             return None
         return ("attribute", owner, prefix)
@@ -703,8 +704,8 @@ _BINDING_TO_COMPLETION_KIND: dict[str, CompletionItemKind] = {
     "pattern_target": "variable",
 }
 
-# Upper bound on returned items so a broad, empty-prefix request stays bounded;
-# editors filter client-side as the user keeps typing.
+# Upper bound on returned items so a broad, empty-prefix request stays bounded.
+# Editors filter client-side as the user keeps typing.
 _COMPLETION_LIMIT = 200
 
 
@@ -712,12 +713,11 @@ def _repair_caret_line(source: str, line: int) -> str:
     """Return ``source`` with line ``line`` replaced by ``pass`` at its original
     indentation.
 
-    The caret line is typically the only unparseable part of a buffer mid-edit
-    (e.g. a trailing ``owner.``). Substituting ``pass`` — rather than blanking
-    the line, which would leave an enclosing ``def``/``class`` with an empty
-    body — lets the file parse while keeping every top-level import and
-    definition intact, which is all the local symbol table and owner resolution
-    need."""
+    Mid-edit, the caret line is usually the only unparseable part of a buffer
+    (e.g. a trailing ``owner.``). ``pass`` keeps the body of an enclosing
+    ``def``/``class`` non-empty, which a blank line would break. The file then
+    parses with every top-level import and definition intact, which is all the
+    local symbol table and owner resolution need."""
     bounds = _source_line_bounds(source)
     if not 0 <= line < len(bounds):
         return source
@@ -751,7 +751,7 @@ def _build_signature_label(
     """Render a ``def name(...)`` label and per-parameter substring offsets.
 
     ``defaults`` maps a parameter name to the source text of its default value
-    (``ast.unparse``d); parameters absent from the mapping render without one.
+    (``ast.unparse``d). Parameters absent from the mapping render without one.
     Spacing follows PEP 8: ``name: ann = default`` when annotated, ``name=default``
     otherwise. When ``defaults`` is ``None`` the output is byte-identical to the
     annotation-only rendering used by hover and completion detail.
@@ -789,7 +789,7 @@ def _defaults_from_arguments(args: ast.arguments) -> dict[str, str]:
     """Map parameter name → ``ast.unparse``d default expression for `args`.
 
     Positional defaults (``args.defaults``) are tail-aligned against the
-    posonly + positional parameters; keyword-only defaults (``args.kw_defaults``)
+    posonly + positional parameters. Keyword-only defaults (``args.kw_defaults``)
     zip 1:1 with ``args.kwonlyargs`` (a ``None`` slot means no default).
     Parameters without a default are omitted.
     """
@@ -812,13 +812,13 @@ def _defaults_from_arguments(args: ast.arguments) -> dict[str, str]:
 def _parameter_defaults_from_source(source: str, lineno: int, name: str) -> dict[str, str] | None:
     """Default-value expressions for the callable named `name` at `lineno`.
 
-    Parses `source` (the *defining* file) and locates the
-    ``FunctionDef`` / ``AsyncFunctionDef`` whose header is at 1-based `lineno`
-    with a matching `name`; for a ``ClassDef`` it digs into the class's
-    ``__init__``. Returns the name→default mapping (see
-    :func:`_defaults_from_arguments`), or ``None`` when the file fails to parse
-    or no matching definition is found. ``self`` / ``cls`` carry no default, so
-    the mapping already matches the self-stripped constructor signature."""
+    Parses `source` (the *defining* file) and finds the ``FunctionDef`` /
+    ``AsyncFunctionDef`` named `name` whose header is at 1-based `lineno`. For
+    a ``ClassDef`` it reads the class's ``__init__``. Returns the name→default
+    mapping (see :func:`_defaults_from_arguments`), or ``None`` when the file
+    fails to parse or has no matching definition. ``self`` / ``cls`` carry no
+    default, so the mapping already matches the self-stripped constructor
+    signature."""
     try:
         tree = _parse_python(source)
     except SyntaxError:
@@ -846,17 +846,15 @@ def _collect_annotation_type_refs(
 ) -> tuple[tuple[str, ...], ...]:
     """Parse a detached annotation string for fallback type references.
 
-    Each entry is either ``("name", id)`` for a bare-name reference or
-    ``("attribute", lhs_id, attr)`` for an ``lhs.attr`` reference where the
-    LHS is itself a bare name. Attribute chains whose LHS is not a bare
-    `Name` (e.g. ``pkg.sub.Foo``) are skipped here because detached text has no
-    lexical position with which to prove the receiver. Source-backed
-    annotations use :func:`_annotation_type_positions` and the shared public
-    resolver instead.
+    Each entry is ``("name", id)`` for a bare-name reference or
+    ``("attribute", lhs_id, attr)`` for an ``lhs.attr`` reference whose LHS is
+    a bare name. Any other attribute chain (e.g. ``pkg.sub.Foo``) is skipped,
+    because detached text has no lexical position to prove the receiver with. Source-backed annotations use
+    :func:`_annotation_type_positions` and the shared public resolver.
 
     A whole-string forward reference (``"Foo"``, ``"pkg.Foo | None"``) is
-    unwrapped exactly once before walking. Malformed annotation text returns
-    an empty tuple.
+    unwrapped once before walking. Malformed annotation text returns an empty
+    tuple.
     """
     try:
         tree = _parse_python(annotation, mode="eval")
@@ -889,9 +887,9 @@ def _compute_folding_ranges(source: str) -> tuple[FoldingRange, ...]:
     """Walk the AST of `source` and emit `FoldingRange` entries.
 
     Folds:
-    - `def`, `async def`, and `class` blocks (header line stays visible, body
-      folds). Decorated definitions start at the first decorator line so the
-      decorator block + def + body collapse together below that line.
+    - `def`, `async def`, and `class` blocks (the header line stays visible
+      and the body folds). Decorated definitions start at the first decorator
+      line, so the decorators, def and body collapse together below that line.
     - Runs of consecutive top-level `import` / `from ... import` statements
       that span more than one source line in total. Mixed `import` and
       `from-import` lines without a blank line between them are grouped.
@@ -976,7 +974,7 @@ def _compute_folding_ranges(source: str) -> tuple[FoldingRange, ...]:
 def _compute_selection_chain(source: str, line: int, character: int) -> tuple[SelectionRange, ...]:
     """Walk the AST of `source` and return a chain of nested ranges around the cursor.
 
-    The chain is ordered innermost-first; each subsequent entry strictly contains its
+    The chain is ordered innermost-first, and each subsequent entry strictly contains its
     predecessor. Coordinates are 0-based (LSP-style) for both line and character.
     Returns `()` when the file fails to parse, the cursor is out of bounds, or no AST
     node contains the cursor.
@@ -1046,11 +1044,10 @@ def _compute_document_links(
 
     For `import M` / `import M as alias` / `import M.x` the link spans the
     `ast.alias` node (which covers any `as <alias>` suffix). For `from M
-    import bar [, baz]` each alias is linked to its own resolved path —
-    the same path goto-definition would jump to for the bound name. Aliases
-    whose resolution is anything other than `"workspace"` (including
-    stdlib / installed / missing / ambiguous) are skipped, mirroring the
-    LSP's existing scope.
+    import bar [, baz]` each alias links to its own resolved path, the same
+    path goto-definition jumps to for the bound name. Only aliases that
+    resolve to `"workspace"` get a link. Stdlib, installed, missing and
+    ambiguous aliases are skipped, matching the LSP's existing scope.
     """
     try:
         tree = _parse_python(source)
@@ -1116,11 +1113,11 @@ _CallableNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
 def _find_callable_node(tree: ast.Module, qualified_name: str) -> _CallableNode | None:
     """Locate the FunctionDef/AsyncFunctionDef/ClassDef matching `qualified_name`.
 
-    Matches `module_symbol_table`'s qualified-name convention: top-level
-    `def f` / `class C` resolve to ``f`` / ``C``; methods inside a class body
-    resolve to ``C.f``; nested classes inside a class body resolve to
-    ``C.Inner``. Nested functions inside another function body are not in
-    the symbol table and are therefore not matched here.
+    Matches `module_symbol_table`'s qualified-name convention. Top-level
+    `def f` / `class C` resolve to ``f`` / ``C``. Methods inside a class body
+    resolve to ``C.f``, and nested classes inside a class body resolve to
+    ``C.Inner``. Functions nested in another function body are absent from
+    the symbol table, so they never match here.
     """
     parts = qualified_name.split(".")
     if not parts or any(not part for part in parts):
@@ -1139,8 +1136,8 @@ def _find_callable_node(tree: ast.Module, qualified_name: str) -> _CallableNode 
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == head:
                 if not rest:
                     return node
-                # Nested functions are not part of the symbol-table qualifier
-                # scheme — stop descending.
+                # Nested functions fall outside the symbol-table qualifier
+                # scheme, so stop descending.
         return None
 
     return walk(list(tree.body), parts)
@@ -1152,10 +1149,10 @@ def _enclosing_callable_qname(
     """Innermost qualified name from `known_qnames` whose def/class span
     contains the 1-based source `line`.
 
-    Qualifier follows the `module_symbol_table` convention: only `ClassDef`
-    nesting contributes to the dotted path; nested function bodies do not
-    extend the qualifier. Returns the deepest matching qname, or ``None`` if
-    no enclosing def/class is in `known_qnames`.
+    The qualifier follows the `module_symbol_table` convention: only
+    `ClassDef` nesting adds to the dotted path, and nested function bodies add
+    nothing. Returns the deepest matching qname, or ``None`` if no enclosing
+    def/class is in `known_qnames`.
     """
     best: tuple[int, str] | None = None
 
@@ -1178,10 +1175,10 @@ def _enclosing_callable_qname(
                 span = end_lineno - node.lineno
                 if best is None or span < best[0]:
                     best = (span, qname)
-            # Nested defs/classes inside a function body are not in the
-            # module symbol table; reset the class qualifier for any further
-            # walk so a nested class can still be detected if it ever lands
-            # in the table.
+            # Defs and classes nested in a function body are absent from the
+            # module symbol table. Reset the class qualifier for the rest of
+            # the walk, so a nested class is still found if it ever lands in
+            # the table.
             for descendant in ast.iter_child_nodes(node):
                 visit(descendant, "")
             return
@@ -1197,7 +1194,7 @@ def _first_positional_param(
 ) -> str | None:
     """Name of a callable's first positional parameter, or ``None``.
 
-    Positional-only parameters take precedence, then regular positionals; a
+    Positional-only parameters come first, then regular positionals. A
     callable that takes only ``*args`` / keyword parameters has none."""
     args = node.args
     if args.posonlyargs:
@@ -1212,12 +1209,12 @@ def _enclosing_method_context(tree: ast.Module, line: int) -> tuple[str, str] | 
     the 1-based `line`, or ``None``.
 
     The innermost callable containing `line` must be a ``FunctionDef`` /
-    ``AsyncFunctionDef`` that is a *direct* child of a ``ClassDef`` body — a
+    ``AsyncFunctionDef`` that is a *direct* child of a ``ClassDef`` body. A
     closure nested inside a method returns ``None``, as does a module-level
     function or a caret outside any callable. The class qualifier follows
     ``module_symbol_table``'s scheme (``Outer.Inner``; function-nested classes
     reset). The first-parameter name is returned verbatim so the caller can
-    apply the literal ``self`` / ``cls`` rule; a method with no positional
+    apply the literal ``self`` / ``cls`` rule. A method with no positional
     parameter yields ``None``.
     """
     best: tuple[int, tuple[str, str] | None] | None = None
@@ -1255,7 +1252,7 @@ def _iter_own_scope(node: ast.AST) -> Iterator[ast.AST]:
     """Yield the descendants of `node` that share its scope.
 
     Descends through control-flow blocks (``if`` / ``for`` / ``while`` /
-    ``with`` / ``try``) but never into nested ``def`` / ``async def`` /
+    ``with`` / ``try``) and stops at nested ``def`` / ``async def`` /
     ``class`` / ``lambda`` bodies, so a scan stays inside `node`'s own scope."""
     for child in ast.iter_child_nodes(node):
         if isinstance(
@@ -1270,17 +1267,17 @@ def _iter_own_scope(node: ast.AST) -> Iterator[ast.AST]:
 def _annotation_expr_for_name_at(tree: ast.Module, line: int, name: str) -> ast.expr | None:
     """Annotation expression bound to bare ``name`` visible at 1-based `line`.
 
-    Rule A's local declaration lookup — first hit wins:
+    Rule A's local declaration lookup. The first hit wins:
 
-    1. a parameter named ``name`` (with an annotation) of the innermost
-       function enclosing `line`;
+    1. an annotated parameter named ``name`` of the innermost function
+       enclosing `line`;
     2. otherwise the nearest preceding ``AnnAssign`` to bare ``Name`` ``name``
-       (``lineno <= line``) inside that same function's own scope — control-flow
-       blocks are searched, nested ``def`` / ``class`` / ``lambda`` scopes are
-       not.
+       (``lineno <= line``) in that function's own scope. The search covers
+       control-flow blocks and skips nested ``def`` / ``class`` / ``lambda``
+       scopes.
 
-    Returns the annotation node, or ``None`` when neither applies. The
-    module-level fallback (priority 3) is the caller's responsibility."""
+    Returns the annotation node, or ``None`` when neither applies. The caller
+    handles the module-level fallback (priority 3)."""
     enclosing: ast.FunctionDef | ast.AsyncFunctionDef | None = None
     enclosing_span: int | None = None
     for node in ast.walk(tree):
@@ -1320,7 +1317,7 @@ def _annotation_expr_for_name_at(tree: ast.Module, line: int, name: str) -> ast.
 
 
 # self./cls. member views: `self` sees instance attributes plus everything the
-# class view sees; `cls` never sees instance attributes.
+# class view sees. `cls` sees only the class view: methods and class variables.
 _INSTANCE_MEMBER_KINDS: frozenset[str] = frozenset(
     {"method", "class_variable", "instance_variable"}
 )
@@ -1330,12 +1327,12 @@ _CLASS_MEMBER_KINDS: frozenset[str] = frozenset({"method", "class_variable"})
 def _collect_outgoing_calls(
     body_node: _CallableNode,
 ) -> tuple[ast.Call, ...]:
-    """Walk `body_node.body` for ``ast.Call`` nodes, skipping descent into
-    any nested ``FunctionDef`` / ``AsyncFunctionDef`` / ``ClassDef`` /
-    ``Lambda`` so each scope owns its own outgoing-call list.
+    """Walk `body_node.body` for ``ast.Call`` nodes, skipping nested
+    ``FunctionDef`` / ``AsyncFunctionDef`` / ``ClassDef`` / ``Lambda`` bodies
+    so each scope owns its own outgoing-call list.
 
     Comprehension scopes (`ListComp`, `SetComp`, `DictComp`, `GeneratorExp`)
-    are walked through since they conceptually run inline.
+    are walked through, since they conceptually run inline.
     """
     calls: list[ast.Call] = []
 
@@ -1358,10 +1355,10 @@ def _collect_outgoing_calls(
 def _call_func_range(call: ast.Call) -> tuple[int, int, int, int] | None:
     """Return the LSP-style 0-based range of `call.func`'s name span.
 
-    For `Name(id=name)` it's the entire Name; for any `Attribute` chain it's
-    just the rightmost-attribute span (matching `find_references`'s reporting
-    convention). Returns ``None`` for subscripted calls, lambdas, and other
-    unsupported call shapes so the caller can skip them.
+    For `Name(id=name)` it is the whole Name. For any `Attribute` chain it is
+    the rightmost-attribute span, matching how `find_references` reports.
+    Returns ``None`` for subscripted calls, lambdas and other unsupported call
+    shapes, so the caller can skip them.
     """
     func = call.func
     if isinstance(func, ast.Name):
@@ -1498,13 +1495,12 @@ def _walk_class_definitions(
 ) -> tuple[tuple[str, ast.ClassDef], ...]:
     """Yield every ``ClassDef`` in ``tree`` with its dotted qualifier.
 
-    The qualifier follows ``module_symbol_table``'s scheme: only
-    ``ClassDef`` nesting contributes to the dotted path — a class
-    declared inside a function body is reported with its bare class
-    name (no function qualifier), matching how the symbol table would
-    have stored it had it been at module top level. Classes declared
-    inside another class are reported as ``Outer.Inner``. Class bodies
-    are walked recursively so arbitrary nesting depth is covered.
+    The qualifier follows ``module_symbol_table``'s scheme: only ``ClassDef``
+    nesting adds to the dotted path. A class declared inside a function body
+    is reported by its bare class name, the way the symbol table would store
+    it at module top level. A class declared inside another class is reported
+    as ``Outer.Inner``. Class bodies are walked recursively, so any nesting
+    depth is covered.
     """
     out: list[tuple[str, ast.ClassDef]] = []
 
@@ -1516,9 +1512,9 @@ def _walk_class_definitions(
                 walk(body_child, qname)
             return
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # Classes declared inside a function body are not part of the
-            # module symbol table's qualifier scheme; reset the class
-            # qualifier so any nested class re-enters at "top level".
+            # Classes declared in a function body fall outside the module
+            # symbol table's qualifier scheme. Reset the class qualifier so
+            # any nested class re-enters at "top level".
             for descendant in ast.iter_child_nodes(node):
                 walk(descendant, "")
             return
@@ -1536,20 +1532,19 @@ def _inlay_hints_for_call(
     """Pair each positional argument with the next positional parameter slot
     and emit one ``InlayHint`` with label ``"name:"`` per pair.
 
-    Walks ``parameters`` left-to-right (which mirrors `_parameter_payloads_from_args`'s
-    posonly-then-positional-then-vararg-then-kwonly-then-kwarg order). The
-    encoding prefixes vararg parameter names with ``*`` and kwargs with
-    ``**`` — both are skipped/stopped here:
+    Walks ``parameters`` left to right, in the order
+    `_parameter_payloads_from_args` uses (posonly, positional, vararg,
+    kwonly, kwarg). The encoding prefixes vararg names with ``*`` and kwarg
+    names with ``**``, handled here as follows:
 
-    - ``**name`` cannot receive positional → silently skipped (kwonly args
-      following a ``*`` are handled by the rule below).
-    - ``*name`` absorbs all remaining positional args → iteration stops.
+    - ``**name`` takes no positional argument, so it is skipped (kwonly args
+      after a ``*`` are handled by the rule below).
+    - ``*name`` absorbs all remaining positional args, so iteration stops.
 
     Iteration also stops at the first ``ast.Starred`` argument in the call,
-    since a `*spread` consumes an unknown number of slots and the pairing
-    becomes ambiguous after that point. Hints are suppressed when the
-    argument is itself a bare ``Name`` whose identifier matches the
-    parameter name.
+    because a `*spread` fills an unknown number of slots and the pairing is
+    ambiguous after it. A bare ``Name`` argument whose identifier matches the
+    parameter name gets no hint.
     """
     hints: list[InlayHint] = []
     param_index = 0
@@ -1633,7 +1628,7 @@ def _normalized_name_offsets_on_line(
 
 def _iter_function_args(args: ast.arguments) -> list[ast.arg]:
     """Return all ``ast.arg`` entries in posonly / positional / vararg /
-    kwonly / kwarg slot order — the same order
+    kwonly / kwarg slot order, the same order
     ``_parameter_payloads_from_args`` uses inside ``symbol_resolution``.
     """
     entries: list[ast.arg] = []
@@ -1653,14 +1648,15 @@ def from_import_semantic_token_types(
     path: str,
     symbol_table: ModuleSymbolTable,
 ) -> dict[str, SemanticTokenType]:
-    """Classify ``from X import name`` bindings by the kind they actually name.
+    """Classify ``from X import name`` bindings by the kind of thing they name.
 
-    The symbol table records such a binding as ``from_import_alias``, which says
-    nothing about what was imported, so a use site would otherwise go
-    unclassified. Following the single cross-module hop lets it be highlighted
-    as the function, class, or variable it resolves to. Anything that does not
-    land on a workspace declaration — installed, stdlib, missing, or ambiguous —
-    is left out so the editor's default highlighting still handles it.
+    The symbol table records such a binding as ``from_import_alias``, which
+    carries no information about what was imported, so a use site would stay
+    unclassified. Following the single cross-module hop lets the editor
+    highlight it as the function, class or variable it resolves to. A binding
+    that resolves anywhere other than a workspace declaration (installed,
+    stdlib, missing or ambiguous) is left out, so the editor's default
+    highlighting handles it.
     """
 
     resolved: dict[str, SemanticTokenType] = {}
@@ -1700,13 +1696,13 @@ def _compute_semantic_tokens(
     symbol table.
 
     Files that fail to parse return ``()``. Token coordinates are 0-based
-    (LSP-style); the returned tuple is sorted by ``(line, character)``.
+    (LSP-style). The returned tuple is sorted by ``(line, character)``.
 
     Use-site classification combines the module symbol table with the shared
-    lexical scope tree.  A local binding therefore wins over an identically
-    named module binding; attribute access remains out of scope. Cross-module
-    ``from``-import kinds are supplied by the caller through
-    ``import_token_types`` so this function stays pure.
+    lexical scope tree, so a local binding wins over a module binding of the
+    same name. Attribute access is out of scope. The caller supplies
+    cross-module ``from``-import kinds through ``import_token_types``, which
+    keeps this function pure.
     """
     try:
         tree = _parse_python(source)

@@ -1,27 +1,27 @@
 """Cross-process checkpoint round-trips.
 
-The durable-cache contract only means something across a *real* process
-boundary: fresh ``id()``s, a fresh randomized hash seed, and fresh module
-state. ``runpy`` (as used in ``test_examples.py``) reuses this interpreter, so
-it cannot exercise D3 (deterministic identities across processes). These tests
-spawn genuine subprocesses via ``sys.executable``.
+The durable-cache contract needs a *real* process boundary to test: fresh
+``id()``s, a fresh randomized hash seed, and fresh module state. ``runpy`` (as
+used in ``test_examples.py``) reuses this interpreter, so it cannot exercise D3
+(deterministic identities across processes). These tests spawn real
+subprocesses via ``sys.executable``.
 
 The idiom (reused by every test below, and the template for future
 cross-process tests):
 
 * A single parameterized *fixture script* is written into ``tmp_path`` and
-  runs in two phases -- ``save`` then ``load`` -- selected by argv. It defines
+  runs in two phases (``save`` then ``load``) selected by argv. It defines
   every ``Input``/``Query``/``Resource`` at MODULE level so identities are
   reproducible (the D3 contract). ``save`` builds state, checkpoints, and
-  persists the key to a file in the store dir; ``load`` reloads in a brand-new
+  persists the key to a file in the store dir. ``load`` reloads in a brand-new
   process, gets the root, and prints the decision plus value as JSON.
 * The store is an on-disk ``FileSystemArtifactStore`` shared by both phases.
 * ``PYTHONPATH`` is set *explicitly* (``src`` plus ``tmp_path``) so the run
-  depends on nothing but the source tree -- no reliance on the repo layout, the
-  installed package, or the test's own ``sys.path``.
+  depends only on the source tree. The repo layout, the installed package and
+  the test's own ``sys.path`` play no part.
 
 Each row of the matrix is its own test. "reused vs executed" is observed with
-``inspect(root).last_recompute`` -- the same public field the in-process
+``inspect(root).last_recompute``, the same public field the in-process
 checkpoint tests assert.
 """
 
@@ -159,14 +159,14 @@ def _run(args: list[str], env: dict[str, str]) -> dict[str, Any]:
 def _child_env(module_dir: str, seed: str | None) -> dict[str, str]:
     """A child environment whose hash seed is an axis the caller chooses.
 
-    ``{**os.environ, ...}`` rather than a bare dict, so the child still inherits
-    ``TMPDIR`` and, on Windows, ``SYSTEMROOT``. Bytecode caching is off in every
-    child: a ``.pyc`` records the absolute path of the source it was built from,
-    which the install-path test below would otherwise measure instead of the
-    identity. A row that wants no pinned seed *deletes* ``PYTHONHASHSEED``
-    rather than setting it to the empty string: CPython reads an empty value as
-    absent, so the two are one configuration -- the one users actually run --
-    and setting it would only prove that they are read alike.
+    The environment starts from ``{**os.environ, ...}``, so the child still
+    inherits ``TMPDIR`` and, on Windows, ``SYSTEMROOT``. Bytecode caching is off
+    in every child. A ``.pyc`` records the absolute path of the source it was
+    built from. With caching on, the install-path test below would measure
+    that path in place of the identity. A row that wants no pinned seed *deletes*
+    ``PYTHONHASHSEED``. CPython reads an empty value as absent, so an empty
+    value and a deleted one are one configuration (the one users run). Setting
+    it empty would only prove that the two are read alike.
     """
 
     env = {
@@ -246,7 +246,7 @@ def test_cross_process_unchanged_state_reuses(cross_process: CrossProcessEnv) ->
 
 def test_cross_process_input_change_reexecutes(cross_process: CrossProcessEnv) -> None:
     out = cross_process.run_load("input_changed")
-    # alpha moves from 1 to 9 in the loading process; the warmed record carries a
+    # alpha moves from 1 to 9 in the loading process. The warmed record carries a
     # real edge to that input, so the root re-executes against the new value.
     assert out["recompute"] == "executed"
     assert out["result"] == 9 + 2 + 5 + 10
@@ -266,8 +266,8 @@ def test_cross_process_query_source_change_reexecutes(
     cross_process: CrossProcessEnv,
 ) -> None:
     out = cross_process.run_load("src_changed")
-    # Same query_id, different body: the code fingerprint moves, so the loading
-    # process's root no longer matches the checkpointed record and re-executes.
+    # Same query_id, different body. The code fingerprint moves, so the loading
+    # process's root misses the checkpointed record and re-executes.
     assert out["recompute"] == "executed"
     assert out["result"] == 1 * 1000 + 2 + 5 + 10
 
@@ -290,8 +290,8 @@ def test_cross_process_optimize_flag_reexecutes(
     cross_process: CrossProcessEnv,
 ) -> None:
     # Identical declared state, but the loading process runs under -O. The build
-    # configuration is part of the identity, so the record is not reused even
-    # though every declared input is unchanged.
+    # configuration is part of the identity, so the root re-executes even though
+    # every declared input is unchanged.
     out = cross_process.run_load("unchanged", optimize=True)
     assert out["recompute"] == "executed"
     assert out["result"] == cross_process.save_result
@@ -391,14 +391,14 @@ def test_wrapped_callable_state_change_misses_across_processes(tmp_path: Path) -
     (tmp_path / "wrapped.key").write_text(saved["key"])
 
     # A loading process that leaves the factor alone is served from the
-    # checkpoint. This is what makes the mutated run below evidence about the
-    # callable's state rather than about the harness refusing every warm.
+    # checkpoint. This control shows the harness can serve a warm, so a miss in
+    # the mutated run below comes from the callable's state.
     unchanged = _run([sys.executable, str(script), str(store_dir), "load_unchanged"], env)
     assert unchanged["results"] == [20, 20]
     assert unchanged["recomputes"] == ["reused", "reused"]
 
     # Both phases run the same file and the helper is never rewritten, so the
-    # module stamp is identical in every process; the factor moving from 2 to 3
+    # module stamp is identical in every process. The factor moving from 2 to 3
     # in the loading process is the only difference the identity can see. The
     # checkpointed records must miss and the queries re-execute against k=3,
     # whether the callable is reached through the module or imported directly.
@@ -498,26 +498,26 @@ def test_dep_query_behind_wrapped_class_reexecutes_across_processes(tmp_path: Pa
     assert saved["results"] == [9, 8]
 
     # Nothing changed between the processes, so both roots must answer the same
-    # values. They get there differently: the root capturing the function has
-    # `leaf` code-pinned and its checkpointed record is served, while the root
-    # reaching `leaf` only through a class is not walked into -- captured classes
-    # are uniformly skipped by the pinning walk -- so `leaf` is unpinned there,
-    # the warm refuses the record rather than serving it, and the root executes.
-    # Should _collect_pinned_capture_objects walk captured classes again, the
-    # expectation here becomes ["reused", "reused"]; update it, do not delete it.
+    # values. They get there differently. The root capturing the function has
+    # `leaf` code-pinned, and its checkpointed record is served. The other root
+    # reaches `leaf` only through a class, and the pinning walk skips every
+    # captured class. So `leaf` is unpinned there, the warm refuses the record,
+    # and the root executes. If _collect_pinned_capture_objects walks
+    # captured classes again, the expectation here becomes ["reused", "reused"].
+    # Then update the expectation and keep the test.
     loaded = _run([sys.executable, str(script), str(store_dir), "load"], env)
     assert loaded["results"] == [9, 8]
     assert loaded["recomputes"] == ["reused", "executed"]
 
 
-# The two fixtures below both ask the shipped source-text query directly and
+# The two fixtures below both ask the shipped source-text query directly, and
 # again through a caller's own queries stacked above it. Every caller reaches the
-# shipped query and the shipped source resource as OBJECTS -- imported by name,
-# never as ``python_source.source_text`` or ``python_source._FILES``. That is
-# load-bearing: a module attribute in the captured chain is something the warm
-# path cannot pin, so the query below it would be executed to verify it while
-# every caller above still reported a reuse, and the row would be measuring the
-# warm gate rather than the identity it is here to hold open.
+# shipped query and the shipped source resource as OBJECTS, imported by name,
+# never as ``python_source.source_text`` or ``python_source._FILES``. The warm
+# path cannot pin a module attribute in the captured chain. With one there, the
+# query below it would execute to verify it while every caller above still
+# reported a reuse. The row would then measure the warm gate in place of the
+# identity it is here to hold open.
 SEEDED_FIXTURE_SCRIPT = '''\
 """Cross-process checkpoint fixture for the hash-seed axis. Everything is
 defined at module level so identities are reproducible across processes."""
@@ -651,8 +651,8 @@ def main():
 main()
 '''
 
-# The file the roots analyse. Its content never moves between the two phases, so
-# it is never the axis; only the seed and the install prefix are.
+# The file the roots analyse. Its content stays fixed across the two phases, so
+# the only axes are the seed and the install prefix.
 SAMPLE_SOURCE = '"""sample"""\n\n\ndef f(x):\n    return x + 1\n'
 
 SEEDED_ROOTS = ("shipped", "parent", "grandparent")
@@ -668,7 +668,7 @@ def _assert_warm_across_processes(
     """Every root answered from the checkpoint, and nothing executed underneath.
 
     The executed-query count is asserted as well as the decision because
-    ``last_recompute`` alone under-reports the work: a dependency the warm path
+    ``last_recompute`` alone under-reports the work. A dependency the warm path
     cannot pin is executed to verify it, and the caller above it still reports a
     reuse. A row that only read the decision would pass with real work happening.
     """
@@ -699,13 +699,13 @@ def _seeded_round_trip(
     return saved, loaded
 
 
-# There is deliberately no (0, non-zero) row here. ``PYTHONHASHSEED=0`` does not
-# pick a seed: it turns hash randomization off, which is a difference in how the
-# interpreter was configured rather than in the order anything was hashed -- so a
-# row crossing it would not be evidence about the seed at all. The randomization
-# flag has a cell of its own below, and
+# This table leaves out a (0, non-zero) row on purpose. ``PYTHONHASHSEED=0``
+# turns hash randomization off and picks no seed. That is a difference in how
+# the interpreter was configured, an axis apart from the order anything was
+# hashed. A row crossing it would say nothing about the seed. The randomization
+# flag has a cell of its own below.
 # ``test_cross_process_optimize_flag_reexecutes`` above is the tree's existing
-# cell for a build-configuration difference that still, deliberately, misses.
+# cell for a build-configuration difference that still misses by design.
 @pytest.mark.parametrize(
     ("save_seed", "load_seed", "label"),
     [
@@ -721,12 +721,12 @@ def test_cross_process_reuse_survives_a_differing_hash_seed(
 ) -> None:
     """A checkpoint written under one hash seed warms a process under another.
 
-    The two same-seed rows are the controls: they say the round trip works at
-    all, so a red on one of the other three is about the seed and nothing else.
-    The last row pins no seed on either side, which is what an ordinary run does
-    -- two such processes carry the same flags and different hash orders, so it
-    is the row that fails first when anything a query's identity folds depends on
-    the order a set or a dict was built in.
+    The two same-seed rows are the controls. They show the round trip works at
+    all, so a red on one of the other three is about the seed alone. The last
+    row pins no seed on either side, as an ordinary run does. Two such processes
+    carry the same flags and different hash orders. So this row fails first when
+    anything a query's identity folds depends on the order a set or a dict was
+    built in.
     """
 
     saved, loaded = _seeded_round_trip(tmp_path, save_seed, load_seed)
@@ -743,15 +743,15 @@ def test_cross_process_reuse_survives_a_differing_hash_seed(
 def test_cross_process_reuse_survives_the_hash_randomization_flag(
     tmp_path: Path, save_seed: str | None, load_seed: str | None, label: str
 ) -> None:
-    """The build-identity axis, not the hash-order one.
+    """The build-identity axis, kept apart from the hash-order one.
 
-    ``PYTHONHASHSEED=0`` turns hash randomization off, and whether it is off is a
-    property of how the interpreter was set up rather than of the order any
-    particular dict was built in. The configurations that pin it are the ones
-    that most want a shared cache -- a benchmark harness, a documentation runner,
-    a CI job asking for a reproducible run -- so a checkpoint one of them writes
-    has to warm an ordinary process and the other way round. This pair is kept
-    out of the seed test above so that a red here reads as what it is.
+    ``PYTHONHASHSEED=0`` turns hash randomization off. Whether it is off is a
+    property of how the interpreter was set up, separate from the order any
+    particular dict was built in. The configurations that pin it most want a
+    shared cache: a benchmark harness, a documentation runner, a CI job asking
+    for a reproducible run. So a checkpoint one of them writes has to warm an
+    ordinary process, and the other way round. This pair stays out of the seed
+    test above so that a red here reads as what it is.
     """
 
     saved, loaded = _seeded_round_trip(tmp_path, save_seed, load_seed)
@@ -789,10 +789,10 @@ def test_cross_process_reuse_survives_a_different_install_path(tmp_path: Path) -
     """A checkpoint written at one absolute prefix warms a load from another.
 
     The two directories hold byte-identical copies of the caller's module and
-    differ only in name -- and in name *length*, so a payload that folded the
-    path would differ in more than a substitution. This is the shape a container
-    image, a second virtualenv or a second CI runner produces: the same
-    distribution, installed somewhere else.
+    differ only in name and in name *length*. So a payload that folded the path
+    would differ in more than a substitution. A container image, a second
+    virtualenv or a second CI runner produces this shape: the same distribution,
+    installed somewhere else.
     """
 
     short_dir = tmp_path / "lib"
@@ -807,9 +807,9 @@ def test_cross_process_reuse_survives_a_different_install_path(tmp_path: Path) -
     source_path = tmp_path / "sample.py"
     source_path.write_text(SAMPLE_SOURCE, encoding="utf-8")
 
-    # The control comes first: the same copy on both sides. It is what makes the
-    # cross-path arm below evidence about the prefix rather than about the round
-    # trip refusing everything.
+    # The control comes first, with the same copy on both sides. It shows the
+    # round trip can warm at all, so a miss in the cross-path arm below comes
+    # from the prefix.
     saved, loaded = _crosspath_round_trip(
         tmp_path, "control", script, source_path, short_dir, short_dir
     )
@@ -823,11 +823,11 @@ def test_cross_process_reuse_survives_a_different_install_path(tmp_path: Path) -
     )
 
 
-# A package whose parent reaches its child as a module attribute -- the spelling
-# `import pkg.queries as q` produces -- beside the `from pkg.queries import thing`
-# control. The two callers live in separate modules on purpose: on 3.11
+# A package whose parent reaches its child as a module attribute (the spelling
+# `import pkg.queries as q` produces), beside the `from pkg.queries import thing`
+# control. The two callers live in separate modules on purpose. On 3.11,
 # ``inspect.getclosurevars`` reports an attribute name that is also a global of
-# the same module as a captured global, so one module holding both spellings
+# the same module as a captured global. So one module holding both spellings
 # would pin the child through the control's import and measure nothing.
 MODATTR_QUERIES_SOURCE = """\
 from pyinc import query
@@ -932,7 +932,7 @@ def test_cross_process_reuse_through_a_module_attribute(tmp_path: Path, root: st
     The fingerprint folds the child behind a static module-attribute chain
     into the parent's identity, so the chain pins the child as a direct capture
     does and the warm gate must count it. The grandparent row is the shape that
-    hid the defect: its own record warmed while the parent underneath was
+    hid the defect. Its own record warmed while the parent underneath was
     executed to verify, so ``last_recompute`` alone read as a reuse. Every row
     asserts the execution count for that reason. The last row is the control.
     """
@@ -950,7 +950,7 @@ def test_cross_process_reuse_through_a_module_attribute(tmp_path: Path, root: st
     store_dir.mkdir()
 
     # The seed is pinned on both sides so the spelling of the edge is the only
-    # axis; the seed has cells of its own above.
+    # axis. The seed has cells of its own above.
     env = _child_env(str(tmp_path), "1")
     saved = _run([sys.executable, str(script), str(store_dir), "save", root], env)
     loaded = _run([sys.executable, str(script), str(store_dir), "load", root], env)
@@ -962,10 +962,11 @@ def test_cross_process_reuse_through_a_module_attribute(tmp_path: Path, root: st
 # A package whose module captures form a cycle: `top` reaches `q.child`, `q`
 # reaches `q2.leaf`, and `q2` reaches back into `q` for `helper`. The
 # fingerprint folds a module already being folded on the same chain by
-# identity and chain names only, so `helper`'s body is not part of `parent`'s
-# identity. It lives in its own module on purpose: editing it moves neither
-# `q`'s nor `q2`'s file digest, so the parent's saved record is found and only
-# the pinned walk and the dep warm stand between the load and a stale answer.
+# identity and chain names only, so `helper`'s body stays outside `parent`'s
+# identity. `helper` lives in its own module on purpose. Editing it leaves the
+# file digests of `q` and `q2` unchanged, so the parent's saved record is found.
+# Then only the pinned walk and the dep warm stand between the load and a stale
+# answer.
 MODCYCLE_TOP_SOURCE = """\
 from pyinc import query
 
@@ -1060,15 +1061,16 @@ main()
 
 
 def test_cross_process_module_capture_cycle_reexecutes_an_edited_leaf(tmp_path: Path) -> None:
-    """A query reached only around a module-capture cycle is not pinned, and
+    """A query reached only around a module-capture cycle stays unpinned, and
     an edit to it re-executes the parent in a fresh process.
 
-    The parent's identity is unchanged by the edit, so its saved record is
+    The edit leaves the parent's identity unchanged, so its saved record is
     found and the deps decide. The cell fails when the pinned walk descends
-    the module the fold declined to descend: every dep then warms from its old
-    record and the parent is served with zero executions. The answer must be
-    the fresh one, not merely different from the saved one, and the recompute
-    must be an execution, so a warm that re-ran nothing cannot pass by luck.
+    the module the fold declined to descend. Every dep then warms from its old
+    record and the parent is served with zero executions. The answer must equal
+    the fresh one, which is stronger than differing from the saved one, and the
+    recompute must be an execution. So a warm that re-ran nothing cannot pass
+    by luck.
     """
 
     package = tmp_path / "cxp_cycle"

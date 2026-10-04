@@ -5,11 +5,11 @@ from typing import Any, BinaryIO, cast
 
 
 class ParseError(ValueError):
-    """A framed message could not be decoded as JSON."""
+    """A framed message failed to decode as JSON."""
 
 
 class InvalidRequest(ValueError):
-    """A decoded JSON value is not a valid JSON-RPC request object."""
+    """A decoded JSON value is an invalid JSON-RPC request object."""
 
 
 _MAX_HEADER_BYTES = 64 * 1024
@@ -84,7 +84,7 @@ def read_message(stream: BinaryIO) -> dict[str, Any] | None:
 
 
 def validate_request(message: dict[str, Any]) -> None:
-    """Validate the base JSON-RPC request envelope."""
+    """Validate the top-level fields of a JSON-RPC request."""
 
     if message.get("jsonrpc") != "2.0":
         raise InvalidRequest("jsonrpc must be exactly '2.0'")

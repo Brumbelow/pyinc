@@ -1,11 +1,11 @@
 """Suite-wide fixtures and collection rules.
 
-Two things live here. Every test runs against a fake, empty site-packages
-unless it opts out, because a fresh analysis otherwise scans the real
-development environment and that scan dominates the runtime of anything that
-builds a session. And the tests that check the repository rather than the
-program are marked ``process`` by file name, so the cross-platform matrix can
-skip them and the quality job can run them once.
+Every test runs against a fake, empty site-packages unless it opts out. A
+fresh analysis would otherwise scan the real development environment, and that
+scan dominates the runtime of anything that builds a session.
+
+Tests that check the repository itself are marked ``process`` by file name, so
+the cross-platform matrix can skip them and the quality job can run them once.
 """
 
 from __future__ import annotations
@@ -15,9 +15,9 @@ from pathlib import Path
 
 import pytest
 
-# Tests that verify the repository as shipped: its docs, its signed history,
-# its release metadata and artifacts, the bench harness, and the cutoff
-# inventory. None of them depends on the operating system or the interpreter.
+# Tests that verify the repository as shipped: its docs, signed history,
+# release metadata and artifacts, the bench harness, and the cutoff inventory.
+# They give the same result on every operating system and interpreter.
 _PROCESS_FILES = frozenset(
     {
         "test_bench_smoke.py",
@@ -64,9 +64,9 @@ def _isolate_site_packages(
     """Point site-packages discovery at an empty directory.
 
     ``pyinc.integrations.installed_packages`` discovers the environment through
-    ``site.getsitepackages`` and ``site.getusersitepackages``; both are
-    replaced so a fresh analysis lists nothing. A test that genuinely needs the
-    real environment opts out with ``@pytest.mark.real_site_packages``.
+    ``site.getsitepackages`` and ``site.getusersitepackages``. Both are replaced,
+    so a fresh analysis sees an empty environment. A test that needs the real
+    environment opts out with ``@pytest.mark.real_site_packages``.
     """
     if request.node.get_closest_marker("real_site_packages"):
         return

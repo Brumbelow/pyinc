@@ -78,19 +78,19 @@ CheckpointOp = tuple[str, object]
 
 def _examples(default: int) -> int:
     # PYINC_PROPERTY_MAX_EXAMPLES caps every row's budget so one quick job can
-    # run the file; unset, each row keeps the budget written beside it.
+    # run the file. When it is unset, each row keeps the budget written beside it.
     cap = os.environ.get("PYINC_PROPERTY_MAX_EXAMPLES", "")
     return min(default, int(cap)) if cap else default
 
 
 def boundary_scalars() -> st.SearchStrategy[object]:
     # The numeric pool behind operation_sequences and checkpoint_op_sequences,
-    # so it feeds test_incremental_results_match_fresh_recomputation and
-    # test_checkpoint_reload_matches_fresh_recomputation. Integers alone cannot
-    # observe a numeric-tower or NaN mistake in the reuse decision, because no
-    # two of them are equal-but-differently-typed and none of them is unequal to
-    # itself. This pool carries both bool/int collisions, both zeros, a float
-    # equal to an int, a non-integral float, and NaN.
+    # which feed test_incremental_results_match_fresh_recomputation and
+    # test_checkpoint_reload_matches_fresh_recomputation. A numeric-tower or NaN
+    # mistake in the reuse decision shows only with values that are equal across
+    # types or unequal to themselves, and plain integers have neither. This pool
+    # has both bool/int collisions, both zeros, a float equal to an int, a
+    # non-integral float, and NaN.
     return st.sampled_from([-3, 0, 1, 7, True, False, 0.0, -0.0, 1.0, 2.5, float("nan")])
 
 
@@ -167,17 +167,16 @@ def test_incremental_results_match_fresh_recomputation(
         assert semantic_equal(incremental.get(describe), fresh_result)
         warm_executions = incremental.statistics().query_executions - warm_before
 
-        # Equality on its own is satisfiable by a warm database that quietly
-        # recomputes everything, which would make this property a statement
-        # about the query bodies rather than about reuse. Witness the reuse:
-        # the cold side really evaluated, the warm side never outworked it, and
-        # a repeat request over an unchanged graph executes nothing. Under the
-        # eviction cap the graph deliberately drops nodes, so the repeat can
-        # only be held to doing strictly less than a cold evaluation there.
+        # A warm database that recomputes everything would also pass the
+        # equality check, so equality by itself tests only the query bodies. These
+        # checks test reuse: the cold side evaluated, the warm side did at most
+        # as much work, and a repeat request over an unchanged graph executes
+        # nothing. The eviction cap drops nodes by design, so under it the
+        # repeat only has to do strictly less than a cold evaluation.
         assert fresh_executions > 0
-        # A bound, not the discriminating assertion: a warm database that
-        # recomputed everything satisfies it with equality. The repeat request
-        # below is what separates reuse from silent recomputation.
+        # Only a bound. A warm database that recomputed everything meets it
+        # with equality. The repeat request below separates reuse from silent
+        # recomputation.
         assert warm_executions <= fresh_executions
         repeat_before = incremental.statistics().query_executions
         assert semantic_equal(incremental.get(describe), fresh_result)
@@ -322,9 +321,9 @@ def test_workspace_queries_match_fresh_recomputation(
     max_query_nodes: int | None,
     states: list[WorkspaceState],
 ) -> None:
-    # Installed-distribution discovery has its own integration tests. Keep this
-    # property focused on workspace graph rewiring instead of re-reading every
-    # development-environment METADATA file for each fresh Database.
+    # Installed-distribution discovery has its own integration tests. Patching
+    # it keeps this property on workspace graph rewiring and spares each fresh
+    # Database from re-reading every development-environment METADATA file.
     with (
         patch.object(site, "getsitepackages", return_value=[]),
         patch.object(site, "getusersitepackages", return_value=""),
@@ -377,14 +376,14 @@ def test_aliasing_mutation_boundaries_behave_by_mode(
 
     db = Database(mode=mode)
     for value in values:
-        # Two independent dicts at the boundary — identity is not preserved across
-        # the membrane unless the caller deliberately shared the input. See the
-        # companion test that exercises the shared-identity case.
+        # Two independent dicts at the boundary. Identity crosses the membrane
+        # only when the caller shares the input on purpose. The companion test
+        # covers that shared-identity case.
         raw = ({"x": value}, {"x": value})
-        # The pre-frozen arm asks whether an already-frozen payload reaches the
-        # queries with the same mode behaviour as a raw one. It says nothing
-        # about wrapper ownership -- the caller never mutates what it handed
-        # over -- so it stays green with the freeze detach reverted too.
+        # The pre-frozen arm checks that an already-frozen payload reaches the
+        # queries with the same mode behaviour as a raw one. The caller never
+        # mutates what it handed over, so the arm leaves wrapper ownership
+        # untested and stays green with the freeze detach reverted too.
         db.set(payload, freeze(raw) if prefrozen else raw)
         if mode == "fast":
             assert db.get(mutate_left) == value
@@ -418,9 +417,9 @@ def test_shared_identity_preserved_across_boundary_in_fast_mode(
         shared = {"x": value}
         db.set(payload, (shared, shared))
         if mode == "fast":
-            # left is right after the boundary — mutation propagates within the call.
+            # left is right after the boundary, so the mutation shows within the call.
             assert db.get(mutate_left) == value + 1
-            # A separate query thaws fresh; the in-query mutation is not persisted.
+            # A separate query thaws a fresh copy, so the mutation stays in its call.
             assert db.get(read_right) == value
         else:
             with pytest.raises((MutationError, TypeError, AttributeError)):
@@ -566,12 +565,12 @@ def test_checkpoint_reload_matches_fresh_recomputation(
                 content = payload
                 path.write_text(content, encoding="utf-8")
             elif kind == "save":
-                # Save the graph as-is, whatever state it is in -- including a
-                # "dirty" graph whose inputs moved since the root was last
-                # evaluated (no get before this save). The save path omits any
-                # record whose cached value no longer matches the live graph, so
-                # reload never warms a stale value; the strongest proof that the
-                # dirty-save soundness fix holds is exercising it here directly.
+                # Save the graph in whatever state it is in, including a "dirty"
+                # graph whose inputs moved since the root was last evaluated (no
+                # get before this save). The save path omits any record whose
+                # cached value disagrees with the live graph, so a reload warms
+                # only current values. Saving here exercises that dirty-save
+                # soundness fix directly.
                 last_key = saver.save_checkpoint()
             elif kind == "get":
                 saver.get(combiner)
@@ -588,9 +587,9 @@ def test_checkpoint_reload_matches_fresh_recomputation(
         reloaded.set(bias, bias_value)
         reloaded.load_checkpoint(last_key)
 
-        # A completely fresh database (no store) over the same declared state is
-        # the ground truth: whatever the checkpoint restores or invalidates, the
-        # reloaded result must match it exactly.
+        # A fresh database without a store, over the same declared state, is the
+        # ground truth. Whatever the checkpoint restores or invalidates, the
+        # reloaded result must match it.
         fresh = Database(mode=mode, max_query_nodes=max_query_nodes)
         fresh.set(scale, scale_value)
         fresh.set(bias, bias_value)
@@ -602,17 +601,17 @@ def test_checkpoint_reload_matches_fresh_recomputation(
 
         warm_before = reloaded.statistics().query_executions
         assert semantic_equal(reloaded.get(combiner), fresh_result)
-        # A bound again, satisfied with equality by a reload that warmed nothing
-        # -- the rewarmed database below is the assertion with teeth.
+        # Again only a bound. A reload that warmed nothing meets it with
+        # equality. The rewarmed database below is the discriminating check.
         assert reloaded.statistics().query_executions - warm_before <= fresh_executions
 
         # How much the reload can warm depends on how far the graph moved after
-        # the last save, so the warm case is pinned directly instead: save the
-        # graph this reload just evaluated and load that into a third database.
-        # That checkpoint describes the declared state exactly, so the answer
-        # has to come back with no query executed at all. Without this witness
-        # every equality above would hold just as well against a load_checkpoint
-        # that warmed nothing and let each read recompute in silence.
+        # the last save, so pin the warm case directly. Save the graph this
+        # reload evaluated and load it into a third database. That checkpoint
+        # matches the declared state, so the answer must come back with zero
+        # query executions. This check catches a load_checkpoint that warms
+        # nothing and lets every read recompute silently, which all the
+        # equalities above would accept.
         warm_key = reloaded.save_checkpoint()
         rewarmed = Database(mode=mode, max_query_nodes=max_query_nodes, store=store)
         rewarmed.set(scale, scale_value)
@@ -629,30 +628,29 @@ def test_checkpoint_reload_matches_fresh_recomputation(
 def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
     mode: str, values: list[int]
 ) -> None:
-    # Honest about its reach, arm by arm.
+    # What each arm covers.
     #
-    # The INPUT arm pins detachment, through total_after_mutation alone: that
-    # query's first evaluation happens after the caller mutates the wrapper it
-    # handed over, so no cached answer can stand in for a fresh read of the
-    # stored snapshot. With freeze's wrapper detach reverted it reads the
-    # caller's mutated items instead -- 9 against a fresh 6 for values
-    # [1, 2, 3] -- in all three modes. The warm `total` assertions do not pin
-    # anything -- total is already memoized before the mutation, so its cached
-    # answer comes back without the stored snapshot being re-read at all, which
-    # is what the execution witness below records.
+    # The INPUT arm pins detachment through total_after_mutation alone. That
+    # query first evaluates after the caller mutates the wrapper it handed over,
+    # so only a fresh read of the stored snapshot can answer it. With freeze's
+    # wrapper detach reverted, it reads the caller's mutated items instead (9
+    # against a fresh 6 for values [1, 2, 3]) in all three modes. The warm
+    # `total` assertions pin nothing, because `total` is memoized before the
+    # mutation. Its cached answer returns without a re-read of the stored
+    # snapshot, as the execution check below records.
     #
-    # The ARGUMENT arm is coverage on both sides of the fix, because the call
-    # envelope hides the mutation: _query_key freezes (args, kwargs) as one
-    # graph, and the empty kwargs dict forces the freeze memo path, so
-    # _finalize_snapshot inlines refs and rebuilds every wrapper leaf before the
-    # body runs. The caller's argument object never reaches the query body, so
-    # mutating it afterwards is unobservable in any mode. The pin that goes red
-    # without the fix is
+    # The ARGUMENT arm passes on both sides of the fix, because the query key
+    # hides the mutation. _query_key freezes (args, kwargs) as one graph, and
+    # the empty kwargs dict forces the freeze memo path, so _finalize_snapshot
+    # inlines refs and rebuilds every wrapper leaf before the body runs. The
+    # query body only sees a rebuilt copy of the caller's argument, so mutating
+    # the original afterwards is unobservable in any mode. The check that goes
+    # red without the fix is
     # tests/test_runtime.py::test_query_result_boundary_owns_returned_wrappers,
-    # for result ingest; test_query_argument_envelope_never_aliased_the_caller
-    # in the same file pins the envelope as a non-bug and is green on both
-    # sides. What the argument assertions add is warm-vs-fresh agreement across
-    # the pre-frozen ingest path in all three modes.
+    # for result ingest. test_query_argument_envelope_never_aliased_the_caller
+    # in the same file pins the (args, kwargs) key as a non-bug and is green on
+    # both sides. The argument assertions here add warm-vs-fresh agreement
+    # across the pre-frozen ingest path in all three modes.
     payload = Input[object]("prefrozen-owned")
 
     @query
@@ -661,11 +659,10 @@ def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
 
     @query
     def total_after_mutation(db: Database) -> int:
-        # The same body as total, which is fine: a query is keyed by
-        # module:qualname and never by its body, so this is a separate node with
-        # nothing memoized in it. Nothing requests it until the caller mutation
-        # below has happened, so its first evaluation is forced to read the
-        # stored snapshot rather than answer from a cache.
+        # Same body as total. A query is keyed by module:qualname, whatever its
+        # body, so this is a separate node with an empty memo. Its first request comes after the
+        # caller mutation below, so its first evaluation must read the stored
+        # snapshot.
         return sum(list(cast("list[int]", payload.read(db))))
 
     @query
@@ -687,19 +684,19 @@ def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
     fresh.set(payload, freeze(list(values)))
     warm_before = db.statistics().query_executions
     assert db.get(total) == fresh.get(total) == expected
-    # No execution on this side: the equality above is the memo answering, which
-    # is precisely why it cannot discriminate.
+    # Zero executions here. The memo answered the equality above, which is why
+    # that equality cannot discriminate.
     assert db.statistics().query_executions == warm_before
 
     cold_before = db.statistics().query_executions
     warm_after_mutation = db.get(total_after_mutation)
-    # This one did execute, for the first time, with the caller's mutation
-    # already applied -- so it reads the stored snapshot rather than a memo.
+    # This one executed for the first time, after the caller's mutation, so it
+    # read the stored snapshot.
     assert db.statistics().query_executions > cold_before
     assert semantic_equal(warm_after_mutation, fresh.get(total_after_mutation))
     assert warm_after_mutation == expected
 
-    # Pre-frozen wrappers arrive as input AND argument values: an equal-encoding
+    # Pre-frozen wrappers arrive as input AND argument values. An equal-encoding
     # argument keys the node that held_argument keyed at ingest, and the warm
     # answer is the ingested list, untouched by the mutation.
     assert list(cast("list[int]", db.get(echo, freeze(list(values))))) == list(values)
@@ -710,16 +707,16 @@ def test_prefrozen_wrapper_inputs_and_arguments_stay_detached(
 # Integration entrypoints against a fresh read
 # ---------------------------------------------------------------------------
 #
-# One property, four shapes of it: for every generated edit sequence, in every
-# mode, and across a checkpoint round trip, a public entrypoint answers a warm
-# database exactly as it answers a fresh one. The two source-file integrations
-# come first; the section below this one carries the same pair of shapes for
-# each of the remaining nine.
+# One property in four shapes. For every generated edit sequence, in every
+# mode, and across a checkpoint round trip, a public entrypoint gives a warm
+# database the same answer as a fresh one. The two source-file integrations come
+# first. The next section applies the same pair of shapes to each of the
+# remaining nine.
 #
-# The document pools are hand-written corpora sampled from, never generated
-# text. Every projection in these integrations degenerates to a raw-text escape
-# hatch on a parse failure, so a free-form generator would spend its budget on
-# documents where the property is trivially true.
+# The document pools are hand-written corpora that the strategies sample from.
+# Every projection in these integrations falls back to raw text on a parse
+# failure, so a free-form text generator would spend its budget on documents
+# where the property is trivially true.
 
 _PY_BASE = (
     "import os\n\n\nclass Shared:\n    def method(self) -> int:\n        return len(os.sep)\n"
@@ -747,11 +744,10 @@ _PY_OTHER = (
     "    return Shared().method()\n"
 )
 
-# Every document carries a class of the same known name, because class_model is
-# asked for one by qualified name and the row cannot drive it otherwise. The
-# comment-removed shape is the reverse direction of the two comment-added ones:
-# the sequence is a walk over this pool, so every ordered pair of members is a
-# reachable edit.
+# Every document has a class with the same known name, because the row drives
+# class_model by qualified name. The comment-removed shape is the reverse of the
+# two comment-added ones. The sequence walks this pool, so every ordered pair of
+# members is a reachable edit.
 _PYTHON_DOCUMENTS = (
     _PY_BASE,
     _PY_BASE + "# trailing comment\n",
@@ -766,10 +762,10 @@ _PYTHON_DOCUMENTS = (
 
 _PYTHON_CLASS = "Shared"
 
-# A single position can sit in a region no edit in the pool moves, which makes
-# that target vacuous, so sweep a few. In the base module these land in turn on
-# the imported name, the class name, the method name, and the name the method
-# body reads; the shifted revisions of it put other things under them.
+# A single position might sit in a region that every edit in the pool leaves
+# alone, which would make it vacuous, so sweep a few. In the base module they
+# land on the imported name, the class name, the method name, and the name the
+# method body reads. The shifted revisions put other things under them.
 _SYMBOL_POSITIONS = (
     SourcePosition(0, 7),
     SourcePosition(3, 7),
@@ -812,10 +808,10 @@ _NB_CELL_OTHER: dict[str, Any] = {
 
 _NB_MARKDOWN: dict[str, Any] = {"cell_type": "markdown", "source": "# Title\n"}
 
-# The last four are written raw rather than through the envelope above. The
+# The last four are written raw, outside the _notebook_document wrapper. The
 # first pair are a two-cell and a one-cell notebook that a flat projection of
-# the text cannot tell apart; the second pair differ only in whether `cells` is
-# absent or empty, which a projection that reads it with a default also cannot.
+# the text conflates. The second pair differ only in whether `cells` is absent
+# or empty, which a projection that reads it with a default also conflates.
 _NOTEBOOK_DOCUMENTS = (
     _notebook_document([_NB_CELL]),
     _notebook_document([_NB_CELL_RUN]),
@@ -829,10 +825,9 @@ _NOTEBOOK_DOCUMENTS = (
 
 
 def python_source_documents() -> st.SearchStrategy[list[str]]:
-    # The sequence length is what dominates this row's cost -- one fresh
-    # Database per step, and each one pays to fingerprint the whole closure
-    # before it answers anything. min_size=2 so every example writes the file
-    # at least twice.
+    # Sequence length dominates this row's cost. Each step builds a fresh
+    # Database, and each one fingerprints the whole closure before it answers.
+    # min_size=2 so every example writes the file at least twice.
     return st.lists(st.sampled_from(_PYTHON_DOCUMENTS), min_size=2, max_size=4)
 
 
@@ -841,16 +836,15 @@ def notebook_documents() -> st.SearchStrategy[list[str]]:
 
 
 def _python_entrypoint_values(db: Database, root: str, path: str) -> dict[str, object]:
-    # The reverse call graph of the raw-text read, taken tree-wide and with the
-    # read itself left out: including it would degenerate the property into
-    # "the file changed", since raw text always differs when the bytes do. The
-    # five entrypoints from the other two modules are not optional -- measured,
-    # python_source's own dependents discriminate on nothing in this pool at
-    # all, and scope_tree's geometry is where a read answered from a coarser
-    # comparison shows. Two further entrypoints in that graph are left out on
-    # purpose: workspace_analysis has its own row in this file above, and
-    # workspace_symbol_index drives the same workspace walk at a cost this
-    # row's budget cannot absorb.
+    # The reverse call graph of the raw-text read, tree-wide, minus the read
+    # itself. Raw text always differs when the bytes do, so including it would
+    # reduce the property to "the file changed". The five entrypoints from the
+    # other two modules are required. Measured on this pool, python_source's own
+    # dependents never discriminate, and scope_tree's geometry is where a read
+    # answered from a coarser comparison shows. Two more entrypoints in the
+    # graph are left out on purpose: workspace_analysis has its own row above,
+    # and workspace_symbol_index drives the same workspace walk at a cost beyond
+    # this row's budget.
     values: dict[str, object] = {
         "file_analysis": file_analysis(db, path),
         "directory_analysis": directory_analysis(db, root),
@@ -860,11 +854,9 @@ def _python_entrypoint_values(db: Database, root: str, path: str) -> dict[str, o
         "class_model": class_model(db, root, path, _PYTHON_CLASS),
     }
     for index, position in enumerate(_SYMBOL_POSITIONS):
-        # find_references takes a resolved SymbolId rather than a path, so the
-        # id has to be resolved separately in each database -- which means the
-        # id itself is compared too. Resolving in each and comparing only the
-        # references would compare two different symbols and agree while both
-        # halves were wrong.
+        # find_references takes a resolved SymbolId, so each database resolves
+        # its own id and the ids are compared too. Comparing only the references
+        # could compare two different symbols and agree while both were wrong.
         symbol_id = symbol_at(db, root, path, position)
         values[f"symbol_at[{index}]"] = symbol_id
         values[f"find_references[{index}]"] = (
@@ -873,11 +865,10 @@ def _python_entrypoint_values(db: Database, root: str, path: str) -> dict[str, o
     return values
 
 
-# mode is a pytest parametrize; max_query_nodes deliberately is not. The
-# [None, 2] stack the rows above use exists for kernel-level toy graphs, and a
-# two-node cap over this closure evicts essentially everything -- which turns
-# the warm database into a cold one and makes warm == fresh true for the wrong
-# reason.
+# mode is a pytest parametrize, and max_query_nodes is left out on purpose. The
+# [None, 2] stack in the rows above suits kernel-level toy graphs. A two-node
+# cap over this closure evicts nearly everything and turns the warm database
+# into a cold one, so warm == fresh would hold for the wrong reason.
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @settings(max_examples=_examples(10), deadline=None)
 @given(documents=python_source_documents())
@@ -885,9 +876,8 @@ def test_python_source_entrypoints_match_fresh_recomputation(
     mode: str, documents: list[str]
 ) -> None:
     # Installed-distribution discovery has its own integration tests, and
-    # several of the entrypoints driven below reach it; without this patch every
-    # fresh Database re-reads every METADATA file in the development
-    # environment.
+    # several entrypoints below reach it. The patch stops every fresh Database
+    # from re-reading every METADATA file in the development environment.
     with (
         patch.object(site, "getsitepackages", return_value=[]),
         patch.object(site, "getusersitepackages", return_value=""),
@@ -904,32 +894,31 @@ def test_python_source_entrypoints_match_fresh_recomputation(
             warm = _python_entrypoint_values(incremental, str(root), str(path))
             fresh = _python_entrypoint_values(Database(mode=mode), str(root), str(path))
             for name in warm:
-                # One line, discriminator first: a parametrized node id this
-                # long fills the summary line on its own, so under the repo's
-                # own `--tb=no` no part of the message survives. Read a failure
-                # here with `-o addopts="" --tb=long`.
+                # One line, discriminator first. A parametrized node id this
+                # long fills the summary line by itself, so the repo's `--tb=no`
+                # hides the whole message. Read a failure here with
+                # `-o addopts="" --tb=long`.
                 assert warm[name] == fresh[name], (
                     f"{name} warm!=fresh | mode={mode} | step={step} | {previous!r} -> {content!r}"
                 )
 
 
-# max_examples is above the floor the python_source rows hold to, on measured
-# grounds: of the three pairs in this pool that project to the same flat tuple
-# of strings, two analyse differently -- the third is the output-only shape,
-# whose equal analysis is what the row below pins. So it is the number of
-# examples rather than the length of any one sequence that decides how often a
-# walk over the pool steps across a pair that can disagree. This row is cheap
-# enough to afford the higher count; the python_source row, at ten times the
-# cost per step, is not.
+# max_examples is above the python_source rows' floor, based on measurement.
+# Three pairs in this pool project to the same flat tuple of strings. Two of
+# them analyse differently. The third is the output-only shape, whose equal
+# analysis the row below pins. So the number of examples, more than any one
+# sequence's length, decides how often a walk crosses a pair that can disagree.
+# This row is cheap enough for the higher count. The python_source row, at ten
+# times the cost per step, is too expensive for it.
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @settings(max_examples=_examples(30), deadline=None)
 @given(documents=notebook_documents())
 def test_notebook_entrypoints_match_fresh_recomputation(mode: str, documents: list[str]) -> None:
-    # notebook_analysis reads the raw text directly, to place its diagnostic
-    # ranges, and it is compared here for exactly that reason: its dependence
-    # on the bytes is the thing a coarser comparison gets wrong, not an
-    # artefact of the measurement. The raw read itself stays out of the
-    # comparison -- it always differs when the bytes do.
+    # notebook_analysis reads the raw text directly to place its diagnostic
+    # ranges, and that is why it is compared here. Its dependence on the bytes
+    # is real behaviour that a coarser comparison gets wrong. The raw read
+    # itself stays out of the comparison because it always differs when the
+    # bytes do.
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir) / "workspace"
         root.mkdir()
@@ -958,8 +947,8 @@ def test_notebook_entrypoints_match_fresh_recomputation(mode: str, documents: li
             )
 
 
-# Output-only revisions of one code cell: the outputs and the execution count
-# move, the cell source never does.
+# Output-only revisions of one code cell. The outputs and the execution count
+# move, and the cell source stays fixed.
 _OUTPUT_ONLY_REVISIONS: tuple[tuple[tuple[dict[str, Any], ...], int | None], ...] = (
     ((), None),
     (({"output_type": "stream", "name": "stdout", "text": "noise\n"},), 7),
@@ -1020,9 +1009,9 @@ def _notebook_run_document(
 def test_a_notebook_output_edit_leaves_the_analysis_where_it_was(
     mode: str, source: str, revisions: list[int]
 ) -> None:
-    # tests/test_notebook.py pins this at a single document. What this adds is
-    # that it holds over the whole pool, so a later regression that spares one
-    # document shape is still visible from here.
+    # tests/test_notebook.py pins this at a single document. This row checks
+    # the whole pool, so a later regression that spares one document shape
+    # still shows here.
     with tempfile.TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "sample.ipynb"
         db = Database(mode=mode)
@@ -1035,15 +1024,13 @@ def test_a_notebook_output_edit_leaves_the_analysis_where_it_was(
                 _notebook_run_document(source, outputs, execution_count), encoding="utf-8"
             )
             analysis = notebook_analysis(db, str(path))
-            # Inspected immediately after a single entrypoint call, which is
-            # the one shape where a record's own stamps can be read at face
-            # value: any node touched again inside the same request is
-            # restamped "reused", so a cell that drives several entrypoints
-            # before inspecting has to count executions from the query profile
-            # instead. changed_at is the instrument here in any case -- the
-            # payload reports "executed" on this edit while leaving changed_at
-            # exactly where it was, which is what "the dependents stayed valid"
-            # means.
+            # Inspect right after a single entrypoint call. Only then can a
+            # record's stamps be read at face value. A node touched again in
+            # the same request is restamped "reused", so a cell that drives
+            # several entrypoints must count executions from the query profile.
+            # changed_at is the measure here anyway. The payload reports
+            # "executed" on this edit and keeps changed_at where it was, which
+            # is what "the dependents stayed valid" means.
             changed_at = db.inspect(notebook_analysis_payload, str(path)).changed_at
             if first is None:
                 first, first_changed = analysis, changed_at
@@ -1079,9 +1066,9 @@ _PYTHON_COMMENTS = (
 def test_a_python_comment_edit_leaves_the_import_analysis_reused(
     mode: str, base: str, comments: list[str]
 ) -> None:
-    # tests/test_python_source.py pins this at a single document too, and the
-    # same reason applies: over the pool a later regression that only affects
-    # one module shape still shows up here.
+    # tests/test_python_source.py pins this at a single document too. Checking
+    # the whole pool catches a later regression that affects only one module
+    # shape.
     with tempfile.TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "sample.py"
         db = Database(mode=mode)
@@ -1091,9 +1078,9 @@ def test_a_python_comment_edit_leaves_the_import_analysis_reused(
         for comment in comments:
             path.write_text(base + comment, encoding="utf-8")
             analysis = file_analysis(db, str(path))
-            # One entrypoint call, then the inspections -- see the note on the
-            # row above for why anything that drives more than one has to read
-            # the query profile instead.
+            # One entrypoint call, then the inspections. The note on the row
+            # above explains why a cell that drives several must read the query
+            # profile.
             imports_decision = db.inspect(imports_for_file, str(path)).last_decision
             payload_decision = db.inspect(file_analysis_payload, str(path)).last_decision
 
@@ -1111,25 +1098,23 @@ def test_a_python_comment_edit_leaves_the_import_analysis_reused(
 
 
 def _python_checkpoint_values(db: Database, path: str) -> dict[str, object]:
-    # Two entrypoints rather than the live row's eight, because the round trip
-    # costs three databases per pair: scope_tree, which is the one that moves
-    # when a read is answered from a coarser comparison, and file_analysis,
-    # python_source's own, as the control beside it. The reduction is measured
-    # rather than assumed -- across every ordered pair of the pool that can
-    # disagree at all, the entrypoint that disagrees is scope_tree and no other,
-    # so this pair separates exactly what the eight do. Entrypoints, never
-    # payload leaves -- checkpoint warming is parent-driven, and a leaf asked on
-    # its own cold-executes even when its record is in the manifest.
+    # Two entrypoints instead of the live row's eight, because the round trip
+    # costs three databases per pair. scope_tree is the one that moves when a
+    # read is answered from a coarser comparison. file_analysis, python_source's
+    # own, is the control beside it. The reduction is measured. Across every
+    # ordered pair of the pool that can disagree, scope_tree is the only
+    # entrypoint that disagrees, so this pair separates the same cases the eight
+    # do. Drive entrypoints only. Checkpoint warming is parent-driven, and a
+    # payload leaf asked by itself cold-executes even when its record is in the
+    # manifest.
     return {"file_analysis": file_analysis(db, path), "scope_tree": scope_tree(db, path)}
 
 
-# The edit happens BEFORE the save, and the ordering is the whole test. Saving
-# first and editing after reproduces nothing: on reload the resource probe
-# mismatches, the read executes on the new bytes, there is no earlier answer
-# left to serve from, and the row is green whether or not a stale read is
-# possible -- a regression that can never fail. Values are compared and never a
-# recompute marker, because a reloaded record reports "reused" or "executed"
-# either way.
+# The edit happens BEFORE the save, and that ordering is the whole test. If the
+# save came first, the reload's resource probe would mismatch and the read would
+# execute on the new bytes with no earlier answer to serve. The row would then
+# pass even with a stale-read bug, so it could never fail. Compare values only.
+# A reloaded record's recompute marker reads "reused" or "executed" either way.
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @settings(max_examples=_examples(10), deadline=None)
 @given(documents=python_source_documents())
@@ -1161,9 +1146,9 @@ def test_python_source_checkpoint_reload_matches_fresh(mode: str, documents: lis
 @settings(max_examples=_examples(30), deadline=None)
 @given(documents=notebook_documents())
 def test_notebook_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) -> None:
-    # Same ordering, same reasons, same two rules: edit before save, compare
-    # values, drive the entrypoints. max_examples is raised for the same reason
-    # as on the notebook row above -- the pool's aliasing pairs are sparse.
+    # Same ordering and rules as above: edit before save, compare values, drive
+    # the entrypoints. max_examples is raised as on the notebook row above,
+    # because the pool's aliasing pairs are sparse.
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir) / "workspace"
         root.mkdir()
@@ -1206,32 +1191,32 @@ def test_notebook_checkpoint_reload_matches_fresh(mode: str, documents: list[str
 # Configuration, environment and packaging entrypoints against a fresh read
 # ---------------------------------------------------------------------------
 #
-# The same property as the two source-file sections above, one live row and one
-# checkpoint row per integration. Every row drives public entrypoints and never
-# a payload leaf, and every row leaves the raw-text read out of the comparison:
-# raw text always differs when the bytes do, so including it would degenerate
-# the property into "the file changed".
+# The same property as the two source-file sections above, with one live row
+# and one checkpoint row per integration. Every row drives only public
+# entrypoints. Every row leaves the raw-text read out of the comparison, because
+# raw text always differs when the bytes do and would reduce the property to
+# "the file changed".
 #
-# mode is a pytest parametrize on every row; max_query_nodes deliberately is
-# not, for the reason recorded above the python_source row -- a two-node cap
-# over a real integration closure evicts the graph and makes warm == fresh true
-# for the wrong reason.
+# mode is a pytest parametrize on every row. max_query_nodes is left out on
+# purpose, for the reason given above the python_source row. A two-node cap over
+# a real integration closure evicts the graph, so warm == fresh would hold for
+# the wrong reason.
 #
-# The document pools are hand-written corpora sampled from, never generated
-# text, and each pool carries the shapes a projection of the file could collapse:
+# The document pools are hand-written corpora that the strategies sample from.
+# Each pool carries the shapes a projection of the file could collapse:
 # reordered inline tables and objects for TOML and JSON, the
 # continuation-backslash pair and an editable install with an inline comment for
-# requirements, an absent header against an empty one for distribution metadata,
-# and the quoting, comment and whitespace classes for the rest. A pool with no
-# such shape in it makes its row vacuous.
+# requirements, an absent header against an empty one for distribution
+# metadata, and the quoting, comment and whitespace classes for the rest. Each
+# pool needs at least one such shape, or its row is vacuous.
 
 _EntrypointGroup = Callable[[Database, str, str], dict[str, object]]
 
 
 def _sampled_documents(documents: tuple[str, ...]) -> st.SearchStrategy[list[str]]:
-    # min_size=2 so every example writes the file at least twice; max_size=4
-    # because the sequence length, not the pool size, is what each row's cost
-    # scales with -- one extra fresh Database per step.
+    # min_size=2 so every example writes the file at least twice. max_size=4
+    # because each row's cost scales with sequence length (one extra fresh
+    # Database per step), whatever the pool size.
     return st.lists(st.sampled_from(documents), min_size=2, max_size=4)
 
 
@@ -1242,11 +1227,11 @@ def _assert_entrypoints_match_fresh(
     mode: str,
     documents: list[str],
 ) -> None:
-    """Walk the pool, comparing every entrypoint against a database with no history.
+    """Walk the pool, comparing every entrypoint against a fresh database.
 
-    One file at a workspace root, under the name workspace discovery looks for,
-    so the path-taking and the root-taking entrypoints both have something to
-    answer about.
+    One file sits at a workspace root under the name workspace discovery looks
+    for, so both the path-taking and the root-taking entrypoints have a file to
+    analyse.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir) / "workspace"
@@ -1260,25 +1245,25 @@ def _assert_entrypoints_match_fresh(
             warm = entrypoints(incremental, str(root), str(path))
             fresh = entrypoints(Database(mode=mode), str(root), str(path))
             for name in warm:
-                # One line, discriminator first: these node ids are long enough
-                # to fill the summary line on their own under the repo's own
-                # `--tb=no`. Read a failure with `-o addopts="" --tb=long`.
+                # One line, discriminator first. These node ids fill the
+                # summary line by themselves under the repo's `--tb=no`. Read a
+                # failure with `-o addopts="" --tb=long`.
                 assert warm[name] == fresh[name], (
                     f"{name} warm!=fresh | mode={mode} | step={step} | "
                     f"{previous!r} -> {content!r}"
                 )
 
 
-# The checkpoint rows come in two orderings and the difference is the whole
-# point of each. Both compare a reloaded database against a fresh one and assert
-# nothing else.
+# The checkpoint rows come in two orderings, and each row exists for its
+# ordering. Both compare a reloaded database against a fresh one and assert only
+# that.
 #
-# The `!= warm` arm that would show the comparison is not vacuous is left out of
-# every checkpoint row in this section on purpose: each step's before/after pair
-# is two separate draws from the pool, so a sequence can repeat one document
-# or pair two members that analyse equal, and then the answer before the edit
-# equals the answer after it -- a `!=` arm goes red on a correct tree. That arm
-# lives in the hand-written rows that choose their own semantic edit --
+# Every checkpoint row in this section leaves out the `!= warm` arm on purpose.
+# That arm would show the comparison is meaningful. Each step's before/after
+# pair is two separate draws from the pool, so a sequence can repeat a document
+# or pair two members that analyse equal. The answer before the edit then equals the
+# answer after it, and a `!=` arm would go red on a correct tree. That arm lives
+# in the hand-written rows that choose their own semantic edit:
 # test_a_checkpoint_reload_answers_an_edit_made_after_the_save in
 # tests/test_csv_data.py, tests/test_env_file.py, tests/test_xml_config.py,
 # tests/test_deep_module_resolution.py and tests/test_codegen.py.
@@ -1293,11 +1278,11 @@ def _assert_reload_after_an_edit_before_the_save_matches_fresh(
 ) -> None:
     """Save a database that has already answered across the edit, then reload it.
 
-    The edit lands BEFORE the save and the entrypoints are re-driven after it,
-    so what gets written is the state the database reached by answering on the
-    new bytes. Saving first and editing afterwards reproduces nothing: on reload
-    the resource probe mismatches, the read executes on the new bytes, and there
-    is no earlier answer left to serve from -- a row that cannot fail.
+    The edit lands BEFORE the save and the entrypoints run again after it, so
+    the checkpoint holds the state the database reached by answering on the new
+    bytes. If the save came first, the reload's resource probe would mismatch
+    and the read would execute on the new bytes with no earlier answer to serve,
+    so the row could never fail.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir) / "workspace"
@@ -1333,11 +1318,11 @@ def _assert_reload_after_an_edit_after_the_save_matches_fresh(
 ) -> None:
     """Edit after the save, and the reload has to notice.
 
-    This is the substitute ordering for the reads that hand back the text they
-    compared: no answer they hold can disagree with the file, so a database
-    saved mid-edit carries nothing stale and the ordering above cannot be built
-    at all. It is the standard for those sites, recorded here so a later reader
-    does not "fix" one of these rows into an ordering that measures nothing.
+    This ordering replaces the one above for reads that return the text they
+    compared. Every answer they hold agrees with the file, so a database saved
+    mid-edit holds only current answers and the ordering above is impossible
+    to build. It is the standard for those sites. Keep these rows in this
+    ordering, because switching them to the other one would measure nothing.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir) / "workspace"
@@ -1367,8 +1352,8 @@ def _assert_reload_after_an_edit_after_the_save_matches_fresh(
 # CSV
 
 # Quoting classes carrying the same table, a separator and a quote character
-# living inside a quoted field, a ragged row that produces a diagnostic, and a
-# file whose delimiter is not a comma at all.
+# inside a quoted field, a ragged row that produces a diagnostic, and a
+# semicolon-delimited file.
 _CSV_DOCUMENTS = (
     "name,age\nAlice,30\nBob,25\n",
     '"name","age"\n"Alice","30"\n"Bob","25"\n',
@@ -1409,8 +1394,8 @@ def test_csv_checkpoint_reload_matches_fresh(mode: str, documents: list[str]) ->
 # ---------------------------------------------------------------------------
 # Environment files
 
-# Whole-line comments of two different lengths, both quote styles and none, an
-# export prefix, an inline comment, blank lines that move every range below
+# Whole-line comments of two lengths, both quote styles and an unquoted value,
+# an export prefix, an inline comment, blank lines that move every range below
 # them, and a line the parser rejects.
 _ENV_DOCUMENTS = (
     "# aaa\nKEY=value\nOTHER='x'\n",
@@ -1453,10 +1438,10 @@ def test_env_file_checkpoint_reload_matches_fresh(mode: str, documents: list[str
 # JSON
 
 # The first two are the discriminating pair: the same object with its keys in a
-# different order, which a canonicalizing projection of the document maps onto
-# one value while the reported section strings differ. The rest are that shape
-# reformatted, the pair repeated one and two containers down, a scalar spread,
-# and a document the parser rejects.
+# different order. A canonicalizing projection maps both to one value, while the
+# reported section strings differ. The rest are that shape reformatted, the pair
+# repeated one and two containers down, a spread of scalars, and a document the
+# parser rejects.
 _JSON_DOCUMENTS = (
     '{"deps": [{"name": "a", "version": "1"}]}',
     '{"deps": [{"version": "1", "name": "a"}]}',
@@ -1497,11 +1482,11 @@ def test_json_config_checkpoint_reload_matches_fresh(mode: str, documents: list[
 # ---------------------------------------------------------------------------
 # TOML
 
-# The first two are the inline-table reorder pair, the third and fourth the same
-# pair written as an array of tables. Then a table against the array carrying
-# the same names, one of the date-like scalars the public value type folds
-# together against an array that spells it out, a project table with
-# dependencies, and a document the parser rejects.
+# The first two are the inline-table reorder pair, and the third and fourth are
+# the same pair as an array of tables. Then come a table against an array with
+# the same names, a date-like scalar against an array that spells it out (the
+# public value type folds the two together), a project table with dependencies,
+# and a document the parser rejects.
 _TOML_DOCUMENTS = (
     "x = [{b = 1, a = 2}]\n",
     "x = [{a = 2, b = 1}]\n",
@@ -1546,7 +1531,7 @@ def test_toml_config_checkpoint_reload_matches_fresh(mode: str, documents: list[
 
 # The same element tree flat and indented, its attributes in both orders, a
 # comment inserted between siblings, a declaration prologue, one more level of
-# nesting, and a document that never closes its element.
+# nesting, and a document with an unclosed element.
 _XML_DOCUMENTS = (
     '<root><child a="1">t</child></root>',
     '<root>\n  <child a="1">t</child>\n</root>\n',
@@ -1587,12 +1572,12 @@ def test_xml_config_checkpoint_reload_matches_fresh(mode: str, documents: list[s
 # ---------------------------------------------------------------------------
 # Requirements
 
-# Every line kind whose public output is built from text a line-normalizing
-# projection throws away, varied one at a time: inline comments on a
+# Every line kind whose public output uses text a line-normalizing projection
+# discards, varied one at a time. The variations are inline comments on a
 # requirement, on an index directive, on an editable install and on a line the
-# parser rejects; an indent; trailing whitespace; and the pair that matters
-# most -- a continuation backslash at the end of a line against the same
-# backslash with one space after it, which stops it continuing the line at all.
+# parser rejects, then an indent and trailing whitespace. The most important pair
+# is a continuation backslash at the end of a line against the same backslash
+# followed by one space, which ends the continuation.
 _REQUIREMENTS_DOCUMENTS = (
     "--index-url https://example.com/simple  # primary\n"
     "requests>=2.0  # http client\n"
@@ -1637,18 +1622,18 @@ _REQUIREMENTS_DOCUMENTS = (
 )
 
 
-# All five documented entrypoints are driven, in two rows rather than one. One
-# row over all five measured past this file's per-cell budget, and the budget is
-# what the CI job that runs this file alone exists to hold; splitting by
-# entrypoint group is the only reduction taken, and the pool, the mode
-# parametrize and the example count are untouched by it.
+# All five documented entrypoints are driven, split across two rows. One row
+# over all five measured past this file's per-cell budget, which the CI job that
+# runs this file by itself exists to hold. Splitting by entrypoint group is the
+# only reduction. The pool, the mode parametrize and the example count stay the
+# same.
 #
-# The boundary is the one the two groups already draw, not an arbitrary cut:
-# only the three reporting surfaces move on the comment, index-directive and
-# diagnostic classes at all. The two evaluation surfaces move on the
-# editable-install name and on the continuation-backslash pair and nowhere else,
-# so several of their cells agree for reasons that have nothing to do with the
-# property -- uninformative by construction rather than by accident.
+# The split follows the line the two groups already draw. Only the three
+# reporting surfaces move on the comment, index-directive and diagnostic
+# classes. The two evaluation surfaces move only on the editable-install name
+# and the continuation-backslash pair, so several of their cells agree for
+# reasons unrelated to the property. Those cells are uninformative by
+# construction.
 
 
 def _requirements_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
@@ -1726,8 +1711,8 @@ def test_requirements_evaluation_checkpoint_reload_matches_fresh(
 # Path-configuration files
 
 # A directory named, the same line commented out, the name with a comment beside
-# it, the name surrounded by blank lines and by spaces, a directory that does
-# not exist, both together, and an executable line.
+# it, the name surrounded by blank lines and by spaces, a missing directory,
+# both together, and an executable line.
 _PTH_DOCUMENTS = (
     "extra\n",
     "# extra\n",
@@ -1743,7 +1728,7 @@ _PTH_MODULE = "import extra_pkg\n\n\ndef helper() -> int:\n    return 1\n"
 
 
 def _build_pth_workspace(tmpdir: str) -> tuple[Path, Path, Path, Path]:
-    """A search-path root holding one .pth file, the directory it can add, and a module."""
+    """Build a search-path root with one .pth file, the directory it can add, and a module."""
     base = Path(tmpdir)
     search_root = base / "site"
     search_root.mkdir()
@@ -1757,23 +1742,22 @@ def _build_pth_workspace(tmpdir: str) -> tuple[Path, Path, Path, Path]:
     return search_root, search_root / "paths.pth", workspace, module
 
 
-# The two entrypoints this integration publishes, and module_analysis as the one
-# cross-integration consumer: the import resolution it reports is enriched from
-# the effective search path, so a .pth read answered from a coarser comparison
-# surfaces there and nowhere cheaper.
+# The two entrypoints this integration publishes, plus module_analysis as the
+# one cross-integration consumer. module_analysis enriches its import resolution
+# from the effective search path, so it is the cheapest place where a .pth read
+# answered from a coarser comparison shows.
 #
-# They are driven in two rows rather than one for the reason recorded above the
-# requirements rows: one row over all of them measured past this file's per-cell
-# budget, and the group boundary is where the cost is -- module_analysis drags
-# the whole python-source closure into every step, and the other two do not.
-# Nothing else about the rows is reduced.
+# They run in two rows for the reason given above the requirements rows. One row
+# over all of them measured past this file's per-cell budget. The split falls
+# where the cost does: module_analysis pulls the whole python-source closure into
+# every step, and the other two skip it. The rows are otherwise unreduced.
 #
-# Left out on purpose, and none of them for lack of a connection: file_analysis
-# and directory_analysis never resolve an import against the search path at all,
-# and workspace_analysis, module_symbol_table, class_model, find_references and
-# symbol_at reach it only through the same resolution module_analysis already
-# drives, at several times the cost per step -- the python_source row above pays
-# that closure once.
+# These entrypoints also connect to this read and are left out on purpose.
+# file_analysis and directory_analysis resolve no import against the search
+# path. workspace_analysis, module_symbol_table, class_model, find_references
+# and symbol_at reach it only through the resolution module_analysis already
+# drives, at several times the cost per step. The python_source row above pays
+# for that closure once.
 
 
 def _pth_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
@@ -1794,13 +1778,13 @@ def _walk_the_pth_pool_against_fresh(
 ) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         search_root, pth_path, workspace, module = _build_pth_workspace(tmpdir)
-        # Discovery is patched with a context manager rather than the
-        # monkeypatch fixture, which Hypothesis refuses under @given, and the
-        # replacement is written in this module: the kernel pins the source of
-        # the query that reads it and will not accept a global it cannot place.
-        # Installed-distribution discovery is emptied for the reason the
-        # python_source row gives -- without it every fresh Database re-reads
-        # every METADATA file in the development environment.
+        # Patch discovery with a context manager, because Hypothesis refuses
+        # the monkeypatch fixture under @given. The replacement lives in this
+        # module because the kernel pins the source of the query that reads it
+        # and rejects a global it cannot place. Installed-distribution discovery
+        # is emptied for the reason the python_source row gives. Otherwise every
+        # fresh Database re-reads every METADATA file in the development
+        # environment.
         with (
             patch.object(
                 deep_module_resolution, "_get_sys_path_entries", lambda: (str(search_root),)
@@ -1834,9 +1818,9 @@ def _reload_the_pth_pool_against_fresh(
             patch.object(site, "getsitepackages", return_value=[]),
             patch.object(site, "getusersitepackages", return_value=""),
         ):
-            # Edited after the save, for the reason set out above the two
-            # orderings: this read hands back the text it compared, so a
-            # database saved in the middle of an edit holds nothing stale.
+            # Edit after the save, for the reason given above the two
+            # orderings. This read returns the text it compared, so a database
+            # saved mid-edit holds only current answers.
             for before, after in zip(documents, documents[1:], strict=False):
                 pth_path.write_text(before, encoding="utf-8")
                 store = InMemoryArtifactStore()
@@ -1893,23 +1877,23 @@ def test_pth_import_resolution_checkpoint_reload_matches_fresh(
 
 
 def _metadata_document(name: str | None, version: str | None) -> str:
-    """A METADATA document, omitting a header entirely when its value is None."""
+    """Build a METADATA document, leaving out each header whose value is None."""
     lines = ["Metadata-Version: 2.1"]
     for field, value in (("Name", name), ("Version", version)):
         if value is not None:
-            # An empty value writes "Name:", not "Name: " -- a header left empty
-            # carries nothing after the colon.
+            # An empty value writes "Name:" with no trailing space, because an
+            # empty header ends at the colon.
             lines.append(f"{field}: {value}".rstrip())
     lines.append("Summary: s")
     return "\n".join(lines) + "\n"
 
 
-# A METADATA header has three states, not two: absent, present-and-empty, and
+# A METADATA header has three states: absent, present-and-empty, and
 # present-with-a-value. The package layer branches on the difference between the
-# first two -- an absent Name is a distribution it cannot describe, an empty one
-# is a distribution whose name is the empty string -- so the absent/empty pair is
-# exactly what a comparison that fills a missing field in with '' cannot see. It
-# is in this pool for both headers, and for both together.
+# first two. An absent Name is a distribution it cannot describe, and an empty
+# one is a distribution whose name is the empty string. A comparison that fills
+# a missing field with '' conflates the two, so this pool has the absent/empty
+# pair for each header and for both together.
 _METADATA_DOCUMENTS = (
     _metadata_document(None, "1.0"),
     _metadata_document("", "1.0"),
@@ -1927,7 +1911,7 @@ _DECLARED_DEPENDENCIES = ("example", "absent-package")
 
 
 def _build_metadata_workspace(tmpdir: str) -> tuple[Path, Path, Path, Path]:
-    """A site-packages holding one dist-info, and a workspace importing its name."""
+    """Build a site-packages with one dist-info, and a workspace importing its name."""
     base = Path(tmpdir)
     site_dir = base / "site-packages"
     dist_info = site_dir / "example-1.0.dist-info"
@@ -1943,36 +1927,35 @@ def _build_metadata_workspace(tmpdir: str) -> tuple[Path, Path, Path, Path]:
 
 
 # Four of the twelve entrypoints this metadata read reaches. The other eight are
-# left out with reasons rather than by omission: module_analysis,
-# workspace_analysis, class_model, find_references and symbol_at reach it through
-# python-source import enrichment, which the python_source row above already pays
-# for; resolve_module_path is driven by the path-configuration rows above; and
-# applicable_requirements and workspace_applicable_requirements are driven by the
-# requirements rows.
+# left out for stated reasons. module_analysis, workspace_analysis, class_model,
+# find_references and symbol_at reach it through python-source import
+# enrichment, which the python_source row above already pays for.
+# resolve_module_path is driven by the path-configuration rows above.
+# applicable_requirements and workspace_applicable_requirements are driven by
+# the requirements rows.
 #
-# The two dependency-checking surfaces are not optional. They are how the
-# installed environment reaches a workspace's declared dependencies, so a
-# metadata read answered from a coarser comparison travels past this module
-# through them. What they cannot see, measured rather than assumed, is this
-# pool's absent-versus-empty transition: a distribution with no Name is not
-# listed and a distribution whose Name is empty is listed under the empty
-# string, and neither state answers to a declared dependency by name -- not even
-# to the empty name. They stay in the set because they carry every other way
-# this read can go wrong into a workspace, not because they discriminate here.
+# The two dependency-checking surfaces are required. They carry the installed
+# environment to a workspace's declared dependencies, so a metadata read
+# answered from a coarser comparison reaches past this module through them.
+# Measurement shows they miss this pool's absent-versus-empty transition. A
+# distribution without a Name is unlisted, one with an empty Name is listed
+# under the empty string, and neither matches a declared dependency by name,
+# the empty name included. They stay in the set because they carry every other
+# failure of this read into a workspace.
 #
-# All four are driven by both shapes. The live row drives them together, which
-# measured inside this file's per-cell budget; the checkpoint shape, which pays
-# for three databases per pair rather than two, did not, so it drives them in
-# three rows -- this integration's own surfaces, then the declared-dependency
-# check, then the workspace check that walks a tree on top of it. Splitting is
-# the only reduction taken: the pool, the mode parametrize and the example count
-# are the same in every one of them, and no entrypoint is dropped.
+# Both shapes drive all four. The live row drives them together, which measured
+# inside this file's per-cell budget. The checkpoint shape pays for three
+# databases per pair instead of two and measured over budget, so it uses three
+# rows: this integration's own surfaces, then the declared-dependency check,
+# then the workspace check that walks a tree on top of it. Splitting is the only
+# reduction. Every row keeps the same pool, mode parametrize and example count,
+# and every entrypoint stays.
 
 
 def _metadata_own_entrypoints(db: Database, root: str, path: str) -> dict[str, object]:
-    # Neither the root nor the module path is needed for these two, and neither
-    # is compared: each is the same string in both arms by construction, which
-    # is exactly the kind of cell that passes while measuring nothing.
+    # These two take neither the root nor the module path, and neither is
+    # compared. Each is the same string in both arms by construction, so a cell
+    # for it would pass while measuring nothing.
     del root, path
     analysis = installed_packages_analysis(db)
     return {
@@ -2047,9 +2030,9 @@ def _reload_the_metadata_pool_against_fresh(
                 saver = Database(mode=mode, store=store)
                 entrypoints(saver, str(workspace), str(module))
 
-                # Edited before the save and the surfaces re-driven after it:
-                # this read can hold an answer that disagrees with the file, and
-                # the ordering is what puts one into the checkpoint.
+                # Edit before the save and drive the surfaces again after it.
+                # This read can hold an answer that disagrees with the file, and
+                # this ordering puts such an answer into the checkpoint.
                 metadata.write_text(after, encoding="utf-8")
                 entrypoints(saver, str(workspace), str(module))
                 key = saver.save_checkpoint()
@@ -2111,12 +2094,12 @@ _SCHEMA_B: dict[str, Any] = {
 }
 _SCHEMA_C: dict[str, Any] = {"type": "object", "properties": {"z": {"type": "string"}}}
 
-# Every member is error-free, and the restriction is not stylistic: both
-# generating entrypoints raise on a schema whose analysis carries errors, so a
-# malformed member would make this row raise instead of compare. The
-# discriminating shapes are the key orders -- definitions and properties in both
-# directions -- which a canonicalizing projection of the document maps onto one
-# value while the emitted models take their order from the text.
+# Every member is error-free because both generating entrypoints raise on a
+# schema whose analysis has errors, so a malformed member would make this row
+# raise before it compares. The discriminating shapes are the key orders
+# (definitions and properties in both directions). A canonicalizing projection
+# maps them to one value, while the emitted models take their order from the
+# text.
 _SCHEMA_DOCUMENTS = (
     _schema_text({"B": _SCHEMA_B, "A": _SCHEMA_A}),
     _schema_text({"A": _SCHEMA_A, "B": _SCHEMA_B}),
@@ -2130,7 +2113,7 @@ _SCHEMA_DOCUMENTS = (
 
 
 def _generated_tree(root: Path) -> dict[str, bytes]:
-    """The emitted files, keyed by path, with the action's own manifest left out."""
+    """Return the emitted files keyed by path, excluding the action's own manifest."""
     if not root.exists():
         return {}
     return {
@@ -2140,15 +2123,15 @@ def _generated_tree(root: Path) -> dict[str, bytes]:
     }
 
 
-# generate_outputs is not driven directly: it is the action behind generate and
-# it takes no output root -- the root is a reconcile argument rather than a
-# parameter of the function -- so calling it alone would compare a desired output
-# set that never reaches a disk. What is compared instead is what generate
-# leaves behind. The ReconcileResult it returns is deliberately not compared:
-# its created/updated/repaired split is a fact about what the destination
-# already held, so an arm writing into a directory it has filled before and an
-# arm writing into an empty one differ there by construction. Each arm therefore
-# gets its own output root.
+# generate_outputs is driven only through generate. It is the action behind
+# generate and takes no output root parameter. The root is a reconcile argument,
+# so calling it alone would compare a desired output set that never reaches a
+# disk. This row
+# compares what generate leaves on disk. The ReconcileResult that generate
+# returns is left out on purpose. Its created/updated/repaired split depends on
+# what the destination already held, so an arm writing into a directory it
+# filled before and an arm writing into an empty one differ there by
+# construction. Each arm gets its own output root.
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_SCHEMA_DOCUMENTS))
@@ -2182,13 +2165,12 @@ def test_schema_entrypoints_match_fresh_recomputation(mode: str, documents: list
             )
 
 
-# The ordering below is the one that can put a stale answer into a checkpoint,
-# and it is written that way here even though this read cannot be caught with
-# one: the state it forms is not observable at any public surface -- the
-# analysis, the emitted models and the generated tree all agree with a fresh
-# read across every edit in this pool. So this is a consistency row rather than
-# a counterexample row, and what would falsify a regression here is the
-# hand-written row in tests/test_codegen.py that chooses its own semantic edit.
+# The ordering below can put a stale answer into a checkpoint. This row uses it,
+# though no public surface shows the state this read forms. Across every edit in
+# this pool, the analysis, the emitted models and the generated tree all agree
+# with a fresh read. This is therefore a consistency row. The hand-written row in
+# tests/test_codegen.py that chooses its own semantic edit is the one that would
+# catch a regression here.
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @settings(max_examples=_examples(10), deadline=None)
 @given(documents=_sampled_documents(_SCHEMA_DOCUMENTS))

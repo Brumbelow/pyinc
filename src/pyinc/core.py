@@ -33,10 +33,10 @@ class Input(Generic[T]):
     cutoff: CutoffFn | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
-        # Exactness is decided before emptiness: the key is stored as node
+        # Exactness is decided before emptiness. The key is stored as node
         # identity and formatted into node labels, so a subclass would let its
         # own equality, formatting and truthiness decide what the kernel
-        # records -- including whether `not self.key` sees an empty key at all.
+        # records. That includes whether `not self.key` sees an empty key.
         if type(self.key) is not str:
             if isinstance(self.key, str):
                 raise InputKeyError(
@@ -78,10 +78,10 @@ class Query(Generic[P, T]):
         if cutoff is not None and not callable(cutoff):
             raise TypeError("@query cutoff= must be callable.")
         query_key = key if key is not None else f"{fn.__module__}:{fn.__qualname__}"
-        # Same exactness-then-emptiness order as `Input`, for the same reason:
-        # the key is formatted into query identities, node labels and the
+        # Same exactness-then-emptiness order as `Input`, for the same reason.
+        # The key is formatted into query identities, node labels and the
         # checkpoint manifest's query ids. The derived default is a plain
-        # string by construction, so only an explicit `key=` reaches the guard.
+        # string by construction, so only an explicit `key=` can trip the guard.
         if type(query_key) is not str:
             if isinstance(query_key, str):
                 raise ValueError(
@@ -96,8 +96,8 @@ class Query(Generic[P, T]):
         self.eq = eq
         self.cutoff = cutoff
         self.key = query_key
-        # Copy descriptive callable metadata without merging the function's
-        # arbitrary attribute dictionary into the query contract.
+        # Copy descriptive callable metadata, and keep the function's arbitrary
+        # attribute dictionary out of the query contract.
         wraps(fn, updated=())(self)
 
     def __call__(self, db: Database, *args: P.args, **kwargs: P.kwargs) -> T:

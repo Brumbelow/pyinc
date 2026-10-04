@@ -1,9 +1,11 @@
 """JSON-Schema -> typed Python models via ``pyinc_codegen``, incrementally.
 
-Generates models from a small schema, then shows the incremental properties of
-the compiler: a whitespace/key-reorder edit writes nothing; a description-only
-edit rewrites only the documentation artifact; removing a definition deletes
-only the files that definition owned.
+Generates models from a small schema, then shows three incremental properties
+of the compiler:
+
+- A whitespace or key-order edit writes nothing.
+- A description-only edit rewrites only the documentation artifact.
+- Removing a definition deletes only the files that definition owned.
 
 Run: ``python examples/codegen_demo.py``
 """
@@ -43,13 +45,13 @@ def main() -> None:
         first = generate(db, schema_path, out)
         print(f"generated={first.created}")
 
-        # Whitespace + key reordering: parsed schema is identical, nothing rewrites.
+        # Reformat and reorder keys. The parsed schema is unchanged, so every file stays as is.
         schema_path.write_text(json.dumps(schema, indent=4, sort_keys=True), encoding="utf-8")
         whitespace = generate(db, schema_path, out)
         whitespace_changes = whitespace.created + whitespace.updated + whitespace.repaired
         print(f"whitespace_edit_changed={whitespace_changes}")
 
-        # Description-only change: only the doc artifact rewrites, not the model.
+        # Change only a description. Only the doc artifact is rewritten.
         widget = schema["$defs"]["Widget"]  # type: ignore[index]
         widget["description"] = "A widget."
         schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")

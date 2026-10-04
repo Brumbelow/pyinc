@@ -1,11 +1,11 @@
 # `pyinc-tools` Guide
 
 `pyinc-tools` is the command-line, watcher, and editor-facing package included
-in the `pyinc` distribution. It consumes the stable `pyinc.integrations` API;
-the kernel itself does not contain LSP or filesystem-watcher behavior.
+in the `pyinc` distribution. It consumes the stable `pyinc.integrations` API.
+LSP and filesystem-watcher behavior lives here, outside the kernel.
 
-**Stability.** `pyinc_tools` is **unstable** and outside the semantic-versioning
-promise; [SECURITY.md](../SECURITY.md) states what that promise covers.
+`pyinc_tools` is **unstable** and outside the semantic-versioning promise.
+[SECURITY.md](../SECURITY.md) states what that promise covers.
 
 ## Install and verify
 
@@ -22,17 +22,20 @@ usage: pyinc-tools [-h] [--version] {analyze,lsp} ...
 ```
 
 The version command prints `pyinc-tools <installed-version>`. The equivalent
-module form is available everywhere the package is importable:
+module form works everywhere the package is importable:
 
 ```console
 python -m pyinc_tools --help
 python -m pyinc_tools --version
 ```
 
-Exit status `0` means success, `1` means an analysis/workspace failure, `2`
-means invalid command-line usage, and `3` means the `--fail-on` diagnostic gate
-tripped. `1` and `3` are deliberately distinct: `1` says the analyzer could not
-run, `3` says it ran and found something.
+Exit statuses:
+
+- `0`: success.
+- `1`: analysis or workspace failure. The analyzer could not run.
+- `2`: invalid command-line usage.
+- `3`: the `--fail-on` diagnostic gate tripped. The analyzer ran and found
+  something.
 
 ## Analyze a workspace
 
@@ -41,19 +44,19 @@ pyinc-tools analyze /path/to/workspace
 pyinc-tools analyze /path/to/workspace --path src/app.py
 ```
 
-The first command prints one JSON `WorkspaceAnalysisResult`; the second prints
-one `FileAnalysisResult`. Output includes Python module/import analysis, the
-workspace symbol index, dependency status, and deduplicated diagnostics. Use
-`--indent 0` for minimal indentation or another non-negative integer for more
-readable JSON.
+The first command prints one JSON `WorkspaceAnalysisResult`. The second prints
+one `FileAnalysisResult`. Output includes Python module and import analysis,
+the workspace symbol index, dependency status, and deduplicated diagnostics.
+`--indent` takes a non-negative integer: `0` gives minimal indentation, and
+larger values give more readable JSON.
 
 `--path` must resolve inside the workspace. Invalid roots, escaping paths, and
-unsafe filesystem links fail without analyzing an outside target.
+unsafe filesystem links fail, and analysis stays inside the workspace.
 
 ### Report diagnostics and gate a CI job
 
 The full JSON result embeds the workspace symbol index, which is large. For
-reporting, ask for just the diagnostics — as one line each, or as a JSON array:
+reporting, print only the diagnostics, as text lines or as a JSON array:
 
 ```console
 pyinc-tools analyze /path/to/workspace --format text
@@ -62,25 +65,24 @@ pyinc-tools analyze /path/to/workspace --diagnostics-only
 
 Text lines are `path:line:col: severity code message`. Line and column are
 1-based for display, converted from the zero-based source geometry. A
-diagnostic with no range — a file that cannot be decoded, for example — keeps
-its `path:` prefix and omits the position instead of pointing at an unrelated
-line. Diagnostics are sorted by location, with rangeless ones first per file,
-so output is stable across runs. A workspace with no diagnostics prints
-nothing.
+diagnostic without a range, such as one for a file that cannot be decoded,
+keeps its `path:` prefix and omits the position. Diagnostics are sorted by
+location, with rangeless ones first in each file, so output is stable across
+runs. A workspace with no diagnostics prints nothing.
 
-`--fail-on` turns the run into a gate. It exits `3` when any diagnostic is at or
-above the given severity, and the threshold is inclusive, so `--fail-on warning`
-also fails on errors:
+`--fail-on` turns the run into a gate. It exits `3` when any diagnostic is at
+or above the given severity. The threshold is inclusive, so
+`--fail-on warning` also fails on errors:
 
 ```console
 pyinc-tools analyze /path/to/workspace --format text --fail-on error
 ```
 
-The report is always printed before the exit status is decided, so a failing
-gate still tells you what failed. The default is `--fail-on none`, which never
-gates — upgrading `pyinc-tools` cannot turn a green pipeline red until you opt
-in. `--fail-on` cannot be combined with `--watch`, which never terminates
-normally; that combination is rejected as a usage error.
+The report prints before the exit status is decided, so a failing gate still
+shows what failed. The default is `--fail-on none`, which never gates, so an
+upgrade of `pyinc-tools` keeps a green pipeline green until you opt in.
+Combining `--fail-on` with `--watch` is a usage error, because watch mode runs
+until it is interrupted.
 
 ### Watch mode
 
@@ -89,19 +91,18 @@ pyinc-tools analyze /path/to/workspace --watch
 pyinc-tools analyze /path/to/workspace --watch --debounce-ms 300 --poll-interval-ms 150
 ```
 
-Watch mode emits the initial analysis, then a JSON object containing
-`changed_paths` and a new `analysis` after changed files have settled for the
-debounce window. The watcher polls in a daemon thread and exits cleanly on
-Ctrl-C. Polling is stdlib-only and portable; platform-specific push watcher
-backends are not included.
+Watch mode prints the initial analysis. After changed files settle for the
+debounce window, it prints a JSON object with `changed_paths` and a new
+`analysis`. The watcher polls in a daemon thread and exits cleanly on Ctrl-C.
+Polling is the only built-in backend. It uses only the standard library and
+is portable.
 
-With `--format text`, each batch is introduced by a `# changed: <paths>` header
-followed by that run's diagnostic lines, so the headers can be filtered out with
-`grep -v '^#'`. With `--diagnostics-only`, the `analysis` key holds the
-diagnostics array rather than the full result, keeping the event wrapper shape
-unchanged.
+With `--format text`, each batch starts with a `# changed: <paths>` header,
+followed by that run's diagnostic lines. `grep -v '^#'` filters out the
+headers. With `--diagnostics-only`, the `analysis` key holds the diagnostics
+array, and the event object keeps its shape.
 
-For an embedded watcher, use the public classes directly:
+To embed a watcher, use the public classes:
 
 ```python
 from pyinc_tools import PollingWorkspaceWatcher, WorkspaceSession
@@ -118,12 +119,13 @@ with WorkspaceSession("/path/to/workspace") as session:
 ```
 
 Callbacks run on the watcher thread. Keep them short or hand work to a queue.
-Calling `refresh_paths(...)` from an existing platform watcher is also
-supported; do not drive one watcher concurrently from both polling paths.
+You can also call `refresh_paths(...)` from an existing platform watcher. Use
+one of these two paths at a time for a given watcher.
+
 `start()`, `stop()`, `poll()` and the session's `close()` may be called from
-different threads: each waits for the others rather than interleaving with
-them, so a stop or a close that lands while the watcher starts stops the thread
-it starts, and `poll()` refuses whenever the watcher is running.
+different threads. Each waits for the others, so a stop or a close that lands
+while the watcher starts stops the thread it starts. `poll()` refuses while
+the watcher is running.
 
 ## Start the LSP server
 
@@ -132,14 +134,14 @@ pyinc-tools lsp
 pyinc-tools lsp --root /fallback/workspace
 ```
 
-The server speaks JSON-RPC over stdio. The client-provided `rootUri` wins,
-followed by its first workspace folder and legacy root path. `--root` is only a
-fallback; the current directory is used when neither side supplies a root.
+The server speaks JSON-RPC over stdio. It picks the workspace root in this
+order: the client's `rootUri`, its first workspace folder, its legacy root
+path, then `--root`, then the current directory.
 
-The server negotiates UTF-8, UTF-16, or UTF-32 positions, uses full-text
-document synchronization, and publishes diagnostics after editor changes or
-external filesystem refreshes. See the [LSP reference](lsp-reference.md) for
-the complete method matrix and user-visible limitations.
+The server negotiates UTF-8, UTF-16, or UTF-32 positions and uses full-text
+document synchronization. It publishes diagnostics after editor changes and
+external filesystem refreshes. The [LSP reference](lsp-reference.md) has the
+complete method matrix and user-visible limitations.
 
 ### Initialization options
 
@@ -152,9 +154,9 @@ Pass these keys under the LSP `initializationOptions` object:
 | `pyinc.watcher.intervalMs` | number | derived from the debounce | Sets the polling interval in milliseconds. |
 | `pyinc.workspace.exclude` | string array | `[]` | Omits matching workspace-relative glob patterns from the mirror and watcher. |
 
-If the editor reliably sends `workspace/didChangeWatchedFiles`, disabling the
-built-in watcher avoids duplicate scanning. Identical diagnostic publications
-are deduplicated either way.
+If the editor reliably sends `workspace/didChangeWatchedFiles`, disable the
+built-in watcher to avoid duplicate scanning. Identical diagnostic
+publications are deduplicated either way.
 
 ## Editor setup
 
@@ -194,43 +196,42 @@ Configure that bridge to run:
 pyinc-tools lsp
 ```
 
-No first-party VS Code extension ships with this release. `pyinc-tools` can run
-beside a type checker: it focuses on incremental workspace symbols, navigation,
-and dependency diagnostics rather than full static typing.
+This release ships without a first-party VS Code extension. `pyinc-tools` can
+run beside a type checker. It covers incremental workspace symbols,
+navigation, and dependency diagnostics, and leaves full static typing to the
+type checker.
 
 ## Workspace mirror and overlays
 
-`WorkspaceSession` analyzes a temporary mirror rather than writing editor text
-to the source tree.
+`WorkspaceSession` analyzes a temporary mirror of the workspace, so editor
+text stays out of the source tree.
 
 1. Construction copies supported Python, configuration, notebook, and root
    requirements files under the workspace into a temporary directory.
-2. `set_overlay(path, text)`—used by LSP open/change notifications—replaces the
-   mirror copy only.
-3. `refresh_paths(paths)`—used by polling and watched-file notifications—syncs
-   saved disk changes into files without an active overlay.
+2. `set_overlay(path, text)` replaces the mirror copy only. LSP open and change
+   notifications use it.
+3. `refresh_paths(paths)` syncs saved disk changes into files that have no
+   active overlay. Polling and watched-file notifications use it.
 4. Results are mapped back to real workspace paths before they reach callers,
    including paths embedded in diagnostic message text.
 5. `close()` stops mutation and removes the temporary mirror.
 
-The root requirements file's in-workspace include closure is mirrored even
-when included files use nonstandard names. Default ignored directory names and
-configured exclusion globs are not traversed. File links are rejected;
-directory links and Windows junctions are not followed. Workspace roots should
-not be concurrently renamed while a session is synchronizing them.
+The mirror also holds the root requirements file's in-workspace include
+closure, even when included files use nonstandard names. The walk skips
+default ignored directory names and configured exclusion globs. File links
+are rejected. Directory links and Windows junctions are skipped. Avoid
+renaming a workspace root while a session is synchronizing it.
 
 All public source ranges are zero-based and end-exclusive. Library positions
-count Unicode code points; the LSP boundary converts them to the encoding
+count Unicode code points. The LSP boundary converts them to the encoding
 negotiated with the editor.
 
 ## Public surface
 
-`pyinc_tools` exports exactly the names below. The groups are editorial: they
-say what a name is for, and a later release may regroup them without changing
-anything a caller can observe. What the table states is the union — these rows
-together are exactly what the package exports. The kind aliases are
-`Literal[...]` string aliases rather than enumerations, so each one's values are
-plain strings.
+`pyinc_tools` exports the names in this table and no others. The groups
+describe what each name is for. A later release may regroup them without any
+change a caller can observe. The kind aliases are `Literal[...]` string
+aliases, so their values are plain strings.
 
 | Group | Names |
 |---|---|
@@ -258,16 +259,16 @@ with WorkspaceSession("/path/to/workspace") as session:
     print(one_file.diagnostics)
 ```
 
-Use the position-resolved `SymbolId` returned by `symbol_at` for references,
-rename, and hierarchy operations. Passing a bare name would lose the lexical
-scope and shadowing information those operations need.
+Pass the position-resolved `SymbolId` from `symbol_at` to references, rename,
+and hierarchy operations. It carries the lexical scope and shadowing
+information those operations need, which a bare name lacks.
 
-`WorkspaceSession` holds one kernel request span per public method: the
-several kernel gets a method such as `analyze_workspace` fans out to share
-one request, so every resource the analysis walks is validated at most once
-per call. Session methods that rewrite the mirror mid-call already declare it
-via `request_inputs_changed()`, which rolls the held span onto a fresh
-request so later reads in the same call see the edit.
+`WorkspaceSession` holds one kernel request span per public method. A method
+such as `analyze_workspace` fans out to several kernel gets, and they all
+share that one request. So each resource the analysis walks is validated at
+most once per call. Session methods that rewrite the mirror mid-call declare
+it with `request_inputs_changed()`. That call rolls the held span onto a
+fresh request, so later reads in the same call see the edit.
 
 ## Troubleshooting
 
@@ -281,12 +282,13 @@ python -m pip show pyinc
 ```
 
 If that works, the interpreter's scripts directory is missing from `PATH`.
+Add it.
 
 ### An editor change is not reflected
 
 The server requests full-text synchronization. Confirm the client sends a
-`text` field containing the complete document in `didChange`. Saving refreshes
-from disk; closing discards the overlay.
+`text` field containing the complete document in `didChange`. Saving
+refreshes from disk. Closing discards the overlay.
 
 For external edits, keep the built-in watcher enabled or configure the client
 to send `workspace/didChangeWatchedFiles`. Exclusion globs apply to both the
@@ -301,17 +303,17 @@ Run the analyzer on the same file and inspect its `symbols`,
 pyinc-tools analyze /path/to/workspace --path src/app.py
 ```
 
-Resolution intentionally returns no target when a binding is ambiguous,
-dynamic, shadowed, outside the workspace, or requires runtime type inference.
-The [LSP reference](lsp-reference.md#analysis-boundary) lists the common limits.
+By design, resolution returns no target when a binding is ambiguous, dynamic,
+shadowed, outside the workspace, or needs runtime type inference. The
+[LSP reference](lsp-reference.md#analysis-boundary) lists the common limits.
 
 ### Dependency diagnostics look wrong
 
 Inspect `dependency_check.statuses` and
 `dependency_check.undeclared_imports` in analyzer output. They are the same
-integration results the LSP publishes. Verify the selected root contains the
-expected `pyproject.toml` or `requirements.txt` and that excluded paths are not
-hiding source files.
+integration results the LSP publishes. Check that the selected root contains
+the expected `pyproject.toml` or `requirements.txt`, and that your source
+files sit outside the excluded paths.
 
 ### Inspect incremental work
 
@@ -327,5 +329,5 @@ with WorkspaceSession("/path/to/workspace") as session:
     print(session.db.dependency_graph())
 ```
 
-These calls report work and timing already recorded by the shared kernel. They
-do not change editor files or the source workspace.
+These calls report work and timing the shared kernel has already recorded.
+They leave editor files and the source workspace unchanged.

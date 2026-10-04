@@ -168,9 +168,9 @@ class _ExplainMethodHolder:
         return cls.factor * value
 
 
-# wraps() is applied to the underlying function instead of decorating the method
-# with it: the runtime object is the same either way, but as a decorator the type
-# checker reads the result as carrying _wrapped_target's signature.
+# wraps() is called on the underlying function, outside the class body. The
+# runtime object matches the decorator form, but the type checker would read a
+# decorated method as carrying _wrapped_target's signature.
 functools.wraps(_wrapped_target)(vars(_ExplainMethodHolder)["scaled"].__func__)
 
 _explain_bound_method = _ExplainMethodHolder.scaled
@@ -356,8 +356,8 @@ def test_dynamically_read_module_is_rejected_by_explain_and_kernel(
         return cast(int, getattr(module, "VALUE"))  # noqa: B009 - the shape under test
 
     # The module has a real source file, so its identity payload alone accepts
-    # it; what refuses it is the fold over the attribute paths the body reads
-    # statically, of which this body has none.
+    # it. The refusal comes from the fold over the attribute paths the body
+    # reads statically, and this body reads none.
     info = {item.name: item for item in explain_query_captures(reads_dynamically)}["module"]
     assert not info.accepted
     assert info.kind == "rejected"
@@ -413,9 +413,10 @@ def test_wrapped_bound_method_capture_is_classified_as_method() -> None:
 
     report = {item.name: item for item in explain_query_captures(offset)}
     info = report["_explain_bound_method"]
-    # A bound method carrying __wrapped__ is dispatched as a method on both
-    # surfaces: the kernel tests for one before probing __wrapped__, so the
-    # report must not describe it as a callable object it cannot fingerprint.
+    # Both surfaces dispatch a bound method carrying __wrapped__ as a method,
+    # because the kernel tests for a method before probing __wrapped__. The
+    # report must match, so it never describes the method as a callable object
+    # it cannot fingerprint.
     assert info.accepted is True
     assert info.kind == "method"
     assert Database().get(offset) == 15
@@ -532,8 +533,8 @@ def test_query_handle_state_is_reported_and_accepted_by_both_surfaces() -> None:
 
     cast(Any, keeps_handle_state).revision = 3
 
-    # The refusing shape below is only half the parity claim: handle state the
-    # fold accepts has to be reported as carried and accepted, not omitted.
+    # The refusing shape below is half the parity claim. This is the other half:
+    # handle state the fold accepts appears in the report, carried and accepted.
     report = {item.name: item for item in explain_query_captures(keeps_handle_state)}
     info = report["handle[revision]"]
     assert info.accepted is True
@@ -561,9 +562,9 @@ def test_rebound_wrapped_on_a_query_handle_is_rejected_by_explain_and_kernel() -
     def rebinds_wrapped(db: Database) -> int:
         return 1
 
-    # `__wrapped__` is a contract name, so the per-entry walk never looks at it;
-    # the fold of the whole handle is the only thing that reaches this refusal,
-    # and without it explain would call a query the kernel refuses accepted.
+    # `__wrapped__` is a contract name, so the per-entry walk skips it. Only the
+    # fold of the whole handle reaches this refusal. Without that fold, explain
+    # would report as accepted a query the kernel refuses.
     cast(Any, rebinds_wrapped).__wrapped__ = {"seen": 1}
 
     report = {item.name: item for item in explain_query_captures(rebinds_wrapped)}
@@ -581,9 +582,9 @@ def test_non_string_handle_state_key_is_rejected_by_explain_and_kernel() -> None
     def keyed_by_a_number(db: Database) -> int:
         return 1
 
-    # The second shape the per-entry walk cannot report: a name that is not a
-    # string is skipped by the walk -- it has no entry to be reported under --
-    # and the fold of the whole handle is what refuses it.
+    # The second shape the per-entry walk cannot report. The walk skips a name
+    # that is not a string, since it has no entry to be reported under. The
+    # fold of the whole handle refuses it.
     state: dict[Any, Any] = vars(keyed_by_a_number)
     state[42] = 1
 
@@ -602,9 +603,8 @@ def test_invalid_type_parameters_on_a_query_handle_are_rejected_by_explain_and_k
     def holds_type_parameters(db: Database) -> int:
         return 1
 
-    # The third: `__type_params__` is a contract name the walk skips, and the
-    # fold refuses anything but a tuple there rather than folding whatever the
-    # handle carries.
+    # The third: `__type_params__` is a contract name the walk skips. The fold
+    # accepts only a tuple there and refuses whatever else the handle carries.
     cast(Any, holds_type_parameters).__type_params__ = [1]
 
     report = {item.name: item for item in explain_query_captures(holds_type_parameters)}
@@ -680,7 +680,8 @@ def test_explain_ignores_nonfunction_lazy_annotation_evaluator() -> None:
 
 # Values a query may capture, each bound to `V` in a module of its own, and
 # the routes a capture takes into the query. The preview must accept a query
-# exactly when the kernel fingerprints it, whatever the value and the route.
+# when, and only when, the kernel fingerprints it, whatever the value and the
+# route.
 _PARITY_VALUES: dict[str, str] = {
     "function": "def V(x=None):\n    return 1\n",
     "source-pinned function": "CACHE = {'k': 1}\n\n\ndef V():\n    return CACHE['k']\n",
@@ -738,12 +739,12 @@ def test_the_preview_accepts_a_query_exactly_when_the_kernel_fingerprints_it(
 ) -> None:
     """Every capture's verdict is the one the kernel's fold of that capture reaches.
 
-    The preview used to fold a value with a walk stricter than the kernel's,
-    which refused any callable inside a tuple, a frozenset or a frozen
-    dataclass; to fold a function without the kernel's fallback to pinning
-    it by its source; and to fold annotations as annotations even when the
-    body reads them back, where the kernel folds them as captures. Each
-    refused a query the kernel fingerprints.
+    The preview used to differ from the kernel in three ways. It folded a
+    value with a stricter walk, which refused any callable inside a tuple, a
+    frozenset or a frozen dataclass. It folded a function without the kernel's
+    fallback to pinning it by its source. It folded annotations as annotations
+    even when the body reads them back, where the kernel folds them as
+    captures. Each refused a query the kernel fingerprints.
     """
     Database()  # so a guarded name binds the guard's wrapper
     name = f"pyinc_explain_parity_{uuid.uuid4().hex}"

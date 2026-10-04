@@ -97,10 +97,10 @@ class FileRenameEdit:
 class FileDeletionEdit:
     """A text edit returned by ``import_edits_for_file_deletions``.
 
-    Represents the deletion of an ``import`` / ``from`` statement (or a
-    single alias inside one) that references a Python file that is about
-    to be removed from the workspace. The edit's range covers the source
-    span to be removed; ``new_text`` is always the empty string.
+    It deletes an ``import`` / ``from`` statement, or a single alias inside
+    one, that references a Python file about to be removed from the
+    workspace. ``range`` covers the source span to remove, and ``new_text``
+    is always the empty string.
 
     ``range`` is zero-based, end-exclusive, and measured in Unicode code
     points.
@@ -119,7 +119,7 @@ class CodeActionEdit:
     """A single text edit produced by a code action.
 
     ``range`` is zero-based, end-exclusive, and measured in Unicode code
-    points; ``new_text`` is the empty string for deletion-style fixes and the
+    points. ``new_text`` is the empty string for deletion-style fixes and the
     replacement text for retarget-style fixes.
     """
 
@@ -132,10 +132,10 @@ class CodeActionEdit:
 class CodeAction:
     """A quick fix anchored to a single diagnostic.
 
-    ``diagnostic`` is the analysis diagnostic the fix resolves; the LSP layer
-    echoes it back (converted) in the ``diagnostics`` field of the response so
-    the client can associate the action with the problem. ``edits`` are the
-    workspace text edits that apply the fix.
+    ``diagnostic`` is the analysis diagnostic the fix resolves. The LSP layer
+    converts it and echoes it in the response's ``diagnostics`` field so the
+    client can link the action to the problem. ``edits`` are the workspace text
+    edits that apply the fix.
     """
 
     title: str
@@ -374,9 +374,9 @@ _PUBLIC_MODELS = (
     TypeHierarchyItem,
 )
 
-# These classes historically lived in ``pyinc_tools.session``. Keeping that
-# module identity preserves reprs and pickle payloads while session re-exports
-# the exact class objects from this module.
+# These classes used to live in ``pyinc_tools.session``. Keeping that module
+# name preserves reprs and pickle payloads. The session module re-exports these
+# same class objects.
 for _model in _PUBLIC_MODELS:
     _model.__module__ = "pyinc_tools.session"
 

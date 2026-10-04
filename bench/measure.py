@@ -135,15 +135,15 @@ class ScenarioResult:
 
 
 def dependency_edge_count(db: Database) -> int:
-    """Return the number of dependency edges, not the number of graph nodes."""
+    """Return the total number of dependency edges across all graph nodes."""
     return sum(len(node.dependency_labels) for node in db.dependency_graph())
 
 
 def measure(fn: Callable[[], _T]) -> tuple[_T, float]:
     """Run ``fn`` once and return its value and wall time.
 
-    Memory tracing is intentionally absent: instrumentation must not perturb the
-    wall-clock sample used in the informational timing report.
+    Memory tracing is left out so instrumentation cannot perturb the wall-clock
+    sample used in the informational timing report.
     """
     start = time.perf_counter()
     value = fn()

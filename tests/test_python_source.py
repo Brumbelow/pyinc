@@ -171,7 +171,7 @@ def test_package_namespace_exports_only_stable_api() -> None:
     assert hasattr(integrations, "config_analysis")
     assert hasattr(integrations, "workspace_config_analysis")
     assert hasattr(integrations, "ConfigAnalysis")
-    # Experimental helpers must not leak.
+    # Experimental helpers stay out of the package namespace.
     assert not hasattr(integrations, "source_text")
     assert not hasattr(integrations, "dependency_check_payload")
     assert not hasattr(integrations, "imports_for_file")
@@ -285,9 +285,8 @@ def test_comment_only_edit_reuses_downstream_analysis(
     second = file_analysis(db, path)
 
     assert second.imports == (ImportRef(module="os", kind="import", range=_range(0, 0, 9)),)
-    # The read is byte-exact now, so it runs; the parse below it is what lands
-    # an equal value and backdates, which is why the two lines under this one
-    # still hold.
+    # The read is byte-exact, so it runs. The parse below it lands an equal
+    # value and backdates, which keeps the next two assertions true.
     assert db.inspect(source_text, str(path)).last_recompute == "executed"
     assert db.inspect(imports_for_file, str(path)).last_decision == "reused"
     assert db.inspect(file_analysis_payload, str(path)).last_decision == "reused"
@@ -300,10 +299,9 @@ def test_comment_inserted_above_the_import_reruns_downstream_analysis(
     """A comment above the import moves the payload, so nothing below it is reused.
 
     `ImportStatementPayload` carries each statement's line number, so an edit
-    above the statement whose line number the payload carries lands a different
-    payload: the parse has nothing to backdate and every consumer of it runs
-    again. Only incrementality is lost -- the warm answer still equals a fresh
-    one, which is what the last assertion pins.
+    above the statement lands a different payload. The parse has nothing to
+    backdate, and every consumer of it runs again. Only incrementality is lost.
+    The warm answer still equals a fresh one, which the last assertion pins.
     """
     path = tmp_path / "sample.py"
     path.write_text("import os\n", encoding="utf-8")
@@ -320,16 +318,16 @@ def test_comment_inserted_above_the_import_reruns_downstream_analysis(
 
     # The third slot is the statement's line number, and the inserted line moved it.
     assert import_statements_for_file(db, str(path)) == (("os", "import", 2, ()),)
-    # So the parse re-ran on a value that changed rather than backdating on an
-    # equal one, and the five nodes whose values moved with it all executed: the
-    # read, the parse, `imports_for_file`, the ranges and the analysis payload.
-    # Backdating instead would leave only the read, since the parse would absorb
-    # the edit. `definitions_for_file` and `syntax_diagnostics_for_file` do
-    # backdate here -- this file declares neither.
+    # So the parse re-ran on a changed value and had nothing to backdate. The
+    # five nodes whose values moved with it all executed: the read, the parse,
+    # `imports_for_file`, the ranges and the analysis payload. A backdating
+    # parse would absorb the edit and leave only the read.
+    # `definitions_for_file` and `syntax_diagnostics_for_file` do backdate
+    # here, because this file declares neither.
     assert db.inspect(import_statements_for_file, str(path)).last_recompute == "executed"
     assert executed == 5
 
-    # Nothing was answered wrongly; the edit only cost the reuse.
+    # Every answer is still correct. The edit cost only the reuse.
     assert second.imports == (ImportRef(module="os", kind="import", range=_range(1, 0, 9)),)
     assert second == file_analysis(Database(mode=mode), path)
 
@@ -1073,7 +1071,7 @@ def test_from_import_stdlib_resolution(tmp_path: Path) -> None:
 
 
 def test_workspace_import_preferred_over_environment(tmp_path: Path) -> None:
-    """A workspace module named 'os' should resolve as workspace, not stdlib."""
+    """A workspace module named 'os' resolves as workspace, ahead of stdlib."""
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "os.py").write_text("x = 1\n", encoding="utf-8")
@@ -1088,7 +1086,7 @@ def test_workspace_import_preferred_over_environment(tmp_path: Path) -> None:
 def test_installed_import_resolves_to_file_via_deep_module_resolution(
     mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: installed-package imports should have resolved_path populated."""
+    """Regression: installed-package imports have resolved_path populated."""
     site = tmp_path / "site-packages"
     site.mkdir()
     pkg_dir = site / "fake_installed"
@@ -1139,8 +1137,8 @@ def test_installed_import_resolves_to_file_via_deep_module_resolution(
     assert submod_ref.resolved_path is not None
     assert Path(submod_ref.resolved_path).resolve() == (pkg_dir / "submod.py").resolve()
 
-    # `from fake_installed import VALUE` (a plain symbol, not a submodule):
-    # Expected to fall back to the package __init__.py since VALUE has no file.
+    # `from fake_installed import VALUE` names a plain symbol. VALUE has no
+    # file of its own, so it falls back to the package __init__.py.
     value_ref = by_module[("fake_installed", "VALUE")]
     assert value_ref.resolution == "installed"
     assert value_ref.resolved_path is not None
@@ -1148,7 +1146,7 @@ def test_installed_import_resolves_to_file_via_deep_module_resolution(
 
 
 def test_relative_import_failure_stays_missing(tmp_path: Path) -> None:
-    """Relative imports with excessive nesting are 'missing', not checked against env."""
+    """Relative imports with excessive nesting are 'missing' and skip the environment check."""
     root = tmp_path / "workspace"
     pkg = root / "pkg"
     pkg.mkdir(parents=True)
@@ -1249,11 +1247,10 @@ def test_import_statements_for_file_collects_tuple_handler_try_block(
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_module_swapped_for_a_directory_matches_a_fresh_database(mode: str, tmp_path: Path) -> None:
-    # The workspace walk only collects regular files, so a fresh database never
-    # sees the swapped module. A warm one re-probes the path it already knows,
-    # and has to reach the same answer rather than the read error a directory
-    # would raise: a directory is not a source file, exactly as an absent one
-    # is not.
+    # The workspace walk collects only regular files, so a fresh database never
+    # sees the swapped module. A warm one re-probes the path it already knows and
+    # must reach the same answer. It treats the directory like an absent file and
+    # drops it, instead of raising the read error a directory would cause.
     (tmp_path / "mod.py").write_text("import os\n", encoding="utf-8")
     (tmp_path / "other.py").write_text("x = 1\n", encoding="utf-8")
 

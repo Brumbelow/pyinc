@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import NoReturn
 
 _FULL_COMMIT_PATTERN = re.compile(r"\A[0-9a-f]{40}\Z")
-# GnuPG still reports VALIDSIG for these, so a fingerprint match alone is not trust.
+# GnuPG still reports VALIDSIG for these, so trust needs more than a fingerprint match.
 _DISQUALIFYING_STATUSES = {
     "REVKEYSIG": "was made by a revoked key",
     "EXPKEYSIG": "was made by an expired key",
@@ -21,7 +21,7 @@ _DISQUALIFYING_STATUSES = {
 
 
 class SignedHistoryError(ValueError):
-    """The tags or the commit range do not satisfy the signed-history policy."""
+    """Raised when the tags or the commit range fail the signed-history policy."""
 
 
 @dataclass(frozen=True)
@@ -94,7 +94,7 @@ def _signature_disqualification(status: str) -> str | None:
 def _require_trusted_signature(
     status: str, subject: str, expected_fingerprint: str
 ) -> None:
-    """Reject unless the status shows a current signature from the expected key."""
+    """Require the status to show a current signature from the expected key."""
 
     if not _is_signed_by(status, expected_fingerprint):
         summary = " / ".join(
@@ -188,8 +188,8 @@ def verify_signed_history(
     verdicts: list[CommitVerdict] = []
     for commit in listing.split():
         status = _signature_status(repository, commit)
-        # The allowlist only covers commits the release key never signed; a commit
-        # bearing a revoked or expired release signature is refused outright.
+        # The allowlist covers only commits the release key never signed. A commit
+        # with a revoked or expired release signature is refused outright.
         if commit in allowed_merge_commits and not _is_signed_by(
             status, expected_fingerprint
         ):

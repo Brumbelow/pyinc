@@ -4,16 +4,16 @@ from pyinc import FrozenGraph, freeze, thaw
 
 
 def main() -> None:
-    # 1. Pure tree: no shared identity, no cycles → the bare snapshot shape
-    #    rather than the FrozenGraph envelope. The freeze is still paid in
-    #    full: every container gets its own Frozen* shell.
+    # 1. Pure tree (each object reached once, acyclic): freezes to the bare
+    #    snapshot shape. FrozenGraph is for shared or cyclic values. The freeze
+    #    still does full work: every container gets its own Frozen* shell.
     tree = {"name": "root", "items": [1, 2, 3]}
     tree_snapshot = freeze(tree)
     print(f"tree_is_FrozenGraph={isinstance(tree_snapshot, FrozenGraph)}")
 
-    # 2. Shared identity: the same list appears at two slots of a parent dict.
-    #    A snapshot without the envelope would turn this into two separate
-    #    copies; FrozenGraph preserves identity across the boundary.
+    # 2. Shared identity: the same list sits at two slots of a parent dict.
+    #    FrozenGraph keeps it one object across the boundary. A bare snapshot
+    #    would make two separate copies.
     shared_inner: list[int] = [10, 20]
     shared_parent = {"left": shared_inner, "right": shared_inner}
     shared_snapshot = freeze(shared_parent)
@@ -23,7 +23,7 @@ def main() -> None:
     shared_thawed["left"].append(30)
     print(f"shared_after_mutation_right={shared_thawed['right']}")
 
-    # 3. Self-referential cycle: a list that contains itself round-trips faithfully.
+    # 3. Self-referential cycle: a list that contains itself round-trips intact.
     cyclic: list[object] = ["before"]
     cyclic.append(cyclic)
     cycle_snapshot = freeze(cyclic)

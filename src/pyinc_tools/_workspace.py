@@ -36,14 +36,14 @@ _RELEVANT_SUFFIXES = frozenset(
     {".py", ".pyi", ".toml", ".json", ".xml", ".csv", ".ipynb", ".txt", ".cfg", ".ini"}
 )
 _RELEVANT_NAMES = frozenset({".env", "Pipfile", "pyproject.toml"})
-# The signal a closed session raises to its watcher; a driver that reports no
+# The signal a closed session raises to its watcher. A driver that reports no
 # closed state is recognized by this message alone.
 SESSION_CLOSED_MESSAGE = "WorkspaceSession is closed."
-# What traversing to a path reports once it is no longer there. A parent that
-# became a regular file raises ENOTDIR on POSIX; Windows answers the same shape
-# with ERROR_PATH_NOT_FOUND or ERROR_DIRECTORY, which arrive as
-# FileNotFoundError and NotADirectoryError. Both mean absence on both
-# platforms, and neither may be reported as an unsafe path.
+# What traversing to a path reports once the path is gone. A parent that became
+# a regular file raises ENOTDIR on POSIX. Windows answers the same shape with
+# ERROR_PATH_NOT_FOUND or ERROR_DIRECTORY, which arrive as FileNotFoundError
+# and NotADirectoryError. Both mean absence on both platforms, so neither may
+# be reported as an unsafe path.
 _MISSING_PATH_ERRORS = (FileNotFoundError, NotADirectoryError)
 _REQUIREMENTS_REFERENCE = re.compile(r"^(?:-r|--requirement|-c|--constraint)\s+(.+)$")
 
@@ -213,9 +213,9 @@ def _read_workspace_file(path: Path, root: Path) -> bytes:
             except FileNotFoundError:
                 raise
             except NotADirectoryError as exc:
-                # A parent that became a plain file means the path is gone, but
-                # a symlinked parent reports the same errno under O_NOFOLLOW and
-                # is the escape this walk exists to reject.
+                # A parent that became a plain file means the path is gone. A
+                # symlinked parent reports the same errno under O_NOFOLLOW, and
+                # it is the escape this walk exists to reject.
                 if _is_link_entry(component, descriptor):
                     raise ValueError(
                         f"workspace file contains an unsafe path component: {path!s}"
@@ -279,9 +279,9 @@ def _read_workspace_file_windows(path: Path, root: Path) -> bytes:
     try:
         descriptor = os.open(path, flags)
     except _MISSING_PATH_ERRORS:
-        # The path went away between the stat and the open, which the mirror
-        # settles by dropping its copy -- an unsafe-read report would instead
-        # fail the refresh and be retried on every later tick.
+        # The path went away between the stat and the open. The mirror settles
+        # that by dropping its copy. An unsafe-read report would fail the
+        # refresh and be retried on every later tick.
         raise
     except OSError as exc:
         raise ValueError(f"workspace file is not safe to read: {path!s}") from exc
@@ -480,9 +480,9 @@ class WorkspaceMirror:
     def content_hashes(self) -> dict[str, str]:
         """Sha256, per real path, of the disk content each mirrored file holds.
 
-        This is the disk state the mirror was last synced from — not the disk
-        state right now — so a poller seeded from it detects edits that landed
-        after the copy but before the poller existed."""
+        This is the disk state the mirror was last synced from, which can differ
+        from the disk state right now. A poller seeded from it detects edits
+        that landed after the copy but before the poller existed."""
         return dict(self._content_hashes)
 
     def normalize_real_path(self, path: str | os.PathLike[str]) -> str:
@@ -567,10 +567,10 @@ class WorkspaceMirror:
     def _materialize_mirror_directory(self, directory: Path) -> None:
         """Make `directory` exist in the mirror as a directory.
 
-        A workspace path that swapped kind -- a tracked file replaced by a
-        same-named directory -- leaves the mirror holding the other kind, and
-        every entry between the mirror root and `directory` has to give way
-        before it can be created.
+        A workspace path can swap kind, such as a tracked file replaced by a
+        same-named directory. The mirror then holds the other kind, and every
+        entry between the mirror root and `directory` has to give way before
+        `directory` can be created.
         """
 
         current = self.mirror_root_path
@@ -610,9 +610,9 @@ class PollingWorkspaceWatcher:
         self._pending: dict[str, float] = {}
         self._thread: threading.Thread | None = None
         # Held by `start`, by `stop` and `_request_stop` while they find the
-        # event and thread to act on, and by `poll` for the whole poll, so none
+        # event and thread to act on, and by `poll` for the whole poll. So none
         # of them interleaves with another. It is taken before the session's
-        # lock (`start` registers, `poll` refreshes) and never after it, which
+        # lock (`start` registers, `poll` refreshes) and never after it. That
         # is why `_runs_in_current_thread` does without it.
         self._lifecycle_lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -643,9 +643,9 @@ class PollingWorkspaceWatcher:
         return thread is not None and thread.is_alive()
 
     def poll(self) -> tuple[str, ...]:
-        # Checked and polled under the lifecycle lock: checked alone, a
-        # `start()` landing after the check ran the thread's first poll
-        # alongside this one, over the same pending map and snapshot.
+        # Check and poll under one hold of the lifecycle lock. With only the
+        # check under it, a `start()` landing after the check ran the thread's
+        # first poll alongside this one, over the same pending map and snapshot.
         with self._lifecycle_lock:
             if self.is_running:
                 raise RuntimeError(
@@ -683,7 +683,7 @@ class PollingWorkspaceWatcher:
                 self._session.refresh_paths(list(ready))
             except Exception:
                 # The snapshot already matches disk, so nothing would re-detect
-                # these paths; requeue them (original timestamps, already past
+                # these paths. Requeue them (original timestamps, already past
                 # the debounce) so the next tick retries the refresh.
                 self._pending.update(in_flight)
                 raise
@@ -740,17 +740,18 @@ class PollingWorkspaceWatcher:
     def _request_stop(self) -> None:
         # `start()` replaces the event under the lifecycle lock. Set without
         # it, a stop landing while `start()` ran could set the event being
-        # replaced: the new thread then ran on, `stop()` timed out joining it,
+        # replaced. The new thread then ran on, `stop()` timed out joining it,
         # and `WorkspaceSession.close()` removed the mirror under it.
         with self._lifecycle_lock:
             self._stop_event.set()
 
     def _runs_in_current_thread(self) -> bool:
-        # No lock: `WorkspaceSession.close()` asks this while holding the
-        # session's lock, which `start()` takes inside this one. A reference
-        # read is atomic, and none is needed: `_thread` changes only in
-        # `start()`, which refuses while the previous thread is alive, so it
-        # cannot change under the one thread for which the answer is True.
+        # No lifecycle lock here. `WorkspaceSession.close()` asks this while
+        # holding the session's lock, which `start()` takes inside the
+        # lifecycle lock. A reference read is atomic, and no lock is needed.
+        # `_thread` changes only in `start()`, which refuses while the previous
+        # thread is alive. So it cannot change under the one thread for which
+        # the answer is True.
         return self._thread is threading.current_thread()
 
     def _register_with_session(self) -> None:
@@ -764,11 +765,12 @@ class PollingWorkspaceWatcher:
             unregister(self)
 
     def _finish_current_thread(self) -> None:
-        # The thread keeps its own reference: it is still running here and
-        # until it returns, and `stop()` has to be able to join it. Cleared,
-        # a stop arriving in that window found nothing to join and returned
-        # while the thread was alive -- so `WorkspaceSession.close` removed
-        # the mirror under it. `is_running` asks the thread itself.
+        # `_thread` keeps pointing at this thread. The thread is still running
+        # here and until it returns, and `stop()` has to be able to join it.
+        # With the reference cleared, a stop arriving in that window found
+        # nothing to join and returned while the thread was alive. So
+        # `WorkspaceSession.close` removed the mirror under it. `is_running`
+        # asks the thread itself.
         with self._lifecycle_lock:
             if self._thread is not threading.current_thread():
                 return
@@ -784,16 +786,16 @@ class PollingWorkspaceWatcher:
 
     def _run(self, interval_s: float) -> None:
         # This thread reads `_stop_event`, `_on_change` and `_on_error` without
-        # the lifecycle lock, and need not take it: `start()` set them before
-        # starting this thread and cannot set them again while it is alive,
-        # and only this thread clears the callbacks, after its loop.
+        # the lifecycle lock, and needs no lock for them. `start()` set them
+        # before starting this thread and cannot set them again while it is
+        # alive. Only this thread clears the callbacks, after its loop.
         try:
             while not self._stop_event.is_set():
                 try:
                     ready = self._poll_once()
                 except RuntimeError as exc:
                     if self._session_closed(exc):
-                        # Session was closed out from under us; exit cleanly.
+                        # The session was closed under us. Exit cleanly.
                         return
                     self._handle_error(exc)
                     ready = ()
@@ -817,9 +819,9 @@ class PollingWorkspaceWatcher:
     def _session_closed(self, exc: RuntimeError) -> bool:
         """Whether `exc` is the session reporting that it closed.
 
-        Only that contract may retire the watcher thread: RuntimeError also
-        covers RecursionError and any bug in the poll path, and those have to
-        be reported rather than mistaken for a shutdown.
+        Only that contract may retire the watcher thread. RuntimeError also
+        covers RecursionError and any bug in the poll path. Those have to be
+        reported as errors, and never taken for a shutdown.
         """
 
         closed = getattr(self._session, "_closed", None)

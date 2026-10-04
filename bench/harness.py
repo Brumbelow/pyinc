@@ -122,17 +122,18 @@ def _work(
     )
 
 
-# These envelopes are the reviewed deterministic-work contract for the release
-# harness. Every count is exact: the worker keys its files by relative path, so
-# the digest-sorted verification order that used to move the call-level reuse
-# counts with the scratch location no longer can. Execution ceilings remain far
-# below a cold/full graph, so deterministic over-recomputation fails the gate.
+# These expectations are the reviewed deterministic-work contract for the
+# release harness. Every count is exact. The worker keys its files by relative
+# path, so the digest-sorted verification order is the same in every scratch
+# location. That order used to vary with the location and move the call-level
+# reuse counts. Execution ceilings stay far below a cold/full graph, so
+# deterministic over-recomputation fails the gate.
 #
 # Values measured on ecd8abe, 2026-09-04, identical on CPython 3.14.4 and
 # 3.14.7 and across scratch locations. The comment-only rows carry one
-# execution since the calc and codegen source reads started answering with
-# the text they compared: the read re-executes, and the parse instances above
-# it backdate.
+# execution because the calc and codegen source reads answer with the text
+# they compared. The read re-executes, and the parse instances above it
+# backdate.
 PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("synthetic", "cold"): _work(7, 0, 0, 0, 14, 7, 18, 18),
     ("synthetic", "unchanged"): _work(0, 7, 0, 0, 14, 0, 18, 0),
@@ -169,7 +170,7 @@ def _minimum(expectation: CountExpectation) -> int:
 
 
 def expected_work_metrics(target: str, scenario: str) -> WorkMetrics:
-    """Return one valid fixture value for the authoritative work envelope."""
+    """Return one valid fixture value within the authoritative work expectation."""
     expectation = PYINC_WORK_EXPECTATIONS[(target, scenario)]
     return WorkMetrics(
         query_executions=_minimum(expectation.query_executions),
@@ -354,7 +355,7 @@ def validate_repetitions(
             f"benchmark requires {REPETITIONS} isolated repetitions, got {len(repetitions)}"
         )
     # Every row is pinned to an exact value per repetition, so five passing
-    # repetitions are five equal ones; there is no drift left to compare.
+    # repetitions are five equal ones. Validating each one covers drift too.
     for results in repetitions:
         validate_repetition(results, targets)
 

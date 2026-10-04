@@ -1,11 +1,10 @@
 """Evaluate PEP 508 markers in a requirements.txt against the active interpreter.
 
-Demonstrates the ``requirement_evaluation`` integration: the analysis reports
-which requirements apply to the current Python environment and which are
-conditionally excluded by markers like ``; python_version < "3.9"``. For
-applicable requirements, it also reports whether the declared version
-specifier is satisfied by the installed version (or ``missing`` if the
-distribution is not installed).
+Demonstrates the ``requirement_evaluation`` integration. The analysis reports
+which requirements apply to the current Python environment and which ones
+markers like ``; python_version < "3.9"`` exclude. For each applicable
+requirement, it also reports whether the installed version satisfies the
+declared specifier, or ``missing`` when the distribution is not installed.
 
 Run: ``python examples/applicable_requirements.py``
 """

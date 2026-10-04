@@ -93,30 +93,32 @@ ResourceValueT = TypeVar("ResourceValueT")
 ResourceProbeT = TypeVar("ResourceProbeT")
 
 # Durable checkpoint manifest schema version. Bumped whenever the identity, the
-# record layout, or the meaning of a recorded field changes, so stale manifests
-# are rejected loudly rather than silently reused. Version 8 marks the kernel
-# rebuilding its own file-stat readings through a built-in adapter. A record
-# saved by an earlier version froze such a reading field by field into a plain
-# record instead, and the layout of the record holding it is otherwise
-# identical, so nothing below this field distinguishes the two: a database
-# holding the built-in would warm that stored encoding without re-freezing it
-# and hand back a mapping where a fresh execution now produces the snapshot
-# type. Registration also changes how a shared reading is stored, from a node
-# of the shared-structure envelope to a value written inline, so the stored
-# bytes of an unchanged value differ across the boundary as well. The adapter
-# gate cannot catch either: it compares the adapter keys a record used, and a
-# record written before the adapter existed names none. Version 7 adds the
-# saving database's mode to the manifest root. The value a query computes and
-# persists depends on that mode -- strict exposes frozen views and frozen call
-# arguments where checked and fast thaw -- so a record saved under one mode can
-# carry a value another mode would never compute; a version-6-or-earlier
-# manifest names no mode at all and so cannot be attributed to one. Version 5
-# and earlier are refused for a second reason that still stands: their records
-# can predate the two soundness repairs version 6 marked -- captured-module
-# identity was derived from a stat tuple a same-size rewrite can preserve, and a
-# stat probe raising NotADirectoryError published no resource edge -- so such a
-# record can carry a stale identity, or claim no dependencies for a read a fresh
-# database re-derives.
+# record layout or the meaning of a recorded field changes, so a stale manifest
+# is refused loudly and never silently reused.
+#
+# Version 8: the kernel rebuilds its own file-stat readings through a built-in
+# adapter. Earlier versions froze such a reading field by field into a plain
+# record, and the record layout is otherwise identical, so nothing below this
+# field tells the two apart. A database holding the built-in would warm the old
+# encoding without re-freezing it and return a mapping where a fresh execution
+# now produces the snapshot type. Registration also stores a shared reading
+# inline in place of a node of the shared-structure encoding, so the stored bytes
+# of an unchanged value differ across the boundary too. The adapter gate misses
+# both: it compares the adapter keys a record used, and a record written before
+# the adapter existed names none.
+#
+# Version 7 adds the saving database's mode to the manifest root. The value a
+# query computes and persists depends on the mode: strict exposes frozen views
+# and frozen call arguments where checked and fast thaw. So a record saved
+# under one mode can carry a value another mode would never compute. A manifest
+# from version 6 or earlier names no mode, so it cannot be attributed to one.
+#
+# Version 5 and earlier are also refused because their records can predate the
+# two soundness repairs version 6 marked. Captured-module identity came from a
+# stat tuple a same-size rewrite can preserve, and a stat probe raising
+# NotADirectoryError published no resource edge. Such a record can carry a
+# stale identity, or claim no dependencies for a read a fresh database
+# re-derives.
 _CHECKPOINT_MANIFEST_VERSION = 8
 # Version of the snapshot/fingerprint encoding this kernel emits, mirrored from
 # value._KERNEL_FINGERPRINT_PREFIX (b"K2;"). Recorded in the manifest and checked
@@ -126,70 +128,65 @@ _DEFAULT_SEMANTIC_EQUALITY_VERSION = 1
 _MISSING_SNAPSHOT = object()
 _EMPTY_CELL_OBSERVATION = object()
 _UNBOUND_GLOBAL_OBSERVATION = object()
-# Answer for a captured module attribute that is not bound. One object, so the
-# guard's identity comparison is stable while the path stays empty and fails
-# the moment anything is bound there: a chain the accessed-path fold found
-# empty records this, and a chain whose attribute later vanishes can match no
-# target a memo recorded from a real value.
+# Answer for an unbound captured module attribute. A single object keeps the
+# guard's identity comparison stable while the path stays empty, and makes it
+# fail once anything is bound there. A chain the accessed-path fold found empty
+# records this, and a chain whose attribute later vanishes matches no target a
+# memo recorded from a real value.
 _MISSING_MODULE_ATTRIBUTE = object()
-# Not a hexadecimal digest, so it can never equal a stored one and always
-# forces the memo guard to fall through to a full recompute.
+# Not a hexadecimal digest, so it never equals a stored one and always makes
+# the memo guard fall through to a full recompute.
 _UNREADABLE_RESOURCE_DIGEST = "unreadable-resource"
 # Implementation digests of the kernel's own fixed adapters, held for the
-# process. Such a digest folds only the adapter's class -- its two method
-# bodies, its type payload, the bytes of the module they ship in -- and the
-# interpreter build, none of which an in-contract process can move, so it cannot
-# differ between two databases here. Re-deriving it per construction made every
-# `Database()` walk two method bodies and hash a source file, which is a cost the
-# design already decided to pay once rather than repeatedly.
+# process. Such a digest folds only the adapter's class (its two method bodies,
+# its type payload, the bytes of its module) and the interpreter build. An
+# in-contract process can move none of these, so the digest is the same for
+# every database here. Deriving it per construction made every `Database()`
+# walk two method bodies and hash a source file, a cost the design pays once.
 #
-# The key is the adapter key paired with the adapter's TYPE, deliberately not
-# `id(adapter)`. An identity key would be sound only under an argument about
-# lifetimes -- that no id recorded here can be recycled, which holds only
-# because the kernel's registry is a module-level mapping keeping each singleton
-# alive for the whole process -- and a key that needs that argument is a key
-# whose soundness a later edit can silently remove. A type object is kept alive
-# by the module that defines it, so the question does not arise. The pair is no
-# coarser than identity would be for this set: an entry reaches this memo only
-# when it IS the kernel's own entry for that key, and a fixed adapter holds no
-# instance state, so two instances of one such class digest identically by
-# construction.
+# The key is the adapter key paired with the adapter's TYPE, on purpose. An
+# `id(adapter)` key would be sound only while no recorded id can be recycled,
+# which holds only because the kernel's registry is a module-level mapping
+# keeping each singleton alive for the process. A later edit could silently
+# break that. A type object stays alive with its defining module, so the
+# question never arises. The pair is as fine as identity for this set. An entry
+# reaches this memo only when it IS the kernel's own entry for that key, and a
+# fixed adapter holds no instance state. So two instances of one such class
+# digest identically.
 #
-# What this does NOT cover: a caller's adapter, including one registered for a
-# type the kernel also adapts. Those are re-derived at every construction and at
-# every trust boundary, because a caller's implementation and configuration are
-# theirs to change between one database and the next.
+# This memo leaves out a caller's adapter, including one registered for a type
+# the kernel also adapts. Such an adapter is re-derived at every construction
+# and every trust boundary, because its implementation and configuration are
+# the caller's to change between one database and the next.
 #
-# One consequence, stated because it is a widening: an out-of-contract in-process
-# rewrite of a fixed adapter's own methods was already invisible to every
-# database already built; it is now invisible to databases built afterwards too.
-# A source-level change still moves the digest, because it needs a new process.
+# This widens one blind spot. An out-of-contract in-process rewrite of a fixed
+# adapter's own methods was already invisible to every database already built.
+# It is now invisible to databases built afterwards too. A source-level change
+# still moves the digest, because it needs a new process.
 #
 # Databases constructed at once on several threads can each find no digest and
 # derive one. The first to finish publishes it with `dict.setdefault`, a single
-# operation, and every database uses the published digest rather than its own,
-# so all of them agree with the memo whatever order the derivations finish in.
-# That needs no lock, so no thread waits while another derives; the price is
-# that databases constructed at the same moment may each derive the digest.
+# operation, and every database uses the published digest, so all agree with
+# the memo whatever order the derivations finish in. No lock is needed, so no
+# thread waits on another. The cost is that concurrent constructions may each
+# derive the digest.
 _FIXED_ADAPTER_IMPLEMENTATION_DIGESTS: dict[tuple[str, type[Any]], str] = {}
 
 
 def _validated_store(store: Any, parameter: str) -> ArtifactStore:
     """Check an injected store against both halves of the store contract.
 
-    A store reaches deep into the persistence path before it is first used,
-    so an unusable one has to be refused where it is handed over rather than
-    surfacing as an ``AttributeError`` or a silent no-op several calls later.
-    The two checks catch different failures: the shape check rejects an object
-    that is missing a method outright, and the identity check rejects a
-    subclass that passes the shape check because it inherited the protocol's
-    own unimplemented ``get``/``put``. Inheriting the ``contains`` default is
+    A store reaches deep into the persistence path before its first use, so an
+    unusable one is refused where it is handed over. Otherwise it would surface
+    as an ``AttributeError`` or a silent no-op several calls later. The shape
+    check refuses an object missing a method. The identity check refuses a
+    subclass that passes the shape check by inheriting the protocol's own
+    unimplemented ``get``/``put``. Inheriting the ``contains`` default is
     intended and stays legal.
 
-    ``parameter`` identifies the door the store came through rather than naming
-    an argument -- call sites pass a phrase such as "The store passed to
-    save_checkpoint()" -- so the raised message reads as a sentence about the
-    call that was actually made.
+    ``parameter`` names the door the store came through, as a phrase such as
+    "The store passed to save_checkpoint()", so the raised message reads as a
+    sentence about the call that was made.
     """
     if not isinstance(store, ArtifactStore):
         raise TypeError(
@@ -213,20 +210,20 @@ def _build_runtime_build_payload() -> tuple[Any, ...]:
         tuple(sys.version_info),
         (
             "flags",
-            # `hash_randomization` is deliberately excluded. It separates a
-            # PYTHONHASHSEED=0 process from every other process while giving no
-            # protection against the hazard it looks like it covers: two
-            # default-seed processes carry the same flag and different hash
-            # orders, so folding it cannot separate a hash-order-dependent body
-            # from a stable one. All it buys is that a checkpoint written under
-            # a pinned seed -- CI, the benchmark harness, the documentation
-            # runner -- can never warm an ordinary process. Route hash-order
-            # dependence through an `Input` or a `Resource`.
+            # `hash_randomization` is excluded on purpose. It separates a
+            # PYTHONHASHSEED=0 process from every other process but misses the
+            # hazard it seems to cover. Two default-seed processes carry the
+            # same flag and different hash orders, so folding it cannot tell a
+            # hash-order-dependent body from a stable one. Folding it would only
+            # stop a checkpoint written under a pinned seed (CI, the benchmark
+            # harness, the documentation runner) from warming an ordinary
+            # process. Route hash-order dependence through an `Input` or a
+            # `Resource`.
             #
-            # The names come from `dir(sys.flags)` rather than a literal list,
-            # so a flag a future interpreter adds is folded the day it appears;
-            # the three `structseq` metadata attributes and the two sequence
-            # methods are not flags and are excluded by name.
+            # The names come from `dir(sys.flags)`, so a flag a future
+            # interpreter adds is folded the day it appears. The three
+            # `structseq` metadata attributes and the two sequence methods are
+            # not flags and are excluded by name.
             tuple(
                 (flag_name, getattr(sys.flags, flag_name))
                 for flag_name in sorted(dir(sys.flags))
@@ -265,20 +262,18 @@ _RUNTIME_BUILD_PAYLOAD = _build_runtime_build_payload()
 def _stdlib_directory_prefixes() -> tuple[str, ...]:
     """The directories this interpreter's standard library was installed in.
 
-    Plural, because the library is not one directory on every platform.
-    `sysconfig`'s `stdlib` and `platstdlib` answer for the pure-Python and the
+    Plural, because on some platforms the library spans several directories.
+    `sysconfig`'s `stdlib` and `platstdlib` give the pure-Python and the
     platform-specific halves of an ordinary installation. A Windows build keeps
-    its extension modules -- `_ctypes.pyd` and about twenty siblings -- in
-    `DLLs`, a sibling of `Lib` that no `sysconfig` path names, and an
-    embeddable build imports the whole pure-Python half out of
-    `python3XY.zip`; both are named by construction. Naming them on every
-    platform costs nothing: a directory the interpreter does not use is a
-    prefix no origin begins with.
+    its extension modules (`_ctypes.pyd` and about twenty siblings) in `DLLs`,
+    a sibling of `Lib` that no `sysconfig` path names. An embeddable build
+    imports the whole pure-Python half from `python3XY.zip`. Both are named by
+    construction. Naming them on every platform is free: a directory the
+    interpreter leaves unused is a prefix no origin begins with.
 
-    Each is returned with a trailing separator, so a prefix test against it
-    cannot match a sibling directory whose name merely begins the same way. The
-    directory holding `os` is the fallback for an interpreter that reports no
-    path at all.
+    Each is returned with a trailing separator, so a prefix test cannot match a
+    sibling directory whose name merely begins the same way. The directory
+    holding `os` is the fallback for an interpreter that reports no path.
     """
 
     reported = [
@@ -292,9 +287,8 @@ def _stdlib_directory_prefixes() -> tuple[str, ...]:
     if not reported:
         fallback = os.path.dirname(getattr(os, "__file__", "") or "")
         if not fallback:
-            # Nothing to compare against: keep the narrower answer, so a module
-            # is treated as the caller's rather than silently losing its
-            # constants.
+            # Nothing to compare against. Keep the narrower answer, so a module
+            # counts as the caller's and keeps its constants folded.
             return ("\x00 no stdlib directory",)
         reported.append(fallback)
     reported.append(os.path.join(sys.base_exec_prefix, "DLLs"))
@@ -340,12 +334,12 @@ def _live_type_binding(value: type[Any]) -> Any:
     """The object the type's defining module currently binds under its name.
 
     Mirrors `_module_type_anchor_payload`'s resolution without its refusal.
-    The payload refuses a type whose defining module no longer binds it, so an
-    observation that pinned the type by identity alone would keep a stored
-    fingerprint serving after the binding moved while every fresh computation
-    refuses. Folded as an identity leaf, this is the type itself while the
-    binding holds and whatever replaced it -- or None -- once it does not,
-    which is exactly when the memo must stop answering.
+    The payload refuses a type its defining module has stopped binding. An
+    observation pinning the type by identity alone would keep serving a stored
+    fingerprint after the binding moved, while every fresh computation refuses.
+    Folded as an identity leaf, this is the type itself while the binding holds
+    and whatever replaced it (or None) once it moves, which is when the memo
+    must stop answering.
     """
 
     module = sys.modules.get(value.__module__)
@@ -362,27 +356,23 @@ def _live_type_binding(value: type[Any]) -> Any:
 def _sorted_state_entries(state: dict[Any, Any]) -> list[tuple[Any, Any]]:
     """Order an instance dictionary's entries, whatever its keys turn out to be.
 
-    An instance dictionary is an ordinary dict, and nothing stops a caller
-    writing a key into one that is not a string. Ordering the entries by their
-    keys then asks an integer to compare against a string, which raises instead
-    of answering -- and a walk that has been handed a value has to decide the
-    order rather than let the keys decide whether there is one at all.
+    An instance dictionary is an ordinary dict, and a caller can write a
+    non-string key into one. Sorting by key then compares an integer with a
+    string, which raises. A walk handed a value has to decide the order itself
+    whatever the keys are.
 
-    So the plain order is attempted first, which keeps every ordinary
-    dictionary on exactly the order, and the cost, it has today; a key set that
-    does not order itself falls back to each key's type name and repr, which
-    orders any two keys against each other. Attempted rather than checked in
-    front for the reason the handle observation states beside its own catch,
-    and because a check would refuse an all-integer dictionary that orders
-    itself perfectly well and is folded today. The fallback order is internal:
-    it is not a documented ordering and nothing outside this module may depend
-    on which order it picks. It can genuinely differ between two processes --
-    a repr may name an object's identity rather than its value, a frozenset's
-    depends on the hash seed once it holds more than one member, and two keys
-    whose type name and repr both tie keep the order the dictionary held them
-    in. Nothing contracts on that order, which is what makes all of it
-    acceptable; a caller who needs a stable fold gives the dictionary keys that
-    order themselves.
+    So the plain order is tried first, which keeps every ordinary dictionary on
+    the order and cost it has today. A key set that cannot order itself falls
+    back to each key's type name and repr, which orders any two keys. It is
+    tried with no check up front, for the reason the handle observation gives
+    beside its own catch. A check would also refuse an all-integer dictionary
+    that orders itself and is folded today. The fallback order is internal and
+    undocumented. Only this module may depend on it. It can differ between two
+    processes. A repr may name an object's identity in place of its value. A
+    frozenset's repr depends on the hash seed once it holds more than one
+    member. Two keys whose type name and repr both tie keep the dictionary's
+    order. That is acceptable because nothing contracts on the order. A caller who needs a stable fold gives the dictionary keys
+    that order themselves.
     """
 
     try:
@@ -397,38 +387,37 @@ def _sorted_state_entries(state: dict[Any, Any]) -> list[tuple[Any, Any]]:
 def _type_anchor_leaves(root: Any) -> tuple[Any, ...]:
     """Live-binding leaves for every anchored type an eager value resolves.
 
-    Follows the shapes `_freeze_static_capture` resolves eagerly -- containers
+    Follows the shapes `_freeze_static_capture` resolves eagerly: containers
     and the instance state of their subclasses, slices, scalar-subclass and
     pathlike instance state, frozen dataclass fields and extras, parameterized
-    generics, unions, nested aliases and type parameters -- and contributes
-    one `_live_type_binding` leaf per non-builtin type reached, because the
-    payload anchors each of those types to its live module binding. An alias
-    or a type parameter recurses only where its evaluate_* attribute is not a
-    Python function: where one exists the payload folds the evaluator instead
-    of the resolved value, and observing that evaluator as a definition
-    already tracks the globals it resolves. Shapes the payload returns
-    pre-frozen or refuses outright contribute nothing, mirroring the payload,
-    which anchors no type there either.
+    generics, unions, nested aliases and type parameters. It contributes one
+    `_live_type_binding` leaf per non-builtin type reached, because the payload
+    anchors each of those types to its live module binding. An alias or a type
+    parameter recurses only where its evaluate_* attribute is not a Python
+    function. Where one is, the payload folds the evaluator in place of the
+    resolved value, and observing that evaluator as a definition already
+    tracks the globals it resolves. Shapes the payload returns pre-frozen or
+    refuses contribute nothing, because the payload anchors no type there
+    either.
 
-    Each swept class and carrier type contributes its own leaf, and the sweep
-    then follows that type's own definition closure -- its metaclass, its
-    bases, the classes its body binds directly. Without that descent,
-    rebinding one of those still answered from the memo where a fresh
-    computation refuses. A class the body holds inside one of the immutable
-    containers the payload accepts, rather than binding directly, is not
-    followed here: the payload folds that attribute through the eager capture
-    instead, so rebinding such a class leaves the memo answering with the
-    stored fingerprint while a fresh computation either moves to a new one or
+    Each swept class and carrier type contributes its own leaf. The sweep then
+    follows that type's definition closure: its metaclass, its bases and the
+    classes its body binds directly. Without that descent, rebinding one of
+    those still answered from the memo where a fresh computation refuses. A
+    class the body holds inside an immutable container the payload accepts is
+    left unfollowed here. The payload folds that attribute through the eager
+    capture, so rebinding such a class leaves the memo answering with the
+    stored fingerprint while a fresh computation moves to a new one or
     refuses. Descent stops without a namespace walk at builtin and
     stdlib-rooted types, which the payload pins by name anchor and runtime
-    build rather than by walking their contents.
+    build.
     """
 
     leaves: list[Any] = []
     swept: builtins.set[int] = set()
-    # Types need their own visited set: the arm below contributes a leaf on
-    # every contact and returns before `swept` is ever consulted, so the id set
-    # that stops the value walk repeating never receives a type.
+    # Types need their own visited set. The type arm below adds a leaf on every
+    # contact and returns before it reads `swept`, so the id set that stops the
+    # value walk repeating never receives a type.
     swept_types: builtins.set[int] = set()
 
     def sweep_instance_state(value: Any, exclude: frozenset[str] = frozenset()) -> None:
@@ -555,41 +544,43 @@ def _reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
     Capture fingerprinting is static: it resolves the names a code object
     references against the function's globals. globals()['NAME'],
     vars(module)['NAME'], getattr(module, 'NAME') and eval reach the same
-    mutable state while referencing only the builtin, so those reads must be
-    rejected rather than silently escaping identity. Only global-scope loads
-    of the builtins count -- an attribute that happens to be named "globals"
-    or "vars" is untouched -- and the getattr family (plus __dict__ attribute
-    loads) is rejected only beside a handle that can produce a module
+    mutable state while referencing only the builtin, so those reads are
+    refused to keep them from silently escaping identity. Only global-scope
+    loads of the builtins count; an attribute that happens to be named
+    "globals" or "vars" is untouched. The getattr family (plus __dict__
+    attribute loads) is refused only beside a handle that can produce a module
     namespace, because getattr on ordinary objects is legitimate and common.
 
-    Three loads mark that handle. One is a reach for the module table: a
-    "modules" attribute load, which survives whatever name sys was imported
-    under and wherever the import sits, or the string "modules" beside a
-    getattr-family builtin, which is how getattr spells the same reach
-    without loading the attribute at all. The second is an "import_module"
-    attribute load, which reaches importlib's own module builder and survives
-    an alias and a body-scope import the same way. Neither is checked against
-    the module it is read off, so an attribute merely named "modules" or
-    "import_module" arms the rule beside an ordinary getattr too -- the
-    over-rejection this conservative reading pays for. The third is a global
-    load of the name importlib, which marks the module wherever that name is
-    read, whatever is done with it afterwards. A callable lifted out of the
-    module by a from-import loads neither the name nor an attribute, so it is
-    an ordinary global load and this rule does not read it.
+    Three loads mark that handle:
 
-    Reaching a module namespace is not itself an offense. A plain
-    sys.modules[...] subscript, and an import_module(...) call, with no
-    reflective builtin beside them stay accepted, deliberately: the handle
-    marks where a reflective read could start, and it is the builtin beside
-    it that is refused.
+    * A reach for the module table. This is a "modules" attribute load, which
+      survives any import name for sys and any import position. It can also be
+      the string "modules" beside a getattr-family builtin, which is how
+      getattr spells the same reach without loading the attribute.
+    * An "import_module" attribute load, which reaches importlib's own module
+      builder and survives an alias and a body-scope import the same way.
+    * A global load of the name importlib, which marks the module wherever
+      that name is read, whatever is done with it afterwards.
+
+    The first two are matched by name alone, so an attribute merely named
+    "modules" or "import_module" also arms the rule beside an ordinary
+    getattr. That over-rejection is the cost of this conservative reading. A
+    callable lifted out of the module by a from-import loads neither the name
+    nor an attribute, so it is an ordinary global load outside this rule.
+
+    Reaching a module namespace is allowed on its own. A plain
+    sys.modules[...] subscript or an import_module(...) call with no
+    reflective builtin beside it stays accepted on purpose. The handle marks
+    where a reflective read could start, and the builtin beside it is what is
+    refused.
 
     A function's __globals__ is its defining module's namespace by another
     spelling, so loading that attribute is an offense on its own: the walk
     that folds a captured function stops at the function and never follows it.
 
-    Results are cached on the code object, which hashes its own constants: a
-    code object carrying a constant that is not hashable -- a slice literal on
-    interpreters before 3.12 -- is scanned uncached instead.
+    Results are cached on the code object, which hashes its own constants. A
+    code object carrying an unhashable constant (a slice literal on
+    interpreters before 3.12) is scanned uncached.
     """
 
     try:
@@ -626,10 +617,9 @@ def _scan_reflective_namespace_offenses(code: CodeType) -> tuple[str, ...]:
     if "__globals__" in attribute_loads:
         offenses = offenses | {"__globals__"}
     # The attribute load carries the module table under any import alias, and
-    # getattr's string argument spells the same access without loading the
-    # attribute at all -- both are the handle the rule below keys on, so
-    # aliasing sys and getattr(sys, "modules") reach it the same way a plain
-    # sys.modules access does.
+    # getattr's string argument spells the same access without the attribute
+    # load. Both are the handle the rule below keys on, so an aliased sys and
+    # getattr(sys, "modules") reach it as a plain sys.modules access does.
     module_table = "modules" in attribute_loads or (
         bool(attribute_builtins) and "modules" in string_constants
     )
@@ -678,10 +668,10 @@ class NodeKey:
     label: str = field(compare=False)
 
     def __post_init__(self) -> None:
-        # The public key boundaries already refuse `str` subclasses, but node
+        # The public key boundaries already refuse `str` subclasses. Node
         # identity decides record equality, manifest validation and every
-        # rendered label, so the node table refuses one itself rather than
-        # trusting every internal path that builds a key.
+        # rendered label, so the node table refuses one here too, whatever
+        # internal path built the key.
         if (
             type(self.kind) is not str
             or type(self.identity) is not str
@@ -708,24 +698,24 @@ class NodeRecord:
     checked_in_request: int = -1
     checkpoint_loaded: bool = False
     failure: str | None = None
-    # The exception the failing load raised, kept only so the reads that follow
-    # it *within the same request* re-raise it instead of re-running the load.
-    # `failure_traceback` is the chain captured at that raise, restored on every
-    # re-raise so the object's traceback stays bounded and points at the load.
-    # A traceback pins its frames and every local in them, so both are dropped
-    # when the request that produced them ends: nothing outside that request may
-    # re-raise them, and a permanently failing node must not pin a load frame
-    # (and whatever it allocated) until the next successful load.
+    # The exception the failing load raised. Later reads *in the same request*
+    # re-raise it in place of re-running the load. `failure_traceback` is the
+    # chain captured at that raise, restored on every re-raise so the object's
+    # traceback stays bounded and points at the load. A traceback pins its
+    # frames and all their locals, so both are dropped when the request ends.
+    # Only that request may re-raise them, and a permanently failing node must
+    # release its load frame (and whatever it allocated) without waiting for
+    # the next successful load.
     failure_exc: BaseException | None = None
     failure_traceback: TracebackType | None = None
     # True once an observation of this node raised without being recorded (an
     # unprobeable failure, or a freeze that failed after the load). The stored
-    # probe then describes a world that has since been contradicted, so it may
-    # no longer prove "unchanged" -- see `_refresh_resource`.
+    # probe then describes a contradicted world, so it stops proving
+    # "unchanged". See `_refresh_resource`.
     probe_unconfirmed: bool = False
     # False once this record's value derived from an exception the graph could
-    # not describe, which makes it reproducible only by re-running it. Such a
-    # record is omitted from checkpoints exactly as a failure record is.
+    # not describe, so only re-running it reproduces the value. Such a record
+    # is left out of checkpoints, as a failure record is.
     checkpointable: bool = True
 
     @property
@@ -741,10 +731,10 @@ class NodeRecord:
 class _RefreshOutcome:
     """Whether a raising resource refresh left the record describing that attempt.
 
-    ``_maybe_changed_after`` may only let a record's ``changed_at`` decide when
-    the refresh it just ran actually (re)wrote that record. A refresh that raises
-    without recording anything leaves whatever the record said before, and a
-    stale "unchanged" there is a from-scratch consistency violation.
+    ``_maybe_changed_after`` lets a record's ``changed_at`` decide only when
+    the refresh it ran (re)wrote that record. A refresh that raises without
+    recording anything leaves the record as it was, and a stale "unchanged"
+    there violates from-scratch consistency.
     """
 
     failure_recorded: bool = False
@@ -759,19 +749,19 @@ class ExecutionFrame:
     untracked_reasons: list[str] = field(default_factory=list)
     checkpointable: bool = True
     # The thread the execution runs on, bound where the frame is built. A
-    # thread spawned inside the body inherits the frame but not the ident, so
-    # this is what tells a descendant apart from the executing thread itself.
+    # thread spawned inside the body inherits the frame but runs under its own
+    # ident, so this field tells a descendant apart from the executing thread.
     thread_ident: int = field(default_factory=threading.get_ident)
-    # Set when the execution leaves. A spawned thread keeps the stack it
-    # inherited for as long as it runs, so whether an execution is still live
-    # has to be the frame's own property rather than the stack's shape.
+    # Set when the execution leaves. A spawned thread keeps its inherited stack
+    # for as long as it runs, so liveness is a property of the frame, read
+    # from this flag and never from the stack's shape.
     completed: bool = False
 
 
-# A thread's ident is reused as soon as the thread exits, so it cannot say which
-# thread opened a request that outlived its thread -- a span abandoned open in a
-# suspended generator, say. A thread-local value dies with its thread instead,
-# and a request holding its token keeps that object from being reallocated.
+# A thread's ident is reused once the thread exits, so it cannot identify the
+# opener of a request that outlived its thread (a span left open in a
+# suspended generator, say). A thread-local value dies with its thread, and a
+# request holding its token keeps that object from being reallocated.
 _THREAD_TOKENS = threading.local()
 
 
@@ -793,12 +783,12 @@ class _RequestScope:
     holds it too: each `threading.Thread` started on a free-threaded 3.14
     build, `asyncio.to_thread`, `Thread(context=...)`, a `copy_context()` run
     later. A copy that joined it would answer from validation done before the
-    copy ran -- after the request ended, from a world that has since moved.
-    So a request belongs to the thread that opened it and ends when its scope
-    exits, and `Database._live_request` sees no request anywhere else. The
-    thread is told by its token rather than its ident, which a later thread
-    can be given once this one has exited. When it ends it lets go of its
-    observer events and failure keys, so a copy keeps none of them alive.
+    copy ran: after the request ended, from a world that has since moved. So a
+    request belongs to the thread that opened it and ends when its scope
+    exits, and `Database._live_request` sees it only there. The thread is
+    identified by its token, because its ident can pass to a later thread once
+    this one exits. On ending, the scope releases its observer events and
+    failure keys, so a copy keeps none of them alive.
     """
 
     request_id: int
@@ -878,10 +868,10 @@ class QueryChangeEvent:
     """Delivered to observers when a subscribed query's stored value moves.
 
     Fires on a cold execution and on a re-execution that advanced the node's
-    `changed_at`. `"reused"` and `"backdated"` decisions do not fire, and
-    neither does a re-execution on a node marked untracked that re-landed a
-    byte-identical value -- it keeps the `changed_at` it had. So `decision` is
-    always `"executed"`.
+    `changed_at`, so `decision` is always `"executed"`. `"reused"` and
+    `"backdated"` decisions stay silent. So does a re-execution of a node
+    marked untracked that re-landed a byte-identical value, because it keeps
+    the `changed_at` it had.
     """
 
     query_id: str
@@ -914,8 +904,8 @@ class _GuardedName:
     """A standard-library callable the guard replaced, and the wrapper it installed.
 
     `module` and `qualname` are the original's own `__module__` and
-    `__qualname__` -- `posix.getcwd`, `posixpath.realpath`, `pathlib.Path.cwd`
-    -- which is what a capture of the wrapper is fingerprinted by.
+    `__qualname__` (`posix.getcwd`, `posixpath.realpath`, `pathlib.Path.cwd`).
+    A capture of the wrapper is fingerprinted by them.
     `_standard_library_name` has checked that they name the original.
     """
 
@@ -927,18 +917,20 @@ class _GuardedName:
 
 # Every callable `_install_guards_once` puts in place of a standard-library one,
 # keyed by the wrapper's id. A query module that binds one of those names after
-# the first `Database` exists (`from os import getcwd`) holds the wrapper, a
-# closure over pyinc's own state that the capture walk cannot fold, so the
-# fingerprint recognises it here and pins it by the name it guards instead.
+# the first `Database` exists (`from os import getcwd`) holds the wrapper. It is
+# a closure over pyinc's own state that the capture walk cannot fold, so the
+# fingerprint recognises it here and pins it by the name it guards.
+#
 # Filled once, under the install lock and before the guard is marked installed,
-# and never changed after, so every fingerprint, which a `Database` takes only
-# once it has installed the guard, sees all of it. The entries keep the
-# wrappers alive, so no id here is ever reused. The two environment mappings
-# the guard installs are not callables and are not here: a captured mapping is
-# state, refused as `os.environ` itself is. Nor is a wrapper around anything a
-# caller put in a guarded name's place before the guard was installed (a mock,
-# a `functools.partial`, a function of its own): no standard-library name
-# describes what that wrapper calls, so a capture of it is refused as any
+# then never changed. A `Database` fingerprints only after installing the guard,
+# so every fingerprint sees all of it. The entries keep the wrappers alive, so
+# no id here is ever reused.
+#
+# Two kinds of object stay out. The two environment mappings the guard installs
+# are state, and a captured mapping is refused as `os.environ` itself is. A
+# wrapper around anything a caller put in a guarded name's place before the
+# guard was installed (a mock, a `functools.partial`, a function of its own) has
+# no standard-library name for what it calls. A capture of it is refused as any
 # closure over pyinc's state is.
 _GUARDED_NAMES: dict[int, _GuardedName] = {}
 
@@ -951,10 +943,10 @@ def _standard_library_name(original: Any) -> tuple[str, str] | None:
     `__qualname__`. They are trusted when the module is part of the standard
     library and the qualified name, read back through it, reaches `original`
     itself, as a standard-library type's anchor must. Anything else that held
-    a guarded name when the guard was installed -- a mock, which has no
-    `__qualname__`; a `functools.partial`, which has neither; a function of
-    the caller's own -- gets None. Called before the guard replaces anything,
-    since it replaces `posixpath.realpath` in its own module's namespace.
+    a guarded name when the guard was installed gets None: a mock (no
+    `__qualname__`), a `functools.partial` (neither attribute), or a function
+    of the caller's own. Called before the guard replaces anything, since the
+    guard replaces `posixpath.realpath` in its own module's namespace.
     """
     module_name = getattr(original, "__module__", None)
     qualname = getattr(original, "__qualname__", None)
@@ -993,10 +985,10 @@ def _name_as_installed(
 def _first_parameter_name(function: Callable[..., Any], default: str) -> str:
     """`function`'s name for its first parameter, or `default` when it has no signature.
 
-    A callable put in a guarded name's place may have no signature to read --
-    a C function, or an object that refuses one -- and the guard still has to
-    install around it; the standard library's own name for the parameter is
-    what a caller passing it by keyword would use.
+    A callable put in a guarded name's place may have no readable signature
+    (a C function, or an object that refuses one), and the guard still has to
+    install around it. A caller passing the argument by keyword would use the
+    standard library's own name for the parameter.
     """
     try:
         parameters = inspect.signature(function).parameters
@@ -1020,9 +1012,8 @@ def _is_guarded_name(value: Any) -> bool:
     return _guarded_name(value) is not None
 
 
-# How a refused call names the position it was made from. Keyed by the
-# boundary states that are not "outside", which is the only state that allows
-# everything.
+# How a refused call names the position it was made from. Keyed by every
+# boundary state except "outside", the one state that allows everything.
 _BOUNDARY_REJECTION_REASONS: Mapping[str, str] = {
     "inside": "inside a query body",
     "hook": "inside a resource hook",
@@ -1043,18 +1034,17 @@ def _cwd_anchoring_realpath(
     """Wrap `os.path.realpath` so the working directory decides nothing silently.
 
     `realpath` anchors a path that is not fully qualified to the working
-    directory, and how it reads the directory is an implementation detail
-    that moves between versions. Windows' `ntpath.realpath` called
-    `os.getcwd()` for every path, fully qualified ones included, until 3.13.16
-    and 3.14.8, and from those releases anchors through `abspath`, which reads
-    the directory in C; the `abspath` wrapper refuses that call too, but only
+    directory. How it reads the directory is an implementation detail that
+    moves between versions. Windows' `ntpath.realpath` called `os.getcwd()`
+    for every path, fully qualified ones included, until 3.13.16 and 3.14.8.
+    From those releases it anchors through `abspath`, which reads the
+    directory in C. The `abspath` wrapper refuses that call too, but only
     because `ntpath.realpath` happens to reach `abspath` through its module's
     namespace. On POSIX before 3.13, a relative path that reaches an absolute
-    symlink is resolved without consulting `os.getcwd` at all. So the wrapper
-    asks the question itself, on the path
-    realpath will see: a path the directory anchors is refused inside a query,
-    whatever the version; any other path resolves, and on Windows the read of
-    the directory it cannot use is let through.
+    symlink resolves without consulting `os.getcwd`. So the wrapper decides on
+    the path realpath will see. Inside a query, a path the directory anchors
+    is refused, whatever the version. Any other path resolves, and on Windows
+    the directory read that the result cannot depend on is let through.
     """
     windows = path_module is ntpath
     # The wrapped function's own name for its first parameter (`filename` on
@@ -1079,9 +1069,9 @@ def _cwd_anchoring_realpath(
             return realpath(target, *args, **kwargs)
         if not windows:
             return realpath(target, *args, **kwargs)
-        # Let through the read Windows' realpath makes without using it, and
-        # nothing else: `strict` is settled first, so no caller code runs
-        # while the read is let through.
+        # Let through only the read Windows' realpath makes without using it.
+        # `strict` is settled first, so no caller code runs while the read is
+        # let through.
         if "strict" in kwargs and kwargs["strict"] is not allow_missing:
             kwargs["strict"] = bool(kwargs["strict"])
         token = _CWD_READ_UNUSED.set(True)
@@ -1099,14 +1089,14 @@ def _cwd_anchoring_abspath(
     """Wrap `os.path.abspath` so a path the working directory anchors is refused.
 
     `posixpath.abspath` anchors a relative path with `os.getcwd`, which the
-    guard refuses, but Windows' `ntpath.abspath` asks `nt._getfullpathname`,
-    which reads the working directory in C where no guard sees it. On Windows
-    that let through `abspath`, `relpath` (which anchors both of its arguments
-    with it) and, from 3.12, `Path.absolute` of a drive-relative path, which
+    guard refuses. Windows' `ntpath.abspath` asks `nt._getfullpathname`, which
+    reads the working directory in C where no guard sees it. On Windows that
+    let through `abspath`, `relpath` (which anchors both its arguments with
+    it) and, from 3.12, `Path.absolute` of a drive-relative path, which
     anchors the drive with it. So the wrapper decides on the path itself, by
-    the rule the `realpath` wrapper uses: a path that is not fully qualified
-    is refused inside a query, on every platform, and any other path goes
-    straight through. On POSIX that is exactly when `abspath` would have read
+    the `realpath` wrapper's rule. Inside a query, a path that is not fully
+    qualified is refused on every platform, and any other path goes straight
+    through. On POSIX those are the paths for which `abspath` would have read
     `os.getcwd`, so only the message changes there.
     """
     # The wrapped function's own name for its parameter (`path` on both
@@ -1124,9 +1114,9 @@ def _cwd_anchoring_abspath(
         try:
             qualified = is_fully_qualified(target, path_module)
         except ValueError:
-            # A path `normpath` cannot read (bytes Windows cannot decode) is one
-            # `abspath` goes on to anchor with the working directory after its
-            # own `normpath` fails, so it is refused like any relative path.
+            # `abspath` anchors a path `normpath` cannot read (bytes Windows
+            # cannot decode) with the working directory after its own
+            # `normpath` fails, so it is refused like any relative path.
             # Outside a query `abspath` raises its own error for it.
             qualified = False
         if not qualified:
@@ -1140,12 +1130,12 @@ def _cwd_anchoring_abspath(
 
 
 def _install_guards_once() -> None:
-    """Install global wrappers around raw I/O entry points exactly once per process.
+    """Install global wrappers around raw I/O entry points once per process.
 
-    The wrappers consult `_ACTIVE_GUARDS` (a `ContextVar`) to determine whether
-    any `Database` currently has a query frame on the calling context without
-    raw-read permission. Installation is idempotent and thread-safe; once
-    installed, the wrappers stay in place for the life of the process.
+    The wrappers read `_ACTIVE_GUARDS` (a `ContextVar`) to tell whether any
+    `Database` has a query frame on the calling context without raw-read
+    permission. Installation is idempotent and thread-safe. Once installed,
+    the wrappers stay in place for the life of the process.
     """
     global _GUARD_INSTALLED
     if _GUARD_INSTALLED:
@@ -1215,10 +1205,9 @@ def _install_guards_once() -> None:
 
         # The working directory is ambient state like the environment: a
         # relative path means something different after a chdir. `Path.cwd` is
-        # wrapped in its own right so the refusal does not depend on how
-        # pathlib reaches the directory, and `os.path.realpath` and
-        # `os.path.abspath` below so it does not depend on how the platform's
-        # path module does.
+        # wrapped in its own right so the refusal holds however pathlib reaches
+        # the directory, and `os.path.realpath` and `os.path.abspath` below so
+        # it holds however the platform's path module does.
         def guarded_getcwd() -> str:
             if not _CWD_READ_UNUSED.get():
                 _raise_if_guarded(f"Raw os.getcwd() inside a query is untracked. {_CWD_ADVICE}")
@@ -1242,48 +1231,46 @@ def _install_guards_once() -> None:
 
             A thread started inside a query body belongs to that execution:
             whatever it reads flows back into the result the query stores, so
-            the frame the guard consults has to be visible from it. Threads
-            start with an empty context otherwise, which is why the frame is
-            invisible to them by default.
+            the frame the guard reads has to be visible from it. Threads
+            otherwise start with an empty context, which hides the frame.
 
-            A resource hook counts too, and not only when a query is running
-            above it. A `read_resource` made at top level holds the state lock
-            across the whole hook while opening no execution at all, so a child
-            that inherited nothing passed every check and then blocked on that
-            lock until its own parent returned -- which, if the parent joins it,
-            is never. The hook depth is the only thing that says where such a
-            child stands.
+            A resource hook counts too, with or without a query running above
+            it. A top-level `read_resource` holds the state lock across the
+            whole hook while opening no execution, so a child that inherited
+            nothing passed every check and then blocked on that lock until its
+            parent returned. If the parent joins the child, that never happens.
+            Only the hook depth says where such a child stands.
 
-            Threads started anywhere else -- every thread in a process that is
-            not inside a query or a hook at that instant -- are left exactly as
-            they were, at the cost of one scan of an almost always empty tuple.
+            Every other thread start (any thread outside a query or a hook at
+            that instant) is left as it was, at the cost of one scan of an
+            almost always empty tuple.
             """
             inside = any(
                 db._current_frame() is not None or db._resource_hook_depth.get() > 0
                 for db in _ACTIVE_GUARDS.get()
             )
             if inside and not getattr(thread, "_pyinc_context_bound", False):
-                # A fresh snapshot per spawn: a Context may not be entered
-                # twice, and the child must not share one with a sibling.
+                # A fresh snapshot per spawn: a Context can be entered only
+                # once, and each child needs its own, apart from its siblings.
                 spawning_context = copy_context()
                 original_run = thread.run
 
                 def run_in_spawning_context() -> None:
                     spawning_context.run(original_run)
 
-                # Rebound on the instance, so Thread subclasses and Timer --
-                # which define their own run() -- are covered without touching
-                # the class.
+                # Rebound on the instance, so Thread subclasses and Timer
+                # (which define their own run()) are covered and the class
+                # stays untouched.
                 thread.run = run_in_spawning_context  # type: ignore[method-assign]
                 thread._pyinc_context_bound = True  # type: ignore[attr-defined]
             original_thread_start(thread)
 
         # `pathlib` and pyinc reach `realpath` and `abspath` through
         # `os.path`, and the path module's own functions (`relpath`,
-        # `ismount`, Windows' `realpath`) through its namespace, which is the
-        # same object; a module that bound one of them by name before the
-        # guard was installed (`sysconfig` binds `realpath`) keeps the
-        # original.
+        # `ismount`, Windows' `realpath`) reach them through its namespace,
+        # which is the same object. A module that bound one of them by name
+        # before the guard was installed (`sysconfig` binds `realpath`) keeps
+        # the original.
         original_realpath = os.path.realpath
         original_abspath = os.path.abspath
         guarded_realpath = _cwd_anchoring_realpath(original_realpath, os.path)
@@ -1340,7 +1327,7 @@ def _install_guards_once() -> None:
             (guarded_thread_start, "threading", "Thread.start", original_thread_start),
         ):
             _name_as_installed(wrapper, module, qualname, original)
-        # Named before anything is replaced: everything that can fail runs
+        # Named before anything is replaced. Everything that can fail runs
         # here, so the guard goes in whole or not at all, and is marked
         # installed as soon as it is in.
         entries: dict[int, _GuardedName] = {}
@@ -1436,7 +1423,7 @@ class _GuardedEnviron(MutableMapping[AnyStr, AnyStr]):
 
     # The PEP 584 operators mirror `os._Environ` so `os.environ | {...}` keeps
     # working after the guard is installed. Both `|` directions build their dict
-    # from `self`, so the reads go through the guarded `keys`/`__getitem__`;
+    # from `self`, so the reads go through the guarded `keys`/`__getitem__`.
     # `|=` only writes, matching the unguarded `__setitem__`.
     def __or__(self, other: object) -> dict[AnyStr, AnyStr]:
         if not isinstance(other, Mapping):
@@ -1460,10 +1447,10 @@ class _GuardedEnviron(MutableMapping[AnyStr, AnyStr]):
 
     def __getattr__(self, name: str) -> Any:
         # `os._Environ` carries codec helpers beyond the mapping protocol
-        # (encodekey/decodekey/encodevalue/decodevalue); expose exactly those.
-        # Everything else stays hidden: `os._Environ` internals such as `_data`
-        # hold the live environment as a plain attribute, so delegating unknown
-        # names would hand queries an unchecked read path around the guard.
+        # (encodekey/decodekey/encodevalue/decodevalue). Expose only those.
+        # `os._Environ` internals such as `_data` hold the live environment as
+        # a plain attribute, so delegating other names would hand queries an
+        # unchecked read path around the guard.
         if name in ("encodekey", "decodekey", "encodevalue", "decodevalue"):
             return getattr(self._wrapped, name)
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
@@ -1472,14 +1459,14 @@ class _GuardedEnviron(MutableMapping[AnyStr, AnyStr]):
 class Subscription:
     """Handle returned by `Database.observe(...)`.
 
-    Calling `unsubscribe()` detaches exactly the registration that produced
-    this handle -- equal callbacks and duplicate registrations each hold their
-    own -- and no change committed after it returns reaches that registration.
-    Repeated unsubscribes are no-ops. Like `observe`, `unsubscribe` is
-    outside-only: called from a query body, a resource hook, or a thread
-    spawned inside a running execution it raises `ReentrantDatabaseError`.
-    Subscriptions do not keep the observed node alive under LRU eviction; if
-    the node is evicted and later re-executed, the callback fires as normal.
+    Calling `unsubscribe()` detaches only the registration that produced this
+    handle. Equal callbacks and duplicate registrations each hold their own.
+    No change committed after it returns reaches that registration. Repeated
+    unsubscribes are no-ops. Like `observe`, `unsubscribe` is outside-only:
+    called from a query body, a resource hook, or a thread spawned inside a
+    running execution, it raises `ReentrantDatabaseError`. A subscription
+    leaves the observed node subject to LRU eviction. If the node is evicted
+    and later re-executed, the callback fires as normal.
     """
 
     __slots__ = ("_database", "_key", "_callback", "_token", "_active")
@@ -1508,38 +1495,38 @@ class Subscription:
 
 class Database:
     # The two instance-dictionary names a query handle carries its annotations
-    # under. They are folded and observed through the annotation vocabulary
-    # rather than the ambient-capture one, so an annotation naming a
-    # module-anchored type stays an anchor instead of becoming a namespace
-    # walk.
+    # under. They are folded and observed through the annotation vocabulary in
+    # place of the ambient-capture one, so an annotation naming a
+    # module-anchored type stays an anchor and never becomes a namespace walk.
     _QUERY_HANDLE_ANNOTATION_NAMES: ClassVar[frozenset[str]] = frozenset(
         {"__annotate__", "__annotations__"}
     )
     # Instance-dictionary names the generic walk over a handle skips because
     # something else owns them: the contract fields the payloads beside the
     # handle fold directly, and `__wrapped__`, which the fold and the
-    # observation each give an arm of their own. It stays on this list rather
-    # than joining the walk: folded unconditionally, a handle's reference to
+    # observation each give an arm of their own. `__wrapped__` stays on this
+    # list and out of the walk. Folded unconditionally, a handle's reference to
     # its own function would carry that function's defining module into the
     # ambient-capture route, which refuses a module with no stable source
-    # identity -- every query defined in `__main__` among them.
+    # identity (every query defined in `__main__` among them).
     _QUERY_HANDLE_SIBLING_NAMES: ClassVar[frozenset[str]] = frozenset(
         {"fn", "eq", "cutoff", "key", "__wrapped__"}
     )
     # Instance-dictionary names `_query_handle_state_payload` folds by hand or
     # leaves to one of those siblings, so its walk over the rest of the handle
-    # skips them. Class attributes rather than module constants: every module
-    # constant this file defines is folded again for every query whose
-    # annotations anchor to a pyinc type.
+    # skips them. These are class attributes because every module constant this
+    # file defines is folded again for every query whose annotations anchor to
+    # a pyinc type.
     _QUERY_HANDLE_CONTRACT_NAMES: ClassVar[frozenset[str]] = (
         _QUERY_HANDLE_ANNOTATION_NAMES
         | _QUERY_HANDLE_SIBLING_NAMES
         | frozenset({"__doc__", "__module__", "__name__", "__qualname__", "__type_params__"})
     )
-    # Held here, not as a module constant: `_module_constants_payload` folds
-    # this module's own module-level bindings when a query captures it, and an
-    # installation path has no business inside a fingerprint. A class attribute
-    # is skipped by that fold, and these values are only ever compared against.
+    # A class attribute, kept out of the module constants:
+    # `_module_constants_payload` folds this module's module-level bindings
+    # when a query captures it, and an installation path has no place in a
+    # fingerprint. That fold skips class attributes, and these values are only
+    # ever compared against.
     _STDLIB_DIRECTORY_PREFIXES: ClassVar[tuple[str, ...]] = _stdlib_directory_prefixes()
 
     def __init__(
@@ -1559,33 +1546,31 @@ class Database:
             raise ValueError("max_query_nodes must be a positive integer or None.")
         self.mode = mode
         self.max_query_nodes = max_query_nodes
-        # Function-scope so this module keeps importing nothing from the
-        # resource module at import time -- that module imports this one.
+        # Function-scope so this module imports nothing from the resource
+        # module at import time, because that module imports this one.
         from .resources import BUILTIN_ADAPTERS
 
         # The kernel's adapters for its own value types come first, so a caller
         # registering their own adapter for one of those types replaces the
-        # entry instead of colliding with it. The replacement is a caller
-        # adapter in every respect; `_partition_adapters_by_kernel_membership`
-        # decides that by membership, below.
+        # entry without colliding. The replacement is a caller adapter in every
+        # respect. `_partition_adapters_by_kernel_membership` decides that by
+        # membership, below.
         #
-        # Because the built-in entries are always present, that partition needs
-        # their implementation digests at every construction -- derived on the
-        # first construction in the process (or on each of several made at
-        # once), published once, and read back after it, see
+        # The built-in entries are always present, so that partition needs
+        # their implementation digests at every construction. They are derived
+        # on the first construction in the process (or on each of several made
+        # at once), published once and read back after; see
         # `_FIXED_ADAPTER_IMPLEMENTATION_DIGESTS`. That derivation is un-guarded
-        # on purpose: a built-in that stopped fingerprinting cleanly would raise
-        # out of `Database(...)` itself rather than be demoted to a caller
-        # adapter and pay the full per-boundary cost silently. What keeps that
-        # honest is a test, not a guard --
-        # `test_the_builtin_file_stat_adapter_digests_cleanly`.
+        # on purpose. A built-in that stopped fingerprinting cleanly raises out
+        # of `Database(...)` itself, so it is never silently demoted to a
+        # caller adapter paying the full per-boundary cost. A test enforces
+        # this: `test_the_builtin_file_stat_adapter_digests_cleanly`.
         self._adapters = {**BUILTIN_ADAPTERS, **dict(adapters or {})}
         # The registry is fixed for this database's lifetime, so the key-indexed
-        # view every boundary exposure needs is built once here rather than per
-        # exposure.
+        # view every boundary exposure needs is built once here.
         self._view_adapter_registry = _AdapterRegistry(self._adapters)
         # Per-adapter-key implementation digests read from a loaded checkpoint's
-        # manifest; the warm gate compares these against the live registry.
+        # manifest. The warm gate compares these against the live registry.
         self._checkpoint_adapter_digests: dict[str, str] = {}
         self._store = (
             _validated_store(store, "The store passed to Database(...)")
@@ -1609,9 +1594,9 @@ class Database:
         )
         self._allow_raw_reads: ContextVar[bool] = ContextVar("pyinc_allow_raw_reads", default=False)
         # How deep the calling context stands inside this database's resource
-        # hooks; zero means outside them. The boundary predicate reads it rather
-        # than an argument, so a probe -- which is handed no database and can
-        # still hold one -- is covered exactly as a load is.
+        # hooks. Zero means outside them. The boundary predicate reads this in
+        # place of an argument, so a probe (handed no database, yet able to
+        # hold one) is covered as a load is.
         self._resource_hook_depth: ContextVar[int] = ContextVar(
             "pyinc_resource_hook_depth", default=0
         )
@@ -1672,20 +1657,20 @@ class Database:
         self._fingerprint_resource_collector: ContextVar[list[tuple[Any, str]] | None] = ContextVar(
             "pyinc_fingerprint_resource_collector", default=None
         )
-        # Plain instance state, not a ContextVar like the request slots beside
-        # it, and deliberately so: the only cross-thread effect is one request
-        # replacing another's cache, which costs the loser fresh reads and can
-        # never hand anyone a digest from a request that has already ended.
-        # Degrading toward re-reading is the safe direction, so the weaker
-        # container buys simplicity without opening a staleness class.
+        # Plain instance state, unlike the ContextVar request slots beside it,
+        # on purpose. The only cross-thread effect is one request replacing
+        # another's cache. That costs the loser fresh reads and never hands
+        # anyone a digest from a request that has already ended. Degrading
+        # toward re-reading is the safe direction, so the simpler container
+        # opens no staleness class.
         self._request_resource_digests: dict[int, tuple[Any, str]] | None = None
         self._fingerprint_cacheable: ContextVar[bool] = ContextVar(
             "pyinc_fingerprint_cacheable", default=True
         )
         self._resource_registry: dict[NodeKey, tuple[Any, Any]] = {}
         self._call_snapshot_registry: dict[NodeKey, Any] = {}
-        # Token-keyed so equal callbacks and duplicate
-        # registrations each own one slot; insertion order is delivery order.
+        # Token-keyed so equal callbacks and duplicate registrations each own
+        # one slot. Insertion order is delivery order.
         self._observers: dict[NodeKey, dict[int, ObserverCallback]] = {}
         self._observer_token_counter = 0
         self._observer_error_hook: ObserverErrorHook = (
@@ -1696,32 +1681,31 @@ class Database:
         self._checkpoint_resource_probes: dict[NodeKey, tuple[Any, str]] = {}
         self._checkpoint_load_store: ArtifactStore | None = None
         self._checkpoint_snapshot_cache: dict[str, Snapshot] = {}
-        # The transitive pinned-query set of the record currently being warmed.
-        # Set at the warm root and consulted while warming its dependency queries
-        # so an unpinned (non-code-pinnable) dep query is never served stale.
+        # The transitive pinned-query set of the record being warmed. Set at the
+        # warm root and read while warming its dependency queries, so an
+        # unpinned (non-code-pinnable) dep query is never served stale.
         self._checkpoint_root_pinned: builtins.set[str] | None = None
-        # Companion object maps for the record currently being warmed, keyed by
-        # the same identity strings the sets carry: query_id -> Query object (for
+        # Companion object maps for the record being warmed, keyed by the same
+        # identity strings the sets carry: query_id -> Query object (for
         # execute-to-verify) and resource identity -> resource object (for
-        # probe-hint restoration). Set at the warm root, consulted transitively.
+        # probe-hint restoration). Set at the warm root, read transitively.
         self._checkpoint_root_pinned_query_objects: dict[str, Any] | None = None
         self._checkpoint_root_pinned_resources: dict[str, Any] | None = None
-        # Which registered adapters this database treats as fixed, and the
-        # implementation digests it can therefore take once instead of at every
-        # trust boundary. Runs here rather than beside the registry itself
-        # because it fingerprints, and the fingerprint walk reads the request
-        # slots above -- moved up beside `_adapters` it raises on
-        # `_type_fingerprint_stack`.
+        # Which registered adapters this database treats as fixed. Their
+        # implementation digests are taken once, and every trust boundary
+        # reads them back. Runs here, after the request slots above, because
+        # it fingerprints and the fingerprint walk reads those slots. Moved up
+        # beside `_adapters`, it raises on `_type_fingerprint_stack`.
         self._partition_adapters_by_kernel_membership()
         # Digest of each registered adapter's instance configuration, taken
         # once at construction. Mutating a registered adapter afterwards
-        # violates the value-boundary law; every top-level request re-derives
+        # violates the value-boundary law. Every top-level request re-derives
         # the digest of each adapter named here and raises AdapterContractError
         # when one moved. An adapter whose configuration cannot be digested
-        # contributes no entry: drift there is undetectable in-process and
+        # contributes no entry. Drift there is undetectable in-process, so
         # enforcement falls back to the documented law (the checkpoint boundary
-        # still refuses trust there), while every other adapter in the same
-        # registry stays checked.
+        # still refuses trust there). Every other adapter in the same registry
+        # stays checked.
         self._registered_adapter_digests: dict[str, str] = (
             self._digestable_adapter_configuration_digests()
         )
@@ -1731,27 +1715,25 @@ class Database:
         """Split the registry into the kernel's own fixed adapters and the rest.
 
         Fixed means one of the kernel's own entries, still the object the kernel
-        put there -- decided by membership, same adapted type AND same adapter
-        object, never by inspecting an adapter for signs of statelessness. A
+        put there. Membership decides it (same adapted type AND same adapter
+        object); an adapter is never inspected for signs of statelessness. A
         caller who registers their own adapter for one of those types replaces
         the entry, so their adapter lands on the non-fixed side and is treated
-        exactly like any other caller adapter: full configuration verification
-        at request scope, implementation digest re-derived at every trust
+        like any other caller adapter: full configuration verification at
+        request scope, implementation digest re-derived at every trust
         boundary.
 
         A fixed adapter carries no instance state and its implementation lives
-        in this package, so nothing an in-contract process can do moves its
-        implementation digest. Those digests are therefore published once per
-        process, and the trust boundary reads them back instead of re-deriving
-        them at each of its call sites -- the difference between a dict lookup
-        and a fingerprint walk over two method bodies per boundary crossing.
-        The same argument is why the derivation is memoized across databases
-        rather than repeated per construction; see
-        `_FIXED_ADAPTER_IMPLEMENTATION_DIGESTS`.
+        in this package, so nothing an in-contract process does moves its
+        implementation digest. Those digests are published once per process,
+        and the trust boundary reads them back at each call site. That is a
+        dict lookup per boundary crossing in place of a fingerprint walk over
+        two method bodies. The same argument is why the derivation is memoized
+        across databases; see `_FIXED_ADAPTER_IMPLEMENTATION_DIGESTS`.
         """
 
-        # Function-scope so this module keeps importing nothing from the
-        # resource module at import time.
+        # Function-scope so this module imports nothing from the resource
+        # module at import time.
         from .resources import BUILTIN_ADAPTERS
 
         self._non_static_adapters: dict[type[Any], ValueAdapter] = {
@@ -1767,12 +1749,12 @@ class Database:
             memo_key = (key, type(adapter))
             digest = _FIXED_ADAPTER_IMPLEMENTATION_DIGESTS.get(memo_key)
             if digest is None:
-                # Still un-guarded, and still for the reason the merge states: a
-                # fixed adapter that stopped fingerprinting cleanly raises out of
-                # every construction in a fresh process, because nothing is
+                # Un-guarded, for the reason the merge in `__init__` states. A
+                # fixed adapter that stopped fingerprinting cleanly raises out
+                # of every construction in a fresh process, because nothing is
                 # memoized until a derivation succeeds.
                 derived = self._adapter_implementation_digest(adapter)
-                # Another construction may have published one meanwhile; use
+                # Another construction may have published one meanwhile. Use
                 # whichever the memo holds, never a private copy.
                 digest = _FIXED_ADAPTER_IMPLEMENTATION_DIGESTS.setdefault(memo_key, derived)
             self._static_adapter_digests[key] = digest
@@ -1854,15 +1836,14 @@ class Database:
             return tuple(sorted(nodes, key=lambda n: n.label))
 
     def set(self, input_key: Any, value: Any) -> None:
-        # Ahead of the type check as well as the lock: a refusal that ran after
-        # the key was resolved could leave a registration behind for an input
-        # the caller was never allowed to declare here. The body extends the
-        # same rule to the whole call. Every step that can fail -- the policy
-        # check, the freeze, the caller's comparator, the store write -- runs
-        # before the input is registered, so a `set` that raises for any reason
-        # leaves the registry, the records, the counters and the revision
-        # exactly as it found them, and the key stays free for whatever `set`
-        # eventually declares it.
+        # Ahead of the type check and the lock: a refusal that ran after the
+        # key was resolved could leave a registration behind for an input the
+        # caller was never allowed to declare here. The body extends the rule
+        # to the whole call. Every step that can fail (the policy check, the
+        # freeze, the caller's comparator, the store write) runs before the
+        # input is registered. So a `set` that raises for any reason leaves the
+        # registry, the records, the counters and the revision as it found
+        # them, and the key stays free for whatever `set` later declares it.
         self._reject_inside_query("db.set()")
         from .core import Input
 
@@ -1870,14 +1851,14 @@ class Database:
             raise TypeError("db.set() expects an Input instance.")
         with self._state_lock:
             self._validate_input_registration(input_key)
-            # Frozen but not published: the bytes reach the store on commit, so
+            # Frozen, still unpublished. The bytes reach the store on commit, so
             # a comparator that raises after a successful freeze cannot strand
             # an object nothing references.
             snapshot = freeze(value, adapters=self._view_adapter_registry)
             digest = fingerprint_snapshot(snapshot)
-            # Resolved, not registered: an already-declared key comes back from
-            # the registry and an undeclared one is built without being stored,
-            # so a call that still fails has claimed nothing.
+            # Resolved, still unregistered. A declared key comes back from the
+            # registry and an undeclared one is built without being stored, so
+            # a call that still fails has claimed nothing.
             node_key = self._input_node_key(input_key)
             record = self._records.get(node_key)
             equal = record is not None and self._compare_input_snapshots(
@@ -1921,8 +1902,8 @@ class Database:
                 record.reason = "input changed"
                 record.checked_in_request = self._current_request_id()
             self._stats["input_sets"] += 1
-            # A set is a declared change: inside a span the request must move
-            # so later gets re-derive from the new input instead of reusing
+            # A set is a declared change. Inside a span the request moves, so
+            # later gets re-derive from the new input in place of reusing
             # answers the span settled before it.
             self._roll_span_request()
 
@@ -1933,9 +1914,9 @@ class Database:
         from .core import Input
 
         with self._state_lock:
-            # Materialization is part of the transaction boundary: an iterator
-            # that fails halfway through cannot leave registrations or counters
-            # behind.
+            # Materialization is part of the transaction boundary, so an
+            # iterator that fails halfway through leaves no registrations or
+            # counters behind.
             materialized = list(updates)
             raw_pairs: list[tuple[Any, Any]] = []
             seen_keys: set[str] = set()
@@ -1956,10 +1937,10 @@ class Database:
                 self._validate_input_registration(input_key)
                 raw_pairs.append((input_key, value))
 
-            # Freeze every value before running any user comparator. Neither
-            # phase mutates database records, revisions, or statistics, and
-            # nothing reaches the store until the whole batch is accepted --
-            # so a comparator that raises leaves no unreferenced bytes behind.
+            # Freeze every value before running any user comparator. Both
+            # phases leave database records, revisions and statistics alone,
+            # and the store sees nothing until the whole batch is accepted, so
+            # a comparator that raises leaves no unreferenced bytes behind.
             pending: list[tuple[Any, NodeKey, Any, str]] = []
             for input_key, value in raw_pairs:
                 snapshot = freeze(value, adapters=self._view_adapter_registry)
@@ -1977,9 +1958,9 @@ class Database:
                 decisions.append((equal, input_key, node_key, snapshot, digest))
 
             # Commit registrations and record changes only after every freeze
-            # and comparator has succeeded. The store writes lead, being the
-            # last step that can fail: a store that refuses one of the frozen
-            # values leaves the batch entirely undeclared.
+            # and comparator has succeeded. The store writes lead, as the last
+            # step that can fail. A store that refuses one of the frozen values
+            # leaves the whole batch undeclared.
             for _input_key, _node_key, pending_snapshot, _digest in pending:
                 self._persist_snapshot(pending_snapshot)
             for input_key, _value in raw_pairs:
@@ -2030,14 +2011,14 @@ class Database:
                     record.reason = "input changed"
                     record.checked_in_request = request_id
                 self._stats["input_sets"] += 1
-            # A set is a declared change: inside a span the request must move
-            # so later gets re-derive from the new inputs instead of reusing
+            # A set is a declared change. Inside a span the request moves, so
+            # later gets re-derive from the new inputs in place of reusing
             # answers the span settled before them.
             self._roll_span_request()
 
     def get(self, query: _core.Query[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
-        # Before the lock, always: a thread spawned inside a query cannot be
-        # told to wait for a lock its own parent is holding.
+        # Always before the lock: a thread spawned inside a query must never
+        # wait for a lock its own parent is holding.
         self._reject_reentrant_read("db.get()")
         from .core import Query
 
@@ -2060,27 +2041,27 @@ class Database:
                     and frame_now.key == key
                 ):
                     # A caller that catches this raise returns a value built
-                    # from a failure the graph does not describe: no edge to
-                    # the node that raised is published, and nothing recorded
-                    # for it describes the exception, so the caller's own
-                    # answer can neither be re-derived nor re-verified from
-                    # records. It is marked untracked instead -- re-executed
-                    # on every request, kept out of checkpoints. The mark
-                    # lands on the frame this call is unwinding into, which is
-                    # the caller's: a node's own frame, where one was pushed at
-                    # all, is popped before its exception reaches here. A
-                    # caller that re-raises writes no record, so the reason is
-                    # only ever read off a query that really did catch.
+                    # from a failure the graph does not describe. No edge to
+                    # the node that raised is published, and no record
+                    # describes the exception, so records can neither
+                    # re-derive nor re-verify the caller's answer. It is
+                    # marked untracked: re-executed on every request, kept
+                    # out of checkpoints. The mark lands on the frame this call
+                    # unwinds into, which is the caller's, because a node's
+                    # own frame (where one was pushed) is popped before its
+                    # exception reaches here. A caller that re-raises writes
+                    # no record, so the reason is only read off a query that
+                    # did catch.
                     #
-                    # The single exception above is a node refused for
-                    # re-entering itself: the frame that would be marked is the
-                    # very node this request names, so the refusal happened
-                    # before any work started and nothing was read into a
-                    # discarded frame -- and that request stays pinned to the
-                    # registration this execution already owns. A cycle that
-                    # reaches back through another query is not that shape:
-                    # the branch that reached back read whatever it read first,
-                    # and its frame is discarded with those reads in it.
+                    # The one exemption above is a node refused for
+                    # re-entering itself. The frame that would be marked is
+                    # the node this request names, so the refusal came before
+                    # any work and nothing was read into a discarded frame.
+                    # That request also stays pinned to the registration this
+                    # execution already owns. A cycle that reaches back
+                    # through another query differs: the branch that reached
+                    # back read whatever it read first, and its frame is
+                    # discarded with those reads in it.
                     self._mark_frame_impure(f"caught exception from sub-query '{key.label}'")
                 raise
             self._record_dependency(key)
@@ -2089,8 +2070,8 @@ class Database:
         return result
 
     def explain(self, query: _core.Query[P, Any], *args: P.args, **kwargs: P.kwargs) -> str:
-        # Checked here rather than left to the inspect below, so the refusal
-        # names the call the caller actually made.
+        # Checked here, ahead of the inspect below, so the refusal names the
+        # call the caller made.
         self._reject_inside_query("db.explain()")
         from .core import Query
 
@@ -2146,26 +2127,25 @@ class Database:
         """Hold one request open across several top-level calls.
 
         ``get`` / ``inspect`` / ``inspect_fresh`` / ``read_resource`` calls
-        inside the span join a single request instead of opening one each, so
-        once-per-request work -- resource validation above all -- happens once
-        for the whole batch. Entering the span declares that the world the
-        database reads from does not change until it closes; a caller that
-        changes it mid-span must say so with :meth:`request_inputs_changed`
-        (``set`` and ``set_many`` declare their own changes). The request
-        boundary moves with the span: failure exceptions retained for
-        re-raising stay live to its end, and observer events are delivered
-        when the outermost span closes -- cleanly or on an exception --
-        exactly as they are for a single ``get``. Spans are reentrant -- an
-        inner span, or one opened inside a ``get``, joins the enclosing
-        request and its close does nothing. A span is its own thread's: a call
-        from another thread opens a request of its own, even through a context
-        copied from inside the span.
+        inside the span join a single request, so once-per-request work
+        (resource validation above all) happens once for the whole batch.
+        Entering the span declares that the world the database reads from
+        holds still until it closes. A caller that changes it mid-span must
+        say so with :meth:`request_inputs_changed` (``set`` and ``set_many``
+        declare their own changes). The request boundary moves with the span.
+        Failure exceptions kept for re-raising stay live to its end. Observer
+        events are delivered when the outermost span closes, cleanly or on an
+        exception, as they are for a single ``get``. Spans are
+        reentrant. An inner span, or one opened inside a ``get``, joins the
+        enclosing request and its close does nothing. A span belongs to its
+        own thread. A call from another thread opens its own request, even
+        through a context copied from inside the span.
         """
         self._reject_reentrant_read("db.request_span()")
         scope = self._request_scope()
         with self._state_lock:
             pending = scope.__enter__()
-            # A fresh request (rather than one joined) is the span's own.
+            # Only a fresh request, never a joined one, is the span's own.
             opened = self._request.get() if pending is not None else None
             if opened is not None:
                 opened.span = True
@@ -2179,10 +2159,10 @@ class Database:
         finally:
             with self._state_lock:
                 scope.__exit__(None, None, None)
-            # Deliver outside the lock, exactly as a single get does. Work the
-            # span committed keeps its notifications even when a later part of
-            # the request fails, so delivery runs on the failure path too --
-            # where it must never mask the propagating span-body exception.
+            # Deliver outside the lock, as a single get does. Work the span
+            # committed keeps its notifications even when a later part of the
+            # request fails, so delivery runs on the failure path too. There it
+            # must never mask the propagating span-body exception.
             if body_exc is None:
                 self._dispatch_events(pending)
             else:
@@ -2192,17 +2172,17 @@ class Database:
     def request_inputs_changed(self) -> None:
         """Declare that the world outside the database changed mid-span.
 
-        The declaration rolls any open :meth:`request_span` -- held by this
-        thread or another -- onto a fresh request, so the span's next read of
-        each node re-validates instead of answering from its earlier
-        observation. Without a span open anywhere it changes nothing: every
-        top-level call already opens its own request.
+        The declaration rolls any open :meth:`request_span` (held by this
+        thread or another) onto a fresh request, so the span's next read of
+        each node re-validates in place of answering from its earlier
+        observation. With no span open anywhere it changes nothing, because
+        every top-level call already opens its own request.
 
         Callers using `pyinc.integrations`' `request_scope` /
         `once_per_request` should call the integrations-level
-        `request_inputs_changed()` instead: it clears that scope's memo and
-        forwards here, whereas this method alone leaves the integrations memo
-        answering from the old world.
+        `request_inputs_changed()` in place of this method. It clears that
+        scope's memo and forwards here. This method alone leaves the
+        integrations memo answering from the old world.
         """
         self._reject_inside_query("db.request_inputs_changed()")
         with self._state_lock:
@@ -2219,9 +2199,9 @@ class Database:
         intermediate ids need no bookkeeping.
         """
         self._span_epoch += 1
-        # A declared change is the one thing that may move a resource's
-        # configuration inside a request, so the once-per-request digests go
-        # with it and the span's next read re-reads.
+        # A declared change is the only thing that may move a resource's
+        # configuration inside a request, so the once-per-request digests are
+        # cleared with it and the span's next read re-reads.
         if self._request_resource_digests is not None:
             self._request_resource_digests.clear()
         self._sync_span_to_epoch()
@@ -2229,12 +2209,12 @@ class Database:
     def _sync_span_to_epoch(self) -> None:
         """Roll this thread's open span forward when the epoch moved past it.
 
-        Callers hold the state lock. Outside a span there is nothing to do:
+        Callers hold the state lock. Outside a span this does nothing, because
         each top-level call mints a fresh request id no record can already
         carry. Inside one, a seen epoch behind the instance's means another
-        thread committed a change since the span last synced, so the request
-        id moves exactly as it does for a same-thread declaration and the
-        span's next reads re-validate against the committed state.
+        thread committed a change since the span last synced. The request id
+        then moves as it does for a same-thread declaration, and the span's
+        next reads re-validate against the committed state.
         """
         request = self._live_request()
         if request is None or not request.span:
@@ -2257,13 +2237,13 @@ class Database:
         Observer callbacks fire once per value move committed by a top-level
         `get` / `inspect` / `inspect_fresh` / `explain` call or by the calls
         inside a `request_span`: a cold execution, or a re-execution that
-        advanced the node's `changed_at`. Backdated and reused decisions do not
-        fire, and neither does a re-execution on a node marked untracked that
+        advanced the node's `changed_at`. Backdated and reused decisions stay
+        silent. So does a re-execution of a node marked untracked that
         re-landed a byte-identical value: such a node re-runs on every request
-        and keeps the `changed_at` it had, so it announces nothing new.
+        and keeps the `changed_at` it had, so it has nothing new to announce.
 
         Each call to `observe` is its own registration with its own
-        `Subscription` handle: registering the same callable twice delivers
+        `Subscription` handle. Registering the same callable twice delivers
         twice, and each handle detaches only its own registration. An event's
         recipients are the subscriptions that existed when the change committed
         and still exist when delivery begins.
@@ -2271,14 +2251,14 @@ class Database:
         Callbacks run after the request scope completes and the kernel lock is
         released, so a callback may safely call back into the database.
         Exceptions from a callback are routed to the `observer_error_hook`
-        (default: a one-line stderr log) and do not suppress sibling callbacks
-        or corrupt kernel state. Both `observe` and `Subscription.unsubscribe`
+        (default: a one-line stderr log). Sibling callbacks still run and
+        kernel state stays intact. Both `observe` and `Subscription.unsubscribe`
         are outside-only and raise `ReentrantDatabaseError` from a query body, a
         resource hook, or a thread spawned inside a running execution.
         """
         # Registration is per call, and a query body runs only when the kernel
         # decides to execute it, so registering from one would make the
-        # subscriber list a function of cache history.
+        # subscriber list depend on cache history.
         self._reject_inside_query("db.observe()")
         from .core import Query
 
@@ -2294,10 +2274,10 @@ class Database:
         return Subscription(self, key, callback, token)
 
     def report_untracked_read(self, reason: str) -> None:
-        # Before the lock, which this method takes ahead of everything else: a
-        # spawned thread blocks there and never reaches the frame check below.
-        # That check would let it through in any case -- a descendant inherits
-        # its parent's frame.
+        # Before the lock, which this method takes ahead of everything else. A
+        # spawned thread would block there and never reach the frame check
+        # below, and that check would let it through anyway, because a
+        # descendant inherits its parent's frame.
         self._reject_reentrant_read("db.report_untracked_read()")
         with self._state_lock:
             frame = self._current_frame()
@@ -2336,7 +2316,7 @@ class Database:
         # Ahead of resolving the store, which is the first step towards the
         # cross-process lock a filesystem store takes to publish an object.
         self._reject_inside_query("db.save_checkpoint()")
-        # A store configured at construction was validated there; one handed
+        # A store configured at construction was validated there. One handed
         # over here is a fresh injection and gets the same check.
         _store = (
             _validated_store(store, "The store passed to save_checkpoint()")
@@ -2361,17 +2341,17 @@ class Database:
 
         Checkpoint records that cannot be verified (missing snapshot bytes,
         changed inputs, no live record for a resource dependency) are silently
-        skipped; the affected queries re-execute on the next :meth:`get` call.
+        skipped. The affected queries re-execute on the next :meth:`get` call.
         A warmed record joins the loading database's own revision timeline, so
         the usual invalidation machinery governs it from then on.
 
         Where a record was skipped because the store holds *different* bytes
         under its digest, persisting the re-executed value back into that store
-        raises the store's collision error rather than writing over it: the
-        content address is already bound to bytes that disagree, and corruption
-        surfaces loudly instead of being silently recomputed around on every
-        run. A database with no store of its own -- one handed a store here and
-        nowhere else -- reads through it without writing back.
+        raises the store's collision error and leaves the stored bytes in
+        place. The content address is already bound to bytes that disagree, so
+        corruption surfaces loudly and is never silently recomputed around on
+        every run. A database with no store of its own (one handed a store
+        here and nowhere else) reads through it without writing back.
 
         Raises ``TypeError`` if a store passed here does not implement the
         ``ArtifactStore`` protocol.
@@ -2381,8 +2361,8 @@ class Database:
         running a different mode.
         """
         self._reject_inside_query("db.load_checkpoint()")
-        # A store handed over here outlives the call -- it serves every later
-        # snapshot read -- so it is checked before the key is even looked up.
+        # A store handed over here outlives the call (it serves every later
+        # snapshot read), so it is checked before the key is looked up.
         _store = (
             _validated_store(store, "The store passed to load_checkpoint()")
             if store is not None
@@ -2399,24 +2379,24 @@ class Database:
     def _record_is_stale_for_save(self, record: NodeRecord) -> bool:
         """True if *record*'s cached value is out of date w.r.t. its live deps.
 
-        A checkpoint may only persist records whose snapshot matches what a fresh
-        recomputation against the *current* graph would produce. When a dependency
-        (typically an ``Input``) is mutated after this record last executed but
-        before ``save_checkpoint`` -- a "dirty graph" with no intervening ``get``
-        -- the record's snapshot is stale, yet the manifest would bake in the
-        dep's *new* digest (``dep_record.digest`` is read live below), yielding a
-        record that warms the stale value on reload and violates from-scratch
-        consistency. Detect that here with the same timeline rule the warm gate
-        uses (`_maybe_changed_after`): any dep that changed after this record was
-        last verified -- or that is missing or untracked, and so can never be
-        trusted at load -- makes the record unsafe to persist.
+        A checkpoint may only persist records whose snapshot matches what a
+        fresh recomputation against the *current* graph would produce. Suppose
+        a dependency (typically an ``Input``) is mutated after this record last
+        executed and before ``save_checkpoint``, with no ``get`` in between (a
+        "dirty graph"). The record's snapshot is stale, yet the manifest would
+        bake in the dep's *new* digest (``dep_record.digest`` is read live
+        below). That record would warm the stale value on reload and violate
+        from-scratch consistency. This check uses the warm gate's timeline rule
+        (`_maybe_changed_after`). Any dep that changed after this record was
+        last verified, or that is missing or untracked and so never trusted at
+        load, makes the record unsafe to persist.
 
-        Pure by design: this never executes a query or re-probes a resource, so a
-        save never mutates the graph. Only directly-stale records are flagged;
-        a record whose stale value is transitively caused by a stale *child* is
-        left to the load path, where the omitted child fails re-verification
-        (execute-to-verify / warm-dep) and the parent is refused rather than
-        warmed stale (see the checkpoint dep-verification path).
+        Pure by design: this never executes a query or re-probes a resource, so
+        a save never mutates the graph. Only directly-stale records are
+        flagged. A record whose stale value comes transitively from a stale
+        *child* is left to the load path. There the omitted child fails
+        re-verification (execute-to-verify / warm-dep) and the parent is
+        refused, never warmed stale (see the checkpoint dep-verification path).
         """
         for dep_key in record.dependencies:
             dep_record = self._records.get(dep_key)
@@ -2434,9 +2414,9 @@ class Database:
             for key, record in self._records.items()
             if key.kind in ("query", "resource")
             # A failure record has no value to persist, and a reader that handled
-            # the failure is only reproducible while the load keeps failing. Both
-            # are omitted -- the dep-closure below drops every parent too -- so a
-            # checkpoint never warms a result derived from an absent value.
+            # the failure is only reproducible while the load keeps failing.
+            # Both are left out (the dep-closure below drops every parent too),
+            # so a checkpoint never warms a result derived from an absent value.
             and not record.is_failed
             # The same exclusion for a failure the graph could not record: the
             # resource record whose probe an unrecorded raise contradicted (it
@@ -2477,8 +2457,9 @@ class Database:
             # own name, content-addressed by the digest already in the manifest:
             # a query's call snapshot (keyed by its args_digest) so it can be
             # re-run to verify, and a resource's frozen parameter (keyed by its
-            # args_digest) so its object can be re-probed live. No manifest field
-            # is added -- the digests already live on the record and its deps.
+            # args_digest) so its object can be re-probed live. The manifest
+            # needs no new field, because the digests already live on the
+            # record and its deps.
             if key.kind == "query":
                 call_snapshot = self._call_snapshots().get(key)
                 if call_snapshot is None:
@@ -2532,8 +2513,8 @@ class Database:
                             "digest": dep_record.digest,
                         }
                     )
-            # Canonical, order-independent dep ordering so the manifest bytes (and
-            # thus the checkpoint key) do not depend on set/dict iteration order.
+            # Canonical dep order, so the manifest bytes (and so the checkpoint
+            # key) are independent of set/dict iteration order.
             deps.sort(key=_canonical_dep_key)
             entry: dict[str, Any] = {
                 "kind": key.kind,
@@ -2555,10 +2536,10 @@ class Database:
                     probe_snapshot = cast(Snapshot, record.probe)
                     entry["probe_bytes"] = serialize_snapshot(probe_snapshot).hex()
                 except (UnsupportedValueError, TypeError):
-                    # Probe hint is best-effort: if a resource's probe value
+                    # Probe hint is best-effort. If a resource's probe value
                     # can't be serialised, the checkpoint still records the
-                    # snapshot digest and the resource will be re-probed on
-                    # load instead of relying on the cached probe match.
+                    # snapshot digest, and on load the resource is re-probed
+                    # with no cached probe match to rely on.
                     pass
             records_list.append(entry)
 
@@ -3018,22 +2999,22 @@ class Database:
         if ckpt.get("is_untracked"):
             return False
         # The root call snapshot is materialized per mode to obtain the
-        # arguments passed to the query, and an adapted value is reconstructed
-        # through its adapter on every one of those paths. A changed adapter
-        # can therefore alter a fresh execution's inputs even when the saved
-        # result itself uses only native values.
+        # arguments passed to the query, and an adapted value is rebuilt
+        # through its adapter on every one of those paths. So a changed adapter
+        # can alter a fresh execution's inputs even when the saved result
+        # itself uses only native values.
         if not self._adapter_keys_trusted(collect_adapter_keys(call_snapshot)):
             return False
         # An adapter whose implementation changed (or vanished) since the save
         # would thaw this record's snapshot into a value a fresh run would not
-        # produce. Refuse and re-execute under the live adapter instead.
+        # produce. Refuse, and re-execute under the live adapter.
         if not self._adapter_keys_trusted(ckpt.get("adapter_keys", ())):
             return False
         # The root's transitive pinned-query set governs this warm and every
         # dependency query warmed beneath it. A dep query outside the set was
-        # reached via a runtime import or dynamic dispatch, so its code is not
-        # pinned into any identity here and it must not be served from the
-        # checkpoint -- refuse and let a fresh execution re-derive it.
+        # reached via a runtime import or dynamic dispatch, so no identity here
+        # pins its code. Refuse to serve it from the checkpoint and let a fresh
+        # execution re-derive it.
         pinned_query_objects, pinned_resource_objects = self._collect_pinned_capture_objects(
             query.fn
         )
@@ -3057,7 +3038,7 @@ class Database:
         snapshot = self._load_snapshot_from_store(ckpt["snapshot_digest"])
         if snapshot is _MISSING_SNAPSHOT:
             return False
-        # Normalise the warmed record onto this database's timeline: its old
+        # Move the warmed record onto this database's timeline. Its old
         # changed_at belongs to the saving process and means nothing here.
         # changed_at == verified_at == the current revision, plus real edges,
         # lets the ordinary red/green machinery govern it. checked_in_request
@@ -3084,11 +3065,11 @@ class Database:
         """Warm a checkpoint query dep from its saved record.
 
         The record is restored under its saved key, so it is served only when
-        the dep's live identity is that key's identity: the pinned object with
+        the dep's live identity is that key's identity. The pinned object with
         the dep's definition is fingerprinted afresh and compared to the saved
-        identity, and a mismatch or a missing object declines the warm. The
-        pinned-set gate argues the same thing from the root's fold; this check
-        holds even where that argument does not.
+        identity. A mismatch or a missing object declines the warm. The
+        pinned-set gate argues the same from the root's fold. This check holds
+        even where that argument fails.
         """
         if dep_key in self._records:
             return True
@@ -3107,7 +3088,7 @@ class Database:
         if live_identity != dep_key.identity:
             return False
         # Same adapter-trust gate as the root warm: a dep record frozen under a
-        # since-changed adapter must not be served from the checkpoint.
+        # since-changed adapter is never served from the checkpoint.
         if not self._adapter_keys_trusted(ckpt.get("adapter_keys", ())):
             return False
         call_snapshot = self._load_snapshot_from_store(dep_key.args_digest)
@@ -3118,7 +3099,7 @@ class Database:
         ):
             return False
         # Apply the root's pinned-query gate transitively: a dep-of-a-dep reached
-        # only via runtime import is not code-pinned and must not warm.
+        # only via runtime import has no code pin, so it never warms.
         pinned_queries = self._checkpoint_root_pinned
         if pinned_queries is not None and not self._checkpoint_deps_are_pinned(
             ckpt["deps"], pinned_queries
@@ -3164,8 +3145,8 @@ class Database:
         """Verify every checkpoint dep against live state and resolve its key.
 
         Returns the resolved dependency edges (as live ``NodeKey``s) when all
-        deps verify, or ``None`` if any dep cannot be verified -- in which case
-        the caller must refuse to warm and let the query re-execute.
+        deps verify, or ``None`` if any dep fails to verify. On ``None`` the
+        caller must refuse to warm and let the query re-execute.
         """
         resolved: set[NodeKey] = set()
         for dep in deps:
@@ -3234,15 +3215,15 @@ class Database:
         ):
             # Re-freezing a live result under a changed adapter can reproduce
             # the old bytes while thawing those bytes has different semantics.
-            # The digest therefore cannot validate a native parent result.
+            # So the digest cannot validate a native parent result.
             return False
         record = self._records.get(dep_key)
         if record is not None:
             return record.digest == expected_digest
         # Prefer warming the dep's subtree from the checkpoint (no execution:
         # resources come back via probe hints). If the subtree can't be warmed
-        # -- e.g. it reaches a resource unresolvable from the pinned captures --
-        # verify the dep by re-execution instead.
+        # (e.g. it reaches a resource unresolvable from the pinned captures),
+        # verify the dep by re-execution.
         if self._warm_checkpoint_dep_query(dep, dep_key):
             return self._records[dep_key].digest == expected_digest
         return self._execute_to_verify_query_dep(dep, dep_key, expected_digest)
@@ -3253,11 +3234,12 @@ class Database:
         """Verify a query dep by re-executing its pinned code against live state.
 
         Used when a query dep cannot be warmed from the checkpoint. Recovers the
-        dep's call snapshot from the store (content-addressed by its args_digest;
-        missing/corrupt ⇒ degrade to warm refusal), runs the pinned Query live --
-        so its resources are probed against the real world -- and compares the
-        resulting digest to the manifest's expectation. Equal ⇒ verified and now
-        live (downstream warming can reuse it); different ⇒ refuse.
+        dep's call snapshot from the store (content-addressed by its
+        args_digest; missing/corrupt ⇒ degrade to warm refusal). Runs the
+        pinned Query live, so its resources are probed against the real world,
+        and compares the resulting digest to the manifest's expectation. Equal
+        ⇒ verified and now live (downstream warming can reuse it). Different ⇒
+        refuse.
         """
         pinned_objects = self._checkpoint_root_pinned_query_objects
         if pinned_objects is None:
@@ -3270,21 +3252,21 @@ class Database:
         # twin) can hand back the wrong object. Registering it under the saved
         # identity would execute the wrong body live and poison the request via
         # the checked_in_request short-circuit. Refuse unless the live object's
-        # full identity matches the dep's -- mirroring the identity match that
-        # _resolve_checkpoint_resource applies to pinned resources. On refusal
-        # the parent re-executes and binds the correct object via _query_key.
+        # full identity matches the dep's, as _resolve_checkpoint_resource
+        # matches identity for pinned resources. On refusal the parent
+        # re-executes and binds the correct object via _query_key.
         live_identity = f"{query_obj.key}:{self._query_fingerprint(query_obj)}"
         if live_identity != dep_key.identity:
             return False
-        # Never re-run an impure (untracked) leaf as a warm-verification step:
-        # an untracked record is never trusted; let the parent re-execute it.
+        # Never re-run an impure (untracked) leaf as a warm-verification step.
+        # An untracked record is never trusted; let the parent re-execute it.
         ckpt = self._checkpoint_query_records.get(dep_key)
         if ckpt is not None and ckpt.get("is_untracked"):
             return False
         call_snapshot = self._load_snapshot_from_store(dep["args_digest"])
         if call_snapshot is _MISSING_SNAPSHOT:
             return False
-        # The call snapshot carries this dep's arguments; an adapted argument
+        # The call snapshot carries this dep's arguments. An adapted argument
         # thawed under a since-changed adapter would re-run the pinned query with
         # the wrong input. Refuse unless every adapter it uses is still trusted.
         if not self._adapter_keys_trusted(collect_adapter_keys(call_snapshot)):
@@ -3314,8 +3296,8 @@ class Database:
         if expected_snapshot is _MISSING_SNAPSHOT or not self._adapter_keys_trusted(
             collect_adapter_keys(cast(Snapshot, expected_snapshot))
         ):
-            # As with query dependencies, equal frozen bytes are not semantic
-            # evidence when the adapter that thaws them has changed.
+            # As with query dependencies, equal frozen bytes prove nothing about
+            # semantics once the adapter that thaws them has changed.
             return False
         record = self._records.get(dep_key)
         if record is not None:
@@ -3323,10 +3305,10 @@ class Database:
         # No live record: resolve the resource object from the root's pinned
         # captures (identity match), thaw its parameter from the store, and probe
         # LIVE via _refresh_resource. That takes the checkpoint probe-hint fast
-        # path when the probe still matches (snapshot restored from the store) or
-        # a full live load otherwise; either way the resulting record's digest
+        # path when the probe still matches (snapshot restored from the store),
+        # or a full live load otherwise. Either way the resulting record's digest
         # reflects live state, so the compare below is sound. If the resource
-        # can't be resolved, refuse -- a query-level execute-to-verify may still
+        # can't be resolved, refuse. A query-level execute-to-verify may still
         # re-establish it by re-running the reader.
         resolved = self._resolve_checkpoint_resource(dep_key)
         if resolved is None:
@@ -3346,7 +3328,7 @@ class Database:
         """Resolve (resource object, parameter) for a checkpoint resource dep.
 
         The object comes from the warm root's pinned captures (matched on the
-        resource's content identity); the parameter is thawed from the store,
+        resource's content identity). The parameter is thawed from the store,
         content-addressed by the dep's args_digest. Any missing piece ⇒ None,
         which the caller treats as "cannot verify from the checkpoint".
         """
@@ -3363,7 +3345,7 @@ class Database:
         if parameter_snapshot is _MISSING_SNAPSHOT:
             return None
         # A resource parameter that thaws through an adapter must do so under the
-        # same implementation that froze it; a changed thaw could hand the
+        # same implementation that froze it. A changed thaw could hand the
         # resource a different-shaped parameter. The round-trip guard below also
         # catches a changed freeze, but only the digest check catches a thaw-only
         # change, so gate here explicitly.
@@ -3380,12 +3362,12 @@ class Database:
             return None
         # Round-trip guard: the resource must be re-probed/loaded with a parameter
         # structurally identical to the one it was keyed by. Thawing is lossy for
-        # values with no reconstructor -- a frozen dataclass parameter thaws to a
-        # plain dict -- so re-freeze the thawed parameter and require it to hash
+        # values with no reconstructor (a frozen dataclass parameter thaws to a
+        # plain dict), so re-freeze the thawed parameter and require it to hash
         # back to this dep's args_digest (computed the same way in _resource_key).
         # A mismatch means we would drive the resource with a different-shaped
-        # parameter (probe/load raising, or a stale value under this dep_key);
-        # refuse so the caller re-executes live with the real parameter instead.
+        # parameter (probe/load raising, or a stale value under this dep_key).
+        # Refuse, so the caller re-executes live with the real parameter.
         if fingerprint_snapshot(self._freeze_value(parameter)) != dep_key.args_digest:
             return None
         return resource, parameter
@@ -3402,24 +3384,24 @@ class Database:
         """Publish the snapshot's serialized bytes under its content address.
 
         The single verifying persist: every path that writes a snapshot goes
-        through here. Presence is never evidence -- a digest already in the
-        store is compared byte for byte against what this snapshot serializes
-        to, so a save can no longer report success against a store holding
-        bytes the database could never warm from.
+        through here. Presence is never evidence. A digest already in the store
+        is compared byte for byte against what this snapshot serializes to, so
+        a save reports success only when the store holds those same bytes.
+        Different bytes under the digest are bytes the database could never
+        warm from.
 
-        Raw filesystem I/O runs under the raw-read allow scope so a
-        `FileSystemArtifactStore` used while a query frame is active is not
-        rejected by the global guard.
+        Raw filesystem I/O runs under the raw-read allow scope, so the global
+        guard lets a `FileSystemArtifactStore` work while a query frame is
+        active.
         """
         digest = fingerprint_snapshot(snapshot)
         payload = serialize_snapshot(snapshot)
         with self._allow_raw_reads_scope():
             if store.get(digest) != payload:
                 # Missing (None) or present-but-different: put either publishes
-                # the bytes or raises the store's own collision error. The
-                # authoritative comparison is the one put makes, so this read is
-                # a filter rather than a trust decision -- a stale answer here
-                # costs a redundant put and changes no outcome.
+                # the bytes or raises the store's own collision error. put makes
+                # the authoritative comparison, so this read is only a filter. A
+                # stale answer here costs a redundant put and changes no outcome.
                 store.put(digest, payload)
 
     def _find_input_node_by_key(self, input_key: str) -> NodeKey | None:
@@ -3444,11 +3426,11 @@ class Database:
         if not isinstance(input_key, Input):
             raise TypeError("db.read_input() expects an Input instance.")
         with self._state_lock:
-            # A read resolves; it never declares. The policy check still runs,
+            # A read resolves and never declares. The policy check still runs,
             # because two Inputs naming one key under different notions of
-            # "changed" is a programming error wherever it surfaces -- but it
+            # "changed" is a programming error wherever it surfaces. It
             # validates without mutating, so a read of a key nothing has set
-            # leaves that key free for the `set` that eventually declares it.
+            # leaves that key free for the `set` that later declares it.
             self._validate_input_registration(input_key)
             key = self._find_input_node_by_key(input_key.key)
             record = self._records.get(key) if key is not None else None
@@ -3477,31 +3459,31 @@ class Database:
                 self._record_dependency(key)
                 result = self._expose_boundary_snapshot(self._records[key].snapshot)
             except Exception as exc:
-                # A load that raised is still an observation: when it left a
-                # failure record behind, the reader depends on it exactly as it
-                # would on a value, so the edge is recorded before unwinding.
+                # A load that raised is still an observation. When it left a
+                # failure record behind, the reader depends on it as it would
+                # on a value, so the edge is recorded before unwinding.
                 if key in self._records:
                     self._record_dependency(key)
                 else:
                     self._resource_objects().pop(key, None)
                     if isinstance(exc, ReentrantDatabaseError):
                         # A hook refused on a resource this database has never
-                        # loaded leaves nothing at all: no record to depend on
-                        # and no stored probe to retire. A body that catches
-                        # the refusal would otherwise commit an answer with no
-                        # edge to anything and be reused from then on -- still
-                        # answering with its fallback once the hook is rewritten
-                        # to stop reading the database, where a fresh database
-                        # returns the value. The untracked mark is what is left
-                        # to force it to derive its answer again.
+                        # loaded leaves nothing: no record to depend on and no
+                        # stored probe to retire. A body that catches the
+                        # refusal would otherwise commit an answer with no edge
+                        # and be reused from then on. It would keep answering
+                        # with its fallback after the hook is rewritten to stop
+                        # reading the database, where a fresh database returns
+                        # the value. The untracked mark is the remaining way to
+                        # force it to derive its answer again.
                         self._mark_frame_impure(f"caught refusal from resource '{key.label}'")
                 if not outcome.failure_recorded:
                     # Nothing in the graph describes the exception this reader is
-                    # about to see, so whatever it returns cannot be re-derived
-                    # from records at load time. A failure record is excluded from
-                    # checkpoints for that reason; a reader of an *unrecordable*
-                    # raise has to be excluded for it too, and with it -- through
-                    # the save-time dependency closure -- everything above it.
+                    # about to see, so records cannot re-derive whatever it
+                    # returns at load time. A failure record is excluded from
+                    # checkpoints for that reason. A reader of an *unrecordable*
+                    # raise is excluded too, and with it, through the save-time
+                    # dependency closure, everything above it.
                     self._mark_frame_uncheckpointable()
                 raise
         self._dispatch_events(pending)
@@ -3562,10 +3544,10 @@ class Database:
         token = self._execution_stack.set(stack + (frame,))
         raw_reads_token = self._allow_raw_reads.set(False)
         try:
-            # The guard covers the whole query boundary, not just the body:
-            # materializing arguments runs adapter thaws and freezing the
-            # result runs adapter freezes, and an ambient read in either
-            # smuggles untracked state into the stored snapshot.
+            # The guard covers the whole query boundary, including the steps
+            # around the body. Materializing arguments runs adapter thaws and
+            # freezing the result runs adapter freezes, and an ambient read in
+            # either smuggles untracked state into the stored snapshot.
             with self._guard_untracked_reads():
                 query_args, query_kwargs = self._materialize_call(
                     call_snapshot,
@@ -3606,21 +3588,21 @@ class Database:
                     # Both operands are canonical freeze outputs: the fresh
                     # snapshot from _freeze_value above, the previous one from
                     # an earlier freeze or a validated checkpoint load. The
-                    # decision is the one canonical relation, snapshots_equal
-                    # -- equality of the canonical encodings of the stored
-                    # snapshots, the same decision in every mode, with no thaw
-                    # and no second opinion. A NaN normalizes to a single
-                    # canonical encoding, so it is reflexive here by
-                    # construction rather than through a digest side channel.
-                    # The digest test in front is a filter, not a verdict: a
-                    # digest is sha256 of that same encoding and a query
-                    # record's snapshot is never written without the matching
-                    # digest beside it (store loads re-derive and check the
-                    # pair on the way in), so unequal digests prove unequal
-                    # encodings and settle the changed case without encoding
-                    # anything. Equal digests decide nothing on their own --
-                    # the byte comparison still runs, so no collision is ever
-                    # trusted.
+                    # decision is the one canonical relation, snapshots_equal:
+                    # equality of the stored snapshots' canonical encodings,
+                    # the same in every mode, with no thaw and no second
+                    # opinion. A NaN normalizes to a single canonical encoding,
+                    # so it is reflexive here by construction, with no digest
+                    # side channel.
+                    #
+                    # The digest test in front is only a filter. A digest is
+                    # sha256 of that same encoding, and a query record's
+                    # snapshot is always written with the matching digest
+                    # beside it (store loads re-derive and check the pair on
+                    # the way in). So unequal digests prove unequal encodings
+                    # and settle the changed case without encoding anything.
+                    # Equal digests decide nothing alone: the byte comparison
+                    # still runs, so no collision is ever trusted.
                     equal = (
                         not impure
                         and digest == previous_digest
@@ -3646,27 +3628,26 @@ class Database:
                     decision = "backdated"
                     value_moved = False
                 elif impure and digest == previous_digest:
-                    # `equal` was forced above, not observed: an untracked
-                    # read skips the comparison entirely. When the re-run
-                    # then lands a byte-identical snapshot there is no new
-                    # value to propagate, so keep the old changed_at and
-                    # leave the revision alone -- otherwise a stable impure
-                    # leaf churns the counter on every warm request. This
-                    # digest short-circuit applies only to the forced case:
-                    # when a comparison actually ran and said unequal (a
-                    # custom eq policy may, even for identical snapshots),
-                    # the bump below stands.
+                    # `equal` was forced above without a comparison, because
+                    # an untracked read skips it. When the re-run lands a
+                    # byte-identical snapshot there is no new value to
+                    # propagate, so keep the old changed_at and leave the
+                    # revision alone. Otherwise a stable impure leaf churns
+                    # the counter on every warm request. This digest
+                    # short-circuit applies only to the forced case. When a
+                    # comparison ran and said unequal (a custom eq policy may,
+                    # even for identical snapshots), the bump below stands.
                     record.changed_at = previous_changed_at
                     decision = "executed"
                     value_moved = False
                 else:
                     # A recompute that lands a new value is a change in the
-                    # graph exactly as an input set or a resource reload is,
-                    # so it moves the revision the same way. Without the bump
-                    # an untracked leaf's new value lands at the revision its
-                    # grandparent was verified at: the direct parent re-runs
+                    # graph, like an input set or a resource reload, so it
+                    # moves the revision the same way. Without the bump an
+                    # untracked leaf's new value lands at the revision its
+                    # grandparent was verified at. The direct parent re-runs
                     # (untracked forces that), but its own changed_at then
-                    # fails the strictly-greater check and every ancestor
+                    # fails the strictly-greater check, and every ancestor
                     # above it keeps a value a fresh database never produces.
                     self._revision += 1
                     record.changed_at = self._revision
@@ -3685,17 +3666,17 @@ class Database:
                 self._stats["query_backdates"] += 1
             else:
                 self._stats["query_executions"] += 1
-                # Delivery follows the value, not the decision: a re-run
-                # that kept the previous changed_at landed nothing new to
-                # announce, while a cold execution always did.
+                # Delivery follows the value. A re-run that kept the previous
+                # changed_at landed nothing new to announce, while a cold
+                # execution always did.
                 if value_moved:
                     self._enqueue_observer_event(query, key, record)
             self._query_timings.setdefault(key, _TimingAggregate()).add(elapsed)
         finally:
-            # First, before the tokens go back: a thread spawned inside this
+            # First, before the tokens go back. A thread spawned inside this
             # execution holds a snapshot of the stack that still contains this
-            # frame, and the flag is the only thing that tells it the
-            # execution it descended from is over.
+            # frame, and only this flag tells it the execution it descended
+            # from is over.
             frame.completed = True
             self._allow_raw_reads.reset(raw_reads_token)
             self._execution_stack.reset(token)
@@ -3710,7 +3691,7 @@ class Database:
         pending = request.pending_events
         # The recipients of an event are the subscriptions that existed
         # when the change committed, minus any that end before delivery
-        # starts -- membership is re-checked once at dispatch entry.
+        # starts. Membership is re-checked once at dispatch entry.
         pending.append(
             (
                 key,
@@ -3772,9 +3753,9 @@ class Database:
             call_snapshot = self._call_snapshots().get(key)
             if query_obj is None or call_snapshot is None:
                 # A checkpoint-warmed record has no live Query object to re-run,
-                # so re-verify it transitively through its own edges instead of
-                # trusting it. Anything else with no Query object is treated as
-                # changed (we cannot prove it is not).
+                # so re-verify it transitively through its own edges. Anything
+                # else with no Query object counts as changed, since nothing
+                # can prove it unchanged.
                 if not record.checkpoint_loaded:
                     return True
                 if self._verify_checkpoint_loaded_record(record):
@@ -3790,14 +3771,14 @@ class Database:
             try:
                 self._refresh_resource(resource, parameter, key, outcome)
             except Exception:
-                # A refresh that raises must not escape a dependent's
-                # verification pass: with a failure record describing *this*
-                # attempt the probe comparison below decides, and the dependent
+                # A refresh that raises must stay inside a dependent's
+                # verification pass. With a failure record describing *this*
+                # attempt, the probe comparison below decides, and the dependent
                 # re-reads inside its own body where its own handler can see the
-                # exception. When nothing was recorded -- an unobservable probe,
-                # or a freeze that failed after a successful load -- the record
-                # still describes an older world, so its changed_at may not be
-                # trusted: report changed and let the dependent re-read.
+                # exception. When nothing was recorded (an unobservable probe,
+                # or a freeze that failed after a successful load), the record
+                # still describes an older world and its changed_at is
+                # untrustworthy. Report changed and let the dependent re-read.
                 if not outcome.failure_recorded:
                     return True
         return self._records[key].is_untracked or self._records[key].changed_at > revision
@@ -3826,29 +3807,29 @@ class Database:
         """Bring this resource node up to date, raising what its load raised.
 
         An observation that raises without being recorded leaves the record
-        describing a world that has just been contradicted. Reporting the node as
-        changed for that one refresh is not enough: the record keeps its old
-        probe, so once the world returns to the state it describes -- an undo, a
-        branch switch back -- the probe matches again and the record claims
+        describing a world that was contradicted. Reporting the node as changed
+        for that one refresh falls short. The record keeps its old probe, so
+        once the world returns to the state it describes (an undo, a branch
+        switch back), the probe matches again and the record claims
         "unchanged" across an interval it never observed. Dependents that
-        consumed the exception then stay green on a value no fresh ``Database``
-        produces. Mark it here instead, so the stored probe stops deciding
-        anything until a real observation rewrites the record.
+        consumed the exception then stay green on a value no fresh
+        ``Database`` produces. So the record is marked here, and the stored
+        probe decides nothing until a real observation rewrites the record.
 
-        Marking alone only repairs the resource's *direct* readers. Reporting the
-        node as changed makes each direct reader re-execute and see the exception,
-        but a reader that handles it returns at the current revision, so its own
-        ``changed_at`` does not move and its parents never learn that anything
-        happened -- they keep a value derived from the pre-failure world forever.
-        The transition into "unconfirmed" is a change in the graph exactly as a
-        recorded failure is, so it moves the revision too, and the reader's
-        re-execution then lands on a revision its parents have not verified past.
-        The bump is guarded on the mark not already being set: one bump per
-        transition, not one per request, so a permanently unprobeable resource
-        settles at a fixed revision instead of churning it on every ``get()``.
-        Every path that rewrites the record from a real observation -- a
-        successful load and a recordable failure alike -- clears the mark, so a
-        resource that heals and breaks again bumps again.
+        Marking alone repairs only the resource's *direct* readers. Reporting
+        the node as changed makes each direct reader re-execute and see the
+        exception. A reader that handles it returns at the current revision,
+        though, so its own ``changed_at`` stays put and its parents never learn
+        anything happened. They keep a value derived from the pre-failure world
+        forever. The transition into "unconfirmed" is a change in the graph, as
+        a recorded failure is, so it moves the revision too. The reader's
+        re-execution then lands on a revision its parents have yet to verify
+        past. The bump runs only when the mark is unset: one bump per
+        transition, so a permanently unprobeable resource settles at a fixed
+        revision and never churns it on every ``get()``. Every path that
+        rewrites the record from a real observation (a successful load and a
+        recordable failure alike) clears the mark, so a resource that heals
+        and breaks again bumps again.
         """
         outcome = outcome if outcome is not None else _RefreshOutcome()
         try:
@@ -3875,11 +3856,11 @@ class Database:
             if not record.is_failed:
                 return
             if record.failure_exc is not None:
-                # A resource is observed at most once per request; a failure is
-                # settled for the request exactly as a value is. Re-raising the
-                # exception that this request's load produced keeps a fan-out of
-                # readers at one load instead of one per reader, and the object
-                # is never older than the observation the request already made.
+                # A resource is observed at most once per request, and a failure
+                # is settled for the request as a value is. Re-raising the
+                # exception this request's load produced keeps a fan-out of
+                # readers at one load in total, and the object is never older
+                # than the observation the request already made.
                 outcome.failure_recorded = True
                 raise record.failure_exc.with_traceback(record.failure_traceback)
         atomic = callable(getattr(resource, "probe_and_load", None))
@@ -3888,14 +3869,13 @@ class Database:
             or (record is None and key in self._checkpoint_resource_probes)
         ):
             # A record (or checkpoint hint) that could answer this request makes
-            # a standalone probe worth taking before the combined read: for the
+            # a standalone probe worth taking before the combined read. For the
             # built-in file resources that is read-plus-hash with no decode. The
             # standalone result only ever answers "unchanged" against a stored
             # atomic pair and is discarded on a miss, so every stored
-            # (probe, value) pair still originates from one observed read. A
-            # probe that raises is not an observation; fall through and let the
-            # combined read decide, exactly as it would have without the
-            # attempt.
+            # (probe, value) pair still comes from one observed read. A probe
+            # that raises observes nothing. Fall through and let the combined
+            # read decide, as it would have without the attempt.
             try:
                 with self._resource_hook_scope():
                     early_probe = resource.probe(parameter)
@@ -3915,12 +3895,12 @@ class Database:
                     probe, loaded_value = resource.probe_and_load(self, parameter)
             except ReentrantDatabaseError:
                 # A hook that read back into the database observed nothing about
-                # the outside world, so there is no failure to record. Writing a
-                # failure record would store a probe for this refusal and let a
-                # later read match on it, which would turn a hook that has to be
-                # rewritten into a value the graph quietly carries. The refresh
-                # above still marks an existing record unconfirmed, which is
-                # what retires the probe its last real observation stored.
+                # the outside world, so there is no failure to record. A failure
+                # record would store a probe for this refusal and let a later
+                # read match on it, turning a hook that has to be rewritten into
+                # a value the graph silently carries. The refresh above still
+                # marks an existing record unconfirmed, which retires the probe
+                # its last real observation stored.
                 raise
             except Exception as exc:
                 outcome.failure_recorded = self._record_resource_failure(
@@ -3945,8 +3925,8 @@ class Database:
                 with self._resource_hook_scope():
                     loaded_value = resource.load(self, parameter)
             except ReentrantDatabaseError:
-                # As above: a refused read is not an observation of the world,
-                # so it writes no failure record for a later read to match on.
+                # As above: a refused read observes nothing of the world, so it
+                # writes no failure record for a later read to match on.
                 raise
             except Exception as exc:
                 outcome.failure_recorded = self._record_resource_failure(
@@ -4000,9 +3980,9 @@ class Database:
         """Answer this request from the record when its probe is unchanged.
 
         A failure record must never take the probe-hit early exit as if it had
-        a value: it holds no snapshot to reuse. The first read of each request
-        re-runs the load on an unchanged failing probe, which is what keeps the
-        exception a live one; the rest of the request re-raises it earlier. A
+        a value, because it holds no snapshot to reuse. The first read of each
+        request re-runs the load on an unchanged failing probe, which keeps the
+        exception a live one. The rest of the request re-raises it earlier. A
         record whose probe was contradicted by an unrecorded raise is excluded
         for the same reason its changed_at is: matching a probe the node has
         since failed to confirm proves nothing about the interval between.
@@ -4029,11 +4009,10 @@ class Database:
     ) -> bool:
         """Scope-B: restore a recordless resource from its checkpoint probe hint.
 
-        When the hint's probe matches, the snapshot comes from the store without
-        performing a full load. The hint is a FROZEN probe, so callers compare
-        the live probe's frozen form: a live value and a thawed snapshot differ
-        in shape (a frozen-dataclass probe thaws to a dict) and would never
-        match.
+        When the hint's probe matches, the snapshot comes from the store with no
+        full load. The hint is a FROZEN probe, so callers compare the live
+        probe's frozen form. A live value and a thawed snapshot differ in shape
+        (a frozen-dataclass probe thaws to a dict) and would never match.
         """
         hint = self._checkpoint_resource_probes.get(key)
         if hint is None:
@@ -4046,9 +4025,9 @@ class Database:
             # An adapter whose implementation changed (or vanished) since the
             # save would thaw this restored snapshot into a value a fresh load
             # never produces. The probe can stay stable while the adapter code
-            # moves, so gate the restore just like every other thaw-into-live
-            # path; on distrust fall through to the full load, which re-freezes
-            # a fresh load under the live adapter.
+            # moves, so gate the restore like every other thaw-into-live path.
+            # On distrust, fall through to the full load, which re-freezes a
+            # fresh load under the live adapter.
             if snapshot is not _MISSING_SNAPSHOT and self._adapter_keys_trusted(
                 collect_adapter_keys(snapshot)
             ):
@@ -4072,17 +4051,17 @@ class Database:
     def _observe_failure_probe(self, resource: Any, parameter: Any) -> Any:
         """Frozen probe observed alongside a load that raised.
 
-        Returns ``_MISSING_SNAPSHOT`` when the probe itself cannot be observed: a
+        Returns ``_MISSING_SNAPSHOT`` when the probe itself cannot be observed. A
         resource that cannot even be probed models its failures partially and is
         outside the contract, so it gets no record at all.
 
-        The base ``Resource`` supplies ``probe_and_load``, so every resource takes
-        the atomic branch and this observation happens at a *later* instant than
-        the load that raised: ``inspect()`` can show a failed node whose probe
-        already describes a healed world. That is self-correcting rather than
-        sticky -- a failure record never takes the probe-unchanged early exit, so
-        the next request re-runs the load and succeeds. Overriding
-        ``probe_and_load`` to observe both from one read is what removes the gap.
+        The base ``Resource`` supplies ``probe_and_load``, so every resource
+        takes the atomic branch, and this observation happens at a *later*
+        instant than the load that raised. ``inspect()`` can show a failed node
+        whose probe already describes a healed world. That corrects itself: a
+        failure record never takes the probe-unchanged early exit, so the next
+        request re-runs the load and succeeds. Overriding ``probe_and_load`` to
+        observe both from one read removes the gap.
         """
         try:
             with self._resource_hook_scope():
@@ -4100,15 +4079,15 @@ class Database:
     ) -> bool:
         """Record that this resource's load raised, carrying the observed probe.
 
-        A failed load is an observation, not the absence of one, so the node keeps
-        a record and the ordinary probe comparison decides when dependents must
-        re-run. The changed_at discipline matches the success path: an unchanged
-        failing probe keeps dependents green, while a changed probe or a
-        transition between success and failure bumps the revision.
+        A failed load is itself an observation, so the node keeps a record and
+        the ordinary probe comparison decides when dependents must re-run. The
+        changed_at discipline matches the success path: an unchanged failing
+        probe keeps dependents green, while a changed probe or a transition
+        between success and failure bumps the revision.
 
         Returns whether a record was written. ``False`` means the node still
-        describes an older world, which callers must treat as "changed" rather
-        than trusting the record's ``changed_at``.
+        describes an older world. Callers must then treat it as "changed" and
+        ignore the record's ``changed_at``.
         """
         if probe_snapshot is _MISSING_SNAPSHOT:
             return False
@@ -4124,8 +4103,8 @@ class Database:
         else:
             self._revision += 1
             changed_at = self._revision
-        # Outside a request nothing can re-raise this exception, so holding it
-        # (and the load frame its traceback pins) would buy nothing.
+        # Only a live request can re-raise this exception, so outside one it
+        # (and the load frame its traceback pins) is dropped.
         request = self._live_request()
         pending = request.failures if request is not None else None
         retained = exc if pending is not None else None
@@ -4168,9 +4147,9 @@ class Database:
     def _release_failure_exceptions(self, keys: list[NodeKey]) -> None:
         """Drop the exceptions this request stored on its failure records.
 
-        Only reads *within* the request that produced one may re-raise it, so the
-        request boundary is where the traceback -- and every frame and local it
-        keeps alive -- stops being useful. Records are never evicted, so leaving
+        Only reads *within* the request that produced one may re-raise it, so
+        at the request boundary the traceback (and every frame and local it
+        keeps alive) stops being useful. Records are never evicted, so leaving
         them attached would pin one load frame per permanently failing node.
         """
         for key in keys:
@@ -4202,16 +4181,16 @@ class Database:
         """Refuse a key already declared under a different equality policy.
 
         The registration family's one validation, called once per call by
-        every path that can declare or resolve an input -- so
+        every path that can declare or resolve an input. So
         `_commit_input_registration` is the pure mutation it reads as, and the
         read path can run the check without registering anything.
         """
         existing = self._inputs_by_key.get(input_key.key)
         if existing is input_key:
-            # The registered object measured against itself: there is no second
-            # policy here to disagree with, so the two digests below could only
-            # ever agree. Skipping them keeps a repeated `set` of a long-lived
-            # `Input` off the policy-fingerprinting path entirely.
+            # The registered object measured against itself has one policy, so
+            # the two digests below could only ever agree. Skipping them keeps
+            # a repeated `set` of a long-lived `Input` off the
+            # policy-fingerprinting path.
             return
         policy_digest = self._input_policy_digest(input_key)
         if existing is not None and self._input_policy_digest(existing) != policy_digest:
@@ -4224,9 +4203,9 @@ class Database:
         """The node key the input would take, built without declaring anything.
 
         A pure function of one read of the key string, so the identity the node
-        is addressed by and the identity its label spells are the same string by
-        construction -- which is what lets the registry hold a single node per
-        key however many `Input` objects name it.
+        is addressed by and the identity its label spells are the same string
+        by construction. That lets the registry hold a single node per key
+        however many `Input` objects name it.
         """
         identity = input_key.key
         return NodeKey(
@@ -4239,10 +4218,9 @@ class Database:
     def _input_node_key(self, input_key: Any) -> NodeKey:
         """The registered node key for this input, or the one it would take.
 
-        A key already in the registry is served from it rather than rebuilt, so
-        setting an input a second time costs a lookup. An unregistered key is
-        constructed and not stored, leaving it free for whatever `set` finally
-        declares it.
+        A key already in the registry is served from it, so setting an input a
+        second time costs a lookup. An unregistered key is constructed without
+        being stored, leaving it free for whatever `set` finally declares it.
         """
         registered = self._input_records.get(input_key.key)
         if registered is not None:
@@ -4253,10 +4231,10 @@ class Database:
         """Declare the input. Called only once a write has already succeeded.
 
         Idempotent and unconditional: validation happened before the caller
-        committed to the write, so nothing here refuses and nothing here can
-        fail part way. Re-declaring a key already registered keeps the first
-        `Input` object as the comparand and adds nothing, so the registry is
-        sized by distinct keys rather than by how often they are set.
+        committed to the write, so this neither refuses nor fails part way.
+        Re-declaring a registered key keeps the first `Input` object as the
+        comparand and adds nothing, so the registry grows with distinct keys
+        and stays flat however often they are set.
         """
         key = self._input_records.get(input_key.key)
         if key is not None:
@@ -4346,19 +4324,19 @@ class Database:
     ) -> Any:
         """Expose a snapshot through rebuilt immutable container interfaces.
 
-        Every `Frozen*` shell is rebuilt, graph or not: frozen dataclass
+        Every `Frozen*` shell is rebuilt, graph or not. Frozen dataclass
         setters refuse plain writes, but `object.__setattr__` bypasses them,
         so a view aliasing the stored snapshot would let a caller corrupt the
-        record it came from. Leaf values and all-leaf tuples are shared —
-        nothing reflective can rebind their contents.
+        record it came from. Leaf values and all-leaf tuples are shared,
+        because no reflective call can rebind their contents.
 
-        With *adapters* supplied, an adapted value is reconstructed through
-        its registered adapter, so a caller boundary hands back the type the
-        adapter builds rather than the kernel's internal wrapper. The adapter
-        is handed the already-rebuilt payload and the rebuild callable, never
-        the stored snapshot: the no-aliasing invariant above must not depend
-        on an adapter cooperating. Callers with no registry — the structural
-        validators — keep the wrapper.
+        With *adapters* supplied, an adapted value is rebuilt through its
+        registered adapter, so a caller boundary hands back the type the
+        adapter builds in place of the kernel's internal wrapper. The adapter
+        gets the already-rebuilt payload and the rebuild callable, never the
+        stored snapshot, so the no-aliasing invariant above holds whether or
+        not the adapter cooperates. Callers with no registry (the structural
+        validators) keep the wrapper.
         """
 
         if type(snapshot) is not FrozenGraph:
@@ -4482,9 +4460,9 @@ class Database:
     ) -> Any:
         # Exposure always detaches: the stored snapshot itself is never handed
         # out, so nothing done to what came back can reach the record. Callers
-        # never see the FrozenGraph envelope either -- a graph-shaped result is
-        # rebuilt into shared/cyclic Frozen* views, exactly as _materialize_call
-        # does for call arguments.
+        # never see a FrozenGraph either. A graph-shaped result is
+        # rebuilt into shared/cyclic Frozen* views, as _materialize_call does
+        # for call arguments.
         if self.mode == "strict":
             exposed = self._strict_snapshot_view(snapshot, adapters=self._view_adapter_registry)
         else:
@@ -4497,16 +4475,15 @@ class Database:
     def _policy_operand(self, snapshot: Any) -> Any:
         """Detach a stored snapshot before a user eq=/cutoff= policy sees it.
 
-        A policy operand is exposed exactly as a caller-boundary value is,
-        without the checked-mode mutation bookkeeping: strict rebuilds every
-        Frozen* shell -- _strict_snapshot_view exists precisely because
-        object.__setattr__ bypasses frozen-dataclass setters, and it handles
-        FrozenGraph cycles, so a cyclic result is comparable without
-        re-freezing -- while checked and fast thaw, which already allocates
-        fresh containers. Either way the operand shares no mutable shell with
-        the record it came from, and either way an adapted value reaches the
-        policy as the type its adapter rebuilds rather than as the kernel's
-        internal wrapper.
+        A policy operand is exposed as a caller-boundary value is, without the
+        checked-mode mutation bookkeeping. Strict rebuilds every Frozen* shell.
+        (_strict_snapshot_view exists because object.__setattr__ bypasses
+        frozen-dataclass setters, and it handles FrozenGraph cycles, so a
+        cyclic result is comparable without re-freezing.) Checked and fast
+        modes thaw, which already allocates fresh containers. Either way the
+        operand shares no mutable shell with the record it came from, and an
+        adapted value reaches the policy as the type its adapter rebuilds,
+        never as the kernel's internal wrapper.
         """
 
         return self._expose_snapshot(snapshot)
@@ -4539,12 +4516,12 @@ class Database:
         """
         frame = self._current_frame()
         if frame is None:
-            # Nothing is executing -- a top-level caller is about to see this,
+            # Nothing is executing. A top-level caller is about to see this,
             # and it stores no answer that could be reused.
             return
         frame.untracked_reasons.append(reason)
-        # Both halves: the reason is what forces re-execution, while the
-        # checkpoint eligibility filter reads `checkpointable` on its own.
+        # Both halves: the reason forces re-execution, while the checkpoint
+        # eligibility filter reads `checkpointable` on its own.
         self._mark_frame_uncheckpointable()
 
     def _inspect_record(self, key: NodeKey) -> InspectionNode:
@@ -4585,24 +4562,23 @@ class Database:
     def _resource_hook_scope(self) -> Iterator[None]:
         """Run a resource hook: raw reads permitted, reads of this database refused.
 
-        Observing the outside world is the whole job, so the raw-read allowance
-        the plain scope grants is exactly what a hook needs and is delegated to
-        unchanged. What the depth adds is the other half: a hook that reads back
-        into the database hides that read behind the resource node, where no
-        edge records it and an unchanged probe skips the hook that made it
-        entirely. The depth is what the boundary predicate sees, so the refusal
-        reaches a `probe` too -- it is handed no database and can still hold
-        one.
+        Observing the outside world is the whole job, so a hook needs the
+        raw-read allowance the plain scope grants, delegated unchanged. The
+        depth adds the other half. A hook that reads back into the database
+        hides that read behind the resource node, where no edge records it and
+        an unchanged probe skips the hook that made it. The boundary predicate
+        sees the depth, so the refusal reaches a `probe` too (handed no
+        database, yet able to hold one).
 
-        The hook also registers on `_ACTIVE_GUARDS` for its extent, which is how
-        `guarded_thread_start` finds it: a `read_resource` made at top level
-        opens no execution, so without this the spawn hook would scan an empty
-        tuple and a thread started from inside such a hook would inherit
-        nothing. Registering changes no raw read, whether or not a query is
-        running above: `_raise_if_guarded` refuses only where a live frame has
-        no raw-read permission, and a hook always has that permission. Under a
-        query the entry is a duplicate of one already there, which costs that
-        scan a second identical check and nothing else.
+        The hook also registers on `_ACTIVE_GUARDS` for its extent, which is
+        how `guarded_thread_start` finds it. A top-level `read_resource` opens
+        no execution, so without this the spawn hook would scan an empty tuple
+        and a thread started inside such a hook would inherit nothing.
+        Registering changes no raw read, with or without a query running above.
+        `_raise_if_guarded` refuses only where a live frame lacks raw-read
+        permission, and a hook always has it. Under a query the entry
+        duplicates one already there, which costs that scan only one more
+        identical check.
         """
         token = self._resource_hook_depth.set(self._resource_hook_depth.get() + 1)
         try:
@@ -4623,15 +4599,16 @@ class Database:
     def _boundary_state(self) -> Literal["outside", "inside", "hook", "descendant"]:
         """Where the calling thread stands relative to this database's executions.
 
-        `"outside"` — no execution of this database is live on the calling
-        context, so every entry point is open. `"inside"` — this very thread is
-        running that execution, which is a query body calling back into the
-        database it was handed. `"descendant"` — the live execution belongs to
-        another thread and this one inherited it by being spawned inside it.
-        `"hook"` — the caller is inside one of this database's resource hooks,
-        which is the most specific of the four and so is answered first: a hook
-        usually runs under a query frame, and it is the hook, not the frame,
-        that decides what the caller may do.
+        * `"outside"`: no execution of this database is live on the calling
+          context, so every entry point is open.
+        * `"inside"`: this thread is running that execution, so a query body
+          is calling back into the database it was handed.
+        * `"descendant"`: the live execution belongs to another thread, and
+          this one inherited it by being spawned inside it.
+        * `"hook"`: the caller is inside one of this database's resource hooks.
+          This is the most specific of the four, so it is answered first. A
+          hook usually runs under a query frame, and the hook takes precedence
+          over the frame in deciding what the caller may do.
         """
         if self._resource_hook_depth.get() > 0:
             return "hook"
@@ -4655,20 +4632,20 @@ class Database:
     def _reject_reentrant_read(self, name: str) -> None:
         """Refuse `name` from a descendant thread or from inside a resource hook.
 
-        The in-query read surface itself stays open: a query body reading its
-        own inputs and resources is the point of the frame. What cannot be
-        served is the same call from a thread spawned inside that body: it
-        would block on the state lock the executing thread is still holding,
-        and where that thread is waiting for the child, neither comes back.
-        Refusing turns a hang into a diagnosable error.
+        The in-query read surface stays open, because a query body reading its
+        own inputs and resources is what the frame is for. The same call from a
+        thread spawned inside that body is refused. It would block on the state
+        lock the executing thread still holds, and if that thread is waiting
+        for the child, neither returns. Refusing turns a hang into a
+        diagnosable error.
 
-        A hook is refused for a different reason. It would not hang -- the lock
-        is reentrant and the call would answer -- but the answer would be
-        invisible to the graph: the resource node records the probe and the
-        value, never what the hook read to produce them, so a warm request that
-        skips the hook on an unchanged probe reuses a value no fresh database
-        would have produced. Database-derived values reach a resource through
-        its key instead, which the reading query passes in and declares.
+        A hook is refused for a different reason. The lock is reentrant, so the
+        call would answer, but the graph would never see the answer. The
+        resource node records the probe and the value, never what the hook read
+        to produce them. A warm request that skips the hook on an unchanged
+        probe would reuse a value no fresh database would have produced.
+        Database-derived values reach a resource through its key, which the
+        reading query passes in and declares.
         """
         state = self._boundary_state()
         if state in ("descendant", "hook"):
@@ -4685,18 +4662,18 @@ class Database:
             and cached[0] == runtime_build
             and self._definition_observation_matches(cached[1], definition_observation)
             # Cheapest arm first: re-resolving a chain is a lookup per path
-            # segment, where a module stamp hashes a file and a resource digest
+            # segment, a module stamp hashes a file, and a resource digest
             # re-runs identity(). Every arm but the last is a pure read, so
             # among those the order only decides what a mismatch costs before
             # it is found. The resource arm goes last because it can refuse,
             # and a moved resource means the resource redefined itself only
-            # once nothing else about the query has moved.
+            # once everything else about the query holds still.
             and all(
                 self._resolve_module_path_target(module, path) is expected
                 for module, path, expected in cached[5]
             )
-            # Reads the recorded targets, which the arm above has just proved
-            # are the objects those chains still name.
+            # Reads the recorded targets, which the arm above proved are still
+            # the objects those chains name.
             and self._definition_observation_matches(
                 cached[6], self._module_function_target_observation(cached[5])
             )
@@ -4734,17 +4711,17 @@ class Database:
             (module, self._module_observation_stamp(module))
             for _module_id, module in sorted(modules.items(), key=lambda item: item[1].__name__)
         )
-        # One pair per resource object: a resource reached from several slots
-        # of one walk is stored once and digests identically every time, so
-        # the repeats only cost the guard re-reads.
+        # One pair per resource object. A resource reached from several slots
+        # of one walk digests identically every time, so it is stored once
+        # and the guard skips the repeat re-reads.
         deduped_resources: dict[int, tuple[Any, str]] = {}
         for observed_resource, observed_digest in resources:
             deduped_resources.setdefault(id(observed_resource), (observed_resource, observed_digest))
-        # One entry per (module, path) chain: the same chain folded from several
-        # slots of one walk reads the same live target every time, so keeping
-        # the first record loses nothing and the guard re-resolves it once. The
-        # records hold every module they name, so no id can be freed and reused
-        # while this loop keys on one.
+        # One entry per (module, path) chain. The same chain folded from
+        # several slots of one walk reads the same live target every time, so
+        # keeping the first record loses nothing and the guard re-resolves it
+        # once. The records hold every module they name, so no id can be freed
+        # and reused while this loop keys on one.
         deduped_attributes: dict[
             tuple[int, tuple[str, ...]], tuple[ModuleType, tuple[str, ...], Any]
         ] = {}
@@ -4771,12 +4748,12 @@ class Database:
     def _query_handle_state_payload(self, query: Any, seen_functions: builtins.set[int]) -> Any:
         """Fold the Query handle's own mutable surface into query identity.
 
-        The handle is a plain object: functools.wraps copies function metadata
-        onto it at decoration time, nothing prevents later assignment, and a
-        query body may read attributes off its own handle. Any of them moving
-        has to move identity exactly as the equivalent function attribute does,
-        which is what makes writing one a supported way to reparameterize a
-        query instead of a change the stored records cannot see.
+        The handle is a plain object. functools.wraps copies function metadata
+        onto it at decoration time, any attribute can be assigned later, and a
+        query body may read attributes off its own handle. When any of them
+        moves, identity moves as it does for the equivalent function attribute.
+        That makes writing one a supported way to reparameterize a query, one
+        the stored records see.
 
         The contract fields are excluded: `fn`, `eq` and `cutoff` are folded by
         the payloads beside this one, and `key` names the node this fingerprint
@@ -4784,28 +4761,25 @@ class Database:
         also refuse the callable policy objects the policy payload accepts, and
         fold the query's own function a second time.
 
-        `__wrapped__` is conditional rather than excluded. While it still points
-        at `fn`, a marker stands in for it and the sibling payload owns it; once
-        it points anywhere else it is folded like any other attribute, so
-        rebinding it moves identity exactly as rebinding it on a plain captured
-        function does.
+        `__wrapped__` is conditional. While it still points at `fn`, a marker
+        stands in for it and the sibling payload owns it. Once it points
+        anywhere else it is folded like any other attribute, so rebinding it
+        moves identity as rebinding it on a plain captured function does.
 
-        Annotations and type parameters take the annotation vocabulary the
-        function metadata payload uses, not the ambient-capture one: an
-        annotation naming a module-anchored type is pinned by that anchor,
-        where the capture digest would walk the type's whole namespace. Where
-        the handle still carries the function's own evaluator or its own
-        annotations dictionary -- the objects functools.wraps copied across --
-        a marker stands in for their content, which that same metadata payload
-        has already folded; only a handle given annotations of its own is
-        folded here.
+        Annotations and type parameters use the function metadata payload's
+        annotation vocabulary. An annotation naming a module-anchored type is
+        pinned by that anchor, where the ambient-capture digest would walk the
+        type's whole namespace. Where the handle still carries the function's
+        own evaluator or its own annotations dictionary (the objects
+        functools.wraps copied across), a marker stands in for their content,
+        which that metadata payload already folded. Only a handle given
+        annotations of its own is folded here.
 
         A query held on another query's handle is folded as the dependency it
         is, which puts a reference cycle within reach. Such a cycle is marked
-        rather than refused: the contact that entered the handle folds
-        everything the repeat would fold again, so eliding the back edge loses
-        nothing, and both handles stay writable the way this fold exists to
-        support.
+        and allowed. The contact that entered the handle folds everything the
+        repeat would fold again, so eliding the back edge loses nothing, and
+        both handles stay writable, which is what this fold exists to support.
         """
 
         handle_id = id(query)
@@ -4815,16 +4789,16 @@ class Database:
         token = self._query_handle_stack.set(stack + (handle_id,))
         try:
             state = vars(query)
-            # Before the sorts below, which compare names against each other:
-            # a handle whose dictionary was given a non-string key answers with
-            # the kernel's own refusal rather than a TypeError out of sorted().
+            # Before the sorts below, which compare names with each other. A
+            # handle whose dictionary holds a non-string key gets the kernel's
+            # own refusal in place of a TypeError out of sorted().
             if any(not isinstance(name, str) for name in state):
                 raise UnsupportedValueError(
                     f"Query handle {query.key!r} has invalid custom state."
                 )
-            # Both carriers are folded, never one instead of the other: which
-            # of them functools.wraps copies depends on the interpreter, and a
-            # handle can be given the other one afterwards.
+            # Both carriers are always folded. Which one functools.wraps copies
+            # depends on the interpreter, and a handle can be given the other
+            # one afterwards.
             annotate = state.get("__annotate__")
             if annotate is None:
                 annotate_payload: Any = None
@@ -4856,11 +4830,11 @@ class Database:
             annotations_payload = (annotate_payload, eager_payload)
             # functools.wraps points __wrapped__ at the function this handle
             # already folds, and a marker says so. Rebound, it is an ordinary
-            # entry: a body can call whatever it points at now, so what it
-            # points at has to be folded like any other attribute. It cannot
-            # simply join the walk below -- the marker is what keeps a query
-            # defined in a module with no stable source identity from being
-            # refused for carrying a reference to its own function.
+            # entry: a body can call whatever it points at now, so that target
+            # is folded like any other attribute. It stays out of the walk
+            # below, because the marker keeps a query defined in a module with
+            # no stable source identity from being refused for carrying a
+            # reference to its own function.
             wrapped = state.get("__wrapped__")
             wrapped_payload: Any = (
                 ("wrapped-is-fn",)
@@ -4897,10 +4871,10 @@ class Database:
         """The annotations dictionary a function holds, or None if reading fails.
 
         Only ever compared by identity, against what a query handle carries
-        under the same name. A read that raises -- an annotation naming
-        something unresolvable, under a lazy evaluator -- answers None, which
-        no dictionary on a handle can be, so the handle's own copy is folded
-        rather than treated as the function's.
+        under the same name. A read that raises (an annotation naming something
+        unresolvable, under a lazy evaluator) answers None. No dictionary on a
+        handle can be None, so the handle's copy then counts as its own and is
+        folded.
         """
 
         try:
@@ -4918,11 +4892,11 @@ class Database:
                 f"handle[{name}]", value, seen_functions, owner=query.fn
             )
         except UnsupportedValueError as exc:
-            # The digest refuses in the vocabulary of an ambient capture, which
-            # is not what this is: nothing read it out of an enclosing scope,
-            # someone wrote it on the handle. The remedy is the same one, and
-            # it stops short of naming the capture-set preview -- that reports
-            # what the body closes over, never what the handle carries.
+            # The digest refuses in the vocabulary of an ambient capture, but
+            # this value was written on the handle and never read out of an
+            # enclosing scope. The remedy is the same. The message leaves out
+            # the capture-set preview, which reports what the body closes over
+            # and never what the handle carries.
             raise UnsupportedValueError(
                 f"Query {query.key!r} holds unsupported state {name!r} of type "
                 f"{type(value).__module__}.{type(value).__qualname__} on its handle. "
@@ -4932,15 +4906,15 @@ class Database:
     def _resource_identities_hold(self, recorded: tuple[tuple[Any, str], ...]) -> bool:
         """Re-read every captured resource's identity, refusing an unstable one.
 
-        A resource that distinguishes itself only by its own state -- the
-        default ``identity()`` hands back the instance -- has no stable
-        identity if a probe or a load mutates that state. Nothing else about
-        the query has moved by the time this arm is reached, so a digest that
-        has moved says the resource redefined itself between two reads: every
-        warm request would cold-execute and leave the record it replaced
-        behind. A resource that defines its own ``identity()`` and returns
-        something different is reparameterizing itself deliberately, and
-        keeps re-fingerprinting the way it always has.
+        A resource that distinguishes itself only by its own state (the
+        default ``identity()`` hands back the instance) has no stable identity
+        if a probe or a load mutates that state. By the time this arm runs,
+        everything else about the query holds still, so a moved digest says
+        the resource redefined itself between two reads. Every warm request
+        would cold-execute and leave the record it replaced behind. A resource
+        that defines its own ``identity()`` and returns something different is
+        reparameterizing itself on purpose, and keeps re-fingerprinting as it
+        always has.
         """
         for resource, expected in recorded:
             digest = self._resource_identity_digest(resource)
@@ -4948,17 +4922,16 @@ class Database:
                 continue
             if digest == _UNREADABLE_RESOURCE_DIGEST:
                 # A resource that has become unreadable forces the full
-                # recompute rather than serving a fingerprint nothing
-                # checked. That is a degradation, not a redefinition.
+                # recompute, so no unchecked fingerprint is served. That is a
+                # degradation, so it answers False and raises nothing.
                 return False
-            # A resource that hands back itself is one that never said what
-            # distinguishes it, so its own state is all there is to compare --
-            # which is asked here by identity rather than by class so that the
-            # question costs this module no new knowledge of the resource
-            # layer it is read from. Asking it with an isinstance check would
-            # take a third deferred import of that layer into a module already
-            # carrying two, each one deferred only because importing the two
-            # modules into each other at load time is what they cannot do.
+            # A resource that hands back itself never said what distinguishes
+            # it, so its own state is all there is to compare. The question is
+            # asked by identity so it costs this module no new knowledge of the
+            # resource layer. An isinstance check would add a third deferred
+            # import of that layer to a module already carrying two, each
+            # deferred only because the two modules cannot import each other
+            # at load time.
             if self._resource_configuration(resource) is resource:
                 raise UnsupportedValueError(
                     f"Resource {type(resource).__module__}:{type(resource).__qualname__} "
@@ -4974,25 +4947,24 @@ class Database:
 
         A resource's ``identity()`` runs user code and hands back a fresh
         object every call, so the reference observation that gates the rest of
-        the memo cannot see it. This re-runs the read and digests its value
-        instead, which is what makes a resource-folding fingerprint memoizable
-        at all. Any failure answers with a value no stored digest can equal, so
-        a resource that has become unreadable forces the full recompute rather
-        than serving a fingerprint nothing checked.
+        the memo cannot see it. This re-runs the read and digests its value,
+        which makes a resource-folding fingerprint memoizable at all. Any
+        failure answers with a value no stored digest can equal, so a resource
+        that has become unreadable forces the full recompute and no unchecked
+        fingerprint is served.
         """
 
-        # Re-read at most once per request. That is exactly the scope the
-        # kernel already gives resource validation -- a span declares that the
-        # world holds still until it closes, and a caller changing it mid-span
-        # must say so, which rolls the request and clears this cache -- so
-        # reusing a digest inside one request introduces no consistency class
-        # the kernel did not already have. Outside a request the cache does
-        # not exist and every read is fresh.
+        # Re-read at most once per request, the scope the kernel already gives
+        # resource validation. A span declares that the world holds still
+        # until it closes, and a caller changing it mid-span must say so, which
+        # rolls the request and clears this cache. So reusing a digest inside
+        # one request adds no new consistency class. Outside a request there is
+        # no cache and every read is fresh.
         cache = self._request_resource_digests
         if cache is not None:
             entry = cache.get(id(resource))
-            # The resource object is kept beside its digest: an id freed and
-            # reused by another object must not answer from this cache.
+            # The resource object is kept beside its digest, so an id freed and
+            # reused by another object never answers from this cache.
             if entry is not None and entry[0] is resource:
                 return entry[1]
         try:
@@ -5012,57 +4984,61 @@ class Database:
     def _query_definition_observation(self, query: Any) -> Any:
         """Observe the live query definition for memoized-fingerprint reuse.
 
-        The observation records object *references* — per entry, not per
-        container, because a `__kwdefaults__` dict or a closure cell mutated in
-        place keeps its identity while changing the definition. Storing the
+        The observation records object *references* for each entry, because a
+        container (a `__kwdefaults__` dict or a closure cell) mutated in place
+        keeps its identity while changing the definition. Storing the
         references in the memo pins their addresses, so identity comparison is
-        collision-free: any rebinding introduces an object that cannot be
+        collision-free. Any rebinding introduces an object that cannot be
         identical to a still-pinned one, and a spurious mismatch only costs a
-        fingerprint recompute. It traverses the same slots as
-        `_function_definition_payload` folds into the fingerprint — function
+        fingerprint recompute. It traverses the slots
+        `_function_definition_payload` folds into the fingerprint (function
         metadata, captured class bodies, and captured instance and policy
-        state — plus the query handle's own instance dictionary, which
-        `_query_handle_state_payload` folds beside it, pinning each entry's
-        reference where the payload folds its value; modules stay leaves, and
-        so do the types the payload pins by module anchor rather than by a
+        state), plus the query handle's own instance dictionary, which
+        `_query_handle_state_payload` folds beside it. It pins each entry's
+        reference where the payload folds its value. Modules stay leaves, and
+        so do the types the payload pins by module anchor in place of a
         namespace walk.
 
-        A module is covered by three memo arms instead, because this walk never
-        enters one: `_module_observation_stamp` re-derives its file bytes,
-        import metadata and, outside the runtime-pinned modules, its
-        module-level constants; each statically accessed attribute chain is
-        re-resolved and its target compared by identity; and the definitions
-        behind the chain landings whose payloads read one live
-        -- functions, wraps-decorated callable objects, query handles, inputs,
-        type aliases, type parameters and resources, whose globals, defaults,
-        policies, evaluators, instance and handle state the payload folds live
-        -- are observed by `_module_function_target_observation`. Where a chain
-        lands on a class or a frozen dataclass instance instead -- named
-        directly, or held inside an immutable container the payload accepts,
-        such as a tuple, a NamedTuple or a frozenset -- no arm follows anything
-        inside that landing: the memo compares the object the chain resolved to
-        by identity while the payload folds what is inside it, so neither a
-        member written in place nor a binding one of those members reads is
-        observed. Where such a container carries a class, the rebinding this
-        walk misses is one the payload refuses outright once the class stops
-        being its module's live binding, so the memo answers on while a fresh
-        computation raises. Landings the payload refuses from the start instead
-        of folding -- a plain object that is not one of those callables, a
-        mutable dataclass, a dict, a list -- raise when the fingerprint is
-        built and carry nothing stale.
+        This walk never enters a module. Three memo arms cover modules:
+
+        * `_module_observation_stamp` re-derives its file bytes, import
+          metadata and, outside the runtime-pinned modules, its module-level
+          constants.
+        * Each statically accessed attribute chain is re-resolved and its
+          target compared by identity.
+        * `_module_function_target_observation` observes the definitions
+          behind the chain landings whose payloads read one live: functions,
+          wraps-decorated callable objects, query handles, inputs, type
+          aliases, type parameters and resources, whose globals, defaults,
+          policies, evaluators, instance and handle state the payload folds
+          live.
+
+        A chain can also land on a class or a frozen dataclass instance, named
+        directly or held inside an immutable container the payload accepts (a
+        tuple, a NamedTuple or a frozenset). No arm follows anything inside
+        that landing. The memo compares the resolved object by identity while
+        the payload folds what is inside it, so the memo misses both a member
+        written in place and a binding one of those members reads. Where such
+        a container carries a class, the payload refuses that missed rebinding
+        outright once the class stops being its module's live binding, so the
+        memo keeps answering while a fresh computation raises. Landings the
+        payload refuses from the start (a plain object that is none of those
+        callables, a mutable dataclass, a dict, a list) raise when the
+        fingerprint is built and carry nothing stale.
+
         What a fold reads out of a resource's `identity()` needs no walk on
-        either route: it is gated by the recorded configuration digests the
-        memo carries alongside this observation. Everything else a fold reads
-        off a resource -- its type, its probe and load and identity methods,
-        and what those read -- is observed as the ordinary instance it is, by
-        this walk where a slot reaches the resource directly and by the
-        chain-landing arm where an attribute chain lands on it.
+        either route. The recorded configuration digests the memo carries
+        beside this observation gate it. Everything else a fold reads off a
+        resource (its type, its probe, load and identity methods, and what
+        those read) is observed as an ordinary instance. This walk observes it
+        where a slot reaches the resource directly, and the chain-landing arm
+        where an attribute chain lands on it.
         """
 
-        # The query arm of `observe_value` is this observation: it folds the
+        # The query arm of `observe_value` is this observation. It folds the
         # key, the policies, the function and the handle state, and it marks
         # the handle before descending, so a body that captures its own query
-        # pins it by reference there instead of walking it a second time.
+        # pins it there by reference and the handle is walked once.
         observe_value, _observe_function = self._definition_observers()
         return observe_value(query)
 
@@ -5076,33 +5052,31 @@ class Database:
         globals live. None of that moves the function's identity, and the
         module's constants payload carries none of it either, so the memo needs
         the same observation the query's own function gets. A wraps-decorated
-        callable object is folded the same way and for the same reason -- its
+        callable object is folded the same way for the same reason: its
         `__call__` definition and its instance state are read live while the
-        landing object's own identity holds still -- so it is observed here
-        too, which is what makes `import m; m.f` and `from m import f` reuse a
-        stored fingerprint on the same conditions. A Query landing is the third
-        such shape: the payload folds its function, its policies and its handle
-        state live, none of which moves the handle the chain resolves to.
+        landing object's own identity holds still. So it is observed here too,
+        which lets `import m; m.f` and `from m import f` reuse a stored
+        fingerprint on the same conditions. A Query landing is the third such
+        shape. The payload folds its function, its policies and its handle
+        state live, and none of them moves the handle the chain resolves to.
 
-        Four more landings are folded from live definitions and belong here for
-        exactly that reason: an Input, whose `eq` and `cutoff` policies are
-        folded as definitions; a type alias and a type parameter, whose lazy
+        Four more landings are folded from live definitions and belong here
+        for that reason: an Input, whose `eq` and `cutoff` policies are folded
+        as definitions; a type alias and a type parameter, whose lazy
         evaluators resolve their globals when the payload calls them; and a
         resource, whose `probe`, `load` and `identity` methods are folded as
         the definitions they are. One observer family covers every record, in
         the order the memo stored them, so a value two chains share is folded
-        on first contact the same way here as it was when the stored
-        observation was built.
+        on first contact here as it was when the stored observation was built.
         """
 
         from .core import Input, Query
 
         def observed(target: Any) -> bool:
-            # A Query is named before the wrapped-callable clause rather than
-            # left to it: functools.wraps does put a __wrapped__ function on
-            # every handle, so the clause would catch one by accident, and the
-            # memo would lose the handle silently if that ever stopped being
-            # true.
+            # A Query is named ahead of the wrapped-callable clause.
+            # functools.wraps does put a __wrapped__ function on every handle,
+            # so the clause would catch one by accident, and the memo would
+            # silently lose the handle if that ever stopped being true.
             if isinstance(target, (FunctionType, Query, Input)):
                 return True
             # The one bound method `_module_attribute_payload` folds, and it
@@ -5111,10 +5085,9 @@ class Database:
                 return True
             # Mirrors `_module_attribute_payload`, which routes a module and a
             # class to their own branches before the resource and
-            # wrapped-callable ones: a module is covered by the memo's other
-            # arms, and a class landing is compared by identity alone, whether
-            # or not it carries a __wrapped__ attribute or the methods a
-            # resource is recognised by.
+            # wrapped-callable ones. The memo's other arms cover a module, and
+            # a class landing is compared by identity alone, whatever
+            # __wrapped__ attribute or resource methods it carries.
             if isinstance(target, (ModuleType, type)):
                 return False
             if _is_type_alias(target) or isinstance(target, _TYPE_PARAMETER_TYPES):
@@ -5138,12 +5111,11 @@ class Database:
     ) -> tuple[Callable[[Any], Any], Callable[[FunctionType], Any]]:
         """Build one observer family over a fresh shared `seen` set.
 
-        The `seen` set is what makes an observation first-contact-complete: a
-        value reached from two slots is folded once, by whichever slot arrives
-        first, and pinned by reference afterwards. Callers that must compare
-        two observations therefore have to build them from families of the same
-        shape — one family per observation, over the same slots in the same
-        order.
+        The `seen` set makes an observation first-contact-complete. A value
+        reached from two slots is folded once, by whichever slot arrives first,
+        and pinned by reference afterwards. So callers comparing two
+        observations must build them from families of the same shape: one
+        family per observation, over the same slots in the same order.
         """
 
         from .core import Input, Query
@@ -5176,10 +5148,10 @@ class Database:
             if isinstance(value, FunctionType):
                 return observe_function(value)
             if isinstance(value, ModuleType):
-                # Modules are gated by three memo arms instead of a walk here:
-                # the observation stamp over file content and namespace
-                # constants, the attribute targets re-resolved by identity, and
-                # the observed definitions behind chain-reached functions.
+                # Three memo arms gate modules, so there is no walk here: the
+                # observation stamp over file content and namespace constants,
+                # the attribute targets re-resolved by identity, and the
+                # observed definitions behind chain-reached functions.
                 return value
             if isinstance(value, type):
                 return observe_type(value)
@@ -5222,11 +5194,11 @@ class Database:
                     observe_value(value.step),
                 )
             if isinstance(value, (staticmethod, classmethod)):
-                # Descriptors are builtin by type and anything but a leaf by
-                # content: _type_definition_payload folds the function they
-                # wrap, so the observation has to reach it too. Before the
-                # builtins arm below, which would otherwise pin the wrapper and
-                # see none of the definition behind it.
+                # Descriptors are builtin by type, yet their content goes
+                # beyond a leaf: _type_definition_payload folds the function
+                # they wrap, so the observation has to reach it too. This runs
+                # before the builtins arm below, which would pin the wrapper
+                # and see none of the definition behind it.
                 return (value, observe_value(value.__func__))
             if isinstance(value, property):
                 return (
@@ -5281,15 +5253,15 @@ class Database:
 
         def observe_state(value: Any) -> Any:
             try:
-                # The slot _static_instance_dict reads. Going through vars()
-                # instead would follow a proxying __getattribute__ to a mapping
-                # rebuilt on every read, which identity comparison never matches.
+                # The slot _static_instance_dict reads. vars() would follow a
+                # proxying __getattribute__ to a mapping rebuilt on every read,
+                # which identity comparison never matches.
                 state = object.__getattribute__(value, "__dict__")
             except (AttributeError, TypeError):
                 return None
-            # Only a concrete instance dictionary is observed: the payload
-            # refuses ambient capture state that is not one, and pinning a
-            # proxy would pin an object rebuilt on the next read.
+            # Only a concrete instance dictionary is observed. The payload
+            # refuses any other ambient capture state, and pinning a proxy
+            # would pin an object rebuilt on the next read.
             if not isinstance(state, dict):
                 return None
             return tuple(
@@ -5365,14 +5337,14 @@ class Database:
             return observe_value(value)
 
         def observe_type_alias(value: Any) -> Any:
-            # One fold for both slots that reach an alias, annotation and
-            # ambient capture, because _freeze_annotation_capture and
+            # One fold for both slots that reach an alias (annotation and
+            # ambient capture), because _freeze_annotation_capture and
             # _freeze_static_capture read the same evaluator and __value__.
-            # Folding on first contact, whichever slot arrives first, is what
-            # makes the shared `seen` set below safe. Nested values take
-            # observe_value, which matches the ambient reading and never
-            # observes less than the annotation one, so neither slot is
-            # short-changed by the other having arrived first.
+            # Folding on first contact, whichever slot arrives first, keeps the
+            # shared `seen` set below safe. Nested values take observe_value,
+            # which matches the ambient reading and observes at least as much
+            # as the annotation one, so whichever slot arrives first, the other
+            # loses nothing.
             if id(value) in seen:
                 # A later contact returns the pinned object: the first one
                 # already folded it, and both paths fold it the same way.
@@ -5384,10 +5356,10 @@ class Database:
             else:
                 # Without a Python evaluator the payload resolved __value__
                 # eagerly and anchored the types it reached to their live
-                # module bindings; the leaves carry the same sensitivity for
+                # module bindings. The leaves carry the same sensitivity for
                 # every swept class and carrier type, and for the definition
-                # closure each of those types anchors in turn, so the memo
-                # refuses when a fresh computation would.
+                # closure each of those types anchors, so the memo refuses
+                # when a fresh computation would.
                 resolved = getattr(value, "__value__", None)
                 content = (observe_value(resolved), _type_anchor_leaves(resolved))
             return (
@@ -5437,14 +5409,13 @@ class Database:
             # Mirrors `_query_handle_state_payload` arm for arm. Each
             # annotation carrier is pinned beside the function's own, because
             # that payload folds the handle's copy by content only where the
-            # two references have come apart; pinning both is what notices
-            # either of them being rebound. __wrapped__ gets the same treatment
-            # for the same reason: a marker while it points at the function,
-            # its definition once it points elsewhere, since the payload then
-            # folds that definition live. Everything else is pinned per entry,
-            # except the contract fields the payload leaves to a sibling --
-            # the arms beside this one observe the key, the policies and the
-            # function.
+            # two references have come apart. Pinning both notices either
+            # being rebound. __wrapped__ gets the same treatment for the same
+            # reason: a marker while it points at the function, its definition
+            # once it points elsewhere, since the payload then folds that
+            # definition live. Everything else is pinned per entry, except the
+            # contract fields the payload leaves to a sibling (the arms beside
+            # this one observe the key, the policies and the function).
             state = vars(handle)
             annotate = state.get("__annotate__")
             if annotate is None:
@@ -5478,20 +5449,18 @@ class Database:
             try:
                 entries = sorted(state.items())
             except TypeError as exc:
-                # A handle dictionary given a name that is not a string is
-                # refused by the payload, and this walk gets there first for
-                # the query being keyed and for one its body closes over --
-                # both are observed before their state is folded -- so it
-                # answers with the same refusal instead of letting the sort's
-                # TypeError out. This does not stand in for the payload's own
+                # The payload refuses a handle dictionary holding a non-string
+                # name. This walk gets there first for the query being keyed
+                # and for one its body closes over (both are observed before
+                # their state is folded). So it answers with the same refusal
+                # in place of the sort's TypeError. The payload keeps its own
                 # check: a handle reached through a module attribute chain is
-                # folded without this walk ever observing it, because the walk
-                # stops at the module. Caught rather than checked in front:
-                # the sort is attempted, and a TypeError out of it -- from the
-                # names, or from the values a tuple comparison falls through
-                # to -- is answered as invalid custom state, while a check
-                # would cost every observation of every handle on the memo
-                # path this closure exists to serve.
+                # folded without this walk observing it, because the walk stops
+                # at the module. The sort is tried with no check up front. A
+                # TypeError out of it (from the names, or from the values a
+                # tuple comparison falls through to) is answered as invalid
+                # custom state. A check would cost every observation of every
+                # handle on the memo path this closure exists to serve.
                 raise UnsupportedValueError(
                     f"Query handle {handle.key!r} has invalid custom state."
                 ) from exc
@@ -5511,7 +5480,7 @@ class Database:
         def observe_metadata(fn: FunctionType) -> Any:
             # _function_metadata_payload folds annotation values as ambient
             # captures when the body reads its own annotations back, and as
-            # annotation captures otherwise; the observation follows the switch.
+            # annotation captures otherwise. The observation follows the switch.
             observe_entry = (
                 observe_value if self._reads_its_own_annotations(fn) else observe_annotation
             )
@@ -5716,8 +5685,8 @@ class Database:
     def _annotation_evaluator_payload(
         self, evaluator: FunctionType, active_ids: builtins.set[int]
     ) -> Any:
-        # The third route that folds a Python function's code, and it makes the
-        # same static assumption the other two do: the names below are resolved
+        # The third route that folds a Python function's code. It makes the
+        # same static assumption as the other two: the names below are resolved
         # against the evaluator's globals. A reflective read reaches state none
         # of them names, so it is refused here as well.
         self._reject_reflective_namespace_reads(evaluator)
@@ -5902,25 +5871,25 @@ class Database:
         )
 
     def _code_location_payload(self, filename: str, module_name: str | None) -> Any:
-        """Fold where a definition sits inside its package, not on this machine.
+        """Fold where a definition sits in its package, independent of the machine.
 
         `co_filename` is the absolute path the source file had when the module
-        was imported, so folding it verbatim binds every identity to the
-        checkout, container or virtualenv the code was installed into: two
-        byte-identical trees at different prefixes then share no fingerprint at
-        all. What the fold needs is which file INSIDE ITS PACKAGE the code was
-        compiled from, and the import system already answers that without
-        touching the filesystem -- the defining module's dotted name encodes
-        its package position, namespace parents included, and the basename
-        separates `pkg/mod.py` from `pkg/mod/__init__.py`.
+        was imported. Folding it verbatim binds every identity to the checkout,
+        container or virtualenv the code was installed into, so two
+        byte-identical trees at different prefixes share no fingerprint. The
+        fold needs the file INSIDE ITS PACKAGE the code was compiled from, and
+        the import system answers that without touching the filesystem. The
+        defining module's dotted name encodes its package position, namespace
+        parents included, and the basename separates `pkg/mod.py` from
+        `pkg/mod/__init__.py`.
 
-        A `co_filename` that is not an absolute path is not a location at all
-        -- `<string>` for exec'd and dataclass-generated code, `<stdin>`,
-        `<frozen importlib._bootstrap>` -- and is folded verbatim, so generated
-        code can never take a real module's identity. An absolute path whose
-        basename is not the defining module's own file is code compiled with a
-        filename of someone's choosing; it is folded verbatim beside the module
-        name rather than being allowed to answer to that module's location.
+        A non-absolute `co_filename` names no location (`<string>` for exec'd
+        and dataclass-generated code, `<stdin>`, `<frozen importlib._bootstrap>`).
+        It is folded verbatim, so generated code can never take a real module's
+        identity. An absolute path whose basename differs from the defining
+        module's own file is code compiled with a filename of someone's
+        choosing. It is folded verbatim beside the module name and never
+        answers to that module's location.
         """
 
         if not os.path.isabs(filename):
@@ -5936,11 +5905,11 @@ class Database:
         """Return a refcount-independent, typed encoding of a code object, in the
         package position its defining module gives it.
 
-        `module_name` is that module's dotted name -- `fn.__module__` at the
-        outer call sites, inherited by every nested code constant -- and is what
-        `_code_location_payload` folds in place of the absolute source path; it
-        is required rather than defaulted so a call site that forgets to thread
-        it is a type error rather than a silent fallback to that path.
+        `module_name` is that module's dotted name (`fn.__module__` at the
+        outer call sites, inherited by every nested code constant).
+        `_code_location_payload` folds it in place of the absolute source path.
+        It is required and has no default, so a call site that forgets to
+        thread it is a type error and never a silent fallback to that path.
         """
         return (
             "code-v3",
@@ -6158,11 +6127,11 @@ class Database:
         """Implementation digest of each registered adapter, keyed by adapted type.
 
         The registry is fixed, but a caller's adapter configuration may be
-        instance state, so those digests are recomputed at each checkpoint trust
-        boundary. The kernel's own fixed adapters are exempt: they carry no
-        instance state and their implementations ship in this package, so their
-        digests -- published once per process -- cannot have moved, and this serves
-        them from that memo. Every registered key still appears, so the
+        instance state, so those digests are recomputed at each checkpoint
+        trust boundary. The kernel's own fixed adapters are exempt. They carry
+        no instance state and their implementations ship in this package, so
+        their digests (published once per process) cannot have moved, and this
+        serves them from that memo. Every registered key still appears, so the
         map a checkpoint manifest is written from is unchanged.
         """
         digests = dict(self._static_adapter_digests)
@@ -6175,21 +6144,20 @@ class Database:
 
         The in-process basis for the pinned-adapter-state law: an adapter's own
         instance state, digested through the same helper the implementation
-        digest folds it with. Implementations stay out of this map; they are
+        digest folds it with. Implementations stay out of this map. They are
         digested at the checkpoint boundary, where the code that froze a record
         and the code reading it come from different processes.
 
         Built one entry at a time, so an adapter whose configuration cannot be
-        digested -- slot state, a state key that defeats the digest's sort --
-        costs the check only its own entry. Construction succeeds either way;
-        what such an adapter loses is the in-process check on itself.
+        digested (slot state, a state key that defeats the digest's sort)
+        costs the check only its own entry. Construction succeeds either way.
+        Such an adapter loses only the in-process check on itself.
 
         The kernel's own fixed adapters contribute nothing here. They hold no
-        instance state, so there is no configuration for the check to catch
-        moving; naming them would only make every top-level request re-derive a
-        digest that cannot change. A registry holding nothing else therefore
-        leaves this map empty, and the request-scope check returns on its first
-        line.
+        instance state, so the check has no configuration to watch. Naming
+        them would only make every top-level request re-derive a digest that
+        cannot change. So a registry holding only them leaves this map empty,
+        and the request-scope check returns on its first line.
         """
         digests: dict[str, str] = {}
         for value_type, adapter in self._non_static_adapters.items():
@@ -6205,12 +6173,13 @@ class Database:
 
         Adapter instance configuration is contractually immutable for the
         registered lifetime. The configuration digests are taken once at
-        construction; re-deriving them at each top-level request turns a silent
-        warm-not-equal-fresh into a loud typed error without changing any cache
-        key. Only the adapters the construction-time map names are re-derived:
-        an adapter whose configuration could not be digested then is absent
-        from it and is skipped, on its own, because drift there is undetectable
-        in-process and the checkpoint boundary already refuses to trust it.
+        construction. Re-deriving them at each top-level request turns a
+        silent warm-not-equal-fresh into a loud typed error and leaves every
+        cache key as it was. Only the adapters the construction-time map names
+        are re-derived. An adapter whose configuration could not be digested
+        then is absent from it and is skipped on its own, because drift there
+        is undetectable in-process and the checkpoint boundary already refuses
+        to trust it.
         """
 
         expected = self._registered_adapter_digests
@@ -6242,13 +6211,14 @@ class Database:
     def _adapter_implementation_digest(self, adapter: ValueAdapter) -> str:
         """Fingerprint an adapter's ``freeze``/``thaw`` implementation.
 
-        Both methods' code is folded in via the same definition-payload machinery
-        that pins query bodies, so a checkpoint record frozen under one adapter is
-        refused under a changed one -- even a change to ``thaw`` alone, which
-        leaves the stored payload (and its digest) untouched. Non-Python methods
-        are identified by their public callable identity. A Python method whose
-        captures cannot be pinned is rejected instead of silently weakening the
-        checkpoint trust boundary to the adapter class name.
+        Both methods' code is folded in via the same definition-payload
+        machinery that pins query bodies, so a checkpoint record frozen under
+        one adapter is refused under a changed one. That includes a change to
+        ``thaw`` alone, which leaves the stored payload (and its digest)
+        untouched. Non-Python methods are identified by their public callable
+        identity. A Python method whose captures cannot be pinned is refused,
+        so the checkpoint trust boundary never silently weakens to the adapter
+        class name.
         """
         try:
             payload: Any = (
@@ -6270,10 +6240,10 @@ class Database:
     def _adapter_configuration_digest(self, adapter: ValueAdapter) -> str:
         """Fingerprint an adapter's instance configuration.
 
-        Folds the adapter's own state through ``_adapter_state_payload``, the
-        same helper the implementation digest folds it with, and nothing else:
-        an adapter that carries its configuration where that helper refuses to
-        look -- slot state -- is as unverifiable here as it is there.
+        Folds only the adapter's own state, through ``_adapter_state_payload``,
+        the same helper the implementation digest folds it with. An adapter
+        that carries its configuration where that helper refuses to look (slot
+        state) is as unverifiable here as it is there.
         """
         return fingerprint_snapshot(
             ("adapter-configuration-v1", self._adapter_state_payload(adapter))
@@ -6338,28 +6308,28 @@ class Database:
         still carries, byte-identical.
 
         A key absent from the live registry, or one whose implementation digest
-        has moved since the checkpoint, is untrusted: the caller must refuse the
+        has moved since the checkpoint, is untrusted. The caller must refuse the
         warm so the record re-executes and any adapted payload is re-frozen and
         re-thawed under the live adapter.
         """
         if not self._checkpoint_adapter_digests and not self._non_static_adapters:
             # Fast path: nothing to distrust. With no checkpoint digests loaded,
             # every key reaching here belongs to a record this process froze
-            # through this very registry -- a loaded checkpoint that had adapted
+            # through this same registry. A loaded checkpoint with adapted
             # values would have brought their digests with it, and the manifest
-            # validator refuses a record naming a key its manifest does not
-            # declare, so no loaded record can reach here. So the only
-            # question left is whether a live adapter has moved since it froze
-            # those records, and the kernel's own fixed adapters cannot: they
-            # hold no state and their code ships with this module. A caller's
-            # adapter takes the full comparison below, because its configuration
-            # is state the law asks the caller to leave alone rather than
-            # something this process can vouch for.
+            # validator refuses a record naming a key its manifest leaves
+            # undeclared, so no loaded record can reach here. The only question
+            # left is whether a live adapter has moved since it froze those
+            # records, and the kernel's own fixed adapters cannot: they hold no
+            # state and their code ships with this module. A caller's adapter
+            # takes the full comparison below, because its configuration is
+            # state the law asks the caller to leave alone, which this process
+            # cannot vouch for.
             return True
         try:
             current = self._current_adapter_digests()
         except (UnsupportedValueError, TypeError, ValueError):
-            # The live adapter can still be used for fresh execution, but its
+            # The live adapter still works for fresh execution, but its
             # implementation cannot be proven identical to the checkpoint's.
             return False
         for adapter_key in adapter_keys:
@@ -6447,7 +6417,7 @@ class Database:
             # Tested before the __wrapped__ probe: a class carrying a
             # __wrapped__ class attribute is still a class, and the class
             # treatment (full body payload) must win. type(value) here is the
-            # metaclass, so no callable-object payload could substitute.
+            # metaclass, so a callable-object payload could never stand in.
             if "<locals>" in value.__qualname__ and self._type_fingerprint_stack.get():
                 return self._implementation_type_payload(value)
             return self._type_definition_payload(value)
@@ -6498,25 +6468,24 @@ class Database:
     ) -> Any:
         """Fingerprint a functools.wraps-style callable object by its behavior.
 
-        The wrapped function alone is not the behavior: __call__ decides what
-        runs and the instance state parameterizes it, exactly as for an
-        eq=/cutoff= policy object. __wrapped__ stays in the payload as
-        additive information, never as a substitute for the implementation.
+        The behavior is more than the wrapped function: __call__ decides what
+        runs and the instance state parameterizes it, as for an eq=/cutoff=
+        policy object. __wrapped__ stays in the payload as extra information,
+        never as a substitute for the implementation.
 
-        The state fold is the ambient-capture one rather than the policy one:
-        functools.wraps writes __wrapped__ and the copied metadata into the
-        instance dictionary, and the policy fold refuses a function held there,
-        so every wraps-decorated callable would be rejected. This fold reaches
-        the same verdict on what matters -- slot state and mutable containers
-        are refused -- while folding a function-valued entry as the dependency
-        it is.
+        The state fold is the ambient-capture one. functools.wraps writes
+        __wrapped__ and the copied metadata into the instance dictionary, and
+        the policy fold refuses a function held there, so it would refuse
+        every wraps-decorated callable. This fold reaches the same verdict on
+        what matters (slot state and mutable containers are refused) while
+        folding a function-valued entry as the dependency it is.
 
-        Reading instance state is also what puts a reference cycle within
-        reach, and the ambient guard that catches one is a per-walk set that
-        restarts whenever a nested value routes back through the dependency
-        digest, as a captured callable held in this one's state does. This
-        stack spans those restarts. It refuses rather than folding a marker,
-        which is what the kernel already does with a cyclic ambient value.
+        Reading instance state also puts a reference cycle within reach. The
+        ambient guard that catches one is a per-walk set that restarts
+        whenever a nested value routes back through the dependency digest, as
+        a captured callable held in this one's state does. This stack spans
+        those restarts. It refuses the cycle and folds no marker, as the
+        kernel already does with a cyclic ambient value.
         """
 
         call = type(value).__call__
@@ -6761,24 +6730,24 @@ class Database:
 
         Through 3.13 `functools.WRAPPER_ASSIGNMENTS` carries `__annotations__`,
         so `functools.wraps` binds the wrapped function's own annotations
-        dictionary -- the same object, not a copy -- into the wrapper's instance
+        dictionary (the same object, uncopied) into the wrapper's instance
         dictionary. The capture walk has no dictionary arm, so it met one there
         and refused the whole callable. From 3.14 the assignment list carries
-        `__annotate__` and `__type_params__` instead, both of which the walk
-        already folds, so the entry never appears and the identical callable is
-        accepted. Skipping it makes the older interpreters agree with 3.14
-        rather than refuse for a reason that belongs to the interpreter.
+        `__annotate__` and `__type_params__` in its place, both of which the
+        walk already folds, so the entry never appears and the identical
+        callable is accepted. Skipping it makes the older interpreters agree
+        with 3.14 and avoids a refusal whose cause is the interpreter.
 
-        Nothing leaves identity with it: the same dictionary is read back out of
-        the wrapped function by `_function_definition_payload`, which the
-        callable payload already folds, so mutating it in place still moves the
-        query. The test is `is` against that function's annotations, so a
-        wrapper whose `__annotations__` was rebound to some other dictionary
-        still meets the dictionary arm and is still refused.
+        Identity loses nothing: `_function_definition_payload` reads the same
+        dictionary back out of the wrapped function, and the callable payload
+        already folds that, so mutating it in place still moves the query. The
+        test is `is` against that function's annotations, so a wrapper whose
+        `__annotations__` was rebound to some other dictionary still meets the
+        dictionary arm and is still refused.
 
-        The name is tested first because reading a function's `__annotations__`
-        materializes them on 3.14, and an entry that cannot be the copy must not
-        force that.
+        The name is tested first because reading a function's
+        `__annotations__` materializes them on 3.14, and an entry that cannot
+        be the copy must not force that.
         """
 
         if state_name != "__annotations__":
@@ -6806,10 +6775,9 @@ class Database:
         if guarded is not None and isinstance(bound_owner, type):
             # A guard wrapper installed as a classmethod (`Path.cwd`), bound
             # to the class it was looked up on. The class is pinned as an
-            # implementation dependency is -- a standard-library one by its
-            # module and name, any other by its body -- not walked whole as
-            # an ordinary method's owner is, which `pathlib.Path` does not
-            # survive.
+            # implementation dependency is (a standard-library one by its
+            # module and name, any other by its body). Walking it whole, as an
+            # ordinary method's owner is walked, fails on `pathlib.Path`.
             return (
                 "bound-guarded-standard-name",
                 guarded,
@@ -6852,27 +6820,26 @@ class Database:
     def _guarded_name_payload(self, value: Any) -> Any | None:
         """Pin a guard wrapper as the standard-library callable it guards, or None.
 
-        A wrapper is a closure over pyinc's own state -- the active guards, the
-        working-directory flag, the original it calls -- which the capture
-        walk refuses. What it does is the original's behaviour behind the
-        guard, so a capture of it is pinned the way a standard-library type
-        is: by the original's module and qualified name, that module's
-        identity, and the interpreter build. Every route that folds a capture
-        lands here and folds the same payload.
+        A wrapper is a closure over pyinc's own state (the active guards, the
+        working-directory flag, the original it calls), which the capture walk
+        refuses. It does what the original does, behind the guard. So a
+        capture of it is pinned the way a standard-library type is: by the
+        original's module and qualified name, that module's identity, and the
+        interpreter build. Every route that folds a capture lands here and
+        folds the same payload.
 
-        It folds no file of pyinc's, by design. Nothing folds pyinc's version
-        or the kernel as a whole into every identity: the kernel marks a
-        change to its own encoding and rules with versions it bumps by hand --
+        It folds no file of pyinc's, by design. No fold adds pyinc's version,
+        or the kernel as a whole, to every identity. The kernel marks a change
+        to its own encoding and rules with versions it bumps by hand:
         `_KERNEL_FINGERPRINT_VERSION`, the `K2;` prefix every digest carries,
         and the checkpoint manifest version. pyinc's own code reaches an
-        identity only where a query captures a pyinc object -- an annotation
-        evaluated to `Database`, a resource -- through the bytes of the module
-        that defines it, as any captured module's code does, so such an
-        identity moves with any edit to that module. A wrapper is not folded
-        that way: a capture of one moves with pyinc's code no more than the
-        same call spelled through its module (`os.getcwd()`) does, and a change
-        to the guard that a stored identity must not outlive bumps the tag
-        below instead.
+        identity only where a query captures a pyinc object (an annotation
+        evaluated to `Database`, a resource), through the bytes of the module
+        that defines it, as any captured module's code does. Such an identity
+        moves with any edit to that module. A wrapper is folded differently. A
+        capture of one moves with pyinc's code only as much as the same call
+        spelled through its module (`os.getcwd()`) does. A change to the guard
+        that a stored identity must not outlive bumps the tag below.
         """
 
         entry = _guarded_name(value)
@@ -7245,8 +7212,8 @@ class Database:
     def _reads_its_own_annotations(fn: FunctionType) -> bool:
         """Whether `fn`'s code can read its annotations back as values.
 
-        Such a function's annotations are folded as ambient captures rather
-        than as annotations, since the body may call what they hold.
+        Such a function's annotations are folded as ambient captures, since
+        the body may call what they hold.
         """
         return any(
             name in {"__annotations__", "get_annotations", "get_type_hints"}
@@ -7264,9 +7231,9 @@ class Database:
     ) -> tuple[builtins.set[str], builtins.set[str]]:
         """Collect the code-pinned query_ids and resource identities of *fn*.
 
-        A thin view over :meth:`_collect_pinned_capture_objects`: the query set
+        A thin view over :meth:`_collect_pinned_capture_objects`. The query set
         drives the warm-time gate (a dep query outside it was reached via a
-        runtime import / dynamic dispatch and must not be served stale); the
+        runtime import / dynamic dispatch and must not be served stale). The
         resource set is the identity space the resource gate resolves against.
         """
         query_objects, resource_objects = self._collect_pinned_capture_objects(fn)
@@ -7281,9 +7248,9 @@ class Database:
         (defaults, kwdefaults, closure nonlocals, globals), recursing through
         captured functions, bound methods, queries, immutable container shapes,
         and the static attribute chains spelled on a captured module. Returns
-        ``(query_id -> Query object, resource identity -> resource object)``; a
+        ``(query_id -> Query object, resource identity -> resource object)``. A
         query or resource reached only via a runtime import or dynamic dispatch
-        is *not* captured and never appears here. The maps let the warm path
+        is left uncaptured and never appears here. The maps let the warm path
         re-run a pinned leaf (execute-to-verify) and re-probe a pinned resource
         (probe-hint) by their manifest identities.
         """
@@ -7320,23 +7287,23 @@ class Database:
         def walk_module(owner: FunctionType, capture_name: str, module: ModuleType) -> None:
             # The fingerprint folds the behaviour behind every static attribute
             # chain the owner spells on a captured module, so a query or a
-            # resource such a chain lands on is code-pinned exactly as a direct
-            # capture is; `q.thing(db, x)` must warm as `thing(db, x)` does. The
-            # chains are the ones `_captured_module_payload` records, resolved
-            # the way its memo guard re-resolves them.
+            # resource such a chain lands on is code-pinned as a direct capture
+            # is. `q.thing(db, x)` must warm as `thing(db, x)` does. The chains
+            # are the ones `_captured_module_payload` records, resolved the way
+            # its memo guard re-resolves them.
             #
             # Invariant: everything this walk pins is folded into the root's
             # identity. The warm path restores a pinned dep's record by its
             # saved key on the strength of that fold, so the walk must stop
-            # exactly where the fold stops. A standard-library module is
-            # skipped as it is there: its functions are pinned by name anchor
-            # only, and nothing in it is a query or a resource. A module that
-            # is already being descended on this path is skipped as the
-            # `recursive-captured-module` arm skips it: the fold records that
-            # module's identity and the chain names, not the behaviour behind
-            # the chains, so a query reached only around such a cycle is not
-            # part of the root's identity and must not be pinned. The pytest
-            # assertion-rewrite module is pinned by identity alone as well.
+            # where the fold stops. A standard-library module is skipped as it
+            # is there: its functions are pinned by name anchor only, and it
+            # holds no query or resource. A module already being descended on
+            # this path is skipped as the `recursive-captured-module` arm skips
+            # it. The fold records that module's identity and the chain names
+            # and leaves out the behaviour behind the chains. So a query reached
+            # only around such a cycle is outside the root's identity and must
+            # stay unpinned. The pytest assertion-rewrite module is pinned by
+            # identity alone as well.
             if capture_name == "@pytest_ar" and module.__name__ == "_pytest.assertion.rewrite":
                 return
             specification = vars(module).get("__spec__")
@@ -7404,13 +7371,12 @@ class Database:
                     if state_name not in field_names:
                         walk_value(item)
             elif isinstance(value, type):
-                # A class is callable, so before this branch existed a class
+                # A class is callable. Before this branch existed, a class
                 # carrying a __wrapped__ attribute fell into the arm below and
                 # had its wrapped function walked, while every other captured
-                # class was skipped. No class is walked now, which is what
-                # makes them uniform: a dep query reachable only through such a
-                # class is no longer code-pinned, so a checkpoint warm refuses
-                # it and re-executes rather than serving it.
+                # class was skipped. Now no class is walked, so all are treated
+                # alike: a dep query reachable only through such a class has no
+                # code pin, and a checkpoint warm refuses and re-executes it.
                 return
             else:
                 wrapped_function = getattr(value, "__wrapped__", None)
@@ -7438,8 +7404,8 @@ class Database:
         owner: FunctionType,
         seen_functions: builtins.set[int],
     ) -> Any:
-        """Pin the statically accessed behavior behind a captured module, and
-        — for a module the runtime build identity pins — the constants those
+        """Pin the statically accessed behavior behind a captured module, and,
+        for a module the runtime build identity pins, the constants those
         accesses land on.
         """
 
@@ -7448,7 +7414,7 @@ class Database:
         # `_module_identity_payload` has already refused this module unless its
         # `__spec__` is a `ModuleSpec`, so the subscript cannot raise. One
         # predicate decides which branch a module takes and whether its
-        # constants are folded, so the two answers cannot disagree.
+        # constants are folded, so the two answers always agree.
         specification = vars(module)["__spec__"]
         if self._is_runtime_pinned_module(module, specification):
             return (
@@ -7495,21 +7461,21 @@ class Database:
         """Fold the constants a captured standard-library module's accessed
         paths name.
 
-        The identity payload no longer folds a runtime-pinned namespace
-        wholesale, so a constant the query's own code names would otherwise
-        stop moving the fingerprint. Only the paths `_module_access_paths`
-        already computed are read, and only values the constant payload folds
-        are kept: a function or a class landing is pinned by name anchor and
-        runtime build, exactly as before.
+        The identity payload skips a runtime-pinned namespace as a whole, so
+        without this fold a constant the query's own code names would stop
+        moving the fingerprint. Only the paths `_module_access_paths` already
+        computed are read, and only values the constant payload folds are
+        kept. A function or a class landing is pinned by name anchor and
+        runtime build, as before.
 
         Each folded landing is recorded for the memo, which re-resolves the
         chain and compares the target by identity. That is exact for these
-        values -- every shape the constant payload accepts is immutable, so the
-        same object always folds to the same payload, and the guard can only be
-        too strict, never too lax. A path that names nothing yet is recorded
-        too, against the sentinel the resolver answers with: a constant bound
-        there after the identity was built moves a fresh fold, and this is the
-        only landing that lets a memoized one follow.
+        values. Every shape the constant payload accepts is immutable, so the
+        same object always folds to the same payload, and the guard can err
+        only on the strict side. A path that names nothing yet is recorded
+        too, against the sentinel the resolver answers with. A constant bound
+        there after the identity was built moves a fresh fold, and only this
+        recorded landing lets a memoized one follow.
         """
 
         folded: list[tuple[tuple[str, ...], Any]] = []
@@ -7517,9 +7483,9 @@ class Database:
             target = self._resolve_module_path_target(module, path)
             if target is _MISSING_MODULE_ATTRIBUTE:
                 # Nothing to fold, but the memo must still learn the path was
-                # empty: a constant bound there later moves a fresh fold, and
-                # the guard's identity check against the sentinel is what sees
-                # it. Without the recording the module is pinned, the stamp
+                # empty. A constant bound there later moves a fresh fold, and
+                # the guard's identity check against the sentinel sees it.
+                # Without the recording the module is pinned, the stamp
                 # carries no constants, and the stored digest answers a
                 # question a fresh database answers differently.
                 self._record_module_path_target(module, path, target)
@@ -7620,11 +7586,11 @@ class Database:
     def _record_module_path_target(
         self, module: ModuleType, path: tuple[str, ...], target: Any
     ) -> None:
-        """Hand the memo the object whose payload this chain just folded.
+        """Hand the memo the object whose payload this chain folded.
 
-        Recorded only while a fingerprint is being computed; outside that scope
+        Recorded only while a fingerprint is being computed. Outside that scope
         the collector is unset and the walk records nothing. ``target`` is the
-        value the walk stopped on, which is exactly what
+        value the walk stopped on, the same value
         ``_resolve_module_path_target`` re-derives for the memo guard.
         """
 
@@ -7704,8 +7670,8 @@ class Database:
         if isinstance(wrapped_function, FunctionType) and callable(value):
             # Same acceptance and the same implementation/state sensitivity
             # whether captured as `from m import f` (the digest path) or
-            # `import m; m.f` (this path); this route still folds its own
-            # module-path envelope around the shared payload.
+            # `import m; m.f` (this path). This route still folds its own
+            # module-path steps and tag around the shared payload.
             try:
                 return (
                     "wrapped-callable",
@@ -7718,12 +7684,12 @@ class Database:
                     ),
                 )
             except UnsupportedValueError as exc:
-                # The shared payload refuses in its own vocabulary -- slot
-                # state, a mutable member, a non-Python __call__, a cycle --
+                # The shared payload refuses in its own vocabulary (slot
+                # state, a mutable member, a non-Python __call__, a cycle),
                 # and one of those refusals is raised by a nested digest that
                 # frames the capture as a direct one. This route re-frames all
-                # of them around the module attribute the query actually named,
-                # and keeps the remedy the digest arm gives the same value.
+                # of them around the module attribute the query named, and
+                # keeps the remedy the digest arm gives the same value.
                 raise UnsupportedValueError(
                     f"Query {owner.__module__}:{owner.__qualname__} captures module attribute "
                     f"{capture_name!r} of type {type(value).__module__}."
@@ -7744,13 +7710,13 @@ class Database:
     ) -> Any:
         """Pin a module attribute whose unrelated ambient globals are mutable.
 
-        Reached only once `function`'s definition fold has refused it, which
-        has taken it back off `seen_functions`. It goes back on while its own
-        globals are folded, as the definition fold puts a function it is
-        folding: a function among its own globals -- one that calls itself,
-        or one of a pair that call each other -- is folded as the marker that
-        fold leaves, where it used to lead back here for the same function
-        until the interpreter's recursion limit.
+        Reached only after `function`'s definition fold refused it, which took
+        it back off `seen_functions`. It goes back on while its own globals are
+        folded, as the definition fold does for a function it is folding. So a
+        function among its own globals (one that calls itself, or one of a
+        pair that call each other) is folded as the marker that fold leaves.
+        Before, it led back here for the same function until the
+        interpreter's recursion limit.
         """
 
         self._reject_reflective_namespace_reads(function)
@@ -7893,18 +7859,18 @@ class Database:
     ) -> bool:
         """True for a module the runtime build identity already pins.
 
-        A built-in or frozen module has no source file of its own, and a module
-        the interpreter installed in one of its own library directories arrives
-        with the interpreter: the runtime build payload every fingerprint folds
+        A built-in or frozen module has no source file of its own. A module the
+        interpreter installed in one of its own library directories arrives
+        with the interpreter. The runtime build payload every fingerprint folds
         already names the implementation, the version and the flags such a
-        module came with, so its namespace tells an identity nothing the build
-        identity has not said -- while carrying values the interpreter rebuilds
-        per process. The directories are plural because the library is: a
-        Windows build keeps its extension modules beside the pure-Python ones
-        rather than under them, and a module of the standard library's is one
-        wherever the interpreter put it. A distribution installed beside the
-        standard library is the caller's code however deep it sits, which is
-        what the last clause excludes.
+        module came with. So its namespace adds nothing to what the build
+        identity says, while carrying values the interpreter rebuilds per
+        process. The directories are plural because the library spans several.
+        A Windows build keeps its extension modules beside the pure-Python
+        ones, outside their directory, and a standard-library module counts
+        as one wherever the interpreter put it. A distribution installed beside
+        the standard library is the caller's code however deep it sits, and
+        the last clause excludes it.
         """
 
         origin = specification.origin
@@ -7914,13 +7880,13 @@ class Database:
             return False
         if not isinstance(origin, str):
             return False
-        # On Windows an origin may carry `/` for `os.sep` -- the path finder
+        # On Windows an origin may carry `/` for `os.sep` (the path finder
         # produces one whenever the `sys.path` entry it joined was spelled that
-        # way -- and may differ in case from `sysconfig`'s answer. Either
-        # difference would otherwise put a third-party module on the pinned
-        # side, where a namespace write to it stops being detected. Both tests
-        # therefore run on a normalised copy; `os.path.normcase` is the identity
-        # on POSIX, so no behaviour moves there.
+        # way) and may differ in case from `sysconfig`'s answer. Either
+        # difference could put a third-party module on the pinned side, where
+        # a namespace write to it goes undetected. So both tests run on a
+        # normalised copy. `os.path.normcase` is the identity on POSIX, so
+        # behaviour there is unchanged.
         normalised = os.path.normcase(origin.replace(os.altsep or os.sep, os.sep))
         if not any(
             normalised.startswith(os.path.normcase(prefix))
@@ -7939,22 +7905,22 @@ class Database:
     def _module_identity_payload(self, module: ModuleType) -> Any:
         """Compute a structural digest for a captured module.
 
-        Name-only capture is not sufficient: a third-party version bump or a
-        source-file edit changes `module.CONSTANT` without touching the
-        module's name, which would silently reuse stale cache entries.
+        Capturing the name alone falls short: a third-party version bump or a
+        source-file edit changes `module.CONSTANT` while the module's name
+        stays the same, which would silently reuse stale cache entries.
         The payload combines:
 
-        * `__version__` (if the module exposes one — standard for third-party
-          packages);
-        * a digest of the bytes at `module.__file__`; frozen and built-in
-          modules are pinned through the runtime-build identity;
+        * `__version__` (if the module exposes one, as is standard for
+          third-party packages);
+        * a digest of the bytes at `module.__file__` (frozen and built-in
+          modules are pinned through the runtime-build identity);
         * a sorted `__all__` tuple when declared, capturing the module's
           publicly promised surface;
         * outside the modules the runtime build identity pins, the
           module-level stable constants, read live by
-          `_module_constants_payload` — so a namespace write to one of them
-          moves this payload without any file changing. A module that identity
-          pins contributes none of them here; the constants a capturing
+          `_module_constants_payload`, so a namespace write to one of them
+          moves this payload with no file changing. A module that identity
+          pins contributes none of them here. The constants a capturing
           query's own code reads off such a module are folded beside the
           capture, by `_accessed_path_constants_payload`.
 
@@ -7963,17 +7929,17 @@ class Database:
         that folded any of this, the memo re-derives the constants inside
         `_module_observation_stamp`, re-resolves each chain and compares its
         target by identity, and observes the definitions behind every landing
-        `_module_function_target_observation` keeps -- the enumeration lives
-        there, beside the filter that decides it. A chain that lands on a class
-        or a frozen dataclass instance -- named directly, or held inside a
-        tuple, a NamedTuple or a frozenset the payload accepts -- is where that
-        stops: what is inside the landing is folded by the payload and compared
-        here only through the resolved target's identity, so a member written
-        in place, and equally a module binding one of those members reads,
-        moves the fold and nothing the memo checks. Shapes the payload refuses
-        instead of folding -- a plain object that is not one of those
-        callables, a mutable dataclass, a dict, a list -- raise when the
-        fingerprint is built. Such state belongs in an `Input` or a `Resource`.
+        `_module_function_target_observation` keeps (the list lives there,
+        beside the filter that decides it). That stops at a chain landing on a
+        class or a frozen dataclass instance, named directly or held inside a
+        tuple, a NamedTuple or a frozenset the payload accepts. The payload
+        folds what is inside the landing, and the memo compares it only
+        through the resolved target's identity. So a member written in place,
+        or a module binding one of those members reads, moves the fold and
+        nothing the memo checks. Shapes the payload refuses outright (a plain
+        object that is none of those callables, a mutable dataclass, a dict, a
+        list) raise when the fingerprint is built. Such state belongs in an
+        `Input` or a `Resource`.
         """
         collector = self._fingerprint_module_collector.get()
         if collector is not None:
@@ -8069,10 +8035,10 @@ class Database:
         else:
             raise UnsupportedValueError(f"Captured module {module_name!r} has an unsafe __all__.")
 
-        # Elided for the modules the runtime build identity already pins: a
+        # Elided for the modules the runtime build identity already pins. A
         # standard-library namespace holds values CPython rebuilds per process
-        # -- `tokenize.ContStr` and its seven siblings are regexes joined from
-        # a set -- so folding them would make this payload process-varying.
+        # (`tokenize.ContStr` and its seven siblings are regexes joined from a
+        # set), so folding them would make this payload vary by process.
         constants_payload = (
             ()
             if self._is_runtime_pinned_module(module, specification)
@@ -8092,9 +8058,9 @@ class Database:
             raise UnsupportedValueError(
                 f"Captured module {module_name!r} has no stable source identity."
             )
-        # The kernel resolving its own capture is not the query reading the
-        # working directory, so this runs where raw reads are allowed, as the
-        # byte read below does.
+        # The kernel resolving its own capture is no query read of the working
+        # directory. So it runs where raw reads are allowed, as the byte read
+        # below does.
         with self._allow_raw_reads_scope():
             if Path(file_path).resolve() != Path(origin).resolve():
                 raise UnsupportedValueError(
@@ -8102,11 +8068,11 @@ class Database:
                 )
 
         # The identity is the bytes, hashed on every derivation. Stat-shaped
-        # shortcuts (size, mtime, ctime, device, inode) are not collision-free:
-        # a same-size rewrite inside one timestamp granule preserves all five.
-        # The read reports rather than waits: a module file someone replaced
+        # shortcuts (size, mtime, ctime, device, inode) can collide: a
+        # same-size rewrite inside one timestamp granule preserves all five.
+        # The read reports and never waits. A module file someone replaced
         # with a pipe or a device has no bytes to hash and never will, and that
-        # report is refused here on the same terms a failed read always was.
+        # report is refused here on the same terms as a failed read.
         with self._allow_raw_reads_scope():
             try:
                 content = read_regular_file_following_links(Path(file_path))
@@ -8126,12 +8092,12 @@ class Database:
     def _resolve_module_path_target(module: ModuleType, path: tuple[str, ...]) -> Any:
         """Resolve the object a static module-attribute chain currently names.
 
-        Walks exactly as `_captured_module_path_payload` does: attribute by
-        attribute through module namespaces, stopping at the first non-module
-        value (whose payload is what the fingerprint folded). An attribute that
-        is not bound resolves to a sentinel, which is also what a path the
-        accessed-path fold found empty records: the guard then holds while the
-        path stays empty and fails as soon as a value is bound there.
+        Walks as `_captured_module_path_payload` does: attribute by attribute
+        through module namespaces, stopping at the first non-module value
+        (whose payload the fingerprint folded). An unbound attribute resolves
+        to a sentinel, which is also what a path the accessed-path fold found
+        empty records. The guard then holds while the path stays empty and
+        fails as soon as a value is bound there.
         """
 
         current: Any = module
@@ -8150,7 +8116,7 @@ class Database:
         Re-derives what `_module_identity_payload` folded: import metadata,
         `__version__`, `__all__`, the file bytes, and, outside the modules the
         runtime build identity pins, the module-level constants. Anything that
-        payload reads and this does not would be a change the memo could hide.
+        payload reads and this skips would be a change the memo could hide.
         """
 
         namespace = vars(module)
@@ -8180,11 +8146,11 @@ class Database:
             else:
                 # Observed by content, never by stat identity: the stamp gates
                 # reuse of a memoized fingerprint, so it carries the same
-                # collision risk the identity payload does. A file that cannot
-                # be read is reported as such rather than refused -- the token
-                # says what was observed, and a token that will not match is
-                # what sends the request back to the identity payload, which is
-                # where an unreadable module file is refused, once.
+                # collision risk the identity payload does. An unreadable file
+                # is reported as such here, with no refusal. The token says
+                # what was observed. A token that fails to match sends the
+                # request back to the identity payload, which refuses an
+                # unreadable module file, once.
                 with self._allow_raw_reads_scope():
                     try:
                         content = read_regular_file_following_links(Path(file_path))
@@ -8208,7 +8174,7 @@ class Database:
             all_payload,
             source_observation,
             # Guarded by the same expression `_module_identity_payload` uses,
-            # so the stamp folds exactly what the identity folded: nothing for
+            # so the stamp folds what the identity folded: nothing for
             # a module the runtime build identity pins, and every module-level
             # constant otherwise, which a namespace write moves without
             # touching the file bytes above.
@@ -8224,15 +8190,15 @@ class Database:
 
         The single read behind both the identity payload and the observation
         stamp, so what a fingerprint folds and what the memo guard re-derives
-        cannot drift apart. Names whose values are not stable constants are
-        skipped rather than refused: functions, modules and types are reached
-        through their own payloads, and anything else the constant payload
-        cannot fold is left to whichever chain reaches it.
+        always match. Names whose values are not stable constants are skipped
+        without refusal. Functions, modules and types are reached through
+        their own payloads, and anything else the constant payload cannot fold
+        is left to whichever chain reaches it.
 
         A runtime-pinned module's constants on an owner's accessed paths are
         folded separately, by `_accessed_path_constants_payload`, and
         re-checked by the memo's chain arm, which re-resolves each landing and
-        compares it by identity rather than re-deriving it through this read.
+        compares it by identity, bypassing this read.
         """
 
         stable_constants: list[tuple[str, Any]] = []
@@ -8305,11 +8271,11 @@ class Database:
                 ) from exc
             collector = self._fingerprint_resource_collector.get()
             if collector is not None:
-                # The configuration this fold just read, recorded so the memo
-                # guard can re-read it and compare. The configuration *type*
-                # payload rides along because two configurations can freeze
-                # alike while their classes carry different behavior, and the
-                # fold below folds both.
+                # The configuration this fold read, recorded so the memo guard
+                # can re-read it and compare. The configuration *type* payload
+                # rides along because two configurations can freeze alike while
+                # their classes carry different behavior, and the fold below
+                # folds both.
                 collector.append(
                     (
                         resource,
@@ -8341,12 +8307,12 @@ class Database:
         """Pin behavior erased by the ordinary boundary snapshot.
 
         ``freeze`` remains the value contract for resource configuration, but it
-        deliberately normalizes scalar/container subclasses, paths, and
-        dataclasses.  That is correct at a query boundary and insufficient for a
+        normalizes scalar/container subclasses, paths and dataclasses on
+        purpose. That is correct at a query boundary and insufficient for a
         durable resource identity: methods on one of those values can influence
-        ``probe``/``load`` even when its normalized data is unchanged.  This
+        ``probe``/``load`` even when its normalized data is unchanged. This
         companion payload mirrors the configuration shape and records every
-        behavior-bearing implementation and adapter without changing K2.
+        behavior-bearing implementation and adapter while leaving K2 unchanged.
         """
 
         active: dict[int, int] = {}
@@ -8909,9 +8875,9 @@ class Database:
     ) -> Iterator[list[_PendingObserverEvent] | None]:
         if self._live_request() is not None:
             # A span's request id must reflect every change committed while
-            # the span thread held no lock; catching up here, at the boundary
-            # of each call joining the span, is what keeps a cross-thread
-            # set from leaving the span's dedupe on stale answers.
+            # the span thread held no lock. Catching up here, at the boundary
+            # of each call joining the span, keeps a cross-thread set from
+            # leaving the span's dedupe on stale answers.
             self._sync_span_to_epoch()
             yield None
             return
@@ -8919,8 +8885,8 @@ class Database:
         self._request_counter += 1
         request = _RequestScope(request_id=self._request_counter)
         token = self._request.set(request)
-        # Lives for exactly this request, so a resource's configuration is
-        # re-read once per request rather than once per memo guard.
+        # Lives for this request only, so a resource's configuration is
+        # re-read once per request, however many memo guards check it.
         self._request_resource_digests = {}
         try:
             yield request.pending_events
@@ -8931,9 +8897,9 @@ class Database:
             self._request_resource_digests = None
             self._release_failure_exceptions(request.failures)
             # A context copied while the request was open still holds it, for
-            # as long as its thread lives. Nothing reads these lists once the
+            # as long as its thread lives. These lists go unread once the
             # request has ended, and the caller delivers the events from the
-            # list it was handed, so the request lets go of its own references.
+            # list it was handed, so the request drops its own references.
             request.pending_events = []
             request.failures = []
             self._request.reset(token)
@@ -8942,8 +8908,9 @@ class Database:
     def _live_request(self) -> _RequestScope | None:
         """The request this thread has open, if any.
 
-        A request seen through a copied context -- one another thread opened,
-        or one that has since ended -- is not live: see `_RequestScope`.
+        A request seen through a copied context (one another thread opened,
+        or one that has since ended) is not live here, so this returns None.
+        See `_RequestScope`.
         """
         request = self._request.get()
         if request is None or request.ended or request.owner is not _current_thread_token():
@@ -9002,19 +8969,19 @@ class Database:
 
     def _current_frame(self) -> ExecutionFrame | None:
         # The innermost execution still running. On the thread that owns the
-        # stack this is its top: a frame is marked completed in the same
-        # finally that pops it. A thread spawned inside a query keeps the
-        # stack it inherited for its whole life, so completed frames are what
-        # it has to look past.
+        # stack this is its top, because a frame is marked completed in the
+        # same finally that pops it. A thread spawned inside a query keeps the
+        # stack it inherited for its whole life, so it has to look past
+        # completed frames.
         for frame in reversed(self._execution_stack.get()):
             if not frame.completed:
                 return frame
         return None
 
     def _freeze_value(self, value: Any) -> Snapshot:
-        # The database's own registry, not the raw map -- see the note on the
-        # sibling helpers below. This one is on the warm request path too: every
-        # query key freezes its arguments through here.
+        # The database's own registry in place of the raw map; see the note on
+        # the sibling helpers below. This one is on the warm request path too:
+        # every query key freezes its arguments through here.
         snapshot = freeze(value, adapters=self._view_adapter_registry)
         if self._store is not None:
             self._persist_snapshot(snapshot)
@@ -9023,22 +8990,21 @@ class Database:
     def _persist_snapshot(self, snapshot: Snapshot) -> None:
         """Write the snapshot's serialized bytes to the configured ArtifactStore.
         The write-through path resolves the database's own store and hands it to
-        `_persist_snapshot_to`, so it verifies present bytes exactly as the
-        checkpoint save path does -- one body, one behaviour."""
+        `_persist_snapshot_to`, so it verifies present bytes as the checkpoint
+        save path does. One body, one behaviour."""
         store = self._store
         if store is None:
             return
         self._persist_snapshot_to(snapshot, store)
 
     # These helpers hand the value layer the key-indexed registry this database
-    # built once, not the raw map. Handed a map, the value layer builds a fresh
-    # registry per call -- deriving an adapter key per entry -- and freezing,
-    # exposing and fingerprinting all run on the warm request path, so a registry
-    # that merely stopped being empty was costing every warm request repeated
-    # rebuilds of a table that cannot change. The registry is fixed for the
-    # database's lifetime, which is what makes reusing it identical rather than
-    # merely cheaper: `_adapters` is assigned once at construction and nothing
-    # writes to it afterwards.
+    # built once. Handed the raw map, the value layer builds a fresh registry
+    # per call (deriving an adapter key per entry). Freezing, exposing and
+    # fingerprinting all run on the warm request path, so any non-empty
+    # registry cost every warm request repeated rebuilds of a table that cannot
+    # change. The registry is fixed for the database's lifetime, so reusing it
+    # gives identical results as well as saving time: `_adapters` is assigned
+    # once at construction and never written afterwards.
     def _thaw_value(self, value: Any) -> Any:
         return thaw(value, adapters=self._view_adapter_registry)
 
@@ -9053,14 +9019,14 @@ class Database:
     ) -> bool:
         if input_key.eq is None and input_key.cutoff is None:
             # Both operands are canonical freeze outputs, so the default
-            # comparison reduces to comparing the stored snapshots directly --
-            # the same decision _execute_query makes for a recomputed result,
+            # comparison reduces to comparing the stored snapshots directly.
+            # That is the decision _execute_query makes for a recomputed result,
             # with no thaw and no ValueAdapter hook on the default input path.
             # Thawing would drop FrozenRecord type identity and call a dict of
             # matching shape an equal update the caller never sees.
             return snapshots_equal(previous, snapshot)
-        # An explicit policy is defined over the values the caller wrote, not
-        # over their encodings, so it keeps the thawed operands.
+        # An explicit policy is defined over the values the caller wrote, so it
+        # keeps the thawed operands and never sees their encodings.
         return self._compare_values(
             eq=input_key.eq,
             cutoff=input_key.cutoff,
@@ -9077,10 +9043,10 @@ class Database:
         right: Any,
     ) -> bool:
         if cutoff is not None:
-            # The caller chooses WHICH token stands for the value; whether two
+            # The caller chooses WHICH token stands for the value. Whether two
             # tokens are the same observation is the kernel's one relation, so
-            # the tokens are frozen and compared canonically -- the numeric
-            # tower stays separated and a NaN token is equal to itself.
+            # the tokens are frozen and compared canonically: the numeric tower
+            # stays separated and a NaN token is equal to itself.
             return snapshots_equal(
                 self._freeze_cutoff_token(cutoff(left)),
                 self._freeze_cutoff_token(cutoff(right)),

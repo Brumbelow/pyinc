@@ -28,7 +28,7 @@ def required_comparators() -> tuple[str, ...]:
 
 
 def make_joblib_memory(cache_dir: str) -> Memory:
-    """Build the required joblib cache without importing it from shipped code."""
+    """Build the required joblib cache, importing joblib only here, outside shipped code."""
     import joblib  # type: ignore[import-untyped]
 
     return cast(Memory, joblib.Memory(location=cache_dir, verbose=0))

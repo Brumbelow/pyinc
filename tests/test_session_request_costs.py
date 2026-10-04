@@ -1,7 +1,7 @@
-"""A warm workspace request must not redo per-file work for unchanged files.
+"""A warm workspace request reuses the per-file work for unchanged files.
 
 The counters here are call counts of the real functions, collected with a trace
-hook rather than by monkeypatching: pyinc's query layer fingerprints every
+hook so the functions stay unpatched. pyinc's query layer fingerprints every
 callable a query transitively reaches and folds in any mutable state it closes
 over, so a counting stand-in would become part of a query's identity and change
 it on every increment (see `tests/test_source_ranges_caching.py`).
@@ -158,7 +158,7 @@ def test_workspace_analysis_fetches_do_not_scale_with_the_file_count(
 ) -> None:
     # Every file that imports a workspace name has to know which of its own
     # names other modules re-export. That used to walk the workspace analysis
-    # once per file; now the request walks it once for all of them.
+    # once per file. Now the request walks it once for all of them.
     small = _count_workspace_analysis_fetches(tmp_path / "small", 2, monkeypatch)
     large = _count_workspace_analysis_fetches(tmp_path / "large", 12, monkeypatch)
     assert small == large
@@ -179,7 +179,7 @@ def test_unused_import_check_does_not_scan_the_workspace(
 
 
 def test_cached_results_still_track_cross_file_changes(tmp_path: Path) -> None:
-    """Caching must not hide a diagnostic that another file's edit creates."""
+    """Cached results still show a diagnostic that another file's edit creates."""
 
     _write_workspace(tmp_path)
     with WorkspaceSession(tmp_path) as session:
@@ -256,7 +256,7 @@ def test_entrypoints_answer_once_per_session_request(
 
 
 def test_entrypoints_outside_a_session_still_see_edits(tmp_path: Path) -> None:
-    """The per-request memo must not exist for a caller driving the layer directly."""
+    """A caller driving the layer directly has no per-request memo, so it sees edits."""
 
     _write_workspace(tmp_path)
     db = Database(mode="strict")
@@ -310,7 +310,7 @@ def test_a_context_copied_inside_a_request_scope_does_not_answer_from_its_memo(
         assert len(scope_tree(db, alpha).bindings) == 2
 
     alpha.write_text(three + "\n\ndef four():\n    return 4\n", encoding="utf-8")
-    # Closed, the scope answers nobody -- not even its own thread through a copy.
+    # Once closed, the scope answers nobody, including its own thread through a copy.
     assert len(carried.run(scope_tree, db, alpha).bindings) == 4
 
 
@@ -365,7 +365,7 @@ def test_decode_memo_is_skipped_when_payload_identity_is_unstable(tmp_path: Path
 
 
 def test_a_mid_request_mirror_rewrite_drops_the_memo(tmp_path: Path) -> None:
-    """Completion repairs the file in the mirror mid-method; the memo must follow."""
+    """Completion repairs the file in the mirror mid-method, and the memo must follow."""
 
     _write_workspace(tmp_path)
     (tmp_path / "delta.py").write_text(
@@ -381,8 +381,8 @@ def test_a_mid_request_mirror_rewrite_drops_the_memo(tmp_path: Path) -> None:
             "from alpha import one\n\n\ndef five():\n    value = one()\n    return value.\n",
         )
         session.completions_at("delta.py", 5, 17)
-        # Reads after the restore must describe the file as it stands, not the
-        # repaired buffer an entrypoint saw a moment earlier in the same request.
+        # Reads after the restore must describe the file as it stands. An
+        # entrypoint saw the repaired buffer a moment earlier in the same request.
         session.clear_overlay("delta.py")
         assert _codes(session, "delta.py") == []
         result = session.analyze_file("delta.py")
@@ -391,7 +391,7 @@ def test_a_mid_request_mirror_rewrite_drops_the_memo(tmp_path: Path) -> None:
 
 
 class _WeakrefablePayload(list[str]):
-    """Plain tuples and lists take no weak references; a list subclass does."""
+    """Plain tuples and lists take no weak references. A list subclass does."""
 
 
 def test_decode_memo_entries_die_with_their_database() -> None:
@@ -478,7 +478,7 @@ def test_decode_memo_keeps_both_threads_entries_for_a_new_database(
 def test_decode_memo_hands_racing_threads_the_decode_it_stored() -> None:
     """Two threads that decode one payload at once get back one object.
 
-    The decode runs outside the memo's lock, so both may run it; whichever
+    The decode runs outside the memo's lock, so both may run it. Whichever
     stored first is what both answer with, and what the memo keeps.
     """
 

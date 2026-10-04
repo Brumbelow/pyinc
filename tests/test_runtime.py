@@ -106,12 +106,12 @@ def _outcome(call: Callable[[], Any]) -> tuple[Any, ...]:
 class _DeniableFileResource(Resource[str, str, tuple[str, ...]]):
     """A file resource whose probe and load both raise while a marker exists.
 
-    A file swapped for a directory used to be the vehicle for a failure neither
-    the probe nor the load survives. A directory reads as a missing file now --
-    a state, and so recordable -- so a scenario about an *unrecordable* failure
-    needs a denial the boundary genuinely cannot absorb, which is what a
-    permission error is. The marker lives beside the key on disk because a
-    query's capture set may not hold mutable state.
+    Tests once swapped a file for a directory to make both the probe and the
+    load fail. A directory now reads as a missing file, which is a recordable
+    state. A scenario about an *unrecordable* failure needs a denial the
+    boundary cannot absorb, and a permission error is one. The marker lives
+    beside the key on disk because a query's capture set may not hold mutable
+    state.
     """
 
     def _denied(self, path: str) -> bool:
@@ -309,11 +309,11 @@ def test_reused_decision_leaves_the_earlier_recompute_outcome_standing(
     assert reused.last_decision == "reused"
     assert reused.last_recompute == "backdated"
 
-    # And for the cheap case inside one request: the second reach at the same
-    # node is recorded as a reuse without re-checking anything, and leaves the
-    # recompute outcome alone as well. The reason is asserted because it is what
-    # distinguishes this arm from the one above -- without it the arm rests on
-    # the span construction alone to reach the within-request branch.
+    # The cheap case inside one request: the second reach at the same node is
+    # recorded as a reuse with no re-check, and it also leaves the recompute
+    # outcome alone. The reason is asserted because it separates this arm from
+    # the one above. Without it, the arm would rely on the span alone to reach
+    # the within-request branch.
     with db.request_span():
         assert db.get(word_count, str(path)) == 3
         assert db.get(word_count, str(path)) == 3
@@ -456,11 +456,11 @@ def test_modes_expose_expected_boundary_shapes(mode: str, expected_type: type[ob
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_boundary_exposure_preserves_canonical_order(mode: str) -> None:
-    """The exposed shape differs per mode; the entry order does not.
+    """The exposed shape differs per mode; the entry order is the same in all.
 
     `strict` hands out the `FrozenDict` itself and the other two hand out a
-    thawed `dict`, so this pins the same canonical sequence through both paths:
-    the order is a property of the stored snapshot, not of the exposure.
+    thawed `dict`. This pins the same canonical sequence through both paths,
+    because the order comes from the stored snapshot.
     """
 
     payload = Input[dict[str, int]](f"canonical.order.{mode}")
@@ -483,14 +483,13 @@ def test_boundary_exposure_preserves_canonical_order(mode: str) -> None:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_boundary_exposure_carries_set_order_only_in_strict(mode: str) -> None:
-    """Canonical member order reaches a query through `strict` and no further.
+    """Canonical member order reaches a query through `strict` only.
 
     `strict` exposes the `FrozenSet` itself, so the stored member sequence is
-    visible and pinned here; a failure of that arm means the order moved, and the
-    answer is STOP rather than re-pin, as for the mapping sequences. `checked`
-    and `fast` thaw to an ordinary `set`, which holds no order at all — its
-    iteration order is Python's and varies between processes — so those arms
-    assert content and deliberately assert nothing about order.
+    visible and pinned here. If that arm fails, the order moved: STOP and do
+    not re-pin, as for the mapping sequences. `checked` and `fast` thaw to an
+    ordinary `set`, which holds no order (its iteration order is Python's and
+    varies between processes). Those arms assert content only.
     """
 
     payload = Input[set[str]](f"canonical.members.{mode}")
@@ -758,8 +757,8 @@ def test_fast_mode_uses_owned_values_without_mutation_detection() -> None:
         _, right = payload.read(db)
         return right["x"]
 
-    # Two independent dicts at the boundary — each thaws to its own owned copy
-    # in fast mode, so a mutation through `left` cannot reach `right`.
+    # Two independent dicts at the boundary. In fast mode each thaws to its own
+    # owned copy, so a mutation through `left` leaves `right` unchanged.
     db = Database(mode="fast")
     db.set(payload, ({"x": 1}, {"x": 1}))
 
@@ -783,14 +782,14 @@ def test_fast_mode_preserves_shared_identity_across_boundary() -> None:
 
     # In v2.0.0 the value membrane preserves shared identity across cached
     # boundaries. Two slots pointing at the same dict thaw to the same dict, so
-    # an in-query mutation through one alias is observable through the other —
-    # the kernel's stored snapshot remains uncorrupted.
+    # an in-query mutation through one alias shows through the other. The
+    # kernel's stored snapshot stays intact.
     shared = {"x": 1}
     db = Database(mode="fast")
     db.set(payload, (shared, shared))
 
     assert db.get(mutate_left) == 99
-    # A separate query thaws fresh — the prior in-query mutation is gone.
+    # A separate query thaws fresh, so the earlier in-query mutation is gone.
     assert db.get(read_right) == 1
 
 
@@ -890,13 +889,12 @@ def test_resource_hook_reaching_into_the_database_is_rejected(
 ) -> None:
     """A load that calls back into the database is refused before it runs.
 
-    This shape used to be allowed and used to be pinned for a different
-    property: the nested query it started ran with raw reads revoked, so its
-    `os.getenv` raised. The nested query no longer starts at all -- the refusal
-    lands on the `get` that would have started it -- so that property is not
-    reachable through a hook any more, and what this pins now is the refusal.
-    Revoking raw reads for a nested query is still pinned for plain queries by
-    `test_condition_two_entry_points_stay_guarded`.
+    This shape was once allowed, and this test pinned a different property:
+    the nested query ran with raw reads revoked, so its `os.getenv` raised.
+    Now the refusal lands on the `get` that would start the nested query, so a
+    hook cannot reach that property. This test pins the refusal.
+    `test_condition_two_entry_points_stay_guarded` still pins revoked raw
+    reads for nested plain queries.
     """
     variable = "PYINC_NESTED_RESOURCE_ENV"
     monkeypatch.setenv(variable, "value")
@@ -954,8 +952,8 @@ def test_failed_resource_reads_do_not_leave_dangling_dependencies(
     assert db.get(classify, str(path)) == "denied"
     inspection = _inspect_node(db, classify, str(path))
     assert inspection.last_decision == "executed"
-    # The probe raises rather than reporting a state, so the failure cannot be
-    # recorded and no edge is published.
+    # The probe raises and reports no state, so the failure is unrecordable and
+    # no edge is published.
     assert inspection.dependencies == ()
 
 
@@ -1030,8 +1028,8 @@ def test_unhandled_resource_load_failure_propagates_out_of_get(
         except FileNotFoundError:
             return -1
 
-    # The class is the assertion, never the message: the text comes from the
-    # operating system and differs by platform.
+    # Assert the class only. The message comes from the operating system and
+    # differs by platform.
     missing = tmp_path / "gone.txt"
     db = Database(mode=mode)
     with pytest.raises(FileNotFoundError) as cold:
@@ -1039,7 +1037,7 @@ def test_unhandled_resource_load_failure_propagates_out_of_get(
     assert type(cold.value) is FileNotFoundError
     assert not isinstance(cold.value, PyIncError)
 
-    # Through a parent that does not handle it either.
+    # The same through a parent that also lets it propagate.
     with pytest.raises(FileNotFoundError) as through_parent:
         db.get(required_words, str(missing))
     assert type(through_parent.value) is FileNotFoundError
@@ -1068,7 +1066,7 @@ def test_unhandled_resource_load_failure_propagates_out_of_get(
         optional_words, str(handled)
     )
 
-    # Propagating out of get() does not change the record-keeping: the failing
+    # Propagating out of get() leaves the record-keeping as it is: the failing
     # resource node reports a failure for both decision fields, with a reason
     # naming what failed.
     failed = _find_node(_inspect_node(control, optional_words, str(handled)), "file[")
@@ -1150,10 +1148,10 @@ def test_file_replaced_by_a_directory_matches_a_fresh_database(mode: str, tmp_pa
 
     path.unlink()
     path.mkdir()
-    # A directory is not a readable regular file and never becomes one by being
-    # read again, so the probe reports it as absent rather than raising: a probe
-    # that raises retires the record and hands the caller an error a fresh
-    # database, which sees the same directory, would have to raise too.
+    # A directory stays unreadable as a regular file however often it is read,
+    # so the probe reports it as absent. A raising probe would retire the record
+    # and hand the caller an error, and a fresh database seeing the same
+    # directory would then have to raise too.
     fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
     assert fresh == ("value", "<default>")
     assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
@@ -1176,9 +1174,9 @@ def test_directory_replaced_by_a_file_matches_a_fresh_database(mode: str, tmp_pa
     (path / "a.txt").unlink()
     path.rmdir()
     path.write_text("not a directory", encoding="utf-8")
-    # The read still tells the caller a file is not a directory; the probe
-    # behind it reports the absent listing instead of raising, so the failure
-    # is recorded rather than retiring the node it was checking.
+    # The read still tells the caller a file is not a directory. The probe
+    # behind it reports the absent listing, so the failure is recorded and the
+    # node it was checking stays.
     fresh = _outcome(lambda: Database(mode=mode).get(names, str(path)))
     assert fresh[0] == "NotADirectoryError"
     assert _outcome(lambda: db.get(names, str(path))) == fresh
@@ -1209,9 +1207,9 @@ def test_directory_restored_after_a_kind_swap_matches_a_fresh_database(
     path.write_text("not a directory", encoding="utf-8")
     assert db.get(names, str(path)) == ("<caught>",)
 
-    # The world returns to exactly the state the resource record described
-    # before the swap (a branch switch, an undo), so the round trip has to land
-    # the original answer and not the one the intervening kind held.
+    # The world returns to the state the resource record described before the
+    # swap (a branch switch, an undo). The round trip must land the original
+    # answer, never the one the intervening kind held.
     path.unlink()
     path.mkdir()
     (path / "a.txt").write_text("a", encoding="utf-8")
@@ -1237,19 +1235,18 @@ def test_missing_file_replaced_by_a_directory_matches_a_fresh_database(
     assert db.get(read_optional, str(path)) == "<default>"
 
     # The failure record left by the absent file still describes the world: a
-    # directory reads as a missing file, so nothing about the answer moves.
+    # directory reads as a missing file, so the answer stays put.
     path.mkdir()
     fresh = _outcome(lambda: Database(mode=mode).get(read_optional, str(path)))
     assert fresh == ("value", "<default>")
     assert _outcome(lambda: db.get(read_optional, str(path))) == fresh
 
 
-# A probe has to be total: it answers for every path it is handed, so that a
-# warm database re-probing a path it already knows lands where a fresh one
-# reading the same world lands. The three ways a path stops naming a readable
-# regular file -- absent, a directory, a file somewhere in its parent chain --
-# are one answer. A permission denial is not among them; that is a genuine
-# failure, and it keeps raising.
+# A probe has to be total. It answers for every path it is handed, so a warm
+# database re-probing a known path lands where a fresh one reading the same
+# world lands. The three ways a path stops naming a readable regular file
+# (absent, a directory, a file somewhere in its parent chain) give one answer.
+# A permission denial is a real failure outside that set, and it keeps raising.
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -1303,8 +1300,8 @@ def test_file_resource_reads_an_unreadable_kind_as_a_missing_file(
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_file_resource_still_raises_a_permission_denial(mode: str, tmp_path: Path) -> None:
-    # Only the kinds that mean "no readable regular file here" are absorbed; a
-    # denial is a genuine failure and stays one, warm and fresh alike.
+    # Only the kinds that mean "no readable regular file here" are absorbed. A
+    # denial is a real failure and stays one, warm and fresh alike.
     files = FileResource()
     path = tmp_path / "thing.txt"
     path.write_text("hello", encoding="utf-8")
@@ -1335,8 +1332,8 @@ def test_listing_probe_follows_the_read_where_a_path_under_a_file_reads_absent(
 ) -> None:
     # Windows reports a path reached through a regular file as absent
     # (ERROR_PATH_NOT_FOUND) where POSIX raises NotADirectoryError from the
-    # listing. Drive that shape here: whichever the platform picks, the probe
-    # must agree with what a read of the path does, and must not raise.
+    # listing. This drives that shape: whichever the platform picks, the probe
+    # must agree with a read of the path and must not raise.
     directories = DirectoryResource()
     holder = tmp_path / "holder.txt"
     holder.write_text("not a directory", encoding="utf-8")
@@ -1354,7 +1351,7 @@ def test_listing_probe_follows_the_read_where_a_path_under_a_file_reads_absent(
 
     assert directories.probe(nested) == (False, ())
     assert directories.load(Database(), nested) == ()
-    # ... which is exactly how an absent path reads, so they share a probe.
+    # ... which is how an absent path reads, so they share a probe.
     absent = str(tmp_path / "never-existed")
     assert directories.probe(absent) == (False, ())
     assert directories.load(Database(), absent) == ()
@@ -1365,11 +1362,11 @@ def _denied(self: Path, *args: Any, **kwargs: Any) -> Any:
 
 
 def _denying_open(*targets: str) -> Callable[..., int]:
-    """Refuse to open exactly ``targets``, the way an ACL denial does.
+    """Refuse to open ``targets``, the way an ACL denial does.
 
     A tracked read opens a descriptor and asks it what kind of thing it got, so
-    a denial has to arrive at the open to be the denial the read meets. Every
-    other path opens normally, including the ones pytest itself needs.
+    the denial must arrive at the open for the read to meet it. Every other
+    path opens normally, including the ones pytest itself needs.
     """
 
     real_open = os.open
@@ -1386,19 +1383,19 @@ def test_file_resources_read_a_denied_directory_as_a_missing_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Windows refuses to open a directory as a file with EACCES where POSIX
-    # raises IsADirectoryError, and that is the very error an ACL denial on a
-    # regular file gives, so the type alone cannot classify it. This drives the
-    # Windows shape on any platform: same raise, two kinds of path, and only
-    # the kind decides.
+    # raises IsADirectoryError. An ACL denial on a regular file gives the same
+    # error, so the type alone cannot classify it. This drives the Windows
+    # shape on any platform: the same raise on two kinds of path, and the kind
+    # alone decides.
     directory = tmp_path / "holder"
     directory.mkdir()
     regular = tmp_path / "thing.txt"
     regular.write_text("hello", encoding="utf-8")
 
-    # Built before the denial: constructing a database fingerprints the kernel's
-    # own adapters, which reads this package's own source, and these hooks deny
-    # every read there is. The database is only the argument the hooks take --
-    # nothing below reaches it -- so building it first changes nothing under test.
+    # Built before the denial. Constructing a database fingerprints the kernel's
+    # own adapters, which reads this package's source, and these hooks deny
+    # every read. The hooks take the database as an argument and nothing below
+    # reaches into it, so building it first leaves what is under test unchanged.
     db = Database()
     monkeypatch.setattr(Path, "read_bytes", _denied)
     monkeypatch.setattr(Path, "read_text", _denied)
@@ -1414,7 +1411,7 @@ def test_file_resources_read_a_denied_directory_as_a_missing_file(
     with pytest.raises(FileNotFoundError):
         binaries.load(db, str(directory))
 
-    # A denial on a regular file is a genuine failure and keeps propagating.
+    # A denial on a regular file is a real failure and keeps propagating.
     for call in (
         lambda: files.probe(str(regular)),
         lambda: binaries.probe(str(regular)),
@@ -1430,7 +1427,7 @@ def test_file_resources_read_a_denied_directory_as_a_missing_file(
 def test_directory_resource_probes_a_file_path_as_an_absent_listing(
     mode: str, tmp_path: Path
 ) -> None:
-    # The probe has to answer for a path whose kind changed; the read behind it
+    # The probe has to answer for a path whose kind changed. The read behind it
     # still reports that a file is not a directory, which is how a workspace
     # walk tells a module from a package.
     directories = DirectoryResource()
@@ -1453,10 +1450,10 @@ def test_directory_resource_probes_a_file_path_as_an_absent_listing(
     listing.write_text("not a directory", encoding="utf-8")
 
     # The invariant a probe keeps: two paths may share one only when reading
-    # them agrees. Which non-directory answer a path *under* a file lands on is
-    # the platform's to decide -- POSIX raises NotADirectoryError from the
-    # listing where Windows reports the path absent -- so the probe is pinned
-    # against the read rather than against either platform's choice.
+    # them agrees. The platform decides which non-directory answer a path
+    # *under* a file lands on. POSIX raises NotADirectoryError from the listing
+    # and Windows reports the path absent. So the probe is pinned against the
+    # read, whichever choice the platform makes.
     kinds = ("directory", "file", "under a file", "absent")
     paths = (
         str(tmp_path),
@@ -1479,7 +1476,7 @@ def test_directory_resource_probes_a_file_path_as_an_absent_listing(
                 assert reads[left] == reads[right], (kinds[left], kinds[right])
 
     # A file and an absent path read differently on every platform, so they may
-    # never share a probe -- which is the state the listing probe had to grow.
+    # never share a probe. That is why the listing probe had to grow a state.
     assert reads[1] != reads[3]
     assert probes[1] != probes[3]
     assert probes[3] == (False, ())
@@ -1487,7 +1484,7 @@ def test_directory_resource_probes_a_file_path_as_an_absent_listing(
     fresh = Database(mode=mode)
     assert db.get(names, str(listing)) == fresh.get(names, str(listing)) == ("<caught>",)
     # The failure is now recorded against the probe that observed it, so the
-    # reader keeps its edge instead of losing the node it depends on.
+    # reader keeps its edge and the node it depends on.
     assert _find_node(_inspect_node(db, names, str(listing)), "dir[").last_decision == "failed"
 
 
@@ -1514,14 +1511,14 @@ def test_handled_unrecordable_failure_invalidates_a_transitive_reader(
     db = Database(mode=mode)
     assert db.get(parent, str(path)) == "P:text"
 
-    # Neither the load nor the probe survives a denial, so nothing about the
-    # failure can be recorded. Reporting the resource changed is enough for
-    # `reader`, which re-executes and catches; it is *not* enough for `parent`
-    # unless the transition also moves the revision, because otherwise `reader`
-    # re-executes at the revision `parent` already verified.
+    # Both the load and the probe fail on a denial, so the failure is
+    # unrecordable. Reporting the resource changed is enough for `reader`,
+    # which re-executes and catches. For `parent`, the transition must also
+    # move the revision. Otherwise `reader` re-executes at the revision
+    # `parent` already verified.
     _deny(path)
     assert db.get(parent, str(path)) == Database(mode=mode).get(parent, str(path)) == "P:<denied>"
-    # Still right when the transitive reader is asked repeatedly, not just once.
+    # Still right when the transitive reader is asked repeatedly.
     assert db.get(parent, str(path)) == "P:<denied>"
 
     # ... and it settles: once the world heals, the parent follows the value back.
@@ -1564,7 +1561,7 @@ def test_handled_unrecordable_failure_propagates_more_than_one_hop(
 
     _deny(path)
     assert db.get(top, str(path)) == Database(mode=mode).get(top, str(path)) == "T:M:<denied>"
-    # Every hop of the chain agrees, not only the root that was asked for.
+    # Every hop of the chain agrees, including those below the requested root.
     assert db.get(middle, str(path)) == "M:<denied>"
     assert db.get(leaf, str(path)) == "<denied>"
 
@@ -1601,8 +1598,8 @@ def test_permanently_unrecordable_failure_settles_the_revision(
 
     _deny(path)
     assert db.get(parent, str(path)) == "P:<denied>"
-    # The transition into "unconfirmed" moves the revision (once per node that
-    # actually changed) -- not once per observation.
+    # The transition into "unconfirmed" moves the revision once per node that
+    # changed. Repeated observations leave it alone.
     transitioned = db.revision
     assert transitioned > before
 
@@ -1610,8 +1607,8 @@ def test_permanently_unrecordable_failure_settles_the_revision(
         assert db.get(parent, str(path)) == "P:<denied>"
         assert db.revision == transitioned
 
-    # A read that ultimately succeeds is not a transition either: the healing
-    # load moves the revision once, and the requests after it leave it alone.
+    # Healing follows the same rule: the healing load moves the revision once,
+    # and the requests after it leave it alone.
     _allow(path)
     assert db.get(parent, str(path)) == "P:text"
     healed = db.revision
@@ -1632,8 +1629,8 @@ def test_module_replaced_by_a_package_matches_a_fresh_database(tmp_path: Path) -
     assert tuple(ref.module for ref in imports) == ("os",)
 
     # A module -> package refactor is the shipped-integration form of the same
-    # transition, and lands on the same answer: the path no longer names a
-    # source file, so it analyzes as an empty one in both databases.
+    # transition, and lands on the same answer: the path stops naming a source
+    # file, so it analyzes as an empty one in both databases.
     path.unlink()
     path.mkdir()
     (path / "__init__.py").write_text("import os\n", encoding="utf-8")
@@ -1781,8 +1778,8 @@ def test_file_stat_resource_delivers_declared_type_in_every_mode(mode: str, tmp_
     differently: what a query body reads, what a query returns to its caller,
     and what a top-level `read_resource` hands back. Three worlds, because a
     caller branches on all three: a file that is there, a path that is absent,
-    and a path reached *through* a file -- which reads exactly as the absent one
-    does, so the last two cells must agree.
+    and a path reached *through* a file. The last reads as the absent one does,
+    so the last two cells must agree.
     """
 
     stats = FileStatResource()
@@ -1845,19 +1842,19 @@ def test_the_builtin_file_stat_machinery_carries_no_instance_state() -> None:
     assert dataclasses.fields(resource) == ()
     assert resource == FileStatResource()
     assert vars(adapter) == {}
-    # `hasattr` reads the class through its MRO, which is the whole of the
-    # question only while the adapter subclasses `object` directly, as this one
-    # does: given a base class the same call answers for the hierarchy, so it
-    # would report a base's `__slots__` -- including an empty one carrying no
-    # state -- without saying which class declared it. `vars()` above is the
-    # complement, and refuses outright on a class with no instance dictionary.
+    # `hasattr` reads the class through its MRO. That answers the whole question
+    # only while the adapter subclasses `object` directly, as this one does.
+    # With a base class, the call answers for the hierarchy: it would report a
+    # base's `__slots__` (even an empty one that carries no state) without
+    # naming the declaring class. `vars()` above is the complement, and refuses
+    # outright on a class with no instance dictionary.
     assert type(adapter).__mro__ == (type(adapter), object)
     assert not hasattr(type(adapter), "__slots__")
     assert type(adapter).__module__ == "pyinc.resources"
-    # One adapter because the built-in map holds one. A second entry wants the
-    # adapter assertions above run over `BUILTIN_ADAPTERS.values()`: naming the
-    # file-stat entry alone would leave the new one unpinned while the test
-    # still read as covering the built-ins.
+    # One adapter because the built-in map holds one. If a second entry arrives,
+    # run the adapter assertions above over `BUILTIN_ADAPTERS.values()`. Naming
+    # the file-stat entry alone would leave the new one unpinned while the test
+    # still seemed to cover the built-ins.
     assert set(BUILTIN_ADAPTERS) == {FileStatSnapshot}
 
 
@@ -1922,15 +1919,13 @@ def test_resolved_path_resource_probe_is_total_for_a_symlink_loop(tmp_path: Path
 
 
 def test_a_resolved_path_answers_an_embedded_null_as_unresolvable(tmp_path: Path) -> None:
-    # A path string holding a null character names no file and never will by
-    # being asked again -- which is exactly what this probe's `None` says, so
-    # it is answered. The answer is settled before the path is handed to the
-    # resolution, because what resolution does with a null is not one
-    # behaviour to catch: it raises on some builds and on others returns the
-    # null-bearing path unchanged, as if it had resolved. All three entry
-    # points are driven because each reaches the filesystem for itself: a
-    # totality that held at one of them and not the others is one a caller
-    # walks around without noticing.
+    # A path string holding a null character names no file, however often it is
+    # asked. This probe's `None` says that, so the path gets an answer. The
+    # answer is settled before the path reaches resolution, because resolution
+    # handles a null in more than one way: some builds raise, and others return
+    # the null-bearing path unchanged, as if it had resolved. All three entry
+    # points are driven because each reaches the filesystem for itself. If only
+    # one of them were total, a caller would walk around it without noticing.
     resolver = ResolvedPathResource()
     db = Database()
     path = nul_path(tmp_path)
@@ -1944,21 +1939,20 @@ def test_a_resolved_path_answers_an_embedded_null_as_unresolvable(tmp_path: Path
 def test_a_resolved_path_answers_a_symlink_loop_alike_on_every_interpreter(
     shape: str, tmp_path: Path
 ) -> None:
-    # Resolution arrives at this answer by several routes. Some platforms and
-    # versions raise out of it; others stop at the loop and hand back a path
-    # that still holds the link; others again join the part they never
-    # resolved onto that path and return the join. Which route is taken varies
-    # by platform as much as by version, and it varies per shape: the same
-    # build can raise for the link named on its own and quietly join for a
-    # name beneath it. The answer has to be the same down every route. A probe
-    # value that told a reader which build had looked at an unchanged world
-    # could not survive being written to a checkpoint by one process and read
-    # back by another.
+    # Resolution reaches this answer by several routes. Some platforms and
+    # versions raise out of it. Others stop at the loop and hand back a path
+    # that still holds the link. Others join the unresolved part onto that path
+    # and return the join. The route varies by platform as much as by version,
+    # and it varies per shape: one build can raise for the link named alone and
+    # join for a name beneath it. The answer must be the same down every route.
+    # A probe value that told a reader which build looked at an unchanged world
+    # would break when one process writes it to a checkpoint and another reads
+    # it back.
     #
-    # All three shapes are driven, not the link alone: a loop is reached
-    # through a name under it as readily as by its own name, the two deeper
-    # shapes are the ones a caller composing a path is most likely to hand
-    # over, and they are the shapes whose route differs most between builds.
+    # All three shapes are driven. A loop is reached through a name under it as
+    # readily as by its own name. The two deeper shapes are the ones a caller
+    # composing a path most likely hands over, and their route differs most
+    # between builds.
     resolver = ResolvedPathResource()
     loop = make_symlink_loop(tmp_path / "loop")
     looped = {
@@ -1978,13 +1972,12 @@ def test_a_resolved_path_answers_a_symlink_loop_alike_on_every_interpreter(
 def test_an_unresolvable_path_is_stable_warm_and_fresh(
     mode: str, shape: str, tmp_path: Path
 ) -> None:
-    # An unresolvable path is a probe value like any other, so it has to hold
-    # still. The same answer from a database that already has one recorded and
-    # from one meeting the path for the first time, in every mode -- and the
-    # same answer again in a database that was handed a checkpoint and never
-    # saw the original read. That last one is what a checkpoint's trust rests
-    # on: a recorded probe is only worth carrying if a later process
-    # re-derives it and lands where the first one did.
+    # An unresolvable path is a probe value like any other, so it must hold
+    # still. In every mode, a database with the answer recorded and one meeting
+    # the path for the first time give the same answer. So does a database that
+    # loaded a checkpoint and never saw the original read. A checkpoint's trust
+    # rests on that last case: a recorded probe is worth carrying only if a
+    # later process re-derives it and lands where the first one did.
     resolver = ResolvedPathResource()
     if shape == "symlink-loop":
         path = str(make_symlink_loop(tmp_path / "loop"))
@@ -2001,9 +1994,9 @@ def test_an_unresolvable_path_is_stable_warm_and_fresh(
     warm.set(target, path)
     assert warm.get(resolves) is None
 
-    # The second ask spends the standalone probe rather than the atomic
-    # probe-and-load, so the body running again here would say the two reads
-    # disagree about an unchanged world.
+    # The second ask verifies with the standalone probe, where the first used
+    # the atomic probe-and-load. A second run of the body here would mean the
+    # two reads disagree about an unchanged world.
     assert warm.get(resolves) is None
     assert warm.statistics().query_executions == 1
 
@@ -2016,8 +2009,8 @@ def test_an_unresolvable_path_is_stable_warm_and_fresh(
     reloaded.set(target, path)
     reloaded.load_checkpoint(key)
 
-    # The counter is the witness that the round trip was live: a reload
-    # carrying nothing usable would answer by running the body again.
+    # The counter shows the round trip was live. A reload carrying nothing
+    # usable would run the body again.
     assert reloaded.get(resolves) is None
     assert reloaded.statistics().query_executions == 0
 
@@ -2240,10 +2233,10 @@ def test_file_resource_identity_includes_configuration(tmp_path: Path) -> None:
 class _ProbeRewritingResource(Resource[str, str, tuple[str, int]]):
     """Probing writes into a log the resource keeps on itself.
 
-    The default ``identity()`` hands back the resource, so this log is the whole
-    of what distinguishes it and every probe redefines it. Written in place: the
-    list the resource holds keeps its identity, so nothing but the resource's
-    own recorded fingerprint can notice the write.
+    The default ``identity()`` hands back the resource, so this log is all that
+    distinguishes it, and every probe redefines it. The write is in place: the
+    list keeps its identity, so only the resource's own recorded fingerprint
+    can notice the write.
     """
 
     reads: list[str] = dataclasses.field(default_factory=list)
@@ -2320,13 +2313,13 @@ class _TallyingContentResource(Resource[str, str, tuple[str]]):
 
 @dataclass
 class _ReparameterizingResource(Resource[str, str, tuple[str, int]]):
-    """Declares its own identity and moves it deliberately.
+    """Declares its own identity and moves it on every probe.
 
-    Every probe advances the generation the resource reports, so each read is a
-    differently configured resource rather than one resource contradicting
-    itself about what it is. It moves its state exactly the way the refused
-    resources above do, so what parts them is the declared identity and nothing
-    else.
+    Every probe advances the generation the resource reports, so each read sees
+    a differently configured resource, and no single resource contradicts
+    itself about what it is. It moves its state the same way the refused
+    resources above do, so the declared identity is the only thing that parts
+    them.
     """
 
     generations: list[str] = dataclasses.field(default_factory=list)
@@ -2395,22 +2388,21 @@ def test_a_resource_that_rewrites_itself_between_reads_is_refused(
         return resource.read(db, key)
 
     db = Database(mode=mode)
-    # The first request records the fingerprint; the flip is what the next
-    # request's guard sees, so the refusal lands on the second get and not the
-    # first.
+    # The first request records the fingerprint and the next request's guard
+    # sees the flip, so the refusal lands on the second get.
     assert db.get(read_key, target) == f"{target}:1"
     with pytest.raises(UnsupportedValueError, match="no stable identity"):
         db.get(read_key, target)
 
-    # Refused rather than half-done: the second request left no execution and
-    # no second resource record behind it.
+    # The refusal is clean: the second request left no execution and no second
+    # resource record behind it.
     stats = db.statistics()
     assert (stats.query_executions, stats.query_reuses, stats.resource_count) == (1, 0, 1)
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_frozen_resource_reuses_its_record(mode: str, tmp_path: Path) -> None:
-    """The control: a resource that holds still is still reused, not refused."""
+    """The control: a resource that holds still keeps being reused."""
 
     resource = _StableTallyingResource()
     target = str(tmp_path / "cell")
@@ -2425,19 +2417,19 @@ def test_a_frozen_resource_reuses_its_record(mode: str, tmp_path: Path) -> None:
 
     stats = db.statistics()
     assert (stats.query_executions, stats.query_reuses, stats.resource_count) == (1, 3, 1)
-    # The tally cannot ride the resource -- a resource that keeps its own
-    # counter is exactly what the refusal above is for -- so it rides a file
-    # beside the key: one load, then a probe for each warm validation.
+    # The refusal above targets a resource that keeps its own counter, so the
+    # tally rides a file beside the key: one load, then a probe for each warm
+    # validation.
     assert _resource_tallied(target) == "pl" + "ppp"
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_node_a_request_does_not_reach_is_not_probed(mode: str, tmp_path: Path) -> None:
-    """Zero probe hits does not mean the node went unprobed.
+    """A node with zero probe hits may still have been probed.
 
     ``resource_probe_hits`` counts probes that answered "unchanged", so a node
     that is reached and whose probe misses records the same zero as a node the
-    request never reaches at all. The hook trace is what parts them.
+    request never reaches. The hook trace parts them.
     """
 
     resource = _TallyingContentResource()
@@ -2462,8 +2454,8 @@ def test_a_node_a_request_does_not_reach_is_not_probed(mode: str, tmp_path: Path
         0,
     )
 
-    # One request, reaching exactly one of the two nodes -- the one whose file
-    # moved underneath it.
+    # One request, reaching one of the two nodes: the one whose file moved
+    # underneath it.
     Path(reached).write_text("second", encoding="utf-8")
     assert db.get(read_key, reached) == "second"
     after = db.statistics()
@@ -2474,9 +2466,9 @@ def test_a_node_a_request_does_not_reach_is_not_probed(mode: str, tmp_path: Path
     assert after.resource_loads == before.resource_loads + 1
     # Not reached: no hook ran on it at all.
     assert _resource_tallied(unreached) == "pl"
-    # Both nodes contributed zero hits, which is why the counter alone cannot
-    # tell the two cases apart: a miss is not a hit, and neither is a probe
-    # that never ran.
+    # Both nodes contributed zero hits, so the counter alone cannot tell the two
+    # cases apart. A miss counts no hit, and a probe that never ran counts none
+    # either.
     assert after.resource_probe_hits == 0
 
 
@@ -2513,9 +2505,8 @@ def test_a_span_with_no_declared_change_probes_once(mode: str, tmp_path: Path) -
     assert spanned.resource_loads == warm.resource_loads
     assert _resource_tallied(target) == "pl" + "p"
 
-    # The same four calls outside a span open four requests and re-probe on
-    # every one of them: the span is what collapses the validation, not the
-    # record.
+    # The same four calls outside a span, over the same record, open four
+    # requests and re-probe on each. The span collapses the validation.
     for _ in range(4):
         assert db.get(read_key, target) == "body"
     bare = db.statistics()
@@ -2529,11 +2520,11 @@ def test_a_span_with_no_declared_change_probes_once(mode: str, tmp_path: Path) -
 def test_a_resource_defining_its_own_identity_may_reparameterize(
     mode: str, tmp_path: Path
 ) -> None:
-    """A declared identity that moves is a new configuration, not a defect.
+    """A declared identity that moves is a new configuration, and is allowed.
 
-    Re-fingerprinting on every read is what such a resource has always cost and
-    what it keeps costing; only the resource that never said what distinguishes
-    it is refused.
+    Such a resource has always paid for re-fingerprinting on every read, and it
+    still does. Only a resource that never said what distinguishes it is
+    refused.
     """
 
     resource = _ReparameterizingResource()
@@ -2554,10 +2545,10 @@ def test_a_resource_defining_its_own_identity_may_reparameterize(
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_resource_that_becomes_unreadable_still_recomputes(mode: str, tmp_path: Path) -> None:
-    """A failed identity read is a degradation, not a redefinition.
+    """A failed identity read counts as a degradation and gets a recompute.
 
-    The guard cannot compare a fingerprint it never got, so the request pays a
-    full recompute -- refusing there would turn a documented degradation into a
+    The guard has no fingerprint to compare, so the request pays a full
+    recompute. Refusing there would turn a documented degradation into a
     crash.
     """
 
@@ -2574,8 +2565,8 @@ def test_a_resource_that_becomes_unreadable_still_recomputes(mode: str, tmp_path
 
     marker.write_text("", encoding="utf-8")
     assert db.get(read_key, target) == f"{target}-value"
-    # Consumed by the guard's own read of the resource, which is the witness
-    # that the unreadable answer really is the one the guard had to judge.
+    # The guard's own read of the resource consumed the marker, which shows the
+    # guard had to judge the unreadable answer.
     assert not marker.exists()
 
     stats = db.statistics()
@@ -2606,12 +2597,12 @@ def test_env_resource_instances_share_stable_behavior(
     first = db.statistics()
     assert (first.resource_count, first.resource_loads) == (1, 1)
 
-    # Two separate but equal instances are one node, not two: the key is
-    # derived from the resource type, its identity() payload and the
-    # parameter, and none of the three separates them. The second query reads
-    # the record the first one wrote, so nothing loads again. The exported
-    # dependency_graph() labels cannot witness this -- they come from the same
-    # key and read identically for both instances -- so the counters do.
+    # Two separate but equal instances share one node. The key derives from the
+    # resource type, its identity() payload and the parameter, and all three
+    # match. The second query reads the record the first one wrote, so nothing
+    # loads again. The exported dependency_graph() labels come from the same
+    # key and read identically for both instances, so the counters witness
+    # this.
     assert db.get(read_b) == "value"
     second = db.statistics()
     assert (second.resource_count, second.resource_loads) == (1, 1)
@@ -2785,7 +2776,7 @@ def test_sharing_pattern_backdates_when_rewired_result_is_equal() -> None:
     db.set(chooser, "right")
     assert db.get(consumer_a) == "a=5"
 
-    # Inspect before consumer_b runs — shared was backdated during consumer_a's request.
+    # Inspect before consumer_b runs: shared was backdated during consumer_a's request.
     tree_a = _inspect_node(db, consumer_a)
     shared_node = _find_node(tree_a, "shared")
     assert shared_node.last_decision == "backdated"
@@ -2865,7 +2856,7 @@ def test_rewiring_with_lru_eviction() -> None:
     # Evict branch by requesting filler (max_query_nodes=2 keeps consumer + filler).
     assert db.get(filler) == "filler"
 
-    # Now switch and request consumer again — branch must re-execute from scratch.
+    # Now switch and request consumer again. The evicted branch must re-execute from scratch.
     db.set(chooser, "right")
     assert db.get(consumer) == 21
 
@@ -2895,7 +2886,7 @@ def test_external_alias_mutation_after_boundary_crossing() -> None:
 
     assert db.get(echo) == {"key": [1, 2, 3]}
 
-    # Mutate through the external alias — kernel snapshot must be unaffected.
+    # Mutate through the external alias. The kernel snapshot must stay as it was.
     data["key"].append(4)
     data["new_key"] = [99]
 
@@ -2914,7 +2905,7 @@ def test_strict_boundary_views_are_detached_from_the_stored_snapshot() -> None:
     view = db.get(listed)
 
     # Frozen dataclass setters refuse plain writes, but object.__setattr__
-    # bypasses them; a view aliasing the stored snapshot would then corrupt it.
+    # bypasses them. A view aliasing the stored snapshot would then corrupt it.
     object.__setattr__(view, "items", (99,))
 
     warm_view = db.get(listed)
@@ -3004,11 +2995,11 @@ def test_custom_eq_with_side_effect_does_not_corrupt_graph(
     assert db.get(describe) == "v=3"
 
     # Change input: 3 → 5 (both odd), parity_eq([3], [5]) → True → backdated.
-    # The comparator sees a container -- a FrozenList view here, since this
-    # database is strict -- so a corrupting comparator would have a shell to
-    # rebind; eq fires with a side effect and the kernel still functions.
+    # The comparator sees a container (a FrozenList view, since this database
+    # is strict), so a corrupting comparator would have a shell to rebind. eq
+    # fires with a side effect and the kernel still functions.
     db.set(number, 5)
-    assert db.get(describe) == "v=3"  # Backdated — parity says equal.
+    assert db.get(describe) == "v=3"  # Backdated: parity says equal.
     assert "custom comparator ran" in capsys.readouterr().out
     assert _inspect_node(db, describe).last_decision == "reused"
 
@@ -3035,7 +3026,7 @@ def test_two_queries_reading_same_input_get_independent_copies(mode: str) -> Non
     result_a = db.get(query_a)
     result_b = db.get(query_b)
 
-    # Independent objects — no shared aliases.
+    # Independent objects with no shared aliases.
     assert result_a is not result_b
     assert result_a == result_b
     assert (
@@ -3043,23 +3034,24 @@ def test_two_queries_reading_same_input_get_independent_copies(mode: str) -> Non
         is not cast(dict[str, list[int]], result_b)["items"]
     )
 
-    # Mutating one must not affect the other.
+    # Mutating one must leave the other intact.
     cast(dict[str, list[int]], result_a)["items"].append(4)
     result_b_again = db.get(query_b)
     assert cast(dict[str, list[int]], result_b_again)["items"] == [1, 2, 3]
 
 
 # ---------------------------------------------------------------------------
-# Outside-the-envelope behavior tests
+# Behaviour outside the soundness guarantee
 # ---------------------------------------------------------------------------
 
 
 def test_os_open_bypasses_untracked_read_guard(tmp_path: Path) -> None:
     """Documents that os.open() (the low-level syscall) is NOT intercepted.
 
-    This is a known limitation of the enforcement boundary — only builtins.open,
-    io.open, os.getenv, os.environ, os.listdir, os.scandir, and Path.iterdir
-    are guarded.
+    This is a known limitation of the enforcement boundary. The guard covers
+    only the entry points docs/kernel-contract.md lists under condition 2
+    (Tracked ambient reads). Limitation 1 there names os.open among the reads
+    that bypass it.
     """
     path = tmp_path / "sample.txt"
     path.write_text("hello", encoding="utf-8")
@@ -3074,7 +3066,7 @@ def test_os_open_bypasses_untracked_read_guard(tmp_path: Path) -> None:
         return data.decode("utf-8")
 
     db = Database()
-    # This does NOT raise — os.open is outside the guard.
+    # This returns normally: os.open is outside the guard.
     assert db.get(read_via_os_open) == "hello"
 
 
@@ -3086,8 +3078,8 @@ def test_report_untracked_read_forces_reexecution_on_every_request() -> None:
 
     db = Database()
 
-    # Three consecutive gets with no input changes at all.
-    # Each must re-execute (not reuse) because the query is impure.
+    # Three consecutive gets with no input changes.
+    # Each must re-execute because the query is impure.
     for _ in range(3):
         assert db.get(impure) == "stable"
         record = _inspect_node(db, impure)
@@ -3150,8 +3142,8 @@ def test_untracked_leaf_value_change_two_levels_up_matches_a_fresh_database(
     assert db.get(top) == 11
 
     # The external state moves between requests. Being untracked keeps the
-    # leaf's *direct* parent honest; the new value must also reach the
-    # grandparent, which only re-verifies through the middle hop's changed_at.
+    # leaf's *direct* parent correct. The new value must also reach the
+    # grandparent, which re-verifies only through the middle hop's changed_at.
     counter.write_text("2", encoding="utf-8")
     assert db.get(middle) == Database().get(middle) == 20
     assert db.get(top) == Database().get(top) == 21
@@ -3181,9 +3173,9 @@ def test_stable_untracked_leaf_keeps_the_revision_settled_across_warm_requests(
     assert db.get(parent) == 10
     settled = db.revision
 
-    # The untracked leaf re-executes on every request -- its result is never
-    # trusted -- but it keeps landing the identical value, so nothing in the
-    # graph has changed and the revision must not move.
+    # The untracked leaf re-executes on every request because its result is
+    # never trusted. It keeps landing the identical value, so the graph is
+    # unchanged and the revision must stay put.
     for _ in range(5):
         assert db.get(parent) == 10
     assert db.revision == settled
@@ -3222,15 +3214,15 @@ def test_cycle_error_does_not_corrupt_database_for_subsequent_queries() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Soundness boundary tests — deeper coverage per kernel-contract.md
+# Soundness boundary tests: deeper coverage per kernel-contract.md
 # ---------------------------------------------------------------------------
 
 
-# Limitation 1 — Unintercepted ambient reads
+# Limitation 1: Unintercepted ambient reads
 
 
 def test_os_pipe_and_os_read_bypass_untracked_read_guard() -> None:
-    """os.pipe/os.read/os.write (raw fd I/O) are NOT intercepted by the guard."""
+    """os.pipe/os.read/os.write (raw fd I/O) bypass the guard."""
 
     @query
     def communicate_via_pipe(db: Database) -> str:
@@ -3248,7 +3240,7 @@ def test_os_pipe_and_os_read_bypass_untracked_read_guard() -> None:
 
 
 def test_mmap_bypasses_untracked_read_guard(tmp_path: Path) -> None:
-    """mmap.mmap over an os.open fd is NOT intercepted by the untracked-read guard."""
+    """mmap.mmap over an os.open fd bypasses the untracked-read guard."""
     path = tmp_path / "sample.txt"
     path.write_text("hello from mmap", encoding="utf-8")
 
@@ -3265,11 +3257,11 @@ def test_mmap_bypasses_untracked_read_guard(tmp_path: Path) -> None:
     assert db.get(read_via_mmap) == "hello from mmap"
 
 
-# Limitation 2 — Custom eq/cutoff with side effects
+# Limitation 2: Custom eq/cutoff with side effects
 
 
 def test_cutoff_performing_ambient_read_does_not_crash(tmp_path: Path) -> None:
-    """A cutoff= that performs ambient file I/O doesn't crash the graph.
+    """The graph survives a cutoff= that performs ambient file I/O.
 
     The backdating decision may be wrong, but the database stays functional.
     """
@@ -3294,20 +3286,20 @@ def test_cutoff_performing_ambient_read_does_not_crash(tmp_path: Path) -> None:
     db.set(number, 2)
     assert db.get(downstream) == "v=2"
 
-    # Same parity — cutoff may backdate.
+    # Same parity, so the cutoff may backdate.
     db.set(number, 4)
     db.get(downstream)
 
-    # Change control file — cutoff token changes, but the cutoff re-evaluates
-    # BOTH old and new values at comparison time. Since the control file now
-    # reads "2" for both, the tokens still match and the graph keeps backdating
-    # to the original stale result. This is the documented limitation:
+    # Change the control file. The cutoff token changes, but the cutoff
+    # re-evaluates BOTH old and new values at comparison time. The control file
+    # now reads "2" for both, so the tokens still match and the graph keeps
+    # backdating to the original stale result. This is the documented limitation:
     # side-effecting cutoffs can cause incorrect but structurally safe backdating.
     control_file.write_text("2", encoding="utf-8")
     db.set(number, 6)
     result = db.get(downstream)
     assert isinstance(result, str)
-    # The graph is functional — further queries still work.
+    # The graph still works for further queries.
     db.set(number, 8)
     assert isinstance(db.get(downstream), str)
 
@@ -3332,7 +3324,7 @@ def test_eq_raising_exception_mid_comparison_leaves_database_usable() -> None:
 
     db = Database()
     db.set(number, 1)
-    assert db.get(transform) == 1  # First execution — no comparison.
+    assert db.get(transform) == 1  # First execution: no comparison.
 
     db.set(number, 2)
     assert db.get(transform) == 2  # Re-executes; this comparison does not raise.
@@ -3348,7 +3340,7 @@ def test_eq_raising_exception_mid_comparison_leaves_database_usable() -> None:
     assert db.get(safe) == 8
 
 
-# Limitation 3 — Mutation in fast mode
+# Limitation 3: Mutation in fast mode
 
 
 def test_fast_mode_does_not_detect_return_value_mutation_unlike_checked() -> None:
@@ -3404,7 +3396,7 @@ def test_fast_mode_frozen_snapshot_safe_despite_mutation() -> None:
 # dedicated test: the documented behaviour is that the kernel cannot observe it.
 
 
-# Cycle detection and recovery — a guarantee, not a contract limitation
+# Cycle detection and recovery: a guarantee, unlike the limitations around it
 
 
 def test_indirect_cycle_three_node_chain_recovery() -> None:
@@ -3439,7 +3431,7 @@ def test_indirect_cycle_three_node_chain_recovery() -> None:
 
 
 def test_cycle_and_safe_query_sharing_dependency() -> None:
-    """Cyclic and safe queries share an Input; cycle doesn't block the safe path."""
+    """Cyclic and safe queries share an Input; the safe path still runs after the cycle."""
     shared = Input[int]("shared")
 
     @query
@@ -3464,11 +3456,11 @@ def test_cycle_and_safe_query_sharing_dependency() -> None:
     assert _inspect_node(db, safe).last_decision == "executed"
 
 
-# Limitation 6 — LRU eviction under active dependencies
+# Limitation 6: LRU eviction under active dependencies
 
 
 def test_very_low_max_query_nodes_causes_reexecution_cascade() -> None:
-    """max_query_nodes=1 with a 3-node chain — correctness via full re-execution."""
+    """max_query_nodes=1 with a 3-node chain stays correct through full re-execution."""
     number = Input[int]("number")
 
     @query
@@ -3488,7 +3480,7 @@ def test_very_low_max_query_nodes_causes_reexecution_cascade() -> None:
 
     assert db.get(step3) == 111
 
-    # Second request — eviction forces re-execution from scratch.
+    # Second request: eviction forces re-execution from scratch.
     assert db.get(step3) == 111
 
     # Input change still propagates correctly through the chain.
@@ -3692,7 +3684,7 @@ def test_reset_statistics_zeroes_counters() -> None:
     assert stats_after.query_executions == 0
     assert stats_after.query_reuses == 0
     assert stats_after.input_sets == 0
-    # Node counts and total_requests are structural, not reset
+    # Node counts and total_requests are structural and survive the reset
     assert stats_after.total_requests == stats_before.total_requests
     assert stats_after.node_count == stats_before.node_count
 
@@ -3973,7 +3965,7 @@ def test_query_profile_counts_executions_not_reuses() -> None:
     db = Database()
     db.set(x, 1)
     db.get(read_x)
-    db.get(read_x)  # reuse, not re-execution
+    db.get(read_x)  # reuse
 
     profiles = db.query_profile()
     assert len(profiles) == 1
@@ -4055,7 +4047,7 @@ def test_concurrent_queries_across_databases_are_thread_safe() -> None:
         t.join()
 
     assert not errors, f"thread errors: {errors}"
-    # Each of 8 threads pushed 50 results — 400 total. Values are 2*i for i in [0..7].
+    # Each of 8 threads pushed 50 results, 400 in total. Values are 2*i for i in [0..7].
     assert len(results) == 8 * 50
     assert set(results) == {2 * i for i in range(8)}
 
@@ -4111,8 +4103,8 @@ def test_untracked_read_still_enforced_per_thread(tmp_path: Path) -> None:
     def raw_open(db: Database) -> int:
         started_event, may_finish_event = db.handshake  # type: ignore[attr-defined]
         # Hold this frame open until the unrelated thread has taken its turn,
-        # so its free read provably overlaps a live query instead of racing
-        # one, then make the read that must be refused here.
+        # so its free read provably overlaps a live query. Then make the read
+        # that must be refused here.
         started_event.set()
         may_finish_event.wait(timeout=5)
         with open(str(path), encoding="utf-8"):
@@ -4143,8 +4135,8 @@ def test_untracked_read_still_enforced_per_thread(tmp_path: Path) -> None:
         finally:
             may_finish.set()
 
-    # Prime: trigger query execution on a separate thread; while it's active,
-    # a parallel thread should still be able to read raw files because it's
+    # Prime: trigger query execution on a separate thread. While it is active,
+    # a parallel thread should still be able to read raw files because it is
     # outside any query frame.
     t_a = threading.Thread(target=worker_a)
     t_b = threading.Thread(target=worker_b)
@@ -4169,11 +4161,11 @@ def _raw_read_outcome(path: Path) -> str:
 
 
 def test_grandchild_thread_of_a_query_is_still_guarded(tmp_path: Path) -> None:
-    """Descent, not depth: every generation below a query is inside its boundary.
+    """Every generation below a query is inside its boundary, however deep.
 
-    The grandchild never touched the query itself — it inherited the spawning
-    context from a thread that inherited it — and its read feeds the same
-    result, so it has to be seen.
+    The grandchild never touched the query itself. It inherited the spawning
+    context from a thread that inherited it, and its read feeds the same
+    result, so the guard must see it.
     """
     path = tmp_path / "f.txt"
     path.write_text("ok", encoding="utf-8")
@@ -4209,12 +4201,12 @@ def test_grandchild_thread_of_a_query_is_still_guarded(tmp_path: Path) -> None:
 
 
 def test_thread_outliving_its_spawning_query_reads_freely_afterward(tmp_path: Path) -> None:
-    """Liveness belongs to the frame, not to the stack a thread inherited.
+    """Liveness is recorded on the frame, whatever stack a thread inherited.
 
     A thread spawned inside a query keeps its spawning context for as long as
-    it runs, so the inherited stack never shrinks. What ends the boundary is
-    the frame itself recording that its execution finished: once the spawning
-    query returns, the survivor is an ordinary thread again and reads freely.
+    it runs, so the inherited stack never shrinks. The boundary ends when the
+    frame records that its execution finished. Once the spawning query
+    returns, the survivor is an ordinary thread again and reads freely.
     """
     path = tmp_path / "f.txt"
     path.write_text("ok", encoding="utf-8")
@@ -4264,12 +4256,12 @@ def test_thread_outliving_its_spawning_query_reads_freely_afterward(tmp_path: Pa
 def test_query_spawned_thread_calling_into_the_database_fails_fast(
     surface: str, tmp_path: Path
 ) -> None:
-    """The whole read surface refuses a descendant thread instead of hanging on it.
+    """The whole read surface refuses a descendant thread at once, so nothing hangs.
 
     A query body that starts a thread and waits for it holds the state lock
     the whole time. Every one of these calls wants that lock, so the child
-    waits for the parent and the parent waits for the child. The refusal is
-    what turns that pair into an error the caller can read.
+    waits for the parent and the parent waits for the child. The refusal
+    turns that mutual wait into an error the caller can read.
     """
     path = tmp_path / "resource.txt"
     path.write_text("ok", encoding="utf-8")
@@ -4319,12 +4311,12 @@ def test_query_spawned_thread_calling_into_the_database_fails_fast(
     assert len(outcome) == 1
     refusal = outcome[0]
     assert isinstance(refusal, ReentrantDatabaseError), refusal
-    # The whole message, not just the tail the five share: the name is the half
-    # that says which entry point refused, so a wiring carrying the wrong
-    # literal -- or one deleted in favour of a refusal further in, which would
-    # answer for a call the child never made -- has to fail here. For
-    # `db.request_span()` and `db.report_untracked_read()` this is the only
-    # place either literal is pinned exactly.
+    # Pin the whole message, including the name before the tail the five share.
+    # The name says which entry point refused. A wiring carrying the wrong
+    # literal must fail here, and so must one deleted in favour of a refusal
+    # further in (which would answer for a call the child never made). This is
+    # the only place the literals for `db.request_span()` and
+    # `db.report_untracked_read()` are pinned in full.
     assert str(refusal) == (
         f"db.{surface}() is not allowed from a thread spawned inside a query execution."
     )
@@ -4436,7 +4428,7 @@ def test_hook_survivor_stays_refused_where_a_query_survivor_recovers(mode: str) 
     carries no such mark: the child inherited a snapshot of it and the parent's
     reset is invisible there, so a survivor of a hook stays refused for the rest
     of its life. Both halves are pinned here because the difference is the
-    behaviour, not an accident of either half.
+    intended behaviour.
     """
     inp = Input[int]("x")
 
@@ -4478,7 +4470,7 @@ def test_hook_survivor_stays_refused_where_a_query_survivor_recovers(mode: str) 
                         outcomes.append(f"{name}: {exc}")
                     else:
                         outcomes.append(f"{name}: allowed")
-            except BaseException as exc:  # noqa: BLE001 -- collected for the main thread
+            except BaseException as exc:  # noqa: BLE001 (collected for the main thread)
                 errors.append(exc)
             finally:
                 done.set()
@@ -4523,12 +4515,11 @@ def test_hook_survivor_stays_refused_where_a_query_survivor_recovers(mode: str) 
 
 
 def test_unrelated_thread_call_serializes_while_a_query_runs() -> None:
-    """A thread the query did not start still waits its turn rather than being refused.
+    """A thread the query did not start waits its turn and is served.
 
     The refusal is scoped to descent. A worker that already existed when the
-    query began is outside its boundary, so it blocks on the state lock and
-    lands the moment the query releases it -- the shared-instance promise,
-    unchanged.
+    query began is outside its boundary. It blocks on the state lock and lands
+    the moment the query releases it, which keeps the shared-instance promise.
     """
     value = Input[int]("value")
 
@@ -4559,10 +4550,10 @@ def test_unrelated_thread_call_serializes_while_a_query_runs() -> None:
         started.wait(timeout=10)
         attempt_made.set()
         try:
-            # A refused surface first, and the flag above says the query body
-            # is still in flight: a rule that keyed on "some thread of this
-            # process is executing" rather than on descent would raise here,
-            # because the check runs before the lock is even asked for.
+            # A refused surface first, while the flag above says the query body
+            # is still in flight. A rule keyed on "some thread of this process
+            # is executing", in place of descent, would raise here, because the
+            # check runs before the lock is even asked for.
             read_from_outside.append(db.read_input(value))
             db.set(value, 2)
         except Exception as exc:  # noqa: BLE001
@@ -4604,9 +4595,9 @@ _OUTSIDE_ONLY_CALLS = (
 def test_administrative_calls_raise_inside_a_query_body(call: str, mode: str) -> None:
     """A query body may read the database; it may not administer or inspect it.
 
-    Each of these either moves state the running execution is deriving from or
-    answers with a function of cache history, so a body that calls one turns
-    its own result into a function of how the caller got here. The refusal is
+    Each of these either moves state the running execution derives from, or
+    answers with a function of cache history. A body that calls one turns its
+    own result into a function of how the caller got here. The refusal is
     the one the boundary predicate already defines, with the message that says
     which side of the boundary the caller stands on.
     """
@@ -4658,10 +4649,10 @@ def test_administrative_calls_raise_inside_a_query_body(call: str, mode: str) ->
     db.checkpoint_store = InMemoryArtifactStore()  # type: ignore[attr-defined]
     db.checkpoint_key = db.save_checkpoint(db.checkpoint_store)  # type: ignore[attr-defined]
 
-    # The whole message, not just its tail: the name is the half that says
-    # which entry point refused, so a wiring carrying the wrong literal -- or
-    # one deleted in favour of a refusal further in, which would answer for a
-    # call the caller never made -- has to fail here.
+    # Pin the whole message, including the name before the tail. The name says
+    # which entry point refused. A wiring carrying the wrong literal must fail
+    # here, and so must one deleted in favour of a refusal further in (which
+    # would answer for a call the caller never made).
     subject = "db.revision" if call == "revision" else f"db.{call}()"
     with pytest.raises(
         ReentrantDatabaseError,
@@ -4674,8 +4665,8 @@ def test_rejected_in_query_set_leaves_no_registration() -> None:
     """The refused `set` registers nothing, because it refuses before it looks.
 
     A rejection that landed after the input was keyed would leave a node the
-    caller never declared, so the check has to come ahead of everything `set`
-    does -- including the isinstance guard it opens with.
+    caller never declared. So the check must come ahead of everything `set`
+    does, including the isinstance guard it opens with.
     """
     counter = Input[int]("counter")
     newcomer = Input[int]("newcomer")
@@ -4704,9 +4695,9 @@ def test_rejected_in_query_set_leaves_no_registration() -> None:
 def test_rejected_in_query_set_many_does_not_consume_the_iterator() -> None:
     """The refused `set_many` never pulls from the caller's iterable.
 
-    `set_many` materializes its updates as the first thing it does under the
-    lock, and materializing is observable: a generator that has been advanced
-    cannot be handed to a second call. The refusal precedes it.
+    `set_many` materializes its updates first thing under the lock, and
+    materializing is observable: an advanced generator cannot be handed to a
+    second call. The refusal comes before it.
     """
     counter = Input[int]("counter")
     newcomer = Input[int]("newcomer")
@@ -4738,7 +4729,7 @@ def test_rejected_in_query_set_many_does_not_consume_the_iterator() -> None:
 
 
 def test_rejected_in_query_save_checkpoint_writes_nothing(tmp_path: Path) -> None:
-    """The refused `save_checkpoint` leaves the store exactly as it found it.
+    """The refused `save_checkpoint` leaves the store as it found it.
 
     The first thing a save touches on a filesystem store is a cross-process
     lock file, taken while the query body still holds the state lock. Nothing
@@ -4773,8 +4764,8 @@ def test_rejected_in_query_load_checkpoint_leaves_staging_untouched() -> None:
 
     A load commits its validated records onto the database by rebinding the
     staging dictionaries, and every later `get` consults them. The rejection
-    has to land before the manifest is even fetched, so the dictionary the
-    database started with is still the one it holds.
+    must land before the manifest is fetched, so the database still holds the
+    dictionary it started with.
     """
     counter = Input[int]("counter")
 
@@ -4817,11 +4808,11 @@ def test_rejected_in_query_load_checkpoint_leaves_staging_untouched() -> None:
 def test_query_catching_the_administrative_rejection_matches_fresh(mode: str) -> None:
     """A body that tries to set its own input and takes the refusal stays deterministic.
 
-    This is the shape the refusal exists for: the query that administers the
-    database it is deriving from used to answer from the state it had just
-    corrupted, so a warm database and a fresh one on the same declared inputs
-    disagreed. With the set refused, the body derives only from what it read
-    and the two agree.
+    The refusal exists for this shape. A query that administered the database
+    it derives from used to answer from the state it had itself corrupted, so a
+    warm database and a fresh one on the same declared inputs disagreed. With
+    the set refused, the body derives only from what it read, and the two
+    agree.
     """
     counter = Input[int]("counter")
 
@@ -4857,7 +4848,7 @@ def test_reads_and_spans_remain_legal_inside_a_query_body(mode: str, tmp_path: P
     Only the administrative and inspection surface is outside-only. Reading
     another query, an input or a resource, declaring an untracked read, and
     opening a span that joins the enclosing request are the body's own
-    vocabulary and are unaffected.
+    vocabulary and stay allowed.
     """
     path = tmp_path / "resource.txt"
     path.write_text("ok", encoding="utf-8")
@@ -4898,10 +4889,10 @@ def test_reads_and_spans_remain_legal_inside_a_query_body(mode: str, tmp_path: P
 def test_query_spawned_thread_setting_an_input_fails_fast() -> None:
     """The administrative refusal names the other side of the boundary too.
 
-    One predicate decides both: the same `db.set`, refused as inside a query
-    when the body makes it and as a descendant when a thread the body started
-    makes it -- and in the second case ahead of the state lock the body is
-    still holding, which is what keeps the join from hanging.
+    One predicate decides both cases for the same `db.set`. It is refused as
+    inside a query when the body makes it, and as a descendant when a thread
+    the body started makes it. In the second case the refusal comes ahead of
+    the state lock the body still holds, which keeps the join from hanging.
     """
     counter = Input[int]("counter")
 
@@ -4960,17 +4951,17 @@ def test_resource_hook_reading_the_database_raises_a_typed_error(
     """A resource hook observes the outside world; it may not read the database.
 
     A hook that reads the database hides that read behind the resource node.
-    The reader declares an edge to the resource and nothing declares an edge to
-    what the hook went and fetched, so a warm request that answers the resource
-    from an unchanged probe reuses a value assembled from state it never
-    re-checked -- and the answer stops matching what a fresh database produces
-    from the same declared inputs.
+    The reader declares an edge to the resource, and no edge leads to what the
+    hook fetched. A warm request that answers the resource from an unchanged
+    probe then reuses a value built from state it never re-checked. The answer
+    stops matching what a fresh database produces from the same declared
+    inputs.
 
-    All three hooks are refused, including `probe`, which is handed no database
-    at all and is refused for reaching one anyway: the position is ambient, not
-    a matter of which argument the hook was given. Each cell first makes the
-    very same read from outside a hook, where it answers, so the refusal is
-    known to be about the position and not about the call.
+    All three hooks are refused. That includes `probe`, which is handed no
+    database and is refused for reaching one anyway: the position is ambient,
+    whatever argument the hook was given. Each cell first makes the same read
+    from outside a hook, where it answers, so the refusal is known to come
+    from the position alone.
     """
     counter = Input[int]("counter")
     constant = _ConstantResource()
@@ -5072,10 +5063,10 @@ def test_resource_hook_calling_set_raises_without_a_live_frame() -> None:
     """A hook is inside the boundary even when no query execution is.
 
     `db.read_resource` at top level opens no execution, so the stack says
-    nothing about where the caller stands. The hook depth does, and it has to:
-    a `set` from inside a load moves the input the observation being made is
-    about to be recorded against, which is the same defect an in-body `set`
-    is refused for.
+    nothing about where the caller stands. The hook depth says it, and must: a
+    `set` from inside a load moves the input that the current observation is
+    about to be recorded against. An in-body `set` is refused for the same
+    defect.
     """
     newcomer = Input[int]("newcomer")
 
@@ -5109,16 +5100,16 @@ def test_resource_hook_calling_set_raises_without_a_live_frame() -> None:
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 @pytest.mark.parametrize("hook", ["probe_and_load", "load"])
 def test_rejected_hook_read_is_not_a_load_failure(hook: str, mode: str) -> None:
-    """A refused hook read is not an observation, so it leaves no failure record.
+    """A refused hook read observes nothing, so it leaves no failure record.
 
-    A load that raises is an observation the kernel records: the node keeps a
+    A load that raises is an observation the kernel records. The node keeps a
     failure record carrying the probe seen beside it, the reader declares its
-    edge to that node, and reads that follow within the request re-raise the
-    exception the load produced. A boundary refusal observes nothing about the
-    outside world -- it says the hook is asking for something it may not have --
-    so it is passed through ahead of the recording. The second attempt is then
-    refused on its own account instead of replaying a record, which is what
-    keeps warm and fresh identical here.
+    edge to that node, and later reads within the request re-raise the
+    exception the load produced. A boundary refusal says the hook asked for
+    something it may not have, and observes nothing about the outside world.
+    So it passes through ahead of the recording. The second attempt is then
+    refused afresh, with no record to replay, which keeps warm and fresh
+    identical here.
     """
     counter = Input[int]("counter")
 
@@ -5172,9 +5163,9 @@ def test_rejected_hook_read_is_not_a_load_failure(hook: str, mode: str) -> None:
         ):
             db.get(root)
 
-    # The second refusal cannot have been served from the first: nothing
-    # completed, nothing was recorded, and the resource has no node at all --
-    # where a recorded load failure would have left one, counted and labelled.
+    # The second refusal cannot have been served from the first. Nothing
+    # completed, nothing was recorded, and the resource has no node. A recorded
+    # load failure would have left one, counted and labelled.
     assert db.statistics().query_executions == executions_before
     assert db.statistics().resource_count == 0
     assert all(not node.label.startswith("hook-failure[") for node in db.dependency_graph())
@@ -5184,11 +5175,11 @@ def test_refused_hook_read_on_a_recorded_resource_retires_its_probe() -> None:
     """A node that already had a record keeps it, and stops answering from it.
 
     Passing the refusal through the failure-record handling leaves the earlier
-    record exactly as the successful load wrote it -- which is a problem on its
-    own if nothing else happens, because a probe that came back to the recorded
-    value would answer warm from a load that can no longer run. The unconfirmed
-    mark is what closes that: the record survives, its stored probe is retired,
-    and the next read re-runs the hook and is refused on its own account.
+    record as the successful load wrote it. Alone, that is a problem: a probe
+    that came back to the recorded value would answer warm from a load that
+    would now be refused. The unconfirmed mark closes that gap. The record
+    survives, its stored probe is retired, and the next read re-runs the hook
+    and is refused afresh.
     """
     counter = Input[int]("counter")
 
@@ -5205,8 +5196,8 @@ def test_refused_hook_read_on_a_recorded_resource_retires_its_probe() -> None:
             return f"sometimes-reading[{name}]"
 
         def probe(self, name: str) -> str:
-            # Moving with the switch, so the second read reaches the load at
-            # all: an unchanged probe would answer from the record instead.
+            # The probe moves with the switch so the second read reaches the
+            # load. An unchanged probe would answer from the record.
             return "reading" if self.reads_the_database else "quiet"
 
         def load(self, db: Database, name: str) -> int:
@@ -5232,8 +5223,8 @@ def test_refused_hook_read_on_a_recorded_resource_retires_its_probe() -> None:
         ):
             db.read_resource(resource, "subject")
 
-    # The record is the one the successful load wrote -- no failure recorded,
-    # and no probe stored for the refusal -- but it is marked unconfirmed, and
+    # The record is the one the successful load wrote, with no failure recorded
+    # and no probe stored for the refusal. It is marked unconfirmed, and
     # entering that state moved the revision as any other graph change does.
     assert db._records[key] is record
     assert not record.is_failed
@@ -5250,14 +5241,14 @@ def test_query_catching_a_refused_hook_read_is_marked_impure() -> None:
     """A body that survives the refusal rests on it, and may not be reused.
 
     Where the resource already held a record, the refusal reaches the reader
-    through the graph: the edge to that node is published on the way out and
+    through the graph. The edge to that node is published on the way out, and
     the unconfirmed mark makes it report as changed. A resource this database
-    has never loaded offers none of that -- no record to depend on, no probe to
-    retire -- so a body that catches the refusal used to commit an answer with
-    no edge to anything and be reused from then on. Once the hook was rewritten
-    to stop reading the database, the warm database went on serving the
-    fallback while a fresh one returned the value. The untracked mark is what
-    is left to force the body to derive its answer again.
+    has never loaded has no record to depend on and no probe to retire. So a
+    body that caught the refusal used to commit an answer with no edges and be
+    reused from then on. After the hook was rewritten to stop reading the
+    database, the warm database kept serving the fallback while a fresh one
+    returned the value. The untracked mark is the remaining way to force the
+    body to derive its answer again.
     """
     counter = Input[int]("counter")
 
@@ -5298,21 +5289,21 @@ def test_query_catching_a_refused_hook_read_is_marked_impure() -> None:
     assert db.get(catcher) == "fallback"
 
     # Nothing was recorded for the resource, so the answer above it rests on no
-    # edge at all -- only on the mark naming what was caught.
+    # edge. It rests only on the mark naming what was caught.
     assert db.statistics().resource_count == 0
     assert db.inspect(catcher).dependencies == ()
     reasons = db.inspect(catcher).untracked_reasons
     assert reasons
     assert any("sometimes-refusing[subject]" in reason for reason in reasons)
 
-    # Which means the next request derives it again rather than reusing it.
+    # So the next request derives it again.
     executions = db.statistics().query_executions
     assert db.get(catcher) == "fallback"
     assert db.statistics().query_executions == executions + 1
     assert db.inspect(catcher).last_decision == "executed"
 
-    # And a hook that stops reading the database reaches the catcher, exactly
-    # as it reaches a database that never saw the refusal.
+    # A hook that stops reading the database then reaches the catcher, as it
+    # reaches a database that never saw the refusal.
     resource.reads_the_database = False
     executions = db.statistics().query_executions
     warm = db.get(catcher)
@@ -5325,15 +5316,15 @@ def test_query_catching_a_refused_hook_read_is_marked_impure() -> None:
 
 
 def test_thread_spawned_inside_a_hook_outside_a_query_is_refused() -> None:
-    """A hook's boundary has to reach the threads it starts, frame or no frame.
+    """A hook's boundary must reach the threads it starts, with or without a frame.
 
-    `read_resource` at top level opens no execution, so nothing about the
-    spawning context said the child was inside anything -- and the child then
-    blocked forever on the state lock its own parent was holding for the whole
-    of the hook, with the parent waiting on the join. That is the deadlock the
-    descendant refusal exists to turn into an error; it just was not reachable
-    through the frame, because there is no frame here. The hook depth is what
-    the child inherits instead.
+    `read_resource` at top level opens no execution, so the spawning context
+    gave the child no sign it was inside anything. The child then blocked
+    forever on the state lock its parent held for the whole hook, while the
+    parent waited on the join. The descendant refusal exists to turn that
+    deadlock into an error. The refusal could not arrive through the frame,
+    because there is no frame here, so the child inherits the hook depth
+    instead.
     """
     counter = Input[int]("counter")
 
@@ -5358,8 +5349,8 @@ def test_thread_spawned_inside_a_hook_outside_a_query_is_refused() -> None:
                 except Exception as exc:  # noqa: BLE001
                     self.outcome.append(exc)
 
-            # A daemon so that a regression fails this test rather than
-            # stranding a blocked thread at interpreter exit.
+            # A daemon, so a regression fails this test and strands no blocked
+            # thread at interpreter exit.
             thread = threading.Thread(target=child, daemon=True)
             self.thread = thread
             thread.start()
@@ -5382,15 +5373,15 @@ def test_thread_spawned_inside_a_hook_outside_a_query_is_refused() -> None:
 
 
 def test_thread_spawned_inside_a_hook_reads_raw_files_freely(tmp_path: Path) -> None:
-    """A hook's child inherits the hook's raw-read permission, not a query's ban.
+    """A hook's child inherits the hook's raw-read permission, even below a query.
 
     The two halves of the boundary part company here. A thread a query body
     starts is refused its ambient reads, because whatever it reads flows into a
-    result no edge describes. A thread a hook starts is doing the very thing a
-    hook is for, and the permission that lifts the guard for the hook's extent
-    sits in the context the child copies -- so its raw reads are allowed and
-    only its calls back into the database refuse, with the query frame above it
-    still live throughout.
+    result no edge describes. A thread a hook starts does what a hook is for.
+    The permission that lifts the guard for the hook's extent sits in the
+    context the child copies. So its raw reads are allowed and only its calls
+    back into the database refuse, while the query frame above it stays live
+    throughout.
     """
     observed = tmp_path / "observed.txt"
     observed.write_text("payload", encoding="utf-8")
@@ -5424,8 +5415,8 @@ def test_thread_spawned_inside_a_hook_reads_raw_files_freely(tmp_path: Path) -> 
                 else:
                     outcome.append("db.revision allowed")
 
-            # A daemon so that a regression fails this test rather than
-            # stranding a blocked thread at interpreter exit.
+            # A daemon, so a regression fails this test and strands no blocked
+            # thread at interpreter exit.
             thread = threading.Thread(target=child, daemon=True)
             thread.start()
             thread.join(timeout=10)
@@ -5444,8 +5435,8 @@ def test_thread_spawned_inside_a_hook_reads_raw_files_freely(tmp_path: Path) -> 
 
     reported = db.get(reads_through_the_hook)
 
-    # Witness: the query really executed, so the string below was assembled by
-    # a live hook under a live frame rather than served from a record.
+    # Witness: the query executed, so a live hook under a live frame built the
+    # string below. No record served it.
     assert db.statistics().query_executions - executions_before == 1
     assert reported == (
         "read allowed: payload | "
@@ -5859,12 +5850,12 @@ def test_observers_thread_safe_under_contention() -> None:
     for t in threads:
         t.join(timeout=5.0)
         assert not t.is_alive()
-    # Churners each added and removed their own registration, so exactly
-    # the twenty pre-registered slots survive the churn.
+    # Churners each added and removed their own registration, so the twenty
+    # pre-registered slots, and only those, survive the churn.
     with db._state_lock:
         (entries,) = db._observers.values()
         assert len(entries) == 20
-    # Just verify no deadlock/crash and that events did get delivered.
+    # Verify no deadlock or crash, and that events were delivered.
     assert len(events) > 0
     for s in subs:
         s.unsubscribe()
@@ -5886,12 +5877,12 @@ def test_observe_evicted_node_does_not_raise_and_refires_after_reload() -> None:
     db.get(a)  # cold: event 1
     db.get(b)  # forces eviction of a under max_query_nodes=1
     assert len(events) == 1
-    # a is no longer a record, but observer is still registered
+    # a has lost its record, but the observer is still registered
     db.get(a)  # re-executes a from scratch → event 2 fires
     assert len(events) == 2
     # The refire is a cold execution of a node whose revision never moved,
-    # so both events carry the same changed_at -- the event stream does not
-    # promise strictly climbing changed_at values.
+    # so both events carry the same changed_at. The event stream makes no
+    # promise of strictly climbing changed_at values.
     assert events[0].changed_at == events[1].changed_at == 0
     assert db.revision == 0
 
@@ -5970,11 +5961,11 @@ def test_observer_events_do_not_scale_with_how_often_a_caller_asks(mode: str) ->
 def test_inspect_explain_and_inspect_fresh_deliver_the_moves_they_commit() -> None:
     """Every top-level call that can commit a move announces the one it commits.
 
-    `get` is not the only entry point that executes: `inspect` runs a node it
-    has no record of, `explain` answers through the same path, and
+    `get` is one of several entry points that execute. `inspect` runs a node
+    it has no record of, `explain` answers through the same path, and
     `inspect_fresh` re-verifies unconditionally. Each is read here beside its
-    own execution witness, so a call that stopped executing -- or stopped
-    delivering what it executed -- fails rather than passing quietly.
+    own execution witness, so a call that stopped executing, or stopped
+    delivering what it executed, makes this test fail.
     """
     inp = Input[int]("x")
 
@@ -5990,7 +5981,7 @@ def test_inspect_explain_and_inspect_fresh_deliver_the_moves_they_commit() -> No
     assert inspecting.inspect(doubled).last_recompute == "executed"
     assert inspecting.statistics().query_executions - before == 1
     assert len(inspected) == 1
-    # The node has a record now, so a second inspect reads it back instead of
+    # The node has a record now, so a second inspect reads it back without
     # executing, and there is no move to announce.
     inspecting.inspect(doubled)
     assert inspecting.statistics().query_executions - before == 1
@@ -6427,12 +6418,12 @@ class Point:
 class PointAdapter(ValueAdapter):
     """Rebuilds a Point from a mapping payload, read while `thaw` runs.
 
-    Reading the payload instead of aliasing it is deliberate: an adapter that
-    only stores what it is handed hides what the payload held at the moment
-    `thaw` was called. A mapping payload is written into the value itself
-    wherever the encoding can hand it back whole, and a value whose payload it
-    could not is refused at the freeze instead of reaching `thaw`, so the
-    payload every cell below reads is the one the adapter wrote.
+    It reads the payload because an adapter that only stores (aliases) what it
+    is handed hides what the payload held at the moment `thaw` was called. A
+    mapping payload is written into the value itself wherever the encoding can
+    hand it back whole. A value whose payload the encoding could not hand back
+    is refused at the freeze and never reaches `thaw`. So the payload every
+    cell below reads is the one the adapter wrote.
     """
 
     def freeze(self, value: Point, freeze: Any) -> Any:
@@ -6453,10 +6444,10 @@ class Reading:
 class ReadingAdapter(ValueAdapter):
     """Rebuilds a Reading from a positional payload of scalars.
 
-    A payload built from tuples and scalars is written into the value itself
-    rather than held as a node of the shared-structure encoding, so it comes
-    back whole wherever the adapted value sits. That is what lets the graph
-    cells below place an adapted value inside shared structure at all.
+    A payload built from tuples and scalars is written into the value itself,
+    outside the nodes of the shared-structure encoding, so it comes back whole
+    wherever the adapted value sits. That lets the graph cells below place an
+    adapted value inside shared structure.
     """
 
     def freeze(self, value: Reading, freeze: Any) -> Any:
@@ -6536,8 +6527,8 @@ def _plant_undigestable_state_key(adapter: Any, shape: str) -> None:
 
 
 # A module-level pre-frozen wrapper. freeze detaches it into a Database-owned
-# clone at every boundary; the backdate below is justified by the equality
-# relation over the stored snapshots, never by shared object identity.
+# clone at every boundary. The backdate below rests on the equality relation
+# over the stored snapshots, never on shared object identity.
 _NAN_ITEMS = cast(FrozenList, freeze([float("nan")]))
 
 
@@ -6718,9 +6709,9 @@ def test_strict_mode_reconstructs_adapted_values_inside_shared_graphs() -> None:
     def shared_readings(db: Database) -> object:
         stage.read(db)
         inner = [Reading(4, 9)]
-        # A shared CONTAINER, not a shared leaf: an adapted value is inlined
-        # rather than memoized, so only the container drives the snapshot into
-        # the graph encoding this arm is about.
+        # A shared CONTAINER around an unshared leaf. An adapted value is
+        # inlined and never memoized, so only the container drives the snapshot
+        # into the graph encoding this arm is about.
         return [inner, inner]
 
     db = Database(mode="strict", adapters={Reading: ReadingAdapter()})
@@ -6734,10 +6725,10 @@ def test_strict_mode_reconstructs_adapted_values_inside_shared_graphs() -> None:
     assert isinstance(exposed[0], FrozenList)
     # Sharing survives the rebuild: both slots resolve to one view.
     assert exposed[0] is exposed[1]
-    # The adapter ran on this arm -- the leaf is the reconstructed type, not
-    # the kernel's internal adapted-value wrapper -- and it comes back whole.
-    # The positional payload is written into the value itself, so nothing the
-    # adapter reads depends on the order the encoding filled its nodes in.
+    # The adapter ran on this arm. The leaf is the reconstructed type (the
+    # kernel's internal adapted-value wrapper is gone), and it comes back whole.
+    # The positional payload is written into the value itself, so what the
+    # adapter reads is independent of the order the encoding filled its nodes in.
     assert isinstance(exposed[0][0], Reading)
     assert (exposed[0][0].left, exposed[0][0].right) == (4, 9)
 
@@ -6761,10 +6752,10 @@ def test_adapted_values_inside_shared_graphs_read_alike_in_every_mode(mode: str)
 
     leaf = exposed[0][0]  # type: ignore[index]
     assert isinstance(leaf, Reading)
-    # The mode boundary is what this cell protects: an adapted value inside a
-    # shared graph reads the same in all three modes. A payload the encoding
-    # could not hand back whole never reaches an adapter -- the freeze refuses
-    # such a value -- so there is nothing left for the modes to drift over.
+    # This cell protects the mode boundary: an adapted value inside a shared
+    # graph reads the same in all three modes. The freeze refuses a value whose
+    # payload the encoding could not hand back whole, so such a payload never
+    # reaches an adapter and the modes have nothing to drift over.
     assert (leaf.left, leaf.right) == (4, 9)
 
 
@@ -6839,7 +6830,7 @@ def test_adapter_configuration_does_not_participate_in_query_identity() -> None:
     adapter.scale = 100
     memoized = db._query_key(constant, (), {})[0].identity
     # The fingerprint memo observes no adapter state, so a primed read reports
-    # the pre-mutation fingerprint whatever the payload folds; dropping the
+    # the pre-mutation fingerprint whatever the payload folds. Dropping the
     # entry makes the last read rebuild it from the live registry.
     db._query_fingerprint_memo.pop(constant, None)
     recomputed = db._query_key(constant, (), {})[0].identity
@@ -6856,8 +6847,8 @@ def test_unverifiable_adapters_construct_and_skip_the_request_check() -> None:
 
     assert db.get(constant) == 1
     adapter.scale = 2
-    # Slot state defeats fingerprinting, so in-process drift is undetectable;
-    # the documented law (and the checkpoint boundary's refusal) is the only
+    # Slot state defeats fingerprinting, so in-process drift is undetectable.
+    # The documented law (and the checkpoint boundary's refusal) is the only
     # protection for such adapters. The request must not raise.
     assert db.get(constant) == 1
 
@@ -6866,9 +6857,9 @@ def test_an_undigestable_adapter_does_not_exempt_its_registry() -> None:
     adapter = _CurrencyAdapter()
     source = Input[Any]("adapter-mixed-registry-source")
     # The second entry is slot-stated, so its configuration cannot be digested
-    # and its own drift stays undetectable in-process. That exemption is the
-    # adapter's, not the registry's: the first adapter is digestable and stays
-    # checked beside it.
+    # and its own drift stays undetectable in-process. That exemption covers
+    # this adapter only. The first adapter is digestable and stays checked
+    # beside it.
     db = Database(adapters={_MutableCurrency: adapter, Boxed: _SlottedAdapter()})
     assert set(db._registered_adapter_digests) == {_adapter_key(_MutableCurrency)}
     db.set(source, _MutableCurrency(5))
@@ -6928,8 +6919,8 @@ def test_class_level_adapter_counters_do_not_trip_the_request_check() -> None:
     calls = _CountingCurrencyAdapter.freeze_calls + _CountingCurrencyAdapter.thaw_calls
     assert calls > 0
     db.set(source, _MutableCurrency(6))
-    # Every boundary crossing moves the counters, and they live on the class,
-    # not in the adapter's own state -- so the request check never sees them.
+    # Every boundary crossing moves the counters. They live on the class,
+    # outside the adapter's own state, so the request check never sees them.
     assert db.get(read_amount) == 6
     assert _CountingCurrencyAdapter.freeze_calls + _CountingCurrencyAdapter.thaw_calls > calls
 
@@ -6959,21 +6950,21 @@ def test_mutating_an_adapter_into_an_undigestable_shape_raises(shape: str) -> No
 
     assert db.get(constant) == 1
     _plant_undigestable_state_key(adapter, shape)
-    # Both raise paths say which adapter they are about: this one the adapter
-    # whose digest can no longer be computed, the drift path the keys whose
-    # digest moved. A registry holding several adapters is the case that needs
-    # it, and the caller has to be told which one to look at either way.
+    # Both raise paths name the adapter they are about. This one names the
+    # adapter whose digest has become uncomputable, and the drift path names
+    # the keys whose digest moved. A registry holding several adapters needs
+    # this, and either way the caller must be told which one to look at.
     with pytest.raises(AdapterContractError, match="no longer fingerprintable") as raised:
         db.get(constant)
     assert _adapter_key(_MutableCurrency) in str(raised.value)
 
 
 def _builtin_file_stat_registry() -> dict[type[Any], Any]:
-    """The built-in file-stat entry, as the exact object the kernel registers.
+    """The built-in file-stat entry, as the same object the kernel registers.
 
-    The cheap path is keyed on membership -- same adapted type AND same adapter
-    object -- so a test that built its own `FileStatAdapter()` would be testing
-    the caller-adapter path instead. Every cell below that means to exercise the
+    The cheap path is keyed on membership (same adapted type AND same adapter
+    object). A test that built its own `FileStatAdapter()` would test the
+    caller-adapter path instead. Every cell below that means to exercise the
     cheap path registers through this helper.
     """
 
@@ -7001,10 +6992,10 @@ def test_the_builtin_file_stat_adapter_round_trips_through_the_public_helpers() 
     snapshot = freeze(value, adapters=adapters)
     assert isinstance(snapshot, FrozenAdapterValue)
     assert snapshot.adapter_key == _adapter_key(FileStatSnapshot)
-    # The payload is the positional triple, written inline -- not held as a
-    # graph node behind a FrozenRef. That is what makes the adapter usable
-    # inside a shared-structure snapshot, where a payload the encoding would
-    # hold as a node is refused at the freeze instead.
+    # The payload is the positional triple, written inline (no graph node
+    # behind a FrozenRef). That makes the adapter usable inside a
+    # shared-structure snapshot, where the freeze refuses a payload the
+    # encoding would hold as a node.
     assert snapshot.payload == (True, 12, 345)
     assert pyinc.thaw(snapshot, adapters=adapters) == value
 
@@ -7027,9 +7018,9 @@ def test_the_builtin_file_stat_adapter_digests_cleanly() -> None:
     db = Database(adapters=_builtin_file_stat_registry())
     adapter = BUILTIN_ADAPTERS[FileStatSnapshot]
 
-    # A real module, no instance state, no slots, no captures -- so both the
-    # implementation and the configuration digest succeed rather than raising
-    # the way a slotted or capture-carrying adapter does.
+    # A real module, no instance state, no slots, no captures. So both the
+    # implementation and the configuration digest succeed, where a slotted or
+    # capture-carrying adapter raises.
     assert len(db._adapter_implementation_digest(adapter)) == 64
     assert len(db._adapter_configuration_digest(adapter)) == 64
 
@@ -7041,8 +7032,8 @@ def test_a_builtin_only_registry_expects_no_configuration_digests() -> None:
     def constant(db_: Database) -> int:
         return 1
 
-    # The request-scope check exists for adapter instance configuration, and a
-    # stateless adapter the kernel registered has none to move -- so it names no
+    # The request-scope check exists for adapter instance configuration. A
+    # stateless adapter the kernel registered has none to move, so it names no
     # expected digest and `_verify_registered_adapters` short-circuits.
     assert db._registered_adapter_digests == {}
     assert db.get(constant) == 1
@@ -7058,8 +7049,8 @@ def test_builtin_adapter_implementation_digests_are_taken_once_per_process() -> 
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(Database, "_adapter_implementation_digest", counting)
-        # Emptied rather than observed as found, so the cell reads the same
-        # whether or not another test built a database first.
+        # Emptied first, so the cell reads the same whether or not another
+        # test built a database first.
         patch.setattr("pyinc.runtime._FIXED_ADAPTER_IMPLEMENTATION_DIGESTS", {})
         first = Database(adapters=_builtin_file_stat_registry())
         during_first = list(calls)
@@ -7076,8 +7067,8 @@ def test_builtin_adapter_implementation_digests_are_taken_once_per_process() -> 
     assert during_first == ["FileStatAdapter"]
     assert during_second == []
     assert second._static_adapter_digests == first._static_adapter_digests
-    # Served from the memo at the trust boundary too, and what it serves is what
-    # construction recorded rather than a second digest that happens to agree.
+    # Served from the memo at the trust boundary too. What it serves is the
+    # digest construction recorded. No second derivation ran.
     assert calls == []
     assert set(digests) == {key}
     assert digests[key] == first._static_adapter_digests[key]
@@ -7088,11 +7079,10 @@ def test_databases_constructed_at_once_use_the_digest_the_memo_publishes() -> No
     """Two first constructions that race both derive, and both use the memo's digest.
 
     Each used to keep the digest it derived while the memo kept whichever was
-    written last, so two derivations that differed -- an out-of-contract
-    rewrite of the adapter between them -- left databases in one process
-    disagreeing with each other and with the memo. Here the two derivations
-    run at the same time and answer differently, as such a rewrite would make
-    them.
+    written last. Two derivations that differed (an out-of-contract rewrite of
+    the adapter between them) left databases in one process disagreeing with
+    each other and with the memo. Here the two derivations run at the same
+    time and answer differently, as such a rewrite would make them.
     """
 
     rendezvous = Rendezvous()
@@ -7125,12 +7115,12 @@ def test_databases_constructed_at_once_use_the_digest_the_memo_publishes() -> No
 
 
 def test_the_memo_covers_the_kernel_entries_and_stops_there() -> None:
-    """A caller's adapter is never carried, at construction or at the boundary.
+    """The memo never carries a caller's adapter, at construction or at the boundary.
 
-    Construction derives implementation digests for the fixed set only, which is
-    what the memo shortens. A caller's implementation is theirs to change, so its
-    digest is taken fresh at every trust boundary crossing, memo or no memo --
-    which is also what keeps the pinned-adapter-state law's basis intact.
+    Construction derives implementation digests for the fixed set only, and the
+    memo shortens that. A caller's implementation is theirs to change, so its
+    digest is taken fresh at every trust boundary crossing, memo or no memo.
+    That also keeps the basis of the pinned-adapter-state law intact.
     """
 
     calls: list[str] = []
@@ -7170,7 +7160,7 @@ def test_a_caller_override_of_a_builtin_type_is_never_memoized() -> None:
     """Same adapted type, a different adapter object: membership fails.
 
     The memo is reached only from the fixed side of the partition, so an
-    override cannot land in it -- and could not be served from it either, since
+    override cannot land in it. It could not be served from it either, since
     the key pairs the adapter key with the adapter's own type.
     """
 
@@ -7229,8 +7219,8 @@ def test_a_default_database_holds_the_builtin_on_the_cheap_path() -> None:
     The sibling tests below register the built-in explicitly, because they were
     written to distinguish the fixed set from a caller's registration. This one
     pins the shape a bare `Database()` has: the built-in entry, on the fixed
-    side, expecting no configuration digest, and on the trust gate's cheap path
-    -- so registering it for everyone costs no re-derivation per boundary.
+    side, expecting no configuration digest, and on the trust gate's cheap
+    path. So registering it for everyone costs no re-derivation per boundary.
     """
 
     calls: list[str] = []
@@ -7336,8 +7326,8 @@ def test_boundary_exposure_reuses_the_databases_own_adapter_registry() -> None:
 
     assert db.get(read_stat) == value
 
-    # The runtime module binds these two names from the value layer, so patching
-    # them in the runtime namespace is what the boundary actually calls.
+    # The runtime module binds these two names from the value layer, so the
+    # boundary calls the versions patched into the runtime namespace.
     handed: list[Any] = []
 
     def recording_thaw(snapshot: Any, *, adapters: Any = None) -> Any:
@@ -7355,18 +7345,18 @@ def test_boundary_exposure_reuses_the_databases_own_adapter_registry() -> None:
         assert db.get(read_stat) == value
         after = db.statistics()
 
-    # Witness, so the assertion below cannot pass by having exposed nothing:
-    # this was a warm request that reused a record rather than executing.
+    # Witness, so the assertion below cannot pass by exposing nothing: this was
+    # a warm request that reused a record without executing.
     assert after.query_executions - before.query_executions == 0
     assert after.query_reuses - before.query_reuses >= 1
-    # A boundary exposure is handed the registry this database built once, not
-    # the raw map -- which the value layer would rebuild into a fresh registry on
+    # A boundary exposure is handed the registry this database built once.
+    # Handed the raw map, the value layer would rebuild a fresh registry on
     # every call, for a table that cannot change.
     assert handed
     assert all(entry is db._view_adapter_registry for entry in handed)
 
-    # The same fact stated as a count, which is what makes it exact rather than a
-    # claim about two named call sites: a warm request builds NO adapter registry.
+    # The same fact as a count, which covers every call site, beyond the two
+    # patched names above: a warm request builds NO adapter registry.
     # Freezing a query key, exposing a value and fingerprinting one all used to
     # build their own.
     built = 0
@@ -7398,8 +7388,8 @@ def test_a_mutated_caller_adapter_still_raises_beside_the_builtin() -> None:
 
     db.get(read_amount)
     adapter.scale = 100
-    # The built-in's exemption is its own. Its presence in the same registry
-    # does not buy the caller's adapter out of the pinned-state law.
+    # The built-in's exemption covers the built-in only. The caller's adapter
+    # in the same registry stays under the pinned-state law.
     with pytest.raises(AdapterContractError, match="_MutableCurrency"):
         db.get(read_amount)
 
@@ -7417,14 +7407,13 @@ def test_prefrozen_nan_wrapper_result_backdates(mode: str) -> None:
     db.set(stage, 0)
     db.get(constant_items)
 
-    # Each execution stores its own detached clone, so the backdate can no
-    # longer rest on the two records holding one object. It still does not pin
-    # NaN reflexivity across distinct floats: detach clones wrapper shells and
-    # shares leaf scalars, so both snapshots hold the very same NaN float and
-    # no comparison of them ever has to decide whether two distinct NaNs are
-    # equal. That case is pinned by
-    # test_freshly_built_nan_result_backdates_and_holds_dependents, which
-    # builds a distinct NaN per execution.
+    # Each execution stores its own detached clone, so the backdate cannot rest
+    # on the two records holding one object. It still leaves NaN reflexivity
+    # across distinct floats unpinned. Detach clones wrapper shells and shares
+    # leaf scalars, so both snapshots hold the same NaN float object, and no
+    # comparison has to decide whether two distinct NaNs are equal.
+    # test_freshly_built_nan_result_backdates_and_holds_dependents pins that
+    # case by building a distinct NaN per execution.
     db.set(stage, 1)
     revision_after_set = db.revision
     second = db.get(constant_items)
@@ -7443,10 +7432,10 @@ def test_prefrozen_nan_wrapper_result_backdates(mode: str) -> None:
 def test_freshly_built_nan_result_backdates_and_holds_dependents(mode: str) -> None:
     stage = Input[int]("stage")
 
-    # Freshly built operands each run: before the canonical relation this
-    # backdate was carried ONLY by the digest fallback the runtime no longer
-    # has. It now rests on snapshots_equal itself; if this test executes
-    # instead of backdating, the canonical relation lost NaN reflexivity.
+    # Freshly built operands each run. Before the canonical relation, only a
+    # digest fallback (since removed from the runtime) carried this backdate.
+    # It now rests on snapshots_equal itself. If this test executes and does
+    # not backdate, the canonical relation lost NaN reflexivity.
     @query
     def measurement(db: Database) -> object:
         stage.read(db)
@@ -7544,8 +7533,8 @@ def test_numeric_dict_key_recompute_decisions(mode: str) -> None:
     stage = Input[int]("stage")
 
     # An int key and a float key are different canonical encodings, so both
-    # shapes execute -- the single-entry case used to backdate because raw
-    # == unified 1 and 1.0.
+    # shapes execute. The single-entry case used to backdate because raw ==
+    # unified 1 and 1.0.
     @query
     def single_entry(db: Database) -> object:
         return {1: "a"} if stage.read(db) == 0 else {1.0: "a"}
@@ -7791,8 +7780,8 @@ def test_hostile_eq_cannot_corrupt_the_stored_record(mode: str) -> None:
 
     # The hostile verdict is False, so the recompute counts as a change. The
     # default relation would call [1] and [1] equal and backdate, so this
-    # witnesses that the policy really ran -- the corruption checks below
-    # cannot pass because the comparison was skipped.
+    # witnesses that the policy ran. The corruption checks below cannot pass
+    # by the comparison being skipped.
     assert _inspect_node(db, produce).last_decision == "executed"
     record = _query_record(db, produce)
     assert fingerprint_snapshot(record.snapshot) == record.digest
@@ -7827,9 +7816,9 @@ def test_eq_operands_are_not_the_stored_snapshots(
     db = Database(mode=mode)
     db.set(stage, 0)
     db.get(produce)
-    # The left operand is the snapshot the first execution stored; the record's
-    # snapshot field is overwritten by the second execution, so the object has
-    # to be held here to be compared against. Holding it also keeps the id
+    # The left operand is the snapshot the first execution stored. The second
+    # execution overwrites the record's snapshot field, so the object has to
+    # be held here to be compared against. Holding it also keeps the id
     # check conclusive: a released object's id can be handed to a new one.
     first = cast(FrozenList, _query_record(db, produce).snapshot)
     db.set(stage, 1)
@@ -7840,12 +7829,12 @@ def test_eq_operands_are_not_the_stored_snapshots(
     reported = capsys.readouterr().out.splitlines()
     assert len(reported) == 2
     # Left is compared against the snapshot it came from, right against the one
-    # the recompute just stored.
+    # the recompute stored.
     for line, stored in zip(reported, (first, second), strict=True):
         _, shell, items = line.split(":")
         assert int(shell) != id(stored)
-        # 0 stands for a thawed operand, which is a list and has no items
-        # tuple to share -- thaw allocates the whole container fresh.
+        # 0 stands for a thawed operand, which is a list with no items tuple
+        # to share (thaw allocates the whole container fresh).
         assert int(items) != id(stored.items)
 
 
@@ -7876,8 +7865,8 @@ def test_hostile_cutoff_cannot_corrupt_the_stored_record(
     db.set(stage, 1)
     db.get(gated)
 
-    # One call per operand: the cutoff really saw both sides, so the checks
-    # below cannot pass with a policy that never fired.
+    # One call per operand: the cutoff saw both sides, so the checks below
+    # cannot pass with a policy that never fired.
     assert capsys.readouterr().out == "cutoff-ran\ncutoff-ran\n"
     record = _query_record(db, gated)
     assert fingerprint_snapshot(record.snapshot) == record.digest
@@ -7913,8 +7902,8 @@ def test_checkpoint_after_hostile_comparator_still_verifies(mode: str) -> None:
     saver.get(produce)
     saver.set(stage, 1)
     saver.get(produce)
-    # The False verdict is the policy's, not the default relation's, which
-    # would have backdated [1] against [1].
+    # The False verdict comes from the policy. The default relation would have
+    # backdated [1] against [1].
     assert _inspect_node(saver, produce).last_decision == "executed"
     key = saver.save_checkpoint()
 
@@ -7935,7 +7924,7 @@ def test_hostile_comparator_cannot_poison_a_shared_warmed_snapshot(mode: str) ->
 
     Two records warmed from one digest hold the same ``Snapshot`` instance, so
     a comparator that reached the stored object would damage every record
-    warmed from that digest, not only the query it was declared on.
+    warmed from that digest, beyond the query it was declared on.
     """
 
     stage = Input[int]("hostile-share-stage")
@@ -7990,11 +7979,11 @@ def test_hostile_comparator_cannot_poison_a_shared_warmed_snapshot(mode: str) ->
 def test_custom_eq_over_a_graph_shaped_result_sees_the_graph(
     mode: str, expected_operand_type: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A graph-shaped result reaches `eq=` as the graph, not as its envelope.
+    """A graph-shaped result reaches `eq=` as the graph, never as its `FrozenGraph`.
 
     The operand carries the result's own back-edge and its shared identity, so
-    a comparator has to be cycle-aware to read it at all; a structural one
-    recurses forever, which the uniformity test below pins.
+    a comparator must be cycle-aware to read it. A structural one recurses
+    forever, which the uniformity test below pins.
     """
 
     stage = Input[int]("graph-eq-stage")
@@ -8029,7 +8018,7 @@ def test_custom_eq_over_a_graph_shaped_result_sees_the_graph(
     db.set(stage, 2)
     result = cast(Any, db.get(graph_shaped))
     # The reported type is the mode's container view, never `FrozenGraph`: the
-    # envelope is rebuilt into the graph it encodes before the policy runs.
+    # `FrozenGraph` is rebuilt into the graph it encodes before the policy runs.
     assert capsys.readouterr().out.splitlines() == [
         f"{expected_operand_type}:cycle=True:shared=True"
     ] * 2
@@ -8106,11 +8095,11 @@ def test_cutoff_token_decides_over_a_cyclic_result(
 def test_structural_eq_over_cyclic_operands_raises_in_every_mode() -> None:
     """A naive structural comparator fails identically in all three modes.
 
-    Strict once handed the comparator the finite `FrozenGraph` envelope, so a
+    Strict once handed the comparator the finite `FrozenGraph`, so a
     structural `==` returned a verdict there while `checked` and `fast` blew
-    the stack on the thawed cycle. The operand is the graph itself in every
-    mode now, so the modes agree -- which is why all three run in one test
-    rather than as parametrized cases.
+    the stack on the thawed cycle. Now the operand is the graph itself in
+    every mode, so the modes agree. That is why all three run in one test, in
+    a loop.
     """
 
     stage = Input[int]("graph-structural-stage")
@@ -8139,7 +8128,7 @@ def test_structural_eq_over_cyclic_operands_raises_in_every_mode() -> None:
 # Request spans
 # ---------------------------------------------------------------------------
 # The tallies live in side files next to each resource key because a query's
-# capture set may not contain mutable state -- a counter attribute or module
+# capture set may not contain mutable state. A counter attribute or module
 # global is rejected before the first get().
 
 
@@ -8171,7 +8160,7 @@ class _SpanTalliedResource(Resource[str, str, tuple[str, str]]):
 
 @dataclass(frozen=True)
 class _SpanFailingResource(Resource[str, str, tuple[str, ...]]):
-    """Never loads; the probe models the file as missing rather than raising."""
+    """Never loads; the probe models the file as missing without raising."""
 
     def probe(self, key: str) -> tuple[str, ...]:
         _span_tally(key, "p")
@@ -8243,7 +8232,7 @@ def test_request_inputs_changed_reopens_the_span_to_the_world(tmp_path: Path) ->
     with db.request_span():
         assert db.get(read_text) == "old"
         Path(target).write_text("new!", encoding="utf-8")
-        # The span declares the world stable, so the write stays invisible --
+        # The span declares the world stable, so the write stays invisible,
         # even to a query executing for the first time.
         assert db.get(read_text) == "old"
         assert db.get(echo_text) == "old"
@@ -8253,8 +8242,8 @@ def test_request_inputs_changed_reopens_the_span_to_the_world(tmp_path: Path) ->
         assert db.get(read_text) == "new!"
         assert db.get(echo_text) == "new!"
 
-    # Outside a span every call opens its own request; declaring a change is
-    # a no-op rather than the start of anything.
+    # Outside a span every call opens its own request, and declaring a change
+    # is a no-op.
     requests_before = db.statistics().total_requests
     db.request_inputs_changed()
     assert db.statistics().total_requests == requests_before
@@ -8276,8 +8265,8 @@ def test_request_span_delivers_observer_events_at_close() -> None:
     with db.request_span():
         assert db.get(doubled) == 2  # cold execution
         assert events == []
-        # set() declares its own change: the next get inside the span must
-        # re-execute rather than reuse the request's earlier answer.
+        # set() declares its own change, so the next get inside the span must
+        # re-execute, without reusing the request's earlier answer.
         db.set(number, 5)
         assert db.get(doubled) == 10
         assert events == []
@@ -8306,7 +8295,7 @@ def test_request_span_delivers_committed_events_when_the_span_body_raises() -> N
         assert events == []
         db.get(exploding)
 
-    # A failing remainder of the request does not undo the committed work: a
+    # A failing remainder of the request leaves the committed work in place. A
     # plain top-level get delivers events for what it committed even when a
     # later part of the request fails, and the span must match.
     assert [event.decision for event in events] == ["executed"]
@@ -8423,9 +8412,9 @@ def test_request_span_inside_a_get_joins_that_request(tmp_path: Path) -> None:
     db.observe(events.append, child)
     requests_before = db.statistics().total_requests
     assert db.get(parent) == "hi!"
-    # The get already holds the request; the span joined it instead of
-    # opening (or closing) one of its own, and the child's event was
-    # delivered by the get exactly as without the span.
+    # The get already holds the request. The span joined it and opened (or
+    # closed) no request of its own, and the get delivered the child's event
+    # as it would without the span.
     assert db.statistics().total_requests == requests_before + 1
     assert [event.query_id for event in events] == [child.key]
 
@@ -8494,8 +8483,8 @@ def test_equal_ignored_cross_thread_set_keeps_the_span_settled(tmp_path: Path) -
         writer = threading.Thread(target=db.set, args=(number, 1))
         writer.start()
         writer.join()
-        # The equal update was ignored -- nothing changed, so the span stays
-        # on its request and the next get re-validates nothing.
+        # The equal update was ignored. Nothing changed, so the span stays on
+        # its request and the next get re-validates nothing.
         assert db.statistics().input_equal_ignores == 1
         assert db.get(read_text) == "hello"
     assert _span_tallied(target) == "pl" + "p"
@@ -8556,7 +8545,7 @@ def test_a_context_copied_inside_a_span_does_not_reuse_it_after_close(tmp_path: 
 
     # The span that validated `read_text` is over. A call made through its
     # copied context opens a request of its own, re-probes, and agrees with a
-    # fresh database -- from another thread and from this one alike.
+    # fresh database, from another thread and from this one alike.
     assert _run_in_thread(carried, lambda: db.get(read_text)) == "new!"
     Path(target).write_text("newer", encoding="utf-8")
     assert carried.run(db.get, read_text) == "newer"
@@ -8578,9 +8567,9 @@ def test_a_thread_carrying_an_open_span_context_opens_its_own_request(tmp_path: 
         assert db.get(read_text) == "old"
         Path(target).write_text("new!", encoding="utf-8")
         requests_before = db.statistics().total_requests
-        # A span is its own thread's promise. Another thread does not join it
+        # A span is its own thread's promise. Another thread never joins it,
         # however it came by the context, so it validates as a plain thread
-        # would -- the same answer on every build.
+        # would. The answer is the same on every build.
         carried = contextvars.copy_context()
         assert _run_in_thread(carried, lambda: db.get(read_text)) == "new!"
         assert db.statistics().total_requests == requests_before + 1
@@ -8677,8 +8666,8 @@ def test_a_thread_given_an_exited_threads_ident_does_not_join_its_request(
 
     A request recorded the ident of the thread that opened it, and a later
     thread can be given that ident once the first has exited. A span or scope
-    abandoned open -- in a generator never resumed, say -- was then joined by
-    any such thread that carried its context, as every thread started on a
+    abandoned open (in a generator never resumed, say) was then joined by any
+    such thread that carried its context, as every thread started on a
     free-threaded build does.
     """
 
@@ -8756,16 +8745,16 @@ def test_input_boundary_owns_prefrozen_wrappers(mode: str, entry_point: str) -> 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_query_argument_round_trip_serves_the_ingested_value(mode: str) -> None:
-    # The wrapper crosses as an ARGUMENT and comes back as the RESULT rather
-    # than being captured in the query closure: captured-value mutation will
-    # later re-key a query, which would quietly turn a closure-based version of
-    # this pin into a fresh execution.
+    # The wrapper crosses as an ARGUMENT and comes back as the RESULT, with no
+    # capture in the query closure. Captured-value mutation will later re-key a
+    # query, which would turn a closure-based version of this pin into a fresh
+    # execution unnoticed.
     #
-    # This test stays GREEN with freeze's wrapper detach reverted -- the
-    # argument envelope rebuilds the wrapper before the body ever sees it, so
-    # nothing here can observe the result-ingest boundary. That boundary is
-    # pinned by test_query_result_boundary_owns_returned_wrappers; do not
-    # delete it as a duplicate of this one.
+    # This test stays GREEN with freeze's wrapper detach reverted. The frozen
+    # (args, kwargs) call snapshot rebuilds the wrapper before the body sees it,
+    # so nothing here can observe the result-ingest boundary.
+    # test_query_result_boundary_owns_returned_wrappers pins that boundary, so
+    # keep it: it is no duplicate of this one.
     held = _held_wrapper()
 
     @query
@@ -8788,12 +8777,12 @@ def test_query_argument_round_trip_serves_the_ingested_value(mode: str) -> None:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_query_result_boundary_owns_returned_wrappers(mode: str) -> None:
-    # The sibling above routes the wrapper through the argument envelope, which
-    # rebuilds it before the body ever runs -- so that test cannot observe the
-    # result boundary on its own. Returning a captured wrapper is the only way
-    # to hand the result freeze the caller's object. This pin therefore takes a
-    # single get and never re-reads after the corruption, so it stays honest
-    # once a captured value's mutation re-keys its query.
+    # The sibling above routes the wrapper through the call snapshot, which
+    # rebuilds it before the body runs, so that test alone cannot observe the
+    # result boundary. Returning a captured wrapper is the only way to hand the
+    # result freeze the caller's object. This pin therefore takes a single get
+    # and never re-reads after the corruption, so it stays valid once a
+    # captured value's mutation re-keys its query.
     held = _held_wrapper()
 
     @query
@@ -8811,7 +8800,7 @@ def test_query_result_boundary_owns_returned_wrappers(mode: str) -> None:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_query_argument_envelope_never_aliased_the_caller(mode: str) -> None:
-    # Pin of a NON-bug: the (args, kwargs) call envelope always takes the
+    # Pin of a NON-bug: the (args, kwargs) call snapshot always takes the
     # freeze memo path (the kwargs dict forces a rebuild), so the retained
     # call snapshot never aliased the caller even before the ownership fix.
     held = _held_wrapper()
@@ -8832,8 +8821,8 @@ def test_resource_load_boundary_owns_prefrozen_wrappers(mode: str) -> None:
     held = _held_wrapper()
 
     # A query's (and a resource method's) capture set may not contain mutable
-    # state, so the held wrapper is captured directly rather than through the
-    # holder dict a probe/load pair would normally share.
+    # state, so the held wrapper is captured directly, without the holder dict
+    # a probe/load pair would normally share.
     @dataclass(frozen=True)
     class _HeldValueResource(Resource[str, Any, Any]):
         def probe(self, key: str) -> Any:
@@ -8860,16 +8849,15 @@ def test_resource_load_boundary_owns_prefrozen_wrappers(mode: str) -> None:
     _corrupt(held)
     assert fingerprint_snapshot(record.snapshot) == record.digest
     # Ownership is asserted on the stored record and on the value already
-    # handed to the caller, not through a second db.get. The wrapper this
-    # resource captured is part of its identity, so corrupting it moves the
-    # resource identity and the query's with it, and a later request
-    # legitimately rebuilds against the corrupted world. The earlier form of
-    # this assertion read [1, 2, 3] from a second db.get only because a
-    # memoized fingerprint held the query key still, and the memo no longer
-    # hides an edit to a value the resource's own methods close over.
-    # What the boundary owes is unchanged and is what is checked here: the
-    # copy it took is detached in content, not merely in identity, and still
-    # agrees with its own digest.
+    # handed to the caller, without a second db.get. The wrapper this resource
+    # captured is part of its identity. Corrupting it moves the resource
+    # identity and the query's with it, and a later request legitimately
+    # rebuilds against the corrupted world. An earlier form of this assertion
+    # read [1, 2, 3] from a second db.get only because a memoized fingerprint
+    # held the query key still. The memo now exposes an edit to a value the
+    # resource's own methods close over. What the boundary owes is unchanged,
+    # and this checks it: the copy it took is detached in content as well as
+    # identity, and still agrees with its own digest.
     assert list(cast(Any, record.snapshot)) == [1, 2, 3]
     assert list(cast(Any, first)) == [1, 2, 3]
 
@@ -8904,8 +8892,8 @@ class _TokenProbeCell:
 
     It rides on the resource instance and stays out of ``identity()``. A
     resource's method capture set may not hold ambient mutable state, and the
-    world a resource observes is not part of what distinguishes the resource,
-    so the node key is unaffected when either half moves.
+    world a resource observes is outside what distinguishes the resource. So
+    the node key stays the same when either half moves.
     """
 
     token: Any
@@ -9049,13 +9037,13 @@ def test_checkpoint_preserves_owned_input_snapshots_after_caller_mutation(
 def test_checkpoint_preserves_owned_result_snapshots_after_caller_mutation(
     mode: str,
 ) -> None:
-    # The wrapper crosses as an ARGUMENT and comes back as the RESULT rather
-    # than being captured in the query closure, for the same reason the
-    # non-checkpoint sibling does: captured-value mutation will later re-key a
-    # query and would quietly turn a closure-based version of this into a fresh
-    # execution. The envelope rebuilds the wrapper before the body runs, so this
-    # too stays green with the detach reverted -- what it pins is that the
-    # reload serves the ingested bytes rather than re-deriving them.
+    # The wrapper crosses as an ARGUMENT and comes back as the RESULT, with no
+    # capture in the query closure, for the same reason as the non-checkpoint
+    # sibling. Captured-value mutation will later re-key a query and would turn
+    # a closure-based version of this into a fresh execution unnoticed. The
+    # call snapshot rebuilds the wrapper before the body runs, so this too stays
+    # green with the detach reverted. It pins that the reload serves the
+    # ingested bytes without re-deriving them.
     held = _held_wrapper()
 
     @query
@@ -9070,8 +9058,8 @@ def test_checkpoint_preserves_owned_result_snapshots_after_caller_mutation(
 
     restored = Database(mode=mode, store=store)
     restored.load_checkpoint(key)
-    # The same args encoding keys the checkpoint-warmed node; the restored
-    # answer is the ingested bytes, not a view through the caller's object.
+    # The same args encoding keys the checkpoint-warmed node. The restored
+    # answer comes from the ingested bytes, untouched by the caller's object.
     executions_before = restored.statistics().query_executions
     assert list(cast(Any, restored.get(echo, freeze([1, 2, 3])))) == [1, 2, 3]
     assert restored.statistics().query_executions == executions_before
@@ -9119,8 +9107,8 @@ def test_checkpoint_hint_restore_owns_the_probe_it_stores(mode: str) -> None:
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_nan_verdict_is_identical_on_input_and_query_paths(mode: str) -> None:
     # One relation: db.set(x, nan) twice is an equal update (was: a change),
-    # and a query returning nan twice still backdates. The two paths can no
-    # longer drift because both call snapshots_equal on stored snapshots.
+    # and a query returning nan twice still backdates. The two paths cannot
+    # drift because both call snapshots_equal on stored snapshots.
     marker = Input[float]("nan-input")
     db = Database(mode=mode)
     db.set(marker, float("nan"))
@@ -9179,8 +9167,8 @@ def test_result_type_flip_matches_fresh(
     warm = db.get(described)
     # The flip published a new value: a backdate would have held measure's
     # changed_at at the pre-flip revision and left the reader on the old type.
-    # measure's own last_decision is not the witness here -- the reader reaches
-    # it a second time while re-executing, which restamps it as reused.
+    # measure's own last_decision cannot witness this: the reader reaches it a
+    # second time while re-executing, which restamps it as reused.
     assert _inspect_node(db, measure).changed_at > changed_at
     assert _inspect_node(db, described).last_decision == "executed"
 
@@ -9224,8 +9212,8 @@ def test_probe_token_type_flip_reloads(
     mode: str, first: object, second: object
 ) -> None:
     # Settled at the probe-hit gate, which compares the stored probe with the
-    # live one and has nothing standing in front of it: no digest filter, no
-    # second opinion. A flip that gate calls equal serves the stale payload.
+    # live one and stands alone, with no digest filter or second opinion in
+    # front. A flip that gate calls equal serves the stale payload.
     cell = _TokenProbeCell(token=first, payload="alpha")
     resource = _HeldTokenResource(cell)
 
@@ -9266,8 +9254,9 @@ def test_failing_probe_type_flip_counts_as_changed(mode: str) -> None:
     cell.token = 1.0
     with pytest.raises(FileNotFoundError):
         db.get(loaded)
-    # An int probe and a float probe are different observations: the failure
-    # record must register a change, not an unchanged-failure backdate.
+    # An int probe and a float probe are different observations, so the
+    # failure record must register a change and skip the unchanged-failure
+    # backdate.
     assert db._records[key].changed_at > changed_at_before
 
 
@@ -9297,8 +9286,8 @@ def test_checkpoint_hint_probe_type_flip_reloads(
     restored.load_checkpoint(key)
     loads_before = restored.statistics().resource_loads
     assert restored.get(loaded) == "beta"
-    # The hint declined: this value came from a load and not from the
-    # checkpoint bytes -- exactly one load, the miss falling straight through.
+    # The hint declined: this value came from a load, and the checkpoint bytes
+    # went unused. One load ran, with the miss falling straight through.
     assert restored.statistics().resource_loads == loads_before + 1
 
     fresh = Database(mode=mode)
@@ -9308,8 +9297,8 @@ def test_checkpoint_hint_probe_type_flip_reloads(
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_checkpoint_hint_probe_without_flip_restores_from_store(mode: str) -> None:
     # The control for the flip pin above. With the probe standing still the
-    # hint is meant to fire, so the miss up there is the flip's doing rather
-    # than a hint that never restores anything in the first place.
+    # hint is meant to fire. That shows the miss up there comes from the flip,
+    # and the hint does restore when the probe holds.
     cell = _TokenProbeCell(token=1, payload="alpha")
     resource = _HeldTokenResource(cell)
 
@@ -9378,9 +9367,9 @@ def test_nan_cutoff_token_backdates(mode: str) -> None:
     db.set(stage, 1)
     db.get(gated)
     # Canonical NaN tokens are equal under the one relation, so an unchanged
-    # NaN token is a backdate, exactly as an unchanged NaN result is. Same
-    # deciding site as the flip pin above, reached with the same policy arm:
-    # nothing but the token comparison can produce this decision.
+    # NaN token is a backdate, as an unchanged NaN result is. Same deciding
+    # site as the flip pin above, reached with the same policy arm: only the
+    # token comparison can produce this decision.
     assert _inspect_node(db, gated).last_decision == "backdated"
 
 
@@ -9418,16 +9407,16 @@ def test_checkpoint_reload_after_type_flip_matches_fresh(
     fresh = Database(mode=mode)
     fresh.set(stage, 1)
     assert restored.get(described) == fresh.get(described) == _tower_repr(second)
-    # Warm, not recomputed: the reload answered the request from the
-    # checkpoint, so this is the stored answer being right and not a
-    # re-execution papering over a stored one that was wrong.
+    # Warm with no recompute: the reload answered the request from the
+    # checkpoint. So this shows the stored answer is right, where a
+    # re-execution could paper over a wrong one.
     assert restored.statistics().query_executions == executions_before
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_checkpoint_reload_after_nan_backdate_matches_fresh(mode: str) -> None:
-    # The NaN half of the same question. Here the saving database backdated --
-    # canonical NaN equals canonical NaN -- so the checkpoint persists a record
+    # The NaN half of the same question. Here the saving database backdated
+    # (canonical NaN equals canonical NaN), so the checkpoint persists a record
     # whose value outlived a change to its dependency. It still has to reload
     # into the answer a fresh database gives.
     stage = Input[int]("ckp-nan-stage")
@@ -9491,10 +9480,10 @@ def test_thaw_colliding_wrappers_are_refused_at_database_boundaries(
 
 def test_store_bytes_carrying_a_thaw_collision_are_not_warmed_into_a_database() -> None:
     # The store-warm entry point. Every warmed byte path decodes through
-    # Database._read_validated_snapshot, which validates the payload and
-    # answers a refused one as a missing artifact rather than handing back a
-    # snapshot whose thaw would drop a key. Bytes stored under their own true
-    # digest -- the digest check below passes -- therefore warm nothing.
+    # Database._read_validated_snapshot. It validates the payload and answers
+    # a refused one as a missing artifact, so it never hands back a snapshot
+    # whose thaw would drop a key. Bytes stored under their own true digest
+    # (the digest check below passes) therefore warm nothing.
     payload = b"K2;D2:f20:0x1.0000000000000p+0;s1:b;i1:1;s1:a;;"
     digest = hashlib.sha256(payload).hexdigest()
     store = InMemoryArtifactStore()
@@ -9502,10 +9491,11 @@ def test_store_bytes_carrying_a_thaw_collision_are_not_warmed_into_a_database() 
     db = Database(store=store)
     assert db._read_validated_snapshot(store, digest) is _MISSING_SNAPSHOT
 
-    # Control: the sentinel above is the collapse refusal, not one of the other
-    # ways this method answers missing -- an absent or non-bytes payload, a
-    # digest mismatch, a decode error, a fingerprint mismatch. The same
-    # construction over a single-key mapping warms and hands back its snapshot.
+    # Control: the sentinel above comes from the collapse refusal. This method
+    # also answers missing for an absent or non-bytes payload, a digest
+    # mismatch, a decode error and a fingerprint mismatch. The same
+    # construction over a single-key mapping warms and hands back its snapshot,
+    # so none of those other causes applies.
     control = serialize_snapshot(FrozenDict(((1, "a"),)))
     control_digest = hashlib.sha256(control).hexdigest()
     store.put(control_digest, control)
@@ -9555,10 +9545,10 @@ class _TrappedLabel(str):
 
 @dataclass(frozen=True)
 class _SubclassLabelResource(Resource[str, str, str]):
-    """Builds its label rather than storing one, so the label check is reached.
+    """Builds its label inside `label()`, so the label check is reached.
 
     A `str` subclass held as resource *configuration* is refused earlier, by the
-    resource-identity freeze; only a label computed inside `label()` reaches the
+    resource-identity freeze. Only a label computed inside `label()` reaches the
     label boundary.
     """
 
@@ -9579,7 +9569,7 @@ class _TallyingFailingResource(Resource[str, str, tuple[str, ...]]):
     """Never loads, appending one character per call to ``<key>.calls``.
 
     The tally lives beside the resource's own key because a query's capture set
-    may not contain mutable state -- a counter attribute or module global is
+    may not contain mutable state. A counter attribute or module global is
     rejected before the first ``get()``.
     """
 
@@ -9651,8 +9641,8 @@ def test_resource_labels_must_be_exact_nonempty_strings() -> None:
     with pytest.raises(ValueError, match="non-empty string"):
         _InvalidLabelResource("").read(db, "value")
     # A label becomes a node label, so it carries the same exactness rule as an
-    # input or query key -- and the resource boundary answers for it by name,
-    # rather than letting the node table's generic refusal surface instead.
+    # input or query key. The resource boundary refuses it by name, before the
+    # node table's generic refusal can surface.
     with pytest.raises(TypeError, match=r"Resource\.label\(\) must return exactly str"):
         _SubclassLabelResource().read(db, "value")
     # Exactness is decided before emptiness here too, so a label lying about

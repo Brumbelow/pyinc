@@ -1,13 +1,13 @@
-"""pyinc correctness demo — showcasing what makes pyinc unique.
+"""pyinc correctness demo.
 
-This demo walks through pyinc's core differentiators in sequence:
+The demo walks through what sets pyinc apart, in order:
 
-1. Incremental recomputation with dependency tracking
-2. Backdating — a comment-only edit recomputes equal counts and stops there
-3. Selective recomputation — only affected queries re-execute
-4. Untracked read enforcement — raw open() raises inside queries
-5. Mutation protection — frozen values reject writes in strict mode
-6. Provenance inspection — structured decision trees via explain()
+1. Incremental recomputation with dependency tracking.
+2. Backdating: a comment-only edit recomputes equal counts and stops there.
+3. Selective recomputation: only affected queries re-execute.
+4. Untracked read enforcement: raw open() raises inside queries.
+5. Mutation protection: frozen values reject writes in strict mode.
+6. Provenance inspection: structured decision trees via explain().
 """
 
 from __future__ import annotations
@@ -161,7 +161,7 @@ def main() -> None:
 
         @query
         def unsafe_query(db: Database, path: str) -> str:
-            # This raw open() bypasses the resource API — pyinc catches it.
+            # A raw open() bypasses the resource API, so pyinc raises.
             with open(path) as f:  # noqa: SIM115
                 return f.read()
 

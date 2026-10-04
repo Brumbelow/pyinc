@@ -1,17 +1,19 @@
-"""Demonstrate cross-run cache reuse via save_checkpoint / load_checkpoint.
+"""Demonstrate cross-run cache reuse with save_checkpoint / load_checkpoint.
 
 The checkpoint API lets a process serialise its eligible node records to an
-ArtifactStore and reload them in a subsequent process, skipping re-execution for
-any query whose declared inputs and resource probes are unchanged.  Only query
-and resource records are written — input records are not — and a record the
-kernel cannot vouch for is left out along with everything that reads it: one
-whose cached value no longer matches the live graph, and one that failed.  A
-record marked untracked rests on state no record describes: nothing that reads
-it is written, and the record itself re-executes on reload rather than warming.
+ArtifactStore. A later process reloads them and skips re-execution for any
+query whose declared inputs and resource probes are unchanged.
 
-This script simulates three "runs" in a single process to make the behaviour
-visible without spawning a subprocess.  In real use, each run would be a
-separate invocation sharing the same FileSystemArtifactStore path.
+A checkpoint holds query and resource records. Input records stay out. The
+kernel also leaves out any record it cannot vouch for, along with everything
+that reads it. That covers a record whose cached value differs from the live
+graph and a record that failed. A record marked untracked rests on state no record
+describes. Its readers stay out of the checkpoint, and the record itself
+re-executes on reload instead of warming.
+
+This script simulates three "runs" in one process so the behaviour is visible
+without a subprocess. In real use, each run is a separate invocation sharing
+the same FileSystemArtifactStore path.
 """
 
 from __future__ import annotations
@@ -55,7 +57,6 @@ def main(mode: str = "strict") -> None:
         data_path = f"{file_root}/data.txt"
         store = FileSystemArtifactStore(store_root)
 
-        # Write initial content.
         with open(data_path, "w") as f:
             f.write("alpha beta gamma delta epsilon")
 
@@ -74,13 +75,13 @@ def main(mode: str = "strict") -> None:
         print(f"run1_executions={stats1.query_executions}")  # 3 queries executed
 
         # -----------------------------------------------------------------------
-        # Run 2: load the checkpoint — same inputs, same results.
+        # Run 2: load the checkpoint. Same inputs, same results.
         #
         # The file is unchanged, so its resource probe hint re-establishes a live
-        # record at load time (its snapshot comes straight back out of the
-        # content-addressed store).  With the resource verified against live
-        # state, the whole resource-backed query chain warms without re-running:
-        # every query reuses and nothing executes.
+        # record at load time. Its snapshot comes straight back out of the
+        # content-addressed store. With the resource verified against live
+        # state, the whole resource-backed query chain warms: every query
+        # reuses, with zero executions.
         # -----------------------------------------------------------------------
         db2 = Database(mode, store=store)
         db2.set(MULTIPLIER, 3)  # same input as run 1
@@ -94,10 +95,10 @@ def main(mode: str = "strict") -> None:
         print(f"run2_executions={stats2.query_executions}")  # 0
 
         # -----------------------------------------------------------------------
-        # Run 3: load checkpoint, change the multiplier.  Only scaled_word_count
-        # depends on it, so it re-executes; word_count/config_text still reuse
-        # against the unchanged file.  The result lands at 50, consistent with a
-        # from-scratch run.
+        # Run 3: load the checkpoint and change the multiplier. Only
+        # scaled_word_count depends on it, so it re-executes. word_count and
+        # config_text still reuse against the unchanged file. The result is 50,
+        # matching a from-scratch run.
         # -----------------------------------------------------------------------
         db3 = Database(mode, store=store)
         db3.set(MULTIPLIER, 10)  # different multiplier

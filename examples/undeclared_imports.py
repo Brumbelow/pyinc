@@ -1,14 +1,14 @@
 """Detect undeclared third-party imports in a Python workspace.
 
-Demonstrates cross-integration composition: ``workspace_dependency_check``
-composes ``python_source`` (import scanning) with ``installed_packages``
-(site-packages discovery) to surface imports that are installed in the
-environment but missing from the declared dependency list.
+Shows cross-integration composition. ``workspace_dependency_check`` combines
+``python_source`` (import scanning) with ``installed_packages`` (site-packages
+discovery). It reports imports that are installed in the environment but
+missing from the declared dependency list.
 
-The finding comes from the ``.dist-info`` directories site-packages carries, so
-the example needs pyinc installed as a distribution: a source tree reached only
-through ``PYTHONPATH`` cannot produce it. Rather than report that nothing was
-found and exit 0, the example fails and says why.
+The finding comes from the ``.dist-info`` directories in site-packages, so the
+example needs pyinc installed as a distribution. A source tree reached only
+through ``PYTHONPATH`` cannot produce it. When the finding is missing, the
+example fails and says why.
 
 Run: ``python examples/undeclared_imports.py``
 """

@@ -54,7 +54,7 @@ def _tree(root: Path) -> dict[str, bytes]:
 
 
 # --------------------------------------------------------------------------- #
-# Task 2B.1 — reformatting edits (C1)
+# Task 2B.1: reformatting edits (C1)
 # --------------------------------------------------------------------------- #
 
 _UNFORMATTED_SCHEMA = (
@@ -100,8 +100,8 @@ def test_a_reformat_recomputes_the_definition_payloads_to_equal_values(tmp_path:
     names_after = definition_names(db, str(p))
     raw_after = tuple(definition_raw(db, str(p), name) for name in names_after)
 
-    # The read now answers with the bytes it was given, so it moves on a
-    # reformat; what absorbs the edit is the layer that sorts and re-emits.
+    # The read returns the bytes it was given, so a reformat changes it. The
+    # layer that sorts and re-emits absorbs the edit.
     assert text_before != text_after, "the reformat never reached the read"
     assert names_before == names_after, (
         f"a reformat moved the names | before {names_before} | after {names_after}"
@@ -110,20 +110,20 @@ def test_a_reformat_recomputes_the_definition_payloads_to_equal_values(tmp_path:
         f"a reformat moved the canonical bodies | before {raw_before} | after {raw_after}"
     )
 
-    # Absorbing it costs a recomputation, and this is where that shows: both
-    # payload queries run again on the new text. Match on ":{name}[" rather than
-    # the bare name -- a label reads "module:name[hash] name()", so a bare
-    # substring also matches any query whose name merely contains this one, and
-    # the check would pass on a tree where nothing re-ran.
+    # Absorbing the edit costs a recomputation: both payload queries run again
+    # on the new text. Match on ":{name}[" because a label reads
+    # "module:name[hash] name()". A bare-name substring also matches any query
+    # whose name contains this one, so the check would pass on a tree where
+    # nothing re-ran.
     executed = [profile.query_label for profile in db.query_profile()]
     for name in ("definition_names", "definition_raw"):
         assert [label for label in executed if f":{name}[" in label], (
             f"{name} did not re-run | executed {executed}"
         )
 
-    # Absolute counts for the second read, not deltas: the read executes on the
-    # new bytes, the three payload instances re-derive equal projections and are
-    # backdated, and the repeat lookups the request makes are served from cache.
+    # Absolute counts for the second read. The read executes on the new bytes,
+    # the three payload instances re-derive equal projections and are
+    # backdated, and the request's repeat lookups are served from cache.
     statistics = db.statistics()
     counts = (
         statistics.query_executions,
@@ -144,14 +144,14 @@ def test_whitespace_edit_backdates_and_writes_nothing(tmp_path: Path) -> None:  
     res = generate(db, str(p), out)
     assert res.created == () and res.updated == () and res.repaired == ()
     assert res.deleted == ()
-    # The read is byte-exact now, so a reformat runs it; the payloads that
-    # project it land an equal value and leave the renderer nothing to redo.
+    # The read is byte-exact, so a reformat runs it. The payloads that project
+    # it land an equal value, which leaves the renderer nothing to redo.
     assert db.inspect(schema_text, str(p)).last_recompute == "executed"
     assert db.inspect(model_python, str(p), "A").last_decision == "reused"
 
 
 # --------------------------------------------------------------------------- #
-# Task 2B.2 — defs, refs, models, diagnostics
+# Task 2B.2: defs, refs, models, diagnostics
 # --------------------------------------------------------------------------- #
 
 
@@ -247,7 +247,7 @@ def test_validation_keywords_warn_in_each_supported_context(tmp_path: Path) -> N
     }
     for pointer, diagnostic in ignored.items():
         assert diagnostic.severity is DiagnosticSeverity.WARNING
-        # The warning names the keyword it is not enforcing.
+        # The warning names the keyword it leaves unenforced.
         assert repr(pointer.rsplit("/", 1)[-1]) in diagnostic.message
 
     generate(db, schema_path, out)
@@ -326,7 +326,7 @@ def test_malformed_constraint_values_are_errors(tmp_path: Path) -> None:
         "/$defs/Good/properties/count/multipleOf",
         "/$defs/Good/properties/tags/maxItems",
     }
-    # A well-formed sibling of a malformed keyword is still merely ignored.
+    # A well-formed sibling of a malformed keyword is still reported as ignored.
     assert "/$defs/Good/properties/code/pattern" in {
         diagnostic.json_pointer
         for diagnostic in analysis.diagnostics
@@ -364,9 +364,8 @@ def test_inline_enum_and_const_render_literal_types(tmp_path: Path) -> None:
     assert schema_analysis(db, schema_path).errors == ()
     generate(db, schema_path, out)
 
-    # ``Literal`` is imported exactly once, after ``TYPE_CHECKING``, and the
-    # enum member that is ``null`` makes the field nullable without a second
-    # ``| None``.
+    # ``Literal`` is imported once, after ``TYPE_CHECKING``. The ``null`` enum
+    # member makes the field nullable without a second ``| None``.
     assert (out / "ticket.py").read_text(encoding="utf-8") == (
         "from __future__ import annotations\n"
         "\n"
@@ -485,7 +484,7 @@ def test_enum_and_const_members_agree_with_a_nullable_union_type(tmp_path: Path)
     )
     db = Database(mode="strict")
     # The union names one type plus null, so a member matching either agrees
-    # with it; the enum still selects the shape and renders the closed set.
+    # with it. The enum still selects the shape and renders the closed set.
     assert schema_analysis(db, schema_path).errors == ()
 
     generate(db, schema_path, out)
@@ -643,8 +642,8 @@ def test_null_branch_annotations_are_validated_like_every_other_node(tmp_path: P
         },
     )
     analysis = schema_analysis(Database(mode="strict"), schema_path)
-    # The null branch names optionality rather than a type, but it is still a
-    # schema node, so a malformed annotation blocks there as it does anywhere.
+    # The null branch names optionality and no type, but it is still a schema
+    # node, so a malformed annotation blocks there as it does anywhere.
     assert [(d.code, d.json_pointer) for d in analysis.diagnostics] == [
         ("invalid-description", "/$defs/Thing/properties/name/anyOf/1/description")
     ]
@@ -665,7 +664,7 @@ def test_any_of_two_null_branches_is_rejected(tmp_path: Path) -> None:
     )
     analysis = schema_analysis(Database(mode="strict"), schema_path)
     # Neither branch names a type to make optional, so the union carries no
-    # information — a one- or three-branch 'anyOf' is an error for the same reason.
+    # information. A one- or three-branch 'anyOf' is an error for the same reason.
     diagnostic = next(d for d in analysis.errors if d.code == "unsupported-construct")
     assert diagnostic.json_pointer == "/$defs/Thing/properties/name/anyOf"
 
@@ -791,7 +790,7 @@ def test_schema_valued_additional_properties_compile_to_mappings(tmp_path: Path)
     db = Database(mode="strict")
     analysis = schema_analysis(db, schema_path)
     assert analysis.errors == ()
-    # A boolean value is still unenforceable and still merely ignored.
+    # A boolean value is still unenforceable and still reported as ignored.
     assert [(d.code, d.json_pointer) for d in analysis.diagnostics] == [
         ("ignored-constraint", "/$defs/Registry/properties/free/additionalProperties")
     ]
@@ -817,8 +816,8 @@ def test_schema_valued_additional_properties_compile_to_mappings(tmp_path: Path)
 
 
 def test_schema_valued_additional_properties_stays_unsupported(tmp_path: Path) -> None:
-    # A definition of type object generates a dataclass, which cannot carry
-    # free-form entries: the keyword is only compiled in property position.
+    # A definition of type object generates a dataclass, which has no place for
+    # free-form entries. The keyword compiles only in property position.
     schema_path = tmp_path / "schema.json"
     _write_schema(
         schema_path,
@@ -845,7 +844,7 @@ def test_a_rejected_mapping_definition_reports_only_its_own_cause(tmp_path: Path
     )
     analysis = schema_analysis(Database(mode="strict"), schema_path)
     # The author did constrain the instance, so the 'model with no fields'
-    # warning would name a cause that is not the one being reported.
+    # warning would name the wrong cause.
     assert [(d.code, d.json_pointer) for d in analysis.diagnostics] == [
         ("unsupported-construct", "/$defs/Bag/additionalProperties")
     ]
@@ -889,8 +888,8 @@ def test_object_definition_without_properties_warns_without_blocking(tmp_path: P
     db = Database(mode="strict")
     analysis = schema_analysis(db, schema_path)
     assert analysis.errors == ()
-    # Declaring an empty property set is a statement about the model; omitting
-    # the keyword entirely is the case that silently drops instance data.
+    # Declaring an empty property set is a statement about the model. Omitting
+    # the keyword is the case that silently drops instance data.
     assert [(d.code, d.json_pointer) for d in analysis.diagnostics] == [
         ("unconstrained-object-model", "/$defs/Bag")
     ]
@@ -972,8 +971,9 @@ def test_tuple_form_items_is_reported_as_an_unsupported_tuple(tmp_path: Path) ->
     )
     analysis = schema_analysis(Database(mode="strict"), schema_path)
     codes = {diagnostic.code for diagnostic in analysis.diagnostics}
-    # The draft-07 tuple form is a valid schema node, so it must not be reported
-    # as one that is neither an object nor a boolean.
+    # The draft-07 tuple form is a valid schema node, so it gets the tuple
+    # diagnostic. invalid-schema-node is for a node that is neither an object
+    # nor a boolean.
     assert "invalid-schema-node" not in codes
     diagnostic = next(d for d in analysis.errors if d.code == "unsupported-tuple-items")
     assert diagnostic.json_pointer == "/$defs/Pair/items"
@@ -1026,8 +1026,8 @@ def test_ambiguous_schema_combinations_are_rejected_at_each_sibling(
         "/$defs/RefObject/properties",
         "/$defs/RefObject/type",
     }
-    # A validation-only keyword never competes with the selected shape: it is
-    # ignored beside a $ref exactly as it is anywhere else.
+    # A validation-only keyword never competes with the selected shape. Beside
+    # a $ref it is ignored the same way as anywhere else.
     constraint = next(
         d for d in analysis.diagnostics if d.json_pointer == "/$defs/RefConstraint/minimum"
     )
@@ -1080,7 +1080,7 @@ def test_documented_annotations_are_accepted_without_affecting_generation(
 
 
 # --------------------------------------------------------------------------- #
-# Task 2B.3 — granularity (C2, C3)
+# Task 2B.3: granularity (C2, C3)
 # --------------------------------------------------------------------------- #
 
 
@@ -1105,10 +1105,10 @@ def test_description_only_change_rewrites_doc_not_model(tmp_path: Path) -> None:
 
 
 def test_internal_change_rewrites_model_revalidates_referrer_only(tmp_path: Path) -> None:  # C3
-    # Closure reading: a change to A re-validates A and the reference-graph
-    # closure (B refs A); each is rewritten only if its bytes change. An
-    # A-internal requiredness change does not alter B's bytes (B refers to A by
-    # name), so B backdates; the unrelated C is reused.
+    # Closure reading: a change to A re-validates A and its reference-graph
+    # closure (B refs A). Each is rewritten only if its bytes change. An
+    # A-internal requiredness change leaves B's bytes alone (B refers to A by
+    # name), so B backdates. The unrelated C is reused.
     p = tmp_path / "s.json"
     out = tmp_path / "gen"
     schema: dict[str, Any] = {
@@ -1158,11 +1158,11 @@ def test_removed_ref_target_fails_without_mutating_outputs(tmp_path: Path) -> No
 
 def test_consistent_rename_propagates_referenced_identifier_to_referrer(tmp_path: Path) -> None:
     # Interface change through a STILL-VALID graph: rename A -> Aaa and update
-    # B's $ref in the same edit; U is independent (no ref to A) and untouched.
-    # A consistent rename MOVES A's files (delete a.*, create aaa.*) — A is not
-    # rewritten in place. The propagation claim lives on the referrer B, whose
+    # B's $ref in the same edit. U is independent (no ref to A) and untouched.
+    # A consistent rename MOVES A's files (delete a.*, create aaa.*) instead of
+    # rewriting A in place. The propagation claim lives on the referrer B, whose
     # ONLY byte delta is the A -> Aaa identifier at the reference site. U proves
-    # the closure is selective: neither rewritten nor re-touched.
+    # the closure is selective: it is neither rewritten nor re-touched.
     p = tmp_path / "s.json"
     out = tmp_path / "gen"
     schema: dict[str, Any] = {
@@ -1208,7 +1208,7 @@ def test_consistent_rename_propagates_referenced_identifier_to_referrer(tmp_path
 
 
 # --------------------------------------------------------------------------- #
-# Task 2B.4 — add/remove (C4/C5), from-scratch (C6), sample, contract lock
+# Task 2B.4: add/remove (C4/C5), from-scratch (C6), sample, contract lock
 # --------------------------------------------------------------------------- #
 
 
@@ -1283,7 +1283,7 @@ def test_generate_from_sample_fixture(tmp_path: Path) -> None:
     assert (out / "docs" / "address.md").exists()
     assert "from .user import User" in (out / "__init__.py").read_text(encoding="utf-8")
     assert res.deleted == ()
-    # Every generated module must be VALID Python, not just substring-correct.
+    # Beyond the substring checks, every generated module must be VALID Python.
     for py in sorted(out.rglob("*.py")):
         compile(py.read_text(encoding="utf-8"), str(py), "exec")
 
@@ -1534,15 +1534,15 @@ def test_codegen_incremental_byte_identical_to_fresh(mode: str, tmp_path: Path) 
 # Checkpoints
 # --------------------------------------------------------------------------- #
 
-# The ordering other integrations use -- edit, drive the entrypoint so a stale
-# answer forms, then save -- is set out beside the same shape in
-# tests/test_csv_data.py, where it cannot be built at all. Here it can be built
-# and is still worth nothing: a reformat leaves every public surface equal, so a
-# database saved in the middle of one reloads to an answer that agrees with the
-# warm one and with a fresh one alike, in every mode. This row edits after the
-# save instead, which the reload has to notice. The second arm is what keeps it
-# honest: with no edit the saved answer and a fresh one agree and the row would
-# pass on any tree at all.
+# Other integrations use this ordering: edit, drive the entrypoint so a stale
+# answer forms, then save. tests/test_csv_data.py sets it out beside the same
+# test shape, where the ordering cannot be built at all. Here it can be built
+# but proves nothing. A reformat leaves every public surface equal, so a
+# database saved mid-reformat reloads to an answer that agrees with both the
+# warm one and a fresh one, in every mode. This row edits after the save,
+# which the reload has to notice. The second assertion keeps the row
+# meaningful. With no edit, the saved answer and a fresh one agree, and the
+# row would pass on any tree.
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -1798,7 +1798,7 @@ def test_root_model_schema_preserves_existing_outputs(tmp_path: Path) -> None:
         },
     )
     analysis = schema_analysis(db, schema_path)
-    # One diagnostic that states the rule, not one per root keyword.
+    # A single diagnostic states the rule for all root keywords.
     root_errors = [
         diagnostic for diagnostic in analysis.errors if diagnostic.code == "unsupported-root-schema"
     ]
@@ -1940,8 +1940,8 @@ def test_definition_names_shadowing_generated_module_bindings_are_errors(tmp_pat
     db = Database(mode="strict")
     analysis = schema_analysis(db, schema_path)
     diagnostics = [d for d in analysis.errors if d.code == "reserved-definition-name"]
-    # One error per shadowing definition, anchored at the definition itself:
-    # emitting these would let ``from .str import str`` and ``from .literal
+    # One error per shadowing definition, anchored at the definition itself.
+    # Emitting these would let ``from .str import str`` and ``from .literal
     # import Literal`` retype every other annotation in the importing module.
     assert {d.json_pointer for d in diagnostics} == {"/$defs/Literal", "/$defs/str"}
 
@@ -2005,8 +2005,8 @@ def test_null_type_value_is_rejected_like_any_other_invalid_type(tmp_path: Path)
     )
     db = Database(mode="strict")
     analysis = schema_analysis(db, schema_path)
-    # ``"type": null`` carries an explicit invalid value, so it is diagnosed on
-    # the keyword rather than falling back to the absent-type warning policy.
+    # ``"type": null`` carries an explicit invalid value, so the error lands on
+    # the keyword, with no fallback to the absent-type warning policy.
     assert [(d.code, d.json_pointer) for d in analysis.errors] == [
         ("invalid-type", "/$defs/Thing/properties/x/type")
     ]
@@ -2014,8 +2014,8 @@ def test_null_type_value_is_rejected_like_any_other_invalid_type(tmp_path: Path)
         generate(db, schema_path, out)
     assert _tree(out) == {}
 
-    # Deleting the keyword — not just its value — is what selects the
-    # unconstrained-schema policy, which stays a non-blocking node warning.
+    # Deleting the whole keyword selects the unconstrained-schema policy,
+    # which stays a non-blocking node warning.
     _write_schema(
         schema_path,
         {"$defs": {"Thing": {"type": "object", "properties": {"x": {}}}}},

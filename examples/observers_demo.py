@@ -19,7 +19,7 @@ def main() -> None:
 
     db.get(doubled)  # cold execute → fires
     db.get(doubled)  # reused, no event
-    db.set(COUNT, 1)  # equal input, no revision bump
+    db.set(COUNT, 1)  # equal input, revision unchanged
     db.get(doubled)  # reused, no event
 
     db.set(COUNT, 7)

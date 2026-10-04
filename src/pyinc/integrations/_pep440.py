@@ -125,8 +125,8 @@ def _comparison_key(
     release = _trim_trailing_zeros(version.release)
 
     if version.pre is None and version.post is None and version.dev is not None:
-        # A development release without an explicit pre-release segment is the
-        # earliest release for its base: 1.0.dev1 < 1.0a1.
+        # A dev release with no explicit pre-release segment sorts first for
+        # its base: 1.0.dev1 < 1.0a1.
         pre_key = (-1, "", 0)
     elif version.pre is None:
         pre_key = (1, "", 0)
@@ -215,9 +215,9 @@ def _satisfies_single(
 ) -> bool | None:
     """Return whether one clause matches, or ``None`` when it is unsupported.
 
-    ``===`` never reaches here: `satisfies` evaluates arbitrary equality against
-    the raw version string before parsing, since that operator is defined on the
-    version as written.
+    `satisfies` handles ``===`` clauses before it calls this. It compares them
+    against the raw version string before parsing, because arbitrary equality
+    is defined on the version as written.
     """
     is_wildcard = spec_version_str.endswith(".*")
     if is_wildcard:
@@ -247,11 +247,10 @@ def _satisfies_single(
         public_version = _without_local(version)
         if compare_versions(public_version, spec_version) < 0:
             return False
-        # ``~= V.N`` is ``>= V.N, == V.*`` with the final release component
-        # dropped, so the upper bound is a prefix match rather than an ordered
-        # comparison: pre-releases and dev releases of the excluded next
-        # release (e.g. 3.0a1 against ~=2.2) sort before it but do not share
-        # the prefix, so they stay excluded.
+        # ``~= V.N`` means ``>= V.N, == V.*`` with the final release component
+        # dropped, so the upper bound is a prefix match. Pre-releases and dev
+        # releases of the excluded next release (e.g. 3.0a1 against ~=2.2)
+        # sort before it but lack the prefix, so they stay excluded.
         prefix = Version(
             epoch=spec_version.epoch,
             release=spec_version.release[:-1],
@@ -330,9 +329,9 @@ def _release_prefix_matches(spec_version: Version, version: Version) -> bool:
     """Prefix-match the epoch and release segment against a wildcard base.
 
     The candidate release is truncated to the prefix length and zero-padded, so
-    segments beyond the prefix — including pre/post/dev suffixes — are ignored
-    (``1.1.post1`` matches ``==1.1.*``). The epoch participates in the prefix,
-    so ``1!1.1`` does not match ``==1.1.*``.
+    segments beyond the prefix are ignored, pre/post/dev suffixes included
+    (``1.1.post1`` matches ``==1.1.*``). The epoch is part of the prefix, so
+    ``1!1.1`` does not match ``==1.1.*``.
     """
     if version.epoch != spec_version.epoch:
         return False
@@ -370,11 +369,11 @@ def satisfies(
     *,
     include_prerelease: bool,
 ) -> tuple[bool, str]:
-    # PEP 440 arbitrary equality compares the version exactly as written, so it
-    # is evaluated before parsing: `===` exists precisely for versions that do
-    # not conform to this specification. Pre-release exclusion is a
-    # version-matching rule and does not apply to an exact string match either,
-    # so an all-`===` specifier set is answered here in full.
+    # PEP 440 arbitrary equality compares the version string as written, so it
+    # runs before parsing. `===` exists for versions that do not conform to
+    # PEP 440. Pre-release exclusion belongs to version matching and leaves
+    # string matches alone, so an all-`===` specifier set is answered here in
+    # full.
     for operator, spec_version in spec_set:
         if operator == "===" and version_str != spec_version:
             return False, f"{version_str} does not satisfy ==={spec_version}"

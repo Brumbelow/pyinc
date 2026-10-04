@@ -50,8 +50,8 @@ class DocumentMap:
 
     def __init__(self, source: str) -> None:
         self.source = source
-        # All Python and LSP line endings delimit lines without contributing to
-        # the character coordinate. ``re.split`` preserves a final empty line.
+        # Every Python and LSP line ending ends a line and adds nothing to the
+        # character coordinate. ``re.split`` keeps a final empty line.
         self.lines = tuple(re.split(r"\r\n?|\n", source))
 
     def line(self, line: int) -> str:
@@ -174,7 +174,7 @@ def identifier_range_in_tokens(
     *,
     reverse: bool = False,
 ) -> SourceRange:
-    """identifier_range against a pre-computed token stream for document."""
+    """Run ``identifier_range`` against a pre-computed token stream for ``document``."""
 
     full = document.ast_range(node)
     candidates = [

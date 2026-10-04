@@ -26,12 +26,14 @@ class ValueAdapter(Protocol):
     """Makes a foreign type snapshot-safe at the value boundary.
 
     Adapters extend the kernel's condition 1 boundary and inherit its laws:
-    `freeze` and `thaw` are deterministic, side-effect-free, and read no
-    ambient state (at query boundaries they run under the ambient-read
-    guard); results are owned by the receiver; the round trip preserves
-    semantics; and adapter instance configuration stays immutable for the
-    registered lifetime (enforced at request scope; see the kernel contract's
-    `ValueAdapter` entry).
+
+    - `freeze` and `thaw` are deterministic, side-effect-free, and read no
+      ambient state. At query boundaries they run under the ambient-read guard.
+    - The receiver owns the results.
+    - The round trip preserves semantics.
+    - Adapter instance configuration stays immutable for the registered
+      lifetime. This is enforced at request scope (see the kernel contract's
+      `ValueAdapter` entry).
     """
 
     def freeze(self, value: Any, freeze: FreezeFn) -> Any:
@@ -65,12 +67,12 @@ class FrozenList(Sequence[Any]):
 class FrozenDict(Mapping[Any, Any]):
     """Owned snapshot of a mapping, entries in canonical order.
 
-    `entries` is ordered by each key's snapshot digest -- deterministic across
-    processes and platforms, but neither insertion order nor sorted order --
-    and iteration, `thaw`, and every mode's boundary exposure preserve that
-    order. Any other order is outside the snapshot grammar: the validator every
-    entry point runs refuses it with `UnsupportedValueError` rather than
-    digesting a hand-assembled mapping the kernel would never have produced.
+    `entries` is ordered by each key's snapshot digest. That order is
+    deterministic across processes and platforms. It is neither insertion
+    order nor sorted order. Iteration, `thaw`, and every mode's boundary
+    exposure preserve it. Any other order is outside the snapshot grammar, and
+    the validator every entry point runs refuses it with
+    `UnsupportedValueError`.
     """
 
     entries: tuple[tuple[Any, Any], ...]
@@ -93,11 +95,10 @@ class FrozenSet:
     """Owned snapshot of a set or frozenset, members in canonical order.
 
     `items` is ordered by each member's snapshot digest, the same rule
-    `FrozenDict` orders keys by, and the validator every entry point runs
-    refuses any other order. That order reaches a query only through `strict`,
-    which exposes this view: `thaw` rebuilds an ordinary `set` or `frozenset`,
-    which holds no order at all, so `checked` and `fast` iterate in Python's
-    order rather than this one.
+    `FrozenDict` orders keys by. The validator every entry point runs refuses
+    any other order. A query sees that order only in `strict`, which exposes
+    this view. `thaw` rebuilds an ordinary, unordered `set` or `frozenset`, so
+    `checked` and `fast` iterate in Python's set order.
     """
 
     kind: str
@@ -209,15 +210,16 @@ class _FreezeState:
     nodes: list[Any] = field(default_factory=list)
     has_back_edge: bool = False
     active_ids: set[int] = field(default_factory=set)
-    # Strong refs to every memoized value. Without this, a value freed mid-freeze
-    # can have its id() reused by a later allocation, causing a spurious memo hit.
+    # Strong refs to every memoized value. They keep each value alive for the
+    # whole freeze, so a later allocation cannot reuse its id() and cause a
+    # spurious memo hit.
     live_refs: list[Any] = field(default_factory=list)
     # Graph-capable wrappers already passed through, and whether one of them was
     # reached a second time. Set on the optimistic pass, consumed by _freeze_root.
     wrapper_ids: set[int] = field(default_factory=set)
     saw_aliased_wrapper: bool = False
-    # Route every graph-capable wrapper through the memo instead of passing it
-    # through. Only the re-encoding pass sets this.
+    # Route every graph-capable wrapper through the memo. Only the re-encoding
+    # pass sets this.
     refreeze_wrappers: bool = False
 
 
@@ -225,20 +227,19 @@ def freeze(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None)
     """Convert a live value into a snapshot the kernel owns outright.
 
     Frozen mappings hold their entries in a canonical order derived from each
-    key's snapshot digest -- deterministic across processes and platforms, but
-    neither insertion order nor sorted order -- and `thaw` and every mode's
-    boundary exposure preserve that canonical order. `FrozenSet` members are
-    ordered by the same digest rule applied to the members themselves, an order
-    the snapshot and `strict`'s view of it carry and a thawed `set` does not:
-    `thaw` rebuilds an ordinary `set` or `frozenset`, which holds no order.
-    Sequences are not reordered: a `FrozenList` keeps its element order and a
-    `FrozenRecord` its field declaration order.
+    key's snapshot digest. That order is deterministic across processes and
+    platforms. It is neither insertion order nor sorted order. `thaw` and
+    every mode's boundary exposure preserve it. `FrozenSet` members
+    follow the same digest rule applied to the members. The snapshot and
+    `strict`'s view of it carry that order. A thawed set is unordered, because
+    `thaw` rebuilds an ordinary `set` or `frozenset`. Sequences keep their
+    order: a `FrozenList` keeps its element order and a `FrozenRecord` its
+    field declaration order.
 
-    That order is load-bearing rather than incidental. The canonical encoding
-    every digest is derived from reads entries in the order they are stored, so
-    the order is fixed for the byte grammar's lifetime; a mapping or set
-    assembled by hand in any other order is refused with
-    `UnsupportedValueError` instead of digesting to something else.
+    Digests depend on this order. The canonical encoding that every digest
+    comes from reads entries in their stored order, so the order is fixed for
+    the byte grammar's lifetime. A mapping or set assembled by hand in any
+    other order is refused with `UnsupportedValueError`.
     """
 
     registry = _coerce_registry(adapters)
@@ -250,16 +251,14 @@ def freeze(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None)
 def _freeze_root(value: Any, registry: _AdapterRegistry) -> Snapshot:
     """Freeze one boundary value, re-encoding once if sibling wrappers alias.
 
-    A wrapper reached twice is a back-edge only once every wrapper on the way
-    registers in the memo, and the first pass deliberately does not register
-    them: a tree wrapper has to keep inlining as a tree rather than becoming a
-    node-table entry.
-    Sharing whose lowest common ancestor is a raw tuple therefore cannot be
-    seen until the aliased wrapper is met, by which point the first occurrence
-    is already inlined. So the walk that finds it is the freeze itself, and the
-    answer it produces is thrown away in favour of a second pass that routes
-    wrappers through the graph machinery -- landing the snapshot the equivalent
-    raw structure produces.
+    A wrapper reached twice is a back-edge only if every wrapper on the way
+    registered in the memo. The first pass leaves wrappers unregistered so a
+    tree wrapper keeps inlining as a tree and stays out of the node table.
+    Sharing whose lowest common ancestor is a raw tuple therefore shows up only
+    when the aliased wrapper is met, after the first occurrence is already
+    inlined. So the freeze itself is the walk that finds it. Its result is
+    discarded, and a second pass routes wrappers through the graph machinery.
+    That pass produces the same snapshot as the equivalent raw structure.
     """
 
     state = _FreezeState()
@@ -278,9 +277,8 @@ def _finalize_snapshot(snapshot: Snapshot, state: _FreezeState) -> Snapshot:
         _reject_hoisted_adapter_payloads(graph)
         return graph
     if not state.nodes:
-        # No memoization happened at all -- the walk already produced a
-        # Database-owned snapshot (wrapper inputs were detached in _freeze),
-        # so there are no refs to inline.
+        # The walk memoized nothing, so the snapshot holds no refs to inline.
+        # It is already Database-owned (_freeze detached any wrapper inputs).
         return snapshot
     # Memoized but no back-edges: inline FrozenRefs so the public snapshot has the
     # same flat shape as v1 for tree-shaped inputs.
@@ -290,18 +288,17 @@ def _finalize_snapshot(snapshot: Snapshot, state: _FreezeState) -> Snapshot:
 def _reject_hoisted_adapter_payloads(graph: FrozenGraph) -> None:
     """Refuse an adapted value whose payload the graph encoding holds as a node.
 
-    An adapter's ``thaw`` is handed the payload as it is stored. Inside a
-    shared or cyclic value the encoding lifts a mapping, list, set or
-    dataclass payload into a node of its own and stores a reference in its
-    place, so what ``thaw`` receives is that reference, or -- where the
-    reference is resolved before ``thaw`` runs -- a container whose contents
-    at that instant depend on the order the encoding filled its nodes in.
-    Neither is something an adapter can be asked to work with, and the
-    second is worse than the first because it answers rather than raising.
-    A payload written inline is unaffected, which is why the kernel's own
-    adapters take positional payloads -- but a tuple is only inline as far
-    as its own elements, so a tuple holding a shared container is refused
-    on the same terms.
+    An adapter's ``thaw`` receives the payload as stored. Inside a shared or
+    cyclic value, the encoding lifts a mapping, list, set or dataclass payload
+    into its own node and stores a reference in its place. ``thaw`` then
+    receives that reference. Where the reference is resolved before ``thaw``
+    runs, it receives a container whose contents at that instant depend on the
+    order the encoding filled its nodes. An adapter cannot work with either.
+    The second is worse, because it returns an answer without raising. A
+    payload written inline is unaffected, which is why the kernel's own
+    adapters take positional payloads. A tuple is inline only as far as its
+    own elements, so a tuple holding a shared container is refused on the same
+    terms.
     """
 
     def holds_a_reference(value: Any) -> bool:
@@ -351,10 +348,10 @@ def _reject_hoisted_adapter_payloads(graph: FrozenGraph) -> None:
             for item in value:
                 walk(item)
 
-    # Neither walker follows a `FrozenRef` into the node table. `walk` reaches
-    # every node from the loop below, so following one would only revisit, and
-    # a cyclic graph would never terminate. `holds_a_reference` does not follow
-    # one either: a reference's presence is the hoist, which is the predicate.
+    # Both walkers stop at a `FrozenRef`. `walk` reaches every node from the
+    # loop below, so following a ref would only revisit nodes and would loop
+    # forever on a cycle. `holds_a_reference` stops there too, because a
+    # reference's presence is the hoist it tests for.
     walk(graph.root)
     for node in graph.nodes:
         walk(node)
@@ -371,28 +368,27 @@ def _freeze(value: Any, registry: _AdapterRegistry, state: _FreezeState) -> Snap
             )
         return cast(Snapshot, value)
     if type(value) in _FROZEN_TYPES:
-        # Both walks below read shell fields directly -- unpacking entry pairs
-        # and iterating `items` -- so the field shapes have to be checked
-        # first. Without this an inbound shell with a 3-element entry escapes
-        # as a raw ValueError past every boundary handler, and one whose
-        # `items` is a list gets rebuilt into a well-formed snapshot instead
-        # of rejected.
+        # Both walks below read shell fields directly (unpacking entry pairs,
+        # iterating `items`), so check the field shapes first. Otherwise an
+        # inbound shell with a 3-element entry escapes past every boundary
+        # handler as a raw ValueError. One whose `items` is a list is rebuilt
+        # into a well-formed snapshot when it should be rejected.
         _validate_wrapper_shape(value)
         if state.refreeze_wrappers or _wrapper_aliases_structure(value):
             # A strict-mode boundary view rebuilds a FrozenGraph snapshot into
-            # wrapper objects that genuinely share or cycle through each other.
-            # Feeding one back across a boundary must restore the graph
-            # encoding it came from; inlining the aliased wrappers as a tree
-            # would either drop the sharing or recurse forever on a cycle.
+            # wrapper objects that share or cycle through each other. Feeding
+            # one back across a boundary must restore the graph encoding it
+            # came from. Inlining the aliased wrappers as a tree would drop the
+            # sharing or recurse forever on a cycle.
             return _refreeze_wrapper(value, state)
         if type(value) in (FrozenList, FrozenDict, FrozenRecord) or (
             type(value) is FrozenSet and value.kind == "set"
         ):
-            # Sibling wrappers can alias through a raw spine that carries no
-            # memo slot of its own: a tuple holds none, and a memoized
-            # container's slot sits one level above the wrappers it holds.
-            # Only the four types a FrozenGraph node table can hold are worth
-            # tracking; nothing else can be the target of a back-edge.
+            # Sibling wrappers can alias through a raw spine with no memo slot
+            # of its own. A tuple has none, and a memoized container's slot
+            # sits one level above the wrappers it holds. Track only the four
+            # types a FrozenGraph node table can hold, since only those can be
+            # a back-edge target.
             if id(value) in state.wrapper_ids:
                 state.saw_aliased_wrapper = True
             else:
@@ -504,18 +500,18 @@ def _validate_wrapper_shape(value: Any, seen: set[int] | None = None) -> None:
     """Reject an inbound Frozen* shell whose fields are not the declared shapes.
 
     `_wrapper_aliases_structure` and `_detach_wrapper` both read these fields
-    directly, so a malformed shell would otherwise escape as a raw
-    `ValueError` -- which no boundary handler catches -- or be silently
-    rebuilt into a well-formed snapshot by the clone.
+    directly. Without this check a malformed shell would escape as a raw
+    `ValueError`, which no boundary handler catches, or the clone would
+    silently rebuild it into a well-formed snapshot.
 
-    `_validate_snapshot` cannot serve here even though it owns the same rules:
-    an inbound wrapper is allowed to be a genuinely cyclic or shared Python
-    object graph, which is precisely what `_refreeze_wrapper` re-encodes,
-    while the canonical grammar forbids exactly that. So this walk is
-    visit-once rather than path-scoped and checks only the field shapes the
-    two walks depend on; ordering, duplicate-key, and cycle rules stay with
-    the canonical validator that runs on the result. The messages are kept
-    identical to it so a caller sees a single contract.
+    `_validate_snapshot` owns the same rules but cannot serve here. An inbound
+    wrapper may be a cyclic or shared Python object graph, which
+    `_refreeze_wrapper` re-encodes, and the canonical grammar forbids that. So
+    this walk visits each object once, where the validator tracks the active
+    path. It checks only the field shapes the two walks depend on. Ordering,
+    duplicate-key, and cycle rules stay with the canonical validator that runs
+    on the result. The messages match that validator's, so a caller sees one
+    contract.
     """
 
     value_type = type(value)
@@ -578,11 +574,11 @@ def _wrapper_aliases_structure(value: Any) -> bool:
     """Report whether an already-frozen wrapper aliases any of its own parts.
 
     A plain tree wrapper is detached into an equal clone that keeps its tree
-    shape, but a wrapper whose object graph revisits one of the four
-    graph-capable container types (shared or cyclic) has to be re-encoded.
-    Hash positions (mapping keys, set members) are frozen in isolated states
-    and can never carry references, so they stay unvisited here exactly as
-    they stay ref-free in `_freeze`.
+    shape. A wrapper whose object graph revisits one of the four graph-capable
+    container types (shared or cyclic) has to be re-encoded. Hash positions
+    (mapping keys, set members) are frozen in isolated states and never carry
+    references, so this walk skips them, matching how `_freeze` keeps them
+    ref-free.
     """
 
     seen_nodes: set[int] = set()
@@ -627,9 +623,9 @@ def _wrapper_aliases_structure(value: Any) -> bool:
 def _refreeze_wrapper(value: Any, state: _FreezeState) -> Snapshot:
     """Re-encode an aliased wrapper graph through the raw-mutable memo machinery.
 
-    Every graph-capable wrapper registers in `state` exactly as its raw
-    counterpart would, so revisits become `FrozenRef` back-edges and
-    `_finalize_snapshot` restores the canonical `FrozenGraph` -- the
+    Every graph-capable wrapper registers in `state` the same way its raw
+    counterpart would. Revisits become `FrozenRef` back-edges, and
+    `_finalize_snapshot` restores the canonical `FrozenGraph`. The
     round-tripped snapshot fingerprints identically to the snapshot the view
     was built from.
     """
@@ -645,9 +641,9 @@ def _refreeze_wrapper(value: Any, state: _FreezeState) -> Snapshot:
         )
     if value_type is FrozenDict:
         # Keys were frozen in isolated states and carry no references, but
-        # they can still be caller-held shells; detach them. Cloning is
-        # structure-preserving, so the canonical entry order (keyed by each
-        # key's fingerprint) is unchanged.
+        # they can still be caller-held shells, so detach them. Cloning
+        # preserves structure, so the canonical entry order (keyed by each
+        # key's fingerprint) stays the same.
         return _freeze_via_memo(
             value,
             state,
@@ -682,10 +678,10 @@ def _refreeze_wrapper(value: Any, state: _FreezeState) -> Snapshot:
         with _active_guard(value, state):
             return tuple(_refreeze_wrapper(item, state) for item in value)
     if value_type in (FrozenGraph, FrozenRef):
-        # A nested graph carries its own reference namespace, so neither this
-        # pass nor the canonical renumbering that follows it descends into
-        # one: without a detach here the caller's envelope, node table and all,
-        # lands in the stored snapshot untouched.
+        # A nested graph carries its own reference namespace, so this pass and
+        # the canonical renumbering after it both leave it whole. Detach it
+        # here, or the caller's FrozenGraph, node table and all, lands in the
+        # stored snapshot still shared with the caller.
         return _detach_wrapper(value)
     raise UnsupportedValueError(f"Unsupported snapshot value {value_type.__qualname__}.")
 
@@ -718,19 +714,19 @@ def _detach_wrapper(value: Any, active: set[int] | None = None) -> Snapshot:
     """Deep-clone a snapshot so it shares no Frozen* shell with the caller.
 
     Every Frozen* type is a frozen dataclass, and ``object.__setattr__``
-    rebinds its fields, so a stored snapshot sharing a shell with the caller
+    rebinds its fields. A stored snapshot that shared a shell with the caller
     would let the caller corrupt the record it came from. Leaf scalars and
-    all-leaf tuples stay shared -- nothing reflective can rebind them --
-    which is the same rule the strict boundary view applies on the way out.
+    all-leaf tuples stay shared, since nothing reflective can rebind them. The
+    strict boundary view applies the same rule on the way out.
     """
 
     value_type = type(value)
     if value_type not in _FROZEN_TYPES and value_type is not tuple:
         return cast(Snapshot, value)
     if value_type is FrozenRef:
-        # A ref cell is a rebindable shell like every other one: handing the
-        # caller's back leaves it holding a live index into the stored node
-        # table, rewritable long after the snapshot was validated.
+        # A ref cell is a rebindable shell like the others. Returning the
+        # caller's own cell would leave the caller holding a live index into
+        # the stored node table, rewritable long after validation.
         return FrozenRef(value.index)
     if active is None:
         active = set()
@@ -781,11 +777,11 @@ def _detach_wrapper(value: Any, active: set[int] | None = None) -> Snapshot:
 def _canonicalize_graph(graph: FrozenGraph) -> FrozenGraph:
     """Renumber graph nodes by deterministic first traversal from the root.
 
-    Memo slots are allocated while live containers are visited.  Mapping and set
-    contents are canonicalized only after their members have been frozen, so the
-    allocation order can reflect insertion or hash iteration order.  Rewriting
-    references from the already-canonical container traversal removes that
-    incidental order while preserving sharing and cycles.
+    Memo slots are allocated while live containers are visited. Mapping and set
+    contents are canonicalized only after their members are frozen, so the
+    allocation order can reflect insertion or hash iteration order. Rewriting
+    references along the already-canonical container traversal removes that
+    incidental order and keeps sharing and cycles.
     """
 
     _validate_snapshot(graph)
@@ -818,8 +814,8 @@ def _canonicalize_graph(graph: FrozenGraph) -> FrozenGraph:
             return FrozenAdapterValue(value.adapter_key, rewrite(value.payload))
         if type(value) is FrozenGraph:
             # A nested graph is an already-frozen value with its own reference
-            # namespace. Preserve it exactly; only this graph's node table is
-            # being renumbered.
+            # namespace. Return it as is. Only this graph's node table is
+            # renumbered.
             return value
         if type(value) is tuple:
             return tuple(rewrite(item) for item in value)
@@ -834,12 +830,12 @@ def _canonicalize_graph(graph: FrozenGraph) -> FrozenGraph:
 def collect_adapter_keys(snapshot: Any) -> frozenset[str]:
     """Collect every adapter key a snapshot's ``FrozenAdapterValue``s depend on.
 
-    Pure and registry-free: it walks the ``Snapshot`` union the same way
+    Pure and registry-free. It walks the ``Snapshot`` union the same way
     ``_inline_refs`` does and returns the set of adapter keys reachable in it.
-    The checkpoint path uses this to record, per manifest record, which adapter
-    implementations a snapshot's fidelity rests on, so a record frozen under a
-    since-changed (or now-missing) adapter is refused at warm time rather than
-    thawed into a value a fresh run would not have produced.
+    The checkpoint path uses it to record, per manifest record, which adapter
+    implementations a snapshot's fidelity rests on. A record frozen under an
+    adapter that has since changed or gone missing is then refused at warm
+    time, before it can thaw into a value a fresh run would not produce.
     """
     keys: set[str] = set()
     _collect_adapter_keys(snapshot, keys)
@@ -869,9 +865,9 @@ def _collect_adapter_keys(value: Any, keys: set[str]) -> None:
             _collect_adapter_keys(item, keys)
         return
     if isinstance(value, FrozenGraph):
-        # Every memoized value is its own node, so walking all nodes (plus the
-        # root) reaches each adapter value inline; a bare FrozenRef just points
-        # back into this table and carries no key of its own.
+        # Every memoized value is its own node, so walking all nodes and the
+        # root reaches each adapter value inline. A bare FrozenRef points back
+        # into this table and carries no key of its own.
         for node in value.nodes:
             _collect_adapter_keys(node, keys)
         _collect_adapter_keys(value.root, keys)
@@ -896,14 +892,13 @@ def thaw(value: Any, *, adapters: AdapterMap | _AdapterRegistry | None = None) -
 def _unhashable_thawed_subject(values: Iterable[Any]) -> str:
     """Name the first thawed value a container refused to hold.
 
-    The interpreter's own unhashable-type error names the type and nothing
-    else, and its wording has moved between releases, so the refusals composed
-    from this one say which container arrived where only a hashable value can
-    go, in this module's words. Asked only after a container has already
-    refused, so an ordinary mapping or set pays nothing for the question. A
-    container can also refuse for a reason no single value carries -- a key
-    that hashes but raises while being compared to another -- and the unnamed
-    subject is what that reads as.
+    The interpreter's own unhashable-type error names only the type, and its
+    wording has changed between releases. The refusals built from this one
+    say, in this module's words, which container arrived where only a hashable
+    value can go. It runs only after a container has refused, so an ordinary
+    mapping or set pays nothing for it. A container can also refuse for a
+    reason no single value carries, such as a key that hashes but raises when
+    compared to another. That case reads as the unnamed subject, "a value".
     """
 
     for value in values:
@@ -945,10 +940,10 @@ def _thaw(value: Any, registry: _AdapterRegistry, env: list[Any] | None) -> Any:
     if isinstance(value, FrozenList):
         return [_thaw(item, registry, env) for item in value.items]
     if isinstance(value, FrozenDict):
-        # Built first and inserted after, so a key the mapping will not take is
-        # reported as this module's refusal rather than as the interpreter's
-        # unhashable-type error, which names no position and spells itself
-        # differently on different releases.
+        # Build the pairs first and insert after, so a key the mapping rejects
+        # is reported as this module's refusal. The interpreter's
+        # unhashable-type error names no position, and its wording varies
+        # across releases.
         entries = [
             (_thaw(key, registry, env), _thaw(item, registry, env)) for key, item in value.entries
         ]
@@ -978,9 +973,9 @@ def _allocate_shell(node: Any, registry: _AdapterRegistry) -> Any:
     if isinstance(node, FrozenSet):
         if node.kind == "set":
             return set()
-        # Frozensets are immutable and cannot participate in cycles, so they are
-        # never genuine back-edge targets. They reach this path only via memoized
-        # adapter values; thaw eagerly during fill.
+        # Frozensets are immutable and cannot be part of a cycle, so they are
+        # never real back-edge targets. They reach this path only through
+        # memoized adapter values. Thaw them eagerly during fill.
         return None
     if isinstance(node, FrozenDict):
         return {}
@@ -989,7 +984,7 @@ def _allocate_shell(node: Any, registry: _AdapterRegistry) -> Any:
     if isinstance(node, FrozenAdapterValue):
         # Defensive only: adapted values are never legal graph nodes. `_freeze`
         # routes them through `_active_guard`, so a cyclic adapted value raises
-        # before a graph is built, and `_validate_snapshot` rejects
+        # before a graph is built. `_validate_snapshot` rejects
         # `FrozenAdapterValue` as a `FrozenGraph` node. See the cycle carve-out
         # in docs/kernel-contract.md.
         return None
@@ -1004,9 +999,9 @@ def _fill_shell(shell: Any, node: Any, registry: _AdapterRegistry, env: list[Any
             shell.append(_thaw(item, registry, env))
         return
     if isinstance(node, FrozenDict):
-        # The same refusals the tree walk composes: a shared or cyclic value is
-        # reached through a reference here rather than written inline, and what
-        # the reference resolves to can be just as unable to be a key.
+        # The same refusals as the tree walk. Here a shared or cyclic value is
+        # reached through a reference, and the value it resolves to can be an
+        # invalid key in the same way.
         for key, item in node.entries:
             thawed_key = _thaw(key, registry, env)
             thawed_item = _thaw(item, registry, env)
@@ -1140,10 +1135,10 @@ def _validate_snapshot(snapshot: Any) -> None:
                     walk(key, depth + 1, graph_size)
                     walk(item, depth + 1, graph_size)
                     key_digests.append(encoded_digest(key))
-                    # Distinct encodings are not distinct keys: thaw restores the
-                    # numeric tower, so keys that encode differently -- 1 and
-                    # 1.0, 0.0 and -0.0 -- can still be one entry of the thawed
-                    # dict, which would silently drop the other key's value.
+                    # Distinct encodings can still be one key. Thaw restores the
+                    # numeric tower, so keys that encode differently (1 and 1.0,
+                    # 0.0 and -0.0) can become one entry of the thawed dict,
+                    # which would silently drop the other key's value.
                     key_class = _thaw_equivalence_key(key)
                     if key_class in key_classes:
                         raise UnsupportedValueError(
@@ -1309,8 +1304,8 @@ def _encode_snapshot(value: Any, buf: bytearray) -> None:
         try:
             body = str(value).encode("ascii")
         except ValueError as exc:
-            # The grammar has no width limit; CPython's int-to-str conversion
-            # does. Type the refusal like every other boundary rejection.
+            # The grammar allows any width, but CPython's int-to-str conversion
+            # has a limit. Type the refusal like every other boundary rejection.
             raise UnsupportedValueError(
                 f"Integer exceeds the {sys.get_int_max_str_digits()}-digit int-to-str "
                 "conversion limit and cannot be encoded; raise the limit with "
@@ -1589,12 +1584,11 @@ def _read_length_prefixed_int(buf: memoryview, offset: int) -> tuple[int, int]:
 def snapshots_equal(left: Any, right: Any) -> bool:
     """Canonical equality over snapshots: equality of canonical encodings.
 
-    This is THE default relation for every backdate, input-update, probe and
-    cutoff decision. It compares type tags before values, so the numeric
-    tower never unifies (1, 1.0, True are three different values and 0.0
-    differs from -0.0), and a canonical NaN equals a canonical NaN. The
-    identity shortcut is sound here because the encoding is a pure function
-    of the object.
+    This is the default relation for every backdate, input-update, probe and
+    cutoff decision. It compares type tags before values, so the numeric tower
+    stays split: 1, 1.0 and True are three different values, and 0.0 differs
+    from -0.0. A canonical NaN equals a canonical NaN. The identity shortcut
+    is sound because the encoding is a pure function of the object.
     """
 
     if left is right:
@@ -1627,10 +1621,9 @@ def _freeze_unordered(
 
 
 def _freeze_hash_position(value: Any, registry: _AdapterRegistry, _state: _FreezeState) -> Snapshot:
-    # Freeze hash-position values independently. Their live identity cannot
-    # safely participate in a mutable graph, and isolating them prevents memo
-    # node numbers allocated during mapping/set iteration from entering the
-    # canonical ordering key.
+    # Freeze hash-position values independently. Their live identity is unsafe
+    # in a mutable graph. Isolating them also keeps memo node numbers allocated
+    # during mapping/set iteration out of the canonical ordering key.
     snapshot = _freeze_root(value, registry)
     _validate_snapshot(snapshot)
     if not _snapshot_thaws_hashably(snapshot, [], set()):
@@ -1643,10 +1636,10 @@ def _freeze_hash_position(value: Any, registry: _AdapterRegistry, _state: _Freez
 
 def _real_number_key(value: float) -> object:
     if math.isnan(value):
-        # Conservative: whether two thawed NaN-carrying positions collapse
-        # depends on float object identity, which the encoding cannot see,
-        # so all canonical NaNs share one class and colliding pairs are
-        # refused rather than accepted nondeterministically.
+        # Conservative. Whether two thawed NaN-carrying positions collapse
+        # depends on float object identity, which is invisible to the
+        # encoding. So all canonical NaNs share one class, and colliding pairs
+        # are refused. Accepting them would be nondeterministic.
         return "nan"
     if math.isinf(value):
         return "+inf" if value > 0 else "-inf"
@@ -1658,10 +1651,10 @@ def _thaw_equivalence_key(snapshot: Any) -> object:
 
     Python's numeric tower unifies bool/int/float/complex under == and hash,
     so entries that encode differently can collapse into one key or member
-    after thaw. Fraction keeps large integers exact where a float cast would
-    not. An adapted value carries its payload's class under its own adapter
-    key. Remaining types fall back to their canonical fingerprint, which
-    rejects nothing the digest-uniqueness rule does not already reject.
+    after thaw. Fraction keeps large integers exact, where a float cast would
+    round them. An adapted value carries its payload's class under its own
+    adapter key. Other types fall back to their canonical fingerprint, which
+    rejects only what the digest-uniqueness rule already rejects.
     """
 
     if snapshot is None:
@@ -1689,13 +1682,12 @@ def _thaw_equivalence_key(snapshot: Any) -> object:
             frozenset(_thaw_equivalence_key(item) for item in snapshot.items),
         )
     if snapshot_type is FrozenAdapterValue:
-        # An adapter rebuilds its value from the payload alone, so two
-        # positions under one adapter key whose payloads already share a class
-        # run the same user code over equivalent inputs. Whether the results
-        # collapse is then the adapter's business, and this validator holds no
-        # registry to ask -- so it refuses the pair instead of guessing.
-        # Distinct adapter keys stay distinct: nothing in the encoding says
-        # whether two adapters can produce equal values.
+        # An adapter rebuilds its value from the payload alone. Two positions
+        # under one adapter key whose payloads share a class run the same user
+        # code over equivalent inputs. Whether the results collapse is up to
+        # the adapter, and this validator has no registry to ask, so it refuses
+        # the pair. Distinct adapter keys stay distinct, because the encoding
+        # cannot tell whether two adapters produce equal values.
         return ("adapter", snapshot.adapter_key, _thaw_equivalence_key(snapshot.payload))
     return ("encoded", fingerprint_snapshot(snapshot))
 
@@ -1765,9 +1757,10 @@ def _coerce_registry(
 
 @contextmanager
 def _active_guard(value: Any, state: _FreezeState) -> Iterator[None]:
-    """Reject in-flight cycles for non-memoized container types (tuple, frozenset, adapter)
-    where Python cannot naturally construct a self-reference but a hand-built cycle would
-    otherwise infinitely recurse."""
+    """Reject in-flight cycles for unmemoized container types (tuple, frozenset, adapter).
+
+    Python cannot naturally build a self-reference in these types, but a
+    hand-built cycle would recurse forever."""
     object_id = id(value)
     if object_id in state.active_ids:
         raise UnsupportedValueError(

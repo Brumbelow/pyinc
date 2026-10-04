@@ -29,9 +29,9 @@ jobs:
 
       - name: Run the free-threaded build with the GIL off
         if: endsWith(matrix.python-version, 't')
-        # Only on the free-threaded cells: a default build refuses PYTHON_GIL=0
-        # at startup. Forcing it keeps an extension that would quietly re-enable
-        # the GIL from turning these cells back into ordinary ones.
+        # Free-threaded cells only, because a default build refuses PYTHON_GIL=0
+        # at startup. Forcing the GIL off keeps an extension that would re-enable
+        # it from turning these cells back into ordinary ones.
         shell: bash
         run: echo "PYTHON_GIL=0" >> "$GITHUB_ENV"
 
@@ -60,8 +60,8 @@ jobs:
           PY
 
       - name: Run property suite
-        # Every case in the file is parametrized over the three modes and the
-        # mode is the last parameter in the identifier, so the closing bracket is
-        # what keeps a case whose own name reads "fast" out of the fast shard.
+        # Every case in the file is parametrized over the three modes, with the
+        # mode as the last parameter in the identifier. The closing bracket keeps
+        # a case whose own name reads "fast" out of the fast shard.
         shell: bash
         run: python -m pytest -q -n auto --dist load -k "${{ matrix.shard }}]" tests/test_properties.py

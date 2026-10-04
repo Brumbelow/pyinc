@@ -2,8 +2,8 @@
 
 Each target is a callable ``(out_dir, comparators) -> list[ScenarioResult]``.
 Every pyinc row's ``correct`` flag compares its output to a fresh, cache-free
-recomputation; the tampered-output scenarios drive the *real* action
-reconcile path (not a re-implemented comparison).
+recomputation. The tampered-output scenarios drive the real action reconcile
+path.
 """
 
 from __future__ import annotations
@@ -103,9 +103,9 @@ def _expect_incremental_work(target: str, scenario: str, work: WorkMetrics) -> N
     if scenario == "comment_only_referenced_edit" and (
         work.query_executions > work.resource_loads or work.query_backdates < 1
     ):
-        # The source read answers with the text it compared, so it executes on
-        # every edit; the only executions allowed here are those reloads. The
-        # parse above each one must re-run equal and backdate.
+        # The source read returns the text it compared, so it executes on every
+        # edit. Those reloads are the only executions allowed here. The parse
+        # above each one must re-run equal and backdate.
         raise AssertionError(
             f"{target}/{scenario} did not backdate cleanly: "
             f"executions={work.query_executions}, resource_loads={work.resource_loads}, "
@@ -155,7 +155,7 @@ def _synthetic(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioRes
         db.set(_ROOT, state["root"])
         db.set_many([(leaves[i], state["leaf"][i]) for i in range(_WIDTH)])
 
-    # naive cache: keyed per branch on its leaf value, FORGETTING the shared root.
+    # Naive cache: keyed per branch on its leaf value and blind to the shared root.
     naive_cache: dict[int, tuple[int, int]] = {}
 
     def naive_compute() -> int:
@@ -279,7 +279,7 @@ def _calc(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResult]:
         return _tree(fresh_dir)
 
     def naive_reconcile() -> None:
-        # Regenerate only when an INPUT file's mtime changed; blind to output tampering.
+        # Regenerate only when an input file's mtime changes. Blind to output tampering.
         sig = {f.name: f.stat().st_mtime_ns for f in (constants, root)}
         if sig != naive_sig:
             naive_sig.clear()
@@ -334,7 +334,7 @@ def _calc(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResult]:
     emit("cold", created=("a.out", "b.out", "c.out"))
     emit("unchanged", unchanged=("a.out", "b.out", "c.out"))
 
-    unrelated.write_text("let z = 2\n", encoding="utf-8")  # not included anywhere
+    unrelated.write_text("let z = 2\n", encoding="utf-8")  # outside the include graph
     emit("unreferenced_file_edit", unchanged=("a.out", "b.out", "c.out"))
 
     root.write_text("# note\n" + _CALC_ROOT, encoding="utf-8")  # comment-only
@@ -354,8 +354,8 @@ def _calc(*, out_dir: Path, comparators: Sequence[str]) -> list[ScenarioResult]:
 
     (out_inc / "a.out").write_text("TAMPERED\n", encoding="utf-8")  # corrupt a generated file
     if "naive" in comparators and naive_out.exists():
-        # The naive cache tracks input mtimes only, so it cannot notice that an
-        # *output* was corrupted — it stays stale where the real action repairs.
+        # The naive cache tracks input mtimes only, so it misses a corrupted
+        # output and stays stale. The real action repairs it.
         (naive_out / "a.out").write_text("TAMPERED\n", encoding="utf-8")
     emit(
         "tampered_generated_output",

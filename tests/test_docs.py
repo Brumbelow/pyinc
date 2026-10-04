@@ -43,7 +43,7 @@ def test_documentation_checker_accepts_repository() -> None:
 
 
 def test_every_documentation_check_is_registered_with_the_composed_checker() -> None:
-    """A check the script defines but the composition never calls is a check that never runs."""
+    """The composed checker calls every check the script defines, so each one runs."""
     source = PROJECT_ROOT / "scripts" / "check_docs.py"
     tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
     defined = {
@@ -80,7 +80,7 @@ def test_documentation_checker_ignores_external_links(tmp_path: Path) -> None:
 
 
 def test_a_link_pinned_to_the_project_version_is_checked_like_a_relative_one(tmp_path: Path) -> None:
-    """A GitHub URL naming `main` or the project's own tag is a local link; any other ref is not."""
+    """A GitHub URL naming `main` or the project's own tag is a local link. Other refs stay external."""
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "pyinc"\nversion = "1.2.3"\n', encoding="utf-8"
     )
@@ -121,7 +121,7 @@ def test_the_checked_files_end_with_the_changelog_and_the_issue_templates(tmp_pa
 
 
 def test_the_public_surface_tables_are_still_read() -> None:
-    """A narrowed row reader would report the whole surface as undocumented; floors catch it."""
+    """Row-count floors catch a narrowed row reader, which would report the whole surface as undocumented."""
     kernel = (PROJECT_ROOT / "docs" / "kernel-contract.md").read_text(encoding="utf-8")
     kernel_rows = [
         row
@@ -142,7 +142,7 @@ def test_the_public_surface_tables_are_still_read() -> None:
 
 
 def test_every_advertised_name_resolves_on_the_package_that_advertises_it() -> None:
-    """A name in `__all__` that the package does not define breaks `import *` at import time."""
+    """Every name in `__all__` resolves on its package, since a missing one breaks `import *` at import time."""
     for module in ("pyinc", "pyinc.integrations", "pyinc_codegen", "pyinc_tools"):
         imported = importlib.import_module(module)
         unresolved = [name for name in imported.__all__ if not hasattr(imported, name)]
@@ -292,7 +292,7 @@ def test_consumer_surface_check_reports_disagreement_in_both_directions(tmp_path
 
 
 def test_the_documents_name_many_external_links() -> None:
-    """The scheduled link check asks about every address this collects; a narrowed harvest passes silently."""
+    """The scheduled link check tests every address collected here. A narrowed harvest would pass silently."""
     urls = external_urls(markdown_files(PROJECT_ROOT))
 
     distinct = set(urls)

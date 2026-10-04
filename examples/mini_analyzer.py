@@ -1,12 +1,12 @@
 """Analyze a small workspace the example builds for itself.
 
 Writes a fixed two-module workspace into a ``TemporaryDirectory`` and prints a
-few named fields of the file-level and workspace-level analyses: the entry
-point's imports and definitions, and for every module in the workspace how many
-imports it has, what it defines, and which kinds of resolution its imports took.
-Nothing is written outside the temporary directory, and every printed value is
-derived from the workspace the example wrote, so what it prints does not depend
-on what is installed or where it is run from.
+few named fields of the file-level and workspace-level analyses. For the entry
+point it prints the imports and definitions. For every module it prints the
+import count, the definitions and the kinds of resolution the imports took.
+All writes stay inside the temporary directory. Every printed value comes from
+that workspace, so the output is the same whatever is installed and wherever
+the example runs.
 
 Run: ``python examples/mini_analyzer.py``
 """

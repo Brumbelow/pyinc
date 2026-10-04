@@ -12,21 +12,21 @@ FileProbe = tuple[str, str] | tuple[str]
 def file_bytes(path: str) -> bytes | None:
     """Read a file resource's bytes, reporting an unreadable kind as absent.
 
-    A path that is a directory, or that has a file somewhere in its parent
-    chain, names no readable regular file and never will by being read again,
-    so it answers the way an absent path does -- which is what keeps the probe
-    built on it total. A pipe, a socket and a device answer that way too, the
-    socket through an errno CPython gives no subclass of its own, so it is
-    named by errno rather than decided by type; any other OSError propagates.
-    Shares the kernel file resources' read so the two classify a failed read
-    the same way, which the platforms make less obvious than it sounds.
+    A directory, or a path with a file somewhere in its parent chain, names no
+    readable regular file, and reading it again will give the same result. It
+    answers as an absent path does, which keeps the probe built on it total. A
+    pipe, a socket and a device answer the same way. CPython has no OSError
+    subclass for the socket's errno, so that case is matched by errno. Any
+    other OSError propagates. The read is shared with the kernel file resources
+    so both classify a failed read the same way. Platform differences make
+    that harder than it looks.
     """
 
     return _read_file(path)
 
 
 def file_probe(path: str) -> FileProbe:
-    """Probe a file resource from its exact bytes, without decoding them."""
+    """Probe a file resource from a hash of its raw, undecoded bytes."""
 
     raw = file_bytes(path)
     if raw is None:
@@ -37,16 +37,17 @@ def file_probe(path: str) -> FileProbe:
 def file_text(path: str, encoding: str) -> str | None:
     """Read a text resource, reporting an unreadable kind as absent.
 
-    Decoding is left to ``Path.read_text`` so a load keeps the newline handling
-    it has always had; ``file_read_snapshot`` decodes the bytes it hashed. The
-    two are not interchangeable -- a text read translates CRLF and a lone CR
-    into a newline where decoding the bytes keeps them -- so the kind check runs
-    as a separate read in front, on the same terms the byte read uses, and a
-    pipe, a socket or a device answers absent here too instead of never
-    returning. An ordinary file is therefore read twice, which is what keeping
-    the newline handling unchanged costs; the second read is skipped only when
-    the kind check found nothing readable and the path is no file either, since
-    a path that became one between the two reads has a text answer to give.
+    ``Path.read_text`` does the decoding, so a load keeps its existing newline
+    handling. ``file_read_snapshot`` decodes the bytes it hashed, and the two
+    give different text: a text read turns CRLF and a lone CR into a newline,
+    while decoding the bytes keeps them. So the kind check runs first as a
+    separate read, on the same terms as the byte read. A pipe, a socket or a
+    device then answers absent here too, where a text read could block
+    forever. An ordinary file is read twice, which is the cost of keeping the
+    newline handling. The second read is skipped only when the kind check found
+    nothing readable and the path is also not a file. The file check is there
+    because a path that became a file between the two reads has a text answer
+    to give.
     """
 
     if file_bytes(path) is None and not os.path.isfile(path):

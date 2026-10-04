@@ -22,15 +22,15 @@ _INLINE_LINK = re.compile(r"(?<!!)\[[^]]*\]\((?P<target>[^)\s]+)")
 _IMAGE_LINK = re.compile(r"!\[[^]]*\]\((?P<target>[^)\s]+)")
 _INLINE_CODE = re.compile(r"`([^`]+)`")
 # An address written out in prose, ending where the surrounding bracket or
-# quote begins. Deliberately not the inline-link pattern above, which needs `](`.
+# quote begins. Unlike the inline-link pattern above, it needs no `](`.
 _EXTERNAL_URL = re.compile(r"""https?://[^\s)\]>"'`]+""")
 # The two ways the documentation spells a file in this repository over HTTPS.
-# Both put the Git ref immediately after the prefix.
+# Both put the Git ref right after the prefix.
 _GITHUB_BLOB_PREFIX = "/Brumbelow/pyinc/blob/"
 _GITHUB_RAW_PREFIX = "/Brumbelow/pyinc/"
 _PUBLIC_ROW_NAMES = frozenset({"Entrypoints", "Result types", "Shared types"})
-# Every `schema vN` a contract writes is compared with the constant that decides
-# the version, so a bumped constant cannot leave a stale number in the prose.
+# Each `schema vN` in a contract is compared with the constant that sets the
+# version, so bumping the constant flags any stale number in the prose.
 _SCHEMA_VERSION = re.compile(r"\b[Ss]chema v(?P<version>\d+)\b")
 _SCHEMA_VERSION_DOCUMENTS = (
     (Path("docs/kernel-contract.md"), Path("src/pyinc/runtime.py"), "_CHECKPOINT_MANIFEST_VERSION"),
@@ -44,10 +44,9 @@ _API_FILES = {
 }
 _LSP_DOCUMENT = Path("docs/lsp-reference.md")
 _LSP_SOURCE = Path("src/pyinc_tools/lsp.py")
-# The language server decides what it supports by comparing `method` against a
-# string in one of these three functions, and it publishes diagnostics of its
-# own accord; a method the reference names that appears in neither place is one
-# the server never sees.
+# The server dispatches by comparing `method` with a string in one of these
+# three functions, and it publishes diagnostics on its own initiative. A method
+# the reference names that appears in neither place never reaches the server.
 _LSP_DISPATCH_FUNCTIONS = ("_handle_request", "_dispatch_request", "_handle_notification")
 _LSP_NOTIFICATION_SENDER = "_send_notification"
 
@@ -76,11 +75,10 @@ class ConsumerSurface:
     labels: frozenset[str]
 
 
-# Each consumer package documents its exported names as grouped rows, and the
-# group labels are what tells such a row from the other two-cell tables the
-# codegen guide carries. The document belongs to the key as much as the labels
-# do, so a label may repeat across guides without one guide answering for the
-# other.
+# Each consumer package documents its exports as grouped rows. The group labels
+# tell those rows apart from the codegen guide's other two-cell tables. Each
+# surface pairs its labels with one document, so a label can repeat across
+# guides and each guide answers for its own package.
 _CONSUMER_SURFACES = (
     ConsumerSurface(
         "pyinc_tools",
@@ -116,10 +114,9 @@ def markdown_files(root: Path) -> tuple[Path, ...]:
     """Return the checked Markdown files in deterministic order.
 
     The changelog and the issue templates are public Markdown the project
-    ships, so a link that stops resolving in one of them is worth as much as a
-    link in a guide. The template entries come from a glob and heal themselves
-    when a template is added or renamed; the changelog is named outright, like
-    the four files above it.
+    ships, so their links matter as much as a guide's. The templates come from
+    a glob, so the list follows any template that is added or renamed. The
+    changelog is named outright, like the four files above it.
     """
     return (
         root / "README.md",
@@ -204,18 +201,17 @@ def heading_anchors(path: Path) -> frozenset[str]:
 def table_rows(text: str, *, max_indent: int = 3) -> Iterator[TableRow]:
     """Yield every Markdown table row, with the heading it sits under.
 
-    The documented tables come in two shapes -- one names a category and lists
-    the names in its second cell, the other names one thing per row -- so the
-    consumers differ in which cell they read and which rows they want. What
-    they must not differ in is what counts as a row, which is what this yields:
-    header and separator rows included, because each caller recognises its own.
+    The documented tables come in two shapes. One names a category and lists
+    the names in its second cell. The other names one thing per row. Callers
+    differ in which cell they read and which rows they want, so this gives
+    them one shared definition of a row. Header and separator rows are
+    included, because each caller recognises its own.
 
-    A row indented further than `max_indent` is not yielded. At the default of
-    three that is the four spaces where the renderer stops seeing a table and
-    starts seeing an indented code block, so reading one would mean checking
-    text nobody renders as a table. `closed` reports whether the row also ends
-    in a pipe, which is how a row wrapped across two lines is told from a whole
-    one.
+    Rows indented by more than `max_indent` spaces are skipped. The default of
+    three skips rows at four spaces, which the renderer shows as an indented
+    code block. Reading them would check text nobody sees as a table.
+    `closed` reports whether the row ends in a pipe, which tells a row
+    wrapped across two lines from a whole one.
     """
     section: str | None = None
     for number, line in enumerate(text.splitlines(), 1):
@@ -240,9 +236,9 @@ def table_rows(text: str, *, max_indent: int = 3) -> Iterator[TableRow]:
 def _pinned_refs(root: Path) -> frozenset[str]:
     """The Git refs whose content this tree may answer for.
 
-    `main` always, and the project's own version tag as soon as the project
-    metadata says what that version is. A link pinned to any other ref describes
-    a tree this one is not, so it is left to an external link checker.
+    Always `main`, plus the project's own version tag once the project
+    metadata names that version. A link pinned to any other ref describes a
+    different tree, so it is left to an external link checker.
     """
     refs = {"main"}
     metadata = root / "pyproject.toml"
@@ -293,10 +289,10 @@ def _local_target(
 
 
 def check_local_links(root: Path, files: tuple[Path, ...]) -> tuple[str, ...]:
-    """Check local Markdown and image targets without requesting external URLs.
+    """Check local Markdown and image targets, offline.
 
-    A link may name a directory, such as `examples/`; an image must name a
-    file. An external image URL is left alone, exactly as an external link is.
+    A link may name a directory, such as `examples/`. An image must name a
+    file. External image URLs are skipped, like external links.
     """
     errors: list[str] = []
     anchors: dict[Path, frozenset[str]] = {}
@@ -331,14 +327,14 @@ def check_local_links(root: Path, files: tuple[Path, ...]) -> tuple[str, ...]:
 def external_urls(files: tuple[Path, ...]) -> tuple[str, ...]:
     """Return every external URL written in those files' prose, in reading order.
 
-    Nothing here opens a connection, and `check_docs` never calls it: this
-    collects the addresses so that a separate, scheduled job can ask whether
-    they still answer, while the check that runs on every change stays offline.
+    This only collects addresses and opens no connection, and `check_docs`
+    never calls it. A separate scheduled job asks whether the addresses still
+    answer, so the check that runs on every change stays offline.
 
-    The scan looks for a bare `https?://` run rather than for Markdown link
-    syntax, because a link-reference definition -- `[3.1.0]: https://...`, the
-    form the changelog writes its release links in -- carries no `](` and would
-    otherwise be collected from nowhere.
+    The scan matches any bare `https?://` run, whatever syntax surrounds it.
+    The changelog writes its release links as link-reference definitions
+    (`[3.1.0]: https://...`), which carry no `](`, so a link-syntax scan would
+    miss them.
     """
     found: list[str] = []
     for path in files:
@@ -467,21 +463,21 @@ def check_documented_kernel_api(root: Path) -> tuple[str, ...]:
 def check_documented_consumer_api(root: Path) -> tuple[str, ...]:
     """Compare each consumer guide's public-surface rows with the package's exports.
 
-    A row is recognised by the group its first cell names, not by the section
-    it sits under. The codegen guide carries other two-cell tables whose first
-    cells are schema tokens, and reading those as documented names would accuse
-    that package of exporting `format` and `pattern`; the tools guide's only
-    other table is four-cell, so it cannot reach a two-cell gate at all. A
-    heading gate would keep the schema tables out as well, but it would also
-    lose any row a fenced comment beginning with `#` had cut loose from its
-    heading, and both guides contain fences. The labels themselves are the
-    gate, and they are paired with the document that carries them so the same
-    label may appear in both guides.
+    A row is recognised by the group label in its first cell. The section it
+    sits under plays no part. The codegen guide has other two-cell tables
+    whose first cells are schema tokens. Reading those as documented names
+    would claim the package exports `format` and `pattern`. The tools guide's
+    only other table has four cells, so the two-cell gate skips it.
 
-    The groups are the guides' own editorial arrangement, so nothing here
-    compares a name against the group it was filed under. What is compared is
-    the union: every exported name appears in some row, and every name the
-    rows carry is exported.
+    A heading gate would exclude the schema tables too, but it would drop any
+    row that a fenced comment starting with `#` had cut off from its heading,
+    and both guides contain fences. So the labels are the gate. Each set of
+    labels is paired with its document, so the same label may appear in both
+    guides.
+
+    The groups are the guides' own editorial arrangement, so a name's group
+    goes unchecked. The check compares the union: every exported name appears
+    in some row, and every name in the rows is exported.
     """
     errors: list[str] = []
     for surface in _CONSUMER_SURFACES:
@@ -530,8 +526,8 @@ def _read_int_constant(root: Path, source: Path, name: str) -> int:
 def check_schema_versions(root: Path) -> tuple[str, ...]:
     """Compare every documented `schema vN` with the constant that decides it.
 
-    A named document that is not there is reported rather than read, so one
-    removed file does not take every other check down with it.
+    A missing document is reported as an error, and the other checks still
+    run.
     """
     errors: list[str] = []
     for relative, source, constant in _SCHEMA_VERSION_DOCUMENTS:
@@ -587,20 +583,20 @@ def _lsp_published_methods(tree: ast.AST) -> set[str]:
 def check_documented_lsp_methods(root: Path, *, minimum: int = 30) -> tuple[str, ...]:
     """Compare the reference's method matrix with the methods the server handles.
 
-    The matrix is the only description of the protocol surface, and nothing
-    compares it with the dispatch chain, so a method the server gains or loses
-    drifts away from the document silently. Every inline-code span in the
-    Method column counts as a documented method: the lifecycle methods carry no
-    slash and neither does an abbreviated spelling, so no shape rule separates
-    a real name from a wrong one, and one would hide the abbreviations this
-    comparison exists to report.
+    The matrix is the only description of the protocol surface. Without this
+    check, a method the server gains or loses would drift from the document
+    silently. Every inline-code span in the Method column counts as a
+    documented method. Lifecycle methods have no slash, and neither does an
+    abbreviated spelling, so a shape rule would fail to tell real names from
+    wrong ones. It would also hide the abbreviations this comparison exists to
+    report.
 
-    `minimum` guards the extraction rather than the surface. It counts the
-    distinct method strings: a function can compare `method` against the same
-    name twice, and the published notification is collected apart from the
-    chain. The default sits well under what the dispatch chain yields, so a
-    walk that matches nothing or nearly nothing is reported rather than passing
-    on an empty harvest; a single dropped method is the comparison's own job.
+    `minimum` guards the extraction itself. It counts distinct method strings,
+    because a function can compare `method` with the same name twice and the
+    published notification is collected apart from the dispatch chain. The
+    default sits well below what the dispatch chain yields, so a walk that
+    matches nothing or almost nothing fails here and an empty harvest never
+    passes. Catching a single dropped method is the comparison's job.
     """
     document = root / _LSP_DOCUMENT
     if not document.is_file():
@@ -630,9 +626,9 @@ def check_documented_lsp_methods(root: Path, *, minimum: int = 30) -> tuple[str,
             continue
         implemented |= _lsp_dispatched_methods(function)
     if unreadable:
-        # A harvest known to be short is not compared: every method the missing
-        # function dispatched would be reported as documented but unhandled,
-        # which blames the reference for a rename in the server.
+        # Skip the comparison when the harvest is known to be short. Every
+        # method the missing function dispatched would show as documented but
+        # unhandled, blaming the reference for a rename in the server.
         return tuple(unreadable)
     if len(implemented) < minimum:
         return (

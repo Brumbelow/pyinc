@@ -244,8 +244,8 @@ _CODE_ACTION_CODES = frozenset({"unused-import", "missing-import", "unresolved-s
 
 # Target module -> the (importing file, imported name) pairs that name it in a
 # `from` import. `_reexported_names_for_module` needs one entry of this per file
-# it examines; building it once per request keeps the workspace analysis from
-# being re-decoded for every file in the workspace.
+# it examines. Building it once per request decodes the workspace analysis once,
+# where a per-file build would re-decode it for every file in the workspace.
 _ReexportIndex: TypeAlias = dict[str, list[tuple[str, str]]]
 
 
@@ -264,21 +264,20 @@ def _build_reexport_index(modules: Sequence[PythonModuleAnalysis]) -> _ReexportI
 
 
 class _RequestLock:
-    """The session lock, which also bounds one request's view of the graph.
+    """The session lock. It also bounds one request's view of the graph.
 
-    Every public method holds this for the whole of its work, and nothing can
-    change the mirror or the overlays while it is held, so an integration
-    entrypoint asked the same question twice inside one method has to answer the
-    same both times. Tying the integrations' per-request memo to the lock is
-    what keeps it from outliving that guarantee: outside a session it does not
+    Every public method holds this lock for all of its work. Nothing can change
+    the mirror or the overlays while it is held. So an integration entrypoint
+    asked the same question twice inside one method must answer the same both
+    times. The integrations' per-request memo is tied to the lock so that it
+    lives only as long as that guarantee. Outside a session the memo does not
     exist, so a caller driving the integrations directly still sees its edits.
 
-    The lock holds a kernel request span for the same reason it holds the
-    memo: the stability it guarantees is exactly what ``Database.request_span``
-    asks a caller to declare, so the several gets a public method fans out to
-    share one request and validate each resource once. The methods that do
-    rewrite the mirror mid-hold already call ``request_inputs_changed()``,
-    which rolls the held span onto a fresh request.
+    The lock holds a kernel request span for the same reason. The stability it
+    guarantees is what ``Database.request_span`` asks a caller to declare. So
+    the several gets a public method fans out to share one request and validate
+    each resource once. Methods that rewrite the mirror mid-hold call
+    ``request_inputs_changed()``, which rolls the held span onto a fresh request.
     """
 
     def __init__(self, db: Database) -> None:
@@ -308,9 +307,9 @@ class _RequestLock:
             raise
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        # A lock left held would wedge every later call on this session, close()
-        # included, and a span left open would outlive the stability it claims,
-        # so neither teardown may be skipped because an earlier one raised.
+        # Run every teardown even when an earlier one raised. A lock left held
+        # would wedge every later call on this session, close() included. A span
+        # left open would outlive the stability it claims.
         try:
             self._depth -= 1
             if self._depth != 0:
@@ -392,8 +391,8 @@ class WorkspaceSession:
             return
 
         try:
-            # Wake every watcher before joining any one of them. No session lock
-            # is held while joining because a watcher may be finishing a refresh.
+            # Wake every watcher before joining any one of them. Join without the
+            # session lock, because a watcher may be finishing a refresh.
             for watcher in watchers:
                 watcher._request_stop()
             for watcher in watchers:
@@ -522,12 +521,12 @@ class WorkspaceSession:
     ) -> tuple[CodeAction, ...]:
         """Quick fixes anchored to diagnostics intersecting a line range.
 
-        Anchoring is line-granular (``start_character`` / ``end_character``
-        are accepted for LSP shape parity but not used to trim the match):
-        every diagnostic whose line falls within ``[start_line, end_line]``
-        and whose code is fixable contributes its actions. The file is parsed
-        once; when it does not parse, no actions are produced (every fix needs
-        the AST). All actions are ``kind == "quickfix"``.
+        Anchoring is line-granular. Every diagnostic whose line falls within
+        ``[start_line, end_line]`` and whose code is fixable contributes its
+        actions. ``start_character`` and ``end_character`` are accepted for LSP
+        shape parity and play no part in the match. The file is parsed once. A
+        file that fails to parse yields no actions, since every fix needs the
+        AST. All actions are ``kind == "quickfix"``.
         """
         del start_character, end_character
         with self._state_lock:
@@ -688,7 +687,7 @@ class WorkspaceSession:
     ) -> list[CodeAction]:
         edits: list[CodeActionEdit]
         if isinstance(node, ast.ImportFrom):
-            # The from-module itself is unresolvable — the whole statement goes.
+            # The from-module itself is unresolvable, so the whole statement goes.
             edit = self._whole_statement_edit(importer_path, source, node)
             edits = [edit] if edit is not None else []
         else:
@@ -1011,13 +1010,13 @@ class WorkspaceSession:
     def _name_is_used_in_file(self, mirror_path: str, resolved: ResolvedTarget) -> bool:
         """Is ``resolved`` referenced from inside ``mirror_path`` itself?
 
-        The unused-import check only ever asks about hits in the importing
-        file, so it scans that one file's occurrences rather than resolving
-        every same-named occurrence in the workspace and then discarding the
-        other files' hits. It matches on `find_references`' rule minus the
-        ``include_declaration`` filter, so a declaration of the target counts
-        as a use here; that can only overreport use, and so never reports a
-        live import as unused.
+        The unused-import check only asks about hits in the importing file. So
+        this scans that one file's occurrences and skips resolving every
+        same-named occurrence in the workspace only to discard the other files'
+        hits. It matches with `find_references`' rule minus the
+        ``include_declaration`` filter, so a declaration of the target counts as
+        a use here. That can only overreport use, so a live import always counts
+        as used.
         """
         target = self._symbol_id_for_resolved(resolved)
         if target is None:
@@ -1139,9 +1138,10 @@ class WorkspaceSession:
         """Declaration-driven completion candidates for the caret position.
 
         Offers bare-name, attribute (``module.``/``class.``), and import
-        completions drawn from real symbol-table bindings — never inferred
-        runtime types. Returns ``()`` when the caret is inside a string/comment,
-        outside the workspace, or otherwise has nothing sensible to offer.
+        completions drawn from real symbol-table bindings. Runtime types are
+        never inferred. Returns ``()`` when the caret is inside a string or
+        comment, outside the workspace, or otherwise has nothing sensible to
+        offer.
         """
         with self._state_lock:
             self._check_open()
@@ -1160,7 +1160,7 @@ class WorkspaceSession:
             items: list[CompletionItem] = []
             if kind == "name":
                 prefix = context[1]
-                # Local symbols need the current file to parse; the caret line is
+                # Local symbols need the current file to parse. The caret line is
                 # usually the only broken part, so analyse a repaired copy.
                 with self._repaired_current_file(mirror_path, source, line) as ok:
                     if ok:
@@ -1227,14 +1227,15 @@ class WorkspaceSession:
 
     @contextlib.contextmanager
     def _repaired_current_file(self, mirror_path: Path, original: str, line: int) -> Iterator[bool]:
-        """Temporarily write a caret-line-repaired copy of the current file to
-        the mirror so symbol-table and resolution queries can run against a
-        parseable buffer, then restore the exact original bytes.
+        """Temporarily write a caret-line-repaired copy of the current file to the mirror.
+
+        Symbol-table and resolution queries can then run against a parseable
+        buffer. On exit the original bytes are restored unchanged.
 
         Yields ``True`` when a repaired, parseable buffer is in place (or the
-        original already parsed), ``False`` when even the repaired buffer is
-        unparseable. Held under ``self._state_lock`` for its whole lifetime, so
-        the transient mirror state is never observed by other threads."""
+        original already parsed). Yields ``False`` when even the repaired buffer
+        fails to parse. Held under ``self._state_lock`` for its whole lifetime,
+        so other threads never observe the transient mirror state."""
         if _source_parses(original):
             yield True
             return
@@ -1377,8 +1378,8 @@ class WorkspaceSession:
     def _workspace_module_completions(self, prefix: str, *, full: bool) -> list[CompletionItem]:
         index = workspace_symbol_index(self.db, self.mirror_root)
         modules = {entry.module for entry in index.entries}
-        # ``full`` offers dotted module names (import position); otherwise the
-        # top-level package component (bare-name position).
+        # ``full`` offers dotted module names (import position). Otherwise offer
+        # the top-level package component (bare-name position).
         names = modules if full else {module.split(".")[0] for module in modules}
         items: list[CompletionItem] = []
         for name in names:
@@ -1413,10 +1414,11 @@ class WorkspaceSession:
         """Members of ``owner`` when it resolves to a workspace module or class.
 
         A single-component ``owner`` (``M.``) keeps the shared public resolver path.
-        A dotted ``owner`` is handled longest-match-first: the whole owner as a
-        workspace module (``pkg.sub.``), else ``head.Class`` where ``head`` is a
-        workspace module and ``Class`` a class in it (``pkg.sub.C.``, ``M.C.``).
-        Instance chains (``obj.attr.``) resolve to nothing — no type inference.
+        A dotted ``owner`` is matched longest first. The whole owner is tried as a
+        workspace module (``pkg.sub.``). Failing that, ``head.Class`` is tried,
+        where ``head`` is a workspace module and ``Class`` a class in it
+        (``pkg.sub.C.``, ``M.C.``). Instance chains (``obj.attr.``) resolve to
+        nothing, because there is no type inference.
         """
         if "." in owner:
             return self._dotted_owner_completions(mirror_path, owner, prefix, binding)
@@ -1435,7 +1437,8 @@ class WorkspaceSession:
             if imported is None or (imported != owner and not imported.startswith(f"{owner}.")):
                 return []
             return self._module_member_completions(owner, prefix)
-        # Rule 2: ``head.Class`` — head is a workspace module, Class a class in it.
+        # Rule 2: ``head.Class``, where head is a workspace module and Class a
+        # class in it.
         head, _, last = owner.rpartition(".")
         module = self._resolve_owner_module(mirror_path, head)
         if module is None:
@@ -1447,20 +1450,22 @@ class WorkspaceSession:
         return self._class_member_completions_from_index(module, last, prefix)
 
     def _is_workspace_module(self, name: str) -> bool:
-        """True when `name` is exactly a module in the workspace symbol index.
+        """True when `name` names a module in the workspace symbol index.
 
-        Exact match keeps dotted-owner resolution unambiguous — module names
-        are unique per path, so there is no fuzzy ``import`` guessing."""
+        The match is exact, which keeps dotted-owner resolution unambiguous.
+        Module names are unique per path, so no fuzzy ``import`` guessing is
+        needed."""
         index = workspace_symbol_index(self.db, self.mirror_root)
         return any(entry.module == name for entry in index.entries)
 
     def _resolve_owner_module(self, mirror_path: Path, owner: str) -> str | None:
         """The workspace module `owner` denotes, or ``None``.
 
-        A dotted `owner` matches a module by exact index name; a single bare
-        name is resolved through the file's imports (the shared public resolver) and
-        accepted only when it lands on a workspace *module* (no source range —
-        a specific symbol range would mean a class / function / variable)."""
+        A dotted `owner` matches a module by exact index name. A single bare
+        name is resolved through the file's imports (the shared public
+        resolver). It is accepted only when it lands on a workspace *module*,
+        which has no source range. A specific symbol range would mean a class,
+        function or variable."""
         if self._is_workspace_module(owner):
             return owner
         if "." in owner:
@@ -1482,7 +1487,7 @@ class WorkspaceSession:
     ) -> list[CompletionItem]:
         """Members of ``module.class_name`` drawn from the workspace index.
 
-        Returns ``[]`` unless ``class_name`` is actually a class in ``module``."""
+        Returns ``[]`` unless ``class_name`` is a class in ``module``."""
         index = workspace_symbol_index(self.db, self.mirror_root)
         member_prefix = f"{class_name}."
         is_class = False
@@ -1541,10 +1546,10 @@ class WorkspaceSession:
                     items.append(item)
             return items
         if owner_symbol.kind == "class":
-            # ``owner`` is a class → offer the flattened CLASS view (own +
-            # inherited methods and class vars, no instance attributes) from the
-            # `class_model` surface, so `Derived.` sees members from workspace
-            # bases just like `self.`/`cls.`/annotated-name completion do.
+            # ``owner`` is a class → offer the flattened CLASS view from the
+            # `class_model` surface: own and inherited methods and class vars, no
+            # instance attributes. `Derived.` then sees members from workspace
+            # bases, as `self.`/`cls.`/annotated-name completion do.
             model = self._remap_class_model(
                 class_model(self.db, self.mirror_root, str(defining_mirror), owner_bare)
             )
@@ -1553,7 +1558,7 @@ class WorkspaceSession:
                     continue
                 items.append(self._class_member_completion_item(member))
             return items
-        # Owner is a function/variable/etc — no member completion.
+        # A function, variable or other owner gets no member completion.
         return []
 
     def _self_or_cls_completions(
@@ -1564,13 +1569,14 @@ class WorkspaceSession:
         owner: str,
         prefix: str,
     ) -> list[CompletionItem]:
-        """Own members of the class enclosing a ``self.``/``cls.`` caret.
+        """Members of the class enclosing a ``self.``/``cls.`` caret.
 
-        The enclosing method is resolved from the (caret-line-repaired) buffer;
-        the owner identifier must be the method's literal first parameter
+        The enclosing method is resolved from the (caret-line-repaired) buffer.
+        The owner identifier must be the method's literal first parameter
         (``self`` → instance view, ``cls`` → class view). The declaration-only
-        member set comes from the ``class_model`` integration surface — no type
-        inference, own members only (Stage 1)."""
+        member set comes from the ``class_model`` integration surface. It holds
+        the class's own members and those inherited from workspace bases. There
+        is no type inference."""
         parse_source = source if _source_parses(source) else _repair_caret_line(source, line)
         try:
             tree = _parse_python(parse_source)
@@ -1616,16 +1622,17 @@ class WorkspaceSession:
         owner: str,
         prefix: str,
     ) -> list[CompletionItem]:
-        """Rule A — instance-view completions for a bare, annotated ``owner``.
+        """Rule A: instance-view completions for a bare, annotated ``owner``.
 
         Applies when ``owner`` is neither ``self``/``cls`` nor resolvable by the
-        shared public resolver attribute path: its declared annotation is followed to
-        a workspace class and that class's instance view (methods + class vars +
-        instance vars, via ``class_model``) is offered. The declaration is looked
-        up on the caret-line-repaired current buffer only — see
-        :func:`_annotation_expr_for_name_at` — falling back to the module-level
-        ``variable`` symbol's annotation. No type inference: only the annotation
-        shapes accepted by :meth:`_workspace_class_from_annotation` resolve."""
+        shared public resolver attribute path. Its declared annotation is
+        followed to a workspace class, and that class's instance view is
+        offered (methods, class vars and instance vars, via ``class_model``).
+        The declaration is looked up only on the caret-line-repaired current
+        buffer (see :func:`_annotation_expr_for_name_at`). The fallback is the
+        module-level ``variable`` symbol's annotation. There is no type
+        inference. Only the annotation shapes accepted by
+        :meth:`_workspace_class_from_annotation` resolve."""
         parse_source = source if _source_parses(source) else _repair_caret_line(source, line)
         try:
             tree = _parse_python(parse_source)
@@ -1660,8 +1667,9 @@ class WorkspaceSession:
         return items
 
     def _module_variable_annotation(self, mirror_path: Path, name: str) -> str | None:
-        """Annotation text of the module-level ``variable`` symbol ``name`` in
-        the current file, or ``None`` — Rule A's priority-3 declaration lookup."""
+        """Annotation of the module-level ``variable`` ``name`` in this file, or ``None``.
+
+        This is Rule A's priority-3 declaration lookup."""
         table = module_symbol_table(self.db, self.mirror_root, str(mirror_path))
         for symbol in table.symbols:
             if (
@@ -1679,14 +1687,15 @@ class WorkspaceSession:
         """Resolve ``annotation_text`` to a verified workspace ``class`` symbol.
 
         Accepts a bare ``Name`` (``Foo``) or a one-hop ``Attribute`` of a bare
-        ``Name`` (``mod.Foo``); a whole-string forward reference (``"Foo"``,
-        ``"mod.Foo"``) is unwrapped exactly once. Subscripted / generic / union /
-        deep-dotted / callable shapes resolve to ``None``. ``Foo`` is resolved in
-        ``mirror_path``'s module context; ``mod.Foo`` resolves ``mod`` to a
-        workspace module then ``Foo`` within it (the ``_resolve_class_target``
-        idiom). The target is confirmed a workspace class against its defining
-        file's table by the ``(lineno, qualified_name, kind == "class")`` check
-        (the ``prepare_type_hierarchy`` idiom); anything else returns ``None``."""
+        ``Name`` (``mod.Foo``). A whole-string forward reference (``"Foo"``,
+        ``"mod.Foo"``) is unwrapped once and only once. Subscripted, generic,
+        union, deep-dotted and callable shapes resolve to ``None``. ``Foo`` is
+        resolved in ``mirror_path``'s module context. ``mod.Foo`` resolves
+        ``mod`` to a workspace module, then ``Foo`` within it (the
+        ``_resolve_class_target`` idiom). The target counts as a workspace
+        class when its defining file's table holds a symbol with the same
+        qualified name and ``kind == "class"`` (the ``prepare_type_hierarchy``
+        idiom). Anything else returns ``None``."""
         try:
             body: ast.expr = _parse_python(annotation_text, mode="eval").body
         except SyntaxError:
@@ -1776,12 +1785,12 @@ class WorkspaceSession:
         """Return one reference-count `CodeLens` per top-level `def`/`class`.
 
         Each lens spans the definition's bare-name identifier range on its
-        header line and carries a `title` of `"N reference"` /
-        `"N references"`, counting workspace references reported by
-        `find_references` with `include_declaration=False`. Methods, class
-        variables, import aliases, and other non-top-level symbols emit no
-        lens — references on those are not reliably resolvable through the
-        symbol resolver. Files that fail to parse or have no symbols emit
+        header line. Its `title` is `"N reference"` or `"N references"`,
+        counting the workspace references `find_references` reports with
+        `include_declaration=False`. Only top-level functions and classes get a
+        lens. Methods, class variables, import aliases, and other non-top-level
+        symbols get none, because the symbol resolver cannot reliably resolve
+        references to them. Files that fail to parse or have no symbols return
         an empty tuple.
         """
         with self._state_lock:
@@ -1843,27 +1852,25 @@ class WorkspaceSession:
 
         Walks the AST for ``ast.Call`` nodes whose call-function span starts
         inside the half-open LSP range ``[(start_line, start_character),
-        (end_line, end_character))`` (omit ``end_line`` to scan the whole
-        file). For each call whose callee resolves to a workspace function
-        or class, positional arguments are matched against the callee's
-        positional parameters from `Signature.parameters` and a single
-        ``"name:"`` hint is emitted at each argument's start position with
+        (end_line, end_character))``. Omit ``end_line`` to scan the whole
+        file. For each call whose callee resolves to a workspace function or
+        class, positional arguments are matched against the callee's
+        positional parameters from `Signature.parameters`. Each argument gets
+        a single ``"name:"`` hint at its start position, with
         ``kind="parameter"`` and ``padding_right=True``.
 
         A hint is suppressed when the argument is a bare ``Name`` whose
         identifier already equals the parameter name (the standard
-        no-redundant-hint convention used by other Python language
-        servers). Iteration stops at the first ``*args`` parameter — once a
-        positional parameter consumes a variable number of slots, slot
-        alignment for subsequent arguments is ambiguous. The first
-        ``ast.Starred`` argument similarly stops emission. ``**kwargs``-only
-        parameters are silently skipped since they cannot receive a
-        positional argument.
+        no-redundant-hint convention of other Python language servers).
+        Iteration stops at the first ``*args`` parameter. Once a positional
+        parameter consumes a variable number of slots, the slot alignment of
+        later arguments is ambiguous. The first ``ast.Starred`` argument also
+        stops emission. ``**kwargs``-only parameters are skipped, since they
+        cannot receive a positional argument.
 
-        Targets resolved as stdlib / installed / ambiguous / missing,
-        unproven or rebound receiver chains, subscripted calls
-        (``factory[T](...)``), lambda calls, and files that fail to parse
-        return ``()``.
+        Targets resolved as stdlib, installed, ambiguous or missing return
+        ``()``. So do unproven or rebound receiver chains, subscripted calls
+        (``factory[T](...)``), lambda calls, and files that fail to parse.
         """
         with self._state_lock:
             self._check_open()
@@ -1924,24 +1931,23 @@ class WorkspaceSession:
 
         Walks the document's AST once and emits one ``SemanticToken`` per:
 
-        - ``def`` / ``async def`` header — token type ``"function"`` (or
+        - ``def`` / ``async def`` header: token type ``"function"`` (or
           ``"method"`` when nested inside a ``ClassDef`` body), modifier
           ``"declaration"`` (plus ``"async"`` for ``async def``).
-        - ``class`` header — token type ``"class"``, modifier
+        - ``class`` header: token type ``"class"``, modifier
           ``"declaration"``.
-        - Each function parameter (posonly / positional / vararg / kwonly /
-          kwarg) — token type ``"parameter"``, modifier ``"declaration"``.
+        - Each function parameter (posonly, positional, vararg, kwonly,
+          kwarg): token type ``"parameter"``, modifier ``"declaration"``.
         - Each resolved bare ``ast.Name`` use (Load context). Local bindings
           are classified through the shared lexical scope tree, so parameters
-          and local variables that shadow module bindings retain their local
+          and local variables that shadow module bindings keep their local
           token kind. Module-level uses fall back to the symbol table's kind.
           Attribute uses and unresolved cross-module re-exports are skipped.
 
-        Tokens are sorted by ``(line, character)`` with ``line`` /
-        ``character`` 0-based (LSP-style). Files that fail to parse,
-        non-``.py`` paths, and missing files raise ``FileNotFoundError``
-        for the missing-file case and return ``()`` for the unparseable
-        case.
+        Tokens are sorted by ``(line, character)``, with ``line`` and
+        ``character`` 0-based (LSP-style). Missing files and non-``.py``
+        paths raise ``FileNotFoundError``. Files that fail to parse return
+        ``()``.
 
         """
         with self._state_lock:
@@ -1956,7 +1962,7 @@ class WorkspaceSession:
             mirror_table = module_symbol_table(self.db, self.mirror_root, str(mirror_path))
             table = self._remap_module_symbol_table(mirror_table)
             lexical = scope_tree(self.db, str(mirror_path))
-            # Resolution runs against mirror paths; only the names are consumed.
+            # Resolution runs against mirror paths. Only the names are consumed.
             import_token_types = from_import_semantic_token_types(
                 self.db, self.mirror_root, str(mirror_path), mirror_table
             )
@@ -1972,20 +1978,20 @@ class WorkspaceSession:
         end_line: int | None = None,
         end_character: int = 0,
     ) -> tuple[SemanticToken, ...]:
-        """Return semantic-token classifications for ``path`` filtered to the
-        half-open LSP range ``[(start_line, start_character),
-        (end_line, end_character))``.
+        """Return semantic-token classifications for ``path`` within an LSP range.
 
-        Computes the full document's tokens via the same walk as
-        :meth:`semantic_tokens_for_file` and then filters by token start
-        position. A token at ``(line, character)`` is included when its start
-        position is ``>= (start_line, start_character)`` and (if ``end_line``
-        is provided) strictly less than ``(end_line, end_character)``. Omit
-        ``end_line`` to scan from the start position through end-of-file.
+        The range is the half-open ``[(start_line, start_character),
+        (end_line, end_character))``. Computes the full document's tokens via
+        the same walk as :meth:`semantic_tokens_for_file`, then filters by
+        token start position. A token at ``(line, character)`` is included
+        when its start position is ``>= (start_line, start_character)`` and,
+        if ``end_line`` is provided, strictly less than
+        ``(end_line, end_character)``. Omit ``end_line`` to scan from the
+        start position through end-of-file.
 
-        Coordinate convention matches the LSP wire format (0-based
-        ``line`` / ``character``). Missing files and non-``.py`` paths raise
-        ``FileNotFoundError``; unparseable files return ``()``.
+        Coordinates match the LSP wire format (0-based ``line`` /
+        ``character``). Missing files and non-``.py`` paths raise
+        ``FileNotFoundError``. Unparseable files return ``()``.
         """
         all_tokens = self.semantic_tokens_for_file(path)
         if not all_tokens:
@@ -2010,19 +2016,19 @@ class WorkspaceSession:
         """Resolve the type-definition locations for ``symbol_id``.
 
         Reads the lexical binding's declared annotation (or a module-level
-        function's return annotation), parses it as a Python expression, and
-        resolves the contained type names against the declaration's module. Returns one
-        `TypeDefinitionLocation(path, range)` per workspace-resolved type,
-        deduplicated by path and range.
+        function's return annotation) and parses it as a Python expression.
+        The type names it contains are resolved against the declaration's
+        module. Returns one `TypeDefinitionLocation(path, range)` per
+        workspace-resolved type, deduplicated by path and range.
 
-        Classes are themselves the type — clicking on a class name returns its
-        own definition location. Annotated lexical bindings, including
+        A class is its own type, so clicking on a class name returns its own
+        definition location. Annotated lexical bindings, including
         parameters, resolve their declared types. Import aliases, `from_import`
         aliases, wildcard-import stubs, unannotated bindings, and non-workspace
-        targets return an empty tuple. Whole-string forward references (`x: "Foo"`,
-        `def f() -> "Foo"`) are unwrapped and re-parsed once; partial string
-        annotations (`x: "Foo" | None`) and stdlib / installed / ambiguous type
-        names are skipped.
+        targets return an empty tuple. Whole-string forward references
+        (`x: "Foo"`, `def f() -> "Foo"`) are unwrapped and re-parsed once.
+        Partial string annotations (`x: "Foo" | None`) and stdlib, installed or
+        ambiguous type names are skipped.
         """
         with self._state_lock:
             self._check_open()
@@ -2146,12 +2152,12 @@ class WorkspaceSession:
         """Return the call-hierarchy item(s) for the identifier at the cursor.
 
         Resolves the identifier under ``(line, character)`` (LSP-style 0-based
-        coordinates) through the shared public resolver. If the resolved target is a
-        workspace function, method, or class, a single
-        :class:`CallHierarchyItem` describing that target is returned;
-        otherwise the result is empty. Variables, import aliases,
-        ``from_import`` aliases, wildcard-import stubs, and stdlib /
-        installed / ambiguous / missing targets all return ``()``.
+        coordinates) through the shared public resolver. If the resolved target
+        is a workspace function, method, or class, returns a single
+        :class:`CallHierarchyItem` describing that target. Any other target
+        returns ``()``. That covers variables, import aliases, ``from_import``
+        aliases, wildcard-import stubs, and stdlib, installed, ambiguous or
+        missing targets.
         """
         with self._state_lock:
             self._check_open()
@@ -2196,15 +2202,15 @@ class WorkspaceSession:
         """Return callers of the symbol named ``qualified_name`` (declared in ``path``).
 
         ``find_references(include_declaration=False)`` produces every workspace
-        reference; each reference is attributed to its innermost enclosing
+        reference. Each reference is attributed to its innermost enclosing
         ``def`` / ``async def`` / ``class`` in the same file whose qualified
         name appears in that file's symbol table. References inside nested
         function bodies bubble up to their enclosing top-level function or
-        class method (mirroring ``module_symbol_table``'s qualifier scheme);
-        references at module top level are dropped because there is no caller
-        item to attribute them to. Stdlib / installed / ambiguous / missing
-        targets, and references that don't sit inside any known def/class in
-        the workspace, return ``()``.
+        class method (mirroring ``module_symbol_table``'s qualifier scheme).
+        References at module top level are dropped, because there is no caller
+        item to attribute them to. Stdlib, installed, ambiguous and missing
+        targets return ``()``, as do references that sit outside every known
+        def or class in the workspace.
         """
         with self._state_lock:
             self._check_open()
@@ -2288,17 +2294,17 @@ class WorkspaceSession:
     ) -> tuple[CallHierarchyOutgoingCall, ...]:
         """Return callees called from the body of ``qualified_name`` (declared in ``path``).
 
-        Parses the declaring file's AST once, locates the ``FunctionDef`` /
-        ``AsyncFunctionDef`` / ``ClassDef`` matching ``qualified_name``, and
-        walks its body for ``ast.Call`` nodes — without descending into
-        nested ``FunctionDef`` / ``AsyncFunctionDef`` / ``ClassDef`` /
-        ``Lambda`` scopes, each of which owns its own outgoing-call list.
-        Each bare-name or attribute callee is resolved at its terminal source
-        position through the shared lexical resolver. Proven workspace-module,
-        class, ``self`` / ``cls``, and directly annotated receiver chains can
-        resolve; unproven or rebound chains do not. Subscripted and lambda
-        calls produce no callee. Targets that don't resolve to a workspace
-        function, method, or class are skipped.
+        Parses the declaring file's AST once and locates the ``FunctionDef`` /
+        ``AsyncFunctionDef`` / ``ClassDef`` matching ``qualified_name``. Then
+        walks its body for ``ast.Call`` nodes. The walk skips nested
+        ``FunctionDef`` / ``AsyncFunctionDef`` / ``ClassDef`` / ``Lambda``
+        scopes, since each owns its own outgoing-call list. Each bare-name or
+        attribute callee is resolved at its terminal source position through
+        the shared lexical resolver. Proven workspace-module, class,
+        ``self`` / ``cls``, and directly annotated receiver chains can resolve.
+        Unproven or rebound chains stay unresolved. Subscripted and lambda
+        calls produce no callee. Only targets that resolve to a workspace
+        function, method, or class are kept.
         """
         with self._state_lock:
             self._check_open()
@@ -2389,14 +2395,13 @@ class WorkspaceSession:
         """Return the type-hierarchy item for the identifier at the cursor.
 
         Resolves the identifier under ``(line, character)`` (LSP-style 0-based
-        coordinates) through the shared public resolver. If the resolved target is
-        a workspace class (including a class re-exported through an
-        ``import`` / ``from … import …`` chain), a single
-        :class:`TypeHierarchyItem` describing the declaring ``ClassDef`` is
-        returned; otherwise the result is empty. Functions, methods,
+        coordinates) through the shared public resolver. If the resolved target
+        is a workspace class, returns a single :class:`TypeHierarchyItem`
+        describing the declaring ``ClassDef``. That includes a class
+        re-exported through an ``import`` / ``from … import …`` chain. Any
+        other target returns ``()``. That covers functions, methods,
         variables, import aliases, ``from_import`` aliases, wildcard-import
-        stubs, and stdlib / installed / ambiguous / missing targets all
-        return ``()``.
+        stubs, and stdlib, installed, ambiguous or missing targets.
         """
         with self._state_lock:
             self._check_open()
@@ -2436,20 +2441,19 @@ class WorkspaceSession:
     ) -> tuple[TypeHierarchyItem, ...]:
         """Return the immediate base classes of ``qualified_name`` (declared in ``path``).
 
-        Parses the declaring file's AST once, locates the ``ClassDef``
-        matching ``qualified_name`` (using the same dotted-name walker as
-        ``call_hierarchy_outgoing_calls``), and resolves each entry in its
+        Parses the declaring file's AST once and locates the ``ClassDef``
+        matching ``qualified_name``, using the same dotted-name walker as
+        ``call_hierarchy_outgoing_calls``. Then resolves each entry in its
         ``bases`` list. ``Subscript`` bases (``Generic[T]``, ``Base[T]``) are
         unwrapped to their ``value`` before resolution, so generic base
         classes are still navigated. Bare-name and attribute-chain bases are
         resolved at their terminal source position through the shared lexical
-        resolver, so a chain such as ``pkg.sub.Foo`` works only when its root
-        and each step are proven. ``Starred`` bases, call expressions, and
+        resolver. A chain such as ``pkg.sub.Foo`` works only when its root and
+        each step are proven. ``Starred`` bases, call expressions, and
         unproven or rebound chains produce no entry. Only workspace ``class``
-        targets contribute an item; stdlib / installed / ambiguous / missing
-        bases are dropped.
-        Duplicates (same ``(path, qualified_name)``) are collapsed, and the
-        result is sorted by ``(path, qualified_name)``.
+        targets contribute an item. Stdlib, installed, ambiguous and missing
+        bases are dropped. Duplicates (same ``(path, qualified_name)``) are
+        collapsed, and the result is sorted by ``(path, qualified_name)``.
         """
         with self._state_lock:
             self._check_open()
@@ -2520,23 +2524,21 @@ class WorkspaceSession:
         """Return the immediate workspace subtypes of ``qualified_name``.
 
         Walks the workspace once via :func:`workspace_analysis` and visits
-        every ``ClassDef`` in every Python file, recursing into class
-        bodies so nested classes are eligible subtypes (qualified-name
-        nesting follows ``module_symbol_table``: ``Outer.Inner`` for a
-        class nested inside another class). For each candidate's
-        ``bases`` list, each base expression is unwrapped (``Subscript``
-        bases drop their subscript) and resolved through the candidate
-        file's imports; a candidate is a subtype iff at least one of its
-        resolved bases points at ``(path, qualified_name)``. Resolution
-        of bases follows the same position-based rules as
-        :meth:`type_hierarchy_supertypes`; unproven or rebound chains are
-        skipped. Duplicates by
-        ``(path, qualified_name)`` are collapsed, and the result is
-        sorted by ``(path, qualified_name)``.
+        every ``ClassDef`` in every Python file. It recurses into class bodies,
+        so nested classes are eligible subtypes. Qualified-name nesting follows
+        ``module_symbol_table`` (``Outer.Inner`` for a class nested inside
+        another class). Each base expression in a candidate's ``bases`` list
+        is unwrapped (``Subscript`` bases drop their subscript) and resolved
+        through the candidate file's imports. A candidate is a subtype iff at
+        least one of its resolved bases points at ``(path, qualified_name)``.
+        Bases resolve by the same position-based rules as
+        :meth:`type_hierarchy_supertypes`, and unproven or rebound chains are
+        skipped. Duplicates by ``(path, qualified_name)`` are collapsed, and
+        the result is sorted by ``(path, qualified_name)``.
 
-        Only direct subtypes are returned; LSP clients drill down by
-        calling ``typeHierarchy/subtypes`` recursively on each result.
-        Returns ``()`` when the target itself is not a workspace class.
+        Only direct subtypes are returned. LSP clients drill down by calling
+        ``typeHierarchy/subtypes`` recursively on each result. Returns ``()``
+        when the target itself is not a workspace class.
         """
         with self._state_lock:
             self._check_open()
@@ -2633,8 +2635,8 @@ class WorkspaceSession:
         imports. ``("attr", L, A)`` resolves ``L`` to a workspace module
         and then ``A`` inside that module. The resolved symbol is mapped
         back from the mirror to the real workspace before being returned.
-        Mirrors :meth:`_resolve_call_target`'s shape — kept separate so
-        the two resolvers can diverge without coupling.
+        Mirrors :meth:`_resolve_call_target`'s shape. The two are kept
+        separate so they can diverge without coupling.
         """
         if position is not None:
             return self._resolved_target_at(caller_mirror_path, position)
@@ -2781,10 +2783,10 @@ class WorkspaceSession:
                 )
                 module_name = table.module
 
-        # Ensure the LSP invariant `selectionRange ⊆ range` even for
-        # decorated definitions: the selection line is the header line,
-        # which is always after the first decorator line and before
-        # `end_lineno`, so the range covers it.
+        # The LSP invariant `selectionRange ⊆ range` holds even for decorated
+        # definitions. The selection line is the header line, which always
+        # falls after the first decorator line and before `end_lineno`, so the
+        # range covers it.
         return CallHierarchyItem(
             name=bare_name,
             kind=kind,
@@ -2867,11 +2869,11 @@ class WorkspaceSession:
     def _signature_defaults(
         self, resolved: ResolvedTarget, display_name: str
     ) -> dict[str, str] | None:
-        """Default-value expressions for `resolved`'s callable, extracted from
-        its defining file's source (`Parameter` carries no
-        default, so this is a consumer-side read). Returns ``None`` when the
-        defining source is unavailable or unparseable — defaults are then
-        simply omitted from the signature label."""
+        """Default-value expressions for `resolved`'s callable, read from its defining source.
+
+        `Parameter` carries no default, so this is a consumer-side read.
+        Returns ``None`` when the defining source is unavailable or
+        unparseable. The signature label then omits defaults."""
         if resolved.defining_path is None or resolved.range is None:
             return None
         defining_source = self.source_text(resolved.defining_path)
@@ -3034,9 +3036,9 @@ class WorkspaceSession:
         workspace. The returned edits update every ``import`` and ``from``
         statement across the workspace that currently references one of the
         ``old`` paths' module names, rewriting it to the corresponding ``new``
-        module name. Renames where either side is outside the workspace, is
-        not a ``.py`` file, is ``__init__.py``, or where the resulting module
-        name is unchanged are silently skipped.
+        module name. A rename is skipped when either side is outside the
+        workspace, is not a ``.py`` file, or is ``__init__.py``, or when the
+        resulting module name is unchanged.
 
         Returned spans are 0-based (LSP-style) and reference the files'
         *current* paths (the old paths for the files being renamed).
@@ -3044,18 +3046,18 @@ class WorkspaceSession:
         Three rewrite shapes are produced:
 
         - ``import <old_module> [as alias]`` → replace the dotted-module span
-          with ``<new_module>``; any ``as`` clause is preserved.
+          with ``<new_module>``. Any ``as`` clause is preserved.
         - ``from <old_module> import ...`` → replace the dotted-module span
           (including any leading dots). When the importer is inside the same
           package anchor as both old and new modules, the existing ``level``
-          is preserved and only the relative tail is rewritten; otherwise the
+          is preserved and only the relative tail is rewritten. Otherwise the
           statement is rewritten to absolute form (``level == 0``).
         - ``from <pkg> import <leaf> [as alias]`` where ``<pkg>.<leaf> ==
-          old_module`` and ``old_module`` and ``new_module`` share the same
-          parent package — rewrite ``<leaf>`` to the new leaf, preserving any
+          old_module``, and ``old_module`` and ``new_module`` share the same
+          parent package → rewrite ``<leaf>`` to the new leaf, preserving any
           ``as`` clause. Cross-directory submodule rewrites are intentionally
-          out of scope: they would require either rewriting usage sites or
-          inserting an ``as`` clause, neither of which is well-defined here.
+          out of scope. They would need either rewritten usage sites or an
+          inserted ``as`` clause, and neither is well-defined here.
         """
         with self._state_lock:
             self._check_open()
@@ -3174,9 +3176,9 @@ class WorkspaceSession:
                                 new_text=replacement,
                             )
                         )
-                    # Don't also try the submodule-alias rewrite when the
-                    # whole from-target matched: the from-module rewrite
-                    # already moved the statement to the new path.
+                    # Skip the submodule-alias rewrite when the whole
+                    # from-target matched. The from-module rewrite already
+                    # moved the statement to the new path.
                     continue
                 for alias in node.names:
                     if alias.name == "*":
@@ -3217,7 +3219,7 @@ class WorkspaceSession:
         """Produce a ``from`` clause replacement that resolves to ``new_module``.
 
         Preserves the existing relative ``level`` when the new module lives
-        under the same package anchor; otherwise rewrites to an absolute
+        under the same package anchor. Otherwise rewrites to an absolute
         ``from <new_module>`` form (``level == 0``).
         """
         anchor = _relative_import_anchor(
@@ -3244,27 +3246,27 @@ class WorkspaceSession:
         editor is about to delete from the workspace. The returned edits
         remove every ``import`` / ``from`` statement (or single alias inside
         one) across the workspace that currently references one of those
-        files' module names; the statements would become broken once the
-        files are gone.
+        files' module names. Those statements would break once the files are
+        gone.
 
-        Deletions are silently skipped when the path is outside the
-        workspace, is not a ``.py`` file, or is ``__init__.py`` (package
-        deletions are a separate feature). The returned edits all carry
-        ``new_text == ""``; the spans are 0-based (LSP-style) and reference
-        the importer file's *current* path.
+        A deletion is skipped when the path is outside the workspace, is not a
+        ``.py`` file, or is ``__init__.py`` (package deletions are a separate
+        feature). Every returned edit carries ``new_text == ""``. The spans
+        are 0-based (LSP-style) and reference the importer file's *current*
+        path.
 
         Three rewrite shapes are produced:
 
-        - ``import <deleted_module> [as alias]`` — when this is the only
-          alias in the statement, the whole statement is removed (including
-          its trailing newline); otherwise only the dead alias plus its
-          adjacent comma is removed, leaving the surviving aliases intact.
-        - ``from <deleted_module> import ...`` — the whole statement is
-          removed; every imported name's source module is gone.
+        - ``import <deleted_module> [as alias]``: when this is the only alias
+          in the statement, the whole statement is removed (including its
+          trailing newline). Otherwise only the dead alias plus its adjacent
+          comma is removed, leaving the surviving aliases intact.
+        - ``from <deleted_module> import ...``: the whole statement is
+          removed, since every imported name's source module is gone.
         - ``from <pkg> import <leaf> [as alias]`` where
-          ``<pkg>.<leaf> == deleted_module`` — when this is the only
-          imported name, the whole statement is removed; otherwise only
-          the dead leaf plus its adjacent comma is removed.
+          ``<pkg>.<leaf> == deleted_module``: when this is the only imported
+          name, the whole statement is removed. Otherwise only the dead leaf
+          plus its adjacent comma is removed.
         """
         with self._state_lock:
             self._check_open()
@@ -3450,17 +3452,16 @@ class WorkspaceSession:
         if overlay is not None:
             return overlay
         # `tokenize.open` detects the declared encoding from the leading bytes,
-        # so the read cannot be replaced by a byte read without changing what a
-        # source decodes to. The kind is asked first instead: a workspace is a
-        # directory an editor pointed at, and a pipe or a device sitting in it
-        # would keep this open call waiting for a byte that never arrives.
-        # Asking costs a second read of a file that is about to be read anyway,
-        # which measured too small against the work a session does around it to
-        # be worth restating the kind rule here as a bare stat. Neither spelling
-        # would close the gap between the two steps -- the open below names the
-        # path again either way -- so what the shared helper buys is one place
-        # where the kinds that read as no source are decided, here and on the
-        # platform whose open cannot be asked not to wait.
+        # so a plain byte read would change what a source decodes to. The file
+        # kind is asked first instead. A workspace is a directory an editor
+        # pointed at, and a pipe or a device sitting in it would keep this open
+        # call waiting for a byte that never arrives. Asking costs a second read
+        # of a file that is about to be read anyway. That cost measured too small
+        # against the work a session does around it to justify restating the
+        # kind rule here as a bare stat. Either form leaves a gap between the
+        # two steps, because the open below names the path again. The shared
+        # helper gives one place that decides which kinds read as no source,
+        # here and on the platform whose open cannot be made non-blocking.
         try:
             if read_regular_file_following_links(Path(real_path)) is None:
                 return None
@@ -3643,14 +3644,13 @@ class WorkspaceSession:
         """Flag workspace ``from M import name`` bindings that are never used.
 
         Conservative by design (see the guide's ``unused-import``
-        limitations): only ``from`` imports whose target resolves to a
+        limitations). Only ``from`` imports whose target resolves to a
         workspace module are considered, so that the occurrence scan can
-        actually verify usage. ``import M`` is skipped (attribute usage is
-        under-reported) and stdlib / installed targets are skipped (their
-        usage cannot be verified). ``__init__.py`` files, self-alias
-        re-exports (``from y import z as z``), names another workspace module
-        re-imports from this file, and files with syntax errors are all left
-        alone.
+        verify usage. ``import M`` is skipped because attribute usage is
+        under-reported. Stdlib and installed targets are skipped because their
+        usage cannot be verified. ``__init__.py`` files, self-alias re-exports
+        (``from y import z as z``), names another workspace module re-imports
+        from this file, and files with syntax errors are all left alone.
         """
         if Path(real_path).name == "__init__.py":
             return []
@@ -3659,8 +3659,8 @@ class WorkspaceSession:
             return []
 
         # Deciding there is nothing to check needs only the module analysis, so
-        # it happens before the file is read and parsed: most files import no
-        # workspace name at all and never reach the scan below.
+        # it happens before the file is read and parsed. Most files import no
+        # workspace name at all and stop here, before the scan below.
         workspace_from: dict[tuple[int, str], ResolvedImportRef] = {}
         for resolved_import in module_result.resolved_imports:
             if (
@@ -3689,7 +3689,7 @@ class WorkspaceSession:
             module_result.module, mirror_path, reexports
         )
         # A name listed in this module's own static `__all__` is an intentional
-        # public re-export; removing it would break the facade's API.
+        # public re-export. Removing it would break the facade's API.
         static_all = _static_module_all_names(tree)
 
         diagnostics: list[AnalysisDiagnostic] = []
@@ -3710,9 +3710,9 @@ class WorkspaceSession:
                 if binding in static_all:
                     continue
                 resolved = _resolve_target(self.db, self.mirror_root, mirror_path, binding)
-                # A binding that doesn't resolve to a workspace symbol is a
-                # *broken* import (its own `unresolved-symbol` diagnostic), not
-                # an unused one — leave it to that diagnostic + its quick fix.
+                # A binding that fails to resolve to a workspace symbol is a
+                # *broken* import with its own `unresolved-symbol` diagnostic.
+                # Leave it to that diagnostic and its quick fix.
                 if resolved.resolution != "workspace":
                     continue
                 if self._name_is_used_in_file(mirror_path, resolved):
@@ -3746,13 +3746,13 @@ class WorkspaceSession:
     ) -> set[str]:
         """Names other workspace modules import ``from <file_module>``.
 
-        Removing a ``from M import name`` binding in this file is only safe
-        when the file does not itself re-export ``name`` — i.e. no *other*
-        workspace module does ``from <this_module> import name`` (or
-        ``from <this_module> import *``, which could re-export anything).
+        Removing a ``from M import name`` binding in this file is safe only
+        when the file itself re-exports nothing under ``name``. That holds when
+        no *other* workspace module does ``from <this_module> import name`` or
+        ``from <this_module> import *`` (which could re-export anything).
 
-        A workspace request passes the index it built once for the whole run;
-        single-file callers fall back to building it from the workspace
+        A workspace request passes the index it built once for the whole run.
+        Single-file callers fall back to building it from the workspace
         analysis, which is the same walk this used to do per file.
         """
         if reexports is None:
@@ -4022,14 +4022,13 @@ class WorkspaceSession:
 
         `pyinc.integrations.Diagnostic` has no path field, so an integration that
         needs to name a file interpolates it into the message. Under a session
-        that file is the mirror copy, whose temporary directory is randomly
-        named, which would make the message differ between otherwise identical
-        runs.
+        that file is the mirror copy. Its temporary directory has a random name,
+        which would make the message differ between otherwise identical runs.
 
-        A `-r` target that escapes the root resolves *beside* the mirror rather
-        than under it, so the mirror's parent is mapped too. That pass must come
-        second: the parent is a prefix of the mirror root, so running it first
-        would rewrite every ordinary mirror path.
+        A `-r` target that escapes the root resolves *beside* the mirror, so the
+        mirror's parent is mapped too. That pass must come second. The parent
+        is a prefix of the mirror root, so running it first would rewrite every
+        ordinary mirror path.
         """
 
         remapped = message.replace(self.mirror_root, self.root)

@@ -1,11 +1,11 @@
 """Filesystem primitives used by durable stores, actions and tracked reads.
 
-Two postures live here, and the difference between them is deliberate.
-Writing to a path the library owns opens without following symbolic links,
-because someone who can plant a link where a write lands can redirect that
-write. Reading a file the library was only asked to track is the opposite
-case: a source reached through a link is an ordinary source, so the following
-read guards against the read that never returns instead.
+Two postures live here, and they differ by design. Writing to a path the
+library owns opens without following symbolic links, because someone who can
+plant a link where a write lands can redirect that write. Reading a file the
+library was only asked to track is the opposite case. A source reached through
+a link is an ordinary source, so that read follows links and guards against
+the read that never returns.
 """
 
 from __future__ import annotations
@@ -29,14 +29,14 @@ from .errors import PyIncError
 class UnsafeFilesystemPathError(PyIncError, OSError):
     """A path is unsafe to read from or to write to as a regular file.
 
-    Both a base: it is what the library raises, so ``except PyIncError``
-    reaches it, and it is an ``OSError``, so the handlers that have always
-    caught a failed filesystem call still catch it unchanged.
+    It has two bases. It is the library's own error, so ``except PyIncError``
+    reaches it. It is an ``OSError``, so the handlers that have always caught
+    a failed filesystem call still catch it unchanged.
     """
 
 
 # Win32 file access, sharing, creation, attribute, and information constants.
-# They live here rather than behind an ``os.name`` branch so the security-
+# They live at module level, outside any ``os.name`` branch, so the security-
 # relevant call boundary and buffer layouts can be tested on every platform.
 _WIN_GENERIC_READ = 0x80000000
 _WIN_GENERIC_WRITE = 0x40000000
@@ -459,29 +459,32 @@ def read_regular_file_with_identity(path: Path) -> tuple[bytes, tuple[int, int]]
         os.close(parent_fd)
 
 
-#: Errnos that mean a path names no readable regular file and never will by
-#: being read again, but which CPython gives no dedicated OSError subclass.
-#: Opening a bound unix socket is what reaches here, and the platforms spell
-#: it differently: Linux answers ENXIO, while POSIX leaves opening a socket
-#: to the implementation and the BSDs, macOS among them, answer EOPNOTSUPP.
-#: ENOTSUP is the same number as EOPNOTSUPP on Linux and a different one on
-#: macOS, so naming all three widens nothing where two of them agree.
+#: Errnos that mean a path names no readable regular file, on this read or any
+#: later one, and that CPython gives no dedicated OSError subclass. Opening a
+#: bound unix socket is what reaches here, and the platforms spell it
+#: differently. Linux answers ENXIO. POSIX leaves opening a socket to the
+#: implementation, and the BSDs, macOS among them, answer EOPNOTSUPP. ENOTSUP
+#: is the same number as EOPNOTSUPP on Linux and a different one on macOS, so
+#: naming all three widens nothing where two of them agree.
 _READS_AS_MISSING_ERRNOS = frozenset({errno.ENXIO, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
 def _read_error_means_missing(path: str, error: OSError) -> bool:
     """Report whether a failed open means the path names no readable file.
 
-    Three groups answer the way an absent path does. The errors that name a
-    path whose shape can never be read as a file -- absent, a directory, or
-    reached through a file -- which platform reports which is the platform's
-    business and is why a permission denial cannot be decided by type alone:
-    Windows raises it for a directory where POSIX raises IsADirectoryError,
-    and it is also what an ACL denial on a perfectly ordinary file raises,
-    which must keep propagating. And the errnos with no subclass of their
-    own that mean the same thing -- opening a bound socket is the one that
-    reaches here, under whichever spelling the platform gives it, because
-    Linux and the BSDs answer that open with different errnos.
+    Three groups answer the way an absent path does:
+
+    * The errors that name a path whose shape can never be read as a file:
+      absent, a directory, or reached through a file.
+    * A permission denial on a directory. Which platform reports which error
+      is the platform's business, so a denial needs the path's kind as well
+      as its type. Windows raises PermissionError for a directory where POSIX
+      raises IsADirectoryError. An ACL denial on an ordinary file raises it
+      too, and that one must keep propagating.
+    * The errnos with no subclass of their own that mean the same thing.
+      Opening a bound socket is the one that reaches here, under whichever
+      spelling the platform gives it, because Linux and the BSDs answer that
+      open with different errnos.
     """
     if isinstance(error, (FileNotFoundError, IsADirectoryError, NotADirectoryError)):
         return True
@@ -493,21 +496,20 @@ def _read_error_means_missing(path: str, error: OSError) -> bool:
 def read_regular_file_following_links(path: Path) -> bytes | None:
     """Read a regular file, following symbolic links, without ever blocking.
 
-    The no-follow primitives beside this one guard a trusted write: they
+    The no-follow primitives beside this one guard a trusted write. They
     refuse a symlinked target because an attacker who can plant a link can
-    redirect the write. A tracked read is the opposite posture -- a source
-    file reached through a symlink is an ordinary source file, and a
-    repository whose `src/` is a link, or a virtual environment's
-    site-packages entry, must stay readable. So this one follows links and
-    guards only against the read that never returns: it opens non-blocking,
-    asks the open descriptor what kind of thing it got, and answers a path
-    that is not a regular file the way an absent path is answered. The
-    non-blocking flag is cleared once the kind is known, so an ordinary
-    read of a large file is unaffected.
+    redirect the write. A tracked read is the opposite posture. A source file
+    reached through a symlink is an ordinary source file, and a repository
+    whose `src/` is a link, or a virtual environment's site-packages entry,
+    must stay readable. So this one follows links and guards only against the
+    read that never returns. It opens non-blocking, asks the open descriptor
+    what kind of thing it got, and answers a path that is not a regular file
+    the way an absent path is answered. The non-blocking flag is cleared once
+    the kind is known, so an ordinary read of a large file is unaffected.
 
     Returns None when the path names no readable regular file. Raises for a
-    failure a caller must see -- a permission denial on an ordinary file
-    keeps propagating, exactly as a plain read does.
+    failure a caller must see: a permission denial on an ordinary file keeps
+    propagating, as it does from a plain read.
     """
     if sys.platform == "win32":
         return _read_regular_file_following_links_windows(path)
@@ -537,10 +539,9 @@ def _read_regular_file_following_links_windows(path: Path) -> bytes | None:
     """The same contract where there is no O_NONBLOCK to open with.
 
     Windows has no non-blocking open flag, so the kind is asked first and
-    the read follows. The window between them costs a re-read at worst: a
-    path whose kind changes between the two answers one of the two states
-    it actually held, which is the same guarantee the descriptor-based arm
-    gives.
+    the read follows. The window between them costs a re-read at worst. A
+    path whose kind changes between the two answers one of the two states it
+    held, the same guarantee the descriptor-based arm gives.
     """
     try:
         metadata = os.stat(path)
@@ -987,7 +988,7 @@ def _require_regular_or_missing(parent_fd: int, name: str, path: Path) -> None:
 
 
 def _require_directory_identity(descriptor: int, path: Path) -> None:
-    """Reject an opened POSIX directory that is no longer at ``path``.
+    """Require that ``path`` still names the opened POSIX directory.
 
     POSIX directory descriptors remain usable after a rename. Reopening the
     expected absolute path and comparing identities closes the deterministic

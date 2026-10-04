@@ -65,7 +65,7 @@ def test_package_namespace_exports_json_config_stable_api() -> None:
     assert hasattr(integrations, "json_analysis")
     assert hasattr(integrations, "workspace_json_analysis")
     assert hasattr(integrations, "JsonAnalysis")
-    # Experimental helpers must not leak.
+    # Experimental helpers stay out of the public namespace.
     assert not hasattr(integrations, "json_file_text")
     assert not hasattr(integrations, "json_sections_payload")
     assert not hasattr(integrations, "json_analysis_payload")
@@ -253,7 +253,7 @@ def test_whitespace_only_edit_backdates_json(tmp_path: Path) -> None:
     db = Database()
     first = json_analysis(db, str(path))
 
-    # Reformat with different indentation — semantically identical.
+    # Reformat with different indentation (semantically identical).
     parsed = json.loads(_MINIMAL_JSON)
     path.write_text(json.dumps(parsed, indent=4), encoding="utf-8")
     second = json_analysis(db, str(path))
@@ -268,7 +268,7 @@ def test_semantic_edit_invalidates_downstream(tmp_path: Path) -> None:
     db = Database()
     first = json_analysis(db, str(path))
 
-    # Change a value — semantic edit.
+    # Change a value (a semantic edit).
     parsed = json.loads(_MINIMAL_JSON)
     parsed["version"] = "1.0.0"
     path.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
@@ -278,11 +278,11 @@ def test_semantic_edit_invalidates_downstream(tmp_path: Path) -> None:
 
 
 # Reorder edits. The order an object's keys were written in survives into the
-# public string, which renders them as they were parsed, but not into any sorted
-# projection of the document. `expected` is what the document on the right
-# actually analyses to, so a warm answer still describing the document on the
-# left fails against a value rather than against a marker. The ladder walks the
-# same reorder one, two, three and four containers down.
+# public string, which renders them as they were parsed. Every sorted projection
+# of the document drops that order. `expected` is what the document on the right
+# analyses to, so a warm answer still describing the document on the left fails
+# against a value in place of a marker. The ladder walks the same reorder one,
+# two, three and four containers down.
 _REORDERED_EDITS: tuple[tuple[str, str, str, tuple[Any, ...]], ...] = (
     (
         "a dependency list",
@@ -382,9 +382,9 @@ def test_a_reorder_edit_moves_the_reported_string_value(mode: str, tmp_path: Pat
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_reorder_edit_survives_a_checkpoint(mode: str, tmp_path: Path) -> None:
     # Both the edit and a drive that lets the stale answer form have to happen
-    # before the save. Saving first and editing after does not reproduce: on
+    # before the save. Saving first and editing after fails to reproduce. On
     # reload the resource probe mismatches, the read executes on the new bytes,
-    # and no earlier answer is left to serve -- the row would then be green
+    # and no earlier answer is left to serve. The row would then be green
     # whether or not the defect is present.
     label, before, after, expected = _REORDERED_EDITS[0]
     path = tmp_path / "package.json"
@@ -432,10 +432,10 @@ def test_a_formatting_only_edit_recomputes_the_payloads_and_leaves_the_analysis_
 
     assert first == second, "a reformat moved the analysis"
 
-    # `query_profile()` records executions only and `reset_statistics()` has just
-    # cleared it, so a query that was reused has no row at all -- there is no row
-    # carrying a zero to look for. Labels also carry an argument-hash suffix, so a
-    # lookup by bare query name never matches; match by substring instead.
+    # `query_profile()` records executions only, and `reset_statistics()` has
+    # cleared it. So a query that was reused has no row at all (there is no row
+    # carrying a zero to look for). Labels also carry an argument-hash suffix, so a
+    # lookup by bare query name never matches. Match by substring.
     executed = [profile.query_label for profile in db.query_profile()]
     for name in _PAYLOAD_QUERIES:
         assert any(name in label for label in executed), (
@@ -491,7 +491,7 @@ def test_json_analysis_on_nonexistent_file(tmp_path: Path) -> None:
     db = Database()
     result = json_analysis(db, str(path))
 
-    # Missing file reads as empty string — no sections, no diagnostics.
+    # A missing file reads as an empty string, with no sections and no diagnostics.
     assert result.sections == ()
     assert result.diagnostics == ()
 
@@ -511,7 +511,7 @@ def test_workspace_json_analysis_returns_none_when_missing(tmp_path: Path) -> No
 
 
 def _nested_json(containers: int, key: str = "configuration") -> str:
-    """A document `containers` objects deep — `containers - 1` wrappers plus a leaf."""
+    """A document `containers` objects deep: `containers - 1` wrappers plus a leaf."""
     return f'{{"{key}": ' * (containers - 1) + '{"leaf": 1}' + "}" * (containers - 1)
 
 
@@ -528,7 +528,7 @@ _OVER_DEEP_JSON = '{"a":[' * 2000 + "1" + "]}" * 2000
         ("{}", 1),
         ("[[[]]]", 3),
         ('{"a": {"b": [1]}}', 3),
-        # Brackets inside string literals are not structure.
+        # Brackets inside string literals carry no structure.
         ('{"a": "{{{[[["}', 1),
         ('{"a": "\\\\"}', 1),
         ('{"a": "\\""}', 1),
@@ -612,9 +612,9 @@ def test_over_deep_json_reports_the_same_result_at_every_caller_stack_depth(
         observed.extend(_analyse_at_depth(pad) for pad in (0, 400, 800))
 
     # A fresh thread starts at the bottom of its own Python stack, so the limit set
-    # here is the whole budget the run gets. Without the cap the scanner descends
-    # once per level and this document is accepted from a shallow caller but
-    # exhausts the stack from a deep one — the same file, two cached payloads.
+    # here is the whole budget the run gets. Without the cap, the scanner descends
+    # once per level. This document would then be accepted from a shallow caller
+    # and exhaust the stack from a deep one, giving one file two cached payloads.
     original = sys.getrecursionlimit()
     sys.setrecursionlimit(1000)
     try:
@@ -645,8 +645,8 @@ def test_the_section_walk_does_not_consume_the_interpreter_recursion_budget() ->
     def _walk() -> None:
         walked.append(len(_walk_sections(parsed, "")))
 
-    # The document is parsed outside the lowered limit; what is measured here is the
-    # walk alone, two orders of magnitude below the document's own nesting.
+    # The document is parsed outside the lowered limit. This measures the walk
+    # alone, two orders of magnitude below the document's own nesting.
     original = sys.getrecursionlimit()
     sys.setrecursionlimit(120)
     try:
@@ -684,11 +684,10 @@ def test_a_deep_document_neither_deepens_the_cache_nor_escapes_the_analysis(
     tmp_path: Path,
 ) -> None:
     # What gets cached is a flat tuple of `(name, keys, subsections)` triples, so
-    # its nesting is a property of that shape and not of the document's: the same
-    # document written two orders of magnitude deeper caches exactly as deep. That
-    # is what keeps every accepted document inside the kernel's snapshot limit,
-    # however deep it nests, and it is why the cap is free to sit where the ~1 MiB
-    # payload budget puts it.
+    # its nesting comes from that shape alone. The same document written two orders
+    # of magnitude deeper caches to the same depth. That keeps every accepted
+    # document inside the kernel's snapshot limit, however deep it nests. It is also
+    # why the cap is free to sit where the ~1 MiB payload budget puts it.
     shallow = tmp_path / "shallow.json"
     shallow.write_text(_nested_json(3), encoding="utf-8")
     deep = tmp_path / "deep.json"
@@ -727,8 +726,8 @@ def test_a_deep_document_neither_deepens_the_cache_nor_escapes_the_analysis(
         except Exception as exc:
             observed.append(exc)
 
-    # A large stack and a raised limit, so the diagnostic observed below is the
-    # cap's own and not stack exhaustion. Both are reported as
+    # A large stack and a raised limit, so the diagnostic observed below comes from
+    # the cap and never from stack exhaustion. Both are reported as
     # `json-decode-error`, and only running with budget to spare tells them apart.
     original_limit = sys.getrecursionlimit()
     original_stack = threading.stack_size(64 * 1024 * 1024)
@@ -755,11 +754,11 @@ def test_a_deep_document_neither_deepens_the_cache_nor_escapes_the_analysis(
 # Lone surrogates
 # ---------------------------------------------------------------------------
 #
-# RFC 8259 permits `\uD800`-style escapes and `json.loads` decodes them, but a
-# lone surrogate is not a Unicode scalar value and so cannot cross a cached
-# boundary. Whatever the integration reports for such a document, it has to
-# report it identically on a first read, after an edit, and from a database
-# that never saw the file.
+# RFC 8259 permits `\uD800`-style escapes and `json.loads` decodes them. A lone
+# surrogate is not a Unicode scalar value, so it cannot cross a cached boundary.
+# Whatever the integration reports for such a document, it has to report it
+# identically on a first read, after an edit, and from a database that never saw
+# the file.
 
 
 _SURROGATE_DOCUMENTS: tuple[tuple[str, str], ...] = (
@@ -820,8 +819,8 @@ def test_lone_surrogate_value_is_analyzed_through_its_escaped_repr(tmp_path: Pat
 # Every section re-emits the dot path of all its ancestors, once as its own name
 # and again in its parent's `subsections`, so the cached payload grows
 # quadratically in nesting depth and linearly in key length. `_MAX_JSON_DEPTH`
-# holds the worst case the budget covers — a key of `_BUDGETED_KEY_LENGTH`
-# characters at the cap — under this ceiling, the same ceiling `xml_config` uses.
+# holds the worst case the budget covers (a key of `_BUDGETED_KEY_LENGTH`
+# characters at the cap) under this ceiling. `xml_config` uses the same ceiling.
 _SECTIONS_PAYLOAD_BUDGET = 1024 * 1024
 _BUDGETED_KEY_LENGTH = 20
 
@@ -834,12 +833,13 @@ def test_sections_payload_at_the_cap_stays_within_the_amplification_budget() -> 
     assert len(repr(tuple(sections))) < _SECTIONS_PAYLOAD_BUDGET
 
 
-# The cap is not a size bound, and the two cells below are the two ways past it.
+# The cap bounds nesting depth only. The two cells below are the two ways an
+# accepted document gets past the budget.
 # Both measure the payload the way the cell above does and against the same
-# constant: `_walk_sections` over the parsed document, which is exactly the tuple
+# constant: `_walk_sections` over the parsed document, which is the tuple
 # `json_sections_payload` caches. Both documents are accepted with no
-# diagnostics, so the budget is a property of the cap's own rationale rather than
-# of everything the integration takes.
+# diagnostics. So the budget belongs to the cap's own rationale, and the
+# integration accepts documents past it.
 #
 # Width first. This document is two levels deep, two orders of magnitude inside
 # `_MAX_JSON_DEPTH`, and its payload runs over the budget on sibling count alone.
@@ -902,8 +902,8 @@ def test_stack_exhaustion_diagnostic_does_not_vary_with_the_recursion_message(
     path = tmp_path / "config.json"
     path.write_text('{"a": 1}', encoding="utf-8")
 
-    # CPython names whichever frame ran out of budget, which is a property of the
-    # call site rather than of the file. A cached payload must not carry it.
+    # CPython names whichever frame ran out of budget. That name belongs to the
+    # call site, independent of the file, so a cached payload must leave it out.
     messages = (
         "maximum recursion depth exceeded",
         "maximum recursion depth exceeded while decoding a JSON object from a unicode string",

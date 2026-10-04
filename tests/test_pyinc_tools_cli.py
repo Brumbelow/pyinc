@@ -269,9 +269,8 @@ def test_main_argparse_exits_for_help_version_and_invalid_values(
 class _DiagnosticResult:
     """Stands in for a real analysis result in the diagnostics-aware paths.
 
-    Kept separate from `_AnalysisResult` on purpose: adding a `diagnostics`
-    field there would change every `asdict` payload the default-output tests
-    assert on.
+    Kept apart from `_AnalysisResult`, because a `diagnostics` field there
+    would change every `asdict` payload the default-output tests assert on.
     """
 
     diagnostics: tuple[AnalysisDiagnostic, ...] = ()
@@ -307,7 +306,7 @@ def _install_diagnostic_session(
 def test_default_invocation_output_is_byte_identical(
     session_factory: list[_Session], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The new flags must not perturb the pre-existing default output."""
+    """The new flags leave the existing default output unchanged."""
 
     assert cli.main(["analyze", "/workspace"]) == cli.EXIT_SUCCESS
     assert capsys.readouterr().out == '{\n  "kind": "workspace",\n  "path": null\n}\n'

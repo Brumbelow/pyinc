@@ -1,8 +1,8 @@
 # Benchmark and correctness harness
 
-This harness exercises pyinc's incremental behavior against fresh recomputation and two
+This harness checks pyinc's incremental behavior against fresh recomputation and two
 cache comparators. Correctness and deterministic work counts are release gates. Wall-clock
-timings are environment-specific diagnostics and are never release thresholds.
+timings are environment-specific diagnostics and stay outside the release gates.
 
 ## Run it
 
@@ -19,11 +19,12 @@ python -m bench.run --output bench/results --repetitions 5
 ```
 
 The command launches five isolated Python processes with `PYTHONHASHSEED=0`. It fails if
-`joblib` is unavailable, a worker emits anything other than the fixed 67-row matrix, work
-counts differ between repetitions, or a correctness/work gate fails.
+`joblib` is missing, a worker's rows differ from the fixed 67-row matrix, work counts differ
+between repetitions, or a correctness/work gate fails.
 
-The benchmark workflow is manual and reusable; it is not run for ordinary pushes or pull
-requests. Its uploaded artifacts are the authoritative record for a particular run.
+The benchmark workflow is manual and reusable. It runs on demand, separate from the checks
+on ordinary pushes and pull requests. Its uploaded artifacts are the authoritative record
+for a particular run.
 
 ## Methodology
 
@@ -37,7 +38,7 @@ trees. The four targets are:
 
 Every engine result is compared with a fresh, cache-free recomputation of the same state.
 The fixed comparator set is full recomputation, an intentionally incomplete naive cache,
-and `joblib.Memory`. Joblib applies to the synthetic function-cache comparison; the realistic
+and `joblib.Memory`. Joblib applies to the synthetic function-cache comparison. The realistic
 action-backed targets compare pyinc with fresh recomputation, and calc also carries the
 naive output-cache control.
 
@@ -51,23 +52,23 @@ every graph node's dependency labels), plus each operation's node and edge delta
 
 ## Release gates
 
-Each repetition must contain exactly 67 rows with the fixed target/scenario/engine matrix.
-The following conditions are enforced:
+Each repetition must contain the 67 rows of the fixed target/scenario/engine matrix, and
+no others. The gates enforce:
 
 - every pyinc, full-recompute, and joblib row matches fresh recomputation;
-- exactly two naive-cache controls are stale: the synthetic shared-input edit and calc output
-  tampering;
+- the only stale rows are two naive-cache controls: the synthetic shared-input edit and calc
+  output tampering;
 - unchanged and unreferenced edits execute zero queries;
 - formatting-only edits backdate and perform zero downstream query executions;
-- localized edits perform targeted work, while removals and tampering delete or repair the
+- localized edits perform targeted work, and removals and tampering delete or repair the
   expected files;
 - every pyinc row stays within its reviewed execution, reuse, backdate, resource-load, node,
-  and edge envelope, so a deterministic regression to full-graph recomputation still fails;
+  and edge bounds, so a deterministic regression to full-graph recomputation fails;
 - memo-node ceilings are 16 for synthetic, 24 for calc, 40 for codegen, and 8 for action;
 - deterministic work counts match across all five isolated repetitions.
 
-The release suite separately retains the 1,000-argument LRU and 1,000-module workspace
-scalability tests.
+The 1,000-argument LRU and 1,000-module workspace scalability tests stay in the release
+suite, separate from this harness.
 
 ## Artifacts
 
@@ -79,6 +80,6 @@ The output directory contains only generated artifacts and is ignored by Git:
 - `metadata.json`: exact commit SHA, dirty-tree state, Python/build details, OS/runner and CPU
   information, comparator versions, targets, and repetition count.
 
-Use `samples.csv` and `metadata.json` when investigating timing changes. A timing difference
-without a correctness failure, work-count change, or node-ceiling breach is not a release
-failure.
+Use `samples.csv` and `metadata.json` to investigate timing changes. A timing difference
+with no correctness failure, work-count change, or node-ceiling breach still passes the
+release.

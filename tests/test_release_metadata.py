@@ -175,7 +175,7 @@ def _git(repository: Path, *arguments: str) -> str:
 
 
 def _commit_release_files(repository: Path, version: str, changelog: str) -> str:
-    """Commit pyproject.toml and CHANGELOG.md through plumbing, so no signing is involved."""
+    """Commit pyproject.toml and CHANGELOG.md through plumbing, which skips commit signing."""
 
     _git(repository, "init", "--quiet")
     (repository / "pyproject.toml").write_bytes(_project(version))

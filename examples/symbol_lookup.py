@@ -1,9 +1,9 @@
 """Resolve a source position through a cross-module re-export chain.
 
-Demonstrates the ``symbol_resolution`` integration: given a position on a name
+Demonstrates the ``symbol_resolution`` integration. Given a position on a name
 exported from a facade module, the analysis follows ``from X import Y`` chains
-(with cycle detection and a bounded follow depth) back to where the symbol
-was originally defined.
+back to where the symbol was defined. It detects cycles and bounds the follow
+depth.
 
 Run: ``python examples/symbol_lookup.py``
 """

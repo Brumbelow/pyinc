@@ -43,17 +43,16 @@ Charlie,35,Denver,extra
 _UNFORMATTED_CSV = "name,age\nAlice,30\nBob,25\n"
 _REFORMATTED_CSV = '"name","age"\n"Alice","30"\n"Bob","25"\n\n'
 
-# Written as bytes so the carriage returns reach the parser untranslated: a
-# single quoted column with CRLF line endings, and a file whose only line breaks
-# are bare carriage returns. The parser translates both to newlines before it
-# sniffs, so neither file's line endings reach the sniffer.
+# Written as bytes so the carriage returns reach the parser untranslated. The
+# first is a single quoted column with CRLF line endings. The second uses bare
+# carriage returns as its only line breaks. The parser translates both to
+# newlines before it sniffs, so the sniffer sees plain newlines in each.
 _CRLF_CSV_BYTES = b'"a"\r\n"b"\r\n"c"\r\n'
 _LONE_CR_CSV_BYTES = b"a\rb\rc\r"
 
-# The same single quoted column with ordinary newlines. Nothing about its line
-# endings is unusual, and it is what the two files above look like once they are
-# translated, so it is the shape that shows the quote character is the whole of
-# what gets refused.
+# The same single quoted column with ordinary newlines. It is what the two
+# files above look like after translation, so it shows that the quote character
+# alone is what gets refused.
 _QUOTED_COLUMN_CSV_BYTES = b'"a"\n"b"\n"c"\n'
 
 _REFUSED_QUOTE = (
@@ -78,7 +77,7 @@ def test_package_namespace_exports_csv_data_stable_api() -> None:
     assert hasattr(integrations, "CsvAnalysis")
     assert hasattr(integrations, "CsvColumn")
 
-    # Experimental helpers must not leak.
+    # Experimental helpers stay private.
     assert not hasattr(integrations, "csv_file_text")
     assert not hasattr(integrations, "csv_columns_payload")
     assert not hasattr(integrations, "csv_meta_payload")
@@ -144,7 +143,7 @@ def test_csv_analysis_no_header(mode: str, tmp_path: Path) -> None:
     db = Database(mode=mode)
     result = csv_analysis(db, str(path))
 
-    # Sniffer may or may not detect header; check columns exist
+    # Header detection varies with the sniffer, so check only that columns exist.
     assert len(result.columns) > 0
     assert result.row_count >= 1
 
@@ -230,7 +229,7 @@ def test_trailing_whitespace_edit_backdates_csv(tmp_path: Path) -> None:
     db = Database()
     first = csv_analysis(db, str(path))
 
-    # Add trailing newlines — semantically identical
+    # Trailing newlines leave the content semantically identical.
     path.write_text("name,age\nAlice,30\n\n\n", encoding="utf-8")
     second = csv_analysis(db, str(path))
 
@@ -279,7 +278,7 @@ def test_diagnostic_only_edit_invalidates_csv(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Reformatting costs nothing above the payloads
+# Reformatting reuses everything above the payloads
 # ---------------------------------------------------------------------------
 
 # The three queries that re-read the text and re-derive a projection of it.
@@ -302,10 +301,9 @@ def test_a_reformat_recomputes_the_payloads_and_leaves_the_composition_reused(
 
     assert first == second, f"a reformat moved the analysis | first {first} | second {second}"
 
-    # `query_profile()` records executions only, and `reset_statistics()` has
-    # just cleared it, so a query that was reused has no row at all -- there is
-    # no row carrying a zero to look for. Labels also carry an argument-hash
-    # suffix, so a lookup by bare query name never matches; match by substring.
+    # `query_profile()` records only executions, and `reset_statistics()` cleared
+    # it, so a reused query is absent from the profile. Labels carry an
+    # argument-hash suffix, so match query names by substring.
     executed = [profile.query_label for profile in db.query_profile()]
     for name in _PAYLOAD_QUERIES:
         assert any(name in label for label in executed), (
@@ -315,10 +313,10 @@ def test_a_reformat_recomputes_the_payloads_and_leaves_the_composition_reused(
         f"csv_analysis_payload re-ran instead of staying reused | executed {executed}"
     )
 
-    # Absolute counts for the second read, not deltas: the read executes on the
-    # new bytes, the three payload queries re-derive equal projections and are
-    # backdated, and everything above them is reused. The reuse figure is what
-    # the reformat is supposed to cost nothing on.
+    # Absolute counts for the second read. The read executes on the new bytes.
+    # The three payload queries re-derive equal projections and are backdated.
+    # Everything above them is reused, and the reuse count shows the reformat
+    # costs nothing there.
     statistics = db.statistics()
     counts = (
         statistics.query_executions,
@@ -347,12 +345,12 @@ def test_a_reformat_leaves_workspace_discovery_identical(mode: str, tmp_path: Pa
 # Checkpoints
 # ---------------------------------------------------------------------------
 
-# The ordering other integrations use -- edit, drive the entrypoint so a stale
-# answer forms, then save -- is unconstructible here: this read compares the text
-# it hands back, so there is no answer that disagrees with the file to save. The
-# substitute edits the file after the save, which the reload has to notice. The
-# second arm is what keeps that honest: with no edit the saved answer and a fresh
-# one agree, and the row would pass on any tree at all.
+# Other integrations edit, drive the entrypoint so a stale answer forms, then
+# save. That order is impossible here. This read compares the text it returns,
+# so every saved answer agrees with the file. These tests edit the file after
+# the save instead, and the reload has to notice. The second assertion keeps the
+# test meaningful. Without the edit, the saved answer and a fresh one would
+# agree, and the row would pass on any tree.
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
@@ -408,7 +406,7 @@ def test_a_checkpoint_reload_over_an_unchanged_file_runs_nothing(
 
 
 # ---------------------------------------------------------------------------
-# Dialects no reader can use
+# Unusable dialects
 # ---------------------------------------------------------------------------
 
 
@@ -424,10 +422,9 @@ def _shape_of(analysis: CsvAnalysis) -> tuple[object, ...]:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_crlf_file_is_read_as_comma_delimited(mode: str, tmp_path: Path) -> None:
-    # The whole answer, not just the delimiter. Translating the line endings is
-    # what stops the file's own line breaks reaching the sniffer, and refusing
-    # the quote character is what stops the guess it makes instead deciding the
-    # answer, so the row pins all of it rather than only the field that moved.
+    # Pin the whole answer, delimiter included. Translating the line endings
+    # keeps the file's own line breaks away from the sniffer. Refusing the quote
+    # character keeps the sniffer's guess from deciding the answer.
     path = tmp_path / "data.csv"
     path.write_bytes(_CRLF_CSV_BYTES)
 
@@ -442,10 +439,10 @@ def test_a_crlf_file_is_read_as_comma_delimited(mode: str, tmp_path: Path) -> No
 def test_a_carriage_return_only_file_is_read_like_any_other_line_ending(
     mode: str, tmp_path: Path
 ) -> None:
-    # Three rows and no diagnostic at all: bare carriage returns are translated
-    # like every other line ending, and the text left over is an unquoted single
-    # column the sniffer cannot call either way, which is the comma fallback's
-    # ordinary silent case rather than anything this file did wrong.
+    # Three rows and an empty diagnostics tuple. Bare carriage returns are
+    # translated like every other line ending. What remains is an unquoted single
+    # column the sniffer cannot decide, so the comma fallback applies silently,
+    # as it does for any ordinary file of that shape.
     path = tmp_path / "data.csv"
     path.write_bytes(_LONE_CR_CSV_BYTES)
 
@@ -460,10 +457,10 @@ def test_a_carriage_return_only_file_is_read_like_any_other_line_ending(
 def test_a_quoted_single_column_file_is_read_as_comma_delimited(
     mode: str, tmp_path: Path
 ) -> None:
-    # No carriage return anywhere in this file, so nothing here is about line
-    # endings: the sniffer reads a column of quoted fields and answers with the
-    # quote character, which some readers accept and others refuse. Refusing it
-    # here is what keeps this file's answer off that difference.
+    # This file uses plain newlines, so the case is about quoting alone. The
+    # sniffer reads a column of quoted fields and answers with the quote
+    # character, which some readers accept and others refuse. Refusing it here
+    # gives this file the same answer under every reader.
     path = tmp_path / "data.csv"
     path.write_bytes(_QUOTED_COLUMN_CSV_BYTES)
 
@@ -478,10 +475,9 @@ def test_a_quoted_single_column_file_is_read_as_comma_delimited(
 def test_the_read_returns_the_bytes_and_the_payloads_choose_the_dialect(
     mode: str, tmp_path: Path
 ) -> None:
-    # Warm first, then edit. A cold read has no earlier answer to compare
-    # against, so it cannot show which layer the dialect decision belongs to;
-    # the second read is where a comparison happens and where the whole question
-    # of what this query is allowed to know about the text arises.
+    # Warm first, then edit. Only the second read compares against an earlier
+    # answer, so only it shows which layer owns the dialect decision and what
+    # this query may know about the text.
     path = tmp_path / "data.csv"
     path.write_text(_UNFORMATTED_CSV, encoding="utf-8")
 

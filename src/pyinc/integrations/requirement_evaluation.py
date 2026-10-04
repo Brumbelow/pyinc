@@ -169,7 +169,7 @@ _DIRECTORIES = DirectoryResource()
 
 
 # ---------------------------------------------------------------------------
-# PEP 508 — marker tokenization and parsing
+# PEP 508 marker tokenization and parsing
 # ---------------------------------------------------------------------------
 
 _TOK_NAME_PAT = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -226,7 +226,7 @@ def _tokenize_marker(text: str) -> list[tuple[str, str]] | None:
         elif word == "in":
             tokens.append(("OP", "in"))
         elif word == "not":
-            # Only 'not in' is valid in PEP 508; peek ahead for 'in'
+            # PEP 508 allows 'not' only in 'not in', so peek ahead for 'in'.
             j = i + len(word)
             while j < n and text[j].isspace():
                 j += 1
@@ -363,7 +363,7 @@ def _parse_marker(text: str) -> _MarkerNode | None:
 
 
 # ---------------------------------------------------------------------------
-# PEP 508 — marker evaluation
+# PEP 508 marker evaluation
 # ---------------------------------------------------------------------------
 
 _MARKER_VARIABLES = frozenset(
@@ -433,14 +433,14 @@ _VERSION_MARKER_VARIABLES = frozenset(
 def _literal_is_version_shaped(literal: str) -> bool:
     """Whether ``literal`` could plausibly form a PEP 440 specifier clause.
 
-    ``parse_specifier_set`` intentionally defers non-wildcard version-format
-    validation to ``satisfies`` (see Task 3) so that ``evaluate_version_specifier``
-    can report a specific "cannot evaluate" detail instead of an upfront parse
-    failure. Marker evaluation needs the sharper distinction that packaging's
-    ``Specifier`` constructor makes: a clause whose text is not version-shaped
-    at all (e.g. ``==6.5.0-28-generic``) is invalid and must fall back to the
-    string table, as opposed to a clause that is well-formed but simply
-    doesn't match the environment's value.
+    ``parse_specifier_set`` leaves version-format checks on non-wildcard
+    clauses to ``satisfies`` (see Task 3). That lets ``evaluate_version_specifier``
+    report a specific "cannot evaluate" detail in place of an early parse
+    failure. Marker evaluation needs the sharper split that packaging's
+    ``Specifier`` constructor makes. A clause whose text is not version-shaped
+    (e.g. ``==6.5.0-28-generic``) is invalid and falls back to the string
+    table. A well-formed clause is compared as a version, even when it fails to
+    match the environment's value.
     """
     base = literal[:-2] if literal.endswith(".*") else literal
     return parse_version(base) is not None
@@ -474,12 +474,12 @@ def _eval_compare(
         return _env_lookup(text, env)
 
     op = node.op
-    # packaging's evaluation triple, with no side normalization and no
-    # operator inversion: the comparison text always comes from the right
-    # node -- a right-side variable contributes its NAME when the left side
+    # Follows packaging's evaluation triple as is: sides stay unnormalized and
+    # operators keep their direction. The comparison text always comes from
+    # the right node. A right-side variable gives its NAME when the left side
     # is also a variable, and its environment value when the left side is a
-    # literal (or when neither side is a variable, in which case there is no
-    # key to look up and the comparison falls straight to the string table).
+    # literal. When both sides are literals the key is empty, so the
+    # comparison goes straight to the string table.
     if node.left_kind == "name":
         lhs = env_value(node.left)
         key = node.left
@@ -509,10 +509,10 @@ def _eval_compare(
                 )
             return ok
 
-    # packaging's fixed fallback table for a non-version key, or a version
-    # key whose clause didn't parse: "<" and ">" are always False, "<=",
-    # ">=", and "==" are string equality, and "!=" is string inequality.
-    # "~=" has no entry -- it has no meaning outside a version comparison.
+    # packaging's fixed fallback table, used for a non-version key or for a
+    # version key whose clause failed to parse. "<" and ">" are always False.
+    # "<=", ">=" and "==" are string equality, and "!=" is string inequality.
+    # "~=" has no entry because it only has meaning in a version comparison.
     if op in ("<", ">"):
         return False
     if op in ("<=", ">=", "=="):
@@ -531,7 +531,7 @@ def _eval_compare(
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: Payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -542,7 +542,7 @@ def python_environment_snapshot(db: Database) -> PythonEnvironmentPayload:
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition queries (NOT re-exported from pyinc.integrations)
+# Layer 2: Composition queries (not re-exported from pyinc.integrations)
 # ---------------------------------------------------------------------------
 
 
@@ -654,11 +654,11 @@ def _evaluate_requirement(
             tuple(diagnostics),
         )
 
-    # Shared with dependency_check so the two installed-version surfaces
-    # cannot diverge: an already-installed pre-release is evaluated against
-    # the specifier rather than excluded (exclusion is a resolver
-    # candidate-selection rule), and a constraint the evaluator cannot decide
-    # is ambiguous, never reported as a mismatch.
+    # Shared with dependency_check so both installed-version surfaces agree.
+    # An installed pre-release is checked against the specifier, because
+    # excluding pre-releases is a resolver rule for choosing candidates. A
+    # constraint the evaluator cannot decide is reported as ambiguous, never
+    # as a mismatch.
     status, detail = _check_version_constraints(version_spec, installed)
     return (
         (normalized, version_spec, markers, True, installed, status, detail),
@@ -687,7 +687,7 @@ def applicable_requirements_payload(
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: Entrypoints
 # ---------------------------------------------------------------------------
 
 

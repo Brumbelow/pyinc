@@ -1,26 +1,25 @@
 """What the integration surface is, and where it may be called from.
 
-The first cells lock the shape of the package: cross-module imports go through
+The first cells lock the shape of the package. Cross-module imports go through
 declared contracts, and a payload query stays out of the package-level surface.
 
 The rest lock the calling context. A high-level entrypoint is called from
-outside a query; reaching one from inside a query body is refused. Every
-documented entrypoint is driven both ways here -- from inside a real query
-body, where none of them runs, and from outside one, where all of them answer.
-The property harness cannot stand in for this: it reaches the entrypoints from
-plain test bodies and never from a query, so it holds no opinion about the
-calling context at all. That is why the composition family lives beside the
-surface lock rather than in the harness.
+outside a query, and a query body that reaches one is refused. Every documented
+entrypoint is driven both ways here: from inside a real query body, where each
+is refused, and from outside one, where each answers. The property harness
+reaches the entrypoints only from plain test bodies, so it says nothing about
+the calling context. That is why the composition family lives beside the
+surface lock and outside the harness.
 
-A further group varies how the query spells the name -- through a local import,
-through the entrypoint's module, or in a branch the body never takes -- because
-a rule that held for one spelling and not the others would leave the boundary
-where it was found. What every cell there pins is that the entrypoint does not
-run; which of the two refusals arrives is not part of the rule.
+A further group varies how the query spells the name: through a local import,
+through the entrypoint's module, or in a branch the body never takes. The rule
+has to hold for every spelling. A rule that covered only one would leave the
+boundary where it was. Every cell there pins that the entrypoint does not run.
+Which of the two refusals arrives is outside the rule.
 
-The last group leaves the query behind. Two of these entrypoints are read
-directly, either side of a link retargeted underneath them, which is the only
-way the question can be put now that the boundary above stands.
+The last group reads two entrypoints directly, outside any query, on either
+side of a link retargeted underneath them. With the boundary above in place,
+that is the only way to ask the question.
 """
 
 from __future__ import annotations
@@ -170,9 +169,9 @@ def test_requirements_payload_is_composable_but_not_package_level() -> None:
 
 
 def _exported_plain_functions() -> frozenset[str]:
-    # `inspect.isfunction`, not an identity check against `FunctionType`: one
-    # of these names is a context manager built by a decorator, and a narrower
-    # predicate silently drops it and compares 37 names to 38.
+    # Use `inspect.isfunction`. One of these names is a context manager built
+    # by a decorator, and an identity check against `FunctionType` silently
+    # drops it and compares 37 names to 38.
     return frozenset(
         name for name in integrations.__all__ if inspect.isfunction(getattr(integrations, name))
     )
@@ -206,10 +205,9 @@ _ROWS_FIXTURE = """\
 | Key limits | It does not do the other thing. |
 """
 
-# A name that is a callable part of the surface but is filed under the row kind
-# reserved for records. A check that pools every row kind into one set sees it
-# documented and reports nothing; reading the entrypoint rows alone is what
-# makes it visible.
+# A callable name from the surface, filed under the row kind reserved for
+# records. A check that pools every row kind into one set sees it documented
+# and reports nothing. Reading only the entrypoint rows makes it visible.
 _ROWS_WITH_AN_ENTRYPOINT_FILED_AS_A_RESULT = """\
 | Contract item | Stable surface |
 |---|---|
@@ -244,7 +242,7 @@ def test_a_result_type_documented_as_an_entrypoint_is_reported() -> None:
 
 
 def test_the_entrypoint_rows_name_a_real_entrypoint() -> None:
-    # Without this the lock below can pass on an empty parse.
+    # Guards the lock below against passing on an empty parse.
     assert "deep_requirements_analysis" in _documented_entrypoint_names(
         _CONTRACT.read_text(encoding="utf-8")
     )
@@ -262,11 +260,11 @@ def test_the_documented_entrypoints_are_the_packages_plain_functions() -> None:
 def test_the_entrypoint_rows_read_the_same_through_the_shared_row_parser() -> None:
     """Two readers of one table have to agree about what the table says.
 
-    The reader above splits the row on pipes without stripping the outer ones;
-    the documentation checker reads the same tables through a shared parser
-    that strips them and tracks the heading each row sits under. The count
-    pinned above holds a cardinality, not an agreement, so either reader could
-    narrow on its own and stay green while the other kept finding the names.
+    The reader above splits the row on pipes and keeps the outer ones. The
+    documentation checker reads the same tables through a shared parser that
+    strips them and tracks the heading each row sits under. The count pinned
+    above checks only a cardinality, so either reader could narrow on its own
+    and stay green while the other kept finding the names.
     """
     document = _CONTRACT.read_text(encoding="utf-8")
 
@@ -285,15 +283,15 @@ def test_the_entrypoint_rows_read_the_same_through_the_shared_row_parser() -> No
 # The composition boundary
 # ---------------------------------------------------------------------------
 
-# These three declare and use a request span rather than analyze anything, and
-# they are deliberately outside the rule below: one of them is called from
-# inside the entrypoints themselves, so refusing them inside a query would
-# refuse the entrypoints' own work.
+# These three declare and use a request span and analyze nothing. They are
+# exempt from the rule below because one of them is called from inside the
+# entrypoints themselves, so refusing them inside a query would refuse the
+# entrypoints' own work.
 _REQUEST_SCOPING = frozenset({"once_per_request", "request_inputs_changed", "request_scope"})
 
 #: Every high-level entrypoint that refuses a query body. A new entrypoint
-#: needs its refusal, a driver below, and its name here; the cell that drives
-#: this set checks the three agree, and reports what appeared or went missing.
+#: needs its refusal, a driver below, and its name here. The cell that drives
+#: this set checks the three agree and reports what appeared or went missing.
 _GUARDED_ENTRYPOINTS: frozenset[str] = frozenset(
     {
         "applicable_requirements",
@@ -390,11 +388,11 @@ def _entrypoint_arguments(db: Database, root: Path) -> dict[str, tuple[object, .
     """One correct argument list per entrypoint.
 
     Binding happens before the body, so an argument list of the wrong length
-    raises before an entrypoint can refuse anything and the census below
+    raises before an entrypoint can refuse anything, and the census below
     reports a refusal that never happened. Six entrypoints take three
-    arguments and one takes four, and one of those needs a symbol identity --
-    which is built here by asking for it outside a query, the only place the
-    question can be asked.
+    arguments and one takes four. One of those needs a symbol identity, built
+    here by asking for it outside a query, the only place the question can be
+    asked.
     """
     top = str(root)
     module = str(root / "pkg" / "mod.py")
@@ -709,13 +707,12 @@ def test_no_high_level_entrypoint_runs_inside_a_query(mode: str, workspace: Path
     arguments = _entrypoint_arguments(db, workspace)
     assert frozenset(arguments) == _GUARDED_ENTRYPOINTS
 
-    # Two refusals reach a caller here and the difference is not part of the
-    # rule: one is the refusal the entrypoint owes a query body, the other the
-    # kernel's own objection to what such a query captures. Which name gives
-    # which is a judgement about the caller's compiled code that moves between
-    # interpreter versions, so nothing below records it. What is pinned is
-    # that the entrypoint never ran and that both refusals share a base a
-    # caller can catch.
+    # Two refusals can reach a caller here, and the rule treats them alike.
+    # One is the refusal the entrypoint owes a query body. The other is the
+    # kernel's objection to what such a query captures. Which name gets which
+    # depends on how each interpreter version compiles the caller, so the test
+    # leaves it unrecorded. It pins that the entrypoint never ran and that both
+    # refusals share a base a caller can catch.
     reached: dict[str, str] = {}
     for name in sorted(_GUARDED_ENTRYPOINTS):
         try:
@@ -742,7 +739,7 @@ def test_every_high_level_entrypoint_answers_outside_a_query(mode: str, workspac
     assert [name for name, answer in answers.items() if answer is None] == []
 
     # The refusal reads the calling context and must read it the right way
-    # round, so these pin real answers rather than the absence of a raise.
+    # round, so these pin real answers. A missing raise alone proves too little.
     assert answers["file_analysis"].path == arguments["file_analysis"][0]
     assert answers["scope_tree"].path == arguments["scope_tree"][0]
     assert answers["symbol_at"].name == "Alpha"
@@ -754,10 +751,10 @@ def test_every_high_level_entrypoint_answers_outside_a_query(mode: str, workspac
 # The shapes a query can name an entrypoint by
 # ---------------------------------------------------------------------------
 
-# What a driver says when its entrypoint ran, and what it says when the body
-# finished without ever reaching the call. Keeping the two apart is what lets a
-# clean answer still be evidence: an answer that came back is either the one
-# shape that never made the call, or a driver that ran what it should not have.
+# What a driver returns when its entrypoint ran, and when the body finished
+# before reaching the call. Keeping the two apart lets a clean answer still be
+# evidence. An answer that came back is either the one shape that skips the
+# call, or a driver that ran what it should not have.
 _RAN = "the entrypoint answered"
 _NOT_REACHED = "the call was never reached"
 _REFUSED = "refused by "
@@ -769,10 +766,10 @@ def _drive(db: Database, driver: Query[..., str], *arguments: object) -> str:
     """Say what a driving query did, without deciding what refused it.
 
     Two refusals reach a caller across these spellings: the one an entrypoint
-    owes a query body, and the kernel's own objection to what such a query
-    captures. Which one arrives is a judgement about the caller's compiled code
-    that moves between interpreter versions, so the answer records only that a
-    refusal happened and leaves the name of it to the failure message.
+    owes a query body, and the kernel's objection to what such a query
+    captures. Which one arrives depends on how each interpreter version
+    compiles the caller, so the answer records only that a refusal happened.
+    The failure message carries its name.
     """
     try:
         return db.get(driver, *arguments)
@@ -784,13 +781,12 @@ def _drive(db: Database, driver: Query[..., str], *arguments: object) -> str:
 def _payload_records(db: Database, payload_query: str) -> tuple[str, ...]:
     """The records the entrypoint's payload query would have left behind.
 
-    Every subject below asks a cached query named after itself as its first act
-    past the refusal, so whether that query left a record is whether the
-    entrypoint got any further than its own front door. Each cell proves the
-    read has teeth in its own mode by asking the entrypoint from outside a
-    query afterwards and finding the record it left. The name is anchored on
-    both sides because a label carries the defining module in front of it and
-    an argument digest behind.
+    Every subject below calls a cached query named after itself as its first
+    act past the refusal. Whether that query left a record shows whether the
+    entrypoint got past its own front door. Each cell proves the read works in
+    its own mode: afterwards it calls the entrypoint from outside a query and
+    finds the record it left. The name is anchored on both sides because a
+    label carries the defining module in front and an argument digest behind.
     """
     anchor = f":{payload_query}["
     return tuple(node.label for node in db.dependency_graph() if anchor in node.label)
@@ -802,21 +798,21 @@ def _assert_never_executed(outcome: str, db: Database, payload_query: str) -> No
     assert _payload_records(db, payload_query) == ()
 
 
-# One driver per spelling per subject. The two subjects are the two sides of
-# what the kernel makes of an ordinary caller. `directory_analysis` hides the
-# work it decodes with inside a generator expression and a query naming it is
-# admitted, so the refusal it meets is its own. `workspace_symbol_index` is
-# turned away before any body runs -- and the two supported interpreters do not
-# even read its body the same way, agreeing on the verdict only because a name
-# they both see is objected to first. Neither cell reads a capture set: both
-# read what happened.
+# One driver per spelling per subject. The two subjects cover both things the
+# kernel does with an ordinary caller. `directory_analysis` hides its decode
+# work inside a generator expression, and the kernel admits a query naming it,
+# so the refusal it meets is its own. The kernel turns `workspace_symbol_index`
+# away before any body runs. The two supported interpreters read its body
+# differently and agree on the verdict only because a name they both see is
+# objected to first. Both cells check what happened and leave the capture set
+# unread.
 
 
 @query
 def _dead_code_directory_analysis(db: Database, root: str, reach_the_call: bool) -> str:
     # The flag is an argument, so the branch is decided while the body runs.
-    # Written as `if False:` the compiler drops the branch and the name never
-    # reaches the caller's code object, which would test the compiler instead.
+    # With `if False:` the compiler drops the branch and the name never reaches
+    # the caller's code object, so the cell would test the compiler.
     if reach_the_call:
         directory_analysis(db, root)
         return _RAN
@@ -883,8 +879,7 @@ _BYPASS_DRIVERS: dict[str, dict[str, Query[..., str]]] = {
 
 def _bypass_arguments(spelling: str, subject_argument: str) -> tuple[object, ...]:
     # Only the dead-code body takes a second argument: the flag that keeps its
-    # branch shut, passed rather than written in so the branch is a run-time
-    # decision.
+    # branch shut. It is passed in so the branch is a run-time decision.
     if spelling == "dead-code":
         return (subject_argument, False)
     return (subject_argument,)
@@ -895,18 +890,17 @@ def _bypass_arguments(spelling: str, subject_argument: str) -> tuple[object, ...
 def test_no_spelling_of_an_entrypoint_runs_inside_a_query(
     spelling: str, mode: str, workspace: Path
 ) -> None:
-    # The three spellings do not all end the same way, and that is the reason
-    # the assertion is about the effect rather than about what refused it.
-    # Mentioning the entrypoint only in a branch the body never takes leaves
-    # the analysis undone either way: either the mention alone is enough for
-    # the kernel to turn the query away, or the query answers having called
-    # nothing. Reaching the entrypoint through its module resolves to the same
-    # function and ends exactly where the plain name ends -- the module is not
-    # what decides it, which is why two entrypoints of the same module end
-    # differently under this spelling. Importing it inside the body is the one
-    # spelling the supported interpreters disagree about, so it is the one that
-    # would pin an interpreter's reading if the class were asserted. None of
-    # that is recorded below; only that the entrypoint did not run.
+    # The three spellings end in different ways, so the assertion checks the
+    # effect and leaves aside what refused it. Naming the entrypoint only in a
+    # branch the body never takes leaves the analysis undone either way. Either
+    # the mention alone makes the kernel turn the query away, or the query
+    # answers having called nothing. Reaching the entrypoint through its module
+    # resolves to the same function and ends where the plain name ends. The
+    # module plays no part in the outcome, which is why two entrypoints of the
+    # same module end differently under this spelling. Importing it inside the
+    # body is the one spelling the supported interpreters disagree about, so
+    # asserting the refusal class would pin one interpreter's reading. The
+    # cell records only that the entrypoint did not run.
     db = Database(mode=mode)
     outcome = _drive(
         db,
@@ -924,14 +918,14 @@ def test_no_spelling_of_an_entrypoint_runs_inside_a_query(
 def test_no_spelling_reaches_the_index_the_interpreters_read_differently(
     spelling: str, mode: str, workspace: Path
 ) -> None:
-    # This entrypoint builds part of its answer inside a comprehension, and the
-    # supported interpreters disagree about whether the names that comprehension
-    # uses belong to the body around it: one of them counts a name the other
-    # does not. The two nonetheless reach the same verdict for an ordinary
-    # caller, because a name they both count is objected to first -- an
-    # agreement that rests on something neither the caller nor the entrypoint
-    # chose. So this cell asserts what happened and never what was read, and
-    # stays true whichever way an interpreter reads the body.
+    # This entrypoint builds part of its answer inside a comprehension. The
+    # supported interpreters disagree about whether the names that
+    # comprehension uses belong to the body around it. One counts a name the
+    # other skips. They still reach the same verdict for an ordinary caller,
+    # because a name they both count is objected to first. That agreement rests
+    # on something neither the caller nor the entrypoint chose. So this cell
+    # asserts what happened, never what was read, and holds whichever way an
+    # interpreter reads the body.
     db = Database(mode=mode)
     outcome = _drive(
         db,
@@ -946,15 +940,14 @@ def test_no_spelling_reaches_the_index_the_interpreters_read_differently(
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_local_import_beside_a_module_level_one_never_runs(mode: str, workspace: Path) -> None:
-    # The sharpest shape available here, and the reason it is its own cell:
-    # this module imports every documented entrypoint at the top, and the body
-    # below imports one of them again inside itself. The two supported
-    # interpreters disagree about that body -- one reads the name the local
-    # import binds as a global of the body and the other does not -- so this
-    # exact shape is refused by the entrypoint on one of them and by the kernel
-    # on the other, and before the entrypoint refused anything it ran the
-    # analysis on one of them. Neither outcome is asserted; what is asserted is
-    # that the analysis does not happen either way.
+    # The sharpest shape here, so it gets its own cell. This module imports
+    # every documented entrypoint at the top, and the body below imports one of
+    # them again. The two supported interpreters disagree about that body. One
+    # reads the name the local import binds as a global of the body, and the
+    # other does not. So the entrypoint refuses this shape on one interpreter
+    # and the kernel refuses it on the other. Before the entrypoint had its
+    # refusal, this shape ran the analysis on one of them. The cell asserts
+    # only that the analysis does not happen either way.
     db = Database(mode=mode)
     module = str(workspace / "pkg" / "mod.py")
     outcome = _drive(db, _local_import_file_analysis, module)
@@ -964,12 +957,12 @@ def test_a_local_import_beside_a_module_level_one_never_runs(mode: str, workspac
     assert _payload_records(db, "file_analysis_payload") != ()
 
 
-# Two miniature high-level entrypoints over one payload query, differing only
+# Two miniature high-level entrypoints over one payload query. They differ only
 # in where the decode step is named. The decode helper is a plain function of
-# its argument on purpose: modelled on a real one it would reach the request
-# memo and the cache the kernel refuses to walk, the direct spelling would be
-# turned away for holding them while the hidden one was not, and this control
-# would go red for the difference it exists to rule out.
+# its argument on purpose. A helper modelled on a real one would reach the
+# request memo and the cache the kernel refuses to walk. The kernel would then
+# turn the direct spelling away for holding them and admit the hidden one, and
+# this control would fail on the difference it exists to rule out.
 
 
 @query
@@ -1013,9 +1006,9 @@ def test_hiding_the_decode_step_changes_nothing_about_the_refusal(mode: str) -> 
     named = _drive(db, _in_query_demo_named, "alpha,beta")
     hidden = _drive(db, _in_query_demo_hidden, "alpha,beta")
 
-    # Same refusal, not merely two refusals: an entrypoint that was turned away
-    # by the kernel and one that refused for itself would both read as "not run"
-    # while differing exactly where they must not.
+    # Both must meet the same refusal. An entrypoint turned away by the kernel
+    # and one that refused for itself would both read as "not run", yet differ
+    # in the one place they must match.
     assert named == hidden, f"named: {named} | hidden: {hidden}"
     _assert_never_executed(named, db, "_demo_payload")
     _assert_never_executed(hidden, db, "_demo_payload")
@@ -1092,9 +1085,9 @@ def _resolved(path: Path) -> str:
 def _canonicalization_key(link: Path) -> str:
     """The label the database files ``link``'s canonicalization under.
 
-    Asked of the resource that does the canonicalizing rather than spelled out
-    here, so the arm below cannot be answered by some other record whose label
-    merely mentions the same path.
+    Asked of the canonicalizing resource itself, so only that resource's record
+    can answer the arm below, even if another record's label mentions the same
+    path.
     """
     return ResolvedPathResource().label(os.fspath(link))
 
@@ -1102,10 +1095,10 @@ def _canonicalization_key(link: Path) -> str:
 def _canonicalizations(db: Database, key: str) -> dict[str, int]:
     """When the record filed under ``key`` last moved its answer.
 
-    Reaching a file through a link means canonicalizing the link first, and
-    this is where that step shows up as something the database declared rather
-    than something it asked the filesystem behind its own back. An empty answer
-    is a step nothing downstream can depend on.
+    Reaching a file through a link means canonicalizing the link first. This
+    is where that step shows up as something the database declared. An
+    undeclared filesystem read leaves no record here, and an empty answer is a
+    step nothing downstream can depend on.
     """
     return {
         node.label: node.changed_at
@@ -1118,8 +1111,8 @@ def _canonicalizations(db: Database, key: str) -> dict[str, int]:
 def test_a_scope_tree_read_through_a_link_follows_the_retarget(
     mode: str, linked_module: Path
 ) -> None:
-    # Read directly and never from a query body, because the boundary above
-    # leaves outside a query the only place this question can be put from.
+    # Read directly, outside any query body. The boundary above makes that the
+    # only place to ask this question.
     db = Database(mode=mode)
     beside = linked_module.parent
     key = _canonicalization_key(linked_module)
@@ -1135,21 +1128,21 @@ def test_a_scope_tree_read_through_a_link_follows_the_retarget(
     declared_after = _canonicalizations(db, key)
     fresh = _tree_answer(scope_tree(Database(mode=mode), str(linked_module)))
 
-    # The four below preserve an answer rather than catch one going wrong: the
-    # shipped tree gives them warm and fresh alike, and so would a tree that
-    # canonicalized the link without declaring the step. What covers the step
-    # is the block at the end, not these.
+    # The four below preserve a known answer. The shipped tree passes them warm
+    # and fresh alike, and so would a tree that canonicalized the link without
+    # declaring the step. The block at the end is what covers the step.
     assert warm == fresh
     assert warm != before, "the link was retargeted and the answer did not move"
     assert warm["path"] == _resolved(beside / "b.py")
     assert warm["bindings"] == ("beta",)
     # The two targets are shaped alike, so the scopes are the one part of the
-    # answer with no reason to move -- which keeps the two that did honest.
+    # answer with no reason to move. Their staying put shows the two parts that
+    # moved did so because of the retarget.
     assert warm["scopes"] == before["scopes"]
 
-    # Canonicalizing the link is a step the database declared: one record,
-    # filed under the label the canonicalizing resource itself gives the link,
-    # answered both reads and moved its answer between them.
+    # Canonicalizing the link is a declared step. One record, filed under the
+    # label the canonicalizing resource gives the link, answered both reads and
+    # moved its answer between them.
     assert set(declared_before) == {key}, "canonicalizing the link declared nothing"
     assert set(declared_after) == {key}
     assert declared_after[key] != declared_before[key]
@@ -1157,8 +1150,8 @@ def test_a_scope_tree_read_through_a_link_follows_the_retarget(
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_symbol_read_through_a_link_follows_the_retarget(mode: str, linked_module: Path) -> None:
-    # Direct for the same reason: a query body cannot reach this entrypoint
-    # either, so the question is put from outside one.
+    # Read directly for the same reason: this entrypoint is also refused inside
+    # a query body.
     db = Database(mode=mode)
     beside = linked_module.parent
     key = _canonicalization_key(linked_module)
@@ -1174,10 +1167,9 @@ def test_a_symbol_read_through_a_link_follows_the_retarget(mode: str, linked_mod
     declared_after = _canonicalizations(db, key)
     fresh = _symbol_answer(symbol_at(Database(mode=mode), str(linked_module), _DEFINITION))
 
-    # Preserving an answer again, not catching one going wrong: the identity
-    # under the position follows the link warm and fresh alike, and would do so
-    # whether or not the step that reached it was declared. The block at the
-    # end is what covers that step.
+    # These preserve a known answer again. The identity under the position
+    # follows the link warm and fresh alike, whether or not the step that
+    # reached it was declared. The block at the end covers that step.
     assert warm == fresh
     assert warm != before, "the link was retargeted and the symbol did not move"
     assert warm["path"] == _resolved(beside / "b.py")
@@ -1189,12 +1181,12 @@ def test_a_symbol_read_through_a_link_follows_the_retarget(mode: str, linked_mod
     assert declared_after[key] != declared_before[key]
 
 
-# Every driver above, and every miniature one of them drives, with the name its
-# body must still call. Thirty-five drivers of one shape are thirty-five
-# chances to paste the wrong name into one of them, and a driver pointed at
-# some other entrypoint is refused just as flatly as the right one -- so the
-# cells that drive it stay green while its own subject is never driven at all.
-# The bodies are read here rather than trusted.
+# Every driver above, and every miniature entrypoint one of them drives, with
+# the name its body must still call. Thirty-five drivers of one shape are
+# thirty-five chances to paste the wrong name. A driver pointed at another
+# entrypoint is refused as flatly as the right one, so its cells stay green
+# while its own subject is never driven. The cell below reads the bodies to
+# catch that.
 _DRIVER_SUBJECTS: dict[str, str] = {
     **{f"_in_query_{name}": name for name in _GUARDED_ENTRYPOINTS},
     **{
@@ -1231,9 +1223,9 @@ def _called_names(source: str) -> dict[str, frozenset[str]]:
 def test_every_driver_still_calls_the_thing_it_drives() -> None:
     called = _called_names(Path(__file__).read_text(encoding="utf-8"))
 
-    # The registry has to cover the whole guarded surface, and each entry has
-    # to be the query the surface cell actually runs -- otherwise a driver
-    # could be checked here and a different one driven there.
+    # The registry must cover the whole guarded surface, and each entry must be
+    # the query the surface cell runs. Otherwise one driver could be checked
+    # here while a different one is driven there.
     assert {f"_in_query_{name}" for name in _GUARDED_ENTRYPOINTS} <= set(_DRIVER_SUBJECTS)
     for name in sorted(_GUARDED_ENTRYPOINTS):
         assert _DRIVERS[name].key.endswith(f":_in_query_{name}")

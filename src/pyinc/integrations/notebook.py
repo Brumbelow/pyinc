@@ -148,19 +148,19 @@ def _first_markdown_heading(source: str) -> str | None:
 # IPython syntax
 # ---------------------------------------------------------------------------
 
-# A cell magic owns the rest of its cell. These hand that body back to the
-# Python compiler; every other cell magic hands it to something else entirely,
-# so the body holds no Python to import from or define.
+# A cell magic owns the rest of its cell. These magics pass that body to the
+# Python compiler. Every other cell magic passes it elsewhere, so its body
+# holds no Python imports or definitions.
 _PYTHON_BODY_CELL_MAGICS = frozenset(
     {"capture", "debug", "prun", "python", "python2", "python3", "time", "timeit"}
 )
 
-# Patterns stay uncompiled: a compiled ``re.Pattern`` is not a snapshot-safe
-# capture, and these helpers are reached from cached queries.
+# Patterns stay as strings because cached queries reach these helpers, and a
+# compiled ``re.Pattern`` is not a snapshot-safe capture.
 _LINE_BREAK = r"\r\n|\r|\n"
 _CELL_MAGIC = r"%%([A-Za-z_]\w*)"
-# ``%`` is modulo and ``!`` is half of ``!=``, so these only read as notebook
-# syntax where IPython itself reads them: at the start of a logical line.
+# ``%`` is modulo and ``!`` starts ``!=``, so these match notebook syntax only
+# where IPython reads it: at the start of a logical line.
 _MAGIC_LINE = r"[ \t]*%{1,2}[A-Za-z_]"
 _SHELL_LINE = r"[ \t]*!{1,2}(?!=)"
 _HELP_PREFIX_LINE = r"[ \t]*\?{1,2}[ \t]*(?:[A-Za-z_%*]|$)"
@@ -191,9 +191,9 @@ def _split_lines(source: str) -> tuple[tuple[str, str], ...]:
 def _logical_line_starts(contents: tuple[str, ...]) -> tuple[bool, ...]:
     """Mark the physical lines that open a logical line.
 
-    IPython only reads a magic where a statement could start, so this is what
-    keeps a string literal or a bracketed continuation that happens to hold a
-    magic-looking line from being rewritten.
+    IPython reads a magic only where a statement could start. This keeps a
+    magic-looking line inside a string literal or a bracketed continuation
+    from being rewritten.
     """
     starts: list[bool] = []
     quote = ""
@@ -244,17 +244,17 @@ def _neutralize_notebook_syntax(source: str) -> tuple[str, bool]:
     """Replace IPython-only lines with equal-width Python placeholders.
 
     Real notebooks open with lines such as ``%matplotlib inline`` that ``ast``
-    rejects, which would otherwise cost the whole cell its imports and
-    definitions. Every rewritten line keeps its exact width and terminator, so
-    each position in the result still names the same position in the notebook
-    and the ranges decoded from it stay truthful. Returns the rewritten source
-    and whether anything was rewritten.
+    rejects. Left in place, one such line costs the whole cell its imports and
+    definitions. Each rewritten line keeps its width and terminator, so every
+    position in the result maps to the same position in the notebook and
+    decoded ranges stay accurate. Returns the rewritten source and whether
+    anything was rewritten.
     """
     lines = _split_lines(source)
     contents = tuple(content for content, _ in lines)
     cell_magic = re.match(_CELL_MAGIC, contents[0])
     if cell_magic is not None and cell_magic.group(1) not in _PYTHON_BODY_CELL_MAGICS:
-        # The magic claims the rest of the cell, and that body is not Python.
+        # The magic owns the rest of the cell and passes the body elsewhere.
         return "".join(" " * len(content) + eol for content, eol in lines), True
     rewritten: list[str] = []
     changed = False
@@ -272,10 +272,10 @@ def _parse_cell_source(
 ) -> tuple[ast.Module | None, str, tuple[str, SyntaxError] | None]:
     """Parse a code cell, neutralizing notebook syntax when plain Python fails.
 
-    Returns the module, the source it was parsed from — geometrically identical
-    to ``source`` — and a ``(code, error)`` pair when it never parsed. A cell
-    that holds notebook syntax reports a different code than a cell whose
-    Python is simply wrong.
+    Returns the module, the source it was parsed from (geometrically identical
+    to ``source``), and a ``(code, error)`` pair when parsing failed. A cell
+    that holds notebook syntax reports a different code from a cell with a
+    Python syntax error.
     """
     try:
         return ast.parse(source), source, None
@@ -328,8 +328,8 @@ def _extract_code_imports_and_defs(
 def _is_unicode_text(value: str) -> bool:
     """Report whether `value` is made only of Unicode scalar values.
 
-    The ASCII test is the fast path an overwhelming majority of notebook text
-    takes; only a string that leaves it pays for an encode.
+    Most notebook text is ASCII and takes the fast path. Only other strings
+    pay for an encode.
     """
     if value.isascii():
         return True
@@ -352,11 +352,11 @@ def _source_is_unicode_text(raw: Any) -> bool:
 def _surrogate_bearing_field(parsed: dict[str, Any]) -> str | None:
     """Name the first payload-bound string that is not valid Unicode.
 
-    Cell sources and the kernel metadata reach the parsed payloads verbatim,
-    and a cell's type is read on the way to them, where a lone surrogate is
-    not a value `freeze` can snapshot. Outputs and per-execution metadata
-    reach none of the parsed payloads, so they are not walked: a notebook
-    that only stores a surrogate loses no analysis over it.
+    Cell sources and kernel metadata reach the parsed payloads verbatim, and
+    each cell's type is read on the way. `freeze` cannot snapshot a lone
+    surrogate in any of them. Outputs and per-execution metadata stay out of
+    the parsed payloads, so this skips them. A surrogate stored only there
+    costs the notebook no analysis.
     """
     metadata = parsed.get("metadata")
     if isinstance(metadata, dict):
@@ -396,7 +396,7 @@ def _try_parse_notebook(text: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: Payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -406,7 +406,7 @@ def notebook_text(db: Database, path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition
+# Layer 2: Composition
 # ---------------------------------------------------------------------------
 
 
@@ -515,7 +515,7 @@ def notebook_analysis_payload(db: Database, path: str) -> NotebookAnalysisPayloa
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: Entrypoints
 # ---------------------------------------------------------------------------
 
 

@@ -61,13 +61,13 @@ class _LegacyKey(str, Enum):  # noqa: UP042 - the pre-StrEnum mixin idiom is und
 
 
 class _TrappedKey(str):
-    """Every dunder a key guard could consult is a trap; reaching one is the defect.
+    """A `str` subclass that raises from every dunder a key guard could consult.
 
-    The refusal is decided from `type(key)` alone and reports the offending type
-    by name, so it never touches the value: not its emptiness (`__bool__`,
-    `__len__`), not its rendering (`__str__`, `__repr__`, `__format__`) and not
-    its equality (`__eq__`). `__hash__` stays `str`'s so the instance is still
-    usable right up to the guard.
+    Reaching one is the defect. The refusal is decided from `type(key)` alone
+    and names the offending type, so it leaves the value untouched. That covers
+    its emptiness (`__bool__`, `__len__`), its rendering (`__str__`,
+    `__repr__`, `__format__`) and its equality (`__eq__`). `__hash__` stays
+    `str`'s, so the instance stays usable up to the guard.
     """
 
     __hash__ = str.__hash__
@@ -92,12 +92,12 @@ class _TrappedKey(str):
 
 
 def test_input_rejects_str_subclasses_and_names_the_plain_spelling() -> None:
-    """Input keys are exactly `str`, and the refusal says what to pass instead.
+    """Input keys must be plain `str`, and the refusal says what to pass.
 
-    A subclass reaches the record table as node identity, so its own equality,
-    formatting and emptiness behaviour decide what the kernel stores. Enum
-    members are the common accidental case, which is why the message names
-    `key.value` rather than only describing the rule.
+    A subclass would reach the record table as node identity, so its own
+    equality, formatting and emptiness behaviour would decide what the kernel
+    stores. Enum members are the common accidental case, so the message names
+    `key.value` as well as describing the rule.
     """
     for key in (_TaggedKey("a"), _ModernKey.A, _LegacyKey.A):
         with pytest.raises(InputKeyError, match="exactly str") as raised:
@@ -116,7 +116,7 @@ def test_query_rejects_str_subclass_keys_and_names_the_plain_spelling() -> None:
 
     A subclass key drifts query identity through `__format__` and reaches the
     checkpoint manifest as a recorded query id, so it is refused where it is
-    written rather than where it is later rendered.
+    written, before anything renders it.
     """
 
     def calculate(db: Database) -> int:
@@ -143,12 +143,12 @@ def test_query_rejects_str_subclass_keys_and_names_the_plain_spelling() -> None:
 
 
 def test_input_empty_key_guard_cannot_be_bypassed_by_a_subclass() -> None:
-    """Emptiness is decided only after the key is known to be exactly `str`.
+    """Emptiness is decided only after the key is known to be plain `str`.
 
-    `not key` consults `__bool__` and `__len__`, so a subclass lying about its
-    own emptiness used to pass the non-empty guard and register a node labelled
-    `input[]`. Ordering the exactness check first means no user dunder runs on
-    the way to a refusal.
+    `not key` consults `__bool__` and `__len__`. A subclass lying about its own
+    emptiness used to pass the non-empty guard and register a node labelled
+    `input[]`. The exactness check runs first, so no user dunder runs on the
+    way to a refusal.
     """
 
     with pytest.raises(InputKeyError, match="non-empty string"):
@@ -156,8 +156,8 @@ def test_input_empty_key_guard_cannot_be_bypassed_by_a_subclass() -> None:
     with pytest.raises(InputKeyError, match="exactly str"):
         Input[int](cast(Any, _TrappedKey("")))
 
-    # Only well-formed keys reach the record table, so a node can no longer be
-    # labelled for a key the guard was supposed to have refused.
+    # Only well-formed keys reach the record table, so every node label belongs
+    # to a key the guard accepted.
     db = Database()
     db.set(Input[int]("present"), 1)
     assert [key.label for key in db._records] == ["input[present]"]
@@ -302,9 +302,9 @@ def test_file_stat_resource_covers_present_and_missing_paths(tmp_path: Path) -> 
         (True, 4, snapshot.mtime_ns),
         snapshot,
     )
-    # Read through the database, in the mode that hands values back as frozen
-    # views: the reading is still the resource's own snapshot type, because the
-    # kernel rebuilds it through a built-in adapter at every boundary.
+    # Read through the database, in the mode that returns frozen views. The
+    # reading is still the resource's own snapshot type, because the kernel
+    # rebuilds it through a built-in adapter at every boundary.
     assert resource.read(db, present).exists is True
 
     absent = resource.load(db, missing)
@@ -400,9 +400,9 @@ def test_environ_codec_helpers_survive_database_construction() -> None:
 
 
 def test_environ_raw_data_mapping_stays_hidden_after_database_construction() -> None:
-    # `os._Environ` keeps the live process environment in `_data`, reachable as
-    # a plain attribute without ever touching the mapping protocol. The wrapper
-    # therefore refuses everything beyond the four codec helpers.
+    # `os._Environ` keeps the live process environment in `_data`, a plain
+    # attribute that bypasses the mapping protocol. So the wrapper refuses
+    # everything beyond the four codec helpers.
     Database()
     with pytest.raises(AttributeError, match="_data"):
         _ = os.environ._data  # type: ignore[attr-defined]

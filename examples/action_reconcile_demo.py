@@ -1,9 +1,9 @@
 """Reconcile pure desired artifacts to the filesystem with the @action layer.
 
-Queries derive *desired* outputs (pure, tracked); a separate @action reconciles
-them with the filesystem: it writes only what changed, repairs out-of-band
-edits via content hashing, deletes outputs it previously owned but no longer
-declares, and supports a dry-run plan. Side effects never enter a query.
+Queries derive the *desired* outputs and stay pure and tracked. A separate
+@action reconciles them with the filesystem. It writes only what changed,
+repairs out-of-band edits by content hash, deletes owned outputs it stops
+declaring, and supports a dry-run plan. All side effects stay in the action.
 
 Run: ``python examples/action_reconcile_demo.py``
 """
@@ -46,20 +46,21 @@ def main(mode: str = "strict") -> None:
         rerun = emit.reconcile(db, str(src), root=out)
         print(f"rerun_updated={rerun.updated}")
 
-        # Out-of-band edit to a generated file is detected via hash mismatch.
+        # The action detects an out-of-band edit to a generated file by hash
+        # mismatch.
         (out / "beta.txt").write_text("TAMPERED", encoding="utf-8")
         repaired = emit.reconcile(db, str(src), root=out)
         print(f"tamper_repaired={repaired.repaired}")
 
-        # Removing a declaration deletes only that owned output — and only
-        # while that file still holds the bytes the ledger recorded for it, and
-        # is still the same file the check read. A drifted orphan is released
-        # instead: the ledger stops claiming it, and the file stays where it is.
+        # Removing a declaration deletes only that owned output. The delete
+        # happens only while the file holds the bytes the ledger recorded and is
+        # the same file the check read. A drifted orphan is released instead:
+        # the ledger drops its claim and the file stays in place.
         db.set(NAMES, ("alpha",))
         removed = emit.reconcile(db, str(src), root=out)
         print(f"orphan_deleted={removed.deleted}")
 
-        # Dry-run plan writes nothing.
+        # A dry-run plan leaves the filesystem unchanged.
         plan_root = root / "planned"
         plan = emit.plan(db, str(src), root=plan_root)
         print(f"plan_created={plan.created}")

@@ -1,10 +1,10 @@
 # pyinc Documentation
 
-Start with [Getting Started](getting-started.md) for a runnable path through
-inputs, queries, resources, modes, inspection, and actions. The
-[examples](../examples/) directory holds small runnable scripts;
+Start with [Getting Started](getting-started.md). It walks through inputs,
+queries, resources, modes, inspection, and actions with code you can run. The
+[examples](../examples/) directory holds small runnable scripts.
 `examples/calc/` is the worked example of a query graph that reconciles its
-results to disk. The documents below each have one job.
+results to disk. Each document below has one job.
 
 ## Learn and operate
 
@@ -30,29 +30,30 @@ results to disk. The documents below each have one job.
 
 | Document | Purpose |
 |---|---|
-| [Integration Authoring](integration-authoring.md) | Normative three-layer pattern for adding an integration without widening the kernel. |
+| [Integration Authoring](integration-authoring.md) | Normative three-layer pattern for adding an integration while keeping the kernel unchanged. |
 
 ## Packages
 
-One distribution ships three top-level typed packages; the stable integration
+One distribution ships three top-level typed packages. The stable integration
 surface is a subpackage of `pyinc`.
 
 | Package | Stability | Owns | Contract |
 |---|---|---|---|
-| `pyinc` | Stable | The query kernel: `Database`, `Input`, `@query`, `Resource` and the built-in resources, `freeze`/`thaw` and the snapshot types, `ValueAdapter`, inspection and push observers, artifact stores and checkpoints, and the `@action` output layer. Domain-agnostic: no language, schema, or editor concept lives here. | [Kernel](kernel-contract.md), [Action](action-contract.md) |
+| `pyinc` | Stable | The query kernel: `Database`, `Input`, `@query`, `Resource` and the built-in resources, `freeze`/`thaw` and the snapshot types, `ValueAdapter`, inspection and push observers, artifact stores and checkpoints, and the `@action` output layer. Domain-agnostic: language, schema, and editor concepts live in the other packages. | [Kernel](kernel-contract.md), [Action](action-contract.md) |
 | `pyinc.integrations` | Stable | Frozen result types and high-level entrypoints for Python source, TOML/JSON/XML/CSV/env configuration, requirements and installed packages, dependency checks, deep module resolution, scopes and symbols, and notebooks, plus the shared source geometry (`SourcePosition`, `SourceRange`, `DocumentMap`). Payload queries and decode helpers stay module-local. | [Integration](integration-contract.md) |
 | `pyinc_tools` | Unstable | `pyinc-tools analyze`, the polling watcher and mirror workspaces, `WorkspaceSession` as the lock-owning façade, protocol-position conversion, and the stdio LSP/JSON-RPC server. | [Tools guide](pyinc-tools-guide.md), [LSP](lsp-reference.md) |
 | `pyinc_codegen` | Unstable | JSON Schema analysis and typed-Python generation through the public query and action APIs. | [Codegen guide](codegen-guide.md) |
 
-Both consumer packages use only public `pyinc` and `pyinc.integrations` names;
-something a consumer needs that only a kernel internal provides is a reason to
-widen the public API deliberately, not to reach around it. Integrations compose
-at the query layer by importing one another's public `@query` functions, which
-the kernel tracks as ordinary dependency edges
+Both consumer packages use only public `pyinc` and `pyinc.integrations` names.
+If a consumer needs something that only a kernel internal provides, widen the
+public API to cover it. Integrations compose at the query layer by importing
+one another's public `@query` functions, which the kernel tracks as ordinary
+dependency edges
 ([composition](integration-contract.md#composition-and-experimental-helpers)).
-The `bench/` harness is not shipped in the wheel; it pairs every timing with an
-incremental-equals-fresh assertion, and its only extra dependency, `joblib`,
-sits in the `bench` extra. What stays out of scope is listed in the
-[FAQ](faq.md#what-is-out-of-scope).
 
-The project [README](../README.md) remains the concise package overview.
+The wheel excludes the `bench/` harness. The harness pairs every timing with an
+incremental-equals-fresh assertion. Its only extra dependency, `joblib`, sits
+in the `bench` extra. The [FAQ](faq.md#what-is-out-of-scope) lists what is out
+of scope.
+
+The project [README](../README.md) is the concise package overview.

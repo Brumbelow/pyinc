@@ -33,7 +33,7 @@ def main() -> None:
     print(f"result={result}")
     print(f"in_memory_object_count={len(in_memory.keys())}")
 
-    # The same database can target a filesystem store; layout is a git-style
+    # A database can also target a filesystem store. Its layout is a git-style
     # two-character fan-out of the snapshot fingerprint digest.
     with tempfile.TemporaryDirectory() as root:
         on_disk = FileSystemArtifactStore(root)
@@ -48,8 +48,8 @@ def main() -> None:
         )
         print(f"on_disk_object_count={len(fanout)}")
 
-    # serialize_snapshot / deserialize_snapshot round-trip is independent of any
-    # Database; external tools can persist or transfer the byte form directly.
+    # The serialize_snapshot / deserialize_snapshot round trip is independent of
+    # any Database. External tools can persist or transfer the byte form directly.
     snapshot = freeze(("hello", "world"))
     payload = serialize_snapshot(snapshot)
     restored = thaw(deserialize_snapshot(payload))

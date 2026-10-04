@@ -66,7 +66,7 @@ def test_dependency_check_stable_api() -> None:
     assert hasattr(integrations, "UndeclaredImport")
     assert hasattr(integrations, "dependency_check_analysis")
     assert hasattr(integrations, "workspace_dependency_check")
-    # Experimental helpers must not leak
+    # Experimental helpers stay private
     assert not hasattr(integrations, "dependency_check_payload")
     assert not hasattr(integrations, "_declared_deps_payload")
 
@@ -148,8 +148,8 @@ def test_ambiguous_for_complex_specifier(
     _patch_site(monkeypatch, site_dir)
 
     db = Database(mode=mode)
-    # `~=1` is a compatible-release clause with too few release segments, so the
-    # evaluator cannot decide it and reports `ambiguous` rather than guessing.
+    # `~=1` is a compatible-release clause with too few release segments. It is
+    # undecidable, so the evaluator reports `ambiguous` instead of guessing.
     result = dependency_check_analysis(db, ("requests~=1",))
     assert len(result.statuses) == 1
     assert result.statuses[0].status == "ambiguous"
@@ -167,8 +167,8 @@ def test_arbitrary_equality_compares_version_strings(
     db = Database(mode=mode)
     exact = dependency_check_analysis(db, ("requests===2.31.0",))
     assert exact.statuses[0].status == "satisfied"
-    # PEP 440 `===` does not normalize, so a differently written but equal
-    # version does not match.
+    # PEP 440 `===` compares versions as written, so an equal version spelled
+    # differently is a mismatch.
     padded = dependency_check_analysis(db, ("requests===2.31",))
     assert padded.statuses[0].status == "version_mismatch"
 
@@ -208,7 +208,7 @@ def test_compatible_release_operator(
 
 
 # ---------------------------------------------------------------------------
-# PEP 440 regression — shapes newly supported after migration
+# PEP 440 regression: shapes supported since the migration
 # ---------------------------------------------------------------------------
 
 
@@ -245,12 +245,11 @@ def test_prerelease_installed_version(
 ) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
-    # Installed pre-release version.
     _make_dist_info(site_dir, "requests", "2.31.0rc1", top_level="requests")
     _patch_site(monkeypatch, site_dir)
 
     db = Database(mode=mode)
-    # include_prerelease=True from dependency_check means pre-releases are allowed.
+    # dependency_check passes include_prerelease=True, so pre-releases are allowed.
     result = dependency_check_analysis(db, ("requests>=2.0",))
     assert result.statuses[0].status == "satisfied"
     assert result.statuses[0].installed_version == "2.31.0rc1"
@@ -280,7 +279,7 @@ def test_dev_release_installed_version(
     _patch_site(monkeypatch, site_dir)
 
     db = Database(mode=mode)
-    # With include_prerelease=True (dependency_check default), dev is accepted.
+    # dependency_check defaults to include_prerelease=True, so dev releases pass.
     result = dependency_check_analysis(db, ("requests>=2.0",))
     assert result.statuses[0].status == "satisfied"
 
@@ -293,9 +292,9 @@ def test_epoch_specifier(mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPa
     _patch_site(monkeypatch, site_dir)
 
     db = Database(mode=mode)
-    # An older epoch spec should not match a higher epoch installed.
+    # Epochs must agree. A spec in the installed epoch matches.
     assert dependency_check_analysis(db, ("mypkg==1!2.0",)).statuses[0].status == "satisfied"
-    # Pre-epoch version cannot satisfy an epoch-bumped installed version.
+    # An epoch-0 spec is a mismatch for an installed version in a higher epoch.
     assert dependency_check_analysis(db, ("mypkg==2.0",)).statuses[0].status == "version_mismatch"
 
 
@@ -309,9 +308,9 @@ def test_compatible_release_three_component(
     _patch_site(monkeypatch, site_dir)
 
     db = Database(mode=mode)
-    # ~=2.31.0 means >=2.31.0, <2.32.0 — 2.31.5 satisfies.
+    # ~=2.31.0 means >=2.31.0, <2.32.0, so 2.31.5 satisfies it.
     assert dependency_check_analysis(db, ("requests~=2.31.0",)).statuses[0].status == "satisfied"
-    # ~=2.30.0 means >=2.30.0, <2.31.0 — 2.31.5 fails.
+    # ~=2.30.0 means >=2.30.0, <2.31.0, so 2.31.5 fails.
     assert (
         dependency_check_analysis(db, ("requests~=2.30.0",)).statuses[0].status
         == "version_mismatch"
@@ -329,15 +328,15 @@ def test_compatible_release_excludes_next_release_prereleases(
     _patch_site(monkeypatch, site_dir)
 
     db = Database(mode=mode)
-    # ~=2.2 means >=2.2, ==2.* — 3.0a1 and 3.0.dev1 sort before 3.0 but are
-    # not 2.x releases, so the compatible-release upper bound excludes them.
+    # ~=2.2 means >=2.2, ==2.*. 3.0a1 and 3.0.dev1 sort before 3.0 but fall
+    # outside 2.x, so the compatible-release upper bound excludes them.
     assert (
         dependency_check_analysis(db, ("requests~=2.2",)).statuses[0].status == "version_mismatch"
     )
     assert dependency_check_analysis(db, ("example~=2.2",)).statuses[0].status == "version_mismatch"
-    # The pre-release itself is visible here (installed versions are evaluated
-    # with pre-releases allowed) — the mismatch above is the upper bound, not
-    # pre-release gating.
+    # Installed versions are evaluated with pre-releases allowed, so the
+    # pre-release satisfies a plain lower bound. The mismatch above therefore
+    # comes from the upper bound.
     assert dependency_check_analysis(db, ("requests>=2.2",)).statuses[0].status == "satisfied"
 
 
@@ -363,8 +362,9 @@ def test_wildcard_specifier_requires_matching_epoch(
 
 
 def test_pep440_compatible_release_upper_bound_is_prefix_match() -> None:
-    # The upper bound of ~=2.2 is ==2.* (prefix match), not an ordered <3.0:
-    # pre-releases and dev releases of 3.0 sort before 3.0 yet are not 2.x.
+    # The upper bound of ~=2.2 is the prefix match ==2.*. An ordered <3.0 would
+    # admit pre-releases and dev releases of 3.0, which sort before 3.0 but fall
+    # outside 2.x.
     spec = parse_specifier_set("~=2.2")
     assert spec is not None
     assert satisfies(spec, "2.9", include_prerelease=True)[0] is True
@@ -372,7 +372,7 @@ def test_pep440_compatible_release_upper_bound_is_prefix_match() -> None:
     assert satisfies(spec, "3.0.dev1", include_prerelease=True)[0] is False
     assert satisfies(spec, "3.0", include_prerelease=True)[0] is False
 
-    # Suffix segments are dropped from the prefix, not from the lower bound.
+    # Suffix segments are dropped from the prefix and kept in the lower bound.
     post_spec = parse_specifier_set("~=2.2.post3")
     assert post_spec is not None
     assert satisfies(post_spec, "2.2", include_prerelease=True)[0] is False
@@ -526,6 +526,6 @@ def test_dependency_check_matches_fresh_recomputation(
     fresh4 = Database(mode=mode)
     result = dependency_check_analysis(incremental, declared)
     assert result == dependency_check_analysis(fresh4, declared)
-    # requests>=2.0 should still be satisfied at 3.0.0
+    # 3.0.0 still satisfies requests>=2.0
     requests_status = next(s for s in result.statuses if s.name == "requests")
     assert requests_status.status == "satisfied"

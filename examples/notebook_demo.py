@@ -8,13 +8,11 @@ from typing import Any
 from pyinc import Database
 from pyinc.integrations import notebook_analysis
 
-# `notebook_analysis_payload` is a module-local helper rather than part of the
-# package's stable surface: it is deliberately absent from
-# `pyinc.integrations.__all__`, and the integration contract's "Composition and
-# experimental helpers" section places such names outside that contract — an
-# experimental helper, by that section's own name. It is imported here because
-# `db.inspect` takes a query, and the public entrypoint
-# `notebook_analysis` is a plain function.
+# `notebook_analysis_payload` is a module-local experimental helper. It is left
+# out of `pyinc.integrations.__all__` on purpose, and the integration contract's
+# "Composition and experimental helpers" section places such names outside the
+# stable surface. The demo imports it because `db.inspect` takes a query and the
+# public entrypoint `notebook_analysis` is a plain function.
 from pyinc.integrations.notebook import notebook_analysis_payload
 
 
@@ -69,10 +67,9 @@ def main() -> None:
 
         first_changed = db.inspect(notebook_analysis_payload, str(path)).changed_at
 
-        # Re-running the notebook produces new outputs and execution_count
-        # entries but leaves cell sources unchanged. The parsed payloads read
-        # neither field, so each of them lands an equal value and is backdated,
-        # and downstream consumers stay valid.
+        # Re-running the notebook changes outputs and execution_count and keeps
+        # the cell sources. The parsed payloads ignore both fields, so each one
+        # lands an equal value and is backdated. Downstream consumers stay valid.
         nb["cells"][1]["outputs"] = [
             {"output_type": "stream", "name": "stdout", "text": "loaded 1024 rows\n"}
         ]

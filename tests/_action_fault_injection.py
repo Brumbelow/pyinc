@@ -1,21 +1,21 @@
 """Fault-injection harness for the action reconcile suites.
 
-The reconcile path touches the filesystem at a fixed set of seams. These
-helpers arm exactly one fault at one seam -- keyed on the path the seam
-receives, never on call order -- and provide the two assertion shapes the
+The reconcile path touches the filesystem at a fixed set of seams. Each
+helper arms one fault at one seam, keyed on the path the seam receives and
+never on call order. The module also provides the two assertion shapes the
 action contract distinguishes:
 
 - a preflight refusal leaves the output tree AND the ledger byte-identical,
   and ``plan()`` refuses identically;
 - a mutation-phase fault leaves each completed step in place (the set is
-  deliberately not transactional), leaves no temporary file behind, leaves
-  the ledger unchanged-or-old, and the next locked run converges.
+  non-transactional by design), leaves no temporary file behind, leaves the
+  ledger unchanged or old, and the next locked run converges.
 
-The first ``read_regular_file`` of every reconcile is the action manifest,
-so hooks gate on names, never on call counts; manifest names carry the
-stable ``.pyinc-action.`` prefix, which separates ledger traffic from output
-traffic at the same seam. Hooks accept ``**kwargs`` and forward them so a
-keyword added to a primitive (``expected_identity`` today) flows through.
+The first ``read_regular_file`` of every reconcile reads the action manifest,
+so hooks gate on names, never on call counts. Manifest names carry the stable
+``.pyinc-action.`` prefix, which separates ledger traffic from output traffic
+at the same seam. Hooks accept ``**kwargs`` and forward them, so a keyword
+added to a primitive (``expected_identity`` today) flows through.
 """
 
 from __future__ import annotations
@@ -41,14 +41,13 @@ from pyinc.errors import ActionManifestError, ActionPathError
 action_module = importlib.import_module("pyinc.action")
 
 #: What a fault may escape ``reconcile()`` as, at a seam whose type this
-#: suite does not own: raw escapes are OSError subclasses (including
-#: UnsafeFilesystemPathError), and the typed refusals are the action
-#: errors, which are ValueError-based and so disjoint from OSError. A
-#: manifest write is reported as a manifest error rather than a path error,
-#: which is why that member is named here beside the path error. A cell that
-#: pins an escape it does not own asserts this union plus the phase's safety
-#: invariants, never a bare type; a cell whose seam has a settled type
-#: asserts that type instead.
+#: suite does not own. Raw escapes are OSError subclasses (including
+#: UnsafeFilesystemPathError). The typed refusals are the action errors,
+#: which derive from ValueError and so are disjoint from OSError. A manifest
+#: write reports an ActionManifestError, so that type sits beside the path
+#: error. A cell that pins an escape it does not own asserts this union plus
+#: the phase's safety invariants, never a bare type. A cell whose seam has a
+#: settled type asserts that type.
 RAW_OR_TYPED: tuple[type[BaseException], ...] = (
     OSError,
     ActionPathError,
@@ -58,10 +57,10 @@ RAW_OR_TYPED: tuple[type[BaseException], ...] = (
 #: The injected OSError families. CPython maps a multi-argument OSError to
 #: its errno-keyed subclass (EACCES/EPERM -> PermissionError, ENOTDIR ->
 #: NotADirectoryError, EINTR -> InterruptedError; ENOSPC/EIO/ELOOP stay
-#: OSError), so an injected fault carries exactly the type a real syscall
-#: failure would. Real EINTR is retried inside os.* by the interpreter and
-#: is unobservable at these seams; an injected EINTR behaves as any other
-#: OSError, which is exactly what its cells document.
+#: OSError), so an injected fault has the same type a real syscall failure
+#: would. The interpreter retries a real EINTR inside os.*, so these seams
+#: never see one. An injected EINTR behaves like any other OSError, as its
+#: cells document.
 FAULT_FAMILIES: tuple[int, ...] = (
     errno.EACCES,
     errno.EPERM,
@@ -87,7 +86,7 @@ def manifest_gate(path: Path) -> bool:
 
 
 def named_gate(name: str) -> Callable[[Path], bool]:
-    """Match exactly one basename at a shared seam."""
+    """Match a single basename at a shared seam."""
 
     def gate(path: Path) -> bool:
         return path.name == name
@@ -107,8 +106,8 @@ def inject_fault(
     Patching the action module's own binding leaves ``pyinc._safe_fs``
     untouched, so the witness helpers and the convergence runs read the
     real tree. (Patching the identity read at the ``_safe_fs`` level would
-    also change ``read_regular_file``'s POSIX branch -- including the
-    manifest read -- which is why this harness never does that.)
+    also change the POSIX branch of ``read_regular_file``, including the
+    manifest read, so this harness patches only the action module.)
     """
     original = getattr(action_module, seam)
     armed = [True]
@@ -136,8 +135,8 @@ def inject_path_method_fault(
     """Arm one fault at a ``pathlib.Path`` method, gated on the receiver.
 
     The patch is class-wide, so the gate must name a basename unique to the
-    fixture, and tree witnesses are taken only while the fault is disarmed
-    (the witness walk itself calls ``lstat``).
+    fixture. Tree witnesses are taken only while the fault is disarmed,
+    because the witness walk itself calls ``lstat``.
     """
     original = getattr(Path, method)
     armed = [True]
@@ -184,11 +183,10 @@ def desired_spec(desired: Mapping[str, str]) -> str:
 def input_driven_action(tool: str) -> tuple[Action, Input[str]]:
     """An action whose desired set flows through the database.
 
-    The desired layout is read from an input through a query, so a
-    checkpoint of the database round-trips the provenance a refusal was
-    computed from -- the ledger itself is re-read from disk on every
-    reconcile regardless. Tool identities must be unique per cell; the
-    input key embeds the tool name.
+    A query reads the desired layout from an input, so a database
+    checkpoint round-trips the provenance a refusal was computed from. The
+    ledger itself is re-read from disk on every reconcile anyway. Each cell
+    needs a unique tool identity, and the input key embeds the tool name.
     """
     source = Input[str](f"fault-harness.{tool}.desired")
 
@@ -213,12 +211,12 @@ def assert_refusal_replays_after_checkpoint(
 ) -> None:
     """The same refusal, warm and after a checkpoint rebuild, identical text.
 
-    Actions publish durable state, so a refusal must not depend on warm
-    in-memory state: the desired set is re-derived through a database
-    rebuilt from the warm one's checkpoint and the refusal text must not
-    change. ``refuse`` asserts the per-cell witnesses on each run and
+    Actions publish durable state, so a refusal must be independent of warm
+    in-memory state. The desired set is re-derived through a database
+    rebuilt from the warm one's checkpoint, and the refusal text must stay
+    the same. ``refuse`` asserts the per-cell witnesses on each run and
     returns the exception text it observed. The warm database must be
-    ``Database("strict", store=store)`` -- the rebuilt one matches it.
+    ``Database("strict", store=store)``, which the rebuilt one matches.
     """
     warm_text = refuse(warm)
     key = warm.save_checkpoint()
@@ -239,7 +237,7 @@ def assert_tree_and_ledger_unchanged(
     before_tree: TreeWitness,
     before_ledger: bytes | None,
 ) -> None:
-    """The preflight-refusal invariant: nothing moved, on disk or in the ledger."""
+    """The preflight-refusal invariant: the tree on disk and the ledger are unchanged."""
     after_tree = tree_witness(root)
     differing = sorted(
         path
@@ -266,12 +264,12 @@ def assert_no_tmp_residue(*directories: Path) -> None:
 def assert_mutation_fault_invariants(
     root: Path, state_dir: Path, tool: str, before_ledger: bytes | None
 ) -> None:
-    """The mutation-phase invariant: ledger unchanged-or-old, no torn file.
+    """The mutation-phase invariant: ledger unchanged or old, no torn file.
 
     Mutation faults fire before the ledger write, so the ledger equals its
-    pre-call bytes. The tree is deliberately NOT asserted byte-identical
-    here: each completed step stays completed by design, and the caller
-    pins the exact steps its fixture performed.
+    pre-call bytes. The tree is NOT asserted byte-identical here. Each
+    completed step stays completed by design, and the caller pins the steps
+    its fixture performed.
     """
     after_ledger = manifest_bytes(state_dir, tool)
     before_size = "absent" if before_ledger is None else f"{len(before_ledger)} bytes"
@@ -286,9 +284,9 @@ def assert_mutation_fault_invariants(
 def make_nonregular_node(path: Path, kind: str) -> None:
     """Create a FIFO, unix socket, or device node; skip where impossible.
 
-    Sockets are bound through a relative name to dodge the AF_UNIX path
-    length cap; device nodes need mknod privilege, so their cells skip on
-    ordinary accounts -- the skip reason records the capability gap.
+    Sockets bind through a relative name to stay under the AF_UNIX path
+    length cap. Device nodes need mknod privilege, so their cells skip on
+    ordinary accounts, and the skip reason records the missing capability.
     """
     if kind == "fifo":
         make_fifo = getattr(os, "mkfifo", None)
@@ -312,7 +310,7 @@ def make_nonregular_node(path: Path, kind: str) -> None:
     make_node = getattr(os, "mknod", None)
     if make_node is None:
         pytest.skip("os.mknod is unavailable on this platform")
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. Callers skip Windows.
         pytest.skip("POSIX only")
     try:
         make_node(path, mode=node_type | 0o600, device=os.makedev(1, 3))

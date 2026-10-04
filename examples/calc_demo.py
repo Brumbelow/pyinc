@@ -1,10 +1,12 @@
 """End-to-end ``calc`` demo: includes, incremental evaluation, and reconciliation.
 
 Builds a tiny ``.calc`` workspace, reconciles the emitted results to disk via the
-``@action`` layer, and shows the incremental properties: an edit to an
-unreferenced file executes zero query bodies and writes no files, though the
-reconcile still locks, probes and verifies; a comment-only edit backdates the
-parse; removing an ``emit`` deletes only that owned output.
+``@action`` layer, and shows the incremental properties:
+
+- An edit to an unreferenced file executes zero query bodies and writes zero
+  files. The reconcile still locks, probes and verifies.
+- A comment-only edit backdates the parse.
+- Removing an ``emit`` deletes only that owned output.
 
 Run: ``python examples/calc_demo.py``
 """
@@ -15,9 +17,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Make the sibling ``calc`` package importable both as ``python
-# examples/calc_demo.py`` and via ``runpy.run_path`` (which does not add the
-# script's directory to sys.path).
+# Make the sibling ``calc`` package importable under ``python
+# examples/calc_demo.py`` and under ``runpy.run_path``, which leaves the
+# script's directory off sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from calc.engine import calc_emit, evaluate_name, parse_calc  # noqa: E402
@@ -44,10 +46,10 @@ def main(mode: str = "strict") -> None:
         calc_emit.reconcile(db, str(root), root=out)
         print(f"alpha={evaluate_name(db, str(root), 'alpha')[1]}")  # 42
 
-        # Editing a file that nothing includes executes zero query bodies and
-        # writes no files. The reconcile still takes its lock, probes what it
-        # declared and verifies the ledger — the reuse count below is what that
-        # work looks like from the statistics.
+        # An edit to a file outside the include graph executes zero query
+        # bodies and writes zero files. The reconcile still takes its lock,
+        # probes what it declared and verifies the ledger. The reuse count
+        # below is that work as the statistics show it.
         db.reset_statistics()
         unrelated.write_text("let z = 2\n", encoding="utf-8")
         unrelated_run = calc_emit.reconcile(db, str(root), root=out)

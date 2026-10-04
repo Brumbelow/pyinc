@@ -334,7 +334,7 @@ def test_workspace_mirror_rejects_in_root_file_symlink(tmp_path: Path) -> None:
 def test_workspace_mirror_rejects_nonregular_source_without_blocking(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     os.mkfifo(tmp_path / "pipe.py")
     with pytest.raises(ValueError, match="not a regular file"):
@@ -550,8 +550,9 @@ def test_workspace_surfaces_recursive_requirements_diagnostics(
 
 
 def test_workspace_remaps_out_of_project_requirements_reference(tmp_path: Path) -> None:
-    """A `-r` target that escapes the root resolves *beside* the mirror, not under
-    it, so remapping the mirror root alone leaves the temporary directory in the
+    """A `-r` target that escapes the root resolves beside the mirror.
+
+    Remapping only the mirror root would leave the temporary directory in the
     message.
     """
     root = tmp_path / "workspace"
@@ -573,10 +574,10 @@ def test_workspace_keeps_a_two_level_out_of_project_reference_deterministic(
 ) -> None:
     """A `-r` target that escapes two levels resolves above the mirror's parent.
 
-    The remap re-anchors the mirror root and its parent, so this message still
-    names the path the mirror layout resolved to rather than the workspace one.
-    What it must never do is vary between runs or leak the mirror's random
-    component.
+    The remap re-anchors the mirror root and its parent. This message still
+    names the path as the mirror layout resolved it, which differs from the
+    workspace path. It must stay identical across runs and leave out the
+    mirror's random component.
     """
 
     root = tmp_path / "nested" / "workspace"

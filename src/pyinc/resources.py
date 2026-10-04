@@ -25,57 +25,55 @@ KeyT = TypeVar("KeyT")
 ValueT = TypeVar("ValueT")
 ProbeT = TypeVar("ProbeT")
 
-# The ways a path stops naming the thing a file or listing resource reads. A
-# probe has to be total -- it answers for every key it is handed -- and none of
-# these is a transient failure a later read could survive: the path is absent,
-# it is a directory, something in its parent chain is a file, or it names a
-# pipe, a socket or a device rather than a file at all. They answer the way an
-# absent path does -- with one carve-out the last three kinds force: opening a
-# bound socket reports an errno CPython gives no subclass of its own, so the
-# file read names that errno explicitly instead of deciding by type alone.
+# The ways a path stops naming what a file or listing resource reads. The path
+# is absent, it is a directory, something in its parent chain is a file, or it
+# names a pipe, a socket or a device. A probe has to be total (it answers for
+# every key it is handed), and none of these is a transient failure that a
+# later read could survive. They answer the way an absent path does. The last
+# three kinds force one carve-out. Opening a bound socket reports an errno that
+# CPython gives no subclass, so the file read names that errno explicitly as
+# well as deciding by type.
 #
-# A denial is the genuine failure that keeps propagating, where the kernel's
-# failure records handle it identically warm and fresh. What is left names
-# nothing readable and never will by being asked again -- a link that leads back
-# to itself, or a path string holding a NUL -- and the file, listing and stat
-# seams below refuse it by type. That is the third outcome a total probe is
-# allowed, and it keeps the platform's own spelling of these two, which differs
-# by interpreter version and by platform, out of a caller's handlers.
+# A permission denial is the real failure, and it keeps propagating. The
+# kernel's failure records handle it identically warm and fresh. What is left
+# names nothing readable, however often it is asked: a link that leads back to
+# itself, or a path string holding a NUL. The file, listing and stat seams
+# below refuse those by type. That is the third outcome a total probe is
+# allowed. It keeps the platform's own spelling of these two cases, which
+# differs by interpreter version and by platform, out of a caller's handlers.
 #
-# Which error carries which of those is the platform's business, and the two
-# disagree. POSIX raises IsADirectoryError for a directory opened as a file and
-# NotADirectoryError for a path reached through one; Windows raises
-# PermissionError for the directory and FileNotFoundError for the path under a
-# file. So this tuple does not decide a permission denial on its own -- see
+# The platforms disagree on which error carries which case. POSIX raises
+# IsADirectoryError for a directory opened as a file and NotADirectoryError for
+# a path reached through a file. Windows raises PermissionError for the
+# directory and FileNotFoundError for the path under a file. So a permission
+# denial needs more than this tuple: see `_reads_as_missing`.
+#
+# The listing and stat probes match this tuple directly. A file read can also
+# be handed a kind that no read of it can ever answer, so it asks
 # `_reads_as_missing`.
-#
-# The tuple itself is what the listing and stat probes match directly. A file
-# read has the wider question, because it can also be handed a kind no read of
-# it can ever answer, and asks `_reads_as_missing` instead.
 _MISSING_FILE_ERRORS = (FileNotFoundError, IsADirectoryError, NotADirectoryError)
 
 
 def _reads_as_missing(path: str, exc: OSError) -> bool:
     """Report whether a failed file read means the path names no readable file.
 
-    A permission denial cannot be decided by its type. Windows raises it for a
-    directory opened as a file, where POSIX raises IsADirectoryError, and it is
-    also what an ACL denial on a perfectly ordinary file raises -- which must
-    keep propagating into a failure record. Only the kind of the path separates
-    them, so that is what is asked.
+    A permission denial needs the path's kind to decide it. Windows raises
+    PermissionError for a directory opened as a file, where POSIX raises
+    IsADirectoryError. An ACL denial on an ordinary file raises it too, and
+    that one must keep propagating into a failure record. Only the kind of
+    the path separates them, so that is what is asked.
 
-    A bound socket is the other answer a type cannot carry: opening one reports
-    an errno CPython gives no subclass, so it is named by errno beside the three
-    types. A pipe and a device raise nothing to classify: the read answers those
-    from the kind it observed rather than from a failure, so only a failed open
-    arrives here.
+    A bound socket also needs more than a type. Opening one reports an errno
+    that CPython gives no subclass, so it is named by errno beside the three
+    types. A pipe and a device raise nothing to classify: the read answers
+    those from the kind it observed, so only a failed open arrives here.
 
-    The question races the read it is explaining. Either answer was true at some
+    The question races the read it explains. Either answer was true at some
     instant inside this call, and the probe the caller goes on to record
-    observed one of them, so a race costs a re-read and never a wrong answer.
+    observed one of them. So a race costs a re-read and never a wrong answer.
 
-    The classification lives beside the read that raises these, so the two
-    cannot drift apart.
+    The classification lives beside the read that raises these errors, so the
+    two stay in step.
     """
 
     return _read_error_means_missing(path, exc)
@@ -89,14 +87,16 @@ class Resource(Generic[KeyT, ValueT, ProbeT]):
     both from one underlying read, as all built-in resources do.
 
     On a warm request the kernel may answer an unchanged-probe check from
-    :meth:`probe` alone and calls :meth:`probe_and_load` only when that probe
-    misses or the record cannot answer, so :meth:`probe` and the probe
-    component of :meth:`probe_and_load` must agree on an unchanged world. The
-    kernel may spend one standalone :meth:`probe` per warm request, and a miss
-    then pays the full :meth:`probe_and_load` on top, so :meth:`probe` should
-    cost no more than :meth:`probe_and_load` and must answer "unchanged" only
-    when it genuinely is: a probe that advances on every call defeats the
-    warm-path check and turns each warm request into two reads.
+    :meth:`probe` alone. It calls :meth:`probe_and_load` only when that probe
+    misses or the record cannot answer. So :meth:`probe` and the probe
+    component of :meth:`probe_and_load` must agree on an unchanged world.
+
+    The kernel may spend one standalone :meth:`probe` per warm request, and a
+    miss then pays the full :meth:`probe_and_load` on top. So :meth:`probe`
+    should cost no more than :meth:`probe_and_load`, and it must answer
+    "unchanged" only when the world is unchanged. A probe that advances on
+    every call defeats the warm-path check and turns each warm request into
+    two reads.
     """
 
     def read(self, db: _runtime.Database, key: KeyT) -> ValueT:
@@ -114,15 +114,15 @@ class Resource(Generic[KeyT, ValueT, ProbeT]):
     def identity(self) -> Any:
         """Return snapshot-safe configuration that distinguishes this resource.
 
-        The configuration must not move while the resource is in use. The
+        The configuration must stay fixed while the resource is in use. The
         default hands back the resource itself, so a resource that keeps
         observation state of its own redefines itself every time it is read.
-        Where that state is written into a list, dict or set the resource
-        holds -- a read log or a cache kept in one -- the read that observes
-        the change is refused. A change made anywhere else is not refused: a
-        value rebound on the resource, or rebound inside another object it
-        holds, leaves the query re-fingerprinting on every request instead,
-        executing cold each time and reusing nothing. Either way such a
+        When that state is written into a list, dict or set the resource
+        holds (such as a read log or a cache), the read that observes the
+        change is refused. A change made anywhere else is accepted at a cost.
+        A value rebound on the resource, or rebound inside another object it
+        holds, makes the query re-fingerprint on every request, so it
+        executes cold each time and reuses nothing. Either way, such a
         resource defines this method and returns the configuration that
         distinguishes it.
         """
@@ -208,31 +208,33 @@ FileStatProbe = tuple[bool, int | None, int | None]
 class FileStatAdapter:
     """Rebuilds a :class:`FileStatSnapshot` at every cached value boundary.
 
-    Without an adapter the kernel freezes a file-stat reading field by field
-    into a record and hands that record back, so a caller reading one out of the
-    cache gets a mapping of the three fields -- a frozen record view in strict
-    mode, a plain dict in the others -- where a fresh read gave the dataclass.
-    This closes that gap: the stored payload is the positional triple
-    ``(exists, size, mtime_ns)`` and every exposure reconstructs the dataclass
-    from it.
+    Without an adapter, the kernel freezes a file-stat reading field by field
+    into a record and hands that record back. A caller reading one out of the
+    cache then gets a mapping of the three fields, where a fresh read gave the
+    dataclass. That mapping is a frozen record view in strict mode and a plain
+    dict in the others. This adapter closes that gap. The stored payload is the
+    positional triple ``(exists, size, mtime_ns)``, and every exposure
+    rebuilds the dataclass from it.
 
-    The payload is positional rather than named on purpose: a payload written
-    inline is the only kind the shared-structure encoding hands back whole. A
-    mapping, list, set or dataclass payload is held as a node of that envelope
-    instead, and a value carrying one is refused at the freeze rather than
-    handed to ``thaw`` as an unresolved reference or as a container filled in
-    an order nothing promises. What makes this payload inline all the way
-    through is that its three elements are scalars, not that it is a tuple: a
-    tuple is inline only as far as its own elements, so a tuple holding a
-    shared or cyclic container is refused on the same terms. Nothing in this
-    triple is a container, which keeps this adapter correct in every mode and
-    in every snapshot shape.
+    The payload is positional on purpose. Only a payload written inline comes
+    back whole from the shared-structure encoding. The encoding holds a
+    mapping, list, set or dataclass payload as a node of the shared structure,
+    and the freeze refuses a value carrying one. Otherwise ``thaw`` would
+    get an unresolved reference, or a container filled in an order nothing
+    promises. This payload is inline all the way through because its three
+    elements are scalars. Being a tuple is not enough: a tuple is inline only
+    as far as its own elements, so a tuple holding a shared or cyclic
+    container is refused on the same terms. This triple holds only scalars,
+    which keeps this adapter correct in every mode and in every snapshot
+    shape.
 
-    Stateless by construction: no instance attributes, no slot state, no
-    captured objects. That is what lets the kernel treat it as fixed --
-    fingerprinting it once per process rather than at every trust boundary, and
-    leaving it out of the request-scope configuration check, which exists for
-    state this adapter does not have.
+    It is stateless by construction: no instance attributes, no slot state, no
+    captured objects. That lets the kernel treat it as fixed. The kernel
+    derives its implementation digest once per process, and each checkpoint
+    trust boundary reads that digest back. A caller adapter's implementation
+    digest is re-derived at every checkpoint trust boundary. The kernel also
+    leaves this adapter out of the request-scope configuration check, which
+    exists for state this adapter does not have.
     """
 
     def freeze(self, value: FileStatSnapshot, freeze: FreezeFn) -> Any:
@@ -245,9 +247,9 @@ class FileStatAdapter:
 
 # The adapters every database carries for the kernel's own value types, as
 # single fixed instances. A database's registry is these entries updated with
-# the caller's, so a caller who registers their own adapter for one of these
-# types replaces the entry rather than colliding with it -- and the replacement
-# is a caller adapter in every respect, including the configuration check.
+# the caller's. A caller who registers their own adapter for one of these types
+# replaces the entry, with no collision. The replacement is a caller adapter in
+# every respect, including the configuration check.
 BUILTIN_ADAPTERS: Mapping[type[Any], ValueAdapter] = MappingProxyType(
     {FileStatSnapshot: FileStatAdapter()}
 )
@@ -296,35 +298,34 @@ def _stopped_at_a_link(resolved: Path) -> bool:
     """Report a resolution that gave up: a resolved path holds no link.
 
     A full resolution has followed every link it met, so no component of its
-    answer is one. A resolution that could not finish reports what it managed
-    instead, and what it managed still holds the link it stopped at -- which
-    is what this asks about, rather than trying to name the failure that
-    stopped it.
+    answer is one. A resolution that could not finish reports what it managed,
+    and that still holds the link it stopped at. This asks about that link and
+    leaves the failure that stopped the resolution unnamed.
 
-    ``os.path.islink`` answers False for a path it cannot read rather than
-    raising, so asking it keeps the probe total. The one path it will not
-    accept is one holding a null character, and `_resolved_path` turns those
-    away before anything here is asked.
+    ``os.path.islink`` answers False for a path it cannot read, without
+    raising, so asking it keeps the probe total. The one path it rejects is
+    one holding a null character, and `_resolved_path` turns those away
+    before anything here is asked.
     """
     return any(os.path.islink(candidate) for candidate in (resolved, *resolved.parents))
 
 
 def _resolved_path(path: str) -> str | None:
     # A path that cannot resolve is answered as None, the way an unset
-    # environment variable is: a NUL path and a looping path each name no
+    # environment variable is. A NUL path and a looping path each name no
     # readable file, and a probe has to be total.
     #
-    # Both are decided here rather than by catching what resolution raised,
-    # because WHICH of them raises is neither the same across platforms nor
-    # settled across versions. A null character is caught before the ask, the
-    # way an action's and a store's entry points test for one before they
-    # resolve; and the answer, however it was reached, is checked for the
-    # links a finished resolution cannot contain. Where one platform raises
-    # for a loop, another quietly joins the unresolved remainder onto the link
-    # it gave up at and returns that -- so the value is pinned by testing the
-    # answer, which every platform composes out of the same parts, and not by
-    # enumerating the failures, which they spell differently. The handler
-    # below stays as the backstop for the platforms that do raise.
+    # Both are decided here by testing the path and the answer, because which
+    # of them raises differs across platforms and is unsettled across
+    # versions. A null character is caught before the ask, the way an action's
+    # and a store's entry points test for one before they resolve. The answer,
+    # however it was reached, is then checked for the links a finished
+    # resolution cannot contain. One platform raises for a loop. Another joins
+    # the unresolved remainder onto the link it gave up at and returns that,
+    # without raising. So the value is pinned by testing the answer, which
+    # every platform composes out of the same parts. Each platform spells the
+    # failures differently, so enumerating them would leave it unpinned. The
+    # handler below stays as the backstop for the platforms that do raise.
     if "\0" in path:
         return None
     try:
@@ -343,7 +344,7 @@ class ResolvedPathResource(Resource[str | os.PathLike[str], str | None, tuple[st
     The semantic value is the fully resolved path string, so retargeting any
     link along the chain invalidates readers. `Path.resolve` of a fully
     qualified path reaches the live filesystem untracked (kernel contract,
-    limitation 1); containment and visited-set decisions inside queries route
+    limitation 1). Containment and visited-set decisions inside queries route
     through this resource instead.
     """
 
@@ -393,29 +394,29 @@ class DirectoryResource(Resource[str | os.PathLike[str], tuple[str, ...], Direct
 def _read_file(path: str) -> bytes | None:
     # A FIFO, a socket and a device file are paths a caller handed us that
     # name no readable file: reading one either never returns or fails in a
-    # way re-reading cannot fix. They answer the way an absent path does --
-    # identically warm and fresh, and reproducible by a fresh run, which is
-    # what keeps the probe built on this total. A symlink is followed: a
-    # source file reached through one is an ordinary source file -- but a link
-    # that leads back to itself names no file at all, and neither does a path
-    # string holding a NUL, so those two are refused by type rather than
-    # answered, which is the third outcome a total probe is allowed.
+    # way re-reading cannot fix. They answer the way an absent path does,
+    # identically warm and fresh and reproducible by a fresh run. That keeps
+    # the probe built on this total. A symlink is followed, because a source
+    # file reached through one is an ordinary source file. A link that leads
+    # back to itself names no file, and neither does a path string holding a
+    # NUL. Those two are refused by type, the third outcome a total probe is
+    # allowed.
     try:
         return read_regular_file_following_links(Path(path))
     except UnsafeFilesystemPathError:
         # Already this library's own refusal, composed where the read decided
-        # it. Restating it here would only bury the sentence that knows why.
+        # it. Re-raising it unchanged keeps the message that says why.
         raise
     except OSError as exc:
         if _reads_as_missing(path, exc):
             return None
         if isinstance(exc, PermissionError):
-            # A denial on an otherwise ordinary path is a genuine failure the
-            # kernel's failure records already handle identically warm and
-            # fresh. It keeps propagating, and the guard says so deliberately
-            # rather than leaving it to the order the arms happen to sit in.
-            # Which shapes read as missing is a separate question with a single
-            # answer, asked first, so a denial is a denial only once it has.
+            # A denial on an otherwise ordinary path is a real failure, and
+            # the kernel's failure records handle it identically warm and
+            # fresh. It keeps propagating. This guard makes that explicit,
+            # independent of the order of the arms. Which shapes read as
+            # missing is a separate question with one answer, asked first, so
+            # a denial counts as a denial only after that check.
             raise
         raise UnsafeFilesystemPathError(f"Path names no readable file: {path}") from exc
 
@@ -427,55 +428,54 @@ def _listing_snapshot(path: str) -> DirectoryProbe:
     except FileNotFoundError:
         return False, ()
     except (IsADirectoryError, NotADirectoryError):
-        # A path that is not a directory is reported as one that is not: a
-        # directory walk tells a module from a package by that answer, and the
-        # probe built on this listing turns it into a third state of its own
-        # rather than sharing the absent one.
+        # A path that is not a directory is reported as not a directory: a
+        # directory walk tells a module from a package by that answer. The
+        # probe built on this listing turns it into a third state of its own,
+        # apart from absent.
         raise
     except PermissionError:
-        # A denial on an otherwise ordinary path is a genuine failure the
-        # kernel's failure records already handle identically warm and fresh.
-        # It keeps propagating.
+        # A denial on an otherwise ordinary path is a real failure, and the
+        # kernel's failure records handle it identically warm and fresh. It
+        # keeps propagating.
         raise
     except (OSError, ValueError) as error:
-        # What is left names no directory and never will by being asked again:
-        # a link that leads back to itself, or a path string holding a NUL,
-        # which the platform reports by raising out of the listing call in a
-        # spelling of its own. Refused by type so the answer is the library's.
+        # What is left names no directory, however often it is asked: a link
+        # that leads back to itself, or a path string holding a NUL. The
+        # platform raises for these out of the listing call in a spelling of
+        # its own. Refused by type, so the answer is the library's.
         raise UnsafeFilesystemPathError(f"Path names no readable directory: {path}") from error
     return True, names
 
 
-# A path that is not a directory may not share the probe an absent one gets:
-# reading them differs -- an absent path yields no entries, a non-directory
-# raises -- so one probe for both would certify an interval a change happened
-# in. "" is never a directory entry name, so it names the third state without
+# A path that is not a directory needs a probe apart from an absent path's.
+# Reading them differs: an absent path yields no entries, and a non-directory
+# raises. One probe for both would certify an interval a change happened in.
+# "" is never a directory entry name, so it names the third state without
 # widening the probe every directory record already carries.
 _NOT_A_DIRECTORY_PROBE: DirectoryProbe = (False, ("",))
 
 
 def _listing_probe(path: str) -> DirectoryProbe:
-    """Report a path whose kind holds no listing rather than raising for it.
+    """Report a path whose kind holds no listing, without raising for it.
 
     The load keeps raising: a caller reading a listing is told a file is not a
     directory, which is how a directory walk tells a module from a package. The
-    probe cannot, because a probe that raises retires the record it was
+    probe has to answer instead. A probe that raises retires the record it was
     checking, and a warm database would then answer a path whose kind changed
     differently from a fresh one reading the same world.
 
-    That sentence is also why the two shapes this probe does still raise for
-    are refused by type rather than in the platform's own words. A link that
-    leads back to itself and a path string holding a NUL name no listing in
-    any world, so retiring the record that asked about one of them is the
-    right outcome -- and the caller is told so in a sentence this library
-    composed, which does not change with the interpreter or the platform
-    underneath it.
+    The same reasoning covers the two shapes this probe still raises for. A
+    link that leads back to itself and a path string holding a NUL name no
+    listing in any world. So retiring the record that asked about one of them
+    is the right outcome. They are refused by type, so the caller is told in a
+    sentence this library composed, the same on every interpreter and
+    platform.
 
-    A path reached *through* a file is where the platforms part: POSIX raises
-    NotADirectoryError and lands here, Windows reports the path absent and never
-    gets this far. Both are sound, because on each the probe still matches what
-    a read of that path does -- Windows reads it exactly as it reads an absent
-    path, so the two may share a probe there.
+    A path reached *through* a file is where the platforms part. POSIX raises
+    NotADirectoryError and lands here. Windows reports the path absent and
+    never gets this far. Both are sound, because on each the probe still
+    matches what a read of that path does. Windows reads it the same way as an
+    absent path, so the two may share a probe there.
     """
 
     try:
@@ -488,15 +488,15 @@ def _stat_snapshot(path: str) -> FileStatSnapshot:
     # A stat answers for directories, so of _MISSING_FILE_ERRORS only the
     # absent-path members can fire here. A PermissionError means a parent ACL
     # denial and keeps propagating into a failure record. What is left names no
-    # file whose metadata any read could ever reach -- a link that leads back to
-    # itself, or a path string holding a NUL -- so it is refused by type instead
-    # of escaping in whichever spelling the platform happened to give it.
+    # file whose metadata any read could ever reach: a link that leads back to
+    # itself, or a path string holding a NUL. It is refused by type, so the
+    # caller sees the library's error in place of the platform's own spelling.
     try:
         metadata = Path(path).stat()
     except _MISSING_FILE_ERRORS:
         return FileStatSnapshot(exists=False, size=None, mtime_ns=None)
     except PermissionError:
-        # A denial is a genuine failure and keeps propagating; the refusal arm
+        # A denial is a real failure and keeps propagating. The refusal arm
         # below must never take it.
         raise
     except (OSError, ValueError) as error:

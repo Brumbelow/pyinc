@@ -187,8 +187,8 @@ def test_workspace_session_remaps_mirror_paths_inside_diagnostic_messages(
 ) -> None:
     """A kernel `Diagnostic` has no path field, so an integration that needs to
     name a file interpolates it into the message. Under a session that file is
-    the mirror copy, in a randomly named temporary directory, so the message has
-    to be remapped just like the `path` field is.
+    the mirror copy, in a randomly named temporary directory. So the message has
+    to be remapped the same way as the `path` field.
     """
     root = tmp_path / "workspace"
     root.mkdir()
@@ -252,7 +252,7 @@ def test_polling_workspace_watcher_first_poll_detects_edits_made_before_watcher_
         return clock_state["now"]
 
     with WorkspaceSession(root) as session:
-        # The mirror was populated at session construction; an edit landing
+        # The mirror was populated at session construction. An edit landing
         # before the watcher exists (e.g. during the initial analysis) must
         # still be picked up by the first polls.
         _write(target, "def a() -> int:\n    return 2\n")
@@ -272,8 +272,8 @@ def test_refresh_paths_converges_when_a_tracked_file_is_swapped_for_a_directory(
     """Refreshing a swapped path must leave the mirror matching disk.
 
     An analysis taken while the swap is settling still fails inside the kernel's
-    file resource -- it does so without a session too -- so what the session owes
-    is convergence: the refresh itself succeeds and analysis recovers once the
+    file resource, as it does without a session. What the session owes is
+    convergence. The refresh itself succeeds, and analysis recovers once the
     workspace stops moving.
     """
 
@@ -339,7 +339,7 @@ def test_set_overlay_replaces_a_mirror_directory_a_swap_left_behind(tmp_path: Pa
 def test_polling_workspace_watcher_converges_when_a_tracked_file_becomes_a_directory(
     tmp_path: Path,
 ) -> None:
-    """A file replaced by a same-named directory must not wedge the poll loop.
+    """The poll loop converges when a file is replaced by a same-named directory.
 
     A refresh that raises leaves its paths pending, so a failure here is retried
     on every tick for as long as the session lives.
@@ -643,12 +643,13 @@ def test_language_server_definition_follows_single_level_wildcard_import(
 def test_symbol_at_wildcard_chain_is_bounded_by_intermediate_surface(
     tmp_path: Path,
 ) -> None:
-    """Two-level ``from X import *`` chain currently does **not** resolve end-to-end:
+    """A two-level ``from X import *`` chain currently fails to resolve end to end.
+
     ``_module_binding_analysis`` treats ``from X import *`` as a
-    "top-level wildcard re-export" impurity and binds no names, so an intermediate
-    module's wildcard export surface is empty. Resolution from the outer consumer
-    therefore cannot see the innermost definition. This pins the design so a future
-    change that widens wildcard propagation does not do so silently.
+    "top-level wildcard re-export" impurity and binds no names. So an intermediate
+    module's wildcard export surface is empty, and resolution from the outer
+    consumer cannot see the innermost definition. This pins the design, so a
+    future change that widens wildcard propagation shows up here.
     """
     root = tmp_path / "workspace"
     root.mkdir()
@@ -737,9 +738,9 @@ def test_language_server_hover_on_ambiguous_wildcard_returns_none(
                 "position": {"line": 3, "character": 1},
             },
         )
-        # `foo` isn't a local symbol in consumer.py (only wildcard stubs are), so
-        # the hover handler finds no symbol and returns None. This pins the current
-        # behavior: the LSP does not synthesize a hover payload for ambiguous
+        # Only wildcard stubs are local symbols in consumer.py, so the hover
+        # handler finds no symbol for `foo` and returns None. This pins the
+        # current behavior. The LSP synthesizes no hover payload for ambiguous
         # wildcard resolutions.
         assert hover is None
 
@@ -802,12 +803,12 @@ def test_language_server_declaration_local_function_returns_def_line(
 def test_language_server_declaration_import_alias_points_at_import_line(
     tmp_path: Path,
 ) -> None:
-    # The point of `textDocument/declaration` vs `textDocument/definition`:
-    # the declaration of an import alias is the `import` statement itself,
-    # while the definition follows the import chain through to the imported
-    # module's file. For a stdlib import like `os`, definition returns []
-    # (stdlib targets are not surfaced), but declaration jumps to the
-    # `import os` line in the current file.
+    # `textDocument/declaration` and `textDocument/definition` differ for an
+    # import alias. Its declaration is the `import` statement itself. Its
+    # definition follows the import chain through to the imported module's
+    # file. For a stdlib import like `os`, definition returns [] (stdlib
+    # targets are not surfaced), and declaration jumps to the `import os` line
+    # in the current file.
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "mod.py"
@@ -839,9 +840,9 @@ def test_language_server_declaration_import_alias_points_at_import_line(
         assert decl[0]["range"]["start"]["character"] == 7
         assert decl[0]["range"]["end"]["character"] == 9
 
-        # `definition` does not surface a Location for stdlib targets, so the
-        # distinction is visible: declaration points at the import statement,
-        # definition is empty.
+        # `definition` surfaces no Location for stdlib targets, so the
+        # distinction is visible. Declaration points at the import statement,
+        # and definition is empty.
         assert defn == []
     finally:
         if server._session is not None:
@@ -906,8 +907,8 @@ def test_language_server_declaration_wildcard_stub_points_at_wildcard_line(
     server = LanguageServer(default_root=str(root))
     try:
         server._handle_request("initialize", {"rootUri": root.as_uri()})
-        # The local module_symbol_table only records a `wildcard_import_stub`
-        # for `*` — `foo` itself isn't a bare-name entry. So
+        # The local module_symbol_table records only a `wildcard_import_stub`
+        # for `*`, and `foo` itself has no bare-name entry. So
         # declaration_location_at falls through and returns None.
         decl = server._handle_request(
             "textDocument/declaration",
@@ -957,7 +958,7 @@ def test_language_server_declaration_on_whitespace_returns_empty(
     server = LanguageServer(default_root=str(root))
     try:
         server._handle_request("initialize", {"rootUri": root.as_uri()})
-        # Whitespace position — no identifier under cursor.
+        # Whitespace position: no identifier under the cursor.
         locations = server._handle_request(
             "textDocument/declaration",
             {
@@ -1003,9 +1004,9 @@ def test_language_server_declaration_class_returns_class_line(
 def test_language_server_declaration_import_with_alias_uses_alias_offsets(
     tmp_path: Path,
 ) -> None:
-    # `import os as my_os` — the bound name is `my_os`. Clicking on `my_os`
-    # should jump to the import line, and the range should span `my_os`,
-    # not the original module name `os`.
+    # In `import os as my_os` the bound name is `my_os`. Clicking on `my_os`
+    # should jump to the import line, and the range should span `my_os`
+    # itself, leaving out the original module name `os`.
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "mod.py"
@@ -1079,7 +1080,7 @@ def test_workspace_session_declaration_location_at_missing_file_raises(
 
 
 def test_language_server_declaration_overlay_sees_edit(tmp_path: Path) -> None:
-    # The overlay (editor buffer) reaches declaration just like definition.
+    # The overlay (editor buffer) reaches declaration the same way as definition.
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "mod.py"
@@ -1113,7 +1114,7 @@ def test_language_server_declaration_overlay_sees_edit(tmp_path: Path) -> None:
             },
         )
         assert len(locations) == 1
-        # Overlay declaration found at the new line 0 — disk is unchanged.
+        # Overlay declaration found at the new line 0. Disk is unchanged.
         assert locations[0]["range"]["start"]["line"] == 0
         assert locations[0]["range"]["start"]["character"] == 4
         assert locations[0]["range"]["end"]["character"] == 9
@@ -1139,10 +1140,10 @@ def _published_diagnostics(out: io.BytesIO) -> list[tuple[str, tuple[str, ...]]]
 
 
 def test_lsp_close_and_watched_file_notifications_refresh_diagnostics(tmp_path: Path) -> None:
-    # didClose drops the editor buffer so the disk text answers again, and
-    # didChangeWatchedFiles pulls a disk edit in without the poller; each one
-    # republishes diagnostics, while an empty change list and an unknown
-    # notification are accepted silently.
+    # didClose drops the editor buffer so the disk text answers again.
+    # didChangeWatchedFiles pulls a disk edit in without the poller. Each one
+    # republishes diagnostics. An empty change list and an unknown
+    # notification are accepted and publish nothing.
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "mod.py"
@@ -1206,7 +1207,7 @@ def test_lsp_close_and_watched_file_notifications_refresh_diagnostics(tmp_path: 
 
 
 def test_lsp_workspace_root_fallback_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # rootUri wins over workspaceFolders, which win over rootPath; with none
+    # rootUri wins over workspaceFolders, which win over rootPath. With none
     # of them the server falls back to its default root, then to the process
     # working directory. Each candidate holds one marker symbol so the
     # workspace/symbol answer names the root that was chosen.
@@ -1520,11 +1521,11 @@ def test_language_server_document_highlight_marks_declaration_write_and_calls_te
     target = root / "mod.py"
     _write(
         target,
-        "def foo() -> int:\n"  # line 0 — declaration
+        "def foo() -> int:\n"  # line 0: declaration
         "    return 1\n"  # line 1
         "\n"  # line 2
-        "foo()\n"  # line 3 — call
-        "x = foo\n",  # line 4 — bare reference
+        "foo()\n"  # line 3: call
+        "x = foo\n",  # line 4: bare reference
     )
 
     server = LanguageServer(default_root=str(root))
@@ -1542,14 +1543,15 @@ def test_language_server_document_highlight_marks_declaration_write_and_calls_te
         by_line = {h["range"]["start"]["line"]: h for h in highlights}
         assert set(by_line) == {0, 3, 4}
 
-        # Declaration is reported as Write (kind=3) with a real identifier span,
-        # not the synthetic col=0..1 placeholder that find_references emits.
+        # Declaration is reported as Write (kind=3) with a real identifier span
+        # in place of the synthetic col=0..1 placeholder that find_references
+        # emits.
         decl = by_line[0]
         assert decl["kind"] == 3
         assert decl["range"]["start"]["character"] == len("def ")
         assert decl["range"]["end"]["character"] == len("def ") + len("foo")
 
-        # Call site is Text (kind=1) and spans the identifier exactly.
+        # Call site is Text (kind=1) and spans only the identifier.
         call = by_line[3]
         assert call["kind"] == 1
         assert call["range"]["start"]["character"] == 0
@@ -1586,10 +1588,10 @@ def test_language_server_document_highlight_excludes_other_files(
             },
         )
 
-        # Only consumer.py occurrences should be returned; provider.py is in
+        # Only consumer.py occurrences should be returned. provider.py is in
         # the workspace-wide reference set but is filtered out for highlight.
         # The `from a import foo` line is an import binding (not a Name AST
-        # node) so the occurrence walker does not emit it.
+        # node), so the occurrence walker does not emit it.
         assert len(highlights) == 2
         lines = sorted(h["range"]["start"]["line"] for h in highlights)
         assert lines == [2, 3]
@@ -1697,7 +1699,7 @@ def test_workspace_session_find_document_highlights_returns_dataclasses(
         assert symbol_id is not None
         highlights = session.find_document_highlights(target, symbol_id)
         kinds = sorted(h.kind for h in highlights)
-        # Exactly one declaration ("write") and one call site ("text").
+        # One declaration ("write") and one call site ("text").
         assert kinds == ["text", "write"]
         decl = next(h for h in highlights if h.kind == "write")
         assert decl.range.start.line + 1 == 1
@@ -1745,11 +1747,11 @@ def test_language_server_linked_editing_range_returns_in_file_ranges(
     target = root / "mod.py"
     _write(
         target,
-        "def foo() -> int:\n"  # line 0 — declaration
+        "def foo() -> int:\n"  # line 0: declaration
         "    return 1\n"  # line 1
         "\n"  # line 2
-        "foo()\n"  # line 3 — call
-        "x = foo\n",  # line 4 — bare reference
+        "foo()\n"  # line 3: call
+        "x = foo\n",  # line 4: bare reference
     )
 
     server = LanguageServer(default_root=str(root))
@@ -1769,11 +1771,11 @@ def test_language_server_linked_editing_range_returns_in_file_ranges(
         # All three in-file occurrences (declaration name, call, bare ref).
         by_line = {r["start"]["line"]: r for r in ranges}
         assert set(by_line) == {0, 3, 4}
-        # The declaration range spans the real identifier, not the def keyword.
+        # The declaration range spans the real identifier after the def keyword.
         decl = by_line[0]
         assert decl["start"]["character"] == len("def ")
         assert decl["end"]["character"] == len("def ") + len("foo")
-        # Every mirrored range spans exactly the identifier (identical content).
+        # Every mirrored range spans only the identifier (identical content).
         source_lines = target.read_text().splitlines()
         for editing_range in ranges:
             text_line = source_lines[editing_range["start"]["line"]]
@@ -1808,7 +1810,7 @@ def test_language_server_linked_editing_range_excludes_other_files(
             },
         )
 
-        # Linked editing is in-file only — provider.py is filtered out. Use
+        # Linked editing is in-file only, so provider.py is filtered out. Use
         # textDocument/rename for workspace-wide edits.
         lines = sorted(r["start"]["line"] for r in result["ranges"])
         assert lines == [2, 3]
@@ -1927,9 +1929,10 @@ def test_workspace_session_linked_editing_ranges_at_non_workspace_target(
 
 
 def test_type_checking_imports_visible_and_lsp_hover_works(tmp_path: Path) -> None:
-    """``if TYPE_CHECKING:`` imports are walked into ``ModuleSymbolTable.symbols``
-    so LSP hover and goto-definition work for any bare identifier that matches a
-    symbol name, including identifiers that appear inside string annotations — the
+    """``if TYPE_CHECKING:`` imports are walked into ``ModuleSymbolTable.symbols``.
+
+    LSP hover and goto-definition then work for any bare identifier that matches a
+    symbol name. That includes identifiers inside string annotations, because the
     identifier-at-position parser operates on raw source characters.
     """
 
@@ -1944,9 +1947,9 @@ def test_type_checking_imports_visible_and_lsp_hover_works(tmp_path: Path) -> No
         "if TYPE_CHECKING:\n"  # line 2
         "    from helper import Foo\n"  # line 3
         "\n"  # line 4
-        "x: Foo\n"  # line 5 — bare identifier reference
+        "x: Foo\n"  # line 5: bare identifier reference
         "\n"  # line 6
-        'def g(a: "Foo") -> "Foo":\n'  # line 7 — string annotation (forward-ref)
+        'def g(a: "Foo") -> "Foo":\n'  # line 7: string annotation (forward-ref)
         "    return a\n",  # line 8
     )
 
@@ -1961,7 +1964,7 @@ def test_type_checking_imports_visible_and_lsp_hover_works(tmp_path: Path) -> No
     try:
         server._handle_request("initialize", {"rootUri": root.as_uri()})
 
-        # Bare identifier `Foo` on line 5 — hover resolves via the symbol table.
+        # Bare identifier `Foo` on line 5. Hover resolves via the symbol table.
         hover = server._handle_request(
             "textDocument/hover",
             {
@@ -1983,7 +1986,7 @@ def test_type_checking_imports_visible_and_lsp_hover_works(tmp_path: Path) -> No
         assert len(locations) == 1
         assert locations[0]["uri"].endswith("helper.py")
 
-        # ``"Foo"`` inside a string annotation on line 7 — the identifier-at-position
+        # ``"Foo"`` inside a string annotation on line 7. The identifier-at-position
         # parser extracts ``Foo`` from raw source characters, so hover resolves
         # against the symbol table and returns a result here too.
         hover_str = server._handle_request(
@@ -2048,7 +2051,7 @@ def test_watcher_callback_fires_for_debounced_change(
             fired.set()
 
         watcher.start(on_change, interval_s=0.02)
-        # Make a change; content size differs from the original.
+        # Make a change. The content size differs from the original.
         _write(target, "x = 1\ny = 2\nz = 3\n")
         assert _wait_for_event(fired)
         watcher.stop()
@@ -2146,7 +2149,7 @@ def test_watcher_double_stop_is_noop(tmp_path: Path, watcher_factory: _WatcherFa
         watcher.stop()  # before start
         watcher.start(lambda _paths: None, interval_s=0.02)
         watcher.stop()
-        watcher.stop()  # after start + stop — still a no-op
+        watcher.stop()  # after start + stop: still a no-op
         assert watcher.is_running is False
 
 
@@ -2466,8 +2469,8 @@ class _ReadHookServer(LanguageServer):
     """A server that runs a hook right after its `_session` is next read.
 
     The hook stands in for another thread acting between two reads of the
-    attribute: the read has already answered, as it would have for a thread
-    preempted just after it.
+    attribute. The read has already answered, as it would have for a thread
+    preempted right after it.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -2559,10 +2562,10 @@ def test_publish_during_teardown_neither_raises_nor_sends(tmp_path: Path) -> Non
 def test_publish_whose_session_was_torn_down_during_analysis_sends_nothing(
     tmp_path: Path,
 ) -> None:
-    """Diagnostics for a session the server no longer serves are dropped.
+    """Diagnostics for a session the server has stopped serving are dropped.
 
     A watcher join that times out leaves the thread analyzing after teardown
-    has moved on; the diagnostics it then sent described a closed session,
+    has moved on. The diagnostics it then sent described a closed session,
     possibly after the shutdown response.
     """
 
@@ -2765,10 +2768,9 @@ def test_session_helpers_use_the_session_they_checked(tmp_path: Path) -> None:
 
 
 class _PairedWriteStream:
-    """In-memory output stream that stalls after each write until the other
-    writer thread has also written.
+    """In-memory output stream that stalls after each write until the other writer writes too.
 
-    ``write_message`` emits a frame as two writes — header, then body. The
+    ``write_message`` emits a frame as two writes: header, then body. The
     rendezvous forces both writers' headers onto the stream before either
     body, so frames interleave unless each writer keeps whole frames atomic.
     """
@@ -2781,9 +2783,9 @@ class _PairedWriteStream:
     def write(self, data: bytes) -> int:
         with self._chunks_lock:
             self._chunks.append(bytes(data))
-        # A timeout breaks the barrier for good: once one writer holds its
-        # frame together, the peer is blocked outside the stream rather than
-        # mid-frame, and every later write proceeds without waiting.
+        # A timeout breaks the barrier for good. Once one writer holds its
+        # frame together, the peer is blocked outside the stream, between
+        # frames, and every later write proceeds without waiting.
         with contextlib.suppress(threading.BrokenBarrierError):
             self._rendezvous.wait(timeout=1.0)
         return len(data)
@@ -2898,7 +2900,7 @@ def test_rename_symbol_function_updates_def_call_and_import_sites(
             (3, 0, 3, "bar"),
             (4, 0, 3, "bar"),
         ]
-        # The `as aliased` clause is preserved; only the source name `foo`
+        # The `as aliased` clause is preserved. Only the source name `foo`
         # in the import is rewritten.
         assert edits_by_file["c.py"] == [(1, 14, 17, "bar")]
         _apply_rename_edits(result.edits)
@@ -3069,8 +3071,9 @@ def test_rename_symbol_relative_import_preserves_as_alias(tmp_path: Path) -> Non
         result = session.rename_symbol(_symbol_for_name(session, pkg / "helper.py", "foo"), "bar")
         assert result.status == "ok"
         sub_edits = [e for e in result.edits if Path(e.path).name == "sub.py"]
-        # Exactly one edit on sub.py — the import-site `foo`. The `as aliased`
-        # clause is preserved and `aliased()` is not a reference to `foo`.
+        # One edit on sub.py, the import-site `foo`, and no other. The
+        # `as aliased` clause is preserved and `aliased()` is not a reference
+        # to `foo`.
         assert len(sub_edits) == 1
         assert sub_edits[0].range.start.character == 20
         assert sub_edits[0].range.end.character == 23
@@ -3082,10 +3085,11 @@ def test_rename_symbol_relative_import_preserves_as_alias(tmp_path: Path) -> Non
 def test_rename_symbol_rewrites_attribute_access_through_module_import(
     tmp_path: Path,
 ) -> None:
-    """When a consumer uses ``import a; a.foo()``, rename of ``foo`` rewrites
-    just the ``foo`` portion of ``a.foo`` (the leading ``a.`` is left intact),
-    in addition to the canonical declaration site. ``import a as alias``
-    plus ``alias.foo()`` is rewritten the same way."""
+    """Renaming ``foo`` rewrites only the ``foo`` portion of ``a.foo``.
+
+    When a consumer uses ``import a; a.foo()``, the leading ``a.`` is left
+    intact, and the canonical declaration site is rewritten too.
+    ``import a as alias`` plus ``alias.foo()`` is rewritten the same way."""
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "a.py", "def foo() -> int:\n    return 1\n")
@@ -3418,7 +3422,7 @@ def test_signature_help_at_advances_active_parameter_after_comma(
         "def helper(a: int, b: int, c: int) -> int:\n    return a + b + c\n\nhelper(1, 2, 3)\n",
     )
     with WorkspaceSession(root) as session:
-        # Just inside `(`: arg 0.
+        # Right after `(`: arg 0.
         first = session.signature_help_at(target, line=3, character=7)
         # After "1, ": arg 1.
         second = session.signature_help_at(target, line=3, character=10)
@@ -3993,7 +3997,7 @@ def test_language_server_selection_range_returns_lsp_payload(tmp_path: Path) -> 
         "start": {"line": 1, "character": 11},
         "end": {"line": 1, "character": 12},
     }
-    # Walk parent chain — each parent must contain its child.
+    # Walk the parent chain. Each parent must contain its child.
     current = head
     seen = 1
     while "parent" in current:
@@ -4157,8 +4161,8 @@ def test_document_links_for_from_import_submodule_targets_submodule(
     with WorkspaceSession(root) as session:
         links = session.document_links_for_file(consumer)
 
-    # `from pkg import child` resolves `child` to the submodule file, not to
-    # `pkg/__init__.py`, so clicking the alias jumps directly to child.py.
+    # `from pkg import child` resolves `child` to the submodule file. Clicking
+    # the alias jumps directly to child.py and skips `pkg/__init__.py`.
     assert links == (
         DocumentLink(
             range=_range(
@@ -4181,8 +4185,8 @@ def test_document_links_skip_stdlib_and_missing_imports(tmp_path: Path) -> None:
     with WorkspaceSession(root) as session:
         links = session.document_links_for_file(consumer)
 
-    # Stdlib and unresolved targets do not get links — the LSP only navigates
-    # to workspace targets.
+    # Stdlib and unresolved targets get no links. The LSP only navigates to
+    # workspace targets.
     assert links == ()
 
 
@@ -4196,7 +4200,7 @@ def test_document_links_skip_wildcard_imports(tmp_path: Path) -> None:
     with WorkspaceSession(root) as session:
         links = session.document_links_for_file(consumer)
 
-    # `*` is not a navigable target; skip it.
+    # `*` is not a navigable target, so it is skipped.
     assert links == ()
 
 
@@ -4384,12 +4388,12 @@ def test_code_lenses_count_multiple_workspace_references(tmp_path: Path) -> None
         lenses = session.code_lenses_for_file(helper)
 
     assert len(lenses) == 1
-    # `from a import greet` binds the alias and one bare call site; the
+    # `from a import greet` binds the alias and one bare call site. The
     # `import helper; helper.greet()` chain adds one attribute reference.
     assert lenses[0].title.endswith(" references")
-    # Loose lower bound — the resolver may or may not count the import alias
-    # itself depending on `include_declaration`; we asked for declarations
-    # excluded so this is the call-site count only.
+    # A loose lower bound. Whether the resolver counts the import alias itself
+    # depends on `include_declaration`. We asked for declarations excluded, so
+    # this is the call-site count only.
     count = int(lenses[0].title.split(" ", 1)[0])
     assert count >= 2
 
@@ -4419,8 +4423,8 @@ def test_code_lenses_emit_one_lens_per_top_level_def_and_class(
         lenses = session.code_lenses_for_file(target)
 
     titles = {(lens.range.start.line, lens.title) for lens in lenses}
-    # f at line 0, g at line 3, C at line 6 — no lens for method m or class
-    # variable X (kind="method" / "class_variable" are excluded).
+    # f at line 0, g at line 3, C at line 6. Method m and class variable X get
+    # no lens (kind="method" / "class_variable" are excluded).
     assert titles == {(0, "0 references"), (3, "0 references"), (6, "0 references")}
 
 
@@ -4456,8 +4460,8 @@ def test_code_lenses_for_decorated_function_use_def_header_line(
         lenses = session.code_lenses_for_file(target)
 
     assert len(lenses) == 1
-    # The lens covers the bare identifier on the `def` line, not the
-    # decorator line — the decorator's `@functools.cache` lineno would
+    # The lens covers the bare identifier on the `def` line. The decorator
+    # line is skipped because the decorator's `@functools.cache` lineno would
     # collide with `functools` identifier resolution.
     assert lenses[0].range.start.line == 3
     assert lenses[0].range.start.character == len("def ")
@@ -4586,7 +4590,7 @@ def test_inlay_hints_for_local_call_emits_parameter_names(tmp_path: Path) -> Non
     with WorkspaceSession(root) as session:
         hints = session.inlay_hints_for_file(target)
 
-    # Line 3 (0-based): `greet('hi', 7)` — args at columns 6 and 12.
+    # Line 3 (0-based): `greet('hi', 7)`, with args at columns 6 and 12.
     assert hints == (
         InlayHint(
             position=SourcePosition(3, 6),
@@ -4619,7 +4623,7 @@ def test_inlay_hints_suppress_redundant_when_arg_name_matches_param(
     with WorkspaceSession(root) as session:
         hints = session.inlay_hints_for_file(target)
 
-    # The first arg `name` matches the parameter name — suppressed.
+    # The first arg `name` matches the parameter name, so it is suppressed.
     assert hints == (
         InlayHint(
             position=SourcePosition(4, 8),
@@ -4643,7 +4647,7 @@ def test_inlay_hints_skip_keyword_arguments(tmp_path: Path) -> None:
     with WorkspaceSession(root) as session:
         hints = session.inlay_hints_for_file(target)
 
-    # Only the positional first arg gets a hint; `second=2` is already named.
+    # Only the positional first arg gets a hint. `second=2` is already named.
     assert len(hints) == 1
     assert hints[0].label == "first:"
 
@@ -4714,7 +4718,7 @@ def test_inlay_hints_stop_at_starred_call_arg(tmp_path: Path) -> None:
     with WorkspaceSession(root) as session:
         hints = session.inlay_hints_for_file(target)
 
-    # Only the first arg gets a hint; *items consumes unknown slots, so the
+    # Only the first arg gets a hint. *items consumes unknown slots, so the
     # walker stops there.
     assert tuple(hint.label for hint in hints) == ("a:",)
 
@@ -4731,7 +4735,7 @@ def test_inlay_hints_stop_at_varargs_parameter(tmp_path: Path) -> None:
     with WorkspaceSession(root) as session:
         hints = session.inlay_hints_for_file(target)
 
-    # Only the bound `first` gets a hint; the rest is absorbed by *rest.
+    # Only the bound `first` gets a hint. *rest absorbs the others.
     assert tuple(hint.label for hint in hints) == ("first:",)
 
 
@@ -4747,9 +4751,10 @@ def test_inlay_hints_skip_method_attribute_call(tmp_path: Path) -> None:
     with WorkspaceSession(root) as session:
         hints = session.inlay_hints_for_file(target)
 
-    # `obj.m(...)` is an instance-attribute call — the resolver only handles
-    # `Name.attr` where `Name` is a workspace module/class, not an instance.
-    # `C()` is a class construction with no positional args, so no hints.
+    # `obj.m(...)` is an instance-attribute call. The resolver handles only
+    # `Name.attr` where `Name` is a workspace module or class, and `obj` is an
+    # instance. `C()` is a class construction with no positional args, so no
+    # hints.
     assert hints == ()
 
 
@@ -5152,7 +5157,7 @@ def test_type_definitions_at_invalid_annotation_returns_empty(
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "app.py"
-    # Annotation text is whatever `ast.unparse` produces; we only need to
+    # Annotation text is whatever `ast.unparse` produces. This only needs to
     # cover the "annotation re-parses cleanly but contains no resolvable
     # workspace name" path.
     _write(target, "x: object = object()\n")
@@ -5210,8 +5215,8 @@ def test_language_server_type_definition_position_off_identifier_returns_empty(
             "textDocument/typeDefinition",
             {
                 "textDocument": {"uri": target.as_uri()},
-                # Line 3 is "x: Foo = Foo()"; column 7 is the "=" sign with
-                # whitespace on both sides — not on any identifier.
+                # Line 3 is "x: Foo = Foo()". Column 7 is the "=" sign, with
+                # whitespace on both sides and no identifier under it.
                 "position": {"line": 3, "character": 7},
             },
         )
@@ -5307,7 +5312,7 @@ def test_prepare_call_hierarchy_on_variable_returns_empty(tmp_path: Path) -> Non
     app = root / "app.py"
     _write(app, "x: int = 1\nprint(x)\n")
     with WorkspaceSession(root) as session:
-        # Cursor on `x` in `print(x)` — a variable, not a callable.
+        # Cursor on `x` in `print(x)`, a variable.
         items = session.prepare_call_hierarchy(app, 1, len("print("))
     assert items == ()
 
@@ -5342,7 +5347,7 @@ def test_prepare_call_hierarchy_decorated_function_range_includes_decorator(
 
     assert len(items) == 1
     item = items[0]
-    # Decorator is on line 2 (0-based); range starts there.
+    # Decorator is on line 2 (0-based), and the range starts there.
     assert item.range.start.line == 2
     # selectionRange is the bare-name span on the `def` line (line 3).
     assert item.selection_range.start.line == 3
@@ -5375,7 +5380,7 @@ def test_call_hierarchy_incoming_calls_groups_per_caller(tmp_path: Path) -> None
     assert set(by_caller) == {"caller_one", "caller_two"}
     assert len(by_caller["caller_one"].call_sites) == 1
     assert len(by_caller["caller_two"].call_sites) == 2
-    # The caller items point at the *consumer* file, not the helper.
+    # The caller items point at the *consumer* file.
     assert by_caller["caller_one"].caller.path == str(app)
 
 
@@ -5425,7 +5430,7 @@ def test_call_hierarchy_incoming_calls_inside_nested_function_bubbles_to_outer(
     with WorkspaceSession(root) as session:
         calls = session.call_hierarchy_incoming_calls(helper, "greet")
 
-    # `inner` is not in the symbol table; the call is attributed to `outer`.
+    # `inner` is not in the symbol table, so the call is attributed to `outer`.
     assert len(calls) == 1
     assert calls[0].caller.qualified_name == "outer"
 
@@ -5444,7 +5449,7 @@ def test_call_hierarchy_incoming_calls_skips_module_top_level_references(
         calls = session.call_hierarchy_incoming_calls(helper, "greet")
 
     # The call site at module top level has no enclosing def/class, so it is
-    # dropped — there is no `CallHierarchyItem` to attribute it to.
+    # dropped. There is no `CallHierarchyItem` to attribute it to.
     assert calls == ()
 
 
@@ -5490,7 +5495,7 @@ def test_call_hierarchy_outgoing_calls_resolves_bare_and_module_attr_calls(
     # Each callee is called once from `driver`.
     assert len(by_callee["alpha"].call_sites) == 1
     assert len(by_callee["beta"].call_sites) == 1
-    # The bare `alpha()` call site spans just the identifier `alpha`.
+    # The bare `alpha()` call site spans only the identifier `alpha`.
     alpha_site = by_callee["alpha"].call_sites[0]
     assert alpha_site.range.start.line == 4
     assert alpha_site.range.end.character - alpha_site.range.start.character == len("alpha")
@@ -5521,7 +5526,7 @@ def test_call_hierarchy_outgoing_calls_skips_nested_function_calls(
         calls = session.call_hierarchy_outgoing_calls(app, "outer")
 
     # The `alpha()` call lives inside the nested `inner` function, which has
-    # its own outgoing-call list; `outer`'s outgoing calls only include
+    # its own outgoing-call list. `outer`'s outgoing calls only include
     # `inner()`. `inner` is not in the symbol table, so it is also dropped.
     assert calls == ()
 
@@ -5567,7 +5572,7 @@ def test_call_hierarchy_outgoing_calls_skips_stdlib_and_unresolvable(
     with WorkspaceSession(root) as session:
         calls = session.call_hierarchy_outgoing_calls(app, "driver")
 
-    # `print` is a builtin, `json.dumps` is stdlib — neither contributes a
+    # `print` is a builtin and `json.dumps` is stdlib. Neither contributes a
     # workspace callee, so the result is empty.
     assert calls == ()
 
@@ -5866,8 +5871,8 @@ def test_prepare_type_hierarchy_on_stdlib_target_returns_empty(
     app = root / "app.py"
     _write(app, "from collections import OrderedDict\n\nOrderedDict()\n")
     with WorkspaceSession(root) as session:
-        # Cursor on `OrderedDict` at the call site — its definition lives in
-        # stdlib so the LSP refuses to surface an item.
+        # Cursor on `OrderedDict` at the call site. Its definition lives in
+        # stdlib, so the LSP refuses to surface an item.
         items = session.prepare_type_hierarchy(app, 2, 0)
     assert items == ()
 
@@ -5931,7 +5936,7 @@ def test_type_hierarchy_supertypes_resolves_multiple_bases_sorted(
     with WorkspaceSession(root) as session:
         supers = session.type_hierarchy_supertypes(app, "Hybrid")
 
-    # Sorted by (path, qualified_name): both bases live in base.py, so the
+    # Sorted by (path, qualified_name). Both bases live in base.py, so the
     # result is alphabetical on qualified_name.
     assert tuple(s.qualified_name for s in supers) == ("Antelope", "Zebra")
 
@@ -5958,9 +5963,9 @@ def test_type_hierarchy_supertypes_unwraps_subscript_bases(
     with WorkspaceSession(root) as session:
         supers = session.type_hierarchy_supertypes(app, "Mine")
 
-    # `Generic[T]` is stdlib; `Container` is the only workspace base. The
-    # subscript unwrap rule means `Base[T]` would still resolve — covered
-    # by the next test.
+    # `Generic[T]` is stdlib, and `Container` is the only workspace base. The
+    # subscript unwrap rule means `Base[T]` would still resolve, as the next
+    # test covers.
     assert tuple(s.qualified_name for s in supers) == ("Container",)
 
 
@@ -6003,8 +6008,8 @@ def test_type_hierarchy_supertypes_resolves_attribute_base(
     with WorkspaceSession(root) as session:
         supers = session.type_hierarchy_supertypes(app, "Child")
 
-    # `base.Base` — LHS is the bare `base` import alias, resolves to the
-    # workspace `base` module; `.Base` resolves to the workspace class.
+    # In `base.Base` the LHS is the bare `base` import alias, which resolves
+    # to the workspace `base` module. `.Base` resolves to the workspace class.
     assert len(supers) == 1
     assert supers[0].qualified_name == "Base"
 
@@ -6023,7 +6028,7 @@ def test_type_hierarchy_supertypes_skips_stdlib_and_installed_bases(
     with WorkspaceSession(root) as session:
         supers = session.type_hierarchy_supertypes(app, "Mine")
 
-    # OrderedDict is stdlib — no workspace item to surface.
+    # OrderedDict is stdlib, so there is no workspace item to surface.
     assert supers == ()
 
 
@@ -6110,8 +6115,8 @@ def test_type_hierarchy_subtypes_excludes_self(tmp_path: Path) -> None:
     with WorkspaceSession(root) as session:
         subs = session.type_hierarchy_subtypes(base, "Base")
 
-    # Base itself shouldn't appear among its own subtypes even though it's
-    # in the same file as Child.
+    # Base itself is left out of its own subtypes, even though it is in the
+    # same file as Child.
     assert tuple(s.qualified_name for s in subs) == ("Child",)
 
 
@@ -6307,9 +6312,9 @@ def test_type_hierarchy_dataclass_exports_are_re_exported_from_pyinc_tools() -> 
 
 
 def test_file_deletion_edit_re_exported_from_pyinc_tools() -> None:
-    # Regression: `FileDeletionEdit` was added to `pyinc_tools.session` but
-    # not added to `pyinc_tools.__init__`'s re-export list in the original
-    # PR; ensure it ships on the public surface.
+    # Regression: the original PR added `FileDeletionEdit` to
+    # `pyinc_tools.session` and left it out of `pyinc_tools.__init__`'s
+    # re-export list. Ensure it ships on the public surface.
     import pyinc_tools
 
     assert hasattr(pyinc_tools, "FileDeletionEdit")
@@ -6489,8 +6494,8 @@ def test_semantic_tokens_from_import_alias_use_resolves_to_target_kind(
     tmp_path: Path,
 ) -> None:
     """`from helper import greet` makes ``greet`` a `from_import_alias` entry in
-    the symbol table; following the single cross-module hop classifies the use
-    site as the function it actually names.
+    the symbol table. Following the single cross-module hop classifies the use
+    site as the function it names.
     """
     root = tmp_path / "workspace"
     root.mkdir()
@@ -6518,7 +6523,7 @@ def test_semantic_tokens_from_import_alias_resolves_class_kind(tmp_path: Path) -
 def test_semantic_tokens_from_import_of_non_workspace_target_is_not_emitted(
     tmp_path: Path,
 ) -> None:
-    """Only workspace declarations are classified; stdlib imports stay unstyled."""
+    """Only workspace declarations are classified. Stdlib imports stay unstyled."""
 
     root = tmp_path / "workspace"
     root.mkdir()
@@ -6600,7 +6605,7 @@ def test_language_server_semantic_tokens_full_delta_encodes(
         if server._session is not None:
             server._session.close()
 
-    # Three tokens — `greet` (function, decl), `name` (parameter, decl),
+    # Three tokens: `greet` (function, decl), `name` (parameter, decl),
     # `greet` use on line 3.
     # Encoding: 5 ints per token: [deltaLine, deltaStart, length, type, mods].
     # Token type indices: function=2, parameter=4. Modifier `declaration` = bit 0 (= 1).
@@ -6612,14 +6617,14 @@ def test_language_server_semantic_tokens_full_delta_encodes(
             5,
             2,
             1,
-            # Second token: name at (0, 10) — same line, delta_start = 10-4 = 6,
+            # Second token: name at (0, 10), same line, delta_start = 10-4 = 6,
             # length 4, parameter, declaration
             0,
             6,
             4,
             4,
             1,
-            # Third token: greet use at (3, 0) — delta_line = 3, delta_start = 0,
+            # Third token: greet use at (3, 0), delta_line = 3, delta_start = 0,
             # length 5, function, no modifiers
             3,
             0,
@@ -6676,7 +6681,7 @@ def test_semantic_tokens_range_returns_only_tokens_inside_range(
     with WorkspaceSession(root) as session:
         all_tokens = session.semantic_tokens_for_file(target)
         # Restrict to the middle `def second` block (lines 3..4 inclusive,
-        # using 0-based LSP coords): end is exclusive at line 6, char 0.
+        # using 0-based LSP coords). The end is exclusive at line 6, char 0.
         middle = session.semantic_tokens_range_for_file(
             target, start_line=3, start_character=0, end_line=6, end_character=0
         )
@@ -6698,8 +6703,9 @@ def test_semantic_tokens_range_returns_only_tokens_inside_range(
 def test_semantic_tokens_range_excludes_token_on_end_line_at_end_character(
     tmp_path: Path,
 ) -> None:
-    """The range is half-open ``[start, end)``: a token whose start position
-    equals the end boundary is excluded."""
+    """The range is half-open ``[start, end)``.
+
+    A token whose start position equals the end boundary is excluded."""
     root = tmp_path / "workspace"
     root.mkdir()
     target = root / "mod.py"
@@ -6711,7 +6717,7 @@ def test_semantic_tokens_range_excludes_token_on_end_line_at_end_character(
         included = session.semantic_tokens_range_for_file(
             target, start_line=0, start_character=0, end_line=3, end_character=5
         )
-    # `def second` starts at (3, 4). With end=(3, 4) it's excluded;
+    # `def second` starts at (3, 4). With end=(3, 4) it's excluded, and
     # with end=(3, 5) it's included.
     assert all(not (t.range.start.line == 3 and t.range.start.character == 4) for t in excluded)
     assert any(t.range.start.line == 3 and t.range.start.character == 4 for t in included)
@@ -6732,8 +6738,8 @@ def test_semantic_tokens_range_omitting_end_line_scans_through_eof(
             target, start_line=3, start_character=0
         )
     assert same == full
-    # Tokens from line 0 (the `def first` header) are excluded; the `def
-    # second` header on line 3 is included.
+    # Tokens from line 0 (the `def first` header) are excluded. The
+    # `def second` header on line 3 is included.
     assert all(t.range.start.line >= 3 for t in from_line_3)
     assert any(t.range.start.line == 3 and t.token_type == "function" for t in from_line_3)
 
@@ -6746,7 +6752,7 @@ def test_semantic_tokens_range_empty_when_range_covers_no_tokens(
     target = root / "mod.py"
     _write(target, "def first():\n    pass\n\ndef second():\n    pass\n")
     with WorkspaceSession(root) as session:
-        # Line 1 is the body `pass` line — no symbol-table tokens there.
+        # Line 1 is the body `pass` line, with no symbol-table tokens.
         empty = session.semantic_tokens_range_for_file(
             target, start_line=1, start_character=0, end_line=2, end_character=0
         )
@@ -6925,7 +6931,7 @@ def test_file_rename_rewrites_absolute_import_and_from_import(
     assert (root / "user.py").read_text() == (
         "import utils\nfrom utils import foo\n\nhelper.foo()\nfoo()\n"
     )
-    # The `as` clause is preserved; only the module portion is rewritten.
+    # The `as` clause is preserved. Only the module portion is rewritten.
     assert (root / "aliased.py").read_text() == (
         "import utils as h\nfrom utils import foo as f\n\nh.foo()\nf()\n"
     )
@@ -6989,8 +6995,8 @@ def test_file_rename_falls_back_to_absolute_on_cross_directory_move(
                 edit.new_text,
             )
         )
-    # The relative import's anchor (`pkg`) no longer contains the new
-    # module, so the rewrite goes to absolute form.
+    # The new module lives outside the relative import's anchor (`pkg`), so
+    # the rewrite goes to absolute form.
     assert by_file["user.py"] == [(0, 5, 12, "top.helper")]
     assert by_file["other.py"] == [(0, 7, 17, "top.helper")]
 
@@ -7036,8 +7042,8 @@ def test_file_rename_skips_from_pkg_import_leaf_on_cross_directory_move(
     tmp_path: Path,
 ) -> None:
     # `from pkg import helper` cannot be cleanly rewritten when `helper.py`
-    # moves out of `pkg`: it would require either rewriting usages of
-    # `helper.foo()` or inserting `as helper`, neither of which is in scope.
+    # moves out of `pkg`. It would need either rewritten usages of
+    # `helper.foo()` or an inserted `as helper`, and both are out of scope.
     root = tmp_path / "workspace"
     pkg = root / "pkg"
     top = root / "top"
@@ -7296,7 +7302,7 @@ def test_file_deletion_removes_whole_import_statement(tmp_path: Path) -> None:
         for e in user_edits
     )
     # Both `import helper` (line 0) and `from helper import foo` (line 1)
-    # are now broken; each is removed as a whole-line edit.
+    # are now broken. Each is removed as a whole-line edit.
     assert spans == [(0, 0, 1, 0), (1, 0, 2, 0)]
     assert all(e.new_text == "" for e in user_edits)
 
@@ -7366,7 +7372,7 @@ def test_file_deletion_partial_alias_in_multi_name_import(tmp_path: Path) -> Non
         edits = session.import_edits_for_file_deletions([root / "a.py"])
 
     user_edits = [e for e in edits if Path(e.path).name == "user.py"]
-    # Only the `a` alias is removed; the rest of the statement survives.
+    # Only the `a` alias is removed. The rest of the statement survives.
     assert len(user_edits) == 1
     edit = user_edits[0]
     # The span absorbs the trailing comma + whitespace up to `b`.
@@ -7396,7 +7402,7 @@ def test_file_deletion_partial_alias_in_multi_name_from_import(
     assert len(user_edits) == 1
 
     _apply_file_deletion_edits(edits)
-    # The dead `a` leaf is removed; the surviving `b` stays.
+    # The dead `a` leaf is removed, and the surviving `b` stays.
     assert (pkg / "user.py").read_text() == "from pkg import b\na.foo()\nb.bar()\n"
 
 
@@ -7436,8 +7442,8 @@ def test_file_deletion_handles_multiple_deletions(tmp_path: Path) -> None:
 
 
 def test_file_deletion_skips_importer_being_deleted(tmp_path: Path) -> None:
-    # A file that imports the deleted module is itself being deleted — no
-    # point in editing it.
+    # A file that imports the deleted module is itself being deleted, so
+    # editing it would be wasted work.
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "helper.py", "def foo(): return 1\n")
@@ -7562,7 +7568,7 @@ def test_language_server_will_delete_files_returns_null_when_no_edits(
     server = LanguageServer(default_root=str(root))
     try:
         server._handle_request("initialize", {"rootUri": root.as_uri()})
-        # No file actually imports helper, so deleting it produces no edits.
+        # No file imports helper, so deleting it produces no edits.
         result = server._handle_request(
             "workspace/willDeleteFiles",
             {"files": [{"uri": (root / "helper.py").as_uri()}]},
@@ -7684,7 +7690,7 @@ def test_language_server_document_diagnostic_changes_after_edit(
         server._handle_request("initialize", {"rootUri": root.as_uri()})
         uri = (root / "user.py").as_uri()
         first = server._handle_request("textDocument/diagnostic", {"textDocument": {"uri": uri}})
-        # Fix the import via an overlay; the stale result id must no longer match.
+        # Fix the import via an overlay. The stale result id must then stop matching.
         server._require_session().set_overlay(str(root / "user.py"), "x = 1\n")
         second = server._handle_request(
             "textDocument/diagnostic",
@@ -7787,7 +7793,7 @@ _COMPLETION_APP = (
 def _caret(text: str, marker_line: str) -> tuple[str, int, int]:
     """Return (source, line, character) for a caret at the end of ``marker_line``.
 
-    ``marker_line`` is appended to ``text`` as a new final line; the caret sits
+    ``marker_line`` is appended to ``text`` as a new final line. The caret sits
     at its end, mimicking a mid-edit buffer.
     """
     source = text + marker_line + "\n"
@@ -7901,8 +7907,9 @@ def test_completion_is_stable_when_unrelated_file_changes(tmp_path: Path) -> Non
         session.set_overlay(app, source)
         first = session.completions_at(app, line, character)
 
-        # Editing an unrelated file must not change app.py's completions; the
-        # workspace/module symbol tables are memoized and reused across requests.
+        # Editing an unrelated file must leave app.py's completions unchanged.
+        # The workspace/module symbol tables are memoized and reused across
+        # requests.
         session.set_overlay(other, "def unrelated() -> int:\n    return 999\n")
         second = session.completions_at(app, line, character)
         assert first == second
@@ -7937,23 +7944,23 @@ def test_language_server_advertises_and_serves_completion(tmp_path: Path) -> Non
     assert result["isIncomplete"] is False
     labels = {item["label"] for item in result["items"]}
     assert {"compute", "Widget", "CONST"} <= labels
-    # Module kind (9) is emitted for none of these members; function/class/field
+    # Module kind (9) is emitted for none of these members. Function/class/field
     # kinds are present and stdlib members are absent.
     assert "path" not in labels  # would only appear if os/stdlib were expanded
 
 
 # ---------------------------------------------------------------------------
-# Task B2 — unused-import diagnostic + textDocument/codeAction quick fixes
+# Task B2: unused-import diagnostic + textDocument/codeAction quick fixes
 # ---------------------------------------------------------------------------
 
 
 def test_find_references_does_not_count_the_import_binding_site(
     tmp_path: Path,
 ) -> None:
-    # Pins the behavior the unused-import rule relies on: a `from M import name`
-    # binding is an `ast.alias`, not an `ast.Name`, so the occurrence scan never
-    # emits a reference for the import statement itself. An unused import
-    # therefore yields zero references in its own file; a used one yields one.
+    # Pins the behavior the unused-import rule relies on. A `from M import name`
+    # binding is an `ast.alias` with no `ast.Name` node, so the occurrence scan
+    # never emits a reference for the import statement itself. An unused import
+    # therefore yields zero references in its own file, and a used one yields one.
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "m.py", "def foo() -> int:\n    return 1\n")
@@ -8086,7 +8093,8 @@ def test_unused_import_diagnostic_flags_aliased_binding(tmp_path: Path) -> None:
 
     unused = [d for d in result.diagnostics if d.code == "unused-import"]
     assert len(unused) == 1
-    # The message names the local binding, not the original symbol.
+    # The message names the local binding (`bar`) in place of the original
+    # symbol (`foo`).
     assert "bar" in unused[0].message
 
 
@@ -8153,8 +8161,8 @@ def test_unused_import_diagnostic_not_emitted_for_broken_symbol_import(
     tmp_path: Path,
 ) -> None:
     # `wrong` is a real workspace module but has no `foo`. That's an
-    # unresolved-symbol problem, not an unused import — the import must not be
-    # double-flagged as unused just because find_references can't verify it.
+    # unresolved-symbol problem. The import must not also be flagged as unused
+    # only because find_references can't verify it.
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "wrong.py", "def other() -> int:\n    return 1\n")
@@ -8175,7 +8183,7 @@ def test_unused_import_diagnostic_skips_stdlib_and_plain_import(
     root.mkdir()
     _write(root / "m.py", "def foo() -> int:\n    return 1\n")
     # stdlib from-import (unverifiable) + plain `import m` (attribute usage
-    # under-reported) — neither should be flagged.
+    # under-reported). Neither should be flagged.
     _write(root / "consumer.py", "import os\nfrom json import dumps\nimport m\n\nx = 1\n")
 
     with WorkspaceSession(root) as session:
@@ -8188,7 +8196,7 @@ def test_unused_import_diagnostic_suppressed_by_module_all_listing(
     tmp_path: Path,
 ) -> None:
     # A facade module re-exports `tool` through its own static `__all__`.
-    # That's an intentional public re-export — removing the import would
+    # That's an intentional public re-export. Removing the import would
     # break the public API, so it must not be flagged as unused.
     root = tmp_path / "workspace"
     root.mkdir()
@@ -8204,8 +8212,8 @@ def test_unused_import_diagnostic_suppressed_by_module_all_listing(
 def test_unused_import_diagnostic_still_flagged_when_not_in_module_all(
     tmp_path: Path,
 ) -> None:
-    # `tool` is imported but absent from `__all__` (which lists a different
-    # name) and unused — the `__all__` guard must not shield it.
+    # `tool` is imported, unused, and absent from `__all__` (which lists a
+    # different name). The `__all__` guard must not shield it.
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "helpers.py", "def tool() -> int:\n    return 1\n")
@@ -8264,7 +8272,7 @@ def test_code_actions_unused_import_one_of_several_absorbs_comma(
 
     unused = [a for a in actions if a.diagnostic.code == "unused-import"]
     assert len(unused) == 1
-    # Only `foo` is dead; `bar` survives with the statement intact.
+    # Only `foo` is dead. `bar` survives with the statement intact.
     assert _apply_code_action_edits(src, unused[0].edits) == "from m import bar\n\nbar()\n"
 
 
@@ -8272,9 +8280,9 @@ def test_code_actions_for_range_removes_unused_alias_in_multiline_import(
     tmp_path: Path,
 ) -> None:
     # In a parenthesised multi-line import the unused-import diagnostic anchors
-    # on the *alias* line, not the statement's first line. The lookup that maps
-    # a diagnostic back to its import statement has to be span-aware or no fix
-    # is offered at all.
+    # on the *alias* line, below the statement's first line. The lookup that
+    # maps a diagnostic back to its import statement has to be span-aware, or
+    # no fix is offered at all.
     root = tmp_path / "workspace"
     root.mkdir()
     _write(
@@ -8345,7 +8353,7 @@ def test_code_actions_unresolved_symbol_offers_removal_and_unique_retarget(
 ) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
-    # `foo` actually lives in `home`, not `wrong` — exactly one workspace module
+    # `foo` lives in `home`, and `wrong` has none. Only one workspace module
     # exposes a top-level `foo`, so a retarget is offered.
     _write(root / "home.py", "def foo() -> int:\n    return 1\n")
     _write(root / "wrong.py", "def other() -> int:\n    return 1\n")
@@ -8368,7 +8376,7 @@ def test_code_actions_unresolved_symbol_no_retarget_when_ambiguous(
     root = tmp_path / "workspace"
     root.mkdir()
     # Two workspace modules expose a top-level `foo` → retarget is ambiguous
-    # and therefore suppressed; only the removal action remains.
+    # and therefore suppressed. Only the removal action remains.
     _write(root / "one.py", "def foo() -> int:\n    return 1\n")
     _write(root / "two.py", "def foo() -> int:\n    return 2\n")
     _write(root / "wrong.py", "def other() -> int:\n    return 1\n")
@@ -8406,7 +8414,7 @@ def test_code_actions_empty_when_range_misses_all_diagnostics(
     root = tmp_path / "workspace"
     root.mkdir()
     _write(root / "m.py", "def foo() -> int:\n    return 1\n")
-    # unused import on line 0; ask for actions on line 2 (the `x = 1` line).
+    # Unused import on line 0. Ask for actions on line 2 (the `x = 1` line).
     _write(root / "consumer.py", "from m import foo\n\nx = 1\n")
 
     with WorkspaceSession(root) as session:
@@ -8516,7 +8524,7 @@ def test_language_server_code_action_honors_context_only_filter(
         if server._session is not None:
             server._session.close()
 
-    # `refactor` excludes our quickfix; `quickfix` includes it.
+    # `refactor` excludes our quickfix, and `quickfix` includes it.
     assert refactor_only == []
     assert len(quickfix_only) == 1
 
@@ -8528,7 +8536,7 @@ def test_language_server_code_action_sees_overlay_introduced_unused_import(
     root.mkdir()
     _write(root / "m.py", "def foo() -> int:\n    return 1\n")
     target = root / "consumer.py"
-    # On disk the import is used; the overlay removes the use, so the import
+    # On disk the import is used. The overlay removes the use, so the import
     # becomes unused and a quick fix must appear from the overlay text alone.
     _write(target, "from m import foo\n\nfoo()\n")
 
@@ -8564,14 +8572,14 @@ def test_language_server_code_action_sees_overlay_introduced_unused_import(
 
 
 # ---------------------------------------------------------------------------
-# Task B3 — completion / signatureHelp polish
-#   (b) dotted attribute owners; (d1) attribute-call signatureHelp;
+# Task B3: completion / signatureHelp polish
+#   (b) dotted attribute owners, (d1) attribute-call signatureHelp,
 #   (d2) default values in signature labels
 # ---------------------------------------------------------------------------
 
 
 def test_completion_dotted_module_owner_lists_exports(tmp_path: Path) -> None:
-    # `import pkg.sub; pkg.sub.<caret>` — the dotted owner is itself a
+    # In `import pkg.sub; pkg.sub.<caret>` the dotted owner is itself a
     # workspace module, so its top-level exports are offered.
     root = tmp_path / "workspace"
     _write(root / "pkg" / "__init__.py", "")
@@ -8612,7 +8620,7 @@ def test_completion_dotted_module_class_owner_lists_members(tmp_path: Path) -> N
 
 
 def test_completion_stdlib_dotted_owner_is_empty(tmp_path: Path) -> None:
-    # `os.path.<caret>` — the head resolves to a stdlib module, so no members.
+    # In `os.path.<caret>` the head resolves to a stdlib module, so no members.
     root = tmp_path / "workspace"
     _write(root / "helpers.py", _COMPLETION_HELPERS)
     app = root / "app.py"
@@ -8625,8 +8633,8 @@ def test_completion_stdlib_dotted_owner_is_empty(tmp_path: Path) -> None:
 
 
 def test_completion_instance_chain_owner_is_empty(tmp_path: Path) -> None:
-    # `w.size.<caret>` — an instance-attribute chain whose type would have to
-    # be inferred stays unsupported.
+    # `w.size.<caret>` is an instance-attribute chain whose type would have to
+    # be inferred. It stays unsupported.
     root = tmp_path / "workspace"
     _write(root / "helpers.py", _COMPLETION_HELPERS)
     app = root / "app.py"
@@ -8640,7 +8648,7 @@ def test_completion_instance_chain_owner_is_empty(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task B4 — self./cls. instance-member completion
+# Task B4: self./cls. instance-member completion
 # ---------------------------------------------------------------------------
 
 
@@ -8672,7 +8680,7 @@ def test_completion_self_lists_instance_and_class_members(tmp_path: Path) -> Non
 
     with WorkspaceSession(root) as session:
         # A caret on `self.` inside a method whose first parameter is `self`
-        # sees instance vars, class vars, and methods — the instance view.
+        # sees instance vars, class vars, and methods: the instance view.
         source, line, character = _caret(_SELF_COMPLETION_SOURCE, "        self.")
         session.set_overlay(app, source)
         items = session.completions_at(app, line, character)
@@ -8714,8 +8722,8 @@ def test_completion_self_in_closure_is_empty(tmp_path: Path) -> None:
     _write(app, closure_src)
 
     with WorkspaceSession(root) as session:
-        # The innermost enclosing callable is the closure `inner`, not a method
-        # of Widget → the self view is unavailable.
+        # The innermost enclosing callable is the closure `inner`, a function
+        # nested in a Widget method → the self view is unavailable.
         source, line, character = _caret(closure_src, "            self.")
         session.set_overlay(app, source)
         assert session.completions_at(app, line, character) == ()
@@ -8783,7 +8791,7 @@ def test_completion_self_is_stable_when_unrelated_file_changes(
 
 
 # ---------------------------------------------------------------------------
-# Task B4 (stage 2) — annotated-name owner completion (Rule A)
+# Task B4 (stage 2): annotated-name owner completion (Rule A)
 # ---------------------------------------------------------------------------
 
 
@@ -8806,8 +8814,8 @@ _WIDGET_INSTANCE_VIEW = {"size", "name", "__init__", "render"}
 
 
 def test_completion_annotated_param_completes_instance_view(tmp_path: Path) -> None:
-    # `def f(w: Widget): w.<caret>` — the parameter's annotation resolves to the
-    # workspace class, and its instance view is offered.
+    # In `def f(w: Widget): w.<caret>` the parameter's annotation resolves to
+    # the workspace class, and its instance view is offered.
     root = tmp_path / "workspace"
     _write(root / "helpers.py", _ANNOT_HELPERS)
     app = root / "app.py"
@@ -8847,7 +8855,7 @@ def test_completion_annotated_local_var_completes_instance_view(
 
 
 def test_completion_annotated_nearest_declaration_wins(tmp_path: Path) -> None:
-    # Two local annotations for `w`; the nearest preceding one (Widget) wins
+    # Two local annotations for `w`. The nearest preceding one (Widget) wins
     # over the earlier (Gadget).
     root = tmp_path / "workspace"
     _write(root / "helpers.py", _ANNOT_HELPERS)
@@ -8881,8 +8889,8 @@ def test_completion_annotated_nearest_declaration_wins(tmp_path: Path) -> None:
     ],
 )
 def test_completion_annotated_generic_or_union_is_empty(tmp_path: Path, annotation: str) -> None:
-    # A bounded model rejects subscripted / union / callable annotations rather
-    # than half-inferring the wrapped class.
+    # A bounded model rejects subscripted / union / callable annotations. It
+    # never half-infers the wrapped class.
     root = tmp_path / "workspace"
     _write(root / "helpers.py", _ANNOT_HELPERS)
     app = root / "app.py"
@@ -8935,8 +8943,8 @@ def test_completion_module_level_annotation_forms(
 
 def test_completion_annotated_import_alias_precedence(tmp_path: Path) -> None:
     # A same-named local annotation must NOT shadow an import that resolves via
-    # the existing attribute path: `Widget` resolves to the imported class, so
-    # its class-object view (no instance-only `name`) wins — Rule A never fires.
+    # the existing attribute path. `Widget` resolves to the imported class, so
+    # its class-object view (no instance-only `name`) wins and Rule A never fires.
     root = tmp_path / "workspace"
     _write(root / "helpers.py", _ANNOT_HELPERS)
     app = root / "app.py"
@@ -8949,8 +8957,8 @@ def test_completion_annotated_import_alias_precedence(tmp_path: Path) -> None:
         source, line, character = _caret(base, "    Widget.")
         session.set_overlay(app, source)
         items = session.completions_at(app, line, character)
-        # Class-object view of Widget (methods + class vars), not Gadget's, and
-        # not the instance-only `name`.
+        # Class-object view of Widget (methods + class vars). Gadget's members
+        # and the instance-only `name` are absent.
         assert _labels(items) == {"size", "render", "__init__"}
 
 
@@ -8958,7 +8966,7 @@ def test_completion_annotation_outer_function_scope_not_applied(
     tmp_path: Path,
 ) -> None:
     # An annotation on an OUTER function's parameter does not apply inside a
-    # nested function — only the innermost enclosing function is consulted.
+    # nested function. Only the innermost enclosing function is consulted.
     root = tmp_path / "workspace"
     _write(root / "helpers.py", _ANNOT_HELPERS)
     app = root / "app.py"
@@ -8977,7 +8985,7 @@ def test_completion_annotation_outer_function_scope_not_applied(
 
 
 # ---------------------------------------------------------------------------
-# Task B4 (stage 3) — inherited-member completion via flattened class_model
+# Task B4 (stage 3): inherited-member completion via flattened class_model
 # ---------------------------------------------------------------------------
 
 
@@ -9035,7 +9043,7 @@ def test_completion_derived_class_view_shows_inherited_methods(
         source, line, character = _caret(_INHERIT_DERIVED, "Derived.")
         session.set_overlay(app, source)
         items = session.completions_at(app, line, character)
-        # Inherited `base_method` / `kind` show; instance-only attrs do not.
+        # Inherited `base_method` / `kind` show. Instance-only attrs do not.
         assert _labels(items) == {"size", "own", "base_method", "kind"}
         by_label = {item.label: item for item in items}
         assert by_label["base_method"].kind == "method"
@@ -9043,7 +9051,7 @@ def test_completion_derived_class_view_shows_inherited_methods(
 
 def test_completion_inherited_reflects_overlay_edit_to_base(tmp_path: Path) -> None:
     # An overlay edit that adds a method to the BASE file flows through to the
-    # subclass's inherited completions — the flattened model is per-file.
+    # subclass's inherited completions. The flattened model is per-file.
     root = tmp_path / "workspace"
     base = root / "base.py"
     _write(base, _INHERIT_BASE)
@@ -9325,10 +9333,11 @@ def test_cli_text_output_omits_position_for_rangeless_diagnostic(
     lines = capsys.readouterr().out.splitlines()
     decode_errors = [line for line in lines if "source-decode-error" in line]
     assert len(decode_errors) == 1
-    # No `:line:col` segment — the path is followed directly by the severity.
+    # No `:line:col` segment. The path is followed directly by the severity.
     assert decode_errors[0].startswith(f"{root / 'bad.py'}: error source-decode-error ")
-    # The message body names the real path too, not the temporary mirror, so the
-    # line is identical across runs. "pyinc-tools-" is the mirror tempdir prefix.
+    # The message body names the real path too, in place of the temporary mirror,
+    # so the line is identical across runs. "pyinc-tools-" is the mirror tempdir
+    # prefix.
     assert decode_errors[0].count(str(root / "bad.py")) == 2
     assert "pyinc-tools-" not in decode_errors[0]
 
@@ -9353,9 +9362,9 @@ def test_warm_workspace_analysis_validates_each_resource_once(tmp_path: Path) ->
         stats_after = session.db.statistics()
 
         assert warm.python == settled.python
-        # One public method holds one kernel request span, so every resource
-        # the analysis walks is validated at most once for the whole call --
-        # not once per entrypoint the method fans out to.
+        # One public method holds one kernel request span. So every resource
+        # the analysis walks is validated at most once for the whole call,
+        # however many entrypoints the method fans out to.
         assert stats_after.total_requests == stats_before.total_requests + 1
         assert stats_after.resource_loads == stats_before.resource_loads
         probes = stats_after.resource_probe_hits - stats_before.resource_probe_hits
@@ -9369,7 +9378,7 @@ def test_mirror_mutation_inside_one_session_request_is_visible(tmp_path: Path) -
     with WorkspaceSession(str(root)) as session:
         session.analyze_workspace()
 
-        # Hold the session lock -- and with it one request span -- across an
+        # Hold the session lock (and with it one request span) across an
         # analysis, an overlay edit, and a second analysis. The edit calls
         # request_inputs_changed() under the same held span, which must make
         # the later analysis re-validate and see the new content.
@@ -9513,10 +9522,10 @@ def test_pyinc_tools_exports_only_stable_api() -> None:
     }
     assert hasattr(pyinc_tools, "WorkspaceSession")
     assert hasattr(pyinc_tools, "PollingWorkspaceWatcher")
-    # No assertion that an unexported name is absent from the package: this
+    # No assertion that an unexported name is absent from the package. This
     # module imports three `pyinc_tools` submodules at its head, and each of
-    # those imports binds the submodule as a package attribute, so what is
-    # reachable here depends on import order rather than on the export list.
+    # those imports binds the submodule as a package attribute. So import
+    # order decides what is reachable here, independent of the export list.
 
 
 def test_file_deletion_coalesces_adjacent_aliases_into_one_edit(tmp_path: Path) -> None:
@@ -9567,9 +9576,9 @@ def test_workspace_refresh_deduplicates_paths_and_preserves_overlays(tmp_path: P
 def test_workspace_source_text_answers_a_pipe_rather_than_waiting_on_it(tmp_path: Path) -> None:
     # A workspace is a directory the editor pointed at, so anything at all can
     # be sitting inside it. Reading a source decodes it, which means opening it
-    # and waiting for bytes -- and a pipe with no writer never sends one. The
-    # kind is asked first so a source that is not a file reads as no source,
-    # which is the same answer this already gave for one that cannot be decoded.
+    # and waiting for bytes, and a pipe with no writer never sends one. The
+    # kind is asked first so a source that is not a file reads as no source.
+    # That is the same answer this already gave for one that cannot be decoded.
     if not hasattr(os, "mkfifo"):
         pytest.skip("os.mkfifo is unavailable on this platform")
     target = tmp_path / "mod.py"

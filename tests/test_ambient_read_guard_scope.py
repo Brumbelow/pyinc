@@ -1,15 +1,14 @@
 """Pins the exact boundary of the condition 2 ambient-read guard.
 
-`docs/kernel-contract.md` condition 2 enumerates what the runtime intercepts and
-limitation 1 enumerates the near neighbours it does not. Both lists are only
-useful if they are true, so this module exercises each named entry point inside a
-real query and asserts which side of the boundary it falls on. Widening the guard
-therefore fails here first, forcing the contract to be updated with it.
+`docs/kernel-contract.md` condition 2 lists what the runtime intercepts, and
+limitation 1 lists the near neighbours outside it. Both lists are useful only
+while they are true. This module exercises each named entry point inside a real
+query and asserts which side of the boundary it falls on. Widening the guard
+therefore fails here first, and the contract must be updated with it.
 
-The boundary is an observation about the interpreter's own implementation —
-`pathlib` and `os.path` reroute their helpers across minor versions — so the
-cases run on every interpreter in the support matrix rather than being assumed
-from one.
+The boundary depends on the interpreter's own implementation, because
+`pathlib` and `os.path` reroute their helpers across minor versions. So the
+cases run on every interpreter in the support matrix.
 """
 
 from __future__ import annotations
@@ -55,7 +54,7 @@ _UNGUARDED_METADATA_READS = (
 
 
 def _metadata_read(reader: str, path: Path) -> bool:
-    """Observe `path`'s metadata; True iff the read saw the live 5-byte file."""
+    """Observe `path`'s metadata, returning True iff the read saw the live 5-byte file."""
     if reader == "os.stat":
         return os.stat(path).st_size == 5
     if reader == "os.lstat":
@@ -83,7 +82,7 @@ def _metadata_read(reader: str, path: Path) -> bool:
 
 @pytest.mark.parametrize("reader", _UNGUARDED_METADATA_READS)
 def test_file_metadata_reads_bypass_untracked_read_guard(tmp_path: Path, reader: str) -> None:
-    """Documents that `stat`-family reads are NOT intercepted (limitation 1).
+    """Documents that `stat`-family reads bypass the guard (limitation 1).
 
     The guard sees file *contents* and directory *listings*. Asking whether a
     file exists, or how large or how recently modified it is, reaches the real
@@ -96,15 +95,15 @@ def test_file_metadata_reads_bypass_untracked_read_guard(tmp_path: Path, reader:
     def observe(db: Database) -> bool:
         return _metadata_read(reader, path)
 
-    # None of these raise — they are outside the guard.
+    # These reads are outside the guard, so none of them raises.
     assert Database().get(observe) is True
 
 
 def test_stat_only_query_is_never_invalidated_by_the_file_it_stats(tmp_path: Path) -> None:
     """The user-visible consequence of the metadata gap.
 
-    A query that stats a file rather than reading it has no recorded dependency,
-    so it is reused forever while a fresh `Database` sees the new state.
+    A query that stats a file without reading it has no recorded dependency. It
+    is reused forever, while a fresh `Database` sees the new state.
     """
     path = tmp_path / "sample.txt"
     path.write_text("hello", encoding="utf-8")
@@ -118,12 +117,12 @@ def test_stat_only_query_is_never_invalidated_by_the_file_it_stats(tmp_path: Pat
 
     path.write_text("hello, world", encoding="utf-8")
 
-    # The stale value is served indefinitely: nothing was recorded to invalidate.
+    # The stale value is served indefinitely, since nothing was recorded to invalidate.
     assert db.get(observed_size) == 5
     node = db.inspect(observed_size)
     assert node.last_decision == "reused"
     assert node.dependencies == ()
-    # A fresh database disagrees — from-scratch consistency does not hold here.
+    # A fresh database disagrees. From-scratch consistency breaks here.
     assert Database().get(observed_size) == 12
 
 
@@ -146,10 +145,10 @@ def test_report_untracked_read_stops_memo_reuse_for_a_stat_only_query(
 
     assert db.get(declared_size) == 12
     # Nothing rewrites the file between these two gets, so both stat the same
-    # size: the equality is about the reading holding still, not about the
-    # declaration making a warm database agree with a fresh one. Rewrite the
-    # file in between and the two sides disagree. The companion below pins that
-    # limit with a reading that moves on its own.
+    # size. The equality comes from the reading holding still. The declaration
+    # does not make a warm database agree with a fresh one. Rewrite the file in
+    # between and the two sides disagree. The companion below pins that limit
+    # with a reading that moves on its own.
     assert db.get(declared_size) == Database().get(declared_size)
     assert db.inspect(declared_size).is_untracked
 
@@ -158,9 +157,9 @@ def test_report_untracked_read_stops_memo_reuse_for_a_stat_only_query(
 def test_report_untracked_read_leaves_a_clock_reading_unreproducible(mode: str) -> None:
     """The limit of the hatch, beside the cell that pins what the hatch buys.
 
-    Declaring the read stops the node being reused; it does not make the reading
-    reproducible. Two requests to one database disagree, and a warm database and
-    a fresh one disagree, in every mode.
+    Declaring the read stops the node being reused, and the reading stays
+    unreproducible. In every mode, two requests to one database disagree, and a
+    warm database and a fresh one disagree.
     """
 
     @query(key=f"declared-clock:{mode}")
@@ -172,10 +171,10 @@ def test_report_untracked_read_leaves_a_clock_reading_unreproducible(mode: str) 
     first = db.get(declared_clock)
     second = db.get(declared_clock)
 
-    # Re-execution on every request is the whole of what the declaration buys,
-    # and here that is exactly what makes the two answers differ.
+    # Re-execution on every request is all the declaration buys, and here it is
+    # what makes the two answers differ.
     assert first != second
-    # From-scratch consistency does not come back with it: a fresh database
+    # The declaration leaves from-scratch consistency broken. A fresh database
     # computes an answer of its own.
     assert db.get(declared_clock) != Database(mode=mode).get(declared_clock)
 
@@ -205,10 +204,10 @@ _GUARDED_ENTRY_POINTS = (
 
 
 def _guarded_read(reader: str, path: Path, directory: Path) -> object:
-    """Perform the named condition 2 read; whether it raises is the guard's call.
+    """Perform the named condition 2 read, and let the guard decide whether it raises.
 
-    Shared by the in-query and in-child-thread cases so the two exercise
-    provably the same entry-point list.
+    Shared by the in-query and in-child-thread cases, so the two provably
+    exercise the same entry-point list.
     """
     if reader == "builtins.open":
         with open(path, encoding="utf-8") as handle:
@@ -220,7 +219,7 @@ def _guarded_read(reader: str, path: Path, directory: Path) -> object:
         return os.getenv("PYINC_GUARDED_ENV")
     if reader == "os.environ":
         return os.environ["PYINC_GUARDED_ENV"]
-    # Windows has no byte environment; its cells are skipped there.
+    # Windows has no byte environment, and its cells are skipped there.
     if sys.platform != "win32" and reader == "os.getenvb":
         return os.getenvb(b"PYINC_GUARDED_ENV")
     if sys.platform != "win32" and reader == "os.environb":
@@ -291,9 +290,9 @@ def test_resolving_a_relative_path_reads_the_working_directory(reader: str) -> N
     """The working-directory guard reaches the helpers that anchor a relative path.
 
     `os.path.realpath` and `os.path.abspath` are wrapped and refuse such a path
-    themselves, and `pathlib` reaches one of them or `os.getcwd`, on every
-    platform: Windows' `ntpath.abspath` reads the directory in C, through
-    `nt._getfullpathname`, so before its wrapper it answered here.
+    themselves. On every platform, `pathlib` reaches one of them or
+    `os.getcwd`. Windows' `ntpath.abspath` reads the directory in C, through
+    `nt._getfullpathname`, so before it had a wrapper it answered here.
     """
 
     @query(key=f"relative-path:{reader}")
@@ -308,11 +307,11 @@ def test_resolving_a_relative_path_reads_the_working_directory(reader: str) -> N
 def test_resolving_an_absolute_path_never_reads_the_working_directory(
     tmp_path: Path, reader: str
 ) -> None:
-    """An absolute path does not depend on the working directory, on any platform.
+    """An absolute path resolves independently of the working directory, on every platform.
 
     Windows' `realpath` reads the working directory for an absolute path too,
-    without using it, and the guard lets that read through; the cells below pin
-    the rule it lets it through by.
+    without using it, and the guard lets that read through. The cells below pin
+    the rule the guard uses to let it through.
     """
 
     @query(key=f"absolute-path:{reader}")
@@ -350,12 +349,13 @@ def test_the_windows_realpath_read_is_let_through_only_where_realpath_ignores_it
     """Pins, on every platform, the rule the guard's Windows `realpath` wrapper uses.
 
     Through Python 3.13.15 and 3.14.7, `ntpath.realpath` reads the working
-    directory before it looks at its argument, and the answer matters only for
-    a path that is not fully qualified: neither drive-and-root, UNC, nor
-    `\\\\?\\`-prefixed, and not the null device. The stand-in reads it the same
-    way. A drive-relative `C:relative` is anchored to that drive's working
-    directory, and a rooted `\\data` to the working directory's drive -- which
-    `ntpath.isabs` called absolute before 3.13 -- so neither read is unused.
+    directory before it looks at its argument. The answer matters only for a
+    path that is not fully qualified. A fully qualified path is drive-and-root,
+    UNC, `\\\\?\\`-prefixed, or the null device. The stand-in reads the
+    directory the same way. A drive-relative `C:relative` is anchored to that
+    drive's working directory. A rooted `\\data` is anchored to the working
+    directory's drive (`ntpath.isabs` called it absolute before 3.13). So both
+    reads are used.
     """
     seen: list[tuple[bool, bool]] = []
 
@@ -406,10 +406,10 @@ def test_a_posix_path_is_fully_qualified_when_it_is_absolute(
 
 
 def test_the_read_is_let_through_on_windows_only_and_never_around_caller_code() -> None:
-    """Nothing but realpath's own read of the working directory may run unguarded.
+    """Only realpath's own read of the working directory may run unguarded.
 
     POSIX's realpath never reads the directory for a fully qualified path, so
-    there is nothing to let through. On Windows a `strict` with a `__bool__` of
+    it has nothing to let through. On Windows, a `strict` with a `__bool__` of
     its own is settled before the read is let through.
     """
     windows_reads: list[bool] = []
@@ -444,9 +444,10 @@ def test_the_realpath_wrapper_refuses_a_relative_path_it_cannot_see_anchored(
     """The wrapper refuses an anchored path itself, however realpath reaches the directory.
 
     From Python 3.14.8, `ntpath.realpath` anchors a relative path through
-    `abspath`, which reads the working directory in C, so no `os.getcwd` call is
-    left for the guard to refuse. The stand-in never reads the directory at
-    all, so only the wrapper can refuse here. An absolute path still answers.
+    `abspath`, which reads the working directory in C. That leaves no
+    `os.getcwd` call for the guard to refuse. The stand-in never reads the
+    directory at all, so only the wrapper can refuse here. An absolute path
+    still answers.
     """
     # Installs the guard around the real realpath before the stand-in replaces it.
     Database()
@@ -491,7 +492,7 @@ def test_a_relative_path_through_an_absolute_link_is_refused(
 
 
 def test_the_wrapped_realpath_still_pickles_and_keeps_its_signature() -> None:
-    """`os.path.realpath` is replaced for the whole process, so it has to stay a good citizen.
+    """`os.path.realpath` is replaced process-wide, so it must still pickle and keep its signature.
 
     A process pool pickles a function it is handed by reference, and feature
     detection reads its signature.
@@ -604,10 +605,10 @@ def test_a_relative_abspath_is_refused_by_name_on_every_platform(
     """`os.path.abspath` refuses a path the working directory anchors, wherever it runs.
 
     POSIX's `abspath` anchored such a path with `os.getcwd` and was refused in
-    that function's name, while Windows' read the directory through
-    `nt._getfullpathname` and answered, and so did `relpath`, which anchors
-    both of its arguments with it -- its default start is the working
-    directory itself. The wrapper refuses in `abspath`'s own name, keyword
+    that function's name. Windows' `abspath` read the directory through
+    `nt._getfullpathname` and answered. So did `relpath`, which anchors both
+    of its arguments with `abspath` (its default start is the working directory
+    itself). The wrapper refuses in `abspath`'s own name, for a keyword
     argument and bytes alike.
     """
 
@@ -669,10 +670,10 @@ def test_the_abspath_wrapper_refuses_by_windows_rules_on_windows(
     """Pins, on every platform, the rule the `abspath` wrapper applies under `ntpath`.
 
     Windows' `abspath` anchors a drive-relative `C:relative` to that drive's
-    working directory and a rooted `\\data` to the working directory's drive,
-    so neither is let through; a drive with a root, a UNC or device path, and
-    the null device are. Whatever it decides, the wrapper hands `abspath` the
-    one string it decided on.
+    working directory, and a rooted `\\data` to the working directory's drive,
+    so the wrapper refuses both. It lets through a drive with a root, a UNC or
+    device path, and the null device. Whatever it decides, the wrapper hands
+    `abspath` the one string it decided on.
     """
     refusals: list[str] = []
     seen: list[str | bytes] = []
@@ -694,10 +695,10 @@ def test_the_abspath_wrapper_refuses_by_windows_rules_on_windows(
 def test_the_abspath_wrapper_reads_its_argument_once_and_keeps_its_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One `__fspath__` call decides and answers; a call `abspath` refuses still raises.
+    """One `__fspath__` call decides and answers, and a call `abspath` refuses still raises.
 
-    A path `normpath` cannot read -- bytes Windows cannot decode -- is one
-    `abspath` would go on to anchor, so it is refused inside a query and left
+    A path `normpath` cannot read (bytes Windows cannot decode) is one
+    `abspath` would go on to anchor. So it is refused inside a query, and left
     to `abspath`'s own error outside one.
     """
     refusals: list[str] = []
@@ -743,10 +744,11 @@ def test_the_wrapped_abspath_still_pickles_and_keeps_its_signature(tmp_path: Pat
     """`os.path.abspath` is replaced for the whole process, so outside a query it is unchanged.
 
     It still pickles by reference, advertises and accepts its own parameter
-    name, anchors a relative path where no query runs, and raises a TypeError
-    wherever the original does -- the original's own, word for word, for a
-    call it refuses by shape. A bad argument is refused by `os.fspath`, whose
-    message Windows' 3.14 `abspath` words differently, from its C `normpath`.
+    name, and anchors a relative path where no query runs. It raises a
+    TypeError wherever the original does. For a call it refuses by shape, that
+    error is the original's own, word for word. A bad argument is refused by
+    `os.fspath`, whose message Windows' 3.14 `abspath` words differently, from
+    its C `normpath`.
     """
     Database()  # installs the guard
     wrapped: Any = os.path.abspath
@@ -781,8 +783,8 @@ def test_the_realpath_and_abspath_wrappers_compose(
     """A realpath that anchors through `abspath`, as 3.14.8's Windows one does, still works.
 
     The `realpath` wrapper decides first, so a relative path is refused in
-    `realpath`'s name; a fully qualified one reaches `abspath`, which lets it
-    through. Outside a query neither wrapper stands in the way.
+    `realpath`'s name. A fully qualified one reaches `abspath`, which lets it
+    through. Outside a query, both wrappers stay out of the way.
     """
     Database()  # installs the guard
 
@@ -807,12 +809,12 @@ def test_the_realpath_and_abspath_wrappers_compose(
 def test_standard_library_callers_of_abspath_still_answer_for_qualified_paths(
     tmp_path: Path,
 ) -> None:
-    """Library code that hands `abspath` a fully qualified path is not refused.
+    """Library code that hands `abspath` a fully qualified path still answers.
 
-    `ismount` (through `realpath` on POSIX and `abspath` on Windows),
-    `tempfile.mkdtemp` (which returns `abspath` of what it made from 3.12),
-    and `inspect` on code whose file name is absolute all reach a wrapper here
-    and answer.
+    Three callers reach a wrapper here and answer: `ismount`,
+    `tempfile.mkdtemp`, and `inspect` on code whose file name is absolute.
+    `ismount` goes through `realpath` on POSIX and `abspath` on Windows. From
+    3.12, `tempfile.mkdtemp` returns `abspath` of what it made.
     """
 
     @query(key="qualified-abspath-callers")
@@ -836,10 +838,10 @@ def test_standard_library_callers_of_abspath_still_answer_for_qualified_paths(
 def test_inspect_on_a_generated_file_name_is_refused_on_every_platform() -> None:
     """`inspect` anchors a file name that is not fully qualified, and that reads the directory.
 
-    Code compiled under a name such as `<generated>` has no file the working
-    directory does not decide, so `inspect.getabsfile` of it anchors the name
-    with `abspath`: refused through `os.getcwd` on POSIX, and on Windows, where
-    it answered, through the wrapper.
+    Code compiled under a name such as `<generated>` names a file whose place
+    the working directory decides. So `inspect.getabsfile` of it anchors the
+    name with `abspath`. On POSIX that is refused through `os.getcwd`. On
+    Windows, where it answered, the wrapper refuses it.
     """
 
     @query(key="inspect-generated-file-name")
@@ -856,9 +858,9 @@ def test_the_kernel_resolves_a_captured_module_file_outside_the_guard(
     """Checking a captured module's file against its import spec is the kernel's work.
 
     A module whose `__file__` is relative resolves it against the working
-    directory. The check ran under the calling query's guard, so a query that
-    captures such a module answered from top level and was refused when first
-    asked for from inside another query.
+    directory. The check used to run under the calling query's guard. So a
+    query that captures such a module answered from top level, and was refused
+    when first asked for from inside another query.
     """
     (tmp_path / "pyinc_guard_relative_file.py").write_text("VALUE = 7\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -884,7 +886,7 @@ def test_the_kernel_resolves_a_captured_module_file_outside_the_guard(
 def test_byte_environment_writes_stay_allowed_inside_queries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only reads are guarded, in the byte view exactly as in `os.environ`."""
+    """Only reads are guarded, in the byte view as in `os.environ`."""
     # Set first so the monkeypatch records the variable and removes it again.
     monkeypatch.setenv("PYINC_BYTE_WRITE", "before")
 
@@ -959,9 +961,9 @@ def test_query_spawned_thread_raw_reads_stay_guarded(
 ) -> None:
     """A thread started inside a query body is inside the query boundary too.
 
-    Whatever such a thread reads flows back into the query's result, so a child
-    that read ambient state freely would record no dependency for it and the
-    warm answer would drift from a fresh one. The whole condition 2 list has to
+    Whatever such a thread reads flows back into the query's result. A child
+    that read ambient state freely would record no dependency for it, and the
+    warm answer would drift from a fresh one. The whole condition 2 list must
     hold on the child, in every mode.
     """
     monkeypatch.setenv("PYINC_GUARDED_ENV", "value")
@@ -970,8 +972,8 @@ def test_query_spawned_thread_raw_reads_stay_guarded(
 
     @query(key=f"child-thread-read:{mode}:{reader}")
     def observe_in_child(db: Database) -> str:
-        # The child's outcome comes back as the query's own result: a query may
-        # not capture mutable ambient state, so there is no shared list to
+        # The child's outcome comes back as the query's own result. A query may
+        # not capture mutable ambient state, so the test has no shared list to
         # append to from out here.
         outcome: list[str] = []
 
@@ -987,7 +989,7 @@ def test_query_spawned_thread_raw_reads_stay_guarded(
         thread.start()
         thread.join(timeout=10)
         if thread.is_alive():
-            # Report a stuck child to the main thread rather than blocking on it.
+            # Report a stuck child to the main thread, without blocking on it.
             return "child still running"
         return outcome[0] if outcome else "child recorded nothing"
 
@@ -1000,15 +1002,15 @@ def test_query_spawned_thread_raw_reads_stay_guarded(
 def test_query_spawning_a_file_reading_thread_raises_instead_of_caching(
     tmp_path: Path, mode: str
 ) -> None:
-    """The read a spawned thread used to make freely is refused, not stored.
+    """The read a spawned thread used to make freely is refused and kept out of the store.
 
     A query that farmed its file read out to a thread recorded no dependency
-    on that file, so the answer it stored outlived every later edit while a
+    on that file. The answer it stored outlived every later edit, while a
     fresh database read the new bytes. Now the child is refused, and a query
     that lets the refusal out fails instead of caching a wrong answer. A query
     that handles the refusal and answers something of its own is deterministic
-    again: the same value warm and fresh, with no dependency on a file it
-    never managed to read.
+    again. It gives the same value warm and fresh, with no dependency on a file
+    it never managed to read.
     """
     path = tmp_path / "data.txt"
     path.write_text("one", encoding="utf-8")
@@ -1062,8 +1064,8 @@ def test_query_spawning_a_file_reading_thread_raises_instead_of_caching(
     path.write_text("two", encoding="utf-8")
 
     assert warm.get(constant_despite_child) == "refused"
-    # Witness: the second answer is the stored one, not a re-execution that
-    # happened to agree.
+    # The count shows the second answer is the stored one. A re-execution that
+    # happened to agree would count as a second execution.
     assert warm.statistics().query_executions == 1
 
     fresh = Database(mode=mode)
@@ -1088,8 +1090,11 @@ def test_environ_union_operators_stay_guarded_inside_queries(direction: str) -> 
 
 
 def test_environ_raw_data_mapping_stays_hidden_inside_queries() -> None:
-    """`os._Environ._data` bypasses the mapping protocol entirely, so the guard
-    refuses the attribute outright instead of leaking the live environment."""
+    """The guard refuses `os._Environ._data` outright inside a query.
+
+    The attribute bypasses the mapping protocol entirely, so reading it would
+    leak the live environment.
+    """
 
     @query(key="environ-raw-data-read")
     def peek(db: Database) -> tuple[str, ...]:
@@ -1128,9 +1133,11 @@ class _ThawReadsFileAdapter:
 
 
 def test_adapter_freeze_of_a_query_result_runs_under_the_guard(tmp_path: Path) -> None:
-    """Freezing a result is part of the query boundary: an adapter that reads
-    ambient state there smuggles it into the stored snapshot, so the condition 2
-    guard has to see the read."""
+    """Freezing a result is part of the query boundary.
+
+    An adapter that reads ambient state there smuggles it into the stored
+    snapshot, so the condition 2 guard must see the read.
+    """
 
     side = tmp_path / "side.txt"
     side.write_text("one", encoding="utf-8")

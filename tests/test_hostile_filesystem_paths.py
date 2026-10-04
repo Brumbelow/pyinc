@@ -1,4 +1,4 @@
-"""Filesystem shapes a caller can hand the library that no read should hang on."""
+"""Filesystem shapes a caller can hand the library that every read must answer promptly."""
 
 from __future__ import annotations
 
@@ -51,8 +51,8 @@ def test_a_readable_source_answers_within_the_budget(tmp_path: Path) -> None:
 
 @posix_only
 def test_a_named_pipe_source_is_answered_rather_than_waited_on(tmp_path: Path) -> None:
-    # A pipe with no writer never delivers a byte, so the read answers from
-    # the kind of the path instead of waiting for one.
+    # A pipe with no writer never delivers a byte, so the read answers at once
+    # from the path's kind.
     pipe = make_fifo(tmp_path / "pipe.py")
     assert within_budget(lambda: FileResource().probe(str(pipe))) == "returned"
     assert FileResource().probe(str(pipe)) == ("missing",)
@@ -60,9 +60,8 @@ def test_a_named_pipe_source_is_answered_rather_than_waited_on(tmp_path: Path) -
 
 #: Every public entry point built on the shared file read, as (name, call)
 #: pairs. The three reading methods appear for both resource types because
-#: each reads on its own rather than delegating. ``read`` is not among them:
-#: it hands the key to the database, so exercising it means driving a real
-#: request rather than calling the shared read.
+#: each reads for itself. ``read`` is left out. It hands the key to the
+#: database, so exercising it takes a real request.
 def _file_read_seams(db: Database) -> tuple[tuple[str, Callable[[str], object]], ...]:
     text = FileResource()
     raw = BinaryFileResource()
@@ -83,9 +82,9 @@ def _file_read_seams(db: Database) -> tuple[tuple[str, Callable[[str], object]],
 #: The seam names in table order; the parametrize id of every cell below.
 _SEAM_NAMES: tuple[str, ...] = tuple(name for name, _call in _file_read_seams(Database()))
 
-#: The seams that report a path naming no readable file by raising rather than
-#: by answering: a load and an atomic read have a value to hand back or nothing
-#: at all, so they raise exactly the way a read of an absent path does.
+#: The seams that raise for a path naming no readable file. A load and an
+#: atomic read either return a value or have nothing to return, so they raise
+#: the way a read of an absent path does.
 _MISSING_RAISES: frozenset[str] = frozenset(
     {
         "FileResource.load",
@@ -167,10 +166,9 @@ def test_a_hostile_source_kind_is_answered_at_every_file_read_seam(
     seam_name: str, hostile_source: str
 ) -> None:
     # A pipe with no writer, a bound socket and an unending device are the
-    # three kinds of path a read can be handed that never returns or never can
-    # succeed. Every seam runs here under a hard budget in a child of its own,
-    # so a seam that goes back to waiting fails the run loudly instead of
-    # hanging it.
+    # three kinds of path whose read never returns or can never succeed. Each
+    # seam runs here under a hard budget in its own child, so a seam that goes
+    # back to waiting fails the run loudly before it can hang it.
     call = _seam(Database(), seam_name)
     expected = "raised: FileNotFoundError" if seam_name in _MISSING_RAISES else "returned"
     assert within_budget(lambda: call(hostile_source)) == expected
@@ -179,9 +177,9 @@ def test_a_hostile_source_kind_is_answered_at_every_file_read_seam(
 @posix_only
 @pytest.mark.parametrize("seam_name", _SEAM_NAMES)
 def test_a_hostile_source_kind_reads_as_missing(seam_name: str, hostile_source: str) -> None:
-    # Bounded is not enough on its own: the answer has to be the one an absent
-    # path gets, so a warm request and a fresh one agree about a path of this
-    # kind and a run that meets one stays reproducible.
+    # A bounded answer must also be the one an absent path gets. Then a warm
+    # request and a fresh one agree about a path of this kind, and a run that
+    # meets one stays reproducible.
     call = _seam(Database(), seam_name)
     if seam_name in _MISSING_RAISES:
         with pytest.raises(FileNotFoundError):
@@ -195,11 +193,11 @@ def test_a_hostile_source_kind_reads_as_missing(seam_name: str, hostile_source: 
 def test_ordinary_and_symlinked_sources_are_unchanged(
     seam_name: str, unchanged_source: str
 ) -> None:
-    # A read that guarded against links rather than against waiting would pass
-    # every hostile-kind cell above and still refuse the ordinary case: a
-    # repository whose sources sit behind a link, or an environment whose
-    # installed packages do. A source reached through one link or two must
-    # answer exactly what the file itself answers.
+    # A read that guarded against links, when it should guard against waiting,
+    # would pass every hostile-kind cell above. It would still refuse the
+    # ordinary case: a repository whose sources sit behind a link, or an
+    # environment whose installed packages do. A source reached through one or two links
+    # must answer what the file itself answers.
     call = _seam(Database(), seam_name)
     expected = _present_answers(_SOURCE_TEXT.encode("utf-8"), _SOURCE_TEXT)[seam_name]
     assert call(unchanged_source) == expected
@@ -209,9 +207,9 @@ def test_ordinary_and_symlinked_sources_are_unchanged(
 @pytest.mark.parametrize("seam_name", _SEAM_NAMES)
 def test_a_denied_regular_source_still_fails_the_read(tmp_path: Path, seam_name: str) -> None:
     # The other half of the policy: only a kind that can never be read answers
-    # absent. A denial on an ordinary regular file is a genuine failure, and
-    # every seam keeps propagating it into the failure record. The message is
-    # the platform's, so only the type is asserted.
+    # absent. A denial on an ordinary regular file is a real failure, and every
+    # seam propagates it into the failure record. The message is the
+    # platform's, so only the type is asserted.
     skip_without_posix_permissions()
     source = tmp_path / "denied.py"
     source.write_text(_SOURCE_TEXT, encoding="utf-8")
@@ -225,15 +223,14 @@ def test_a_denied_regular_source_still_fails_the_read(tmp_path: Path, seam_name:
 
 
 #: What a tracked read answers for a key that names no readable file. A read
-#: hands back a value or it hands back nothing at all, so it refuses the way a
-#: read of an absent path does; naming that outcome gives a query something to
-#: return, and a checkpoint something to carry.
+#: either returns a value or has nothing to return, so it refuses the way a
+#: read of an absent path does. Naming that outcome gives a query something to
+#: return and a checkpoint something to carry.
 _MISSING_READ = "missing"
 
-#: The two file resources held as values rather than reached through their
-#: classes. A query body's captures are fingerprinted, and a resource is
-#: fingerprinted by the configuration that distinguishes it -- which an
-#: instance has and a class does not.
+#: The two file resources, held as instances. A query body's captures are
+#: fingerprinted, and a resource is fingerprinted by the configuration that
+#: distinguishes it, which only an instance has.
 _TEXT_FILE = FileResource()
 _BYTE_FILE = BinaryFileResource()
 
@@ -242,10 +239,9 @@ def _tracked_reads(db: Database, path: str) -> tuple[str, str]:
     """Both tracked read entry points on one key, as a value a query returns.
 
     ``read`` is the entry point the seam table above leaves out, because it
-    hands the key to the database rather than calling the shared read. It is
-    driven here instead, through a real request, for the text resource and the
-    byte one, so the two agree about a key and a caller can tell which of them
-    stopped agreeing.
+    hands the key to the database. It is driven here through a real request,
+    for both the text and the byte resource, so the two agree about a key and a
+    caller can tell which one stopped agreeing.
     """
 
     try:
@@ -262,7 +258,7 @@ def _tracked_reads(db: Database, path: str) -> tuple[str, str]:
 @posix_only
 def test_an_unrelated_query_still_answers_while_a_pipe_is_being_read(tmp_path: Path) -> None:
     # The database holds one lock across a resource read, so a read that
-    # never returns is not one caller's problem -- it is every caller's.
+    # never returns blocks every caller.
     pipe = make_fifo(tmp_path / "pipe.py")
     pipe_path = str(pipe)
     unrelated = Input[str]("hostile.paths.escalation.unrelated")
@@ -277,8 +273,8 @@ def test_an_unrelated_query_still_answers_while_a_pipe_is_being_read(tmp_path: P
 
     # The threads below are ordinary joinable ones, so a read that went back to
     # waiting would strand them for the rest of the run. Both tracked reads run
-    # under the forked budget first, where waiting is reported rather than
-    # inherited, and nothing is started until they have answered.
+    # under the forked budget first, which reports a wait without passing it to
+    # this process. The threads start only after those reads have answered.
     assert within_budget(lambda: _tracked_reads(Database(), pipe_path)) == "returned"
 
     db = Database()
@@ -288,9 +284,9 @@ def test_an_unrelated_query_still_answers_while_a_pipe_is_being_read(tmp_path: P
     finished = {"pipe": threading.Event(), "unrelated": threading.Event()}
 
     def drive(name: str, call: Callable[[], object]) -> None:
-        # Reaching the end is what this cell measures, so a refusal is recorded
-        # as an outcome rather than dropped: the flag says the thread got there
-        # and the recorded answer says what it got there with.
+        # This cell measures reaching the end, so a refusal is recorded as an
+        # outcome. The flag says the thread got there, and the recorded answer
+        # says what it got there with.
         try:
             answers[name] = call()
         except BaseException as error:  # noqa: BLE001 - the outcome IS the result
@@ -315,9 +311,9 @@ def test_an_unrelated_query_still_answers_while_a_pipe_is_being_read(tmp_path: P
     assert not pipe_thread.is_alive()
     assert not other_thread.is_alive()
 
-    # Both halves. The unrelated query answered, which is what a lock held
-    # across a waiting read takes away; and the pipe query answered too, the
-    # way an absent path is answered, rather than by waiting for a byte.
+    # Both halves. The unrelated query answered, which a lock held across a
+    # waiting read would prevent. The pipe query answered too, the way an
+    # absent path is answered.
     assert answers["unrelated"] == "ALPHA"
     assert answers["pipe"] == (_MISSING_READ, _MISSING_READ)
 
@@ -326,9 +322,9 @@ def test_an_unrelated_query_still_answers_while_a_pipe_is_being_read(tmp_path: P
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_pipe_source_reads_as_missing_in_every_mode(mode: str, tmp_path: Path) -> None:
     # A bounded answer that differed between a warm request and a fresh one
-    # would trade a hang for a worse thing: a run whose result depends on which
-    # database asked. The choice has to be the same one in every mode, warm and
-    # fresh alike.
+    # would trade a hang for something worse: a run whose result depends on
+    # which database asked. The answer must match in every mode, warm and fresh
+    # alike.
     pipe = make_fifo(tmp_path / "pipe.py")
     pipe_path = str(pipe)
 
@@ -342,20 +338,19 @@ def test_a_pipe_source_reads_as_missing_in_every_mode(mode: str, tmp_path: Path)
     fresh_answer = Database(mode).get(reads_the_pipe)
 
     assert cold_answer == warm_answer == fresh_answer == (_MISSING_READ, _MISSING_READ)
-    # The second request was served rather than re-derived, so the equality
-    # above is the warm path agreeing and not the body running twice.
+    # The second request reused the first answer, so the equality above shows
+    # the warm path agreeing after one execution of the body.
     assert warm.statistics().query_executions == 1
 
 
 @posix_only
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_a_pipe_source_survives_a_checkpoint_round_trip(mode: str, tmp_path: Path) -> None:
-    # A checkpoint may only carry a probe a later process can reproduce. The
-    # answer a pipe gets is reached by asking the path what kind it is, and a
-    # reload asks that question again in a database that never saw the first
-    # answer -- so this answer is re-derived rather than replayed, and what the
-    # round trip has to show is that re-deriving it lands where the warm run
-    # landed.
+    # A checkpoint may carry only a probe a later process can reproduce. A
+    # pipe's answer comes from asking the path what kind it is, and a reload
+    # asks again in a database that never saw the first answer. So the answer
+    # is re-derived after the reload, and the round trip has to show that
+    # re-deriving it lands where the warm run landed.
     pipe = make_fifo(tmp_path / "pipe.py")
     ordinary = tmp_path / "module.py"
     ordinary.write_text(_SOURCE_TEXT, encoding="utf-8")
@@ -381,18 +376,18 @@ def test_a_pipe_source_survives_a_checkpoint_round_trip(mode: str, tmp_path: Pat
     reloaded.set(source, str(pipe))
     reloaded.load_checkpoint(key)
 
-    # The sibling reads an ordinary file, so its record is one a checkpoint
-    # does carry, and the reloaded database answers it without running its
-    # body. That is what says the round trip below was live: written, loaded
-    # and used, rather than a reload that quietly carried nothing.
+    # The sibling reads an ordinary file, so a checkpoint carries its record,
+    # and the reloaded database answers it without running its body. That
+    # proves the round trip below was live: written, loaded and used. A reload
+    # that carried nothing would fail here.
     assert reloaded.get(reads_an_ordinary_source) == warm_sibling
     assert warm_sibling == (_SOURCE_TEXT, _SOURCE_TEXT)
     assert reloaded.statistics().query_executions == 0
 
-    # The pipe query is the one that re-derives, and the reason is specific: a
-    # read of a path naming no file leaves a failure record, and a checkpoint
-    # carries neither a failure record nor a reader that handled one. So the
-    # counter moves here and did not move for the sibling.
+    # The pipe query re-derives for a specific reason. A read of a path naming
+    # no file leaves a failure record, and a checkpoint carries neither failure
+    # records nor readers that handled one. So the counter moves here, and it
+    # stayed put for the sibling.
     reloaded_answer = reloaded.get(reads_the_source)
     assert reloaded.statistics().query_executions == 1
 
@@ -406,9 +401,9 @@ def test_a_pipe_source_survives_a_checkpoint_round_trip(mode: str, tmp_path: Pat
 @posix_only
 def test_a_pipe_that_becomes_a_regular_file_is_re_read(tmp_path: Path) -> None:
     # The other half of reading as missing: the answer describes the path as it
-    # is now, not a verdict recorded against the name for good. A pipe replaced
-    # by an ordinary source is an ordinary source, to a database that watched it
-    # happen as much as to one that never saw the pipe.
+    # is now, and it changes when the path does. A pipe replaced by an ordinary
+    # source is an ordinary source, both to a database that watched the change
+    # and to one that never saw the pipe.
     source = tmp_path / "module.py"
     make_fifo(source)
     source_path = str(source)
@@ -427,32 +422,30 @@ def test_a_pipe_that_becomes_a_regular_file_is_re_read(tmp_path: Path) -> None:
     assert warm.get(reads_the_source) == (_SOURCE_TEXT, _SOURCE_TEXT)
 
 
-#: The probes whose value domain holds no member for a path that names nothing
-#: readable at all, so a typed refusal is the only total answer they can give.
-#: The resolved-path probe is deliberately not among them, and its absence is
-#: not an inconsistency: an unresolvable path is already a member of that
-#: probe's value domain, so a looping path and a path string holding a NUL are
-#: both shapes it answers rather than refuses. What those two answers are, and
-#: that every interpreter gives the same one, is pinned beside the other
-#: resolved-path cells rather than here.
+#: The probes whose value domain has no member for a path that names nothing
+#: readable, so a typed refusal is the only total answer they can give. The
+#: resolved-path probe is left out on purpose. An unresolvable path is already
+#: a member of that probe's value domain, so it answers a looping path and a
+#: path string holding a NUL. The other resolved-path cells pin what those two
+#: answers are and that every interpreter gives the same one.
 _REFUSING_PROBE_NAMES: tuple[str, ...] = ("file", "binary-file", "stat", "directory")
 
 #: The two shapes every one of those probes must refuse.
 _UNREADABLE_SHAPES: tuple[str, ...] = ("symlink-loop", "embedded-null")
 
 #: Every entry point of a resource that reaches the filesystem for itself. The
-#: probe, the load and the atomic probe-and-load are three separate reads, so a
-#: refusal only one of them makes is a refusal a caller can walk around by
-#: asking a different way.
+#: probe, the load and the atomic probe-and-load are three separate reads. A
+#: refusal made by only one of them is one a caller can walk around by asking a
+#: different way.
 _ENTRY_POINTS: tuple[str, ...] = ("probe", "load", "probe_and_load")
 
 
 def _refusing_seams(db: Database, probe_name: str) -> dict[str, Callable[[str], object]]:
     """One resource's three filesystem entry points, keyed by entry-point name.
 
-    The load and the probe-and-load take a database, which is what the kernel
-    hands them, so they are held here as calls of one path rather than as bound
-    methods; the probe takes the path alone.
+    The load and the probe-and-load take the database the kernel hands them,
+    so they are wrapped here as calls of one path. The probe takes the path
+    alone.
     """
 
     files = FileResource()
@@ -485,7 +478,7 @@ def _refusing_seams(db: Database, probe_name: str) -> dict[str, Callable[[str], 
 
 
 def _unreadable_path(shape: str, base: Path) -> str:
-    """A path under ``base`` in one of the two shapes nothing can read."""
+    """A path under ``base`` in one of the two unreadable shapes."""
     if shape == "symlink-loop":
         return str(make_symlink_loop(base / "loop"))
     return nul_path(base)
@@ -495,12 +488,11 @@ def _expected_refusal(probe_name: str, shape: str) -> str:
     """The words the refusal composes, which are always this library's own.
 
     A file read refuses a path holding a NUL inside the read primitive it
-    calls, so that one refusal reaches a caller in the primitive's sentence;
-    every other cell here meets a sentence the file, listing or stat seam
-    composed for itself. Neither phrase belongs to the platform on purpose:
-    what a symlink loop and a NUL path draw out of the operating system is
-    spelled differently by interpreter version and by platform, so no cell
-    here pins one.
+    calls, so that one refusal reaches a caller in the primitive's sentence.
+    Every other cell here meets a sentence the file, listing or stat seam
+    composed itself. Both phrases are the library's on purpose. The operating
+    system's message for a symlink loop or a NUL path varies by interpreter
+    version and platform, so the cells here pin only the library's words.
     """
 
     if shape == "embedded-null" and probe_name in {"file", "binary-file"}:
@@ -516,16 +508,15 @@ def test_a_path_that_names_nothing_readable_is_refused_by_type(
     probe_name: str, shape: str, entry_point: str, tmp_path: Path
 ) -> None:
     # A link pointing at itself and a path string holding a NUL name no file, no
-    # listing and no metadata. Unlike a pipe or a device they have no reading at
-    # all to report, so answering "missing" would certify an interval nothing
-    # observed; and unlike an absent path they never become readable by being
-    # asked again. Each resource refuses them by type, which is an outcome the
-    # kernel already knows what to do with, rather than by whatever the platform
-    # happened to raise.
+    # listing and no metadata. A pipe or a device has a reading to report, and
+    # these have none, so answering "missing" would certify an interval nothing
+    # observed. An absent path can become readable when asked again, and these
+    # never do. Each resource refuses them by type, an outcome the kernel
+    # already handles, in place of whatever the platform happened to raise.
     #
-    # Every entry point is driven, not the probe alone: the probe, the load and
-    # the atomic probe-and-load read for themselves, so a refusal made at one of
-    # them and not the others is one a caller reaches around without noticing.
+    # All three entry points are driven. The probe, the load and the atomic
+    # probe-and-load each read for themselves, so a refusal made at only one of
+    # them is one a caller reaches around without noticing.
     seam = _refusing_seams(Database(), probe_name)[entry_point]
     path = _unreadable_path(shape, tmp_path)
     with pytest.raises(UnsafeFilesystemPathError, match=_expected_refusal(probe_name, shape)):
@@ -538,10 +529,10 @@ def test_a_path_that_names_nothing_readable_is_refused_by_type(
 def test_a_refusal_is_caught_by_the_library_base_and_as_an_operating_system_error(
     probe_name: str, shape: str, tmp_path: Path
 ) -> None:
-    # The refusal wears two faces on purpose. A caller guarding a query with the
-    # library's own base class reaches it, and so does every handler that has
-    # always wrapped a filesystem call in `except OSError` -- so routing these
-    # two shapes through a typed refusal takes nothing away from either.
+    # The refusal has two faces on purpose. A caller guarding a query with the
+    # library's own base class catches it, and so does every handler that wraps
+    # a filesystem call in `except OSError`. Routing these two shapes through a
+    # typed refusal keeps both handlers working.
     probe = _refusing_seams(Database(), probe_name)["probe"]
     path = _unreadable_path(shape, tmp_path)
 
@@ -568,9 +559,9 @@ def test_a_denied_path_still_fails_every_probe_as_a_denial(
 ) -> None:
     # The other half of the policy, at all four probes: only a path that names
     # nothing readable is refused as such. A denial on an otherwise ordinary
-    # path is a genuine failure the kernel's failure records already carry
-    # identically warm and fresh, so it keeps propagating as itself instead of
-    # being restated as a refusal about the path's shape.
+    # path is a real failure, which the kernel's failure records already carry
+    # identically warm and fresh. So it propagates as itself, a PermissionError,
+    # and stays separate from the refusal about a path's shape.
     skip_without_posix_permissions()
     holder = tmp_path / "holder"
     holder.mkdir()
@@ -587,7 +578,7 @@ def test_a_denied_path_still_fails_every_probe_as_a_denial(
     finally:
         holder.chmod(0o755)
 
-    # ... and the mode was the whole of it: the same paths read normally again.
+    # The mode was the only cause: the same paths read normally again.
     assert probe(str(denied)) is not None
 
 
@@ -597,10 +588,10 @@ def _module_on_disk(
     """Import a real module written under ``tmp_path``, with its file.
 
     A captured module is identified by the bytes at its ``__file__``, so the
-    fixture has to be a module that genuinely came from a file: only such a
-    file can then be replaced by a pipe underneath the module that was loaded
-    from it. The import is undone through ``monkeypatch`` so a cell that fails
-    partway leaves no entry behind for the next one to import instead.
+    fixture has to be a module that came from a file. Only such a file can then
+    be replaced by a pipe underneath the loaded module. The import is undone
+    through ``monkeypatch``, so a cell that fails partway leaves no stale entry
+    for the next cell to import.
     """
 
     source = tmp_path / f"{name}.py"
@@ -617,13 +608,12 @@ def _module_on_disk(
 def test_hashing_a_captured_module_whose_file_is_a_pipe_does_not_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A captured module's file is a path the library found rather than one a
-    # caller handed it, so it is not a hostile input in the ordinary sense --
-    # but a module loaded from a file someone has since replaced with a pipe is
-    # still a world the kernel has to end a request in. What this seam answers
-    # for a file it cannot read does not change: it refuses, because a
-    # fingerprint that skipped the module's own bytes would certify nothing.
-    # Only the waiting is removed.
+    # The library found this module's file itself, so it is a hostile input
+    # only in a loose sense. Still, a module loaded from a file that was later
+    # replaced with a pipe is a world the kernel must finish a request in. This
+    # seam still refuses a file it cannot read, because a fingerprint that
+    # skipped the module's own bytes would certify nothing. Only the waiting is
+    # removed.
     module, source = _module_on_disk("pyinc_hostile_module_hash", tmp_path, monkeypatch)
 
     @query
@@ -641,11 +631,11 @@ def test_hashing_a_captured_module_whose_file_is_a_pipe_does_not_wait(
 
     assert within_budget(fingerprint_a_fresh_database) == "returned"
 
-    # Asserted again in the parent, on a shape that can no longer block, because
-    # the type is half the claim: a read that reports "no readable file" has to
-    # reach the refusal rather than be handed to the hash. Hashing that report
-    # raises a TypeError about the argument, which tells a caller nothing about
-    # their module and is not what this seam promises.
+    # Asserted again in the parent, now that the read is known to return,
+    # because the type is half the claim. A read that reports "no readable
+    # file" has to reach the refusal before the hash sees it. Hashing that
+    # report raises a TypeError about the argument, which tells a caller
+    # nothing about their module and breaks this seam's promise.
     with pytest.raises(UnsupportedValueError, match="cannot be read safely"):
         Database()._query_fingerprint(reads_the_module)
 
@@ -654,12 +644,12 @@ def test_hashing_a_captured_module_whose_file_is_a_pipe_does_not_wait(
 def test_a_module_stamp_reports_a_pipe_rather_than_waiting_on_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The second read of the same file, and deliberately not the same answer.
-    # This one is the token that gates reuse of a memoized fingerprint, so its
-    # job is to report what it observed and let the comparison decide; a module
-    # file that has stopped being readable is a token that will not match, which
-    # is exactly the outcome that sends the request back to the identity read to
-    # be refused there, once, by the seam that owns that refusal.
+    # The second read of the same file, with a different answer on purpose.
+    # This one is the token that gates reuse of a memoized fingerprint, so it
+    # reports what it observed and lets the comparison decide. A module file
+    # that has stopped being readable gives a token that fails to match. That
+    # sends the request back to the identity read, which refuses it there,
+    # once, as the seam that owns that refusal.
     module, _source = _module_on_disk("pyinc_hostile_module_stamp", tmp_path, monkeypatch)
     file_path = Path(cast(str, module.__file__))
 

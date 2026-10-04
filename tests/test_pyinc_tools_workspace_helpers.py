@@ -110,8 +110,8 @@ def test_workspace_link_detection_handles_windows_reparse_metadata(
     assert workspace._is_workspace_link(Probe(0x400))  # type: ignore[arg-type]
     assert not workspace._is_workspace_link(Probe(0))  # type: ignore[arg-type]
     assert not workspace._is_workspace_link(Probe(None))  # type: ignore[arg-type]
-    # Windows reports ERROR_DIRECTORY for a component under a file parent; an
-    # entry the probe cannot reach is absent, not a link.
+    # Windows reports ERROR_DIRECTORY for a component under a file parent. An
+    # entry the probe cannot reach is absent, and an absent entry is no link.
     assert not workspace._is_workspace_link(Probe(NotADirectoryError))  # type: ignore[arg-type]
 
     symlink = tmp_path / "link"
@@ -206,8 +206,9 @@ def test_read_workspace_file_rejects_outside_unnormalized_directories_and_specia
         with pytest.raises(ValueError, match="not a regular file"):
             workspace._read_workspace_file(fifo, root)
 
-    # A parent that is a file means the path is gone, not that it is unsafe.
-    # POSIX reports ENOTDIR for that shape, Windows ERROR_PATH_NOT_FOUND.
+    # A parent that is a file means the path is gone, so it reads as missing
+    # and never as unsafe. POSIX reports ENOTDIR for that shape, Windows
+    # ERROR_PATH_NOT_FOUND.
     plain = root / "mod.py"
     plain.write_bytes(b"pass\n")
     with pytest.raises(workspace._MISSING_PATH_ERRORS):
@@ -410,7 +411,7 @@ def test_windows_shaped_missing_child_is_absence_for_the_reader_and_the_mirror(
     """Windows reports ERROR_PATH_NOT_FOUND where POSIX reports ENOTDIR.
 
     The child of a path that is a regular file again reaches the stat as a
-    FileNotFoundError there, and both signals have to mean the same thing: the
+    FileNotFoundError there. Both signals have to mean the same thing. The
     entry is gone, and its mirror copy goes with it.
     """
 
@@ -439,8 +440,8 @@ def test_windows_shaped_missing_child_is_absence_for_the_reader_and_the_mirror(
     class WindowsOs:
         """The real os module, reporting the name that picks the Windows reader.
 
-        Patching `os.name` itself is not an option: pathlib reads it when it
-        builds a path and would refuse to instantiate a WindowsPath here.
+        Patching `os.name` itself would break pathlib. It reads `os.name` when
+        it builds a path and would refuse to instantiate a WindowsPath here.
         """
 
         name = "nt"
@@ -578,8 +579,8 @@ def test_collect_filesystem_snapshot_hashes_contents_and_tolerates_a_disappearin
     }
 
     monkeypatch.setattr(workspace, "_workspace_files", lambda *_args: ({target}, set()))
-    # A path can also swap kind between the walk and the read, which POSIX and
-    # Windows report differently and the snapshot has to survive either way.
+    # A path can also swap kind between the walk and the read. POSIX and
+    # Windows report that differently, and the snapshot has to survive either.
     for error in workspace._MISSING_PATH_ERRORS:
         monkeypatch.setattr(
             workspace,
@@ -722,7 +723,8 @@ def test_workspace_mirror_syncs_a_tracked_file_swapped_for_a_directory_and_back(
     assert (mirror_root / "mod.py").read_bytes() == b"second"
     assert mirror.content_hashes()[str(target)] == hashlib.sha256(b"second").hexdigest()
 
-    # The child the directory used to hold is now unreachable, not unsafe.
+    # The child the directory used to hold is now unreachable. That reads as
+    # gone, never as unsafe.
     mirror.sync_path_from_disk(str(child))
     assert (mirror_root / "mod.py").read_bytes() == b"second"
     assert str(child) not in mirror.content_hashes()
@@ -854,8 +856,8 @@ def test_watcher_run_reports_a_runtime_error_that_is_not_a_closed_session(
 ) -> None:
     """RuntimeError also covers RecursionError and plain bugs in the poll path.
 
-    Only the closed-session contract may retire the watcher thread; anything
-    else has to reach the error handler instead of disappearing.
+    Only the closed-session contract may retire the watcher thread. Anything
+    else has to reach the error handler.
     """
 
     watcher = workspace.PollingWorkspaceWatcher(_Driver(tmp_path))
@@ -941,8 +943,9 @@ def test_watcher_stop_waits_for_a_thread_that_has_finished_its_loop(tmp_path: Pa
     The thread clears its callbacks and unregisters in its own `finally`, and it
     used to forget its own reference there too. A stop arriving in that window
     found nothing to join and returned with the thread still alive, so
-    `WorkspaceSession.close` removed the mirror under it -- about one close in
-    ten on a free-threaded build. The fake holds the thread inside that window.
+    `WorkspaceSession.close` removed the mirror under it. That happened about
+    one close in ten on a free-threaded build. The fake holds the thread inside
+    that window.
     """
     unregistering = threading.Event()
     release = threading.Event()
@@ -969,7 +972,7 @@ def test_watcher_stop_waits_for_a_thread_that_has_finished_its_loop(tmp_path: Pa
     stopper.start()
     try:
         # Held in its `finally`, the thread is alive, so stop() must still be
-        # waiting for it rather than returning past it.
+        # waiting for it.
         assert not stopped.wait(0.2)
         assert thread.is_alive()
     finally:
@@ -1030,11 +1033,11 @@ def test_watcher_stop_during_start_stops_the_thread_start_launches(tmp_path: Pat
 def test_watcher_poll_refuses_a_start_until_it_has_finished(tmp_path: Path) -> None:
     """`start()` waits for a `poll()` in progress instead of running beside it.
 
-    `poll()` refused while the watcher ran, but checked before polling, so a
+    `poll()` refused while the watcher ran, but it checked before polling. So a
     `start()` landing after the check began the thread's polling alongside
-    it, over the same pending map and snapshot -- "dictionary changed size
-    during iteration" in one of them. The driver holds the poll in its
-    refresh while another thread starts the watcher.
+    it, over the same pending map and snapshot. One of them then failed with
+    "dictionary changed size during iteration". The driver holds the poll in
+    its refresh while another thread starts the watcher.
     """
 
     rendezvous = Rendezvous()

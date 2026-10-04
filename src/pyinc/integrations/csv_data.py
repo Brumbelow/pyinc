@@ -102,28 +102,25 @@ def _parse_csv(
     if not stripped:
         return [], 0, ",", False, []
 
-    # The text arrives with whatever line endings the file holds, so translate
-    # them before anything looks at it. Spelled as two replacements rather than
-    # splitlines(), which also breaks on the vertical tab, form feed and the
-    # other separators a field is allowed to contain.
+    # The text keeps the file's own line endings, so translate them before
+    # anything reads it. This uses two replacements because splitlines() also
+    # breaks on the vertical tab, form feed and other separators a field may
+    # contain.
     stripped = stripped.replace("\r\n", "\n").replace("\r", "\n")
 
     delimiter = _detect_delimiter(stripped)
     has_header = _detect_has_header(stripped)
     diagnostics: list[DiagnosticPayload] = []
 
-    # Two guesses no reader can be relied on to use the same way: a line
-    # terminator, and the quote character itself. Readers disagree about both --
-    # some refuse them outright, some accept them and split fields somewhere the
-    # file never meant. The translation above settles what the sniffer sees;
-    # refusing these two settles what is done with the answer, so neither the
-    # file's line endings nor a guess of the quote character can decide the
-    # dialect. The quote character is read from the dialect the reader below
-    # falls back on, which is the module's fixed default for a call that names
-    # only a delimiter. The terminator arm is belt and braces: no sniffer path
-    # measured here returns one once the text above has been translated, and it
-    # is kept for the reader that does rather than removed for the ones that
-    # do not.
+    # Readers handle two sniffed delimiters inconsistently: a line terminator
+    # and the quote character. Some refuse them and others split fields in the
+    # wrong place. The translation above fixes what the sniffer sees. Replacing
+    # these two with ',' fixes how the answer is used, so the dialect depends on
+    # neither the file's line endings nor a guessed quote character. The quote
+    # character comes from the dialect the reader below falls back on, which is
+    # the module default when a call names only a delimiter. The terminator arm
+    # is a safeguard. No sniffer path measured here returns a terminator after
+    # the translation, and the arm stays for any reader that does.
     if delimiter in ("\r", "\n"):
         diagnostics.append(
             (
@@ -177,7 +174,7 @@ def _parse_csv(
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: Payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -214,7 +211,7 @@ def csv_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload,
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition
+# Layer 2: Composition
 # ---------------------------------------------------------------------------
 
 
@@ -228,7 +225,7 @@ def csv_analysis_payload(db: Database, path: str) -> CsvAnalysisPayload:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: Entrypoints
 # ---------------------------------------------------------------------------
 
 

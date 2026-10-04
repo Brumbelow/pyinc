@@ -67,7 +67,7 @@ def test_package_namespace_exports_installed_packages_stable_api() -> None:
     assert hasattr(integrations, "installed_packages_analysis")
     assert hasattr(integrations, "resolve_import_name")
     assert hasattr(integrations, "InstalledPackageRef")
-    # Experimental helpers must not leak.
+    # Experimental helpers stay out of the package namespace.
     assert not hasattr(integrations, "_site_packages_dirs")
     assert not hasattr(integrations, "_dist_info_listing")
     assert not hasattr(integrations, "_metadata_text")
@@ -97,7 +97,7 @@ def test_installed_packages_discovers_packages_in_fake_site(
         requires_dist=("dep1>=1.0", "dep2"),
     )
 
-    # Patch site-packages discovery to use our fake directory
+    # Point site-packages discovery at the fake directory.
     monkeypatch.setattr(
         "pyinc.integrations.installed_packages._get_site_packages_dirs",
         lambda: (str(site_dir),),
@@ -191,7 +191,7 @@ def test_resolve_import_name_unknown(
 def test_top_level_fallback_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
-    # No top_level.txt → should fall back to normalized dist name
+    # Without top_level.txt, the import name falls back to the normalized dist name.
     _make_dist_info(site_dir, "My-Package", "1.0.0")
     monkeypatch.setattr(
         "pyinc.integrations.installed_packages._get_site_packages_dirs",
@@ -302,7 +302,7 @@ def test_empty_site_packages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 def test_non_dist_info_entries_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
-    # Create non-dist-info directories/files that should be ignored
+    # Entries other than dist-info directories, which the scan ignores.
     (site_dir / "some_package").mkdir()
     (site_dir / "some_package" / "__init__.py").write_text("", encoding="utf-8")
     (site_dir / "README.txt").write_text("ignore me", encoding="utf-8")
@@ -337,7 +337,7 @@ def test_metadata_comment_edit_backdates(tmp_path: Path, monkeypatch: pytest.Mon
     db = Database()
     first = installed_packages_analysis(db)
 
-    # Rewrite METADATA with different whitespace but same fields
+    # Same fields, different whitespace.
     meta = dist_info / "METADATA"
     meta.write_text(
         "Metadata-Version: 2.1\n\nName: example\nVersion: 1.0.0\n\nSummary: A test package\n",
@@ -361,7 +361,7 @@ def test_version_change_invalidates(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     first = installed_packages_analysis(db)
     assert first.packages[0].version == "1.0.0"
 
-    # Change the version — but keep same dist-info directory name
+    # Change the version and keep the same dist-info directory name.
     meta = dist_info / "METADATA"
     meta.write_text(
         "Metadata-Version: 2.1\nName: example\nVersion: 2.0.0\nSummary: A test package\n",
@@ -376,12 +376,12 @@ def test_version_change_invalidates(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 # Reads that must answer with the text they compared
 # ---------------------------------------------------------------------------
 
-# A METADATA header has three states, not two: absent, present-and-empty, and
+# A METADATA header has three states: absent, present-and-empty, and
 # present-with-a-value. _parse_metadata_field answers None for the first and ''
-# for the second, and the package layer branches on exactly that difference --
-# an absent Name or Version is a distribution it cannot describe, an empty one
-# is a distribution whose name or version is the empty string. Any comparison
-# that fills a missing field in with '' cannot tell those two apart, so it
+# for the second, and the package layer branches on that difference. An absent
+# Name or Version is a distribution it cannot describe. An empty one is a
+# distribution whose name or version is the empty string. A comparison that
+# fills a missing field in with '' sees these two states as equal. It then
 # reports no change across an edit that moves a package on and off the listing.
 
 
@@ -390,8 +390,8 @@ def _metadata_document(*, name: str | None, version: str | None, summary: str = 
     lines = ["Metadata-Version: 2.1"]
     for field, value in (("Name", name), ("Version", version)):
         if value is not None:
-            # An empty value writes "Name:", not "Name: " -- a header left
-            # empty carries nothing after the colon.
+            # An empty value writes "Name:" with no trailing space, because an
+            # empty header ends at the colon.
             lines.append(f"{field}: {value}".rstrip())
     lines.append(f"Summary: {summary}")
     return "\n".join(lines) + "\n"
@@ -399,11 +399,10 @@ def _metadata_document(*, name: str | None, version: str | None, summary: str = 
 
 # Each step carries the document, the distribution listing it must produce, and
 # the diagnostic codes that must come with it. Both sequences pass through the
-# empty state twice, so both directions of the edit that a field-value
-# comparison cannot see are walked: absent -> empty on the way in, and
-# empty -> absent on the way out. The two middle steps move the field to a real
-# value and back, which any comparison can see; they are here to separate the
-# two blind transitions rather than to witness anything themselves.
+# empty state twice. That walks both directions of the edit a field-value
+# comparison misses: absent -> empty on the way in, and empty -> absent on the
+# way out. The two middle steps move the field to a real value and back, which
+# any comparison sees. They exist only to separate the two blind transitions.
 _Step = tuple[str, str, tuple[tuple[str, str], ...], tuple[str, ...]]
 
 _NAME_SEQUENCE: tuple[_Step, ...] = (
@@ -477,9 +476,10 @@ def _site_with_one_dist_info(tmp_path: Path) -> tuple[Path, Path]:
 def _every_surface(db: Database) -> dict[str, object]:
     """The four public surfaces this metadata read reaches.
 
-    The two indexes are the cross-integration half: they are what dependency
-    checking, python-source enrichment and module resolution read the installed
-    environment through, so a stale answer here travels well past this module.
+    The two indexes are the cross-integration half. Dependency checking,
+    python-source enrichment and module resolution read the installed
+    environment through them, so a stale answer here travels well past this
+    module.
     """
     analysis = installed_packages_analysis(db)
     stdlib_modules, package_entries = environment_index(db)
@@ -487,9 +487,9 @@ def _every_surface(db: Database) -> dict[str, object]:
         "installed_packages_analysis packages": analysis.packages,
         "installed_packages_analysis diagnostics": analysis.diagnostics,
         "resolve_import_name": resolve_import_name(db, "example"),
-        # environment_index is compared as both of its halves rather than as one
-        # value, so that a failure prints the package entries instead of
-        # truncating inside three hundred stdlib module names.
+        # environment_index is compared as its two halves. Compared as one value,
+        # a failure message would truncate inside three hundred stdlib module
+        # names and hide the package entries.
         "environment_index stdlib modules": stdlib_modules,
         "environment_index package entries": package_entries,
         "installed_distributions_index": installed_distributions_index(db),
@@ -534,11 +534,11 @@ def test_every_installed_packages_surface_matches_a_fresh_read_across_the_field_
                 f"mode={mode} | warm={_brief(warm[name])} | fresh={_brief(fresh[name])}"
             )
 
-        # The equality above is satisfied by two databases that are wrong the
-        # same way, so each step also pins the answer itself. This is where the
-        # empty-field states are held to what they report: a distribution whose
-        # Name or Version is present and empty stays on the listing with that
-        # empty value, and carries no diagnostic.
+        # Two databases that are wrong the same way also pass the equality
+        # above, so each step pins the answer itself. This holds the empty-field
+        # states to what they report. A distribution whose Name or Version is
+        # present and empty stays on the listing with that empty value and
+        # carries no diagnostic.
         analysis = installed_packages_analysis(incremental)
         listing = tuple((pkg.distribution_name, pkg.version) for pkg in analysis.packages)
         assert listing == expected_listing, (
@@ -567,11 +567,10 @@ def test_a_reloaded_installed_packages_checkpoint_answers_like_a_fresh_database(
     saver = Database(mode=mode, store=store)
     _every_surface(saver)
 
-    # The edit lands BEFORE the save and the surfaces are re-driven, so what
-    # gets written is the state the database reached by answering after the
-    # edit. Saving first and editing afterwards would checkpoint a database that
-    # had never answered across this edit at all, and the row would pass whether
-    # or not anything is wrong.
+    # The edit lands BEFORE the save, and the surfaces are re-driven, so the
+    # checkpoint holds the state the database reached by answering after the
+    # edit. Saving first would checkpoint a database that never answered across
+    # this edit, and the row would pass whether or not anything is wrong.
     meta.write_text(_metadata_document(name="", version="1.0"), encoding="utf-8")
     _every_surface(saver)
     key = saver.save_checkpoint()
@@ -587,7 +586,7 @@ def test_a_reloaded_installed_packages_checkpoint_answers_like_a_fresh_database(
             f"restored={_brief(restored[name])} | fresh={_brief(fresh[name])}"
         )
 
-    # A reload is the durable half of what this guards against: an answer
+    # A reload is the durable half of what this test guards against. An answer
     # carried over from before the edit would outlive the process that produced
     # it, and every consumer of the two indexes would inherit it.
     analysis = installed_packages_analysis(reloaded)
@@ -708,7 +707,7 @@ def test_environment_index_returns_stdlib_and_package_data(
 
 
 def test_environment_index_not_in_integrations_namespace() -> None:
-    """environment_index is a composition query, not re-exported from integrations."""
+    """environment_index is a composition query and stays out of the integrations namespace."""
     assert "environment_index" not in integrations.__all__
 
 
@@ -731,8 +730,8 @@ def test_empty_distribution_metadata_produces_a_diagnostic(
 def test_import_resolution_checks_later_installed_packages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A name owned by the second listed distribution resolves to it: the
-    # search does not stop at the first distribution it sees.
+    # A name owned by the second listed distribution resolves to it, so the
+    # search continues past the first distribution.
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     _make_dist_info(site_dir, "first", "1", top_level="first")
@@ -757,9 +756,9 @@ def test_import_resolution_checks_later_installed_packages(
 def test_site_package_discovery_ignores_duplicates_missing_paths_and_nonstring_user_site(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Discovery goes through ``site``: a directory listed twice is scanned
-    # once, a missing entry is dropped, and a user site that is not a string
-    # is ignored rather than raising.
+    # Discovery goes through ``site``. A directory listed twice is scanned once,
+    # a missing entry is dropped, and a non-string user site is ignored without
+    # raising.
     existing = tmp_path / "site-packages"
     existing.mkdir()
     _make_dist_info(existing, "only", "1.0", top_level="only")

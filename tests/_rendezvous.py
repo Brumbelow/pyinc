@@ -1,12 +1,12 @@
 """Hold a race open until both threads have reached it, without sleeping.
 
-A race test has to put two threads inside one window at once. Before the fix
-the second thread walks into the window; after it, a lock keeps the second
+A race test has to put two threads inside one window at once. Before the fix,
+the second thread walks into the window. After it, a lock keeps the second
 thread out, so it can only queue on that lock. `Rendezvous.point` holds the
-first thread that reaches it until either has happened, and
-`Rendezvous.lock` wraps the lock under test so that queueing on it counts as
-arriving. The outcome is the same on every run: no sleep decides it, and
-neither version of the code leaves the first thread waiting.
+first thread that reaches it until either has happened. `Rendezvous.lock`
+wraps the lock under test so that queueing on it counts as arriving. The
+outcome is the same on every run: no sleep decides it, and both versions of
+the code release the first thread.
 """
 
 from __future__ import annotations

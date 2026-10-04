@@ -24,7 +24,7 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 class ReleaseArtifactError(ValueError):
-    """Release artifacts do not satisfy the publication contract."""
+    """Release artifacts violate the publication contract."""
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,7 @@ def render_checksums(checksums: Mapping[str, str]) -> str:
 
 
 def parse_checksums(document: bytes) -> dict[str, str]:
-    """Parse strict sha256sum-compatible contents without accepting duplicate names."""
+    """Parse strict sha256sum-compatible contents and reject duplicate names."""
 
     try:
         lines = document.decode("ascii").splitlines()

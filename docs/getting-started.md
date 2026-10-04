@@ -16,7 +16,7 @@ The wheel has no runtime dependencies and includes `pyinc`, `pyinc_tools`, and
 ## 1. Declare keyed inputs and queries
 
 An `Input` is a base value supplied by your application. Give it a stable,
-non-empty key: the key is its identity in a `Database` and in checkpoints.
+non-empty key. The key is its identity in a `Database` and in checkpoints.
 
 ```python docs-check
 from pyinc import Database, Input, query
@@ -44,13 +44,13 @@ assert db.get(word_count) == 5
 
 Calling one query from another is ordinary Python. While `word_count` runs,
 the database records its dependency on `words`, and `words` records its
-dependency on `SOURCE`. `db.get(...)` is the top-level request boundary;
-calling a `Query` inside another query delegates to the same database.
+dependency on `SOURCE`. `db.get(...)` is the top-level request boundary.
+Calling a `Query` inside another query delegates to the same database.
 
-Use an explicit `@query(key="...")` only when the default
-`module:qualified_name` identity is not stable enough for your deployment. An
-`Input` or query accepts either `eq=` for custom equality or `cutoff=` for a
-snapshot-safe comparison token, never both.
+A query's default identity is `module:qualified_name`. Pass an explicit
+`@query(key="...")` only when your deployment needs a more stable one. An `Input` or
+query accepts `eq=` for custom equality or `cutoff=` for a snapshot-safe
+comparison token. Use at most one of the two.
 
 ## 2. Track files and other resources
 
@@ -85,49 +85,50 @@ with TemporaryDirectory() as directory:
     assert db.get(nonempty_lines, str(path)) == ("Ada", "Linus")
 ```
 
-Inside a query, the raw reads
-[condition 2](kernel-contract.md#2-tracked-ambient-reads) enumerates — file
-opens, environment access, directory listings — raise `UntrackedReadError`
-outside a resource. For ambient reads the guard cannot intercept, such as
-`os.open()`, subprocess output, time, random values, network calls, or C
-extensions, call `db.report_untracked_read(reason)`. That node then executes on
-every request and cannot backdate.
+Inside a query, the raw reads listed in
+[condition 2](kernel-contract.md#2-tracked-ambient-reads) (file opens,
+environment access, directory listings) raise `UntrackedReadError` outside a
+resource. Some ambient reads escape the guard, such as `os.open()`, subprocess
+output, time, random values, network calls, or C extensions. For those, call
+`db.report_untracked_read(reason)`. That node then executes on every request and
+never backdates.
 
-A custom resource implements `probe`, `load`, and `label`; `read`,
-`probe_and_load`, and `identity` arrive with working defaults you may override.
-The instance itself must be snapshot-safe — a frozen dataclass whose fields are
-themselves snapshot-safe, or a class whose `identity()` returns a snapshot-safe
-value — or the first `get()` of a query that captures it is refused. The kernel
-probes a resource when a request needs that node verified: at most one standalone
-probe per request per resource key, none if the node is not reached. Read the
+A custom resource implements `probe`, `load`, and `label`. `read`,
+`probe_and_load`, and `identity` have working defaults you may override. The
+instance itself must be snapshot-safe. Use a frozen dataclass whose fields are
+snapshot-safe, or a class whose `identity()` returns a snapshot-safe value.
+Otherwise the kernel refuses the first `get()` of a query that captures it. The
+kernel probes a resource when a request needs that node verified. It runs at most
+one standalone probe per request per resource key, and only for nodes the request
+reaches. Read the
 [kernel contract](kernel-contract.md#conditions-for-from-scratch-consistency)
 before relying on a custom probe across checkpoints.
 
 ## 3. Choose a mode
 
-The mode changes boundary exposure and mutation checking, not dependency or
-ambient-read tracking.
+The mode changes boundary exposure and mutation checking. Dependency and
+ambient-read tracking work the same in every mode.
 
 | Mode | Values seen by queries and callers | In-query mutation |
 |---|---|---|
-| `strict` | Frozen snapshot views such as `FrozenList`, `FrozenDict`, `FrozenSet`, and `FrozenRecord` | An ordinary write fails immediately. `object.__setattr__` still rebinds a field, so the kernel rebuilds every exposed view instead of trusting it. |
+| `strict` | Frozen snapshot views such as `FrozenList`, `FrozenDict`, `FrozenSet`, and `FrozenRecord` | An ordinary write fails immediately. `object.__setattr__` can still rebind a field, so the kernel rebuilds every exposed view. |
 | `checked` | Owned thawed copies | A before/after fingerprint detects mutation. |
-| `fast` | Owned thawed copies | Not checked; deterministic, non-mutating queries are the caller's responsibility. |
+| `fast` | Owned thawed copies | Unchecked. The caller must keep queries deterministic and non-mutating. |
 
 Start with `Database(mode="strict")`. Move a measured workload to `checked` or
-`fast` only when code genuinely needs ordinary containers at a boundary.
+`fast` only when its code needs ordinary containers at a boundary.
 
-`freeze()` is a snapshot conversion, not a general object serializer: a
-mapping comes back in a canonical order, a dataclass thaws to a dictionary
-unless a `ValueAdapter` reconstructs it, and the rules are stated under
-[condition 1](kernel-contract.md#1-value-boundary-ownership) of the kernel
-contract.
+`freeze()` converts a value to a snapshot, and the round trip can change its
+shape. A mapping comes back in canonical order. A dataclass thaws to a
+dictionary unless a `ValueAdapter` reconstructs it.
+[Condition 1](kernel-contract.md#1-value-boundary-ownership) of the kernel
+contract states the rules.
 
 ## 4. Inspect what happened
 
-`inspect()` is observational: it reports the most recently recorded decision
-without starting another verification pass. Use `inspect_fresh()` when the
-inspection itself must first verify current inputs and resources.
+`inspect()` is observational. It reports the most recently recorded decision
+and starts no verification pass. Use `inspect_fresh()` when the inspection must
+first verify current inputs and resources.
 
 ```python docs-check
 from pyinc import Database, Input, query
@@ -154,17 +155,17 @@ print(db.statistics())
 print(db.query_profile())
 ```
 
-Hold a batch of reads inside `db.request_span()` when they should all see one
-world: the batch shares a single resource-validation pass, and a `db.set`
-inside it that actually changes something rolls the span so later reads
+Wrap a batch of reads in `db.request_span()` when they should all see one
+world. The batch shares a single resource-validation pass. A `db.set` inside
+the span that changes an input rolls the span, so later reads
 re-derive. A caller that changes the world some other way declares it with
 `db.request_inputs_changed()`, which is a no-op outside a span. Spans nest, and
 only the outermost close ends the request.
 
 Use `dependency_graph()` for a machine-readable graph. `statistics()` reports
-work counts and cache decisions; `query_profile()` reports timing aggregates.
-Those APIs are better correctness and performance signals than inferring work
-from wall-clock time alone.
+work counts and cache decisions. `query_profile()` reports timing aggregates.
+These APIs give better correctness and performance signals than wall-clock time
+alone.
 
 ## 5. Reconcile a first output
 
@@ -204,9 +205,9 @@ with TemporaryDirectory() as directory:
     assert Path(directory, "greeting.txt").read_text() == "Hello, Ada!\n"
 ```
 
-`plan()` runs the same preflight and locking as `reconcile()` without changing
-outputs or the ownership ledger. The action owns only paths recorded
-in its validated ledger. Review the [action contract](action-contract.md)
+`plan()` runs the same preflight and locking as `reconcile()` and leaves the
+outputs and the ownership ledger unchanged. The action owns only the paths
+recorded in its validated ledger. Review the [action contract](action-contract.md)
 before sharing an output root between tools.
 
 ## Next steps

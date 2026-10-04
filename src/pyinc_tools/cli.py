@@ -23,7 +23,7 @@ EXIT_DIAGNOSTICS = 3
 
 AnalysisResult = WorkspaceAnalysisResult | FileAnalysisResult
 
-# Ordered most to least severe; a threshold matches itself and everything above.
+# Ordered most to least severe. A threshold matches itself and everything above.
 _SEVERITY_RANK: dict[str, int] = {"error": 0, "warning": 1, "information": 2, "hint": 3}
 
 _FAIL_ON_NEVER = "none"
@@ -106,8 +106,8 @@ def _format_diagnostic(diagnostic: AnalysisDiagnostic) -> str:
     """Render one diagnostic as ``path:line:col: severity code message``.
 
     Source coordinates are zero-based, so both are incremented for display. A
-    diagnostic without a range keeps the ``path:`` anchor and omits the position
-    rather than pointing at an unrelated line.
+    diagnostic without a range keeps the ``path:`` anchor and omits the
+    position, since any position would point at an unrelated line.
     """
 
     if diagnostic.range is None:
@@ -155,8 +155,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "analyze":
         if args.watch and args.fail_on != _FAIL_ON_NEVER:
-            # Watch mode never terminates normally, so there is no run for an
-            # exit-code gate to report on.
+            # Watch mode runs until interrupted, so an exit-code gate has no
+            # finished run to report on.
             print(
                 "pyinc-tools: --fail-on cannot be combined with --watch",
                 file=sys.stderr,

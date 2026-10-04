@@ -1,7 +1,7 @@
-"""High-level codegen: the ``@action`` that emits files and the public entrypoints.
+"""High-level codegen: the ``@action`` that emits files, and the public entrypoints.
 
-Output ownership (for precise orphan deletion): each definition ``D`` owns
-``<snake(D)>.py`` and ``docs/<snake(D)>.md``; the aggregate index owns
+Output ownership drives orphan deletion. Each definition ``D`` owns
+``<snake(D)>.py`` and ``docs/<snake(D)>.md``. The aggregate index owns
 ``__init__.py``.
 """
 
@@ -47,12 +47,12 @@ def generate_outputs(db: Database, schema_path: str) -> list[Output]:
 def generate(
     db: Database, schema_path: str | os.PathLike[str], out_dir: str | os.PathLike[str]
 ) -> ReconcileResult:
-    """Generate typed Python models from ``schema_path`` into ``out_dir``,
-    reconciling outputs incrementally (only changed files are written).
+    """Generate typed Python models from ``schema_path`` into ``out_dir``.
 
-    Schema validation is completed before the action reads its ownership
-    manifest or mutates the output tree. Existing generated files are therefore
-    preserved when the new schema is malformed or unsupported.
+    Outputs are reconciled incrementally, and only changed files are written.
+    The schema is validated before the action reads its ownership manifest
+    or mutates the output tree. A malformed or unsupported schema therefore
+    leaves existing generated files in place.
     """
     path = os.fspath(schema_path)
     analysis = schema_analysis(db, path)
@@ -62,7 +62,7 @@ def generate(
 
 
 def schema_analysis(db: Database, schema_path: str | os.PathLike[str]) -> SchemaAnalysis:
-    """Decode the per-definition models for inspection (non-generating)."""
+    """Decode the per-definition models for read-only inspection."""
     path = os.fspath(schema_path)
     models = tuple(
         _decode_model(definition_model(db, path, name)) for name in definition_names(db, path)

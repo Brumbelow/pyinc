@@ -71,7 +71,7 @@ def test_package_namespace_exports_xml_config_stable_api() -> None:
     assert hasattr(integrations, "XmlAttribute")
     assert hasattr(integrations, "XmlElement")
 
-    # Experimental helpers must not leak.
+    # Experimental helpers stay out of the public namespace.
     assert not hasattr(integrations, "xml_file_text")
     assert not hasattr(integrations, "xml_elements_payload")
     assert not hasattr(integrations, "xml_analysis_payload")
@@ -266,7 +266,7 @@ def test_whitespace_only_edit_backdates_xml(tmp_path: Path) -> None:
     db = Database()
     first = xml_analysis(db, str(path))
 
-    # Reformat with indentation — semantically identical
+    # Reformat with indentation (semantically identical)
     path.write_text("<root>\n  <child>text</child>\n</root>\n", encoding="utf-8")
     second = xml_analysis(db, str(path))
 
@@ -396,7 +396,7 @@ def test_xml_analysis_matches_fresh_recomputation_with_adversarial_payloads(
 
 
 def _nested_xml(levels: int, tag: str = "level") -> str:
-    """A document `levels + 1` elements deep — `<root>` plus `levels` nestings."""
+    """A document `levels + 1` elements deep: `<root>` plus `levels` nestings."""
     return "<root>" + f"<{tag}>" * levels + "leaf" + f"</{tag}>" * levels + "</root>"
 
 
@@ -463,8 +463,8 @@ def test_the_element_walk_does_not_consume_the_interpreter_recursion_budget() ->
         walked.append(len(_walk_elements(_safe_parse(text), "")))
 
     # A fresh thread starts at the bottom of its own Python stack, so the lowered
-    # limit is the whole budget the parse and walk get — two orders of magnitude
-    # below the document's own nesting.
+    # limit is the whole budget the parse and walk get. That budget is two orders
+    # of magnitude below the document's own nesting.
     original = sys.getrecursionlimit()
     sys.setrecursionlimit(120)
     try:
@@ -513,8 +513,8 @@ def test_stack_exhaustion_diagnostic_does_not_vary_with_the_recursion_message(
     path = tmp_path / "config.xml"
     path.write_text("<root/>", encoding="utf-8")
 
-    # CPython names whichever frame ran out of budget, which is a property of the
-    # call site rather than of the file. A cached payload must not carry it.
+    # CPython names whichever frame ran out of budget. That name belongs to the
+    # call site, independent of the file, so a cached payload must leave it out.
     messages = (
         "maximum recursion depth exceeded",
         "maximum recursion depth exceeded while calling a Python object",
@@ -540,8 +540,8 @@ def test_stack_exhaustion_diagnostic_does_not_vary_with_the_recursion_message(
 
 # Every element re-emits the dot path of all its ancestors, so the cached element
 # payload grows quadratically in nesting depth and linearly in element-name
-# length. `_MAX_XML_DEPTH` is chosen to hold the worst case the budget covers — an
-# element name of `_BUDGETED_NAME_LENGTH` characters at the cap — under this
+# length. `_MAX_XML_DEPTH` is chosen to hold the worst case the budget covers (an
+# element name of `_BUDGETED_NAME_LENGTH` characters at the cap) under this
 # ceiling.
 _ELEMENT_PATH_BUDGET = 1024 * 1024
 _BUDGETED_NAME_LENGTH = 20
@@ -582,10 +582,10 @@ def test_elements_are_emitted_in_document_pre_order(tmp_path: Path) -> None:
 
 
 def test_the_element_payload_is_byte_for_byte_stable(tmp_path: Path) -> None:
-    # The cached structure, spelled out rather than derived, so that a change to
-    # the element shape has to be made here deliberately. The payload is a tuple
-    # of plain tuples, which is what the cache holds -- not a list wrapper -- so
-    # the whole value is written out literally.
+    # The cached structure is spelled out, never derived, so a change to the
+    # element shape has to be made here on purpose. The payload is a tuple of
+    # plain tuples (no list wrapper), which is what the cache holds, so the whole
+    # value is written out literally.
     path = tmp_path / "config.xml"
     path.write_text('<root attr="v"><child>text</child><other/></root>', encoding="utf-8")
 
@@ -597,9 +597,9 @@ def test_the_element_payload_is_byte_for_byte_stable(tmp_path: Path) -> None:
 
 
 def test_a_malformed_document_caches_no_elements_and_one_diagnostic(tmp_path: Path) -> None:
-    # A document the parser rejects yields no elements at all; the reason is
-    # carried beside them, by the diagnostics payload. Only the diagnostic's code
-    # is pinned -- its message is the parser's own wording and varies with the
+    # A document the parser rejects yields no elements at all. The diagnostics
+    # payload carries the reason beside them. Only the diagnostic's code is
+    # pinned, because its message is the parser's own wording and varies with the
     # expat build underneath.
     path = tmp_path / "config.xml"
     path.write_text("<root><unclosed>", encoding="utf-8")
@@ -639,11 +639,10 @@ def test_a_reformat_recomputes_the_payloads_and_leaves_the_composition_reused(
     assert first == second, f"a reformat moved the analysis | first {first} | second {second}"
 
     # `query_profile()` records executions only, and `reset_statistics()` has
-    # just cleared it, so a query that was reused has no row at all -- there is
-    # no row carrying a zero to look for. A label reads `module:name[hash] name()`,
-    # so a lookup by bare query name never matches; anchoring on `:name[` picks out
-    # the one meant and cannot be satisfied by a longer sibling name that happens
-    # to contain it.
+    # cleared it. So a query that was reused has no row at all (there is no row
+    # carrying a zero to look for). A label reads `module:name[hash] name()`, so a
+    # lookup by bare query name never matches. Anchoring on `:name[` picks out the
+    # intended query, and a longer sibling name that contains it cannot match.
     executed = [profile.query_label for profile in db.query_profile()]
     for name in _PAYLOAD_QUERIES:
         assert any(f":{name}[" in label for label in executed), (
@@ -653,10 +652,10 @@ def test_a_reformat_recomputes_the_payloads_and_leaves_the_composition_reused(
         f"xml_analysis_payload re-ran instead of staying reused | executed {executed}"
     )
 
-    # Absolute counts for the second read, not deltas: the read executes on the
-    # new bytes, the two payload queries re-derive equal projections and are
-    # backdated, and everything above them is reused. The reuse figure is what
-    # the reformat is supposed to cost nothing on.
+    # These are absolute counts for the second read. The read executes on the new
+    # bytes, the two payload queries re-derive equal projections and are
+    # backdated, and everything above them is reused. The reuse figure is where
+    # the reformat should cost nothing.
     statistics = db.statistics()
     counts = (
         statistics.query_executions,
@@ -685,13 +684,13 @@ def test_a_reformat_leaves_workspace_discovery_identical(mode: str, tmp_path: Pa
 # Checkpoints
 # ---------------------------------------------------------------------------
 
-# The ordering other integrations use -- edit, drive the entrypoint so a stale
-# answer forms, then save -- is unconstructible here: this read compares the text
-# it hands back, so there is no answer that disagrees with the file to save. The
-# substitute edits the file after the save, which the reload has to notice. The
-# second arm is what keeps that honest: with no edit the saved answer and a fresh
-# one agree, and the row would pass on any tree at all. The CSV, environment-file
-# and .pth suites carry the same substitute for the same reason.
+# Other integrations edit, drive the entrypoint so a stale answer forms, then
+# save. That ordering cannot be built here. This read compares the text it hands
+# back, so no answer that disagrees with the file exists to save. The substitute
+# edits the file after the save, which the reload has to notice. The second arm
+# keeps that check meaningful. With no edit, the saved answer and a fresh one
+# agree, and the row would pass on any tree at all. The CSV, environment-file and
+# .pth suites carry the same substitute for the same reason.
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

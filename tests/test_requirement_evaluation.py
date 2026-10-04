@@ -120,7 +120,7 @@ def test_requirement_evaluation_stable_api() -> None:
     assert hasattr(integrations, "PythonEnvironmentSnapshot")
     assert hasattr(integrations, "VersionSpecifierEvaluation")
 
-    # Composition queries and private helpers must not leak.
+    # Composition queries and private helpers stay private.
     assert not hasattr(integrations, "python_environment_snapshot")
     assert not hasattr(integrations, "applicable_requirements_payload")
     assert not hasattr(integrations, "_parse_version")
@@ -130,7 +130,7 @@ def test_requirement_evaluation_stable_api() -> None:
 
 
 # ---------------------------------------------------------------------------
-# PEP 440 — version specifier satisfaction
+# PEP 440: version specifier satisfaction
 # ---------------------------------------------------------------------------
 
 
@@ -160,8 +160,8 @@ def test_requirement_evaluation_stable_api() -> None:
         ("~=2.2.post3", "2.3"),
         # Arbitrary equality, restricted to operands where both implementations
         # agree. `packaging` case-folds and compares against the *normalized*
-        # version, so e.g. `===V1.0` against `V1.0` diverges; that case is pinned
-        # locally in `test_version_specifier_arbitrary_equality` instead.
+        # version, so `===V1.0` against `V1.0` diverges. That case is pinned
+        # locally in `test_version_specifier_arbitrary_equality`.
         ("===1.0", "1.0"),
         ("===1.0", "1.0.0"),
         ("===1.0.0", "1.0"),
@@ -227,8 +227,8 @@ def test_supported_pep508_marker_vectors_match_packaging(marker: str) -> None:
         ("==1!2.0", "2.0", False),
         ("==1.0+local", "1.0+local", True),
         ("==1.0", "1.0+local", True),
-        # PEP 440 arbitrary equality: string equality, no normalization. Contrast
-        # ("==1.0", "1.0.0", True) above — `===` does not pad the release.
+        # PEP 440 arbitrary equality is string equality without normalization.
+        # Compare ("==1.0", "1.0.0", True) above: `===` leaves the release unpadded.
         ("===1.0", "1.0", True),
         ("===1.0", "1.0.0", False),
         ("===1.0.0", "1.0", False),
@@ -262,7 +262,7 @@ def test_version_specifier_post_release_accepted(mode: str) -> None:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_version_specifier_wildcard_prefix_compares_epoch(mode: str) -> None:
-    """PEP 440 prefix matching includes the epoch, not just the release digits."""
+    """PEP 440 prefix matching compares the epoch as well as the release digits."""
     db = Database(mode=mode)
     assert evaluate_version_specifier(db, "==1.1.*", "1!1.1").satisfied is False
     assert evaluate_version_specifier(db, "!=1.1.*", "1!1.1").satisfied is True
@@ -287,21 +287,21 @@ def test_version_specifier_arbitrary_equality(mode: str) -> None:
     """PEP 440 `===` is string equality against the version as written."""
     db = Database(mode=mode)
     assert evaluate_version_specifier(db, "===1.0", "1.0").satisfied is True
-    # No normalization: `==1.0` matches `1.0.0`, `===1.0` does not.
+    # `===` skips normalization: `==1.0` matches `1.0.0`, and `===1.0` rejects it.
     assert evaluate_version_specifier(db, "===1.0", "1.0.0").satisfied is False
-    # No case folding either — this is where the local rule diverges from
+    # `===` also skips case folding. Here the local rule diverges from
     # `packaging`, which compares against the normalized version and says False.
     assert evaluate_version_specifier(db, "===V1.0", "V1.0").satisfied is True
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_version_specifier_arbitrary_equality_accepts_unparseable_version(mode: str) -> None:
-    """`===` is decidable without a PEP 440-conforming version — its whole point."""
+    """`===` can decide a version that fails to conform to PEP 440. That is its purpose."""
     db = Database(mode=mode)
     weird = "1.0-weird+not!pep440"
     assert evaluate_version_specifier(db, f"==={weird}", weird).satisfied is True
     assert evaluate_version_specifier(db, f"==={weird}", "1.0").satisfied is False
-    # A mixed set still needs a parseable version for the non-`===` clause.
+    # A mixed set still needs a parseable version for its `>=1.0` clause.
     mixed = evaluate_version_specifier(db, ">=1.0,===weird", "weird")
     assert mixed.satisfied is False
     assert "unparseable version" in mixed.detail
@@ -326,7 +326,7 @@ def test_version_prerelease_ordering(mode: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# PEP 508 — marker expression evaluation
+# PEP 508: marker expression evaluation
 # ---------------------------------------------------------------------------
 
 
@@ -418,7 +418,7 @@ def test_marker_version_variable_semantics(mode: str, monkeypatch: pytest.Monkey
     _patch_env(monkeypatch, _fixed_env(python_full_version="3.12.3"))
     db = Database(mode=mode)
 
-    # Numeric comparison, not lexicographic.
+    # Numeric comparison. Lexicographic order would fail the first assertion.
     assert evaluate_markers(db, 'python_full_version >= "3.9"').value is True
     assert evaluate_markers(db, 'python_full_version < "3.13"').value is True
 
@@ -442,18 +442,18 @@ def test_marker_version_variable_wildcard_equality_is_prefix_matching(
     assert evaluate_markers(db, 'python_version != "3.*"').value is False
     assert evaluate_markers(db, 'python_full_version == "3.12.*"').value is True
 
-    # A wildcard base that is not itself a version forms no valid specifier
-    # clause, exactly as packaging's Specifier construction would reject it,
-    # so evaluation falls back to packaging's fixed operator table rather
-    # than reporting an unparseable environment value.
+    # The wildcard base `bad` is not a version, so the clause is an invalid
+    # specifier, which packaging's Specifier construction also rejects.
+    # Evaluation falls back to packaging's fixed operator table and reports no
+    # unparseable environment value.
     bad = evaluate_markers(db, 'python_version == "bad.*"')
     assert bad.value is False
     assert bad.diagnostics == ()
 
-    # Wildcards are only defined for ==/!= in PEP 440; an ordered operator
-    # against a wildcard literal is also not a valid specifier clause, so it
-    # falls back to the table too -- ">=" maps to string equality there, not
-    # string ordering, exactly as packaging's own fallback does.
+    # PEP 440 defines wildcards only for ==/!=. An ordered operator against a
+    # wildcard literal is also an invalid specifier clause, so it falls back to
+    # the table too. There ">=" maps to string equality instead of string
+    # ordering, matching packaging's own fallback.
     ordered = evaluate_markers(db, 'python_version >= "3.*"')
     assert ordered.value is False
     assert ordered.diagnostics == ()
@@ -493,7 +493,7 @@ def test_python_environment_monkeypatch_flows_through(
 
 
 # ---------------------------------------------------------------------------
-# Composition — applicable_requirements
+# Composition: applicable_requirements
 # ---------------------------------------------------------------------------
 
 
@@ -580,7 +580,7 @@ def test_applicable_requirements_status_matrix(
     assert by_spec[("requests", ">=2.0")].status == "satisfied"
     assert by_spec[("flask", ">=1.0")].status == "missing"
     assert by_spec[("requests", ">=5.0")].status == "version_mismatch"
-    # Installed version is exactly "2.31.0", so arbitrary equality matches.
+    # The installed version string is "2.31.0", so arbitrary equality matches.
     assert by_spec[("requests", "===2.31.0")].status == "satisfied"
 
 
@@ -628,7 +628,7 @@ def test_applicable_requirements_undecidable_spec_is_ambiguous_like_dependency_c
     _patch_site(monkeypatch, site_dir)
 
     # `~=1` has too few release segments for a compatible-release clause, so it
-    # cannot be evaluated against any installed version.
+    # is undecidable against any installed version.
     req_file = tmp_path / "requirements.txt"
     req_file.write_text("requests~=1\n", encoding="utf-8")
 
@@ -658,9 +658,9 @@ def test_applicable_requirements_installed_prerelease_agrees_with_dependency_che
     result = applicable_requirements(db, str(req_file))
     dep_result = dependency_check_analysis(db, ("numpy>=1.20",))
 
-    # Pre-release exclusion is a resolver candidate-selection rule; an
-    # already-installed version is evaluated with pre-releases allowed, the
-    # same way dependency_check evaluates it (and pip check does).
+    # Pre-release exclusion is a resolver candidate-selection rule. An
+    # installed version is evaluated with pre-releases allowed, as
+    # dependency_check (and pip check) evaluate it.
     assert len(result.requirements) == 1
     assert result.requirements[0].installed_version == "2.0.0rc1"
     assert dep_result.statuses[0].status == "satisfied"
@@ -700,20 +700,19 @@ def test_both_applicable_surfaces_match_a_fresh_read_across_the_edit_sequence(
 ) -> None:
     """Both evaluation surfaces answer every step the way a fresh database does.
 
-    The document and the seven edits are imported from the requirements suite
-    rather than restated here, so "the same sequence" is a fact about the object
-    both rows walk instead of a claim about two copies staying in step.
+    The document and the seven edits are imported from the requirements suite,
+    so both rows walk one shared sequence and no copy can drift.
 
-    The assertion is uniform across the seven edits; the divergence it guards
-    against is not, and the difference matters when reading a green run. Only
-    two of the seven edits reach here at all -- the editable install's name and
-    the continuation backslash, both of which change a requirement's identity.
-    Rewording the comment on a plain requirement, on an index directive, or on
-    a line the parser rejects changes what the requirements suite reports while
-    leaving these two surfaces untouched, so three of the cells below hold for
-    reasons that have nothing to do with what they are here to catch. They are
-    written anyway, because which edits reach this layer is a fact about
-    today's evaluation code rather than a property anyone has pinned.
+    The assertion is the same for all seven edits, but the divergence it guards
+    against varies, which matters when reading a green run. Only two of the
+    seven edits reach this layer: the editable install's name and the
+    continuation backslash. Both change a requirement's identity. Rewording the
+    comment on a plain requirement, on an index directive, or on a line the
+    parser rejects changes what the requirements suite reports and leaves these
+    two surfaces untouched. So three of the cells below pass for reasons
+    unrelated to what they are here to catch. They stay because which edits
+    reach this layer is a property of today's evaluation code, and no test pins
+    it.
     """
     _patch_env(monkeypatch, _fixed_env())
     site_dir = tmp_path / "site-packages"
@@ -744,9 +743,9 @@ def test_both_applicable_surfaces_match_a_fresh_read_across_the_edit_sequence(
             assert warm_value == fresh_value, (
                 f"{name} disagrees with a fresh read | after: {label} | mode={mode}"
             )
-            # Both sides must have answered: workspace discovery returns None
-            # when it finds no requirements.txt, and None == None would satisfy
-            # the comparison above without either surface having read anything.
+            # Both sides must have answered. Workspace discovery returns None
+            # when it finds no requirements.txt, and None == None would pass the
+            # comparison above even if neither surface read anything.
             assert fresh_value is not None, (
                 f"{name} returned nothing to compare | after: {label} | mode={mode}"
             )
@@ -1015,7 +1014,7 @@ def test_wildcard_specifier_validity_matches_packaging(spec_text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Marker comparisons follow packaging's algorithm, not a variable list
+# Marker comparisons follow packaging's algorithm instead of a variable list
 # ---------------------------------------------------------------------------
 
 _PARITY_ENV_MAPPING = {
@@ -1095,8 +1094,10 @@ def test_unparseable_environment_version_under_a_valid_specifier_diagnoses() -> 
 
 
 def test_compatible_release_against_non_version_variable_diagnoses() -> None:
-    """packaging raises UndefinedComparison for a ~= key it doesn't version-match;
-    pyinc's non-raising contract reports the divergence and evaluates False."""
+    """packaging raises UndefinedComparison for a ~= key it cannot version-match.
+
+    Under its non-raising contract, pyinc reports the divergence and evaluates False.
+    """
     node = requirement_evaluation._parse_marker('sys_platform ~= "linux"')
     assert node is not None
     value, diags = requirement_evaluation._evaluate_marker(node, _PARITY_ENV_PAYLOAD)

@@ -24,12 +24,11 @@ def test_an_unsafe_filesystem_path_is_both_a_pyinc_error_and_an_os_error() -> No
     assert issubclass(UnsafeFilesystemPathError, PyIncError)
     assert issubclass(UnsafeFilesystemPathError, OSError)
     # The OSError constructor still applies, so a refusal raised from a
-    # failed system call keeps the code and the path it names.
+    # failed system call keeps its error code and path.
     error = UnsafeFilesystemPathError(errno.EACCES, os.strerror(errno.EACCES), "/x")
     assert error.errno == errno.EACCES
     assert error.filename == "/x"
-    # And a plain message still constructs, which is how the library
-    # raises it today.
+    # A plain message also constructs. The library raises it this way today.
     assert str(UnsafeFilesystemPathError("Path is not a regular file: /x")).endswith("/x")
 
 

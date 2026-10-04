@@ -59,7 +59,7 @@ jobs:
 
       - name: Run the free-threaded build with the GIL off
         if: endsWith(matrix.python-version, 't')
-        # As in ci.yml: only the free-threaded cells, since a default build
+        # As in ci.yml: free-threaded cells only, because a default build
         # refuses PYTHON_GIL=0 at startup.
         shell: bash
         run: echo "PYTHON_GIL=0" >> "$GITHUB_ENV"

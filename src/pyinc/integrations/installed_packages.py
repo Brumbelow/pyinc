@@ -199,7 +199,7 @@ def _get_stdlib_modules() -> tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: Payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -249,7 +249,6 @@ def _package_metadata_payload(
     summary = _parse_metadata_field(text, "Summary") or ""
     requires_dist = _parse_metadata_fields(text, "Requires-Dist")
 
-    # Determine top-level import names
     top_level_raw = _top_level_text(db, top_level_file)
     if top_level_raw.strip():
         top_level_names = tuple(
@@ -263,7 +262,7 @@ def _package_metadata_payload(
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition
+# Layer 2: Composition
 # ---------------------------------------------------------------------------
 
 
@@ -320,7 +319,7 @@ def installed_distributions_index(db: Database) -> InstalledDistributionsIndexPa
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: Entrypoints
 # ---------------------------------------------------------------------------
 
 
@@ -369,7 +368,6 @@ def resolve_import_name(db: Database, import_name: str) -> ImportNameResolution:
             distribution_version=None,
         )
 
-    # Check installed packages
     for pkg in packages_raw:
         dist_name, version, top_level_names, _, _ = pkg
         if top_level in top_level_names:

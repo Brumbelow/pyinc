@@ -17,14 +17,14 @@ Existing API, escape hatches, or workarounds you have already used.
 
 **Which layer does this belong to?**
 
-The kernel stays domain-agnostic; consumer concerns live in `pyinc_tools` and
+The kernel stays domain-agnostic. Consumer concerns live in `pyinc_tools` and
 `pyinc_codegen`. See
 [the package map](https://github.com/Brumbelow/pyinc/blob/main/docs/README.md#packages).
 
-- [ ] `pyinc` kernel — this would widen the kernel contract
-- [ ] `pyinc.integrations` — a new or extended integration
-- [ ] `pyinc_tools` — CLI, LSP, or watcher
-- [ ] `pyinc_codegen` — JSON Schema to Python
+- [ ] `pyinc` kernel (widens the kernel contract)
+- [ ] `pyinc.integrations`: a new or extended integration
+- [ ] `pyinc_tools`: CLI, LSP, or watcher
+- [ ] `pyinc_codegen`: JSON Schema to Python
 - [ ] Not sure
 
 If this widens the kernel contract, what is the trade-off you would accept?

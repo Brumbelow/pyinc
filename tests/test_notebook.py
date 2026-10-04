@@ -64,7 +64,7 @@ def test_package_namespace_exports_notebook_stable_api() -> None:
     assert hasattr(integrations, "notebook_analysis")
     assert hasattr(integrations, "workspace_notebook_analysis")
     assert hasattr(integrations, "NotebookAnalysis")
-    # Experimental helpers must not leak.
+    # Experimental helpers stay out of the public namespace.
     assert not hasattr(integrations, "notebook_text")
     assert not hasattr(integrations, "notebook_cells_payload")
     assert not hasattr(integrations, "notebook_analysis_payload")
@@ -245,7 +245,7 @@ def test_notebook_definition_range_survives_neutralization(tmp_path: Path) -> No
     definition = cell.definitions[0]
     import_range = cell.imports[0].range
 
-    # The placeholder is exactly as wide as the magic it replaced, so every
+    # The placeholder has the same width as the magic it replaced, so every
     # reported range still names its notebook line and column.
     assert (definition.range.start.line, definition.range.start.character) == (3, 4)
     assert (definition.range.end.line, definition.range.end.character) == (3, 8)
@@ -342,9 +342,9 @@ def test_notebook_magic_shaped_lines_inside_strings_and_brackets_are_kept(tmp_pa
 
     result = notebook_analysis(Database(), str(path))
 
-    # Rewriting the string's closing line would leave it unterminated, and
-    # rewriting either continuation line would leave a bracket open; both would
-    # surface here as a diagnostic.
+    # Rewriting the string's closing line would leave it unterminated.
+    # Rewriting either continuation line would leave a bracket open. Both would
+    # show up here as a diagnostic.
     assert result.diagnostics == ()
     assert tuple((d.name, d.range.start.line) for d in result.cells[0].definitions) == (
         ("report", 9),
@@ -528,7 +528,7 @@ def test_whitespace_only_envelope_edit_backdates_notebook(tmp_path: Path) -> Non
     first = notebook_analysis(db, str(path))
     first_changed = db.inspect(notebook_analysis_payload, str(path)).changed_at
 
-    # Reformat with indent — semantically identical envelope.
+    # Reindent the JSON. The notebook is semantically identical.
     path.write_text(json.dumps(nb, indent=2), encoding="utf-8")
     second = notebook_analysis(db, str(path))
     second_changed = db.inspect(notebook_analysis_payload, str(path)).changed_at
@@ -583,8 +583,8 @@ def test_workspace_notebook_analysis_empty_directory(tmp_path: Path) -> None:
 def test_workspace_notebook_analysis_nonexistent_directory(tmp_path: Path) -> None:
     db = Database()
     missing = tmp_path / "no-such-dir"
-    # DirectoryResource raises NotADirectoryError on missing paths in some
-    # underlying backends; the integration coerces this to an empty tuple.
+    # Some backends make DirectoryResource raise NotADirectoryError for a
+    # missing path. The integration turns that into an empty tuple.
     result = workspace_notebook_analysis(db, str(missing))
     assert result == ()
 
@@ -642,9 +642,9 @@ def test_notebook_analysis_matches_fresh_recomputation_over_changes(
         assert notebook_analysis(incremental, str(path)) == notebook_analysis(fresh, str(path))
 
 
-# The pool above is well-formed throughout, which is why it never caught the
-# reshape below: these two documents are deliberately malformed, so the
-# `_notebook` envelope is the wrong shape for them and they are written raw.
+# The pool above holds only well-formed documents, so it missed the reshape
+# below. These two documents are malformed on purpose. They are written raw
+# because the `_notebook` helper builds a different shape.
 _ARITY_A = '{"cells": [1, 2]}'
 _ARITY_B = '{"cells": [{"cell_type": "invalid-cell", "source": "invalid-cell"}]}'
 
@@ -658,11 +658,11 @@ _ARITY_B = '{"cells": [{"cell_type": "invalid-cell", "source": "invalid-cell"}]}
 def test_notebook_edit_matches_a_fresh_read(
     tmp_path: Path, mode: str, before: str, after: str
 ) -> None:
-    # These two documents project to the same flat tuple of strings: a cell
-    # that is not an object contributes one element and a cell that is
-    # contributes two, so a one-cell notebook and a two-cell one can line up.
-    # A read that compared by that projection answered the second document
-    # with the first document's analysis.
+    # These two documents project to the same flat tuple of strings. A
+    # non-object cell contributes one element and an object cell contributes
+    # two, so a one-cell notebook and a two-cell one can line up. A read that
+    # compared by that projection answered the second document with the first
+    # document's analysis.
     path = tmp_path / "sample.ipynb"
     path.write_text(before, encoding="utf-8")
     incremental = Database(mode=mode)
@@ -673,21 +673,20 @@ def test_notebook_edit_matches_a_fresh_read(
     scratch = Database(mode=mode)
     fresh = notebook_analysis(scratch, str(path))
 
-    # One line, counts first. A parametrized node id this long fills the whole
-    # summary line on its own, so under the default `--tb=no` no message
-    # survives at all; read a failure here with `-o addopts="" --tb=long`. The
-    # message is laid out for that read: the numbers that identify the failure
-    # first, the documents last.
+    # One line, counts first. A parametrized node id this long fills the
+    # summary line by itself, so the default `--tb=no` drops the message. Read
+    # a failure here with `-o addopts="" --tb=long`. The message puts the
+    # numbers that identify the failure first and the documents last.
     assert warm == fresh, (
         f"cells {len(warm.cells)}!={len(fresh.cells)} | "
         f"diags {len(warm.diagnostics)}!={len(fresh.diagnostics)} | "
         f"{before} -> {after}"
     )
 
-    # Secondary diagnostics: which parsed projection moved. Metadata is left
-    # out on purpose -- it reads only the kernelspec and the language info,
-    # which both documents share, so a metadata comparison passes here whether
-    # or not the analysis diverged.
+    # Secondary checks show which parsed projection moved. Metadata is left
+    # out on purpose. It reads only the kernelspec and the language info, which
+    # both documents share, so a metadata comparison would pass here either
+    # way.
     warm_cells = notebook_cells_payload(incremental, str(path))
     scratch_cells = notebook_cells_payload(scratch, str(path))
     assert warm_cells == scratch_cells, (
@@ -703,11 +702,10 @@ def test_notebook_edit_matches_a_fresh_read(
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_notebook_edit_survives_a_checkpoint(tmp_path: Path, mode: str) -> None:
-    # The edit has to happen before the save. Saving first and editing after
-    # does not reproduce: on reload the resource probe mismatches, the read
-    # executes on the new bytes, and there is no earlier comparison left to
-    # answer from -- the test would then be green whether or not the bug is
-    # present.
+    # The edit has to happen before the save. Saving first hides the bug. On
+    # reload the resource probe mismatches, the read executes on the new bytes,
+    # and no earlier comparison is left to answer from. The test would then
+    # pass with or without the bug.
     path = tmp_path / "sample.ipynb"
     path.write_text(_ARITY_A, encoding="utf-8")
 
@@ -722,11 +720,11 @@ def test_notebook_edit_survives_a_checkpoint(tmp_path: Path, mode: str) -> None:
     reloaded = Database(mode=mode, store=store)
     reloaded.load_checkpoint(key)
 
-    # Compare values, never a recompute marker: a reloaded record reports
-    # `executed` or `reused` either way, so the marker cannot tell a restored
-    # analysis from a stale one. Ask the entrypoint rather than a payload
-    # leaf, too -- checkpoint warming is parent-driven, and a leaf asked on
-    # its own cold-executes even when its record is in the manifest.
+    # Compare values. A reloaded record reports `executed` or `reused` either
+    # way, so a recompute marker cannot tell a restored analysis from a stale
+    # one. Ask the entrypoint, too. Checkpoint warming is parent-driven, so a
+    # payload leaf asked directly cold-executes even when its record is in the
+    # manifest.
     warm = notebook_analysis(reloaded, str(path))
     fresh = notebook_analysis(Database(mode=mode), str(path))
 
@@ -741,14 +739,13 @@ def test_notebook_edit_survives_a_checkpoint(tmp_path: Path, mode: str) -> None:
 # Shapes a flat projection could not tell apart
 # ---------------------------------------------------------------------------
 #
-# The diagnostics payload decides on `cells` three ways -- the field is absent,
-# it is present but is not a list, or it is walked cell by cell -- and the
-# documents below cover all three, together with the pair above whose cell
-# counts differ while their flattened text lines up. Each row drives the public
-# entrypoint over an explicit ordered pair, never a sampled one, and pins the
-# analysis the second document has to produce, so a change to a reported
-# diagnostic fails here as itself rather than somewhere downstream as a
-# mismatch against a corpus.
+# The diagnostics payload handles `cells` three ways: the field is absent, it
+# is present but is not a list, or it is walked cell by cell. The documents
+# below cover all three, plus the pair above whose cell counts differ while
+# their flattened text lines up. Each row drives the public entrypoint over an
+# explicit ordered pair and pins the analysis the second document must
+# produce. So a change to a reported diagnostic fails here under its own
+# name. A downstream corpus check would show it only as a mismatch.
 
 _NB_NO_CELLS_FIELD = '{"metadata": {}, "nbformat": 4}'
 _NB_EMPTY_CELLS = '{"cells": [], "metadata": {}, "nbformat": 4}'
@@ -756,9 +753,9 @@ _NB_CELLS_NOT_A_LIST = '{"cells": {}, "metadata": {}, "nbformat": 4}'
 
 _NotebookShape = tuple[str, tuple[NotebookCell, ...], tuple[NotebookDiagnostic, ...]]
 
-# One spelling for the comparand throughout: the entrypoint reports
-# `NotebookDiagnostic`, which compares unequal to any tuple, so the expectation
-# is written as the dataclass rather than as the payload's flat triple.
+# Expectations use the dataclass throughout. The entrypoint reports
+# `NotebookDiagnostic`, which compares unequal to any tuple, including the
+# payload's flat triple.
 _NOTEBOOK_SHAPES: dict[str, _NotebookShape] = {
     "missing": (
         _NB_NO_CELLS_FIELD,
@@ -820,8 +817,8 @@ _NOTEBOOK_SHAPES: dict[str, _NotebookShape] = {
 }
 
 # Both directions for every pair. A read that answers with an earlier analysis
-# answers with the *first* document's, so which document that is decides what a
-# wrong read reports and one direction alone leaves half the shape unpinned.
+# answers with the *first* document's. So the order decides what a wrong read
+# reports, and one direction alone pins only half the shape.
 _NOTEBOOK_SHAPE_PAIRS = (
     ("missing", "empty"),
     ("empty", "missing"),
@@ -833,10 +830,10 @@ _NOTEBOOK_SHAPE_PAIRS = (
     ("missing", "not-a-list"),
 )
 
-# Across a checkpoint, the missing/empty and object/non-object pairs: the two
-# whose members a projection reading `cells` with a default cannot tell apart.
-# A `cells` field that is not a list is distinguishable in the text itself, so
-# it is covered live above rather than across a save as well.
+# Across a checkpoint, test the missing/empty and object/non-object pairs.
+# Their members look the same to a projection that reads `cells` with a
+# default. A `cells` field that is not a list differs in the text itself, so
+# the live pairs above cover it.
 _NOTEBOOK_SHAPE_CHECKPOINT_PAIRS = (
     ("missing", "empty"),
     ("empty", "missing"),
@@ -866,10 +863,10 @@ def test_notebook_shape_pair_reads_the_same_warm_and_fresh(
     warm = notebook_analysis(incremental, str(path))
     fresh = notebook_analysis(Database(mode=mode), str(path))
 
-    # Pin the diagnostics, not only warm == fresh: two reads that agree on the
-    # wrong analysis agree just as loudly as two that are right. One line per
-    # message, discriminator first -- a node id this long fills the summary
-    # line on its own, so read a failure with `-o addopts="" --tb=long`.
+    # Pin the diagnostics as well as warm == fresh, because two reads can agree
+    # on the wrong analysis. One line per message, discriminator first. A node
+    # id this long fills the summary line by itself, so read a failure with
+    # `-o addopts="" --tb=long`.
     expected = _diagnostic_summary(expected_diagnostics)
     assert warm.diagnostics == expected_diagnostics, (
         f"warm diagnostics {_diagnostic_summary(warm.diagnostics)} != {expected}"
@@ -896,10 +893,10 @@ def test_notebook_shape_pair_reads_the_same_warm_and_fresh(
 def test_notebook_shape_pair_survives_a_checkpoint(
     tmp_path: Path, mode: str, before: str, after: str
 ) -> None:
-    # The edit has to happen before the save, and the entrypoint has to be
-    # driven again afterwards. Saving first and editing after does not
-    # reproduce: on reload the resource probe mismatches, the read executes on
-    # the new bytes, and there is no earlier comparison left to answer from.
+    # The edit has to happen before the save, and the entrypoint has to run
+    # again afterwards. Saving first hides the bug. On reload the resource probe
+    # mismatches, the read executes on the new bytes, and no earlier comparison
+    # is left to answer from.
     before_text, before_cells, before_diagnostics = _NOTEBOOK_SHAPES[before]
     after_text, expected_cells, expected_diagnostics = _NOTEBOOK_SHAPES[after]
 
@@ -936,8 +933,8 @@ def test_notebook_shape_pair_survives_a_checkpoint(
         f"diags {len(reloaded.diagnostics)}!={len(fresh.diagnostics)} | "
         f"saved after {before} -> {after}"
     )
-    # The two documents have to analyze differently at the entrypoint, or the
-    # assertions above would hold whatever the reload carried across.
+    # The two documents must analyze differently at the entrypoint. Otherwise
+    # the assertions above would hold whatever the reload carried across.
     assert (reloaded.cells, reloaded.diagnostics) != (before_cells, before_diagnostics), (
         f"reloaded matches the pre-edit analysis {_diagnostic_summary(before_diagnostics)}"
         f" | saved after {before} -> {after}"
@@ -984,11 +981,11 @@ def test_notebook_markdown_heading_strips_hashes(tmp_path: Path) -> None:
 # Lone surrogates
 # ---------------------------------------------------------------------------
 #
-# RFC 8259 permits `\uD800`-style escapes and `json.loads` decodes them, but a
-# lone surrogate is not a Unicode scalar value and so cannot cross a cached
+# RFC 8259 permits `\uD800`-style escapes and `json.loads` decodes them. A lone
+# surrogate is not a Unicode scalar value, so it cannot cross a cached
 # boundary. Cell sources and the kernel metadata reach the parsed payloads
-# verbatim, so whatever the integration reports for such a notebook, it has to
-# report it identically on a first read, after an edit, and from a database that
+# verbatim. Whatever the integration reports for such a notebook, it must
+# report the same on a first read, after an edit, and from a database that
 # never saw the file.
 
 
@@ -1021,7 +1018,7 @@ def test_lone_surrogate_notebooks_analyze_identically_warm_and_fresh(
     _write_notebook(path, _notebook([]))
     notebook_analysis(incremental, str(path))
     # Warm the database on a clean notebook first, so the surrogate arrives as
-    # an edit rather than as a first read.
+    # an edit.
     path.write_text(document, encoding="utf-8")
 
     assert notebook_analysis(incremental, str(path)) == first
@@ -1044,8 +1041,8 @@ def test_lone_surrogate_notebooks_are_reported_as_a_decode_error(
 
 
 def test_surrogate_outside_the_payload_leaves_a_notebook_analyzable(tmp_path: Path) -> None:
-    # Outputs and execution metadata never reach the payload, so a surrogate
-    # there is not the integration's problem and must not cost the notebook its
+    # Outputs and execution metadata stay out of the payload. A surrogate there
+    # is outside the integration's concern, and the notebook keeps its
     # analysis.
     path = tmp_path / "nb.ipynb"
     path.write_text(
@@ -1066,8 +1063,8 @@ def test_notebook_payload_queries_answer_malformed_documents(tmp_path: Path) -> 
     not_json = tmp_path / "not-json.ipynb"
     not_json.write_text("not json", encoding="utf-8")
     decode_diagnostics = notebook.notebook_diagnostics_payload(db, str(not_json))
-    # The decoder's own wording belongs to the interpreter, so only the code
-    # and the (absent) cell index are pinned here.
+    # The interpreter owns the decoder's wording, so pin only the code and the
+    # (absent) cell index.
     assert [(entry[0], entry[2]) for entry in decode_diagnostics] == [
         ("notebook-decode-error", None)
     ]
@@ -1102,24 +1099,24 @@ def test_notebook_metadata_payload_handles_malformed_shapes_and_metadata(
         path.write_text(text, encoding="utf-8")
         return notebook.notebook_metadata_payload(db, os.fspath(path))
 
-    # Undecodable text never becomes a document: `_try_parse_notebook` answers
-    # `None` and the payload returns before it looks at any metadata.
+    # Undecodable text yields no document. `_try_parse_notebook` answers `None`
+    # and the payload returns before it looks at any metadata.
     assert metadata_of("not_json", "not json") == (None, None)
 
-    # A `cells` field that is not a list still decodes to a document, so this
-    # one reaches the same answer by the other route: the metadata block runs
-    # and the empty `metadata` object yields neither a kernel nor a language.
+    # A `cells` field that is not a list still decodes to a document. This one
+    # reaches the same answer by the other route. The metadata block runs, and
+    # the empty `metadata` object yields no kernel and no language.
     assert metadata_of("cells_not_list", json.dumps({"cells": {}, "metadata": {}})) == (
         None,
         None,
     )
 
-    # A `metadata` field that is not an object short-circuits before either
-    # holder is consulted.
+    # A non-object `metadata` field short-circuits before either holder is
+    # consulted.
     invalid_metadata = json.dumps({"cells": [None], "metadata": "invalid"})
     assert metadata_of("invalid_metadata", invalid_metadata) == (None, None)
 
-    # A non-string `kernelspec.name` is ignored; `kernelspec.language` is taken.
+    # A non-string `kernelspec.name` is ignored. `kernelspec.language` is used.
     kernelspec_language = json.dumps(
         {
             "cells": [],
@@ -1140,7 +1137,7 @@ def test_notebook_metadata_payload_handles_malformed_shapes_and_metadata(
     )
     assert metadata_of("language_info", language_info) == (None, "python")
 
-    # Neither holder yields a string: `kernelspec` is not an object at all and
+    # Neither holder yields a string. `kernelspec` is a list and
     # `language_info.name` is a number.
     nonstring_language_info = json.dumps(
         {
@@ -1153,8 +1150,7 @@ def test_notebook_metadata_payload_handles_malformed_shapes_and_metadata(
     )
     assert metadata_of("nonstring_language_info", nonstring_language_info) == (None, None)
 
-    # A `language_info` that is present but not an object is passed over the
-    # same way an absent one is.
+    # A non-object `language_info` is treated like an absent one.
     invalid_language_info = json.dumps({"cells": [], "metadata": {"language_info": "invalid"}})
     assert metadata_of("invalid_language_info", invalid_language_info) == (None, None)
 

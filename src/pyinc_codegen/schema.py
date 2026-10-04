@@ -1,10 +1,11 @@
-"""Incremental JSON-Schema analysis and rendering queries.
+"""Incremental JSON Schema analysis and rendering queries.
 
-Only the deliberately small subset documented in ``docs/codegen-guide.md`` is
-compiled into types. Annotation- and validation-only keywords are accepted with
-a non-blocking ``ignored-constraint`` warning naming what the emitted type does
-not enforce; unsupported or malformed shapes produce error diagnostics, and the
-high-level generator refuses to reconcile outputs while any error is present.
+The compiler turns only the small subset documented in
+``docs/codegen-guide.md`` into types. Annotation- and validation-only keywords are accepted with a
+non-blocking ``ignored-constraint`` warning that names what the emitted type
+leaves unenforced. Unsupported or malformed shapes produce error diagnostics,
+and the high-level generator refuses to reconcile outputs while any error is
+present.
 """
 
 from __future__ import annotations
@@ -45,8 +46,8 @@ _IGNORED_BOOLEAN_KEYWORDS = frozenset(
 _IGNORED_ANNOTATION_KEYWORDS = frozenset(
     {"default", "deprecated", "examples", "readOnly", "writeOnly"}
 )
-# Annotation- and validation-only keywords: accepted everywhere a schema node is
-# accepted, validated for value shape, and reported as non-blocking
+# Annotation- and validation-only keywords. They are accepted wherever a schema
+# node is, checked for value shape, and reported as non-blocking
 # ``ignored-constraint`` warnings because the emitted type cannot enforce them.
 _IGNORED_KEYWORDS = (
     _IGNORED_NUMBER_KEYWORDS
@@ -81,12 +82,12 @@ _WINDOWS_RESERVED_MODULE_STEMS = frozenset(
         *(f"lpt{number}" for number in range(1, 10)),
     }
 )
-# The closed set of names every generated module binds: the fixed imports
-# ``_render_python`` emits plus the builtins ``_render_type`` spells in type
-# expressions. A model class with one of these names would shadow the binding
-# in every module that imports it under ``TYPE_CHECKING``, and a field with one
-# shadows it for the rest of its own class body, silently changing what the
-# other annotations mean. Keep this in sync with the emitter.
+# Every name a generated module binds: the fixed imports ``_render_python``
+# emits plus the builtins ``_render_type`` uses in type expressions. A model
+# class with one of these names would shadow the binding in every module that
+# imports it under ``TYPE_CHECKING``. A field with one shadows it for the rest
+# of its class body and silently changes what the other annotations mean.
+# Keep this in sync with the emitter.
 _EMITTER_BOUND_NAMES = frozenset(
     {
         # Fixed imports.
@@ -420,8 +421,8 @@ def _mapping_value_schema(spec: dict[str, object]) -> dict[str, object] | None:
         return None
     if set(spec) & _SHAPE_SELECTORS:
         return None
-    # Membership, not the value: a present ``"type": null`` is an invalid type,
-    # not an absent keyword, so it must not select the mapping rendering.
+    # Check the key's presence. A present ``"type": null`` is an invalid type,
+    # so only an absent ``type`` or an object type selects the mapping rendering.
     if "type" in spec and _effective_type(spec["type"]) != "object":
         return None
     return value
@@ -527,9 +528,9 @@ def _schema_node_diagnostics(
             diagnostics.append(_keyword_diagnostic(name, json_pointer, ambiguous=True))
         return tuple(diagnostics)
 
-    # Both keywords select a closed set of literal values and admit only a
-    # ``type`` beside them; whichever comes first wins, and the other reads as
-    # a competing shape.
+    # Both keywords select a closed set of literal values and allow only
+    # ``type`` beside them. ``enum`` is checked first, so when both are present
+    # ``const`` counts as a competing shape.
     for selector in ("enum", "const"):
         if selector not in structural:
             continue
@@ -581,7 +582,7 @@ def _render_combinator(
     definition_exists: Callable[[str], bool],
     json_pointer: str,
 ) -> tuple[str, tuple[str, ...], tuple[DiagnosticPayload, ...], bool]:
-    """Render the two supported combinator spellings, both of which name one type."""
+    """Render the two supported combinator spellings. Each names one type."""
 
     keyword_pointer = _pointer(json_pointer, keyword)
     if isinstance(branches, list) and keyword == "allOf" and len(branches) == 1:
@@ -610,9 +611,9 @@ def _render_combinator(
                 definition_exists,
                 _pointer(keyword_pointer, str(value_index)),
             )
-            # The null branch selects optionality rather than a type, so it never
-            # reaches ``_render_type``; its annotations are validated here so a
-            # malformed one is not the single place the check does not run.
+            # The null branch selects optionality and skips ``_render_type``, so
+            # its annotations are validated here. This keeps the annotation check
+            # running on every branch.
             null_diagnostics = _annotation_diagnostics(
                 branches[null_index],
                 _pointer(keyword_pointer, str(null_index)),
@@ -825,8 +826,8 @@ def _render_type(
 
     if type_field == "array":
         if "items" not in spec:
-            # ``prefixItems`` constrains the items positionally; it is reported
-            # where it appears, so the item type is not unconstrained here.
+            # ``prefixItems`` constrains the items by position and is reported
+            # where it appears, so the items count as constrained here.
             if "prefixItems" not in spec:
                 diagnostics.append(
                     _diagnostic(
@@ -883,9 +884,9 @@ def _render_type(
         return ("object", (), tuple(diagnostics), False)
 
     if "type" in spec:
-        # A present ``type`` whose value is JSON null reaches here as Python
-        # ``None``; presence, not the value, distinguishes it from an absent
-        # keyword, so it is diagnosed instead of taking the warning below.
+        # A present ``type`` whose value is JSON null arrives as Python
+        # ``None``. Its presence separates it from an absent keyword, so it
+        # gets an error here and skips the warning below.
         diagnostics.append(
             _diagnostic(
                 "invalid-type",
@@ -916,9 +917,9 @@ def _enum_type_matches(value: object, declared_type: object) -> bool:
     if declared_type is None:
         return True
     if isinstance(declared_type, list):
-        # The one union the compiler renders names a type plus null, so a member
-        # agrees with it when it matches that type or is the null it adds. Any
-        # other list names no single type to check a member against.
+        # The only union the compiler renders is one type plus null. A member
+        # matches it when it matches that type or is null. Any other list has
+        # no single type to check a member against.
         effective = _effective_type(declared_type)
         if not isinstance(effective, str):
             return False
@@ -1012,8 +1013,8 @@ def _build_enum(
             rendered_values.append(literal)
         rendered = tuple(rendered_values)
 
-    # The supported nullable union names the type the members are drawn from;
-    # the enum already carries the null, so the union adds no base type.
+    # The supported nullable union names the members' type. The enum already
+    # carries the null, so the union adds no base type.
     declared = effective_declared
     if declared is not None and (not isinstance(declared, str) or declared not in base_map):
         diagnostics.append(
@@ -1028,11 +1029,11 @@ def _build_enum(
 
 
 def _alias_names_itself(name: str, type_expr: str, refs: tuple[str, ...]) -> bool:
-    """Whether an alias resolves to its own name with nothing in between.
+    """Whether an alias resolves directly to its own name.
 
-    ``X: TypeAlias = 'X'`` — or ``'X | None'``, which the nullable spellings
-    render — denotes no type at all. Recursion that passes through a model or a
-    container (``list[X]``) names one and keeps compiling.
+    ``X: TypeAlias = 'X'``, or the ``'X | None'`` that the nullable spellings
+    render, denotes no type at all. Recursion through a model or a container
+    (``list[X]``) names a real type and compiles.
     """
 
     if name not in refs:
@@ -1106,19 +1107,19 @@ def _build_model(
     raw_description = fragment.get("description", "")
     description = raw_description if isinstance(raw_description, str) else ""
 
-    # A definition selects its shape in the same precedence ``_render_type``
-    # uses, so a shape-selecting keyword is never dropped by the type-driven
-    # object branch running first.
+    # A definition selects its shape with the same precedence ``_render_type``
+    # uses, so a shape-selecting keyword takes effect before the type-driven
+    # object branch can drop it.
     selector = next((name for name in _SHAPE_SELECTOR_ORDER if name in fragment), None)
     if selector == "enum":
         return _build_enum(name, fragment, description, json_pointer, diagnostics)
 
     if selector is None and (fragment.get("type") == "object" or "properties" in fragment):
         if "properties" not in fragment and _mapping_value_schema(fragment) is None:
-            # A dataclass with no fields cannot hold the instance data such a
-            # definition accepts, and a $ref to it would type that data away. A
-            # mapping value schema does constrain that data; it is rejected on
-            # its own keyword, so repeating it here would misname the cause.
+            # A dataclass with no fields cannot hold the data such a definition
+            # accepts, and a $ref to it would type that data away. A mapping
+            # value schema does constrain the data. That case is rejected on its
+            # own keyword, so a warning here would misname the cause.
             diagnostics += (
                 _diagnostic(
                     "unconstrained-object-model",
@@ -1198,9 +1199,9 @@ def _build_model(
                 continue
             if _shadows_emitter_binding(property_name):
                 # A field binds its name in the class body, so every later
-                # annotation there reads the field instead of the import or
-                # builtin it names. Rejected like the definition name that
-                # shadows the same binding at module scope.
+                # annotation there resolves to the field instead of the import
+                # or builtin. Rejected like a definition name that shadows the
+                # same binding at module scope.
                 diagnostics += (
                     _diagnostic(
                         "reserved-field-name",
@@ -1364,8 +1365,8 @@ def schema_text(db: Database, path: str) -> str:
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError as error:
-        # Keep malformed input representable by the kernel's value grammar while
-        # preserving a deterministic, actionable diagnostic for the public API.
+        # Encode malformed input as a value the kernel's grammar accepts, and
+        # keep a deterministic, actionable diagnostic for the public API.
         return f"{_INVALID_UTF8_PREFIX}{error}"
 
 
@@ -1399,8 +1400,8 @@ def document_diagnostics(db: Database, path: str) -> tuple[DiagnosticPayload, ..
         else:
             root_model_keys.append(root_key)
     if root_model_keys:
-        # One rule, stated once: the root carries metadata, models live in a
-        # definition section. Listing every root keyword separately said neither.
+        # One diagnostic states the rule: the root holds metadata, and models
+        # live in a definition section. One per root keyword would hide the rule.
         rendered = ", ".join(repr(root_key) for root_key in root_model_keys)
         diagnostics.append(
             _diagnostic(
@@ -1460,11 +1461,10 @@ def document_diagnostics(db: Database, path: str) -> tuple[DiagnosticPayload, ..
                 )
             )
 
-    # Canonical order, like every other diagnostic group here: sorting by name
-    # makes the emitted order a property of what the schema declares rather than
-    # of how its keys happen to be laid out. Document key order would move this
-    # tuple on a reorder that changes nothing a caller can see, and the analysis
-    # that reads it would be rebuilt for that.
+    # Sort by name, like every other diagnostic group here, so the order follows
+    # what the schema declares and survives a reorder of its keys. Document key
+    # order would change this tuple on a reorder that changes nothing callers
+    # can see, and the analysis that reads it would rebuild for nothing.
     for name in sorted(unique_names):
         location = locations_by_name[name][0]
         diagnostics.extend(_definition_name_diagnostics(name, location))
@@ -1549,9 +1549,10 @@ def definition_structure(db: Database, path: str, name: str) -> ModelPayload:
 def _pure_alias_target(payload: ModelPayload, names: frozenset[str]) -> str | None:
     """The single definition this alias renames, or None.
 
-    Only an alias whose whole expression is another definition's name (bare, or
-    with the rendered `| None` nullable spelling) forms an edge: recursion that
-    passes through a container or object field names a real type and compiles.
+    An alias forms an edge only when its whole expression is another
+    definition's name, bare or with the rendered `| None` nullable spelling.
+    Recursion through a container or object field names a real type and
+    compiles.
     """
     if payload[1] != "alias":
         return None
@@ -1570,8 +1571,8 @@ def alias_cycle_diagnostics(db: Database, path: str) -> tuple[DiagnosticPayload,
     """Error diagnostics for pure alias cycles that span definitions.
 
     Each member of such a cycle would render as a module whose alias imports
-    the next member, closing an import loop with no type in between; the
-    single-definition case is already caught as `self-referential-alias`.
+    the next member, closing an import loop with no type in between. The
+    single-definition case is reported as `self-referential-alias`.
     """
     names = frozenset(definition_names(db, path))
     edges: dict[str, str] = {}

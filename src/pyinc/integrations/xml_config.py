@@ -92,31 +92,30 @@ _DIRECTORIES = DirectoryResource()
 
 _NS_PAT = "}"
 
-# Element nesting is capped during parsing because every element re-emits the dot
-# path of all its ancestors: the cached element payload grows with the square of
-# the nesting depth, so this cap is what bounds the *cache*, not just the parse.
+# Element nesting is capped during parsing. Every element re-emits the dot path
+# of all its ancestors, so the cached element payload grows with the square of
+# the nesting depth. The cap bounds the *cache* as well as the parse.
 #
-# It is therefore set from an explicit amplification budget, not from the
-# interpreter's recursion limit — the walk keeps its own stack and needs under 20
-# frames at any depth, so the interpreter's ceiling is not the constraint here.
-# Budget: a document at the cap must not cache more than ~1 MiB of element paths.
+# The cap comes from an explicit amplification budget. The interpreter's
+# recursion limit plays no part, because the walk keeps its own stack and needs
+# under 20 frames at any depth.
+# Budget: a document at the cap caches at most ~1 MiB of element paths.
 # At 256 levels that holds for element names up to 20 characters (measured: 670 KB
 # of paths for a 20-character name, 192 KB for a 5-character one, 65 KB for a
-# 1-character one). The paths scale linearly in name length on top of the
-# quadratic depth term, so the budget is stated for that name length rather than
-# unconditionally.
+# 1-character one). Path size grows linearly with name length on top of the
+# quadratic depth term, so the budget holds only up to that name length.
 # 256 is still an order of magnitude deeper than any real configuration document.
 _MAX_XML_DEPTH = 256
 
-# A RecursionError raised anywhere under `_safe_parse` cannot be a property of the
-# document: `_MAX_XML_DEPTH` rejects runaway nesting as a ParseError before the
-# tree is built, and the element walk is iterative. It means only that the caller
-# entered with the interpreter's stack all but spent, because expat invokes
-# `_start_element` as a Python frame. CPython names whichever frame ran out
-# ("...while calling a Python object", "...while getting the str of an object"),
-# so the message describes the call site rather than the file. These payloads are
-# cached, so a fixed string is emitted instead and the payload stays a function of
-# the tracked inputs. `json_config` emits the same shape for the same reason.
+# A RecursionError raised anywhere under `_safe_parse` comes from the caller,
+# never the document. `_MAX_XML_DEPTH` rejects runaway nesting as a ParseError
+# before the tree is built, and the element walk is iterative. The error means
+# the caller entered with the interpreter's stack nearly spent, because expat
+# invokes `_start_element` as a Python frame. CPython's message names whichever
+# frame ran out ("...while calling a Python object", "...while getting the str
+# of an object"), so it describes the call site. These payloads are cached, so
+# the diagnostic is a fixed string and the payload stays a function of the
+# tracked inputs. `json_config` emits the same shape for the same reason.
 _STACK_EXHAUSTED_DIAGNOSTIC = "XML parsing exhausted the interpreter stack"
 
 
@@ -134,8 +133,8 @@ def _walk_elements(
 ) -> list[XmlElementPayload]:
     """Collect every element in document pre-order, deepest nesting included.
 
-    The traversal keeps its own stack rather than recursing, so the payload a
-    document produces depends only on the document — never on how much of the
+    The traversal keeps its own stack instead of recursing. The payload
+    therefore depends only on the document, whatever share of the
     interpreter's recursion budget the caller has already spent.
     """
     elements: list[XmlElementPayload] = []
@@ -164,13 +163,12 @@ def _walk_elements(
 def _safe_parse(text: str) -> ET.Element:
     """Parse XML with DOCTYPE, entity declarations, and runaway nesting rejected.
 
-    DTDs and entity declarations are blocked at parse time; this neutralises
+    DTDs and entity declarations are blocked at parse time. This neutralises
     billion-laughs expansion and external-DTD exfiltration regardless of the
     underlying expat version's default handling. Nesting past `_MAX_XML_DEPTH`
     is rejected at the element that crosses the cap, so the tree stops growing
-    there rather than being built in full and rejected afterwards.
-    Namespace-qualified tags are normalised to Clark notation
-    (`{uri}localname`) so the result is shaped identically to `ET.fromstring`.
+    at that element. Namespace-qualified tags are normalised to Clark notation
+    (`{uri}localname`), so the result has the same shape as `ET.fromstring`.
     Malformed input and rejected constructs both surface as `ET.ParseError`.
     """
     builder = ET.TreeBuilder()
@@ -216,7 +214,7 @@ def _try_parse_xml(text: str) -> ET.Element | None:
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: Payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -249,7 +247,7 @@ def xml_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPayload,
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition
+# Layer 2: Composition
 # ---------------------------------------------------------------------------
 
 
@@ -262,7 +260,7 @@ def xml_analysis_payload(db: Database, path: str) -> XmlAnalysisPayload:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: Entrypoints
 # ---------------------------------------------------------------------------
 
 

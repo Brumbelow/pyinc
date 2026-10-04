@@ -1,19 +1,19 @@
 """Store integrity for the durable checkpoint path.
 
 The checkpoint API (`Database.save_checkpoint` / `Database.load_checkpoint`)
-trusts an `ArtifactStore` to return, for a given content-address, exactly the
-bytes that were written under it. These tests simulate a store that breaks
-that contract (bit-flipped bytes, truncation, a foreign kernel version, a
-tampered manifest) and pin the kernel's response on both sides of the store.
+trusts an `ArtifactStore` to return, for a given content-address, the bytes
+that were written under it. These tests simulate a store that breaks that
+contract (bit-flipped bytes, truncation, a foreign kernel version, a tampered
+manifest) and pin the kernel's response on both sides of the store.
 
 Reading: snapshot-level corruption is silently skipped and the affected query
-re-executes; manifest-level corruption raises a loud `ValueError`.
+re-executes. Manifest-level corruption raises a loud `ValueError`.
 
-Writing: a digest whose stored bytes disagree with what is being persisted
-raises the store's collision error rather than being trusted because it is
-present, so a save never reports success against a store it could not warm
-from -- and a value re-executed after a skipped load raises on the way back
-in rather than recomputing around the corruption on every run.
+Writing: when a present digest's stored bytes disagree with what is being
+persisted, the store raises its collision error. A save therefore reports
+success only against a store it can warm from. A value re-executed after a
+skipped load also raises when it is written back, so the corruption surfaces
+as an error. Otherwise every run would recompute around it.
 """
 
 from __future__ import annotations
@@ -87,17 +87,17 @@ def test_bitflipped_snapshot_bytes_are_skipped_and_reexecuted() -> None:
     ck_key = db1.save_checkpoint()
 
     # Plant the serialization of a DIFFERENT valid value under the digest
-    # for 11. The bytes still decode cleanly -- only the content address
-    # is wrong.
+    # for 11. The bytes still decode cleanly. Only the content address is
+    # wrong.
     digest = fingerprint_snapshot(freeze(11))
     store._items[digest] = serialize_snapshot(freeze(99))
 
-    # The loader gets the store for reading only, never as its own write-back
-    # store: what this test pins is the load side -- verification refuses the
-    # planted bytes and the query re-executes. Persisting that recomputed value
-    # into a store still holding different bytes under the same digest raises
-    # the store's collision error, which is pinned separately. Passing the store
-    # to load_checkpoint keeps every snapshot read verifying against it.
+    # The loader reads from the store and never writes back to it. This test
+    # pins the load side: verification refuses the planted bytes and the query
+    # re-executes. Persisting the recomputed value into a store that holds other
+    # bytes under that digest raises the store's collision error, which is
+    # pinned separately. Passing the store to load_checkpoint makes every
+    # snapshot read verify against it.
     db2 = Database()
     db2.set(p, 0)
     db2.load_checkpoint(ck_key, store=store)
@@ -122,10 +122,10 @@ def test_truncated_snapshot_bytes_are_skipped() -> None:
     original = store._items[digest]
     store._items[digest] = original[:-1]
 
-    # Read-only loader, as above: truncated bytes must be refused at load and
-    # the query re-executed. The recomputed value is not written back, because
-    # publishing it over the truncated bytes is the store's collision error --
-    # a separate behaviour with its own test.
+    # Read-only loader, as above. Load refuses the truncated bytes and the
+    # query re-executes. The recomputed value stays out of the store, because
+    # publishing it over the truncated bytes raises the collision error, a
+    # separate behaviour with its own test.
     db2 = Database()
     db2.set(p, 0)
     db2.load_checkpoint(ck_key, store=store)
@@ -150,10 +150,9 @@ def test_wrong_kernel_prefix_snapshot_is_skipped() -> None:
     original = store._items[digest]
     store._items[digest] = b"K9;" + original[3:]
 
-    # Read-only loader, as above: the foreign kernel prefix must be refused at
-    # load and the query re-executed. No write-back store, so the re-executed
-    # value never meets the planted bytes at `put` -- that refusal is pinned by
-    # its own test rather than here.
+    # Read-only loader, as above. Load refuses the foreign kernel prefix and
+    # the query re-executes. With no write-back store, the re-executed value
+    # never meets the planted bytes at `put`. That refusal has its own test.
     db2 = Database()
     db2.set(p, 0)
     db2.load_checkpoint(ck_key, store=store)
@@ -185,8 +184,8 @@ def test_missing_snapshot_key_reexecutes() -> None:
 
 
 def test_reexecuted_value_refuses_to_overwrite_wrong_stored_bytes() -> None:
-    """The composed case the tests above hold apart, on one store that both
-    serves the load and takes the write-back."""
+    """The composed case the tests above keep apart: one store serves the load
+    and takes the write-back."""
     p = Input[int]("trust_writeback")
 
     @query
@@ -205,28 +204,28 @@ def test_reexecuted_value_refuses_to_overwrite_wrong_stored_bytes() -> None:
 
     db2 = Database(store=store)
     db2.set(p, 0)
-    # The load itself succeeds -- it is called outside the raises block so a
-    # refusal here would surface as an error rather than satisfy the test.
+    # The load itself succeeds. It runs outside the raises block, so a refusal
+    # here fails the test with an error.
     db2.load_checkpoint(ck_key)
 
-    # Naming the victim digest in the match is the execution witness: only a
-    # re-execution that produced 88 can attempt to publish under that address,
-    # so the test cannot pass unless the record was skipped at load, the query
-    # body ran, and the persist of its result was attempted. Were the persist
-    # ever exempted for load-skipped digests, nothing would raise and this
-    # fails. (`query_executions` cannot serve as the witness: the counter is
-    # incremented after the persist, so the raise arrives before it moves.)
+    # The victim digest in the match is the execution witness. Only a
+    # re-execution that produced 88 can publish under that address, so the test
+    # passes only if the record was skipped at load, the query body ran, and the
+    # persist of its result was attempted. If load-skipped digests were ever
+    # exempt from the persist, nothing would raise and this would fail.
+    # (`query_executions` cannot be the witness: it increments after the
+    # persist, so the raise comes first.)
     with pytest.raises(ValueError, match=f"Digest collision.*{digest}"):
         db2.get(trust_writeback_query)
 
-    # Refused, not overwritten.
+    # The refusal leaves the planted bytes in place.
     assert store._items[digest] == planted
 
 
 # ---------------------------------------------------------------------------
-# Save-side store trust: a digest that is already present but holds the wrong
-# bytes must make the save fail loudly. Reporting success here would hand back
-# a key naming a store the database provably cannot warm from.
+# Save-side store trust: a digest that is present but holds the wrong bytes
+# makes the save fail loudly. Success here would return a key for a store the
+# database provably cannot warm from.
 # ---------------------------------------------------------------------------
 
 
@@ -249,7 +248,7 @@ def test_save_checkpoint_raises_on_preseeded_wrong_bytes_in_memory() -> None:
     db = Database(store=clean)
     db.set(p, 0)
     assert db.get(preseed_mem_query) == 55
-    # A clean save teaches us the digest the record is content-addressed by.
+    # A clean save reveals the digest that content-addresses the record.
     victim = _single_record_snapshot_digest(clean, db.save_checkpoint())
 
     hostile = InMemoryArtifactStore()
@@ -258,7 +257,7 @@ def test_save_checkpoint_raises_on_preseeded_wrong_bytes_in_memory() -> None:
     with pytest.raises(ValueError, match="Digest collision"):
         db.save_checkpoint(store=hostile)
 
-    # The refusal never overwrites: the corrupt bytes are still exactly there.
+    # The refusal leaves the corrupt bytes in place.
     assert hostile.get(victim) == b"wrong bytes"
 
 
@@ -313,8 +312,8 @@ def test_clean_save_and_load_warm_matches_fresh_per_mode(mode: str) -> None:
     after = warm_db.statistics()
 
     assert warm == fresh
-    # Witnesses, so a vacuous pass is impossible: the warm request executed
-    # nothing and reused at least one record.
+    # Witnesses against a vacuous pass: the warm request executed nothing and
+    # reused at least one record.
     executions_during_warm = after.query_executions - before.query_executions
     assert executions_during_warm == 0
     assert after.query_reuses - before.query_reuses >= 1
@@ -341,8 +340,8 @@ def test_tampered_manifest_raises_value_error() -> None:
     assert db1.get(trust_tamper_query) == 55
     ck_key = db1.save_checkpoint()
 
-    # Trailing whitespace keeps the JSON parseable but changes the bytes,
-    # so the recomputed content address no longer matches the requested key.
+    # Trailing whitespace keeps the JSON parseable but changes the bytes, so
+    # the recomputed content address differs from the requested key.
     store._items[ck_key] = store._items[ck_key] + b" "
 
     db2 = Database(store=store)
@@ -365,7 +364,7 @@ def test_malformed_manifest_json_raises_value_error() -> None:
 
 
 def test_deeply_nested_manifest_json_raises_typed_checkpoint_error() -> None:
-    """A malformed manifest must never escape as a raw RecursionError."""
+    """A malformed manifest raises a typed error, never a raw RecursionError."""
     store = InMemoryArtifactStore()
     db = Database(store=store)
 
@@ -391,7 +390,7 @@ def test_unsupported_manifest_version_raises_value_error() -> None:
 
 
 def test_manifest_missing_required_field_raises_value_error() -> None:
-    """Structurally missing required fields must raise ValueError, not KeyError."""
+    """Structurally missing required fields raise ValueError, never KeyError."""
     store = InMemoryArtifactStore()
     db = Database(store=store)
 
@@ -459,10 +458,10 @@ def test_checkpoint_accepts_graph_query_call_snapshot() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Warm-path soundness: a record restored from a checkpoint must take part in
+# Warm-path soundness: a record restored from a checkpoint takes part in
 # normal invalidation. It carries real dependency edges, its revisions are
 # normalised onto the loading database's timeline, and its resources are
-# re-probed against live state -- so an incremental read after a load still
+# re-probed against live state. An incremental read after a load therefore
 # equals a fresh recomputation.
 # ---------------------------------------------------------------------------
 
@@ -487,9 +486,8 @@ def test_input_change_after_load_reexecutes() -> None:
     assert db2.get(warm_input_query) == 11
     assert db2.inspect(warm_input_query).last_recompute == "reused"
 
-    # Now change the input the query depends on. The warmed record must carry a
-    # real edge to that input, so the next get re-executes against the new value
-    # instead of serving the stale checkpointed result.
+    # Change the input the query depends on. The warmed record carries a real
+    # edge to that input, so the next get re-executes against the new value.
     db2.set(p, 20)
     assert db2.get(warm_input_query) == 21
     assert db2.inspect(warm_input_query).last_recompute == "executed"
@@ -514,8 +512,8 @@ def test_file_change_between_runs_reexecutes(tmp_path: Path) -> None:
 
     db2 = Database(store=store)
     db2.load_checkpoint(ck_key)
-    # No live resource record exists in the fresh database, so the warm is
-    # refused and the query re-executes, re-probing the (now changed) file.
+    # The fresh database has no live resource record, so the warm is refused.
+    # The query re-executes and re-probes the changed file.
     assert db2.get(warm_file_query) == "value:omega"
     assert db2.inspect(warm_file_query).last_recompute == "executed"
 
@@ -541,9 +539,9 @@ def test_second_request_after_load_still_reuses() -> None:
     assert db2.inspect(warm_stable_query).last_decision == "reused"
     reuses_after_first = db2.statistics().query_reuses
 
-    # A second request against unchanged state must still reuse. Normalising the
-    # warmed record's revisions onto this database's timeline must not leave it
-    # looking perpetually dirty (which would thrash into a re-execute).
+    # A second request against unchanged state still reuses. Normalising the
+    # warmed record's revisions onto this database's timeline must leave it
+    # clean, or every request would thrash into a re-execute.
     assert db2.get(warm_stable_query) == 15
     assert db2.inspect(warm_stable_query).last_decision == "reused"
     assert db2.statistics().query_reuses > reuses_after_first
@@ -640,8 +638,8 @@ def test_transitive_dep_change_invalidates_warmed_parent_without_live_child() ->
     assert db2.get(warm_parent) == 50
     assert db2.inspect(warm_parent).last_recompute == "reused"
 
-    # Change the child's input. The parent has no live child to walk into, so it
-    # must transitively re-verify the warmed child record and re-execute.
+    # Change the child's input. With no live child to walk into, the parent
+    # re-verifies the warmed child record transitively and re-executes.
     db2.set(p, 9)
     assert db2.get(warm_parent) == 100
     assert db2.inspect(warm_parent).last_recompute == "executed"
@@ -666,8 +664,8 @@ def test_untracked_records_are_never_warmed(mode: str) -> None:
     db2 = Database(store=store, mode=mode)
     db2.set(p, 7)
     db2.load_checkpoint(ck_key)
-    # An untracked record is impure by definition; it must never be served from
-    # a checkpoint. The warm is refused and the query re-executes.
+    # An untracked record is impure by definition, so a checkpoint never serves
+    # it. The warm is refused and the query re-executes.
     assert db2.get(warm_untracked_query) == 8
     assert db2.inspect(warm_untracked_query).last_recompute == "executed"
 
@@ -675,17 +673,17 @@ def test_untracked_records_are_never_warmed(mode: str) -> None:
 # ---------------------------------------------------------------------------
 # Deterministic, code-complete identities (D1/D2/D3/D7).
 #
-# A checkpoint identity must be complete over the code it depends on and
-# reproducible in a fresh process. If a captured dependency query's body
-# changes, the parent's identity must move (transitive code pinning). Identities
-# must not embed per-process addresses, must react to build flags, and manifests
-# must be versioned strictly.
+# A checkpoint identity covers all the code it depends on and is reproducible
+# in a fresh process. When a captured dependency query's body changes, the
+# parent's identity moves (transitive code pinning). Identities hold no
+# per-process addresses and react to build flags. Manifests are versioned
+# strictly.
 # ---------------------------------------------------------------------------
 
 
 def _make_dep_child(value: int) -> Query[..., int]:
-    # A query factory: every child shares a query_id (same qualname/module) but
-    # carries a different captured body, standing in for a code change to a
+    # A query factory. Every child shares a query_id (same qualname and module)
+    # but captures a different body. This stands in for a code change to a
     # dependency query that keeps its name across runs.
     @query
     def dep_child(db: Database) -> int:
@@ -723,9 +721,9 @@ def test_dep_query_code_change_between_runs_reexecutes() -> None:
 
     db2 = Database(store=store)
     db2.load_checkpoint(ck_key)
-    # The child's code is pinned into the parent's identity, so the parent no
-    # longer matches the checkpointed record and re-executes against the new
-    # child body instead of serving the stale value.
+    # The child's code is pinned into the parent's identity, so the parent's
+    # identity moves away from the checkpointed record. The parent re-executes
+    # against the new child body.
     assert db2.get(parent_v2) == 3
     assert db2.inspect(parent_v2).last_recompute == "executed"
 
@@ -738,8 +736,8 @@ def test_query_identity_pins_captured_query_code() -> None:
     identity_a = db._query_key(parent_a, (), {})[0].identity
     identity_b = db._query_key(parent_b, (), {})[0].identity
 
-    # Same parent source, same captured-child query_id, different child body:
-    # the identities must diverge because the child's code is folded in.
+    # Same parent source, same captured-child query_id, different child body.
+    # The identities diverge because the child's code is folded in.
     assert identity_a != identity_b
 
 
@@ -826,8 +824,8 @@ def test_optimize_flag_changes_identity(tmp_path: Path) -> None:
     ).stdout
 
     assert normal.strip() != ""
-    # -O changes captured-module behaviour invisibly to source digests, so the
-    # build configuration is part of the identity.
+    # -O changes captured-module behaviour without changing source digests, so
+    # the build configuration is part of the identity.
     assert normal != optimized
 
 
@@ -865,8 +863,8 @@ def test_runtime_imported_dep_query_refuses_warm_and_recomputes(
         sys.modules.pop(mod_name, None)
 
     sys.path.insert(0, str(tmp_path))
-    # Never cache bytecode: two same-second source rewrites can otherwise share a
-    # .pyc and reimport the stale body, masking whether the warm gate fired.
+    # Disable bytecode caching. Two rewrites in the same second can share a .pyc
+    # and reimport the stale body, which would hide whether the warm gate fired.
     saved_dont_write_bytecode = sys.dont_write_bytecode
     sys.dont_write_bytecode = True
     try:
@@ -875,8 +873,8 @@ def test_runtime_imported_dep_query_refuses_warm_and_recomputes(
 
         @query
         def runtime_import_parent(db: Database) -> int:
-            # The child is obtained by a runtime import inside the body, so it is
-            # never captured and cannot be code-pinned.
+            # The body imports the child at runtime, so the child is never
+            # captured and cannot be code-pinned.
             module = importlib.import_module(mod_name)
             child_value: int = module.imported_child(db)
             return child_value + 1000
@@ -892,7 +890,7 @@ def test_runtime_imported_dep_query_refuses_warm_and_recomputes(
 
         db2 = Database(store=store)
         db2.load_checkpoint(ck_key)
-        # The dep query is not in the parent's pinned capture set, so the warm
+        # The dep query is outside the parent's pinned capture set, so the warm
         # is refused and the parent re-executes against the changed module.
         assert db2.get(runtime_import_parent) == 1002
         assert db2.inspect(runtime_import_parent).last_recompute == "executed"
@@ -921,13 +919,12 @@ def test_v2_manifest_rejected_loudly() -> None:
 
 
 def test_v4_manifest_rejected_loudly() -> None:
-    """A 3.0.0 manifest records dependency sets this kernel no longer means.
+    """A 3.0.0 manifest records dependency sets whose meaning has since changed.
 
     3.0.0 recorded no dependencies for a reader whose resource read raised a
-    caught exception, so warming such a record here would report "dependencies
-    unchanged" for a node a fresh database re-derives. The record layout is
-    unchanged, which is exactly why the manifest version has to carry the
-    difference.
+    caught exception. Warming such a record here would report "dependencies
+    unchanged" for a node a fresh database re-derives. The record layout is the
+    same, so the manifest version has to carry the difference.
     """
     store = InMemoryArtifactStore()
     db = Database(store=store)
@@ -948,11 +945,11 @@ def test_v4_manifest_rejected_loudly() -> None:
 def test_v5_manifest_rejected_loudly() -> None:
     """A 3.1.x manifest can carry records this kernel would trust unsoundly.
 
-    Version-5 records may have been written by a kernel that derived captured-
-    module identity from a stat tuple a same-size rewrite can preserve, and
-    that dropped the resource edge for a stat probe raising NotADirectoryError.
-    Both leave records a warm database would reuse while a fresh one
-    re-derives, so the manifest version has to carry the difference.
+    The kernel that wrote version-5 records may have had two flaws. It derived
+    captured-module identity from a stat tuple that a same-size rewrite can
+    preserve. It dropped the resource edge for a stat probe raising
+    NotADirectoryError. Both leave records a warm database would reuse while a
+    fresh one re-derives, so the manifest version has to carry the difference.
     """
     store = InMemoryArtifactStore()
     db = Database(store=store)
@@ -975,8 +972,8 @@ def test_v6_manifest_rejected_loudly() -> None:
 
     The value a query computes and persists depends on the database mode, so a
     record carries a value only a database in the saving mode would produce.
-    Version 6 records no mode, so such a record cannot be attributed to one at
-    all, and the manifest version has to carry the difference.
+    Version 6 records no mode, so its records cannot be attributed to any mode,
+    and the manifest version has to carry the difference.
     """
     store = InMemoryArtifactStore()
     db = Database(store=store)
@@ -997,11 +994,11 @@ def test_v6_manifest_rejected_loudly() -> None:
 def test_v7_manifest_rejected_loudly() -> None:
     """A version-7 record predates the kernel's built-in file-stat adapter.
 
-    Such a record froze a stat reading field by field into a plain record, where
-    this kernel freezes it through an adapter. Nothing in the record says so --
-    the adapter gate reads the keys a record used, and a record written before
-    the adapter exists names none -- so a database holding the built-in would
-    warm that encoding without re-freezing it and hand back a shape no fresh
+    Such a record froze a stat reading field by field into a plain record. This
+    kernel freezes it through an adapter. The record gives no sign of the
+    difference: the adapter gate reads the keys a record used, and a record
+    written before the adapter names none. A database holding the built-in
+    would warm that encoding without re-freezing it and return a shape no fresh
     execution produces. The manifest version has to carry the difference.
     """
     store = InMemoryArtifactStore()
@@ -1022,17 +1019,17 @@ def test_v7_manifest_rejected_loudly() -> None:
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
 def test_pre_adapter_checkpoints_are_refused_not_warmed(mode: str, tmp_path: Path) -> None:
-    """A manifest from before the built-in adapter is refused, not reused.
+    """A manifest from before the built-in adapter is refused.
 
-    The manifest is built the way the kernel that predates the adapter built it:
-    schema version 7, and an `adapters` map that does not name the file-stat
-    key, because that kernel had no such adapter to name. Its records are this
-    kernel's own, which is the point -- the record layout never moved, so
-    nothing below the version field could tell the two apart, and the load would
-    otherwise warm a stat reading whose encoding this kernel no longer produces.
+    The manifest is built the way the pre-adapter kernel built it: schema
+    version 7, with an `adapters` map that omits the file-stat key, because
+    that kernel had no such adapter. Its records are this kernel's own. The
+    record layout never moved, so only the version field tells the two apart.
+    Without that check, the load would warm a stat reading in an encoding this
+    kernel has stopped producing.
 
-    The refusal has to be complete: the loader raises, stages nothing, and the
-    request that follows executes for itself.
+    The refusal is complete: the loader raises, stages nothing, and the next
+    request executes for itself.
     """
     target = tmp_path / "watched.txt"
     target.write_text("hello", encoding="utf-8")
@@ -1062,23 +1059,22 @@ def test_pre_adapter_checkpoints_are_refused_not_warmed(mode: str, tmp_path: Pat
     before = loader.statistics()
     assert loader.get(watched_size) == 5
     after = loader.statistics()
-    # The witness that the refusal cost a real execution rather than falling
-    # through to a warm the raise was supposed to have prevented.
+    # Witness that the request after the refusal ran a real execution, with no
+    # warm slipping past the raise.
     assert after.query_executions - before.query_executions == 1
     assert after.query_reuses - before.query_reuses == 0
 
 
 def test_a_manifest_hiding_a_records_adapter_keys_is_refused(tmp_path: Path) -> None:
-    """A record may not name an adapter key its own manifest leaves undeclared.
+    """A record may name only adapter keys its own manifest declares.
 
-    This is what keeps the warm gate's cheap path honest. That path trusts every
-    key handed to it when no checkpoint digests are loaded and the registry
-    holds only the kernel's own fixed adapters, on the ground that such a key
-    can only have come from a record this process froze. A manifest declaring an
-    empty `adapters` map while its records still name a key would break that
-    ground, so the manifest validator refuses the shape before any record is
-    staged -- and the save path cannot write it, since it writes the map from
-    the whole registry.
+    This keeps the warm gate's cheap path sound. That path trusts every key it
+    is given when no checkpoint digests are loaded and the registry holds only
+    the kernel's fixed adapters, because such a key can only come from a record
+    this process froze. A manifest with an empty `adapters` map whose records
+    still name a key would break that reasoning. The manifest validator refuses
+    that shape before any record is staged. The save path cannot write it,
+    because it writes the map from the whole registry.
     """
     target = tmp_path / "watched.txt"
     target.write_text("hello", encoding="utf-8")
@@ -1111,11 +1107,11 @@ def test_a_manifest_hiding_a_records_adapter_keys_is_refused(tmp_path: Path) -> 
 def test_file_stat_records_round_trip_through_a_checkpoint_per_mode(
     mode: str, tmp_path: Path
 ) -> None:
-    """The adapted stat reading warms, and warms to what a fresh run computes.
+    """The adapted stat reading warms to what a fresh run computes.
 
-    The guard on the sibling refusal above: a checkpoint this kernel writes must
-    still warm in a database of the same mode, through the adapter, with the
-    reading itself in the dependency graph rather than only in the returned
+    This guards the sibling refusal above. A checkpoint this kernel writes
+    still warms in a database of the same mode, through the adapter. The
+    reading itself sits in the dependency graph as well as in the returned
     value.
     """
     target = tmp_path / "watched.txt"
@@ -1147,13 +1143,13 @@ def test_file_stat_records_round_trip_through_a_checkpoint_per_mode(
     executions_during_warm = after.query_executions - before.query_executions
     assert executions_during_warm == 0
     assert after.query_reuses - before.query_reuses >= 1
-    # The reading survives the round trip as the declared type on the warm side
-    # too, not only inside the query that computed the tuple above.
+    # The reading keeps its declared type on the warm side, as well as inside
+    # the query that computed the tuple above.
     assert type(warm_db.get(observed)) is FileStatSnapshot
 
 
 def test_saved_manifest_records_the_database_mode() -> None:
-    """The save side writes the mode the load side refuses to disagree with."""
+    """The save side records the mode that the load side must match."""
 
     @query(key="manifest-records-mode")
     def moded(db: Database) -> int:
@@ -1179,19 +1175,18 @@ def test_saved_manifest_records_the_database_mode() -> None:
 # Cross-mode loads: a checkpoint warms only a database running the mode that
 # saved it.
 #
-# The value a query computes can depend on the mode that computed it, so a
-# persisted record is attributable to one mode and warms no other. The refusal
-# keys on the mode mismatch itself rather than on whether a particular pair of
-# modes is observed to disagree: all six ordered cross-mode pairs are refused,
-# including the pairs whose answers coincide today. Anything narrower would
-# encode today's coincidence and rot the moment it stops holding.
+# The value a query computes can depend on its mode, so a persisted record
+# belongs to one mode and warms no other. The refusal keys on the mode mismatch
+# itself. All six ordered cross-mode pairs are refused, including pairs whose
+# answers coincide today. A narrower rule would encode today's coincidence and
+# break as soon as it stops holding.
 #
-# Constructing the cases takes care. The saving mode is part of the manifest
-# bytes, so the checkpoint key differs per mode; a key re-derived under a second
-# mode is absent from the store, so the load raises a plain `KeyError` and never
-# reaches the refusal. These tests hand the loading database the exact key the
-# saving database returned, which is what a caller who carries a key between
-# runs does and the only way to put the refusal under test.
+# The saving mode is part of the manifest bytes, so the checkpoint key differs
+# per mode. A key re-derived under a second mode is absent from the store, so
+# that load raises a plain `KeyError` before it reaches the refusal. These
+# tests hand the loading database the key the saving database returned. A
+# caller who carries a key between runs does the same, and it is the only way
+# to test the refusal.
 # ---------------------------------------------------------------------------
 
 _MODES = ("strict", "checked", "fast")
@@ -1205,26 +1200,25 @@ _CROSS_MODE_PAIRS = [
 def _observed_argument_shape(db: Database, xs: object) -> str:
     """Report the type of the object the database hands this query.
 
-    Type-sensitive and argument-taking on purpose. Most queries answer the same
-    thing in every mode, and one of those could not tell a warm from the wrong
-    mode apart from a correct one -- it would pass whether or not the refusal
-    existed. This one persists a different string on either side of the strict
-    boundary, so a cross-mode warm is visible in the value itself.
+    It takes an argument and is type-sensitive on purpose. Most queries answer
+    the same in every mode, so a test built on one would pass with or without
+    the refusal. This one persists a different string on each side of the
+    strict boundary, so a cross-mode warm shows in the value itself.
     """
     return type(xs).__name__
 
 
 def _shape_argument() -> list[int]:
-    # A fresh list per call, so nothing is shared between databases.
+    # A fresh list per call, so each database gets its own.
     return [1, 2, 3]
 
 
 def test_argument_shape_query_answers_differently_per_mode() -> None:
-    """The witness query the cross-mode tests use can actually tell modes apart.
+    """The witness query the cross-mode tests use tells modes apart.
 
     Strict mode rebuilds every boundary value as a snapshot view before a query
-    sees it, while checked and fast thaw it back into a plain `list`. Pinning
-    that here is what makes the refusal tests below non-vacuous.
+    sees it. Checked and fast thaw it back into a plain `list`. Pinning that
+    here keeps the refusal tests below meaningful.
     """
     answers = {
         mode: Database(mode=mode).get(_observed_argument_shape, _shape_argument())
@@ -1241,37 +1235,37 @@ def test_cross_mode_checkpoint_load_refuses_loudly(save_mode: str, load_mode: st
     checkpoint = saver.save_checkpoint()
 
     loader = Database(mode=load_mode, store=store)
-    # Internal: the staging a load commits onto the database, which every later
-    # get consults. Held by identity so a rebind cannot hide behind equality.
+    # Internal: the staging a load commits onto the database, consulted by every
+    # later get. Compared by identity so an equal rebind still shows.
     staging_before = loader._checkpoint_query_records
     with pytest.raises(CheckpointModeError, match="refusing to load"):
         loader.load_checkpoint(checkpoint)
 
-    # The refusal lands before the commit, so the loader still holds the empty
-    # staging it was constructed with and never adopted the checkpoint's store.
+    # The refusal lands before the commit. The loader keeps the empty staging it
+    # was constructed with and never adopts the checkpoint's store.
     assert loader._checkpoint_query_records is staging_before
     assert loader._checkpoint_query_records == {}
     assert loader._checkpoint_load_store is None
 
-    # And the next request computes for itself instead of serving what the
-    # other mode persisted.
+    # The next request computes its own answer and ignores what the other mode
+    # persisted.
     fresh = Database(mode=load_mode).get(_observed_argument_shape, _shape_argument())
     executions_before = loader.statistics().query_executions
     answer = loader.get(_observed_argument_shape, _shape_argument())
     assert loader.statistics().query_executions - executions_before == 1
     assert answer == fresh
-    # It coincides with what the refused checkpoint holds only where the two
-    # modes agree anyway; for the four pairs that straddle the strict boundary
-    # this is an inequality with the string the saver persisted.
+    # It matches the refused checkpoint's value only where the two modes agree
+    # anyway. For the four pairs that straddle the strict boundary, it differs
+    # from the string the saver persisted.
     assert (answer == persisted) is (fresh == persisted)
 
 
 def test_cross_mode_refusal_is_catchable_as_the_checkpoint_family() -> None:
     """The refusal a real cross-mode load raises is catchable by family.
 
-    The class's own bases are pinned separately; what this pins is the object
-    `load_checkpoint` actually raises, which is what a caller writing
-    `except CheckpointError` or `except ValueError` around a load depends on.
+    The class's bases are pinned separately. This pins the object
+    `load_checkpoint` raises, which a caller writing `except CheckpointError`
+    or `except ValueError` around a load depends on.
     """
     store = InMemoryArtifactStore()
     saver = Database(mode="strict", store=store)
@@ -1281,8 +1275,8 @@ def test_cross_mode_refusal_is_catchable_as_the_checkpoint_family() -> None:
     loader = Database(mode="fast", store=store)
     with pytest.raises(CheckpointError, match="refusing to load"):
         loader.load_checkpoint(checkpoint)
-    # Nothing was staged by the first attempt, so the second sees the same
-    # database and refuses on the same terms.
+    # The first attempt staged nothing, so the second sees the same database
+    # and refuses on the same terms.
     with pytest.raises(ValueError, match="refusing to load"):
         loader.load_checkpoint(checkpoint)
     assert loader._checkpoint_query_records == {}
@@ -1304,8 +1298,8 @@ def test_same_mode_checkpoint_load_warms_and_matches_fresh(mode: str) -> None:
 
     fresh = Database(mode=mode).get(_observed_argument_shape, _shape_argument())
     assert warm == fresh == persisted
-    # Witnesses: the warm request executed nothing and reused a record, so the
-    # equality above cannot be satisfied by a load that warmed nothing.
+    # Witnesses: the warm request executed nothing and reused a record, so only
+    # a load that warmed a record satisfies the equality above.
     assert after.query_executions - before.query_executions == 0
     assert after.query_reuses - before.query_reuses >= 1
 
@@ -1332,10 +1326,10 @@ def test_captured_class_attribute_change_rekeys_the_saved_record(
 
     loaded = Database(store=store)
     loaded.load_checkpoint(checkpoint)
-    # A record is filed under the identity its database derived when it ran,
-    # so a saving database that answered from a fingerprint predating the
-    # change would write the earlier identity into the manifest and this load
-    # would miss it. Reuse is the witness that the saved identity is the one a
+    # A record is filed under the identity its database derived when it ran. A
+    # saving database that answered from a fingerprint predating the change
+    # would write the earlier identity into the manifest, and this load would
+    # miss it. Reuse is the witness that the saved identity matches what a
     # loading database derives from the same live class.
     assert loaded.get(scaled) == Database().get(scaled) == 3
     assert loaded.inspect(scaled).last_recompute == "reused"
@@ -1363,10 +1357,10 @@ def test_record_saved_after_a_captured_class_change_is_not_warmed_into_the_old_w
         assert saver.get(scaled) == 60
         checkpoint = saver.save_checkpoint()
 
-    # The class is back to what it was before that execution, and the record
-    # must not be reachable from here: only its identity records which capture
-    # produced it, and a database that never held the changed class must
-    # recompute rather than warm the value that class produced.
+    # The class is back to its value before that execution, so the record must
+    # be unreachable from here. Only its identity records which capture produced
+    # it. A database that never held the changed class must recompute, never
+    # warm the value that class produced.
     loaded = Database(store=store)
     loaded.set(limit, 20)
     loaded.load_checkpoint(checkpoint)
@@ -1381,12 +1375,12 @@ def test_record_saved_after_a_captured_class_change_is_not_warmed_into_the_old_w
 # re-establish a resource's live record from its checkpoint probe hint.
 #
 # Stage 2 kept warming sound but dropped resource-rooted reuse in a fresh
-# process (a resource dep with no live record was refused). These tests restore
-# high reuse without giving back soundness: an unchanged resource is verified by
-# a live probe (its snapshot restored from the store), and a query dep whose
-# subtree cannot be warmed from the checkpoint is verified by re-execution, its
-# call snapshot recovered from the store. Every degradation path lands on
-# re-execution (a correct value), never on an error or a stale value.
+# process: a resource dep with no live record was refused. These tests restore
+# high reuse and keep soundness. A live probe verifies an unchanged resource,
+# whose snapshot is restored from the store. Re-execution verifies a query dep
+# whose subtree the checkpoint cannot warm, with its call snapshot recovered
+# from the store. Every degradation path ends in re-execution and a correct
+# value, never an error or a stale value.
 # ---------------------------------------------------------------------------
 
 
@@ -1482,8 +1476,8 @@ def test_changed_file_reexecutes_only_affected_subtree(tmp_path: Path) -> None:
     db2 = Database(store=store)
     db2.load_checkpoint(ck_key)
     assert db2.get(combined) == 7  # 4 + 3
-    # Subtree A's changed probe fails verification and re-executes; subtree B is
-    # unchanged and reuses; the root re-executes because A moved.
+    # Subtree A's changed probe fails verification and A re-executes. Subtree B
+    # is unchanged and reuses. The root re-executes because A moved.
     assert db2.inspect(size_a).last_recompute == "executed"
     assert db2.inspect(size_b).last_recompute == "reused"
     assert db2.inspect(combined).last_recompute == "executed"
@@ -1539,9 +1533,10 @@ def test_resource_probe_hint_reuses_with_frozen_dataclass_probe(
     db2 = Database(store=store)
     db2.load_checkpoint(ck_key)
     assert db2.get(read_stamped) == "HELLO"
-    # The frozen-dataclass probe is unchanged, so the probe hint matches (this
-    # only holds once the hint compares frozen forms rather than a live probe
-    # against a thawed dict) and the resource record is restored from the store.
+    # The frozen-dataclass probe is unchanged, so the probe hint matches and the
+    # resource record is restored from the store. The match holds only because
+    # the hint compares frozen forms. A live dataclass probe compared with a
+    # thawed dict would miss.
     assert db2.inspect(read_stamped).last_recompute == "reused"
     assert db2.statistics().query_executions == 0
     assert db2.statistics().resource_probe_hits >= 1
@@ -1565,9 +1560,9 @@ def test_missing_args_snapshot_degrades_to_reexecution(tmp_path: Path) -> None:
     assert db1.get(wrapper) == "PAYLOAD"
     ck_key = db1.save_checkpoint()
 
-    # Drop the persisted call snapshot for hidden_leaf(path): execute-to-verify
-    # can no longer recover the leaf's args from the store and must degrade to
-    # warm refusal (re-execution) -- never an error, never a stale value.
+    # Drop the persisted call snapshot for hidden_leaf(path). Execute-to-verify
+    # then cannot recover the leaf's args from the store, so it degrades to warm
+    # refusal and re-execution, never an error or a stale value.
     call_snapshot_digest = fingerprint_snapshot(freeze(((str(data_file),), {})))
     assert call_snapshot_digest in store._items  # the call snapshot was persisted
     del store._items[call_snapshot_digest]
@@ -1582,8 +1577,9 @@ _twin_input = Input[int]("twin_execute_verify_p")
 
 
 def _make_twin_child(op: str) -> Query[..., int]:
-    # Two children share a query_id (same module:qualname) but carry different
-    # bodies -- the query-factory twin pattern. Their identities diverge on code.
+    # The query-factory twin pattern: two children share a query_id (same
+    # module:qualname) but carry different bodies. Their identities diverge on
+    # code.
     if op == "mul":
 
         @query
@@ -1600,8 +1596,8 @@ def _make_twin_child(op: str) -> Query[..., int]:
 
 
 def _make_twin_root(a_wrong: Query[..., int], z_right: Query[..., int]) -> Query[..., int]:
-    # The captured objects are freevars, walked in co_freevars order -- which
-    # CPython sorts alphabetically. Name the wrong twin so it sorts first, so the
+    # The captured objects are freevars, walked in co_freevars order, which
+    # CPython sorts alphabetically. The wrong twin's name sorts first, so the
     # first-wins pinned-capture map binds it under the shared query_id.
     @query
     def twin_root(db: Database) -> int:
@@ -1612,10 +1608,10 @@ def _make_twin_root(a_wrong: Query[..., int], z_right: Query[..., int]) -> Query
 
 
 def test_twin_query_id_execute_to_verify_refuses_wrong_body() -> None:
-    # Two twins share a query_id; the pinned-capture map is keyed by bare
-    # query_id (first-wins), so the WRONG twin (mul) is the one the root pins.
+    # Two twins share a query_id. The pinned-capture map is keyed by bare
+    # query_id (first wins), so the root pins the WRONG twin (mul).
     wrong_child = _make_twin_child("mul")  # p*2
-    right_child = _make_twin_child("add")  # p+2, the body root actually calls
+    right_child = _make_twin_child("add")  # p+2, the body the root calls
     assert wrong_child.key == right_child.key
     root = _make_twin_root(wrong_child, right_child)
 
@@ -1627,8 +1623,8 @@ def test_twin_query_id_execute_to_verify_refuses_wrong_body() -> None:
     assert db1.get(root) == 104  # add: 2+2=4 -> 104
     ck_key = db1.save_checkpoint()
 
-    # Evict the child's result snapshot so it cannot warm and must take the
-    # execute-to-verify path.
+    # Evict the child's result snapshot, which forces the execute-to-verify
+    # path.
     child_digest = fingerprint_snapshot(freeze(4))
     assert child_digest in store._items
     del store._items[child_digest]
@@ -1637,8 +1633,9 @@ def test_twin_query_id_execute_to_verify_refuses_wrong_body() -> None:
     db2.set(_twin_input, 2)
     db2.load_checkpoint(ck_key)
     # Diverge BEFORE the first get, so the poisoned execute-to-verify and the
-    # parent's re-execution land in the same request -- the only window where the
-    # checked_in_request short-circuit would serve the wrong twin's value.
+    # parent's re-execution land in the same request. That is the only window
+    # where the checked_in_request short-circuit would serve the wrong twin's
+    # value.
     db2.set(_twin_input, 5)
     reloaded = db2.get(root)
 
@@ -1675,8 +1672,8 @@ def test_statistics_reflect_frontier_verification(tmp_path: Path) -> None:
     assert db2.get(stat_top) == "alpha beta!"
 
     stats = db2.statistics()
-    # The frontier was verified by a live resource probe that hit its checkpoint
-    # hint, not by re-executing any query.
+    # A live resource probe that hit its checkpoint hint verified the frontier,
+    # with zero query executions.
     assert stats.query_executions == 0
     assert stats.resource_probe_hits >= 1
     assert stats.query_reuses >= 1
@@ -1687,9 +1684,9 @@ class _RecordSpec:
     """A resource *parameter* shaped as a frozen dataclass.
 
     A frozen dataclass freezes to a ``FrozenRecord`` but *thaws* to a plain
-    ``dict`` (it has no reconstructor). A checkpoint path that thaws the stored
-    parameter and hands it back to the resource therefore hands ``load`` a dict,
-    not the dataclass -- so a ``load`` that reaches for ``spec.name`` blows up.
+    ``dict``, because it has no reconstructor. A checkpoint path that thaws the
+    stored parameter and hands it back to the resource gives ``load`` a dict. A
+    ``load`` that reaches for ``spec.name`` then fails.
     """
 
     name: str
@@ -1701,8 +1698,7 @@ class _SpecResource:
     """A custom resource keyed by a frozen-dataclass parameter.
 
     Its ``load`` reads the parameter's *attributes*, the natural shape for a
-    hand-written resource. That is exactly what a thawed-to-dict parameter
-    cannot satisfy.
+    hand-written resource. A thawed-to-dict parameter cannot satisfy it.
     """
 
     def read(self, db: Database, spec: _RecordSpec) -> str:
@@ -1730,18 +1726,17 @@ def test_dataclass_parameter_resource_probe_hint_refuses_and_reexecutes() -> Non
     assert db1.get(read_spec) == "ALPHA:V3"
     ck_key = db1.save_checkpoint()
 
-    # Fresh process: no live records, so warming read_spec has to verify its
+    # Fresh process with no live records, so warming read_spec has to verify its
     # resource dep from the checkpoint. The dataclass parameter thaws to a plain
-    # dict, so the probe-hint restoration cannot faithfully re-drive the resource:
-    # it must refuse (resolve nothing, pre-create no shadow record) and let
-    # read_spec re-execute against the real dataclass parameter.
+    # dict, so probe-hint restoration cannot re-drive the resource faithfully. It
+    # refuses (resolves nothing, pre-creates no shadow record) and lets read_spec
+    # re-execute against the real dataclass parameter.
     db2 = Database(store=store)
     db2.load_checkpoint(ck_key)
-    # Never raises (before the guard, load(dict) explodes on spec.name) and hands
-    # back the freshly-recomputed, correct value -- never a dict-parameter load.
+    # Returns the freshly recomputed, correct value from a dataclass-parameter
+    # load. Before the guard, load(dict) raised on spec.name.
     assert db2.get(read_spec) == "ALPHA:V3"
-    # The resource-dep probe hint refused, so read_spec re-executed instead of
-    # being served from the checkpoint.
+    # The resource-dep probe hint refused, so read_spec re-executed.
     assert db2.inspect(read_spec).last_recompute == "executed"
     assert db2.statistics().query_executions == 1
 
@@ -1760,10 +1755,10 @@ def test_dataclass_value_round_trips_a_checkpoint_without_its_class(
 ) -> None:
     """A checkpointed dataclass comes back as data, in every mode.
 
-    Nothing reconstructs the class -- not the first request, not the reload,
-    not a fresh database -- so what a caller holds is the snapshot shape its
-    mode exposes: strict keeps the `FrozenRecord` view, checked and fast hand
-    back the owned thawed dict.
+    The first request, the reload and a fresh database all leave the class
+    unreconstructed. A caller holds the snapshot shape its mode exposes. Strict
+    keeps the `FrozenRecord` view. Checked and fast return the owned thawed
+    dict.
     """
     point = Input[_Point]("checkpoint_dataclass_point")
 
@@ -1771,8 +1766,8 @@ def test_dataclass_value_round_trips_a_checkpoint_without_its_class(
     def point_value(db: Database) -> Any:
         return point.read(db)
 
-    # One store directory throughout: the loader reads back exactly what the
-    # saver wrote, at the same path, with nothing edited in between.
+    # One store directory throughout. The loader reads back what the saver
+    # wrote, at the same path, with no edits in between.
     saver = Database(mode=mode, store=FileSystemArtifactStore(tmp_path))
     saver.set(point, _Point(5, 6))
     saved = saver.get(point_value)
@@ -1789,12 +1784,12 @@ def test_dataclass_value_round_trips_a_checkpoint_without_its_class(
     fresh.set(point, _Point(5, 6))
     fresh_value = fresh.get(point_value)
 
-    # Witnesses that the load actually warmed the record: the request that
-    # produced `reloaded` executed no query and reused one.
+    # Witnesses that the load warmed the record: the request that produced
+    # `reloaded` executed no query and reused one.
     assert after.query_executions - before.query_executions == 0
     assert after.query_reuses - before.query_reuses >= 1
 
-    # The value survives the round trip; the class does not, and no adapter is
+    # The value survives the round trip. The class is lost, and no adapter is
     # registered to bring it back.
     assert reloaded == saved
     assert reloaded == fresh_value
@@ -1810,20 +1805,20 @@ def test_dataclass_value_round_trips_a_checkpoint_without_its_class(
 
 # ---------------------------------------------------------------------------
 # Adapter registry trust (A5): a ValueAdapter's key (module:qualname of the
-# adapted TYPE) is process-independent, but its freeze/thaw *implementation* is
-# not. A checkpoint records, per adapter key, a digest of the implementation
-# that produced it; a warmed record whose snapshot uses an adapter whose
-# implementation has since changed (or gone missing) is skipped and the query
-# re-executes -- so a load can never thaw a stale payload under a divergent
-# adapter and hand back a value a fresh run would not have produced.
+# adapted TYPE) is process-independent, but its freeze/thaw *implementation*
+# can vary between processes. A checkpoint records, per adapter key, a digest
+# of the implementation that produced it. A warmed record whose snapshot uses
+# an adapter whose implementation has since changed or gone missing is skipped,
+# and the query re-executes. A load therefore never thaws a stale payload under
+# a divergent adapter or returns a value a fresh run would not produce.
 # ---------------------------------------------------------------------------
 
 
 class _Temperature:
-    """A boundary value with no native snapshot form; it needs an adapter.
+    """A boundary value with no native snapshot form, so it needs an adapter.
 
-    A plain (non-dataclass) object so ``freeze`` refuses it outright unless an
-    adapter is registered -- which makes the "no adapter" failure mode explicit.
+    A plain (non-dataclass) object, so ``freeze`` refuses it outright unless an
+    adapter is registered. This makes the "no adapter" failure mode explicit.
     """
 
     def __init__(self, degrees: float) -> None:
@@ -1878,7 +1873,7 @@ _MUTABLE_ADAPTER_OFFSETS = {"freeze": 1.0, "thaw": 1.0}
 
 
 class _MutableCaptureTempAdapter:
-    """An operational adapter whose mutable ambient state is not pinnable."""
+    """An operational adapter with unpinnable mutable ambient state."""
 
     def freeze(self, value: Any, recurse: Callable[[Any], Any]) -> Any:
         return recurse(value.degrees + _MUTABLE_ADAPTER_OFFSETS["freeze"])
@@ -1966,8 +1961,8 @@ def test_modified_adapter_implementation_skips_warm() -> None:
     reference.set(temp_in, 5.0)
     assert reference.get(read_temp) == _Temperature(5.0)
 
-    # The adapter digest no longer matches, so the warm is skipped and the query
-    # re-executes -- never serving the stale, wrongly-thawed value.
+    # The adapter digest differs now, so the warm is skipped and the query
+    # re-executes, never serving the stale, wrongly thawed value.
     assert db2.get(read_temp) == _Temperature(5.0)
     assert db2.inspect(read_temp).last_recompute == "executed"
 
@@ -2206,13 +2201,14 @@ def test_mutated_adapter_database_raises_while_a_reloaded_database_reexecutes() 
     assert saver.get(read_temp) == _Temperature(5.0)
     checkpoint = saver.save_checkpoint()
 
-    # Violating the immutability law on the SAVING database is loud, not silent.
+    # Violating the immutability law on the SAVING database raises loudly.
     object.__setattr__(adapter, "offset", 2.0)
     with pytest.raises(AdapterContractError):
         saver.get(read_temp)
 
-    # A database built honestly with the new configuration refuses the warm
-    # record and re-executes -- the load-side half the sibling test pins.
+    # A database built with the new configuration from the start refuses the
+    # warm record and re-executes. This is the load-side half the sibling test
+    # pins.
     loaded = Database("checked", store=store, adapters={_Temperature: _ConfiguredTempAdapter(2.0)})
     loaded.set(temp_in, 5.0)
     loaded.load_checkpoint(checkpoint)
@@ -2238,9 +2234,9 @@ def test_the_builtin_file_stat_adapter_checkpoints_cleanly(tmp_path: Path) -> No
     assert db.get(watched_size) == 5
 
     # A stateless adapter defined in a real module fingerprints cleanly, so the
-    # save succeeds and the manifest carries the adapter key the warm gate will
-    # compare against. An adapter carrying slot state or an unpinnable capture
-    # raises here instead -- the sibling tests above pin both.
+    # save succeeds and the manifest carries the adapter key the warm gate
+    # compares against. An adapter with slot state or an unpinnable capture
+    # raises here, as the sibling tests above pin.
     key = db.save_checkpoint()
     manifest = json.loads(cast(bytes, store.get(key)).decode("utf-8"))
     assert list(manifest["adapters"]) == ["pyinc.resources:FileStatSnapshot"]
@@ -2268,7 +2264,7 @@ def test_missing_adapter_errors_match_fresh_database() -> None:
         return _Temperature(temp_in.read(db))
 
     # A fresh database with NO adapter cannot freeze the returned _Temperature,
-    # so the query raises when it executes -- this is the reference failure mode.
+    # so the query raises when it executes. This is the reference failure mode.
     fresh = Database("checked")
     fresh.set(temp_in, 5.0)
     with pytest.raises(UnsupportedValueError) as fresh_exc:
@@ -2280,9 +2276,9 @@ def test_missing_adapter_errors_match_fresh_database() -> None:
     assert db1.get(read_temp) == _Temperature(5.0)
     ck_key = db1.save_checkpoint()
 
-    # Loading into a process without the adapter must fail identically: the warm
-    # is skipped (the required adapter key is absent from this registry) and the
-    # re-execution raises the same exception -- never a wrongly-thawed value.
+    # Loading into a process without the adapter fails the same way. The warm
+    # is skipped because this registry lacks the required adapter key, and the
+    # re-execution raises the same exception, never a wrongly thawed value.
     db2 = Database("checked", store=store)
     db2.set(temp_in, 5.0)
     db2.load_checkpoint(ck_key)
@@ -2294,13 +2290,12 @@ def test_missing_adapter_errors_match_fresh_database() -> None:
 
 @dataclass(frozen=True)
 class _StableProbeTempResource:
-    """A resource whose PROBE is a stable scalar but whose LOAD returns an
-    adapter-wrapped value.
+    """A resource with a stable scalar PROBE and an adapter-wrapped LOAD result.
 
-    The stable probe means a fresh process hits the probe-hint fast path in
+    With a stable probe, a fresh process hits the probe-hint fast path in
     ``_refresh_resource`` and restores the RESULT snapshot straight from the
-    store. That snapshot is an adapter payload, so a since-changed adapter would
-    thaw it into a value a fresh run never produces unless the restore is gated.
+    store. That snapshot is an adapter payload. Without a gate on the restore, a
+    since-changed adapter would thaw it into a value a fresh run never produces.
     """
 
     def read(self, db: Database, degrees: float) -> _Temperature:
@@ -2310,8 +2305,8 @@ class _StableProbeTempResource:
         return f"temp[{degrees}]"
 
     def probe(self, degrees: float) -> str:
-        # A stable version string: it never changes across processes, so the
-        # probe hint always matches and the result snapshot is restored directly.
+        # A version string that stays the same across processes, so the probe
+        # hint always matches and the result snapshot is restored directly.
         return "v1"
 
     def load(self, db: Database, degrees: float) -> _Temperature:
@@ -2331,8 +2326,8 @@ def test_adapter_change_with_stable_probe_reloads_resource_result() -> None:
     ck_key = db1.save_checkpoint()
 
     # Fresh process, behaviourally different adapter under the same key. The v1
-    # payload stored the raw degrees (5.0); thawing it under the offset adapter
-    # would yield _Temperature(4.0) -- a value the new adapter never produces.
+    # payload stored the raw degrees (5.0). Thawing it under the offset adapter
+    # would yield _Temperature(4.0), a value the new adapter never produces.
     db2 = Database("checked", store=store, adapters={_Temperature: _OffsetTempAdapter()})
     db2.load_checkpoint(ck_key)
 
@@ -2342,11 +2337,11 @@ def test_adapter_change_with_stable_probe_reloads_resource_result() -> None:
 
     # The probe is stable so the hint matches, but the adapter digest moved. The
     # ungated fast path would restore the stale snapshot and thaw it to
-    # _Temperature(4.0); the gate must refuse it so the resource re-loads under
-    # the live adapter and yields the fresh value.
+    # _Temperature(4.0). The gate refuses it, so the resource re-loads under the
+    # live adapter and yields the fresh value.
     assert db2.get(read_temp_resource) == _Temperature(5.0)
-    # The resource actually re-loaded (fell through to the full load path) rather
-    # than being served from the probe-hint fast path.
+    # The resource re-loaded through the full load path, bypassing the
+    # probe-hint fast path.
     assert db2.statistics().resource_loads == 1
     assert db2.statistics().resource_probe_hits == 0
     assert db2.inspect(read_temp_resource).last_recompute == "executed"
@@ -2378,10 +2373,10 @@ def test_modified_resource_result_adapter_skips_parent_warm() -> None:
 #
 # The disk-backed store writes objects atomically (tempfile in the target dir
 # plus os.replace) under a two-level fan-out. These tests pin the durability
-# guarantees a fresh process depends on: a checkpoint round-trips through a
-# brand-new store instance on the same directory; crashed-writer temp-file
-# debris is never content-addressed; and a torn write is never served as a
-# value (a read either misses or fails the A1 integrity check).
+# guarantees a fresh process depends on. A checkpoint round-trips through a
+# brand-new store instance on the same directory. Temp-file debris from a
+# crashed writer is never content-addressed. A torn write is never served as a
+# value: a read either misses or fails the A1 integrity check.
 # ---------------------------------------------------------------------------
 
 
@@ -2400,8 +2395,8 @@ def test_checkpoint_round_trip_across_store_instances_and_processes(
     assert db1.get(dur_round_trip_query) == 21
     ck_key = db1.save_checkpoint()
 
-    # A brand-new store instance over the same directory shares no in-process
-    # state with the saver -- only the bytes on disk.
+    # A brand-new store instance over the same directory shares only the bytes
+    # on disk with the saver.
     loader_store = FileSystemArtifactStore(tmp_path)
     db2 = Database(store=loader_store)
     db2.set(p, 7)
@@ -2425,8 +2420,8 @@ def test_leftover_tmp_files_are_ignored(tmp_path: Path) -> None:
 
     # Seed the store with crashed-writer debris: leftover ".tmp-" files (the
     # prefix FileSystemArtifactStore hands to tempfile.mkstemp) at the objects
-    # root and inside each fan-out directory. Nothing is content-addressed to a
-    # ".tmp-" name, so no get() can ever resolve one.
+    # root and inside each fan-out directory. Content addresses never use a
+    # ".tmp-" name, so get() can never resolve one.
     objects = tmp_path / "objects"
     (objects / ".tmp-root-junk").write_bytes(b"not an object")
     for fanout in objects.iterdir():
@@ -2461,22 +2456,21 @@ def test_partial_object_write_never_visible(tmp_path: Path) -> None:
     full_payload = object_path.read_bytes()
 
     # (a) A crashed atomic write leaves a ".tmp-" file holding a partial payload
-    #     that never reached the final name via os.replace. It must stay
-    #     invisible: the real object still resolves and the debris never shadows
-    #     it.
+    #     that never reached the final name via os.replace. It stays invisible:
+    #     the real object still resolves and the debris never shadows it.
     partial = full_payload[: len(full_payload) // 2]
     (object_path.parent / ".tmp-crash").write_bytes(partial)
     assert store.get(digest) == full_payload
 
     # (b) A torn write that somehow landed under the FINAL name yields truncated
     #     bytes. The load-time content-address check (A1) refuses them, so the
-    #     query re-executes to a correct value -- partial bytes are never served.
+    #     query re-executes to a correct value. Partial bytes are never served.
     object_path.write_bytes(full_payload[:-1])
 
-    #     The loader reads through this store but does not write back to it:
-    #     the point here is that torn bytes are refused and the query
-    #     re-executes. Publishing the recomputed value over those torn bytes is
-    #     the store's collision error, pinned by its own test.
+    #     The loader reads through this store and never writes back to it.
+    #     This test pins that torn bytes are refused and the query re-executes.
+    #     Publishing the recomputed value over the torn bytes raises the
+    #     store's collision error, which has its own test.
     loader = FileSystemArtifactStore(tmp_path)
     db2 = Database()
     db2.set(p, 0)
@@ -2488,16 +2482,16 @@ def test_partial_object_write_never_visible(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Code-identity determinism.
 #
-# A code object's identity must not depend on ambient runtime refcounts. The
+# A code object's identity is independent of ambient runtime refcounts. The
 # canonical typed encoder reads semantic code fields directly, so retaining a
 # string constant elsewhere in the process cannot move the identity.
 # ---------------------------------------------------------------------------
 
 
 def _refcount_guard_helper(text: str) -> bool:
-    # The regex-pattern literal is a const of THIS code object; passing it by
-    # identity to re.fullmatch makes re._cache retain that exact object on first
-    # use, nudging its refcount from 1 to 2. The identity must ignore that move.
+    # The regex-pattern literal is a const of THIS code object. Passing it by
+    # identity to re.fullmatch makes re._cache retain that object on first use,
+    # moving its refcount from 1 to 2. The identity must ignore that move.
     return re.fullmatch(r"\d+ refcount_guard \w+", text) is not None
 
 
@@ -2512,22 +2506,22 @@ def test_code_fingerprint_ignores_ambient_refcount_changes() -> None:
     re.purge()
     identity_before = db._query_key(refcount_guard_query, (), {})[0].identity
 
-    # Perturb ambient refcounts exactly as first regex use does: the helper's
-    # pattern const is retained by re._cache, so its refcount crosses 1 -> 2.
+    # Perturb ambient refcounts the way first regex use does: re._cache retains
+    # the helper's pattern const, so its refcount crosses 1 -> 2.
     assert _refcount_guard_helper("7 refcount_guard ok") is True
     identity_after = db._query_key(refcount_guard_query, (), {})[0].identity
 
-    # The typed code encoding is invariant to the refcount shift. Pin the
-    # externally observable identity rather than an encoding implementation.
+    # The typed code encoding is invariant to the refcount shift. The test pins
+    # the externally observable identity and leaves the encoding free to change.
     assert identity_before == identity_after
 
 
 # ---------------------------------------------------------------------------
-# Dirty-graph save: a checkpoint may only persist records whose cached value
+# Dirty-graph save: a checkpoint persists only records whose cached value
 # matches what a fresh recomputation against the *current* graph would produce.
-# If an input is mutated after a query computed but before save_checkpoint (no
-# intervening get -- a "dirty graph"), that query's record is stale and must not
-# warm on reload. Save omits it; the query re-executes to the correct value.
+# If an input changes after a query computed and before save_checkpoint, with
+# no get in between (a "dirty graph"), that query's record is stale and stays
+# cold on reload. Save omits it, and the query re-executes to the correct value.
 # ---------------------------------------------------------------------------
 
 
@@ -2552,8 +2546,8 @@ def test_dirty_graph_save_reloads_fresh_not_stale() -> None:
     fresh = Database()
     fresh.set(b, 1)
 
-    # Reload must serve what a from-scratch database computes, not the stale
-    # pre-set value baked at save. Pre-fix the stale record warms and serves 0.
+    # Reload serves what a from-scratch database computes. Before the fix, the
+    # stale record baked at save warmed and served 0.
     assert fresh.get(dirty_reload_q) == 1
     assert reloaded.get(dirty_reload_q) == 1
     assert reloaded.inspect(dirty_reload_q).last_recompute == "executed"
@@ -2586,8 +2580,8 @@ def test_dirty_save_does_not_degrade_settled_records() -> None:
     reloaded.set(dirty_in, 99)
     reloaded.load_checkpoint(ck_key)
 
-    # The settled sibling must still warm from the checkpoint -- omitting the
-    # stale record must not spill over and drop records that are still sound.
+    # The settled sibling still warms from the checkpoint. The save omits only
+    # the stale record and keeps every record that is still sound.
     assert reloaded.get(settled_q) == 110
     assert reloaded.inspect(settled_q).last_recompute == "reused"
 
@@ -2615,7 +2609,7 @@ def test_settled_save_reuse_unchanged() -> None:
     reloaded.set(b, 5)
     reloaded.load_checkpoint(ck_key)
 
-    # A settled save must still warm on reload -- guard against over-omission.
+    # A settled save still warms on reload. This guards against over-omission.
     assert reloaded.get(settled_reuse_q) == 12
     assert reloaded.inspect(settled_reuse_q).last_recompute == "reused"
 
@@ -2623,9 +2617,9 @@ def test_settled_save_reuse_unchanged() -> None:
 # ---------------------------------------------------------------------------
 # Query handle state: a body may read attributes off its own handle, and
 # writing one is a supported way to reparameterize the query. Identity moves
-# with the write, so a checkpoint saved beforehand can no longer answer for the
-# query: the record misses and the body re-executes against the state that is
-# there now. Left alone, the same records still warm.
+# with the write. A checkpoint saved before the write then misses, and the body
+# re-executes against the current state. An untouched handle still warms the
+# same records.
 # ---------------------------------------------------------------------------
 
 
@@ -2644,9 +2638,9 @@ def test_query_handle_attribute_change_invalidates_checkpointed_records() -> Non
     cast(Any, selfread).threshold = 2
     loaded = Database(store=store)
     loaded.load_checkpoint(checkpoint)
-    # The write moves the node the stored record is keyed by. That is what
-    # makes the record unreachable rather than merely unused, so the value
-    # below cannot be the saved 1 dressed up as a recomputation.
+    # The write moves the node the stored record is keyed by, so the record is
+    # unreachable. The value below therefore cannot be the saved 1 dressed up
+    # as a recomputation.
     assert loaded._query_key(selfread, (), {})[0].identity != saved_identity
 
     value = loaded.get(selfread)
@@ -2666,13 +2660,12 @@ def test_query_handle_attribute_the_body_never_reads_invalidates_records() -> No
     checkpoint = saver.save_checkpoint()
 
     # This body reads nothing off its handle, so the write below cannot reach
-    # the query through the capture the test above relies on. The handle fold
-    # is what moves identity here, reaching the whole handle rather than the
-    # part some body happens to read, and the moved identity is what makes the
-    # stored record unreachable. Nothing this write does can change the answer,
-    # which is what puts the assertions below on the identity and the execution
-    # counter: for a query shaped like this one, they are what a miss looks
-    # like.
+    # the query through the capture the test above relies on. Here the handle
+    # fold moves identity. It covers the whole handle, including parts no body
+    # reads, and the moved identity makes the stored record unreachable. The
+    # write cannot change the answer, so the assertions below check the
+    # identity and the execution counter. For a query shaped like this one,
+    # those are what show a miss.
     cast(Any, stamped).threshold = 2
     loaded = Database(store=store)
     loaded.load_checkpoint(checkpoint)
@@ -2696,11 +2689,10 @@ def test_unchanged_query_handle_attribute_still_warms_from_a_checkpoint() -> Non
 
     loaded = Database(store=store)
     loaded.load_checkpoint(checkpoint)
-    # Control on the misses above: folding handle state into identity must not
-    # cost every query that carries some its checkpoint. An untouched handle
-    # keys the same node and the stored record answers without running the
-    # body, which is what keeps those misses from reading as a query shape that
-    # can never warm at all.
+    # Control for the misses above: queries that carry handle state keep their
+    # checkpoints. An untouched handle keys the same node, and the stored record
+    # answers without running the body. So the misses come from the write, and
+    # this query shape still warms.
     assert loaded._query_key(selfread, (), {})[0].identity == saved_identity
     assert loaded.get(selfread) == 3
     assert loaded.inspect(selfread).last_recompute == "reused"
@@ -2729,12 +2721,11 @@ def test_reverting_a_query_handle_attribute_restores_its_records() -> None:
     cast(Any, selfread).threshold = 1
     reverted = Database(store=store)
     reverted.load_checkpoint(checkpoint)
-    # What the write above did to the saved record was leave it unaddressed,
-    # not destroy it. Writing the attribute back rebuilds the same identity
-    # byte for byte, so the record the checkpoint holds is reachable again and
-    # answers without the body running -- which is what makes a handle
-    # attribute a way to reparameterize a query rather than a one-way spend of
-    # everything stored under it.
+    # The write above left the saved record unaddressed but intact. Writing the
+    # attribute back rebuilds the same identity byte for byte, so the
+    # checkpoint's record is reachable again and answers without running the
+    # body. A handle attribute therefore reparameterizes a query reversibly,
+    # and everything stored under it survives.
     assert reverted._query_key(selfread, (), {})[0].identity == saved_identity
     assert reverted.get(selfread) == 1
     assert reverted.inspect(selfread).last_recompute == "reused"
@@ -2763,9 +2754,8 @@ def test_reflective_queries_stay_rejected_after_a_checkpoint_load(
     store = InMemoryArtifactStore()
     saver = Database(store=store)
     saver.set(anchor, 1)
-    # A refused query never reaches a stored record, so the durable claim is
-    # not about what a checkpoint holds: it is that loading one cannot smuggle
-    # the refusal away on the far side.
+    # A refused query never reaches a stored record. The durable claim is that
+    # loading a checkpoint keeps the refusal in force on the far side.
     with pytest.raises(UnsupportedValueError):
         saver.get(read_config)
     checkpoint = saver.save_checkpoint()
@@ -2778,13 +2768,12 @@ def test_reflective_queries_stay_rejected_after_a_checkpoint_load(
 
 
 # ---------------------------------------------------------------------------
-# The checkpoint error taxonomy. Each cause a load can fail for is its own
-# class, so a caller can catch that cause specifically instead of every
-# checkpoint failure at once -- though the classes nest where the causes do,
-# and catching CheckpointManifestError still catches CheckpointIntegrityError,
-# which is one of its subclasses. A mode mismatch is a cause of its own, and
-# like its siblings it is catchable as a checkpoint failure, as a pyinc error,
-# and as a ValueError.
+# The checkpoint error taxonomy. Each cause a load can fail for has its own
+# class, so a caller can catch one cause on its own. The classes nest where the
+# causes do: catching CheckpointManifestError also catches its subclass
+# CheckpointIntegrityError. A mode mismatch is its own cause. Like its
+# siblings, it is catchable as a checkpoint failure, as a pyinc error, and as a
+# ValueError.
 # ---------------------------------------------------------------------------
 
 
@@ -2800,10 +2789,9 @@ def test_checkpoint_mode_error_is_public_and_catchable() -> None:
 # ---------------------------------------------------------------------------
 # Input keys and the durability of what they write. A key that renders one way
 # as node identity and another way as a node label writes a checkpoint whose
-# input dependency labels can never satisfy the load-side invariant, so the
-# save reports success and every load of it fails. The key boundary refuses
-# such a key outright, and the plain-string spelling it names is what a caller
-# writes instead.
+# input dependency labels fail the load-side invariant. The save would report
+# success and every load of it would fail. The key boundary refuses such a key
+# outright, and the caller writes the plain-string spelling it names.
 # ---------------------------------------------------------------------------
 
 
@@ -2814,11 +2802,11 @@ class _CheckpointKey(str, Enum):  # noqa: UP042 - the pre-StrEnum mixin idiom is
 def test_enum_keys_cannot_write_checkpoints_and_value_spelling_round_trips() -> None:
     """The unloadable-checkpoint shape is unconstructible, and `.value` warms.
 
-    A `str`-mixin Enum member is stored as node identity unchanged while the
-    node label is formatted from it, and the two render differently, so the
-    saved manifest carries an input dependency label the loader rejects. That
-    made a successful save produce state no database could ever read back.
-    The key is now refused where it is written; the `member.value` spelling the
+    A `str`-mixin Enum member is stored unchanged as node identity, while the
+    node label is formatted from it. The two render differently, so the saved
+    manifest carries an input dependency label the loader rejects. A
+    successful save used to produce state no database could read back. The key
+    is now refused where it is written. The `member.value` spelling the
     refusal names is a plain string and round-trips through a checkpoint.
     """
     with pytest.raises(InputKeyError, match="exactly str") as raised:
@@ -2846,8 +2834,8 @@ def test_enum_keys_cannot_write_checkpoints_and_value_spelling_round_trips() -> 
     warm = loader.get(enum_value_keyed)
     after = loader.statistics()
 
-    # Witnesses, so the load cannot pass by having warmed nothing: the warm
-    # request executed no query and reused at least one record.
+    # Witnesses that the load warmed a record: the warm request executed no
+    # query and reused at least one record.
     assert warm == fresh
     assert after.query_executions - before.query_executions == 0
     assert after.query_reuses - before.query_reuses >= 1

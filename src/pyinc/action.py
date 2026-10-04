@@ -48,7 +48,7 @@ _WINDOWS_INVALID_CHARACTERS = frozenset('<>:"|?*')
 
 @dataclass(frozen=True)
 class Output:
-    """A root-relative output path and its exact desired bytes."""
+    """A root-relative output path and its desired bytes."""
 
     path: str
     content: bytes
@@ -159,11 +159,11 @@ def _manifest_root_digest(root: Path) -> str:
 
 
 def _root_incarnation(root: Path) -> list[int] | None:
-    """Identify the directory the root path currently names, not the path text.
+    """Identify the directory the root path currently names, by device and inode.
 
-    A root deleted and recreated at the same path is a different directory:
-    the ledger's claims name files in the old one, and deleting same-named
-    files in the new one would destroy outputs this action never owned.
+    A root deleted and recreated at the same path is a different directory. The
+    ledger's claims name files in the old one. Deleting same-named files in the
+    new one would destroy outputs this action never owned.
     """
     try:
         metadata = root.stat()
@@ -248,11 +248,11 @@ def _read_manifest(
         and recorded_incarnation != current_incarnation
     ):
         # The root was deleted and recreated at this path. The recorded claims
-        # name files in a directory that no longer exists, so they are void
-        # and the current directory is adopted fresh, deleting nothing.
-        # Detection is best-effort -- a filesystem can hand the recreated
-        # directory its old inode straight back -- which is why deletion is
-        # additionally digest-verified where the claims are consumed.
+        # name files in the deleted directory, so they are void. The current
+        # directory is adopted fresh and nothing is deleted. Detection is
+        # best-effort, since a filesystem can give the recreated directory its
+        # old inode back. That is why deletion is also digest-verified where
+        # the claims are consumed.
         return True, {}, True
     return True, outputs, False
 
@@ -277,13 +277,12 @@ def _write_manifest(
             json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n",
         )
     except (OSError, ActionPathError) as error:
-        # The step that did not happen is the ledger write, so that is what
-        # this is reported as -- including the one case where the manifest
-        # path itself is at fault and arrives here already converted to a
-        # path error, which is deliberately re-reported as a manifest failure
-        # rather than surfacing as a path refusal from a call the caller made
-        # about outputs. The outputs this ledger would have claimed are
-        # already published, so the next locked run is what reconciles the two.
+        # The ledger write is the step that failed, so report a manifest error.
+        # That includes a fault in the manifest path itself, which arrives here
+        # already converted to ActionPathError. As a path refusal it would
+        # point the caller at their outputs. The outputs this ledger would have
+        # claimed are already published, so the next locked run reconciles the
+        # two.
         raise ActionManifestError(f"Cannot record owned outputs: {error}") from error
 
 
@@ -292,9 +291,8 @@ def _atomic_write(target: Path, data: bytes) -> None:
         atomic_write(target, data)
     except OSError as error:
         # Publication reaches the filesystem here, so a full disk or an
-        # unwritable parent is as much a refusal as an unsafe path is. The
-        # unsafe-path error is itself an OSError, so its conversion is
-        # unchanged and only the wider failures are newly typed.
+        # unwritable parent is a refusal, like an unsafe path. The unsafe-path
+        # error is itself an OSError, so it converts the same way.
         raise ActionPathError(str(error)) from error
 
 
@@ -324,16 +322,15 @@ def _action_lock_directory() -> Path:
         if uid is not None and stat.S_IMODE(metadata.st_mode) & 0o077:
             directory.chmod(0o700)
     except (OSError, RuntimeError) as error:
-        # The lock directory is prepared outside every try ``reconcile``
-        # opens, so a failure here is never seen by those handlers and this
-        # is where it becomes a typed refusal. A runtime error is caught
-        # beside the OS errors because two steps report that way: locating
-        # the home directory raises it on every interpreter where there is no
-        # home to locate, and resolving the temporary base raises it for a
-        # symbolic-link cycle on the older interpreters this library still
-        # supports, where the newer ones report that same cycle as an OS
-        # error. The two refusals raised just above are value errors, not OS
-        # or runtime errors, so they pass through untouched.
+        # The lock directory is prepared outside every try that ``reconcile``
+        # opens, so this is where a failure becomes a typed refusal.
+        # RuntimeError is caught with OSError because two steps raise it.
+        # Locating the home directory raises it on every interpreter when there
+        # is no home to locate. Resolving the temporary base raises it for a
+        # symbolic-link cycle on the older supported interpreters. Newer ones
+        # raise OSError for the same cycle. The two refusals raised above are
+        # ValueErrors, outside this handler's types, so they pass through
+        # untouched.
         raise ActionPathError(
             f"Cannot safely prepare the reconciliation lock directory: {error}"
         ) from error
@@ -400,7 +397,7 @@ def _orphan_cannot_exist(root: Path, relative: str) -> bool:
 
 
 def _holds_only_desired_outputs(target: Path, relative: str, desired: Collection[str]) -> bool:
-    """Report whether a directory holds nothing but regular files of the desired set."""
+    """Report whether a directory holds only regular files from the desired set."""
     pending = [(target, relative)]
     while pending:
         directory, prefix = pending.pop()
@@ -429,7 +426,7 @@ def _unprunable_entry(
         with os.scandir(target) as entries:
             listing = sorted(entries, key=lambda entry: entry.name)
     except (FileNotFoundError, NotADirectoryError):
-        # Nothing is here to block pruning; the prune step re-checks anyway.
+        # Nothing here blocks pruning. The prune step re-checks anyway.
         return None
     for entry in listing:
         path = f"{relative}/{entry.name}"
@@ -572,24 +569,24 @@ class Action:
         )
         _validate_path_set(desired, source="owned output")
 
-        # A ledger entry that conflicts with the new desired layout is just an
-        # orphan of the previous layout; it is released below rather than
-        # rejected, so an output can migrate between file and directory forms.
+        # A ledger entry that conflicts with the new desired layout is an orphan
+        # of the previous layout. It is released below, so an output can move
+        # between file and directory forms.
         previous_only = sorted(set(previous) - set(desired))
         desired_by_key = {_portable_path_key(path): path for path in desired}
         for relative in previous_only:
             twin = desired_by_key.get(_portable_path_key(relative))
             if twin is not None:
                 # On a case-insensitive filesystem the orphan and the desired
-                # output are one file; deleting the orphan would destroy the
-                # reconciled output, so a spelling change stays rejected.
+                # output are one file. Deleting the orphan would destroy the
+                # reconciled output, so a spelling change is rejected.
                 raise ActionPathError(
                     f"Portable-path collision in owned output: {relative!r} and {twin!r}"
                 )
 
-        # Directories that stand where a desired file must go exist only
-        # because the previous layout nested owned outputs there. Record them
-        # so they can be pruned once their orphans are deleted.
+        # A directory where a desired file must go exists only because the
+        # previous layout nested owned outputs there. Record it for pruning
+        # once its orphans are deleted.
         prune_map: dict[str, str] = {}
         for relative in previous_only:
             for ancestor in _ancestors(relative):
@@ -629,8 +626,8 @@ class Action:
                 ) from error
             if unreachable:
                 # A run that stopped before publishing its ledger left a file
-                # where this orphan's parent directory stood. No file can exist
-                # at the recorded path, so it is already released.
+                # where this orphan's parent directory stood. The recorded path
+                # is unreachable, so the orphan is already released.
                 targets[relative] = (root.joinpath(*relative.split("/")), None)
                 continue
             target, metadata = _safe_target(root, relative)
@@ -647,21 +644,21 @@ class Action:
                         f"previous layout: {error}"
                     ) from error
                 if already_released:
-                    # The desired layout nests outputs strictly beneath this path
-                    # and the directory holds nothing else, so a run that stopped
-                    # before publishing its ledger already released the orphan.
-                    # Nothing here is deleted; the nested outputs are reconciled
-                    # exactly as they would be under an unrecorded directory.
+                    # The desired layout nests outputs strictly beneath this
+                    # path, and the directory holds only those. A run that
+                    # stopped before publishing its ledger already released the
+                    # orphan. Nothing here is deleted. The nested outputs
+                    # reconcile as they would under an unrecorded directory.
                     metadata = None
             if metadata is not None and not stat.S_ISREG(metadata.st_mode):
                 raise ActionPathError(f"Owned output target is not a regular file: {relative!r}")
             targets[relative] = (target, metadata)
             if metadata is not None:
                 # An orphan is this action's to delete only while it still
-                # carries the exact bytes the ledger recorded. The recorded
-                # digest decides ownership because nothing stat-shaped can: a
-                # recreated directory can reuse its inode, and a drifted file
-                # is the user's now either way.
+                # carries the bytes the ledger recorded. The recorded digest
+                # decides ownership because stat metadata can mislead: a
+                # recreated directory can reuse its inode. A drifted file is
+                # the user's now either way.
                 try:
                     current = read_regular_file(target)
                 except OSError as error:
@@ -687,19 +684,19 @@ class Action:
                 ]
                 if drifted:
                     # The parent path is an orphan whose bytes drifted from the
-                    # ledger: it is not this action's to delete, and the write
-                    # beneath it cannot proceed without destroying it.
+                    # ledger. It is the user's file now, and writing beneath it
+                    # would destroy it.
                     raise ActionPathError(
                         f"Cannot publish {relative!r}: its parent {drifted[0]!r} no longer "
                         "carries the bytes this action's ledger recorded."
                     )
-                # An orphan file from the previous layout occupies exactly this
-                # parent path; a mere casefold twin of a parent frees nothing
-                # when it is deleted, so it does not lift validation. The
-                # orphan's components were validated when it was inspected, it
-                # is deleted before this path is written, and the write
-                # revalidates the target, so classify the target as absent
-                # here.
+                # An orphan file from the previous layout sits at this parent
+                # path, spelled identically. Deleting a casefold twin of a
+                # parent frees nothing, so only an identical spelling lifts
+                # validation. The orphan's components were validated when it
+                # was inspected. It is deleted before this path is written, and
+                # the write revalidates the target. So classify the target as
+                # absent here.
                 targets[relative] = (root.joinpath(*relative.split("/")), None)
                 continue
             target, metadata = _safe_target(root, relative)
@@ -716,8 +713,8 @@ class Action:
             targets[relative] = (target, metadata)
 
         # Pruning is refused for a directory that still holds an unowned entry.
-        # The refusal is decided here so a dry run reports it instead of a
-        # reconcile discovering it after its deletions.
+        # Deciding it here lets a dry run report the refusal, and makes a real
+        # run refuse before any deletion.
         for relative in sorted(prune_map.values()):
             target, metadata = _safe_target(root, relative)
             if metadata is None or not stat.S_ISDIR(metadata.st_mode):
@@ -725,9 +722,9 @@ class Action:
             try:
                 blocking = _unprunable_entry(target, relative, deletable_orphans, prune_map)
             except OSError as error:
-                # An unanswerable directory refuses the run before anything is
-                # deleted; failing open here would let the deletions run and
-                # surface the refusal only after them.
+                # An unreadable directory refuses the run before anything is
+                # deleted. Failing open here would let the deletions run first
+                # and surface the refusal after them.
                 raise ActionPathError(
                     f"Cannot safely inspect directory {relative!r} left by the "
                     f"previous layout: {error}"
@@ -772,9 +769,9 @@ class Action:
         performed_deletions: list[str] = []
         if not dry_run:
             # Orphans are deleted and their emptied directories pruned before
-            # any write so a path can change between file and directory forms.
-            # Each step is individually atomic; if the run stops early, the
-            # prior ledger lets the next locked reconcile finish the set.
+            # any write, so a path can change between file and directory forms.
+            # Each step is atomic. If the run stops early, the prior ledger lets
+            # the next locked reconcile finish the set.
             for relative in predicted_deletions:
                 target, metadata = _safe_target(root, relative)
                 if metadata is None:
@@ -784,11 +781,11 @@ class Action:
                         f"Refusing to delete a non-regular owned target: {relative!r}"
                     )
                 try:
-                    # Ownership is re-verified against the recorded bytes at
-                    # the last moment, and the unlink is pinned to the file
-                    # the verification read: an entry that changed since
-                    # preflight -- or was replaced under the same name, even
-                    # by identical bytes -- is not this action's anymore.
+                    # Re-verify ownership against the recorded bytes at the
+                    # last moment, and pin the unlink to the file that check
+                    # read. An entry that changed since preflight, or was
+                    # replaced under the same name (even by identical bytes),
+                    # is the user's now.
                     read = read_regular_file_with_identity(target)
                     if read is None:
                         continue

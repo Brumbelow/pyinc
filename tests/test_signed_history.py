@@ -211,10 +211,10 @@ def _revoke_key(keys: SigningKeys, fingerprint: str, staged: Path) -> None:
     generated = Path(keys.gnupghome) / "openpgp-revocs.d" / f"{fingerprint}.rev"
     if not generated.is_file():
         pytest.skip(f"gpg wrote no revocation certificate for {fingerprint}")
-    # gpg puts a colon in front of the armour header so the certificate cannot be
-    # imported by accident; left in place, the import reports no OpenPGP data and
-    # the key stays valid. Stage the stripped copy outside GNUPGHOME so gpg never
-    # reads a second certificate out of its own directory.
+    # gpg prefixes the armour header with a colon to block accidental imports.
+    # With the colon left in, the import reports no OpenPGP data and the key
+    # stays valid. Stage the stripped copy outside GNUPGHOME so gpg never reads
+    # a second certificate from its own directory.
     staged.write_text(
         generated.read_text(encoding="utf-8").replace(":-----BEGIN", "-----BEGIN", 1),
         encoding="utf-8",
@@ -326,7 +326,7 @@ def _merge_from_branch(
     merge_fingerprint: str,
     branch_file: str = "feature.txt",
 ) -> tuple[str, str]:
-    """Create base -> feature branch -> merge; return (baseline, merge commit)."""
+    """Create base -> feature branch -> merge and return (baseline, merge commit)."""
 
     env = _repository_env(keys)
     baseline = _commit(repository, keys, "Baseline")
@@ -408,7 +408,7 @@ def test_allowlisted_merge_requires_all_parents_signed(
 ) -> None:
     env = _repository_env(signing_keys)
     # The unsigned parent is the baseline itself, so it sits outside the verified
-    # range: only the parent check can catch it.
+    # range. Only the parent check can catch it.
     baseline = _commit(repository, signing_keys, "Unsigned baseline", sign=False)
     _run(["git", "checkout", "--quiet", "-b", "feature"], cwd=repository, env=env)
     (repository / "feature.txt").write_text("feature content\n", encoding="utf-8")
@@ -482,8 +482,8 @@ def test_rejects_commit_signed_by_an_expired_key(
     head = _commit(
         repository, signing_keys, "Signed before expiry", fingerprint=expiring
     )
-    # gpg keeps reporting VALIDSIG for this signature once the key expires; only the
-    # EXPKEYSIG status distinguishes it from a good one.
+    # gpg keeps reporting VALIDSIG for this signature after the key expires. Only
+    # the EXPKEYSIG status distinguishes it from a good one.
     _expire_key(signing_keys, expiring)
     status = subprocess.run(
         ["git", "verify-commit", "--raw", head],
@@ -508,8 +508,9 @@ def test_rejects_commit_signed_by_an_expired_key(
 
 
 def test_every_disqualifying_status_is_accounted_for() -> None:
-    # Frozen deliberately: each key is a GnuPG status that accompanies a VALIDSIG,
-    # so dropping one silently downgrades an untrusted signature to a trusted one.
+    # The test pins the whole set. Each key is a GnuPG status that accompanies a
+    # VALIDSIG, so dropping one would silently accept an untrusted signature as
+    # trusted.
     assert set(_DISQUALIFYING_STATUSES) == {"REVKEYSIG", "EXPKEYSIG", "EXPSIG"}
 
 
@@ -584,8 +585,8 @@ def test_allowlisted_merge_checks_parents_beyond_the_first(
     unsigned = _commit(repository, signing_keys, "Unsigned ancestor", sign=False)
     baseline = _commit(repository, signing_keys, "Baseline")
     first_parent = _commit(repository, signing_keys, "Mainline change")
-    # The unsigned commit predates the baseline, so the range walk never sees it; it
-    # is reachable only as the merge's SECOND parent.
+    # The unsigned commit predates the baseline, so it falls outside the range
+    # walk. It is reachable only as the merge's second parent.
     merge = _merge_of_parents(
         repository,
         signing_keys,
@@ -921,8 +922,8 @@ def _workflow_value(text: str, key: str) -> str:
 
 @pytest.mark.parametrize("workflow", ["release.yml", "ci.yml"])
 def test_workflows_pin_the_audited_trust_inputs(workflow: str) -> None:
-    # Pinned by value rather than by shape: a mistyped but well-formed identifier
-    # would otherwise ship with the suite green.
+    # Pinned by value. A shape check would let a mistyped but well-formed
+    # identifier ship with the suite green.
     text = _workflow_text(workflow)
     assert _workflow_value(text, "EXPECTED_FINGERPRINT") == _EXPECTED_FINGERPRINT
     assert _workflow_value(text, "TRUSTED_BASELINE") == _TRUSTED_BASELINE
@@ -954,8 +955,8 @@ def test_release_workflow_fingerprint_matches_the_shipped_key() -> None:
             str(_REPO_ROOT / ".github" / "release-signing-key.asc"),
         ]
     )
-    # The workflow's awk stops at the first fpr line, so the pin has to be the
-    # primary key: a subkey fingerprint would import cleanly and verify nothing.
+    # The workflow's awk stops at the first fpr line, so the pin must be the
+    # primary key. A subkey fingerprint would import cleanly and verify nothing.
     assert fingerprint == _primary_key_fingerprint(listing)
     primary_count = sum(
         1 for line in listing.splitlines() if line.split(":")[0] == "pub"
@@ -972,9 +973,9 @@ def _verifier_invocations(text: str) -> list[str]:
 
 def test_release_workflow_calls_the_extracted_verifier() -> None:
     text = _workflow_text("release.yml")
-    # Flags are matched against the verifier's own commands, not the whole file:
-    # the release-metadata step hands the same --tag "$GITHUB_REF_NAME" to another
-    # script, so a file-wide match stays green after the tag wiring is deleted here.
+    # Flags are matched against the verifier's own commands. The release-metadata
+    # step passes the same --tag "$GITHUB_REF_NAME" to another script, so a
+    # file-wide match would stay green after the tag wiring is deleted here.
     invocations = _verifier_invocations(text)
     assert len(invocations) == 2
     assert all("--allowed-merge-commit" in call for call in invocations)
@@ -1006,10 +1007,10 @@ _CI_SIGNED_HISTORY_GUARD = (
 
 
 def test_ci_workflow_pins_the_signed_history_gate() -> None:
-    # Two shipped documents say CI verifies signed history on every push to main,
-    # and this job is the only thing behind that claim, so the call is pinned flag
-    # by flag: a job that still mentions the script but drops --baseline would pass
-    # a name-only check while verifying nothing.
+    # Two shipped documents say CI verifies signed history on every push to main.
+    # This job is the only thing behind that claim, so the call is pinned flag by
+    # flag. A job that still names the script but drops --baseline would pass a
+    # name-only check while verifying nothing.
     job = _job_text(_workflow_text("ci.yml"), "signed-history")
     invocations = _verifier_invocations(job)
     assert len(invocations) == 1
@@ -1024,9 +1025,9 @@ def test_ci_workflow_pins_the_signed_history_gate() -> None:
         assert flag in call, f"the CI verifier call is missing {flag}"
     # A push event names no tag, so a --tag here could only fail the push it guards.
     assert "--tag" not in call
-    # Pinned whole rather than clause by clause: dropping the repository test would
-    # hand every fork a red job it has no key to make green, and dropping either of
-    # the others would run the gate where $GITHUB_SHA is not the audited history.
+    # Pinned as a whole. Dropping the repository test would give every fork a red
+    # job it has no key to fix. Dropping either of the other clauses would run the
+    # gate on a $GITHUB_SHA other than the audited history.
     assert _CI_SIGNED_HISTORY_GUARD in job
-    # The range walk needs the whole history, not the default shallow clone.
+    # The range walk needs the whole history, and the default checkout is shallow.
     assert "fetch-depth: 0" in job

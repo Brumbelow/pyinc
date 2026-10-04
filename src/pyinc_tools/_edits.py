@@ -32,12 +32,11 @@ def _resolve_import_from_target(
 def _relative_import_anchor(*, importer_module: str, importer_path: str, level: int) -> str | None:
     """Return the dotted-package anchor a relative import resolves against.
 
-    Mirrors :func:`_resolve_import_from_target`'s level math: starts from
-    ``importer_module``, drops the trailing component when the importer is
-    not a package (``__init__.py``), then walks up ``level - 1`` more
-    components. Returns ``None`` when ``level`` overshoots the available
-    package depth, and ``""`` for ``level == 0`` (no anchor — absolute
-    import).
+    Uses the same level math as :func:`_resolve_import_from_target`. It
+    starts from ``importer_module``, drops the last component unless the
+    importer is a package (``__init__.py``), then walks up ``level - 1`` more
+    components. Returns ``None`` when ``level`` exceeds the package depth,
+    and ``""`` for ``level == 0`` (an absolute import has no anchor).
     """
     if level == 0:
         return ""
@@ -54,10 +53,10 @@ def _find_from_module_span(
 ) -> tuple[int, int, int] | None:
     """Locate the dotted-module span of an ``ast.ImportFrom`` in source.
 
-    Returns ``(line_index, start_column, end_column)`` — 0-based — for the
-    ``".".joinedmodule`` portion between ``from`` and ``import`` (including
-    any leading dots). Returns ``None`` when the span can't be located
-    unambiguously on the statement's header line.
+    Returns 0-based ``(line_index, start_column, end_column)`` for the
+    ``".".joinedmodule`` part between ``from`` and ``import``, leading dots
+    included. Returns ``None`` when the span is ambiguous or absent on the
+    statement's header line.
     """
     line_idx = node.lineno - 1
     if not (0 <= line_idx < len(source_lines)):
@@ -85,11 +84,11 @@ def _import_node_for_line(
 ) -> ast.Import | ast.ImportFrom | None:
     """Return the import statement whose line span covers ``lineno``.
 
-    Diagnostics anchor at different points: ``unused-import`` sits on the
-    individual alias line, which in a parenthesised multi-line import is
-    *not* the statement's first line, whereas ``missing-import`` /
-    ``unresolved-symbol`` sit on the statement line. A span-aware lookup
-    (``node.lineno <= lineno <= node.end_lineno``) matches all three; import
+    Diagnostics anchor at different lines. ``unused-import`` sits on the
+    alias line, which in a parenthesised multi-line import can be below the
+    statement's first line. ``missing-import`` and ``unresolved-symbol`` sit
+    on the statement line. The span lookup
+    (``node.lineno <= lineno <= node.end_lineno``) matches all three. Import
     statements never overlap, so at most one node matches.
     """
     if lineno is None:
@@ -104,12 +103,12 @@ def _import_node_for_line(
 def _static_module_all_names(tree: ast.Module) -> frozenset[str]:
     """Names in the module's *static* ``__all__``, or empty when it has none.
 
-    Mirrors the integration's ``static_all_names`` notion: only a literal
-    ``__all__`` list / tuple / set of string constants at module scope
-    counts. A dynamically built or mutated ``__all__`` cannot be inspected
-    statically and yields the empty set (no suppression). Used to leave
-    intentional public re-exports (``from m import foo`` with ``foo`` in this
-    module's own ``__all__``) unflagged.
+    Matches the integration's ``static_all_names``. Only a module-scope
+    ``__all__`` that is a literal list, tuple or set of string constants
+    counts. A dynamically built or mutated ``__all__`` yields the empty set,
+    so nothing is suppressed. Callers use this to leave intentional public
+    re-exports (``from m import foo`` with ``foo`` in this module's
+    ``__all__``) unflagged.
     """
     names: set[str] = set()
     has_static = False
@@ -126,7 +125,7 @@ def _static_module_all_names(tree: ast.Module) -> frozenset[str]:
             continue
         literal: set[str] = set()
         if value is None or not isinstance(value, (ast.List, ast.Set, ast.Tuple)):
-            # A non-literal `__all__` is dynamic — can't confirm membership.
+            # A non-literal `__all__` is dynamic, so membership is unknown.
             return frozenset()
         for item in value.elts:
             if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
@@ -141,17 +140,15 @@ def _statement_line_span(source: str, node: ast.stmt) -> tuple[int, int] | None:
     """Return ``(start_line, end_line)`` for an import statement to delete.
 
     Both values are 0-based LSP-style line indices. ``start_line`` is the
-    statement's first line (``node.lineno - 1``); ``end_line`` is one past
-    the statement's last source line — i.e. the line index where the next
-    statement starts. Pairing the two as ``{start: line_start, end:
-    end_line_start}`` produces an LSP ``TextEdit`` range that removes the
-    statement *including* its trailing newline, so neighbouring lines are
-    not pulled up onto the same physical line.
+    statement's first line (``node.lineno - 1``). ``end_line`` is one past
+    its last source line, where the next statement starts. The pair
+    ``{start: line_start, end: end_line_start}`` gives an LSP ``TextEdit``
+    range that removes the statement *with* its trailing newline, so
+    neighbouring lines keep their own physical lines.
 
-    For an EOF-anchored statement (no trailing newline), ``end_line`` is
-    clamped to the total number of source lines and the column at the end
-    of the last line is folded back into the line index by setting
-    ``end_line == start_line + n``.
+    For a statement at EOF with no trailing newline, ``end_line`` is clamped
+    to the number of source lines. The column at the end of the last line
+    folds back into the line index by setting ``end_line == start_line + n``.
     """
     if node.end_lineno is None:
         return None
@@ -172,16 +169,15 @@ def _alias_list_deletion_edits(
 ) -> list[FileDeletionEdit]:
     """Emit edits that remove specific aliases from an alias-list import.
 
-    Used when only some aliases inside a single ``import a, b, c`` /
-    ``from M import a, b, c`` statement are dead — the surviving aliases
-    keep the statement intact. For each dead alias the edit covers the
-    alias's name + ``as`` clause span plus an adjacent comma so the list
-    stays well-formed afterwards. Adjacent dead aliases are coalesced into one
-    edit so callers never receive overlapping ranges.
+    Used when only some aliases in one ``import a, b, c`` or
+    ``from M import a, b, c`` statement are dead. The surviving aliases keep
+    the statement intact. Each edit covers the alias name, its ``as`` clause
+    and one adjacent comma, so the list stays well-formed. Adjacent dead
+    aliases merge into one edit, so callers never receive overlapping ranges.
 
-    Runs containing aliases whose source positions are missing are skipped
-    (the surviving statement still references the deleted module but at least
-    the file is not mis-edited).
+    A run with an alias that lacks source positions is skipped. The surviving
+    statement then still references the deleted module, but the file is never
+    mis-edited.
     """
     del source  # AST positions are sufficient; the source is unused here.
     edits: list[FileDeletionEdit] = []
@@ -212,7 +208,6 @@ def _alias_list_deletion_edits(
         alias_end_line = last_alias.end_lineno - 1
         alias_end_char = last_alias.end_col_offset
 
-        # Decide which adjacent comma to absorb.
         prev_alive_idx: int | None = None
         for j in range(first_index - 1, -1, -1):
             if j not in dead:
@@ -225,8 +220,8 @@ def _alias_list_deletion_edits(
                 break
 
         if next_alive_idx is not None:
-            # Absorb the trailing comma + whitespace up to the next alive
-            # alias's start, so the surviving alias slides into this slot.
+            # Take the comma and whitespace up to the next live alias, which
+            # then slides into this slot.
             next_alias = aliases[next_alive_idx]
             if next_alias.lineno is None or next_alias.col_offset is None:
                 continue
@@ -242,8 +237,8 @@ def _alias_list_deletion_edits(
                 )
             )
         elif prev_alive_idx is not None:
-            # No surviving alias after us — absorb the preceding comma so
-            # the surviving alias before us doesn't end with a trailing `,`.
+            # This run is last. Take the preceding comma so the live alias
+            # before it has no trailing `,`.
             prev_alias = aliases[prev_alive_idx]
             if prev_alias.end_lineno is None or prev_alias.end_col_offset is None:
                 continue
@@ -259,9 +254,9 @@ def _alias_list_deletion_edits(
                 )
             )
         else:
-            # No surviving sibling at all — caller should have routed this
-            # to the whole-statement removal path, but emit a span-only
-            # edit defensively rather than misbehaving silently.
+            # Every alias is dead. Callers should route this case to
+            # whole-statement removal. As a defensive fallback, delete the
+            # alias span alone so the case never misbehaves silently.
             edits.append(
                 FileDeletionEdit(
                     path=importer_path,

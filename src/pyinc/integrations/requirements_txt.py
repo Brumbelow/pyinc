@@ -112,18 +112,18 @@ class _RequirementsFileResource:
 class _RequirementsFilePresenceResource:
     """Whether a referenced requirements file exists, read as a dependency.
 
-    Asking the filesystem directly is an ambient read the kernel cannot see, so
-    the walk's answer would rest on state it never declared. The probe is the
-    file resource's own, which already answers ``('missing',)`` for every shape
+    A direct filesystem check would be an ambient read the kernel cannot see,
+    and the walk's answer would rest on undeclared state. This resource reuses
+    the file resource's probe, which answers ``('missing',)`` for every shape
     that names no readable file: an absent path, a directory, a path below a
     file.
 
-    A path this library refuses to read answers the same way here. The walk has
-    one thing to say about a reference it cannot read, and the diagnostic at the
-    call site says it -- the same answer the sibling arm already gives a
-    reference that cannot be canonicalized at all. A denial is the shape that
-    reaches this; the other class is caught because a probe owes the kernel a
-    total answer, not because the arms in front of this one let it through.
+    A path this library refuses to read also answers ``('missing',)``. The
+    walk reports every unreadable reference with the diagnostic at the call
+    site, the same one the sibling arm gives a reference that cannot be
+    canonicalized. A ``PermissionError`` is the case that reaches this probe.
+    ``UnsafeFilesystemPathError`` is caught too, because a probe owes the
+    kernel a total answer, even though the earlier arms already stop it.
     """
 
     def read(self, db: Database, path: str | os.PathLike[str]) -> bool:
@@ -156,9 +156,9 @@ _RESOLVED_PATHS = ResolvedPathResource()
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-# Regex pattern strings — kept as strings (not compiled re.Pattern objects)
-# to avoid ambient-capture issues with the query runtime, which cannot freeze
-# compiled Pattern objects.  Each helper compiles locally on first call.
+# Regex patterns stay as strings. The query runtime cannot freeze compiled
+# re.Pattern objects, so compiled module-level patterns would cause
+# ambient-capture issues. Each helper compiles locally on first call.
 
 _REQ_PAT = (
     r"^"
@@ -193,9 +193,9 @@ def _valid_file_reference_path(path: str) -> bool:
 def _normalize_name(name: str) -> str:
     """Fold a package name to the underscore form `RequirementRef.name` carries.
 
-    Runs of `-`, `_`, and `.` collapse to a single underscore and the result is
-    lowercased. That is PEP 503 normalization with underscores where PEP 503
-    specifies hyphens; the evaluation surfaces re-normalize to the hyphen form.
+    Runs of `-`, `_`, and `.` collapse to one underscore, and the result is
+    lowercased. This is PEP 503 normalization with underscores in place of
+    PEP 503's hyphens. The evaluation surfaces re-normalize to the hyphen form.
     """
     return re.sub(r"[-_.]+", "_", name).lower()
 
@@ -235,10 +235,10 @@ def _logical_line_ranges(text: str) -> dict[int, SourceRange]:
 
 
 def _strip_inline_comment(line: str) -> str:
-    """Remove inline comment from a requirement line.
+    """Remove an inline comment from a requirement line.
 
-    Inline comments start with `` #`` (space then hash) that is not
-    inside a quoted marker string.
+    An inline comment starts at `` #`` (space then hash) outside a quoted
+    marker string.
     """
     in_quote: str | None = None
     i = 0
@@ -258,12 +258,12 @@ def _strip_inline_comment(line: str) -> str:
 def _strip_requirement_options(line: str) -> str:
     """Remove pip per-requirement options from a requirement line.
 
-    pip's requirements-file grammar places options such as ``--hash=...``
-    after the requirement, whitespace-separated — pip-compile emits them on
+    pip's requirements-file grammar puts options such as ``--hash=...``
+    after the requirement, separated by whitespace. pip-compile emits them on
     backslash continuation lines, which ``_logical_lines`` joins back into
-    the requirement line.  A ``--`` token never occurs inside a PEP 508
-    requirement, so everything from the first whitespace-delimited ``--``
-    token onward is option text, not specifier text.
+    the requirement line. A PEP 508 requirement never contains a ``--``
+    token, so everything from the first whitespace-delimited ``--`` token
+    onward is option text.
     """
     match = re.search(r"(?:^|\s)--", line)
     if match is None:
@@ -309,7 +309,6 @@ def _parse_requirements(text: str) -> tuple[RequirementPayload, ...]:
             continue
         # Skip option lines and file references
         if stripped.startswith("-") or stripped.startswith("--"):
-            # Check for editable installs
             editable_match = re.match(_EDITABLE_PAT, stripped)
             if editable_match:
                 target = editable_match.group(1).strip()
@@ -394,7 +393,7 @@ def _parse_diagnostics(text: str) -> tuple[DiagnosticPayload, ...]:
         ):
             results.append(("unparseable-line", f"line {lineno}: {stripped}"))
             continue
-        # Known option/directive lines are not diagnostics
+        # Skip known option and directive lines.
         if stripped.startswith(
             (
                 "-r ",
@@ -419,7 +418,6 @@ def _parse_diagnostics(text: str) -> tuple[DiagnosticPayload, ...]:
             )
         ):
             continue
-        # Try parsing as a requirement
         payload = _parse_requirement_line(stripped, lineno)
         if payload is None:
             results.append(("unparseable-line", f"line {lineno}: {stripped}"))
@@ -427,7 +425,7 @@ def _parse_diagnostics(text: str) -> tuple[DiagnosticPayload, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -461,7 +459,7 @@ def requirements_diagnostics_payload(db: Database, path: str) -> tuple[Diagnosti
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition
+# Layer 2: composition
 # ---------------------------------------------------------------------------
 
 
@@ -475,7 +473,7 @@ def requirements_analysis_payload(db: Database, path: str) -> RequirementsAnalys
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: entrypoints
 # ---------------------------------------------------------------------------
 
 
@@ -549,21 +547,22 @@ def workspace_requirements_analysis(
 def deep_requirements_analysis(db: Database, path: str | os.PathLike[str]) -> RequirementsAnalysis:
     """Follow -r/--requirement references recursively, merging all requirements.
 
-    Composes at the entrypoint layer: calls requirements_analysis() for each
-    file in the chain, merges results.  Cycle detection via canonical path set.
-    Constraint files (-c) are noted as file references but not followed.
+    Composes at the entrypoint layer. It calls requirements_analysis() for
+    each file in the chain and merges the results. A set of canonical paths
+    detects cycles. Constraint files (-c) appear as file references, and the
+    walk follows only -r references.
     """
     _reject_in_query(db, "deep_requirements_analysis")
     # Every canonicalization below runs through the tracked path, so each one
-    # declares an edge: retargeting a link anywhere in the chain of files this
-    # walk reaches invalidates the analysis, which a bare `Path.resolve` could
-    # not report because it reaches the live filesystem untracked.
+    # declares an edge. Retargeting a link anywhere in the chain of files this
+    # walk reaches then invalidates the analysis. A bare `Path.resolve` reads
+    # the live filesystem untracked and would miss that.
     #
     # The root is the one the caller named. A root that cannot be canonicalized
-    # names no file, and there is no analysis to answer with -- not even a
-    # containment root to judge references against -- so it is refused. A path
-    # the walk finds *inside* a file is content rather than a request, and is
-    # reported as a missing reference below, the way an absent one already is.
+    # names no file, so there is no analysis to return and no containment root
+    # to judge references against. It is refused. A path the walk finds
+    # *inside* a file is content, so it is reported below as a missing
+    # reference, the same way an absent one is.
     normalized_root = _RESOLVED_PATHS.read(db, os.fspath(path))
     if normalized_root is None:
         raise UnsupportedValueError(f"Path cannot be resolved: {os.fspath(path)}")

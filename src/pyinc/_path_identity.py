@@ -17,13 +17,14 @@ def is_stdlib_path(value: object) -> bool:
 def is_fully_qualified(path: str | bytes, path_module: ModuleType) -> bool:
     r"""Return whether ``path`` names one place whatever the working directory.
 
-    On POSIX that is an absolute path. On Windows it is decided by Windows' own
-    path types rather than by ``ntpath.isabs`` or ``ntpath.splitdrive``, whose
-    answers moved between versions: a drive with a root (``C:\x``), a UNC or
-    device path (``\\server\share``, ``\\?\...``, ``\\.\...``), or the null
-    device, which ``realpath`` answers before it anchors anything. A
-    drive-relative ``C:x`` depends on that drive's working directory and a
-    rooted ``\x`` on the working directory's drive, so neither qualifies.
+    On POSIX that is an absolute path. On Windows the answer follows Windows'
+    own path types, because ``ntpath.isabs`` and ``ntpath.splitdrive`` changed
+    their answers between versions. These qualify: a drive with a root
+    (``C:\x``), a UNC or device path (``\\server\share``, ``\\?\...``,
+    ``\\.\...``), and the null device, which ``realpath`` answers before it
+    anchors anything. A drive-relative ``C:x`` depends on that drive's working
+    directory, and a rooted ``\x`` on the working directory's drive, so neither
+    qualifies.
     """
 
     normalized = path_module.normpath(path)

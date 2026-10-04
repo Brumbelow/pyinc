@@ -95,7 +95,7 @@ def _extract_dep_name_and_spec(specifier: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: Payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -109,7 +109,7 @@ def _declared_deps_payload(db: Database, deps: tuple[str, ...]) -> tuple[tuple[s
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition
+# Layer 2: Composition
 # ---------------------------------------------------------------------------
 
 
@@ -146,7 +146,7 @@ def dependency_check_payload(
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: Entrypoints
 # ---------------------------------------------------------------------------
 
 
@@ -181,10 +181,10 @@ def dependency_check_analysis(
 def workspace_dependency_check(
     db: Database, root: str, declared_deps: tuple[str, ...]
 ) -> DependencyCheckAnalysis:
-    """Full dependency check including undeclared import detection.
+    """Full dependency check, including undeclared-import detection.
 
-    Composes with python_source.workspace_analysis at the entrypoint layer
-    (not the query layer) to detect imports that are installed but not declared.
+    Composes with python_source.workspace_analysis at the entrypoint layer,
+    outside any query, to find imports that are installed but undeclared.
     """
     _reject_in_query(db, "workspace_dependency_check")
 

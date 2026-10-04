@@ -1,11 +1,11 @@
 """Payloads the layer-3 entrypoints read must be tuples of primitives.
 
-Those entrypoints index `db.get(...)` directly instead of thawing it first. That
-is only correct while every payload freezes to plain tuples: `freeze` leaves
-tuples and primitives alone, but a payload aliased as a `dict`, `list`, or `set`
-would come back from a strict-mode `db.get` as a `FrozenDict`/`FrozenList`/
-`FrozenSet` and reach a decoder that indexes it as a tuple. Nothing in the type
-system says a payload alias may not grow such a field, so it is asserted here.
+Those entrypoints index the result of `db.get(...)` directly, without thawing
+it. That works while every payload freezes to plain tuples. `freeze` leaves
+tuples and primitives as they are. A payload aliased as a `dict`, `list`, or
+`set` would come back from a strict-mode `db.get` as a `FrozenDict`/`FrozenList`/
+`FrozenSet` and reach a decoder that indexes it as a tuple. The type system lets
+a payload alias grow such a field, so this module asserts the rule.
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ def test_every_read_payload_is_tuples_of_primitives(workspace: Path) -> None:
 
 
 def test_the_scan_would_catch_a_non_tuple_payload() -> None:
-    # Without this the test above passes trivially if the walk is ever broken.
+    # A broken walk would let the test above pass trivially. This catches it.
     assert _offending_types(("a", 1, (True, None)), "root") == []
     assert _offending_types(("a", {"k": "v"}), "root") == ["root[1]: builtins.dict"]
     assert _offending_types(["a"], "root") == ["root: builtins.list"]

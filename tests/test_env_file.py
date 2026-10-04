@@ -38,9 +38,8 @@ PORT=8080 # the port
 NAME="quoted value" # this comment is inside quotes? no
 """
 
-# The same environment twice: the whole-line comment is reworded to a different
-# length and the quote style changes, and every entry keeps its value and its
-# source range through both.
+# The same environment twice. The whole-line comment changes length and the
+# quote style changes, while every entry keeps its value and source range.
 _UNFORMATTED_ENV = "# aaa\nKEY=value\nOTHER='x'\n"
 _REFORMATTED_ENV = '# a much longer comment body\nKEY=value\nOTHER="x"\n'
 
@@ -61,7 +60,7 @@ def test_package_namespace_exports_env_file_stable_api() -> None:
     assert hasattr(integrations, "EnvEntry")
     assert hasattr(integrations, "EnvFileAnalysis")
 
-    # Experimental helpers must not leak.
+    # Experimental helpers stay private.
     assert not hasattr(integrations, "env_file_text")
     assert not hasattr(integrations, "env_entries_payload")
     assert not hasattr(integrations, "env_analysis_payload")
@@ -87,7 +86,6 @@ def test_env_analysis_extracts_entries(mode: str, tmp_path: Path) -> None:
     keys = {e.key for e in result.entries}
     assert keys == {"DB_HOST", "DB_PORT", "DB_NAME", "SECRET_KEY"}
 
-    # Check specific values
     by_key = {e.key: e for e in result.entries}
     assert by_key["DB_HOST"].value == "localhost"
     assert by_key["DB_HOST"].quoted is False
@@ -139,7 +137,7 @@ def test_env_analysis_strips_inline_comments(mode: str, tmp_path: Path) -> None:
     by_key = {e.key: e for e in result.entries}
     assert by_key["HOST"].value == "localhost"
     assert by_key["PORT"].value == "8080"
-    # Quoted values are not stripped of inline comments
+    # A quoted value is the text between its quotes. Comment stripping skips it.
     assert by_key["NAME"].value == "quoted value"
 
 
@@ -248,7 +246,7 @@ def test_trailing_comment_edit_backdates_env(tmp_path: Path) -> None:
     db = Database()
     first = env_analysis(db, str(path))
 
-    # Change comment text after the entry — source range unchanged
+    # Change the comment after the entry. The source range stays the same.
     path.write_text("KEY=value\n# new comment\n", encoding="utf-8")
     second = env_analysis(db, str(path))
 
@@ -262,7 +260,7 @@ def test_comment_shift_does_not_backdate_env(tmp_path: Path) -> None:
     db = Database()
     first = env_analysis(db, str(path))
 
-    # Prepend a comment — shifts the source range, so this must not backdate.
+    # Prepending a comment shifts the source range, so this must not backdate.
     path.write_text("# new comment\nKEY=value\n", encoding="utf-8")
     second = env_analysis(db, str(path))
 
@@ -308,14 +306,14 @@ _PAYLOAD_QUERIES = ("env_entries_payload", "env_diagnostics_payload")
 def test_a_reformat_recomputes_the_payloads_and_leaves_the_composition_reused(
     mode: str, tmp_path: Path
 ) -> None:
-    # There are two comment classes here and only one of them is narrow. A
+    # There are two comment classes, and only the inline one is narrow. A
     # whole-line comment is skipped before anything is derived from it, so
-    # rewording its body reaches nothing at any length -- which is why this edit
-    # rewrites one to a different length. An inline comment is part of its
-    # entry's own raw line, and the range end is that line's length, so there
-    # only an equal-length rewrite leaves the entry where it was. Adding or
-    # removing a comment line is a third thing again: it moves every following
-    # entry's line number, and the analysis moves with it.
+    # rewording it changes nothing at any length. This edit therefore rewrites
+    # one to a different length. An inline comment is part of its entry's raw
+    # line, and the range ends at that line's length, so only an equal-length
+    # rewrite leaves the entry in place. Adding or removing a comment line is a
+    # third case: it moves every following entry's line number, and the
+    # analysis moves with it.
     path = tmp_path / ".env"
     path.write_text(_UNFORMATTED_ENV, encoding="utf-8")
 
@@ -328,10 +326,9 @@ def test_a_reformat_recomputes_the_payloads_and_leaves_the_composition_reused(
 
     assert first == second, f"a reformat moved the analysis | first {first} | second {second}"
 
-    # `query_profile()` records executions only, and `reset_statistics()` has
-    # just cleared it, so a query that was reused has no row at all -- there is
-    # no row carrying a zero to look for. Labels also carry an argument-hash
-    # suffix, so a lookup by bare query name never matches; match by substring.
+    # `query_profile()` records only executions, and `reset_statistics()` cleared
+    # it, so a reused query has no row at all. Labels carry an argument-hash
+    # suffix, so match the query name as a substring.
     executed = [profile.query_label for profile in db.query_profile()]
     for name in _PAYLOAD_QUERIES:
         assert any(name in label for label in executed), (
@@ -341,10 +338,10 @@ def test_a_reformat_recomputes_the_payloads_and_leaves_the_composition_reused(
         f"env_analysis_payload re-ran instead of staying reused | executed {executed}"
     )
 
-    # Absolute counts for the second read, not deltas: the read executes on the
-    # new bytes, the two payload queries re-derive equal projections and are
-    # backdated, and everything above them is reused. The reuse figure is what
-    # the reformat is supposed to cost nothing on.
+    # Absolute counts for the second read. The read executes on the new bytes,
+    # the two payload queries re-derive equal projections and backdate, and
+    # everything above them is reused. The reuse count shows the reformat costs
+    # nothing above the payloads.
     statistics = db.statistics()
     counts = (
         statistics.query_executions,
@@ -373,12 +370,12 @@ def test_a_reformat_leaves_workspace_discovery_identical(mode: str, tmp_path: Pa
 # Checkpoints
 # ---------------------------------------------------------------------------
 
-# The ordering other integrations use -- edit, drive the entrypoint so a stale
-# answer forms, then save -- is unconstructible here: this read compares the text
-# it hands back, so there is no answer that disagrees with the file to save. The
-# substitute edits the file after the save, which the reload has to notice. The
-# second arm is what keeps that honest: with no edit the saved answer and a fresh
-# one agree, and the row would pass on any tree at all.
+# Other integrations edit, drive the entrypoint so a stale answer forms, and
+# then save. That order is impossible here. This read compares the text it
+# returns, so no saved answer can disagree with the file. This test edits the
+# file after the save, and the reload has to notice. The second arm
+# keeps this meaningful. Without an edit, the saved answer and a fresh one
+# agree, and the row would pass on any tree.
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

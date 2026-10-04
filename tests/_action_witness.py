@@ -1,13 +1,13 @@
 """Filesystem effect witnesses shared by the action reconcile suites.
 
 An assertion that reads only the returned ``ReconcileResult`` can pass while
-the tree or the ledger silently changed underneath it. These helpers record
-what is actually on disk -- kind, identity (st_dev/st_ino), and exact bytes
--- so a refusal test can prove nothing moved and a deletion test can prove
-the report matches the filesystem.
+the tree or the ledger changed underneath it. These helpers record what is on
+disk (kind, identity as st_dev/st_ino, and byte content). A refusal test can then
+prove nothing moved, and a deletion test can prove the report matches the
+filesystem.
 
-A directory that cannot be listed hides its children from the walk: restore
-its permissions before taking a witness, or the witness manufactures a
+The walk skips the children of a directory it cannot list. Restore the
+directory's permissions before taking a witness, or the witness shows a
 phantom diff.
 """
 
@@ -45,7 +45,7 @@ def tree_witness(root: Path) -> TreeWitness:
 
 
 def manifest_bytes(state_dir: Path, tool: str) -> bytes | None:
-    """The ledger's exact bytes, or None while no ledger exists."""
+    """The ledger's bytes, or None while the ledger is absent."""
     try:
         return _manifest_path(state_dir, tool).read_bytes()
     except FileNotFoundError:

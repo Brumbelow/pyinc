@@ -50,8 +50,8 @@ dev = [
   "pytest-xdist>=3.6",
   "ruff>=0.4",
 ]
-# Benchmark-only comparison dependencies. Never imported by src/pyinc or
-# src/pyinc_codegen — used only by the bench/ harness.
+# Benchmark comparison dependencies. Only the bench/ harness imports them.
+# src/pyinc and src/pyinc_codegen never do.
 bench = [
   "joblib>=1.3",
 ]

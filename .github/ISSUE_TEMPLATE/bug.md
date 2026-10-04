@@ -9,7 +9,7 @@ labels: bug
 
 **What you expected**
 
-If a specific document states the expected behavior, please link it.
+If a document states the expected behavior, link it.
 
 **Reproducer**
 

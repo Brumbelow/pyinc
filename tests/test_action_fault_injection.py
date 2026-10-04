@@ -37,7 +37,7 @@ from pyinc.action import Action, _manifest_path
 from pyinc.errors import ActionManifestError, ActionPathError
 
 # ``pyinc`` re-exports the action decorator under the submodule's own name,
-# so the module object is fetched by path rather than by attribute.
+# so fetch the module object by its import path.
 action_module = importlib.import_module("pyinc.action")
 
 
@@ -45,7 +45,7 @@ action_module = importlib.import_module("pyinc.action")
 def test_an_unreadable_ledger_refuses_before_mutation_warm_and_reloaded(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -95,16 +95,16 @@ def test_a_ledger_write_fault_leaves_outputs_published_and_the_next_run_converge
     with pytest.raises(ActionManifestError):
         emit.reconcile(db, root=root)
 
-    # The output landed before the ledger fault; the set is deliberately
-    # not transactional, so the published file stays published.
+    # The output landed before the ledger fault. The set is non-transactional
+    # by design, so the published file stays published.
     assert (root / "out.txt").read_bytes() == b"fresh"
     assert_mutation_fault_invariants(root, root, "fault-ledger-write", None)
 
     disarm()
     result = emit.reconcile(db, root=root)
-    # The repair run finds the bytes already correct and the ledger absent:
-    # it classifies the output unchanged, not created, and publishes the
-    # ledger it could not write before.
+    # The repair run finds the bytes already correct and the ledger absent.
+    # It classifies the output as unchanged (created stays empty) and
+    # publishes the ledger the faulted run failed to write.
     assert result.created == ()
     assert result.unchanged == ("out.txt",)
     assert manifest_bytes(root, "fault-ledger-write") is not None
@@ -133,7 +133,7 @@ def test_a_root_resolution_fault_is_typed_and_touches_nothing(
 
     assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
     disarm()
-    # Entry faults precede everything: the root was never even created.
+    # Entry faults fire first, before the root is even created.
     assert not root.exists()
     result = emit.reconcile(db, root=root)
     assert result.created == ("out.txt",)
@@ -174,7 +174,7 @@ def test_a_root_inspection_fault_is_typed_and_touches_nothing(
 def test_an_unwritable_lock_directory_base_fails_before_any_root_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -233,7 +233,7 @@ def test_a_lock_directory_creation_fault_fails_before_any_root_work(
 def test_a_lock_directory_mode_repair_fault_fails_before_any_root_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("lock directory mode repair does not bite as root")
@@ -250,7 +250,7 @@ def test_a_lock_directory_mode_repair_fault_fails_before_any_root_work(
     disarm = inject_path_method_fault(monkeypatch, "chmod", errno.EPERM, gate=locks_gate)
 
     # The mode repair also runs outside every try reconcile opens, so the
-    # same preparation handler is what types this one.
+    # same preparation handler types this one.
     with pytest.raises(ActionPathError):
         emit.reconcile(db, root=root)
 
@@ -262,8 +262,8 @@ def test_a_lock_directory_mode_repair_fault_fails_before_any_root_work(
     assert stat.S_IMODE(lock_directory.lstat().st_mode) == 0o700
 
 
-# An injected EINTR at this seam behaves as any other OSError; the
-# interpreter retries a real EINTR below it, where it is unobservable.
+# An injected EINTR at this seam behaves like any other OSError. The
+# interpreter retries a real EINTR below the seam, so the seam never sees it.
 @pytest.mark.parametrize("code", FAULT_FAMILIES)
 def test_a_lock_acquisition_fault_is_typed_and_touches_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
@@ -294,8 +294,8 @@ def test_a_lock_acquisition_fault_is_typed_and_touches_nothing(
     assert result.created == ("out.txt",)
 
 
-# An injected EINTR behaves as any other OSError at these preflight seams;
-# the interpreter retries a real EINTR below them, where it is unobservable.
+# An injected EINTR behaves like any other OSError at these preflight seams.
+# The interpreter retries a real EINTR below them, so they never see it.
 @pytest.mark.parametrize("code", FAULT_FAMILIES)
 def test_a_ledger_read_fault_refuses_typed_with_the_tree_and_ledger_intact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
@@ -338,14 +338,14 @@ def inject_root_incarnation_stat_fault(
     """Arm a ``Path.stat`` fault confined to the ``_root_incarnation`` probe.
 
     ``Path.lstat`` delegates to ``Path.stat`` through CPython 3.13, and
-    ``Path.resolve`` ends in a ``stat`` on older ones, so a class-wide
-    ``stat`` patch would also fault the reconcile entry's inspection of the
-    root -- a different seam, with a typed refusal of its own. Swapping
-    ``Path.stat`` in only for the dynamic extent of ``_root_incarnation``
-    keeps the fault at the identity probe and leaves every other seam
-    reading real pathlib. The module attribute is the seam ``_read_manifest``
-    and ``_write_manifest`` both call the probe through; the original
-    function runs underneath, so its own tolerating arm is what answers.
+    ``Path.resolve`` ends in a ``stat`` on older versions. A class-wide
+    ``stat`` patch would therefore also fault the reconcile entry's
+    inspection of the root, a different seam with its own typed refusal.
+    Swapping ``Path.stat`` in only while ``_root_incarnation`` runs keeps the
+    fault at the identity probe, and every other seam reads real pathlib.
+    ``_read_manifest`` and ``_write_manifest`` both call the probe through
+    this module attribute. The original function runs underneath, so its own
+    tolerating arm answers.
     """
     original_incarnation: Callable[[Path], list[int] | None] = (
         action_module._root_incarnation
@@ -387,9 +387,8 @@ def test_a_root_identity_fault_is_tolerated_and_the_run_converges(
     emit.reconcile(db, root=root)
     ledger_before = manifest_bytes(root, tool)
     before = tree_witness(root)
-    # Scoped to the incarnation probe rather than armed class-wide: the
-    # helper's docstring records why the root's stat is the only one that
-    # may fault here.
+    # Scoped to the incarnation probe. The helper's docstring explains why
+    # only the root's stat may fault here.
     disarm = inject_root_incarnation_stat_fault(
         monkeypatch, code, gate=named_gate("fault-root")
     )
@@ -408,7 +407,7 @@ def test_a_root_identity_fault_is_tolerated_and_the_run_converges(
 def test_an_unsearchable_orphan_parent_refuses_during_preflight(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -424,9 +423,9 @@ def test_an_unsearchable_orphan_parent_refuses_during_preflight(
 
     ledger_before = manifest_bytes(root, tool)
     before = tree_witness(root)
-    # lstat needs search permission on the ancestor; the recorded path is
-    # two levels below it, so the probe meets EACCES rather than a benign
-    # missing answer.
+    # lstat needs search permission on the ancestor. The recorded path is
+    # two levels below it, so the probe meets EACCES (a missing answer would
+    # be benign).
     (root / "outer").chmod(0o600)
 
     def refuse(active: Database) -> str:
@@ -456,7 +455,7 @@ def test_an_unsearchable_orphan_parent_refuses_during_preflight(
 def test_an_unlistable_released_directory_refuses_during_preflight(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -479,8 +478,8 @@ def test_an_unlistable_released_directory_refuses_during_preflight(
 
     ledger_before = manifest_bytes(root, tool)
     before = tree_witness(root)
-    # Deciding whether the directory holds nothing but desired outputs needs
-    # a listing, and scandir needs read permission.
+    # Checking whether the directory holds only desired outputs needs a
+    # listing, and scandir needs read permission.
     (root / "pkg").chmod(0o300)
 
     def refuse(active: Database) -> str:
@@ -503,9 +502,9 @@ def test_an_unlistable_released_directory_refuses_during_preflight(
 
     assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
     result = emit.reconcile(db, root=root)
-    # With the listing answerable the orphan reads as already released:
-    # nothing is deleted, both files already carry the desired bytes, and
-    # the fresh ledger records exactly the new layout.
+    # With the listing answerable, the orphan reads as already released. The
+    # run deletes nothing, both files already carry the desired bytes, and
+    # the fresh ledger records the new layout and nothing else.
     assert result.deleted == ()
     assert result.unchanged == ("keep.txt", "pkg/inner.txt")
     ledger_after = manifest_bytes(root, tool)
@@ -541,8 +540,8 @@ def test_a_target_inspection_fault_refuses_typed_before_any_write(
     ):
         emit.plan(db, root=root)
     disarm()
-    # An unanswerable component is fatal for every family but a plain
-    # missing answer, so nothing was written and no ledger was published.
+    # An unanswerable component is fatal for every family except a plain
+    # missing answer, so the run wrote nothing and published no ledger.
     # Read the tree back only with the class-wide hook disarmed.
     assert list(root.iterdir()) == []
     assert manifest_bytes(root, tool) is None
@@ -554,7 +553,7 @@ def test_a_target_inspection_fault_refuses_typed_before_any_write(
 def test_an_unreadable_orphan_refuses_typed_during_preflight(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -614,9 +613,9 @@ def test_an_orphan_ownership_read_fault_refuses_with_nothing_mutated(
         monkeypatch, "read_regular_file", code, gate=named_gate("orphan.txt")
     )
 
-    # The ownership read carries its own refusal now, so every injected
-    # family arrives typed. No message is pinned: the wording is whatever the
-    # failed read composed, and that spelling parts by platform.
+    # The ownership read carries its own refusal, so every injected family
+    # arrives typed. The message stays unpinned because the failed read
+    # composes it and its wording varies by platform.
     def refuse(active: Database) -> str:
         with pytest.raises(ActionPathError) as caught:
             emit.reconcile(active, root=root)
@@ -635,7 +634,7 @@ def test_an_orphan_ownership_read_fault_refuses_with_nothing_mutated(
 def test_an_unreadable_output_refuses_typed_during_preflight(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -696,9 +695,9 @@ def test_a_desired_state_read_fault_refuses_with_nothing_mutated(
         monkeypatch, "read_regular_file", code, gate=named_gate("out.txt")
     )
 
-    # The desired-state read carries its own refusal now, so every injected
-    # family arrives typed. No message is pinned: the wording is whatever the
-    # failed read composed, and that spelling parts by platform.
+    # The desired-state read carries its own refusal, so every injected
+    # family arrives typed. The message stays unpinned because the failed
+    # read composes it and its wording varies by platform.
     def refuse(active: Database) -> str:
         with pytest.raises(ActionPathError) as caught:
             emit.reconcile(active, root=root)
@@ -728,7 +727,7 @@ def test_an_orphan_that_vanishes_in_the_deletion_window_is_not_reported_deleted(
     original_read = action_module.read_regular_file_with_identity
 
     def vanish_inside_the_window(path: Path, **kwargs: object) -> object:
-        # The preflight read classified the orphan deletable; it vanishes
+        # The preflight read classified the orphan deletable. It vanishes
         # before the last-moment verification, which then reads None.
         if path.name == "orphan.txt" and target.exists():
             target.unlink()
@@ -739,17 +738,17 @@ def test_an_orphan_that_vanishes_in_the_deletion_window_is_not_reported_deleted(
     )
     result = emit.reconcile(db, root=root)
 
-    # The action reports only its own removals: the entry vanished under
-    # someone else's hand, so deleted stays empty even though the path is
-    # gone -- and the claim is still released by the fresh ledger.
+    # The action reports only its own removals. Someone else removed the
+    # entry, so deleted stays empty even though the path is gone. The fresh
+    # ledger still releases the claim.
     assert result.deleted == ()
     assert not target.exists()
     ledger = manifest_bytes(root, tool)
     assert ledger is not None and b"orphan.txt" not in ledger
 
 
-# An injected EINTR behaves as any other OSError at these mutation seams;
-# the interpreter retries a real EINTR below them, where it is unobservable.
+# An injected EINTR behaves like any other OSError at these mutation seams.
+# The interpreter retries a real EINTR below them, so they never see it.
 @pytest.mark.parametrize("code", FAULT_FAMILIES)
 def test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
@@ -773,9 +772,9 @@ def test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touche
         gate=named_gate("orphan.txt"),
     )
 
-    # The deletion window carries its own refusal now, so every injected
-    # family arrives typed. No message is pinned: the wording is whatever the
-    # failed verification composed, and that spelling parts by platform.
+    # The deletion window carries its own refusal, so every injected family
+    # arrives typed. The message stays unpinned because the failed
+    # verification composes it and its wording varies by platform.
     def refuse(active: Database) -> str:
         with pytest.raises(ActionPathError) as caught:
             emit.reconcile(active, root=root)
@@ -784,7 +783,7 @@ def test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touche
     assert_refusal_replays_after_checkpoint(source, spec, store, db, refuse)
 
     # The verification is the first mutation step, so this single-orphan
-    # fixture is byte-identical too: nothing was deleted, pruned, or written.
+    # fixture is byte-identical too. The run deleted, pruned and wrote nothing.
     assert_tree_and_ledger_unchanged(root, root, tool, before, ledger_before)
     assert_no_tmp_residue(root)
 
@@ -797,7 +796,7 @@ def test_a_deletion_verification_fault_stops_the_run_before_the_orphan_is_touche
 def test_an_undeletable_orphan_stops_the_run_and_the_next_run_deletes_it(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -818,9 +817,10 @@ def test_an_undeletable_orphan_stops_the_run_and_the_next_run_deletes_it(
     (root / "sub").chmod(0o555)
 
     # The unlink sits inside the typed wrap, so the refusal arrives typed
-    # carrying whatever the failed removal said -- the entry's bare name
+    # with whatever the failed removal said. That is the entry's bare name
     # where the removal is pinned to an open parent directory, and a whole
-    # path where the platform has no such handle, so no message is pinned.
+    # path where the platform lacks such a handle. The message stays
+    # unpinned because of that difference.
     def refuse(active: Database) -> str:
         with pytest.raises(ActionPathError) as caught:
             emit.reconcile(active, root=root)
@@ -861,8 +861,8 @@ def test_an_unlink_fault_stops_the_run_with_the_orphan_and_ledger_intact(
     )
 
     # The removal sits inside the typed wrap, so every injected family
-    # arrives typed. No message is pinned: the wording is whatever the failed
-    # removal composed, and that spelling parts by platform.
+    # arrives typed. The message stays unpinned because the failed removal
+    # composes it and its wording varies by platform.
     def refuse(active: Database) -> str:
         with pytest.raises(ActionPathError) as caught:
             emit.reconcile(active, root=root)
@@ -884,7 +884,7 @@ def test_an_unlink_fault_stops_the_run_with_the_orphan_and_ledger_intact(
 def test_a_mid_set_deletion_fault_preserves_the_performed_order_across_runs(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -923,8 +923,8 @@ def test_a_mid_set_deletion_fault_preserves_the_performed_order_across_runs(
     before = tree_witness(root)
     result = emit.reconcile(db, root=root)
     after = tree_witness(root)
-    # The repair run deletes the remainder in the same sorted order --
-    # the report's tuple order is part of the matrix.
+    # The repair run deletes the remainder in the same sorted order. The
+    # report's tuple order is part of the matrix.
     assert result.deleted == ("three/c.txt", "two/b.txt")
     assert_deleted_equals_removed(result, before, after)
 
@@ -951,9 +951,9 @@ def test_a_prune_fault_after_deletions_is_typed_and_the_next_run_converges(
     ):
         emit.reconcile(db, root=root)
 
-    # Phase-keyed: the orphan deletion already ran and STAYS run -- each
-    # step is atomic, the set deliberately is not -- while the ledger is
-    # still the old one and nothing torn is left behind.
+    # Phase-keyed: the orphan deletion already ran and STAYS run. Each step
+    # is atomic, and the set is non-transactional by design. The ledger is
+    # still the old one and no torn file is left behind.
     assert not (root / "pkg" / "inner.txt").exists()
     assert (root / "pkg").is_dir()
     assert_mutation_fault_invariants(root, root, tool, ledger_before)
@@ -969,7 +969,7 @@ def test_a_prune_fault_after_deletions_is_typed_and_the_next_run_converges(
 def test_an_unwritable_root_stops_publication_with_the_stale_bytes_intact(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -979,7 +979,7 @@ def test_an_unwritable_root_stops_publication_with_the_stale_bytes_intact(
     emit, source = input_driven_action(tool)
     db = Database("strict", store=InMemoryArtifactStore())
     db.set(source, desired_spec({"out.txt": "fresh"}))
-    # Bytes standing at the target that no ledger ever claimed.
+    # Unclaimed bytes already standing at the target.
     output = root / "out.txt"
     output.write_bytes(b"stale")
 
@@ -991,15 +991,15 @@ def test_an_unwritable_root_stops_publication_with_the_stale_bytes_intact(
         root.chmod(0o755)
 
     # Publication opens its temporary beside the target, so an unwritable
-    # parent stops the very first step: no temporary was ever created and
-    # the bytes that were there are the bytes still there.
+    # parent stops the first step. No temporary was created and the
+    # original bytes are still there.
     assert output.read_bytes() == b"stale"
     assert manifest_bytes(root, tool) is None
     assert_no_tmp_residue(root)
 
     result = emit.reconcile(db, root=root)
-    # Unowned pre-existing bytes classify as an update, not a creation: the
-    # target exists with different content and the previous claims are empty.
+    # Unowned pre-existing bytes classify as an update. The target exists
+    # with different content and the previous claims are empty.
     assert result.updated == ("out.txt",)
     assert output.read_bytes() == b"fresh"
 
@@ -1008,7 +1008,7 @@ def test_an_unwritable_root_stops_publication_with_the_stale_bytes_intact(
 def test_an_unwritable_root_stops_parent_creation_with_nothing_created(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -1054,8 +1054,8 @@ def test_a_publication_fault_leaves_no_temporary_and_the_next_run_converges(
     with pytest.raises(ActionPathError):
         emit.reconcile(db, root=root)
 
-    # The replacement never reached the target: the published bytes are the
-    # old ones, the ledger is the old one, and no temporary survives.
+    # The replacement never reached the target. The published bytes and the
+    # ledger are the old ones, and no temporary survives.
     assert (root / "out.txt").read_bytes() == b"old"
     assert_mutation_fault_invariants(root, root, tool, ledger_before)
 
@@ -1069,7 +1069,7 @@ def test_a_publication_fault_leaves_no_temporary_and_the_next_run_converges(
 def test_a_read_only_state_directory_leaves_outputs_published_and_the_ledger_old(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -1090,9 +1090,9 @@ def test_a_read_only_state_directory_leaves_outputs_published_and_the_ledger_old
     finally:
         state.chmod(0o755)
 
-    # The output published before the ledger write faulted; the ledger is
-    # the old one and the repair run classifies the already-correct bytes
-    # unchanged.
+    # The output published before the ledger write faulted. The ledger is
+    # the old one, and the repair run classifies the already-correct bytes
+    # as unchanged.
     assert (root / "out.txt").read_bytes() == b"two"
     assert_mutation_fault_invariants(root, state, tool, ledger_before)
     result = emit.reconcile(db, root=root, state_dir=state)
@@ -1122,14 +1122,14 @@ def test_a_ledger_write_fault_during_a_voiding_run_leaves_the_void_unpersisted(
     with pytest.raises(ActionManifestError):
         emit.reconcile(db, root=root, state_dir=state)
 
-    # The voiding decision could not be persisted: the ledger still holds
-    # the dead claims and the dead incarnation, and nothing was deleted.
+    # The voiding decision failed to persist. The ledger still holds the
+    # dead claims and the dead incarnation, and the run deleted nothing.
     assert manifest_bytes(state, tool) == ledger_before
     assert list(root.iterdir()) == []
 
     disarm()
-    # The next run voids again -- and this time persists: fresh adoption,
-    # live incarnation, no claims, and the renamed-aside bytes stay safe.
+    # The next run voids again and this time persists it: fresh adoption,
+    # live incarnation, empty claims, and the renamed-aside bytes stay safe.
     emit.reconcile(db, root=root, state_dir=state)
     persisted = json.loads(manifest_bytes(state, tool) or b"{}")
     assert persisted["outputs"] == {}
@@ -1166,7 +1166,7 @@ def _window_replacement_run(
     original_unlink = action_module.unlink_regular_file
 
     def replace_inside_the_window(path: Path, **kwargs: object) -> bool:
-        # Fires between the ownership read and the unlink -- the window.
+        # Fires in the window between the ownership read and the unlink.
         if path.name == "inner.txt":
             foreign = tmp_path / "replacement"
             foreign.write_bytes(replacement)
@@ -1194,9 +1194,9 @@ def test_a_window_replacement_inside_a_pruned_directory_aborts_then_refuses_pref
     before = tree_witness(root)
 
     # Stage 1: the unlink declines the replaced entry, the directory is
-    # not empty at the prune, and the run aborts typed mid-mutation.
-    # The match stops at the bracket opening the OS error: this refusal
-    # wraps a real OSError, which spells itself [Errno N] on POSIX and
+    # non-empty at the prune, and the run aborts typed mid-mutation.
+    # The match stops at the bracket that opens the OS error. This refusal
+    # wraps a real OSError, which reads [Errno N] on POSIX and
     # [WinError N] on Windows.
     with pytest.raises(
         ActionPathError,
@@ -1206,9 +1206,9 @@ def test_a_window_replacement_inside_a_pruned_directory_aborts_then_refuses_pref
 
     after = tree_witness(root)
     installed = target.stat()
-    # The only difference against the pre-call tree is the replacement
-    # itself; the desired file was never written (deletions and prunes
-    # precede writes), and the ledger is byte-unchanged.
+    # The only difference from the pre-call tree is the replacement itself.
+    # The desired file was never written (deletions and prunes precede
+    # writes), and the ledger is byte-unchanged.
     assert {k: v for k, v in after.items() if k != "pkg/inner.txt"} == {
         k: v for k, v in before.items() if k != "pkg/inner.txt"
     }
@@ -1217,10 +1217,10 @@ def test_a_window_replacement_inside_a_pruned_directory_aborts_then_refuses_pref
     assert manifest_bytes(root, tool) == ledger_before
     assert (root / "pkg").is_dir()
 
-    # Stage 2: with no injection, the next run refuses during preflight --
-    # the survivor's bytes drifted from the recorded digest, so it is not
-    # deletable and the prune preflight names it; plan() and reconcile()
-    # agree, pre-mutation.
+    # Stage 2: with the injection removed, the next run refuses during
+    # preflight. The survivor's bytes drifted from the recorded digest, so
+    # it is undeletable and the prune preflight names it. plan() and
+    # reconcile() agree, before any mutation.
     disarm()
     ledger_stage2 = manifest_bytes(root, tool)
     stage2 = tree_witness(root)
@@ -1249,10 +1249,9 @@ def test_a_byte_identical_window_survivor_inside_a_pruned_directory_is_deleted_n
     ledger_before = manifest_bytes(root, tool)
     before = tree_witness(root)
 
-    # The abort is the same as the drifted replacement's: the unlink
-    # declines the replaced entry and the directory is not empty at the
-    # prune, and the match stops at the OS error's opening bracket for the
-    # same reason.
+    # The abort matches the drifted replacement's: the unlink declines the
+    # replaced entry and the directory is non-empty at the prune. The match
+    # stops at the OS error's opening bracket for the same reason.
     with pytest.raises(
         ActionPathError,
         match="Cannot prune directory 'pkg' left by the previous layout: \\[",
@@ -1263,8 +1262,8 @@ def test_a_byte_identical_window_survivor_inside_a_pruned_directory_is_deleted_n
     assert {k: v for k, v in after.items() if k != "pkg/inner.txt"} == {
         k: v for k, v in before.items() if k != "pkg/inner.txt"
     }
-    # Identity is compared DELIBERATELY: the replacement carries the same
-    # bytes, so a bytes-only witness cannot see it at all.
+    # Identity is compared because the replacement carries the same bytes,
+    # so a bytes-only witness would miss it.
     assert after["pkg/inner.txt"][3] == before["pkg/inner.txt"][3] == b"nested"
     assert after["pkg/inner.txt"][1:3] != before["pkg/inner.txt"][1:3]
     assert manifest_bytes(root, tool) == ledger_before
@@ -1272,10 +1271,9 @@ def test_a_byte_identical_window_survivor_inside_a_pruned_directory_is_deleted_n
 
     disarm()
     result = emit.reconcile(db, root=root)
-    # Across runs the recorded digest decides ownership; the intra-run
-    # identity protection ended with the aborted run, whose claim was
-    # never released. The byte-identical survivor is therefore deleted
-    # and the migration completes.
+    # Across runs the recorded digest decides ownership. The intra-run
+    # identity protection ended with the aborted run, which kept its claim.
+    # So the byte-identical survivor is deleted and the migration completes.
     assert result.deleted == ("pkg/inner.txt",)
     assert result.created == ("pkg",)
     assert (root / "pkg").read_bytes() == b"now a file"
@@ -1309,10 +1307,10 @@ def test_a_byte_identical_window_survivor_in_a_plain_deletion_is_durably_safe(
     first = emit.reconcile(db, root=root)
     monkeypatch.setattr(action_module, "unlink_regular_file", original_unlink)
 
-    # No prune is involved, so the run COMPLETES: the ledger write
-    # releases the claim, and the survivor is nobody's to delete --
-    # durably, unlike the same survivor inside a pruned directory, where
-    # the aborted run keeps the claim and the next run deletes it.
+    # With no prune involved, the run COMPLETES. The ledger write releases
+    # the claim, so the survivor stays out of every later run's reach.
+    # Inside a pruned directory the same survivor behaves differently: the
+    # aborted run keeps the claim and the next run deletes it.
     assert first.deleted == ()
     survivor = target.stat()
     assert (survivor.st_dev, survivor.st_ino) != (verified.st_dev, verified.st_ino)
@@ -1383,7 +1381,7 @@ def test_a_non_regular_lock_path_refuses_with_a_typed_error(
             emit.reconcile(db, root=root)
         assert list(root.iterdir()) == []
     finally:
-        lock_path.unlink()  # the lock directory is shared; leave it clean
+        lock_path.unlink()  # the lock directory is shared, so leave it clean
 
 
 _FS_CALLEES = frozenset({
@@ -1404,9 +1402,9 @@ OS_CALLS = frozenset({
 })
 
 #: Every attribute-call name in the module, frozen. A new method call of
-#: ANY name fails here first: if it touches the filesystem, register a
-#: fault cell and add the callee to _FS_CALLEES; either way, extend this
-#: inventory deliberately.
+#: ANY name fails here first. If it touches the filesystem, register a
+#: fault cell and add the callee to _FS_CALLEES. Either way, add the name
+#: to this inventory.
 METHOD_CALL_NAMES = frozenset({
     "S_IMODE", "S_ISDIR", "S_ISLNK", "S_ISREG", "_desired_map",
     "_reconcile_locked", "acquire", "append", "as_posix", "casefold",
@@ -1422,7 +1420,7 @@ METHOD_CALL_NAMES = frozenset({
 
 def _action_ast() -> ast.Module:
     # Fetching the module by path types it as a plain module object, whose
-    # ``__file__`` is optional; the action layer is always file-backed.
+    # ``__file__`` is optional. The action layer is always file-backed.
     source = action_module.__file__
     assert source is not None
     return ast.parse(Path(source).read_text(encoding="utf-8"))
@@ -1497,12 +1495,11 @@ def _imported_names() -> frozenset[str]:
     """Every name the action module binds by importing it.
 
     The four inventories above see attribute calls and a fixed list of
-    bare names, so a filesystem primitive imported by name from anywhere
-    but the safe-filesystem module and called as a plain name is invisible
-    to all of them. Freezing what the module imports closes that by
-    construction rather than by enumeration: a new import fails here
-    first, and whoever adds it decides then whether it touches the
-    filesystem.
+    bare names. A filesystem primitive imported by name from outside the
+    safe-filesystem module and called as a plain name would slip past all
+    of them. Freezing what the module imports closes that gap by
+    construction: a new import fails here first, and whoever adds it
+    decides then whether it touches the filesystem.
     """
     names: set[str] = set()
     for node in ast.walk(_action_ast()):
@@ -1513,12 +1510,12 @@ def _imported_names() -> frozenset[str]:
     return frozenset(names)
 
 
-#: Every name the action module imports, frozen. This set is DERIVED by
-#: running _imported_names() against the module and pasting its sorted
-#: output -- never transcribed by hand, because a hand-written entry pins
-#: what someone believed rather than what the module imports. A new import
-#: fails here first, and whoever adds it decides then whether it touches
-#: the filesystem and so needs a fault cell.
+#: Every name the action module imports, frozen. This set is DERIVED: run
+#: _imported_names() against the module and paste its sorted output. Never
+#: write it by hand, because a hand-written entry pins what someone
+#: believed the module imports. A new import fails here first, and whoever
+#: adds it decides then whether it touches the filesystem and so needs a
+#: fault cell.
 IMPORTED_NAMES = frozenset({
     "ActionLockTimeoutError", "ActionManifestError", "ActionPathError", "Any",
     "Callable", "Collection", "Database", "FileLock", "Iterable", "Mapping",
@@ -1541,8 +1538,8 @@ def _resolve_cell(reference: str) -> object:
 
 #: Every filesystem call site in pyinc.action, keyed
 #: (enclosing function, callee) -> (call count, fault cells).
-#: Cells named bare live in this module; "file.py::name" cells live in the
-#: named suite. A new fs call site -- a new pair OR a changed count --
+#: Bare cell names live in this module, and "file.py::name" cells live in
+#: the named suite. A new fs call site (a new pair OR a changed count)
 #: fails the inventory test until a cell is registered here.
 FAULT_REGISTRY: dict[tuple[str, str], tuple[int, tuple[str, ...]]] = {
     ("reconcile", "resolve"): (2, (
@@ -1754,8 +1751,8 @@ def test_no_unlisted_import_enters_the_action_layer() -> None:
 
 
 def test_every_public_safe_fs_seam_reached_by_actions_is_registered() -> None:
-    # open_lock_file is reached through the lock machinery rather than an
-    # action.py import; a new _safe_fs import lands here first.
+    # The action layer reaches open_lock_file through the lock machinery,
+    # outside action.py's imports. A new _safe_fs import lands here first.
     assert set(SAFE_FS_SEAMS) == _safe_fs_imports() | {"open_lock_file"}
 
 

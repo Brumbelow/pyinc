@@ -31,15 +31,15 @@ _sys_trace = _SysTrace()
 
 
 def _install_counter(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
-    # Swapping in a counting replacement for identifier_tokens won't work:
-    # pyinc's query layer fingerprints every callable a query transitively
-    # reaches, including a monkeypatched one, and folds in any mutable state
-    # it closes over so a changed source module can't hide behind it (see
-    # "Mutable closure/global rejection" in docs/kernel-contract.md). That
-    # means the counter's own value would become part of source_ranges_for_file's
-    # identity and change it on every increment, defeating the very caching
-    # this test verifies. A trace hook counts real calls to the original,
-    # untouched function without pyinc ever seeing it.
+    # Count with a trace hook. pyinc's query layer fingerprints every callable
+    # a query transitively reaches, monkeypatched ones included. It also folds
+    # in any mutable state those callables close over, so a changed source
+    # module can't hide behind them (see "Mutable closure/global rejection" in
+    # docs/kernel-contract.md). A counting replacement for identifier_tokens
+    # would put the counter's value into source_ranges_for_file's identity and
+    # change it on every increment, defeating the caching this test checks. A
+    # trace hook counts real calls to the original function, out of pyinc's
+    # sight.
     counter = {"n": 0}
     target_code = identifier_tokens.__code__
 
@@ -67,7 +67,7 @@ def test_single_tokenization_per_file(tmp_path: Path, monkeypatch: pytest.Monkey
     counter = _install_counter(monkeypatch)
     db = Database(mode="strict")
     workspace_analysis(db, tmp_path)
-    # One tokenization per file, NOT one per definition (alpha has 3 defs).
+    # One tokenization per file. alpha has 3 defs and still tokenizes once.
     assert counter["n"] == 2
 
 
@@ -103,7 +103,7 @@ def test_ranges_still_precise_after_caching(tmp_path: Path) -> None:
     db = Database(mode="strict")
     result = file_analysis(db, tmp_path / "alpha.py")
     one = next(d for d in result.definitions if d.name == "one")
-    # "def one():" -- the name range covers exactly the identifier.
+    # In "def one():", the name range covers only the identifier.
     assert (one.range.start.line, one.range.start.character) == (0, 4)
     assert (one.range.end.line, one.range.end.character) == (0, 7)
 

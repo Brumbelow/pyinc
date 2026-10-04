@@ -1,14 +1,14 @@
 """Hostile filesystem shapes and a bounded-time runner for the suites.
 
-A test that hands the library a FIFO must fail loudly rather than hang the
-run, so the call under test runs in a forked child with a hard budget and a
-child that outlives it is reported as a block. Forking is the mechanism
-because it needs no import of the tree under test in a subprocess and no
-temporary module: the child inherits the parent's imports exactly.
+A test that hands the library a FIFO must fail loudly and never hang the run.
+So the call under test runs in a forked child with a hard budget, and a child
+that outlives it is reported as a block. Forking is used because it needs no
+import of the tree under test in a subprocess and no temporary module. The
+child inherits the parent's imports as they are.
 
-Every shape here is POSIX-only to build, so the factory skips rather than
-fails where the platform has no such thing. Permission-shaped fixtures also
-skip for a root euid, where a mode of 0o000 denies nothing.
+Every shape here needs POSIX to build, so the factory skips where the
+platform lacks the shape. Permission-shaped fixtures also skip for a root
+euid, where a mode of 0o000 denies nothing.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-#: A call that has not returned by now is not going to.
+#: A call still running after this many seconds is treated as blocked.
 BUDGET_SECONDS = 5.0
 
 #: Marks a cell whose fixture only exists on POSIX.
@@ -48,9 +48,9 @@ def make_fifo(path: Path) -> Path:
 
 
 def make_socket(path: Path) -> tuple[Path, socket.socket]:
-    """Bind a listening unix socket at ``path``; the caller closes it.
+    """Bind a listening unix socket at ``path``. The caller closes it.
 
-    Bound through a relative name after chdir because ``sun_path`` is
+    Binds through a relative name after chdir, because ``sun_path`` is
     length-capped and a pytest tmp_path can exceed the cap.
     """
     if not hasattr(socket, "AF_UNIX"):
@@ -73,7 +73,7 @@ def character_device() -> str:
 
 
 def make_symlink_loop(path: Path) -> Path:
-    """Create a two-link cycle at ``path``; returns ``path``."""
+    """Create a two-link cycle at ``path`` and return ``path``."""
     partner = path.with_name(path.name + "-partner")
     try:
         os.symlink(partner, path)
@@ -91,11 +91,11 @@ def nul_path(base: Path) -> str:
 def within_budget(call: Callable[[], Any], *, budget: float = BUDGET_SECONDS) -> str:
     """Run ``call`` in a forked child and report how it ended.
 
-    Returns "returned", "raised: <TypeName>", or "BLOCKED". The value itself
-    is deliberately not returned: a cell that needs the value asserts it in
+    Returns "returned", "raised: <TypeName>", or "BLOCKED". The call's value
+    stays in the child on purpose. A cell that needs the value asserts it in
     the parent, on a shape that cannot block.
     """
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. Callers skip Windows.
         pytest.skip("POSIX only")
     if not hasattr(os, "fork"):
         pytest.skip("os.fork is unavailable on this platform")

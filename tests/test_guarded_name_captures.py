@@ -1,14 +1,14 @@
 """A query may capture a name the ambient-read guard replaced, by any route.
 
-Once a `Database` exists, `from os import getcwd` binds the guard's wrapper
-rather than the builtin. The wrapper is a closure over pyinc's own state -- the
-active guards, the working-directory flag, the original it calls -- which the
-capture walk cannot fold, so the kernel recognises every callable the guard
-installed and pins a capture of one by the standard-library callable it
-guards: that callable's module and qualified name, its module's identity, and
-the interpreter build. These cells pin the registry, every route a capture
-takes, the preview, and that a name bound before the first `Database` -- the
-unguarded original -- fingerprints exactly as it did.
+Once a `Database` exists, `from os import getcwd` binds the guard's wrapper in
+place of the builtin. The wrapper is a closure over pyinc's own state (the
+active guards, the working-directory flag, the original it calls), which the
+capture walk cannot fold. So the kernel recognises every callable the guard
+installed. It pins a capture of one by the standard-library callable it guards:
+that callable's module and qualified name, its module's identity, and the
+interpreter build. These cells pin the registry, every route a capture takes,
+and the preview. They also pin that a name bound before the first `Database`
+(the unguarded original) fingerprints as it did before.
 """
 
 from __future__ import annotations
@@ -35,10 +35,11 @@ from pyinc import runtime as pyinc_runtime
 from pyinc.runtime import _GUARDED_NAMES, _guarded_name, _GuardedEnviron, _is_guarded_name
 from pyinc.value import fingerprint_snapshot
 
-# Each guarded callable: the line that binds it as `W`, a call through `{f}`
-# whatever route reached it, and the same call spelled through its module,
-# which is what the guard refuses or answers today. `arg` is the query's
-# argument: a directory holding `sample.txt`, or `relative`.
+# Each guarded callable maps to three strings: the line that binds it as `W`, a
+# call through `{f}` whatever route reached it, and the same call spelled
+# through its module. The guard refuses or answers that last spelling today.
+# `arg` is the query's argument: either a directory holding `sample.txt`, or
+# `relative`.
 _GUARDED: dict[str, tuple[str, str, str]] = {
     "builtins.open": (
         "from builtins import open as W",
@@ -80,9 +81,10 @@ if sys.platform != "win32":
         "os.getenvb",
     )
 
-# The module every generated query module starts with: the modules the
-# baseline spellings name, and a helper that starts a thread through whatever
-# `start` it is handed and reports what a raw read inside it met.
+# The prelude of every generated query module. It imports the modules the
+# baseline spellings name, and defines a helper that starts a thread through
+# whatever `start` it is handed. The helper reports what a raw read inside the
+# thread met.
 _PRELUDE = """\
 import builtins
 import io
@@ -154,9 +156,10 @@ _ROUTE_HANDLES = {
     "handle-attribute": "f",
     "class-attribute": "f",
 }
-# Every name on every route, but `Path.cwd` held in a class body: it reads as
-# a bound method, and `staticmethod` of a bound method is not a Python
-# function's descriptor, which a class body is folded through for any method.
+# Every name on every route, except `Path.cwd` held in a class body. `Path.cwd`
+# reads as a bound method. A class body is folded through a Python function's
+# descriptor for any method, and `staticmethod` of a bound method is no such
+# descriptor.
 _CAPTURES = [
     (label, route)
     for label in sorted(_GUARDED)
@@ -222,10 +225,10 @@ def test_a_captured_guard_wrapper_fingerprints_and_still_guards(
 ) -> None:
     """Every guarded callable, captured by every route, fingerprints and behaves as the guarded call.
 
-    Before, each of these raised `UnsupportedValueError` at fingerprinting --
-    `getcwd` and `getcwdb` among them, which fingerprinted as builtins until
+    Before, each of these raised `UnsupportedValueError` at fingerprinting.
+    That included `getcwd` and `getcwdb`, which fingerprinted as builtins until
     the working-directory guard replaced them. A capture now answers, or is
-    refused, exactly as the same call through its module is.
+    refused, as the same call through its module is.
     """
     binding, call, _spelled = _GUARDED[label]
     binding_module = module_factory("from pyinc import query\n" + binding + "\n")
@@ -249,7 +252,7 @@ def test_a_captured_guard_wrapper_fingerprints_and_still_guards(
         assert _outcome(captured, arg) == _outcome(baseline, arg)
 
 
-# What the guard does with each call made through its module: the refusal
+# What the guard does with each call made through its module. The refusal
 # names the call, and `realpath` and `abspath` answer for a fully qualified
 # path. A thread a query starts meets the guard on its own raw read.
 _REFUSED_AS = {
@@ -270,9 +273,9 @@ _REFUSED_AS = {
 def test_the_outcomes_compared_above_are_the_guards_own(
     module_factory: Callable[[str], ModuleType], sample_directory: Path, label: str
 ) -> None:
-    """The cells above compare a capture with the guarded call; this pins what that call does.
+    """Pin the guarded call's own outcome, which the cells above compare captures with.
 
-    Two refusals for the same wrong reason would compare equal as well.
+    Two refusals for the same wrong reason would also compare equal.
     """
     baseline = _baseline(label, module_factory)
     outcome = _outcome(baseline, str(sample_directory))
@@ -291,13 +294,13 @@ def test_the_outcomes_compared_above_are_the_guards_own(
 
 
 def test_every_callable_the_guard_installs_is_registered(tmp_path: Path) -> None:
-    """The registry is exactly the callables the guard put in place, each beside its original.
+    """The registry matches the callables the guard put in place, each beside its original.
 
     Every function defined in `pyinc.runtime` that sits where a standard-library
-    callable did is a registered wrapper, and the entry names the original's
-    own module and qualified name. The two environment mappings are the only
-    other objects the guard installs; they are state, not callables, and are
-    deliberately not registered.
+    callable did is a registered wrapper. Its entry names the original's own
+    module and qualified name. The only other objects the guard installs are
+    the two environment mappings. They are state, so they stay out of the
+    registry.
     """
     Database()
     runtime_file = pyinc_runtime.__file__
@@ -355,9 +358,9 @@ def _payload_routes(db: Database, value: Any) -> list[Any]:
 
     A direct capture (a global, a default, a closure cell, a handle attribute
     or a source-pinned function's global), a module attribute, and a container
-    member fold it whole; a function's definition, folded for a class body, a
-    policy or a dataclass default factory, is the same payload inside their
-    own envelopes.
+    member fold it whole. A function's definition, folded for a class body, a
+    policy or a dataclass default factory, carries the same payload inside each
+    route's own outer layer.
     """
     owner: Any = _owner
     member = db._freeze_captured_immutable("T[0]", value, set(), owner=owner, active_ids=set())
@@ -378,11 +381,11 @@ def _payload_routes(db: Database, value: Any) -> list[Any]:
 
 @pytest.mark.parametrize("label", sorted(_GUARDED))
 def test_a_guard_wrapper_folds_one_payload_naming_the_original(label: str) -> None:
-    """Every route folds the same payload, and it names the original, not the wrapper.
+    """Every route folds the same payload, and it names the original callable.
 
     The routes agree, as they do for a builtin, so `import m; m.getcwd` and
-    `from m import getcwd` share an identity, and nothing of pyinc's own is in
-    it. That it carries no id or address is the cross-process cell's to check.
+    `from m import getcwd` share an identity. The payload holds nothing of
+    pyinc's own. The cross-process cell checks that it carries no id or address.
     """
     db = Database()
     wrapper = _live_wrappers()[label]
@@ -409,11 +412,11 @@ def test_only_a_captured_pyinc_object_folds_a_file_of_pyincs(
 ) -> None:
     """The contract's account of which identities move with pyinc's own code.
 
-    An annotation evaluated to `Database` folds `pyinc.runtime`, and a
-    captured resource the module its type is defined in and those its code
-    reaches, by those files' bytes, as any captured module is folded. A
-    captured guard wrapper folds no module of pyinc's, so it moves with
-    pyinc's code no more than the same call spelled through `os` does.
+    An annotation evaluated to `Database` folds `pyinc.runtime`. A captured
+    resource folds the module its type is defined in and the modules its code
+    reaches. Both fold those files' bytes, as any captured module is folded. A
+    captured guard wrapper folds no module of pyinc's, so it moves with pyinc's
+    code as little as the same call spelled through `os` does.
     """
     module = module_factory(
         "import os\nfrom os import getcwd\n\nfrom pyinc import Database, FileResource, query\n\n"
@@ -472,10 +475,10 @@ def _live_wrappers() -> dict[str, Any]:
 
 
 def test_different_originals_fold_differently_and_one_original_folds_once() -> None:
-    """The payload separates what the originals separate, and nothing else.
+    """The payload separates what the originals separate, and only that.
 
     `builtins.open` and `io.open` are two wrappers around one function, so
-    they fold alike; `getcwd` and `getcwdb` are two functions. An original is
+    they fold alike. `getcwd` and `getcwdb` are two functions. An original is
     never taken for its wrapper.
     """
     db = Database()
@@ -522,8 +525,8 @@ def test_the_capture_preview_agrees_with_the_kernel(
     )
     by_name = {info.name: info for info in explain_query_captures(module.q)}
     assert (by_name["default[0]"].accepted, by_name["default[0]"].kind) == (True, "guarded")
-    # The kernel agrees: the query answers or is refused by the guard, never
-    # with `UnsupportedValueError`.
+    # The kernel agrees. The query answers or the guard refuses it, and it
+    # never raises `UnsupportedValueError`.
     _outcome(module.q, str(sample_directory))
 
 
@@ -536,11 +539,10 @@ def test_the_capture_preview_accepts_a_wrapper_on_every_route_the_kernel_does(
 ) -> None:
     """The preview reports every capture of a query accepted when the kernel fingerprints it.
 
-    The preview used to fold a container member with a stricter walk than
-    the kernel's and a helper without the kernel's fallback to its source,
-    so a wrapper held in a tuple, or returned by a helper that reads a
-    mutable global, was reported refused while the kernel fingerprinted the
-    query.
+    The preview used to fold a container member with a stricter walk than the
+    kernel's, and a helper without the kernel's fallback to its source. So a
+    wrapper held in a tuple, or returned by a helper that reads a mutable
+    global, was reported refused while the kernel fingerprinted the query.
     """
     binding, call, _spelled = _GUARDED[label]
     binding_module = module_factory("from pyinc import query\n" + binding + "\n")
@@ -560,8 +562,8 @@ def test_the_capture_preview_accepts_a_wrapper_on_every_route_the_kernel_does(
         if not info.accepted
     ]
     assert refused == []
-    # The kernel agrees: the query answers or is refused by the guard, never
-    # with `UnsupportedValueError`.
+    # The kernel agrees. The query answers or the guard refuses it, and it
+    # never raises `UnsupportedValueError`.
     _outcome(module.q, str(sample_directory))
 
 
@@ -570,8 +572,8 @@ def test_a_standard_library_function_that_calls_a_wrapper_by_name_fingerprints(
 ) -> None:
     """`relpath` and `ismount` reach the guarded `abspath` and `realpath` through their module.
 
-    Captured, they are folded as the functions they are, and their globals
-    hold the wrappers; both the preview and the kernel accept them.
+    Captured, each is folded as a function, and its globals hold the wrappers.
+    Both the preview and the kernel accept them.
     """
     module = module_factory(
         "from os.path import relpath, ismount\nfrom pyinc import query\n\n\n"
@@ -590,8 +592,8 @@ def test_a_wrapper_capture_reuses_its_identity_and_warms_from_a_checkpoint(
 ) -> None:
     """The memo reuses a stored identity, and a checkpoint warms another database.
 
-    The memo observes a wrapper as a leaf, as the payload folds it, and the
-    warm path's walk of pinned captures stops at it.
+    The memo observes a wrapper as a leaf, as the payload folds it. The warm
+    path's walk of pinned captures stops at it.
     """
     module = module_factory(
         "from os.path import realpath\nfrom pyinc import query\n\n\n"
@@ -618,10 +620,10 @@ def test_the_memo_sees_an_edit_to_the_class_a_bound_wrapper_is_read_off(
 
     `H.W`, where `W = LocalPath.cwd` on a class of the caller's own, folds
     that class's body beside the wrapper's pin. The memo reuses a stored
-    identity only while the definitions behind a module attribute hold
-    still, and the bound wrapper is among the landings it observes, so a
-    class attribute written in place moves a warm database's identity as it
-    moves a fresh one's, and the query runs again.
+    identity only while the definitions behind a module attribute hold still,
+    and the bound wrapper is among the landings it observes. So a class
+    attribute written in place moves a warm database's identity as it moves a
+    fresh one's, and the query runs again.
     """
     holder = module_factory(
         "from pathlib import Path\n\n\nclass LocalPath(type(Path())):\n    X = 1\n\n\n"
@@ -692,13 +694,14 @@ print("JSON " + json.dumps(out))
 def test_a_name_bound_before_the_first_database_keeps_the_unguarded_original(
     tmp_path: Path,
 ) -> None:
-    """The documented limitation, unchanged: a name bound early is the original, fingerprinted as before.
+    """The documented limitation still holds: a name bound early is the original, fingerprinted as before.
 
-    `from os import getcwd` before any `Database` keeps the builtin, which
-    reads the working directory unrefused and fingerprints as a builtin;
-    `os.getenv` stays refused at fingerprinting, because its global `environ`
-    is the guard's mapping, which is not recognised. Neither is a registered
-    wrapper. A fresh process is the only place no `Database` exists yet.
+    `from os import getcwd` before any `Database` keeps the builtin. It reads
+    the working directory unrefused and fingerprints as a builtin. `os.getenv`
+    stays refused at fingerprinting, because its global `environ` is the
+    guard's mapping, which the kernel does not recognise. Neither is a
+    registered wrapper. The test runs in a fresh process, the only place where
+    no `Database` exists yet.
     """
     script = tmp_path / "bound_early_fixture.py"
     script.write_text(_BEFORE_THE_FIRST_DATABASE, encoding="utf-8")
@@ -866,19 +869,19 @@ print("JSON " + json.dumps(out))
 
 
 def test_the_guard_installs_whole_around_whatever_holds_a_guarded_name(tmp_path: Path) -> None:
-    """A mock, a partial or a caller's function in a guarded name's place is wrapped once, and not pinned.
+    """A mock, a partial or a caller's function in a guarded name's place is wrapped once and left unpinned.
 
-    Recording the replaced callable read its `__qualname__` after every
-    wrapper was in place and before the guard was marked installed, so a
-    replacement without one failed the first `Database` with `AttributeError`
-    and the next one wrapped every name a second time; `Path.cwd` replaced by
+    Before, recording the replaced callable read its `__qualname__` after every
+    wrapper was in place and before the guard was marked installed. A
+    replacement without one failed the first `Database` with `AttributeError`,
+    and the next one wrapped every name a second time. `Path.cwd` replaced by
     anything but a classmethod failed it on its missing `__func__`, and a
-    `realpath` without a signature on its parameters. Now the guard installs
-    whole around what it finds, still refuses the call inside a query, and
-    records a wrapper only around the standard-library callable its module
-    and qualified name name, so a capture of a wrapper around anything else
-    is refused as before. A fresh process is the only place no `Database`
-    exists yet.
+    `realpath` without a signature failed it on its parameters. Now the guard
+    installs whole around what it finds and still refuses the call inside a
+    query. It records a wrapper only around the standard-library callable named
+    by its module and qualified name, so a capture of a wrapper around anything
+    else is refused as before. The test runs in a fresh process, the only place
+    where no `Database` exists yet.
     """
     script = tmp_path / "replaced_before_first_database.py"
     script.write_text(_REPLACED_BEFORE_THE_FIRST_DATABASE, encoding="utf-8")

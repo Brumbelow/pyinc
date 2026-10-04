@@ -1,10 +1,9 @@
 """Shared policy for checking an installed version against a declared spec.
 
 Dependency checking and requirement evaluation must agree on what an
-installed version satisfies, so both route through this one helper: an
-already-installed pre-release counts (pip's own installed-version
-semantics), and an unsupported or unparseable constraint is ambiguous
-rather than guessed.
+installed version satisfies, so both use this helper. An installed
+pre-release counts, matching how pip treats installed versions. An
+unsupported or unparseable constraint is reported as ambiguous.
 """
 
 from __future__ import annotations

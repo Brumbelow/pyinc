@@ -249,11 +249,11 @@ class ClassModel:
 
 MAX_FOLLOW_DEPTH = 8
 
-# Depth bound for base-class following in `resolved_class_model_payload`.
-# Mirrors `MAX_FOLLOW_DEPTH`'s trail/cap idiom: the starting class sits at depth
-# 0, so classes at depths 0..MAX_BASE_DEPTH-1 contribute members and the class
-# reached at depth MAX_BASE_DEPTH (and beyond) is not walked. A base stopped by
-# the cap is named in `ClassModel.truncated_bases`, so the loss is observable.
+# Depth bound for base-class following in `resolved_class_model_payload`. It
+# follows `MAX_FOLLOW_DEPTH`'s trail/cap idiom. The starting class sits at depth
+# 0, so classes at depths 0..MAX_BASE_DEPTH-1 contribute members and the walk
+# stops at depth MAX_BASE_DEPTH. `ClassModel.truncated_bases` names each base the
+# cap stopped, so the loss is observable.
 MAX_BASE_DEPTH = 8
 
 # ---------------------------------------------------------------------------
@@ -467,7 +467,7 @@ def _has_import_error_handler(handlers: list[ast.ExceptHandler]) -> bool:
 
 
 def _type_checking_block_walk(body: list[ast.stmt], symbols: list[SymbolPayload]) -> None:
-    """Collect import symbols from a block — used for TYPE_CHECKING and try/except ImportError."""
+    """Collect import symbols from a TYPE_CHECKING or try/except ImportError block."""
     for stmt in body:
         if isinstance(stmt, ast.Import):
             for alias in stmt.names:
@@ -783,9 +783,10 @@ def _resolve_via_wildcards(
     """Try to resolve `qualified_name` through `from X import *` stubs.
 
     Returns:
-        * ``(target_path, target_qname)`` — continue hopping to target file.
-        * ``"ambiguous"`` — multi-provider match or dynamic-__all__ provider blocks lookup.
-        * ``None`` — no wildcard stubs or no matching provider export.
+        * ``(target_path, target_qname)``: continue hopping to the target file.
+        * ``"ambiguous"``: several providers match, or a provider with a dynamic
+          ``__all__`` blocks the lookup.
+        * ``None``: the table has no wildcard stubs, or no provider exports the name.
     """
     stubs = _find_wildcard_stubs(table)
     if not stubs:
@@ -1217,8 +1218,8 @@ def _build_source_ranges(
 ) -> dict[tuple[str, int], SourceRange]:
     """Exact source spans for a file's bindings, keyed by name and line.
 
-    The result is memoized and handed to every caller, so it is read-only by
-    contract: the three call sites only look names up in it.
+    The result is memoized and shared by every caller, so it is read-only by
+    contract. The three call sites only look names up in it.
     """
     ranges = {
         (binding.name, binding.range.start.line): binding.range
@@ -1241,10 +1242,10 @@ def _build_source_ranges(
 # Layer 3 entrypoints
 # ---------------------------------------------------------------------------
 
-# Every payload below is declared as nested tuples of primitives, and `freeze`
-# leaves such a value as plain tuples, so what `db.get` hands back in any mode is
-# already the payload. Thawing it again only walks and copies the whole tree --
-# on a workspace-sized request that copy dominated the cost of decoding.
+# Every payload below is declared as nested tuples of primitives. `freeze` leaves
+# such a value as plain tuples, so `db.get` returns the payload itself in any
+# mode. Thawing it again only walks and copies the whole tree. On a
+# workspace-sized request that copy dominated the cost of decoding.
 
 
 def module_symbol_table(
@@ -1399,7 +1400,7 @@ def _find_references_for_symbol(
     Local bindings are compared directly. Module attributes and direct
     ``from`` imports are normalized through the conservative workspace
     resolver before comparison, so an unrelated shadow with the same spelling
-    is never included.
+    is excluded.
     """
 
     files = db.get(workspace_python_files, root)
@@ -1414,8 +1415,8 @@ def _find_references_for_symbol(
             if candidate != target:
                 continue
             if occurrence.is_declaration and occurrence.symbol_id != target:
-                # An import binding names the target but is not itself a
-                # declaration or usage of the target symbol.
+                # An import binding names the target without declaring or
+                # using it.
                 continue
             is_declaration = (
                 occurrence.is_declaration
@@ -1440,16 +1441,15 @@ def _find_references_for_symbol(
 
 
 # ---------------------------------------------------------------------------
-# Class model (own members) — declaration-only, caret-free
+# Class model (own members): declaration-only, caret-free
 # ---------------------------------------------------------------------------
 
 
 def _first_param_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
     """The name of a callable's first positional parameter, or ``None``.
 
-    Positional-only parameters take precedence, then regular positionals; a
-    callable that only takes ``*args`` / keyword parameters has no first
-    positional and returns ``None``.
+    Positional-only parameters take precedence, then regular positionals. A
+    callable that takes only ``*args`` or keyword parameters returns ``None``.
     """
     args = node.args
     if args.posonlyargs:
@@ -1462,11 +1462,11 @@ def _first_param_name(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | Non
 def _encode_base(node: ast.expr) -> EncodedBasePayload:
     """Encode a ``ClassDef`` base expression for later (Stage 3) resolution.
 
-    ``("name", id)`` for a bare ``Name``, ``("attr", lhs_id, attr)`` for
-    ``Name.attr``. A single ``Subscript`` layer is unwrapped so ``Base[T]``
-    resolves through its ``value`` (``Base``). ``Starred`` bases, deep
-    attribute chains, and call expressions fall back to
-    ``("text", ast.unparse(node))`` carrying the raw source of the whole
+    A bare ``Name`` encodes as ``("name", id)`` and ``Name.attr`` as
+    ``("attr", lhs_id, attr)``. One ``Subscript`` layer is unwrapped, so
+    ``Base[T]`` resolves through its ``value`` (``Base``). ``Starred`` bases,
+    deep attribute chains, and call expressions fall back to
+    ``("text", ast.unparse(node))``, which carries the raw source of the whole
     original base expression.
     """
     inner: ast.expr = node
@@ -1489,9 +1489,9 @@ def _base_text(encoded: EncodedBasePayload) -> str:
 def _self_attribute_names(target: ast.expr) -> tuple[str, ...]:
     """Attribute names bound by assigning to a ``self.NAME`` target.
 
-    Handles tuple / list / starred unpacking (``self.a, *self.rest = ...``)
+    Handles tuple, list, and starred unpacking (``self.a, *self.rest = ...``)
     recursively. Only ``Attribute`` targets whose value is the bare ``Name``
-    ``self`` contribute; anything else yields nothing.
+    ``self`` contribute. Any other target yields an empty tuple.
     """
     if (
         isinstance(target, ast.Attribute)
@@ -1512,14 +1512,13 @@ def _self_attribute_names(target: ast.expr) -> tuple[str, ...]:
 def _collect_instance_attributes(
     method: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> list[tuple[str, int, str | None]]:
-    """Every ``self.NAME`` assignment in *method*'s body as ``(name, lineno,
-    annotation_text)``.
+    """Every ``self.NAME`` assignment in *method*'s body.
 
-    Descent stops at nested ``FunctionDef`` / ``AsyncFunctionDef`` /
-    ``ClassDef`` / ``Lambda`` scopes — a ``self.x`` inside a closure belongs to
-    that closure's binding of ``self``, not the enclosing method's. ``AugAssign``
-    (``self.x += 1``) is excluded because it presumes a pre-existing attribute
-    rather than establishing one.
+    Each entry is ``(name, lineno, annotation_text)``. Descent stops at nested
+    ``FunctionDef``, ``AsyncFunctionDef``, ``ClassDef``, and ``Lambda`` scopes,
+    because a ``self.x`` inside a closure belongs to that closure's own binding
+    of ``self``. ``AugAssign`` (``self.x += 1``) is excluded because it presumes
+    the attribute already exists.
     """
     collected: list[tuple[str, int, str | None]] = []
 
@@ -1554,12 +1553,12 @@ def _collect_instance_attributes(
 def _class_member_walk(cls: ast.ClassDef) -> tuple[ClassMemberPayload, ...]:
     """Own members of a single ``ClassDef`` in deterministic, deduped order.
 
-    Priority (first binding of a name wins): annotated class-body variables,
-    assigned class-body variables, methods, then instance attributes collected
-    from every direct method whose first parameter is literally ``self``
-    (lowest lineno kept when an attribute is bound in more than one place).
-    Nested ``ClassDef`` members belong to that class's own model and are not
-    reported here.
+    Priority, where the first binding of a name wins: annotated class-body
+    variables, assigned class-body variables, methods, then instance attributes.
+    Instance attributes come from every direct method whose first parameter is
+    literally ``self``. When an attribute is bound in more than one place, the
+    lowest lineno is kept. Members of a nested ``ClassDef`` are reported in that
+    class's own model.
     """
     members: list[ClassMemberPayload] = []
     seen: set[str] = set()
@@ -1616,9 +1615,9 @@ def _class_member_walk(cls: ast.ClassDef) -> tuple[ClassMemberPayload, ...]:
 def _walk_class_defs(tree: ast.Module) -> tuple[tuple[str, ast.ClassDef], ...]:
     """Every ``ClassDef`` in *tree* paired with its dotted qualifier.
 
-    The qualifier follows ``module_symbol_table``'s scheme: only ``ClassDef``
-    nesting extends the dotted path (``Outer.Inner``); a class declared inside
-    a function body re-enters at its bare name.
+    The qualifier follows ``module_symbol_table``'s scheme. Only ``ClassDef``
+    nesting extends the dotted path (``Outer.Inner``). A class declared inside
+    a function body starts again at its bare name.
     """
     out: list[tuple[str, ast.ClassDef]] = []
 
@@ -1657,13 +1656,14 @@ def class_models_for_file(db: Database, path: str) -> tuple[OwnClassModelPayload
 def _class_site_from_resolved(
     db: Database, root: str, resolved: _ResolvedSymbolPayload
 ) -> tuple[str, str] | None:
-    """The ``(defining_path, class_qname)`` a resolved symbol lands on when it
-    points at a workspace ``class`` — else ``None``.
+    """Locate a resolved workspace ``class`` as ``(defining_path, class_qname)``.
 
-    The resolver returns the *original* requested name, which may be an import
-    alias; ``defining_lineno`` instead pins the class in its own module table,
-    which both confirms the target is a class and recovers its qualified name in
-    that file (nested classes included, e.g. ``Outer.Inner``)."""
+    Any other symbol returns ``None``. The resolver returns the *original*
+    requested name, which may be an import alias. ``defining_lineno`` pins the
+    class in its own module table instead. That confirms the target is a class
+    and recovers its qualified name in that file, including nested classes such
+    as ``Outer.Inner``.
+    """
     if resolved[2] != "workspace":
         return None
     defining_path = resolved[4]
@@ -1680,16 +1680,16 @@ def _class_site_from_resolved(
 def _resolve_base_to_class(
     db: Database, root: str, path: str, encoded: EncodedBasePayload
 ) -> tuple[str, str] | None:
-    """Resolve one encoded base to the ``(path, class_qname)`` of a workspace
-    class, in ``path``'s module context.
+    """Resolve one encoded base to a workspace class's ``(path, class_qname)``.
 
-    ``("name", X)`` resolves ``X`` through the file's imports (same-file class
-    qnames live in the module table, so bare local bases resolve too).
-    ``("attr", L, A)`` first tries the whole dotted name as a same-module class
-    (``Outer.Inner``), then falls back to resolving ``L`` to a workspace module
-    and ``A`` inside it (the ``_resolve_attr_on_module`` idiom). ``("text", …)``
-    bases, and anything not landing on a workspace class (stdlib / installed /
-    missing / ambiguous / non-class), return ``None`` — the caller records them
+    Resolution runs in ``path``'s module context. ``("name", X)`` resolves ``X``
+    through the file's imports. Same-file class qnames live in the module table,
+    so bare local bases resolve too. ``("attr", L, A)`` first tries the whole
+    dotted name as a same-module class (``Outer.Inner``). It then falls back to
+    resolving ``L`` to a workspace module and ``A`` inside it (the
+    ``_resolve_attr_on_module`` idiom). ``("text", …)`` bases return ``None``.
+    So does any base that resolves to something other than a workspace class
+    (stdlib, installed, missing, ambiguous, non-class). The caller records them
     in ``unresolved_bases``.
     """
     tag = encoded[0]
@@ -1705,7 +1705,7 @@ def _resolve_base_to_class(
             return site
         lhs_resolved = _resolve_symbol_payload(db, root, path, lhs)
         lhs_path = lhs_resolved[4]
-        # `defining_lineno is None` means the LHS is a module, not a symbol.
+        # `defining_lineno is None` means the LHS resolved to a module.
         if lhs_resolved[2] == "workspace" and lhs_resolved[5] is None and lhs_path:
             return _class_site_from_resolved(
                 db, root, _resolve_symbol_payload(db, root, lhs_path, attr)
@@ -1721,24 +1721,25 @@ def resolved_class_model_payload(
     if path not in workspace_files:
         return (path, qualified_name, tuple(), tuple(), tuple())
 
-    # Flatten the inheritance graph: DEPTH-FIRST, LEFT-TO-RIGHT,
-    # SHALLOWEST-DEFINITION-WINS by member name (derived shadows base), ties at
-    # equal depth going to the earlier arrival. This is not C3 MRO. Cycles are
-    # cut by a `(path, class_qname)` key, and the walk is bounded by
-    # `MAX_BASE_DEPTH`. Base files are queried one at a time via
-    # `class_models_for_file`, so an edit to one base invalidates per file.
+    # Flatten the inheritance graph depth-first and left to right. For each
+    # member name the shallowest definition wins (derived shadows base), and a
+    # tie at equal depth goes to the earlier arrival. This differs from C3 MRO.
+    # A `(path, class_qname)` key cuts cycles, and `MAX_BASE_DEPTH` bounds the
+    # walk. Base files are queried one at a time via `class_models_for_file`, so
+    # an edit to one base invalidates per file.
     #
-    # `reached` holds the SHALLOWEST depth each key was walked at, not mere
-    # membership: a class first met near the cap has its own bases cut short, so
-    # a strictly-shallower reach has to walk it again with the larger remaining
-    # budget — otherwise which members survive depends on traversal order. That
-    # depth strictly decreases per revisit, so a key is walked at most
-    # `MAX_BASE_DEPTH` times and a wide diamond cannot revisit exponentially.
+    # `reached` records the shallowest depth at which each key was walked. A
+    # class first met near the cap has its own bases cut short, so a strictly
+    # shallower reach walks it again with the larger remaining budget. That
+    # keeps the surviving members independent of traversal order. The depth
+    # strictly decreases on each revisit, so a key is walked at most
+    # `MAX_BASE_DEPTH` times, which keeps a wide diamond from revisiting
+    # exponentially.
     #
-    # `member_depth` makes the winning DEFINITION depth-canonical the same way:
-    # a revisit can splice a previously-cut ancestor into the walk ahead of a
-    # sibling subtree that overrides it, so arrival order alone would let a base
-    # claim a name over a nearer override. Claims are therefore replaced when a
+    # `member_depth` makes the winning definition depth-canonical the same way.
+    # A revisit can splice a previously cut ancestor into the walk ahead of a
+    # sibling subtree that overrides it. Arrival order alone would then let the
+    # base claim a name over a nearer override, so a claim is replaced when a
     # class reached strictly shallower defines the same name.
     members: dict[str, ResolvedClassMemberPayload] = {}
     member_depth: dict[str, int] = {}
@@ -1748,8 +1749,8 @@ def resolved_class_model_payload(
     # One resolution per base expression, shared across a key's revisits.
     base_sites: dict[tuple[str, EncodedBasePayload], tuple[str, str] | None] = {}
     # Bases that resolved to a workspace class the cap stopped us from walking,
-    # in first-encounter order and paired with the site so a later shallower
-    # reach can retract the report.
+    # in first-encounter order. Each is paired with its site so a later,
+    # shallower reach can retract the report.
     cut: list[tuple[tuple[str, str], str]] = []
     seen_cut: set[tuple[tuple[str, str], str]] = set()
 
@@ -1802,7 +1803,7 @@ def resolved_class_model_payload(
             visit(site[0], site[1], depth + 1)
 
     visit(path, qualified_name, 0)
-    # A site the cap stopped is only truly lost if no other reach walked it.
+    # A site the cap stopped is lost only if no other reach walked it.
     truncated: list[str] = []
     seen_truncated: set[str] = set()
     for site, text in cut:

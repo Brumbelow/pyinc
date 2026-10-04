@@ -383,7 +383,7 @@ class _ScopeBuilder:
         current = scope
         parent = current.parent
         while parent is not None:
-            # A method/function does not close over the class namespace.
+            # Functions and methods skip the class namespace when resolving free names.
             if (
                 current.kind
                 in {
@@ -1021,10 +1021,10 @@ def scope_tree_payload(db: Database, path: str) -> ScopeTreePayload:
     return path, scopes, bindings, occurrences
 
 
-# Every payload below is declared as nested tuples of primitives, and `freeze`
-# leaves such a value as plain tuples, so what `db.get` hands back in any mode is
-# already the payload. Thawing it again only walks and copies the whole tree --
-# on a workspace-sized request that copy dominated the cost of decoding.
+# Each payload is nested tuples of primitives, which `freeze` keeps as plain
+# tuples, so `db.get` returns the payload itself in every mode. A `thaw` here
+# would only copy the whole tree, and on a workspace-sized request that copy
+# dominated decoding cost.
 def _decode_scope_tree(payload: ScopeTreePayload) -> ScopeTree:
     result_path, scopes_payload, bindings_payload, occurrences_payload = payload
     scopes = tuple(
@@ -1072,13 +1072,13 @@ def _decode_scope_tree(payload: ScopeTreePayload) -> ScopeTree:
 def scope_tree(db: Database, path: str | os.PathLike[str]) -> ScopeTree:
     _reject_in_query(db, "scope_tree")
 
-    # Canonicalizing through the tracked path declares the edge, so retargeting
-    # any link along the chain invalidates what was answered from the old
-    # target -- a bare `Path.resolve` reaches the live filesystem untracked. It
-    # also makes the answer for a path that cannot be canonicalized the same on
-    # every interpreter, where the bare call raises on some and hands back a
-    # path that is still a link on others. Such a path names no source file, so
-    # it is refused here in this layer's own voice.
+    # Canonicalize through the tracked resource so the edge is recorded, and
+    # retargeting any link in the chain invalidates answers from the old target.
+    # A bare `Path.resolve` reads the live filesystem untracked. The resource
+    # also gives one answer on every interpreter for a path that cannot be
+    # canonicalized. The bare call raises on some interpreters and returns a
+    # path that is still a link on others. Such a path names no source file,
+    # so this layer raises its own error for it.
     normalized = _RESOLVED_PATHS.read(db, os.fspath(path))
     if normalized is None:
         raise UnsupportedValueError(f"Path cannot be resolved: {os.fspath(path)}")
@@ -1118,7 +1118,8 @@ def symbol_at(
     """Resolve the lexical symbol covering ``position``.
 
     Passing a workspace root enables conservative cross-module resolution for
-    direct imports and module attributes. The two-argument form is purely local.
+    direct imports and module attributes. The two-argument form resolves only
+    within the file.
     """
 
     _reject_in_query(db, "symbol_at")
@@ -1155,9 +1156,9 @@ def _symbol_at(
         return occurrence.symbol_id
 
     if occurrence.receiver is not None and occurrence.receiver not in {"self", "cls"}:
-        # Attribute occurrences must never fall back to resolving the attribute
-        # name as an unrelated bare name. If the receiver chain is shadowed,
-        # rebound, or otherwise unproven, the conservative result is no symbol.
+        # An attribute resolves only through its receiver chain, never as an
+        # unrelated bare name. A shadowed, rebound or otherwise unproven chain
+        # gives the conservative answer, None.
         return _resolve_attribute(db, root, path, tree, occurrence)
 
     symbol_id = occurrence.symbol_id

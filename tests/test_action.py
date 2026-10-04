@@ -90,7 +90,7 @@ def _action_reconcile_worker(
 
 
 # --------------------------------------------------------------------------- #
-# Task 1.1 — value types + fs helpers
+# Task 1.1: value types and fs helpers
 # --------------------------------------------------------------------------- #
 
 
@@ -233,11 +233,10 @@ def test_a_resolve_that_fails_still_produces_a_typed_refusal(
     monkeypatch: pytest.MonkeyPatch,
     entry_point: Callable[[Any, Database, Path], object],
 ) -> None:
-    # Resolving a looping path raised on the interpreters this library still
-    # supports and stopped raising on the newer ones, so the handler is driven
-    # directly rather than through a shape only some interpreters produce.
-    # Patching resolve is class-wide, so every witness is taken before it is
-    # armed and the arming lasts exactly as long as the call under test.
+    # Only the older supported interpreters raise when resolving a looping
+    # path, so the test patches resolve to raise and drives the handler
+    # directly. The patch is class-wide, so every witness is taken before it
+    # is armed, and it stays armed only for the call under test.
     @action(tool="unresolvable-root")
     def unresolvable_root_action(db: Database) -> list[Output]:
         return [Output("result.txt", b"content")]
@@ -344,7 +343,7 @@ def test_atomic_write_creates_parents_and_leaves_no_temp(tmp_path: Path) -> None
 
 
 # --------------------------------------------------------------------------- #
-# Task 1.2 — Action.reconcile (A1, A2, A4, A6 dry-run)
+# Task 1.2: Action.reconcile (A1, A2, A4, A6 dry-run)
 # --------------------------------------------------------------------------- #
 
 _FILES = FileResource()
@@ -433,7 +432,7 @@ def test_dry_run_touches_nothing(tmp_path: Path) -> None:  # A6 dry-run
 
 
 # --------------------------------------------------------------------------- #
-# Task 1.3 — orphan deletion (A3) + failure cleanup (A6)
+# Task 1.3: orphan deletion (A3) and failure cleanup (A6)
 # --------------------------------------------------------------------------- #
 
 EMIT_SET = Input[tuple[str, ...]]("emit_names")
@@ -477,7 +476,7 @@ def test_failure_in_outputs_writes_nothing(tmp_path: Path) -> None:  # A6 failur
 
 
 # --------------------------------------------------------------------------- #
-# Task 1.4 — from-scratch consistency over an edit sequence (A5)
+# Task 1.4: from-scratch consistency over an edit sequence (A5)
 # --------------------------------------------------------------------------- #
 
 
@@ -521,7 +520,7 @@ def test_action_incremental_matches_fresh_over_edits(mode: str, tmp_path: Path) 
 
 
 # --------------------------------------------------------------------------- #
-# Task 1.5 — public export lock
+# Task 1.5: public export lock
 # --------------------------------------------------------------------------- #
 
 
@@ -870,8 +869,8 @@ def test_teardown_after_a_directory_to_file_crash_releases_the_recorded_layout(
 
     assert result.deleted == ()
     assert _ledger_outputs(inc_root) == {}
-    # The stopped run published this file without recording it; it is unowned
-    # now and must survive the teardown.
+    # The stopped run published this file without recording it. The file is
+    # unowned and must survive the teardown.
     assert (inc_root / "pkg").read_text(encoding="utf-8") == "file layout"
 
 
@@ -1136,9 +1135,9 @@ def test_manifest_schema_is_strict_and_failure_is_premutation(
             f'"version":2,"outputs":{{"a":"{zero}","a":"{zero}"}}}}'
         ).encode()
     else:
-        # The raw-bytes cases above carry no incarnation field to falsify: parsing
-        # and the field-set check precede the comparison, so their mismatch cells
-        # are identical to their matching ones.
+        # The raw-bytes cases above carry no incarnation field to falsify.
+        # Parsing and the field-set check run before the comparison, so their
+        # mismatch cells are identical to their matching ones.
         if incarnation == "mismatch":
             recorded = valid["root_incarnation"]
             valid["root_incarnation"] = [recorded[0] + 1, recorded[1] + 1]
@@ -1622,18 +1621,18 @@ def test_stale_external_ledger_never_deletes_in_a_recreated_output_root(
         return [Output.text(path, text) for path, text in sorted(wanted.items())]
 
     if recreation == "undetected":
-        # A filesystem can hand the recreated directory its old inode straight
-        # back (ext4 does), so stat identity never observes the recreation and
-        # only the byte-level ownership check stands between the stale claims
-        # and the new directory's files.
+        # A filesystem can hand the recreated directory its old inode back
+        # (ext4 does). Stat identity then misses the recreation, and only the
+        # byte-level ownership check guards the new directory's files against
+        # the stale claims.
         monkeypatch.setattr(action_module, "_root_incarnation", lambda _root: [1, 1])
 
     incarnation_action.reconcile(Database(), root=root, state_dir=state)
     assert (root / "owned.txt").read_text() == "content"
 
-    # The root is deleted and recreated at the same path: the ledger's claims
-    # name files in a directory that no longer exists, so they must not delete
-    # files somebody else placed in the new one.
+    # The root is deleted and recreated at the same path. The ledger's claims
+    # name files in the deleted directory, so files somebody else placed in
+    # the new one must survive.
     shutil.rmtree(root)
     root.mkdir()
     somebody_else = root / "owned.txt"
@@ -1649,8 +1648,9 @@ def test_stale_external_ledger_never_deletes_in_a_recreated_output_root(
     assert "owned.txt" not in result.deleted
     assert (root / "other.txt").read_text() == "new output"
 
-    # The released claim is gone: reconciling the somebody-else file into a
-    # desired output later must not treat it as an orphan of this ledger.
+    # The released claim is gone. A later run that reconciles the
+    # somebody-else file into a desired output must not treat it as an orphan
+    # of this ledger.
     manifest_text = _manifest_path(state, "incarnation-bound-manifest").read_text(
         encoding="utf-8"
     )
@@ -1691,15 +1691,15 @@ def test_a_voiding_reconcile_persists_the_adoption(
     first_void = emit.reconcile(Database(), root=root, state_dir=state)
     assert "out.txt" not in first_void.deleted
 
-    # The voiding decision is durable: the ledger no longer claims out.txt
+    # The voiding decision is durable. The ledger drops its claim on out.txt
     # and records the directory the root now names.
     persisted = json.loads(manifest.read_bytes())
     assert "out.txt" not in persisted["outputs"]
     assert persisted["root_incarnation"] == _live_incarnation(root)
 
-    # The chain: renaming the old directory back re-creates the mismatch
-    # against the incarnation just recorded, so the next reconcile voids
-    # again -- and must persist again.
+    # Renaming the old directory back re-creates the mismatch against the
+    # newly recorded incarnation. So the next reconcile voids again and must
+    # persist again.
     os.rename(root, tmp_path / "displaced")
     os.rename(stash, root)
     assert _live_incarnation(root) != persisted["root_incarnation"]
@@ -1708,9 +1708,9 @@ def test_a_voiding_reconcile_persists_the_adoption(
     assert "out.txt" not in persisted["outputs"]
     assert persisted["root_incarnation"] == _live_incarnation(root)
 
-    # The rename-back directory still holds the bytes the first run wrote.
-    # With the claims durably void, nothing owns them and nothing deletes
-    # them -- this is the victim the resurrected ledger used to destroy.
+    # The renamed-back directory still holds the bytes the first run wrote.
+    # The claims are durably void, so nothing owns or deletes them. These
+    # are the bytes the resurrected ledger used to destroy.
     assert second_void.deleted == ()
     assert (root / "out.txt").read_bytes() == b"generated"
 
@@ -1730,8 +1730,8 @@ def test_a_dry_run_reports_the_post_adoption_prediction_and_writes_nothing(
     emit.reconcile(Database(), root=root, state_dir=state)
     os.rename(root, tmp_path / "stash")
     root.mkdir()
-    # The recreated root holds a file at the claimed path carrying exactly the
-    # recorded bytes, so only the void keeps it out of the prediction.
+    # The recreated root holds a file at the claimed path with the recorded
+    # bytes, so only the void keeps it out of the prediction.
     (root / "out.txt").write_bytes(b"generated")
     ledger_before = manifest.read_bytes()
 
@@ -1739,8 +1739,8 @@ def test_a_dry_run_reports_the_post_adoption_prediction_and_writes_nothing(
     del wanted["out.txt"]
     result = emit.plan(Database(), root=root, state_dir=state)
 
-    # The prediction is post-adoption: the voided claim is not a deletion,
-    # the new output is a creation, and the ledger is untouched.
+    # The prediction is post-adoption. The voided claim is left out of the
+    # deletions, the new output is a creation, and the ledger is untouched.
     assert result.dry_run is True
     assert result.deleted == ()
     assert result.created == ("other.txt",)
@@ -1751,7 +1751,7 @@ def test_a_dry_run_reports_the_post_adoption_prediction_and_writes_nothing(
 def test_reconcile_refuses_an_unlistable_migration_directory_before_deleting(
     tmp_path: Path,
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -1772,22 +1772,23 @@ def test_reconcile_refuses_an_unlistable_migration_directory_before_deleting(
 
     ledger_before = manifest_bytes(root, "unlistable-migration")
     before = tree_witness(root)
-    (root / "b").chmod(0o300)  # traversable, not listable
+    (root / "b").chmod(0o300)  # traversable but unlistable
     try:
         with pytest.raises(ActionPathError, match="Cannot safely inspect directory 'b'"):
             emit.reconcile(Database(), root=root)
     finally:
         (root / "b").chmod(0o700)
-    # The refusal is pre-mutation: every owned file, the unowned file, both
-    # directories, and the ledger are untouched. The witness is taken with
-    # the mode restored -- an unlistable directory hides its children.
+    # The refusal is pre-mutation, so every owned file, the unowned file,
+    # both directories and the ledger are untouched. The witness is taken
+    # with the mode restored, because an unlistable directory hides its
+    # children.
     assert tree_witness(root) == before
     assert manifest_bytes(root, "unlistable-migration") == ledger_before
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics")
 def test_plan_refuses_an_unlistable_migration_directory(tmp_path: Path) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
@@ -1813,8 +1814,8 @@ def test_plan_refuses_an_unlistable_migration_directory(tmp_path: Path) -> None:
             emit.plan(Database(), root=root)
     finally:
         (root / "b").chmod(0o700)
-    # A refusal decided in preflight is reported by plan(); the dry run
-    # leaves the tree and the ledger it holds exactly as they were.
+    # plan() reports a refusal decided in preflight. The dry run leaves the
+    # tree, and the ledger it holds, unchanged.
     assert tree_witness(root) == before
 
 
@@ -1837,7 +1838,7 @@ def test_a_replacement_landing_in_the_deletion_window_survives(
     original_unlink = action_module.unlink_regular_file
 
     def replace_inside_the_window(path: Path, **kwargs: object) -> bool:
-        # Fires between the ownership read and the unlink -- the window.
+        # Fires in the window between the ownership read and the unlink.
         if path.name == "gen.txt":
             replacement = tmp_path / "replacement"
             replacement.write_bytes(b"BRAND NEW FILE FROM ANOTHER PROCESS")
@@ -1876,7 +1877,7 @@ def test_a_byte_identical_replacement_in_the_deletion_window_survives(
     original_unlink = action_module.unlink_regular_file
 
     def replace_inside_the_window(path: Path, **kwargs: object) -> bool:
-        # Fires between the ownership read and the unlink -- the window.
+        # Fires in the window between the ownership read and the unlink.
         if path.name == "gen.txt":
             replacement = tmp_path / "replacement"
             replacement.write_bytes(b"generated")
@@ -1888,8 +1889,8 @@ def test_a_byte_identical_replacement_in_the_deletion_window_survives(
     result = emit.reconcile(Database(), root=root)
     after = tree_witness(root)
 
-    # Identity decides ownership, not bytes: the replacement carries the
-    # recorded bytes but is a file this action never wrote.
+    # Identity decides ownership. The replacement carries the recorded bytes,
+    # but it is a file this action never wrote.
     assert target.read_bytes() == b"generated"
     installed = target.stat()
     assert (installed.st_dev, installed.st_ino) != (verified.st_dev, verified.st_ino)
@@ -1917,8 +1918,8 @@ def test_deleted_excludes_an_orphan_that_survived_the_last_moment_digest_check(
 
     def drift_after_the_preflight_read(path: Path) -> bytes | None:
         # The preflight read sees the recorded bytes and classifies the
-        # orphan deletable; the drift lands immediately after, so the
-        # last-moment re-check meets different bytes.
+        # orphan deletable. The drift lands right after, so the last-moment
+        # re-check meets different bytes.
         nonlocal drifted
         data: bytes | None = original_read(path)
         if path.name == "orphan.txt" and not drifted:
@@ -1960,8 +1961,8 @@ def test_plan_still_predicts_deletions_it_cannot_perform(
 
     def drift_after_the_preflight_read(path: Path) -> bytes | None:
         # The preflight read sees the recorded bytes and classifies the
-        # orphan deletable; the drift lands immediately after, so a
-        # deletion would meet different bytes and be skipped.
+        # orphan deletable. The drift lands right after, so a deletion would
+        # meet different bytes and be skipped.
         nonlocal drifted
         data: bytes | None = original_read(path)
         if path.name == "orphan.txt" and not drifted:
@@ -1974,8 +1975,8 @@ def test_plan_still_predicts_deletions_it_cannot_perform(
     result = emit.plan(Database(), root=root)
 
     # The preflight read saw the recorded bytes, so the prediction names
-    # the orphan -- and the drift that landed right after guarantees the
-    # deletion could not actually be performed.
+    # the orphan. The drift that landed right after guarantees the deletion
+    # could not be performed.
     assert result.dry_run is True
     assert result.deleted == ("orphan.txt",)
     assert target.read_bytes() == b"user edited this"
@@ -2002,9 +2003,9 @@ def test_convergence_after_a_surviving_drift(
 
     def drift_after_the_preflight_read(path: Path) -> bytes | None:
         # The preflight read sees the recorded bytes and classifies the
-        # orphan deletable; the drift lands immediately after, so the
-        # last-moment re-check meets different bytes. It fires once, so the
-        # reconcile that follows runs against a settled tree.
+        # orphan deletable. The drift lands right after, so the last-moment
+        # re-check meets different bytes. It fires once, so the reconcile
+        # that follows runs against a settled tree.
         nonlocal drifted
         data: bytes | None = original_read(path)
         if path.name == "orphan.txt" and not drifted:
@@ -2015,8 +2016,8 @@ def test_convergence_after_a_surviving_drift(
     monkeypatch.setattr(action_module, "read_regular_file", drift_after_the_preflight_read)
     emit.reconcile(Database(), root=root)
 
-    # The released orphan is the user's file now: the next run neither
-    # touches it nor rewrites the ledger that already dropped the claim.
+    # The released orphan is now the user's file. The next run leaves it
+    # alone and skips rewriting the ledger, which already dropped the claim.
     ledger = manifest_bytes(root, "drift-convergence")
     second = emit.reconcile(Database(), root=root)
     assert second.created == second.updated == second.repaired == second.deleted == ()
@@ -2048,8 +2049,8 @@ def test_unowned_files_survive_and_owned_outputs_match_a_fresh_root(
         assert (incremental_root / path).read_bytes() == (fresh_root / path).read_bytes()
     # ...the foreign file is untouched...
     assert foreign.read_text(encoding="utf-8") == "hands off"
-    # ...and precisely because of it the roots as a whole differ: the
-    # guarantee is scoped to the paths the action declares and owns.
+    # ...and because of it the roots as a whole differ. The guarantee
+    # covers only the paths the action declares and owns.
     incremental_names = {
         p.relative_to(incremental_root).as_posix() for p in incremental_root.rglob("*")
     }
@@ -2157,8 +2158,8 @@ def test_a_drifted_orphan_is_released_but_never_deleted(tmp_path: Path) -> None:
     del wanted["dropped.txt"]
     result = drift_action.reconcile(Database(), root=root)
 
-    # The file no longer carries the bytes the ledger recorded, so it is the
-    # user's file now: the claim is released, the file survives.
+    # The file's bytes differ from the ones the ledger recorded, so it is now
+    # the user's file. The claim is released and the file survives.
     assert edited.read_text() == "hand-edited after generation"
     assert "dropped.txt" not in result.deleted
 
@@ -2334,7 +2335,7 @@ def test_action_lock_directory_rejects_a_symlinked_private_directory(
 def test_action_lock_directory_rejects_foreign_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     uid = os.getuid()
     directory = tmp_path / f"pyinc-action-locks-{uid}"
@@ -2356,7 +2357,7 @@ def test_action_lock_directory_rejects_foreign_owner(
 def test_action_lock_directory_repairs_permissive_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     directory = tmp_path / f"pyinc-action-locks-{os.getuid()}"
     directory.mkdir(mode=0o755)
@@ -2434,12 +2435,12 @@ def test_action_rechecks_target_type_before_writing(
 def test_preflight_probes_answer_missing_and_refuse_unanswerable(
     tmp_path: Path, probe: str, condition: str
 ) -> None:
-    if sys.platform == "win32":  # mypy reads this check; the marker skips there
+    if sys.platform == "win32":  # mypy reads this check. The marker skips Windows.
         pytest.skip("POSIX only")
     if os.geteuid() == 0:
         pytest.skip("EACCES does not bite as root")
     if condition == "missing":
-        # A genuinely missing path is a benign, complete answer.
+        # A missing path is a benign, complete answer.
         missing = tmp_path / "missing"
         if probe == "unprunable-entry":
             assert _unprunable_entry(missing, "missing", set(), {}) is None
@@ -2449,7 +2450,7 @@ def test_preflight_probes_answer_missing_and_refuse_unanswerable(
             assert _orphan_cannot_exist(tmp_path, "missing/file.txt") is False
         return
     if condition == "unlistable":
-        # scandir needs read permission; --wx removes exactly that.
+        # scandir needs read permission, and --wx removes only that.
         blocked = tmp_path / "blocked"
         blocked.mkdir()
         (blocked / "entry.txt").write_text("held", encoding="utf-8")
@@ -2463,7 +2464,7 @@ def test_preflight_probes_answer_missing_and_refuse_unanswerable(
         finally:
             blocked.chmod(0o700)
         return
-    # lstat needs search permission on the parent: an 0o600 ancestor makes
+    # lstat needs search permission on the parent. An 0o600 ancestor makes
     # a component two levels down unanswerable.
     outer = tmp_path / "outer"
     (outer / "d").mkdir(parents=True)

@@ -93,34 +93,32 @@ class _TomlNestingLimitError(ValueError):
     pass
 
 
-# Table and array nesting is capped because every section re-emits the dot path of
-# all its ancestors: `config_sections_payload` grows with the square of the nesting
-# depth, so this cap is what bounds the depth-driven growth of the *cache*, not just
-# the parse. `json_config` caps `_MAX_JSON_DEPTH` and `xml_config` caps
-# `_MAX_XML_DEPTH` for the same reason and against the same budget — at the table
-# name length that budget is stated for, a document at the cap must not cache more
-# than ~1 MiB. Width at shallow depth is bounded by none of that: a document of many
-# sibling tables one header component deep is accepted and can cache past the
-# budget.
+# Table and array nesting is capped because every section repeats the dot path of
+# all its ancestors, so `config_sections_payload` grows with the square of the
+# nesting depth. The cap bounds the *cache* as well as the parse. `json_config`
+# (`_MAX_JSON_DEPTH`) and `xml_config` (`_MAX_XML_DEPTH`) cap depth for the same
+# reason and against the same budget. At the table-name length the budget
+# assumes, a document at the cap must cache at most ~1 MiB. The cap leaves width
+# at shallow depth unbounded. A document with many sibling tables one header component deep
+# is accepted and can cache past the budget.
 #
-# That budget is the only thing that binds here. Depth counts the document's
-# implicit top-level table as level 1, the way `json_config` counts the outermost
-# `{`, so `[a.b]` is three levels. What gets cached is a flat tuple of
-# `(name, keys, subsections)` triples whose own nesting does not grow with the
-# document's, so nesting costs cache size and nothing else. Measured with
-# 20-character table names, a document at this cap caches 823 KiB of section
-# payload text — inside the ceiling, and an order of magnitude deeper than any real
-# configuration document.
+# The cache budget is the only constraint on this value. Depth counts the
+# document's implicit top-level table as level 1 (as `json_config` counts the
+# outermost `{`), so `[a.b]` is three levels. The cache holds a flat tuple of
+# `(name, keys, subsections)` triples at any document depth, so nesting costs cache
+# size and nothing else. With 20-character table names, a document at this cap
+# caches 823 KiB of section payload text. That is inside the ceiling, and the cap
+# is an order of magnitude deeper than any real configuration document.
 _MAX_TOML_DEPTH = 200
 
 
 def _structure_depth(value: object) -> int:
-    """Report the deepest table/array nesting in a parsed document without recursing.
+    """Report the deepest table/array nesting in a parsed document.
 
-    The document's own top-level table is level 1, so a flat file is 1 and `[a.b]`
-    is 3. The traversal keeps its own stack, so the answer depends only on the
-    parsed document — never on how much of the interpreter's recursion budget the
-    caller has already spent.
+    The document's top-level table is level 1, so a flat file is 1 and `[a.b]` is
+    3. The traversal keeps its own stack instead of recursing, so the answer
+    depends only on the parsed document, whatever recursion budget the caller has
+    left.
     """
     deepest = 0
     pending: list[tuple[object, int]] = [(value, 1)]
@@ -144,19 +142,20 @@ def _structure_depth(value: object) -> int:
 def _load_toml(text: str) -> dict[str, Any]:
     """Parse `text`, rejecting nesting past `_MAX_TOML_DEPTH` as a decode error.
 
-    The depth is measured on the parsed document rather than on the file text.
-    TOML spreads nesting across table headers, dotted keys, inline tables, and
-    arrays, and brackets and braces also appear inside comments and in four kinds
-    of string literal, so counting depth from the text would mean re-lexing the
-    grammar — and any disagreement with `tomllib` would reject documents this
-    integration accepts today. `tomllib` builds header-nested and dotted-key tables
-    iteratively, so those reach the check however deep they go (measured to 1500
-    levels under the default recursion limit); inline tables and arrays recurse, so
-    a document nested hundreds of levels deep in *those* can exhaust the parser
-    before the cap is reported (measured, again under the default limit and from a
-    fresh thread: 330 inline-table levels and 495 array levels still parse). Both
-    outcomes are fixed strings under `toml-decode-error`; the residual is disclosed
-    in `docs/integration-contract.md`.
+    Depth is measured on the parsed document. TOML spreads nesting across table
+    headers, dotted keys, inline tables and arrays, and brackets and braces also
+    appear in comments and in four kinds of string literal. Counting depth from
+    the text would mean re-lexing the grammar, and any disagreement with `tomllib`
+    would reject documents this integration accepts today.
+
+    `tomllib` builds header-nested and dotted-key tables iteratively, so those
+    reach the check at any depth (measured to 1500 levels under the default
+    recursion limit). Inline tables and arrays recurse, so a document nested
+    hundreds of levels deep in *those* can exhaust the parser before the cap is
+    reported. Measured under the default limit from a fresh thread, 330
+    inline-table levels and 495 array levels still parse. Both outcomes are fixed
+    strings under `toml-decode-error`. `docs/integration-contract.md` documents
+    the residual.
     """
     parsed = tomllib.loads(text)
     if _structure_depth(parsed) > _MAX_TOML_DEPTH:
@@ -166,19 +165,18 @@ def _load_toml(text: str) -> dict[str, Any]:
     return parsed
 
 
-# `tomllib` recurses once per inline-table and once per array level, so which frame
-# runs out of the interpreter's recursion budget — and so which message CPython
-# raises — depends on how much stack the caller had already spent, not on the file.
-# CPython names whichever frame ran out, so the same document can report a different
-# message from different call depths. These payloads are cached, so a fixed string
-# is emitted instead and the message stops recording which frame ran out.
+# `tomllib` recurses once per inline-table and once per array level. Which frame
+# runs out of the interpreter's recursion budget depends on how much stack the
+# caller already spent, and CPython's message names that frame. The same document
+# can therefore report different messages from different call depths. These
+# payloads are cached, so this fixed string is reported instead.
 #
-# That closes the message axis, not the outcome axis: `tomllib` still descends once
-# per inline-table and array level, so whether a document within the cap parses at
-# all remains a property of the call site as well as of the file, and a caller
-# entering with its stack nearly spent turns a valid document into this diagnostic.
-# `json_config` and `xml_config` emit the same shape for the same reason and carry
-# the same residual.
+# The fixed string makes the message stable. The outcome still depends on the call
+# site. `tomllib` descends once per inline-table and array level, so whether a
+# document within the cap parses depends on the caller's stack as well as on the
+# file. A caller entering with its stack nearly spent turns a valid document into
+# this diagnostic. `json_config` and `xml_config` emit the same shape for the same
+# reason and carry the same residual.
 _STACK_EXHAUSTED_DIAGNOSTIC = "TOML parsing exhausted the interpreter stack"
 
 
@@ -212,13 +210,11 @@ def _walk_sections(
 ) -> list[ConfigSectionPayload]:
     """Collect every table in sorted pre-order, deepest nesting included.
 
-    Keys are visited in sorted order at every level rather than in the order the
-    document wrote them, so a file that writes `[b]` before `[a]` still yields
-    `<root>`, `a`, `b`.
+    Keys are visited in sorted order at every level, so a file that writes `[b]`
+    before `[a]` still yields `<root>`, `a`, `b`.
 
-    The traversal keeps its own stack rather than recursing, so the payload a
-    document produces depends only on the document — never on how much of the
-    interpreter's recursion budget the caller has already spent.
+    The traversal keeps its own stack instead of recursing, so the payload
+    depends only on the document, whatever recursion budget the caller has left.
     """
     sections: list[ConfigSectionPayload] = []
     pending: list[tuple[dict[str, Any], str]] = [(data, prefix)]
@@ -300,7 +296,7 @@ def _config_shape_diagnostics(parsed: dict[str, Any]) -> tuple[DiagnosticPayload
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 — Payload queries
+# Layer 1: Payload queries
 # ---------------------------------------------------------------------------
 
 
@@ -373,7 +369,7 @@ def config_diagnostics_payload(db: Database, path: str) -> tuple[DiagnosticPaylo
 
 
 # ---------------------------------------------------------------------------
-# Layer 2 — Composition
+# Layer 2: Composition
 # ---------------------------------------------------------------------------
 
 
@@ -387,7 +383,7 @@ def config_analysis_payload(db: Database, path: str) -> ConfigAnalysisPayload:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Entrypoints
+# Layer 3: Entrypoints
 # ---------------------------------------------------------------------------
 
 

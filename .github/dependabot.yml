@@ -8,8 +8,8 @@ updates:
       - dependencies
     groups:
       # `init` and `analyze` are two paths of one action and must run the same
-      # version; bumped separately, each PR pairs a new half with an old one and
-      # CodeQL fails.
+      # version. Separate bumps would pair a new half with an old one and break
+      # CodeQL.
       codeql-action:
         patterns:
           - "github/codeql-action*"
