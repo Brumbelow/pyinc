@@ -1,0 +1,600 @@
+"""A query may capture a name the ambient-read guard replaced, by any route.
+
+Once a `Database` exists, `from os import getcwd` binds the guard's wrapper
+rather than the builtin. The wrapper is a closure over pyinc's own state -- the
+active guards, the working-directory flag, the original it calls -- which the
+capture walk cannot fold, so the kernel recognises every callable the guard
+installed and pins a capture of one by the standard-library callable it
+guards: that callable's module and qualified name, its module's identity, and
+the interpreter build. These cells pin the registry, every route a capture
+takes, the preview, and that a name bound before the first `Database` -- the
+unguarded original -- fingerprints exactly as it did.
+"""
+
+from __future__ import annotations
+
+import builtins
+import importlib
+import io
+import json
+import os
+import subprocess
+import sys
+import threading
+import uuid
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from types import FunctionType, MethodType, ModuleType
+from typing import Any
+
+import pytest
+
+import pyinc
+from pyinc import Database, InMemoryArtifactStore, UntrackedReadError, explain_query_captures
+from pyinc import runtime as pyinc_runtime
+from pyinc.runtime import _GUARDED_NAMES, _guarded_name, _GuardedEnviron, _is_guarded_name
+from pyinc.value import fingerprint_snapshot
+
+# Each guarded callable: the line that binds it as `W`, a call through `{f}`
+# whatever route reached it, and the same call spelled through its module,
+# which is what the guard refuses or answers today. `arg` is the query's
+# argument: a directory holding `sample.txt`, or `relative`.
+_GUARDED: dict[str, tuple[str, str, str]] = {
+    "builtins.open": (
+        "from builtins import open as W",
+        "{f}(os.path.join(arg, 'sample.txt')).read()",
+        "builtins.open",
+    ),
+    "io.open": (
+        "from io import open as W",
+        "{f}(os.path.join(arg, 'sample.txt')).read()",
+        "io.open",
+    ),
+    "os.getenv": ("from os import getenv as W", "{f}('PYINC_GUARDED_NAME')", "os.getenv"),
+    "os.listdir": ("from os import listdir as W", "sorted({f}(arg))", "os.listdir"),
+    "os.scandir": (
+        "from os import scandir as W",
+        "sorted(entry.name for entry in {f}(arg))",
+        "os.scandir",
+    ),
+    "os.getcwd": ("from os import getcwd as W", "{f}()", "os.getcwd"),
+    "os.getcwdb": ("from os import getcwdb as W", "{f}()", "os.getcwdb"),
+    "os.path.realpath": ("from os.path import realpath as W", "{f}(arg)", "os.path.realpath"),
+    "os.path.abspath": ("from os.path import abspath as W", "{f}(arg)", "os.path.abspath"),
+    "Path.iterdir": (
+        "from pathlib import Path\nW = Path.iterdir",
+        "sorted(child.name for child in {f}(pathlib.Path(arg)))",
+        "pathlib.Path.iterdir",
+    ),
+    "Path.cwd": ("from pathlib import Path\nW = Path.cwd", "str({f}())", "pathlib.Path.cwd"),
+    "Thread.start": (
+        "from threading import Thread\nW = Thread.start",
+        "_listed_in_a_thread({f}, arg)",
+        "threading.Thread.start",
+    ),
+}
+if sys.platform != "win32":
+    _GUARDED["os.getenvb"] = (
+        "from os import getenvb as W",
+        "{f}(b'PYINC_GUARDED_NAME')",
+        "os.getenvb",
+    )
+
+# The module every generated query module starts with: the modules the
+# baseline spellings name, and a helper that starts a thread through whatever
+# `start` it is handed and reports what a raw read inside it met.
+_PRELUDE = """\
+import builtins
+import io
+import os
+import pathlib
+import threading
+
+from pyinc import query
+
+
+def _listed_in_a_thread(start, path):
+    seen = []
+
+    def body():
+        try:
+            seen.append(sorted(os.listdir(path)))
+        except Exception as exc:
+            seen.append(type(exc).__name__ + ": " + str(exc))
+
+    thread = threading.Thread(target=body)
+    start(thread)
+    thread.join()
+    return seen[0]
+"""
+
+# Every route a capture can take to the query's identity. `{call}` is the
+# guarded call with the route's handle in place of `{f}`.
+_ROUTES: dict[str, str] = {
+    "global": "@query(key=KEY)\ndef q(db, arg):\n    return {call}\n",
+    "default": "@query(key=KEY)\ndef q(db, arg, f=W):\n    return {call}\n",
+    "kwdefault": "@query(key=KEY)\ndef q(db, arg, *, f=W):\n    return {call}\n",
+    "closure": (
+        "def make():\n    f = W\n\n    @query(key=KEY)\n    def q(db, arg):\n"
+        "        return {call}\n\n    return q\n\n\nq = make()\n"
+    ),
+    "tuple": "T = (W, 1)\n\n\n@query(key=KEY)\ndef q(db, arg):\n    f = T[0]\n    return {call}\n",
+    "helper": (
+        "def helper():\n    return W\n\n\n@query(key=KEY)\ndef q(db, arg):\n"
+        "    f = helper()\n    return {call}\n"
+    ),
+    # A mutable module global makes the helper's definition fold refuse, so
+    # the kernel pins it by its source and folds each global separately.
+    "source-pinned": (
+        "CACHE = {{'k': 1}}\n\n\ndef helper():\n    CACHE['k']\n    return W\n\n\n"
+        "@query(key=KEY)\ndef q(db, arg):\n    f = helper()\n    return {call}\n"
+    ),
+    "module-attribute": (
+        "import {binding_module} as H\n\n\n@query(key=KEY)\ndef q(db, arg):\n    return {call}\n"
+    ),
+    # Folded with the handle the body reads it off.
+    "handle-attribute": (
+        "@query(key=KEY)\ndef q(db, arg):\n    f = q.f\n    return {call}\n\n\nq.f = W\n"
+    ),
+    # Folded with the class, whose body holds it as a static method.
+    "class-attribute": (
+        "class Holder:\n    f = staticmethod(W)\n\n\n@query(key=KEY)\ndef q(db, arg):\n"
+        "    f = Holder.f\n    return {call}\n"
+    ),
+}
+_ROUTE_HANDLES = {
+    "global": "W",
+    "default": "f",
+    "kwdefault": "f",
+    "closure": "f",
+    "tuple": "f",
+    "helper": "f",
+    "source-pinned": "f",
+    "module-attribute": "H.W",
+    "handle-attribute": "f",
+    "class-attribute": "f",
+}
+# Every name on every route, but `Path.cwd` held in a class body: it reads as
+# a bound method, and `staticmethod` of a bound method is not a Python
+# function's descriptor, which a class body is folded through for any method.
+_CAPTURES = [
+    (label, route)
+    for label in sorted(_GUARDED)
+    for route in sorted(_ROUTES)
+    if (label, route) != ("Path.cwd", "class-attribute")
+]
+
+
+@pytest.fixture
+def sample_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    directory = tmp_path / "data"
+    directory.mkdir()
+    (directory / "sample.txt").write_text("hello", encoding="utf-8")
+    monkeypatch.setenv("PYINC_GUARDED_NAME", "value")
+    return directory
+
+
+@pytest.fixture
+def module_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[[str], ModuleType]]:
+    """Write a module and import it, once a `Database` has installed the guard."""
+    Database()
+    source_root = tmp_path / "modules"
+    source_root.mkdir()
+    monkeypatch.syspath_prepend(str(source_root))
+    created: list[str] = []
+
+    def make(source: str) -> ModuleType:
+        name = f"pyinc_guarded_capture_{uuid.uuid4().hex}"
+        (source_root / f"{name}.py").write_text(source, encoding="utf-8")
+        created.append(name)
+        return importlib.import_module(name)
+
+    yield make
+    for name in created:
+        sys.modules.pop(name, None)
+
+
+def _outcome(query: Any, arg: str) -> tuple[str, Any]:
+    """What a fresh database answers, or the refusal it raises."""
+    try:
+        return ("answered", Database().get(query, arg))
+    except UntrackedReadError as exc:
+        return ("refused", str(exc))
+
+
+def _baseline(label: str, module_factory: Callable[[str], ModuleType]) -> Any:
+    _binding, call, spelled = _GUARDED[label]
+    source = _PRELUDE + (
+        f"\n\n@query(key={f'baseline:{label}'!r})\ndef q(db, arg):\n"
+        f"    return {call.format(f=spelled)}\n"
+    )
+    return module_factory(source).q
+
+
+@pytest.mark.parametrize(("label", "route"), _CAPTURES)
+def test_a_captured_guard_wrapper_fingerprints_and_still_guards(
+    module_factory: Callable[[str], ModuleType],
+    sample_directory: Path,
+    label: str,
+    route: str,
+) -> None:
+    """Every guarded callable, captured by every route, fingerprints and behaves as the guarded call.
+
+    Before, each of these raised `UnsupportedValueError` at fingerprinting --
+    `getcwd` and `getcwdb` among them, which fingerprinted as builtins until
+    the working-directory guard replaced them. A capture now answers, or is
+    refused, exactly as the same call through its module is.
+    """
+    binding, call, _spelled = _GUARDED[label]
+    binding_module = module_factory("from pyinc import query\n" + binding + "\n")
+    source = (
+        _PRELUDE
+        + binding
+        + "\n\nKEY = "
+        + repr(f"guarded-capture:{label}:{route}")
+        + "\n\n\n"
+        + _ROUTES[route].format(
+            call=call.format(f=_ROUTE_HANDLES[route]), binding_module=binding_module.__name__
+        )
+    )
+    captured = module_factory(source).q
+    baseline = _baseline(label, module_factory)
+
+    arguments = [str(sample_directory)]
+    if label in {"os.path.realpath", "os.path.abspath"}:
+        arguments.append("relative")
+    for arg in arguments:
+        assert _outcome(captured, arg) == _outcome(baseline, arg)
+
+
+# What the guard does with each call made through its module: the refusal
+# names the call, and `realpath` and `abspath` answer for a fully qualified
+# path. A thread a query starts meets the guard on its own raw read.
+_REFUSED_AS = {
+    "builtins.open": "Raw open() inside a query",
+    "io.open": "Raw open() inside a query",
+    "os.getenv": "Raw os.getenv() inside a query",
+    "os.getenvb": "Raw os.getenvb() inside a query",
+    "os.listdir": "Raw os.listdir() inside a query",
+    "os.scandir": "Raw os.scandir() inside a query",
+    "os.getcwd": "Raw os.getcwd() inside a query",
+    "os.getcwdb": "Raw os.getcwdb() inside a query",
+    "Path.iterdir": "Raw Path.iterdir() inside a query",
+    "Path.cwd": "Raw Path.cwd() inside a query",
+}
+
+
+@pytest.mark.parametrize("label", sorted(_GUARDED))
+def test_the_outcomes_compared_above_are_the_guards_own(
+    module_factory: Callable[[str], ModuleType], sample_directory: Path, label: str
+) -> None:
+    """The cells above compare a capture with the guarded call; this pins what that call does.
+
+    Two refusals for the same wrong reason would compare equal as well.
+    """
+    baseline = _baseline(label, module_factory)
+    outcome = _outcome(baseline, str(sample_directory))
+    if label in _REFUSED_AS:
+        assert outcome[0] == "refused"
+        assert _REFUSED_AS[label] in outcome[1]
+    elif label == "Thread.start":
+        assert outcome[0] == "answered"
+        assert outcome[1].startswith("UntrackedReadError: Raw os.listdir() inside a query")
+    else:
+        name = label.rpartition(".")[2]
+        assert outcome == ("answered", getattr(os.path, name)(str(sample_directory)))
+        refused = _outcome(baseline, "relative")
+        assert refused[0] == "refused"
+        assert f"Raw os.path.{name}() of a relative path" in refused[1]
+
+
+def test_every_callable_the_guard_installs_is_registered(tmp_path: Path) -> None:
+    """The registry is exactly the callables the guard put in place, each beside its original.
+
+    Every function defined in `pyinc.runtime` that sits where a standard-library
+    callable did is a registered wrapper, and the entry names the original's
+    own module and qualified name. The two environment mappings are the only
+    other objects the guard installs; they are state, not callables, and are
+    deliberately not registered.
+    """
+    Database()
+    runtime_file = pyinc_runtime.__file__
+
+    def defined_in_runtime(value: Any) -> bool:
+        function = value.__func__ if isinstance(value, (classmethod, staticmethod)) else value
+        return isinstance(function, FunctionType) and function.__code__.co_filename == runtime_file
+
+    found: dict[int, Any] = {}
+    for namespace in (
+        vars(builtins),
+        vars(io),
+        vars(os),
+        vars(os.path),
+        vars(Path),
+        vars(threading.Thread),
+    ):
+        for value in namespace.values():
+            if defined_in_runtime(value):
+                function = (
+                    value.__func__ if isinstance(value, (classmethod, staticmethod)) else value
+                )
+                found[id(function)] = function
+    assert set(found) == set(_GUARDED_NAMES)
+
+    live = {
+        label: wrapper.__func__ if isinstance(wrapper, MethodType) else wrapper
+        for label, wrapper in _live_wrappers().items()
+    }
+    assert set(live) == set(_GUARDED)
+    for label, wrapper in live.items():
+        entry = _guarded_name(wrapper)
+        assert entry is not None, label
+        assert entry.wrapper is wrapper
+        assert _guarded_name(entry.original) is None
+        assert (entry.module, entry.qualname) == (
+            entry.original.__module__,
+            entry.original.__qualname__,
+        )
+    assert {id(wrapper) for wrapper in live.values()} == set(_GUARDED_NAMES)
+
+    assert isinstance(os.environ, _GuardedEnviron)
+    assert not _is_guarded_name(os.environ)
+    if sys.platform != "win32":
+        assert isinstance(os.environb, _GuardedEnviron)
+        assert not _is_guarded_name(os.environb)
+
+
+def _owner() -> None:
+    """Stands in for the query function a payload builder names in its refusals."""
+
+
+def _payload_routes(db: Database, value: Any) -> list[Any]:
+    """The payload a value folds to on each route that folds one directly.
+
+    A direct capture (a global, a default, a closure cell, a handle attribute
+    or a source-pinned function's global), a module attribute, and a container
+    member fold it whole; a function's definition, folded for a class body, a
+    policy or a dataclass default factory, is the same payload inside their
+    own envelopes.
+    """
+    owner: Any = _owner
+    member = db._freeze_captured_immutable("T[0]", value, set(), owner=owner, active_ids=set())
+    assert member[0] == "captured-dependency"
+    payloads = [
+        db._captured_dependency_digest("W", value, set(), owner=owner),
+        db._module_attribute_payload(value, set(), owner=owner, capture_name="module.W"),
+        member[1],
+    ]
+    if isinstance(value, FunctionType):
+        payloads.append(db._function_definition_payload(value, set()))
+        policy = db._policy_definition_payload(value)
+        factory = db._dataclass_default_factory_payload(value)
+        assert policy[0] == factory[0] == "function"
+        payloads.extend((policy[1], factory[1]))
+    return payloads
+
+
+@pytest.mark.parametrize("label", sorted(_GUARDED))
+def test_a_guard_wrapper_folds_one_payload_naming_the_original(label: str) -> None:
+    """Every route folds the same payload, and it names the original, not the wrapper.
+
+    The routes agree, as they do for a builtin, so `import m; m.getcwd` and
+    `from m import getcwd` share an identity, and nothing of pyinc's own is in
+    it. That it carries no id or address is the cross-process cell's to check.
+    """
+    db = Database()
+    wrapper = _live_wrappers()[label]
+    payloads = _payload_routes(db, wrapper)
+    assert all(payload == payloads[0] for payload in payloads)
+
+    function = wrapper.__func__ if isinstance(wrapper, MethodType) else wrapper
+    entry = _guarded_name(function)
+    assert entry is not None
+    guarded = db._guarded_name_payload(function)
+    flattened = repr(guarded)
+    assert entry.module in flattened
+    assert entry.qualname in flattened
+    assert "pyinc" not in flattened
+    if isinstance(wrapper, MethodType):
+        assert payloads[0][0] == "bound-guarded-standard-name"
+        assert payloads[0][1] == guarded
+    else:
+        assert payloads[0] == guarded
+
+
+def _live_wrappers() -> dict[str, Any]:
+    """Each guarded callable where the guard installed it, as a capture reads it."""
+    Database()
+    live: dict[str, Any] = {
+        "builtins.open": builtins.open,
+        "io.open": io.open,
+        "os.getenv": os.getenv,
+        "os.listdir": os.listdir,
+        "os.scandir": os.scandir,
+        "os.getcwd": os.getcwd,
+        "os.getcwdb": os.getcwdb,
+        "os.path.realpath": os.path.realpath,
+        "os.path.abspath": os.path.abspath,
+        "Path.iterdir": Path.iterdir,
+        # A classmethod: reading it binds the wrapper to the class.
+        "Path.cwd": Path.cwd,
+        "Thread.start": threading.Thread.start,
+    }
+    if sys.platform != "win32":
+        live["os.getenvb"] = os.getenvb
+    return live
+
+
+def test_different_originals_fold_differently_and_one_original_folds_once() -> None:
+    """The payload separates what the originals separate, and nothing else.
+
+    `builtins.open` and `io.open` are two wrappers around one function, so
+    they fold alike; `getcwd` and `getcwdb` are two functions. An original is
+    never taken for its wrapper.
+    """
+    db = Database()
+    digest = fingerprint_snapshot
+    assert digest(db._guarded_name_payload(builtins.open)) == digest(
+        db._guarded_name_payload(io.open)
+    )
+    assert digest(db._guarded_name_payload(os.getcwd)) != digest(
+        db._guarded_name_payload(os.getcwdb)
+    )
+    for entry in _GUARDED_NAMES.values():
+        assert db._guarded_name_payload(entry.original) is None
+
+
+def test_a_bound_guard_wrapper_folds_the_class_it_is_bound_to() -> None:
+    """`Path.cwd` binds the wrapper to the class it was read from, and that class is folded.
+
+    A standard-library class is pinned by its module and name, and a subclass
+    the caller defines by its body, as an implementation dependency is.
+    """
+    db = Database()
+
+    class LocalPath(type(Path())):  # type: ignore[misc]
+        pass
+
+    owner: Any = _owner
+    standard = db._captured_dependency_digest("W", Path.cwd, set(), owner=owner)
+    local = db._captured_dependency_digest("W", LocalPath.cwd, set(), owner=owner)
+    assert standard[1] == local[1]
+    assert standard[2] != local[2]
+
+
+@pytest.mark.parametrize("label", sorted(_GUARDED))
+def test_the_capture_preview_agrees_with_the_kernel(
+    module_factory: Callable[[str], ModuleType], sample_directory: Path, label: str
+) -> None:
+    """`explain_query_captures` accepts a captured wrapper, as the kernel now does, as `guarded`."""
+    binding, call, _spelled = _GUARDED[label]
+    module = module_factory(
+        _PRELUDE
+        + binding
+        + f"\n\nKEY = {f'guarded-preview:{label}'!r}\n\n\n"
+        + _ROUTES["default"].format(call=call.format(f="f"), binding_module="")
+    )
+    by_name = {info.name: info for info in explain_query_captures(module.q)}
+    assert (by_name["default[0]"].accepted, by_name["default[0]"].kind) == (True, "guarded")
+    # The kernel agrees: the query answers or is refused by the guard, never
+    # with `UnsupportedValueError`.
+    _outcome(module.q, str(sample_directory))
+
+
+def test_a_standard_library_function_that_calls_a_wrapper_by_name_fingerprints(
+    module_factory: Callable[[str], ModuleType], sample_directory: Path
+) -> None:
+    """`relpath` and `ismount` reach the guarded `abspath` and `realpath` through their module.
+
+    Captured, they are folded as the functions they are, and their globals
+    hold the wrappers; both the preview and the kernel accept them.
+    """
+    module = module_factory(
+        "from os.path import relpath, ismount\nfrom pyinc import query\n\n\n"
+        "@query(key='guarded-preview:stdlib-callers')\n"
+        "def q(db, path, start):\n    return relpath(path, start), ismount(path)\n"
+    )
+    by_name = {info.name: info for info in explain_query_captures(module.q)}
+    assert (by_name["relpath"].accepted, by_name["relpath"].kind) == (True, "function")
+    assert (by_name["ismount"].accepted, by_name["ismount"].kind) == (True, "function")
+    sample = str(sample_directory / "sample.txt")
+    assert Database().get(module.q, sample, str(sample_directory)) == ("sample.txt", False)
+
+
+def test_a_wrapper_capture_reuses_its_identity_and_warms_from_a_checkpoint(
+    module_factory: Callable[[str], ModuleType], sample_directory: Path
+) -> None:
+    """The memo reuses a stored identity, and a checkpoint warms another database.
+
+    The memo observes a wrapper as a leaf, as the payload folds it, and the
+    warm path's walk of pinned captures stops at it.
+    """
+    module = module_factory(
+        "from os.path import realpath\nfrom pyinc import query\n\n\n"
+        "@query(key='guarded-capture:warm')\n"
+        "def q(db, path):\n    return realpath(path)\n"
+    )
+    store = InMemoryArtifactStore()
+    db = Database(store=store)
+    answer = db.get(module.q, str(sample_directory))
+    assert db.get(module.q, str(sample_directory)) == answer
+    assert db.inspect(module.q, str(sample_directory)).last_decision == "reused"
+
+    warm = Database(store=store)
+    warm.load_checkpoint(db.save_checkpoint())
+    assert warm.get(module.q, str(sample_directory)) == answer
+    assert warm.inspect(module.q, str(sample_directory)).last_recompute == "reused"
+    assert warm.statistics().query_executions == 0
+
+
+_BEFORE_THE_FIRST_DATABASE = '''\
+"""Bind guarded names before any Database exists, then fingerprint captures of them."""
+
+import json
+import os
+import sys
+import tempfile
+
+directory = tempfile.mkdtemp()
+sys.path.insert(0, directory)
+with open(os.path.join(directory, "bound_early.py"), "w", encoding="utf-8") as handle:
+    handle.write(
+        "from os import getcwd, getenv\\n"
+        "from pyinc import query\\n"
+        "@query(key='early:getcwd')\\n"
+        "def q_getcwd(db):\\n    return getcwd()\\n"
+        "@query(key='early:getenv')\\n"
+        "def q_getenv(db):\\n    return getenv('PYINC_GUARDED_NAME')\\n"
+    )
+import bound_early
+
+from pyinc import Database, UnsupportedValueError, UntrackedReadError
+from pyinc.runtime import _guarded_name
+
+db = Database()
+out = {}
+for name in ("getcwd", "getenv"):
+    query = getattr(bound_early, "q_" + name)
+    captured = vars(bound_early)[name]
+    try:
+        db.get(query)
+        out[name] = ["answered", _guarded_name(captured) is not None]
+    except UnsupportedValueError:
+        out[name] = ["unsupported", _guarded_name(captured) is not None]
+    except UntrackedReadError:
+        out[name] = ["refused", _guarded_name(captured) is not None]
+out["getcwd_payload"] = db._captured_dependency_digest(
+    "getcwd", bound_early.getcwd, set(), owner=bound_early.q_getcwd.fn
+)[0]
+print("JSON " + json.dumps(out))
+'''
+
+
+def test_a_name_bound_before_the_first_database_keeps_the_unguarded_original(
+    tmp_path: Path,
+) -> None:
+    """The documented limitation, unchanged: a name bound early is the original, fingerprinted as before.
+
+    `from os import getcwd` before any `Database` keeps the builtin, which
+    reads the working directory unrefused and fingerprints as a builtin;
+    `os.getenv` stays refused at fingerprinting, because its global `environ`
+    is the guard's mapping, which is not recognised. Neither is a registered
+    wrapper. A fresh process is the only place no `Database` exists yet.
+    """
+    script = tmp_path / "bound_early_fixture.py"
+    script.write_text(_BEFORE_THE_FIRST_DATABASE, encoding="utf-8")
+    src = str(Path(pyinc.__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": src, "PYTHONDONTWRITEBYTECODE": "1"}
+    env["PYINC_GUARDED_NAME"] = "value"
+    proc = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, env=env, check=False
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    line = [ln for ln in proc.stdout.splitlines() if ln.startswith("JSON ")][-1]
+    assert json.loads(line[len("JSON ") :]) == {
+        "getcwd": ["answered", False],
+        "getenv": ["unsupported", False],
+        "getcwd_payload": "builtin",
+    }

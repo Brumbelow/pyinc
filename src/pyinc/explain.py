@@ -234,7 +234,7 @@ def _classify_capture(
     name: str, value: Any, origin: str, *, owner: FunctionType | None = None
 ) -> CaptureInfo:
     from .core import Input, Query
-    from .runtime import Database
+    from .runtime import Database, _is_guarded_name
 
     type_name = type(value).__qualname__
     database = Database()
@@ -247,6 +247,13 @@ def _classify_capture(
         elif origin == "annotation_evaluator" and isinstance(value, FunctionType):
             kind = "annotation"
             database._annotation_evaluator_payload(value, set())
+        elif _is_guarded_name(value):
+            # A wrapper the ambient-read guard installed in place of a
+            # standard-library callable (`from os import getcwd` once a
+            # Database exists): the kernel pins it by the name it guards
+            # before any other arm sees it.
+            kind = "guarded"
+            database._captured_dependency_digest(name, value, set(), owner=owner_function)
         elif isinstance(value, Query):
             kind = "query"
             database._query_fingerprint(value)

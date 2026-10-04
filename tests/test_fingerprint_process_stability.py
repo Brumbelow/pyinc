@@ -536,3 +536,102 @@ def test_the_runtime_build_payload_ignores_the_hash_randomization_flag(
         f"above is not comparing what it claims: {randomization_on} "
         f"then {another_seed}"
     )
+
+
+# Each name the ambient-read guard replaces, bound in a query module once a
+# Database exists, so the module holds the guard's wrapper. The module is
+# written once by the cell and imported by every child from the same place.
+_GUARDED_CAPTURE_MODULE = '''\
+import builtins
+import io
+import os
+import os.path
+import sys
+import threading
+from pathlib import Path
+
+from pyinc import query
+
+CAPTURED = {
+    "builtins.open": builtins.open,
+    "io.open": io.open,
+    "os.getenv": os.getenv,
+    "os.listdir": os.listdir,
+    "os.scandir": os.scandir,
+    "os.getcwd": os.getcwd,
+    "os.getcwdb": os.getcwdb,
+    "os.path.realpath": os.path.realpath,
+    "os.path.abspath": os.path.abspath,
+    "Path.iterdir": Path.iterdir,
+    "Path.cwd": Path.cwd,
+    "Thread.start": threading.Thread.start,
+}
+if sys.platform != "win32":
+    CAPTURED["os.getenvb"] = os.getenvb
+
+QUERIES = {}
+for _label, _wrapper in CAPTURED.items():
+
+    def _make(wrapper, label):
+        @query(key="guarded-capture:" + label)
+        def captures(db):
+            return wrapper is not None
+
+        return captures
+
+    QUERIES[_label] = _make(_wrapper, _label)
+'''
+
+GUARDED_CAPTURE_FIXTURE_SCRIPT = '''\
+"""Print the identity of a query capturing each guard wrapper, and the wrapper's payload."""
+
+import json
+import sys
+
+from pyinc import Database
+from pyinc.value import fingerprint_snapshot
+
+db = Database(mode="strict")  # installs the guard before the module binds the names
+sys.path.insert(0, sys.argv[1])
+import guarded_capture_module as module
+
+out = {}
+for label, query in module.QUERIES.items():
+    out["Q|" + label] = db._query_fingerprint(query)
+    wrapper = module.CAPTURED[label]
+    out["P|" + label] = fingerprint_snapshot(
+        db._guarded_name_payload(getattr(wrapper, "__func__", wrapper))
+    )
+print("JSON " + json.dumps(out))
+'''
+
+
+def test_a_captured_guard_wrapper_has_the_same_identity_in_every_process(
+    tmp_path: Path,
+) -> None:
+    """A query that captures a guard wrapper digests the same in three processes.
+
+    The wrapper's own payload names the standard-library callable it guards,
+    never the wrapper object, so it carries no address and nothing the hash
+    seed orders; the query that captures it follows. Two non-zero seeds and no
+    pinned seed, as in the cell above.
+    """
+
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    (modules / "guarded_capture_module.py").write_text(_GUARDED_CAPTURE_MODULE, encoding="utf-8")
+    script = tmp_path / "guarded_capture_fixture.py"
+    script.write_text(GUARDED_CAPTURE_FIXTURE_SCRIPT, encoding="utf-8")
+
+    seeds: tuple[str | None, ...] = ("1", "2", None)
+    runs = [_run([sys.executable, str(script), str(modules)], _child_env(seed)) for seed in seeds]
+
+    expected = 12 if sys.platform == "win32" else 13
+    assert len(runs[0]) == 2 * expected
+    assert all(run == runs[0] for run in runs[1:]), [
+        key for key in runs[0] if len({run.get(key) for run in runs}) > 1
+    ]
+    # Distinct names fold distinctly; `open` and `io.open` guard one function.
+    payloads = {key: value for key, value in runs[0].items() if key.startswith("P|")}
+    assert payloads["P|builtins.open"] == payloads["P|io.open"]
+    assert len(set(payloads.values())) == len(payloads) - 1

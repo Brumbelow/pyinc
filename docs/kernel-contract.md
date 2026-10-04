@@ -191,6 +191,26 @@ reflective builtin beside them are accepted, and neither reaches identity
 (limitation 5). `pyinc.explain_query_captures(fn)` previews how each capture is
 classified before the first `db.get()`.
 
+A query may capture a callable the condition 2 guard replaced. Bound once a
+`Database` exists (`from os import getcwd`, `from os.path import realpath`,
+`Path.cwd`), such a name holds the guard's wrapper, and wherever the kernel
+folds a captured callable it pins the wrapper as the standard-library callable
+it guards -- by that callable's module and qualified name, its module's
+identity, and the interpreter build, as it pins a standard-library type --
+never by the wrapper's own code. A standard-library function that calls one
+through its module's namespace, such as `os.path.relpath` or
+`os.path.ismount`, is folded as the function it is, with the wrapper among its
+globals. Calling a captured wrapper inside a query is refused exactly as the
+call through its module is, and a fully qualified `realpath` or `abspath`
+still answers. `explain_query_captures` reports such a capture with kind
+`guarded`. The environment mappings the guard installs are state rather than
+callables: a capture of `os.environ` or `os.environb` itself is refused, as it
+always was. The pin does not move with the guard's implementation, as no
+identity moves with the kernel's own code: an identity folds the code a query
+captures, pyinc's resource types included, never pyinc's version or the
+kernel itself, whose encoding and rules are marked by the kernel fingerprint
+version every digest carries.
+
 `Input` keys and `@query`/`Query` keys are exactly `str` and non-empty; the
 default query key is `module:qualname`. A `str` subclass, a `StrEnum` member
 included, is rejected at construction with a message naming the plain string
@@ -321,7 +341,9 @@ enough to the guarded set to be named:
 - *The working directory outside the guarded names.* The import system resolves
   an empty or relative `sys.path` entry with the interpreter's own `getcwd`; a
   name bound before the first `Database` is created (`from os import getcwd`)
-  keeps the unguarded function; and a system call given a relative path
+  keeps the unguarded function, which reads the directory unrefused and is
+  fingerprinted as that function, where one bound afterwards holds the guard's
+  wrapper (condition 3); and a system call given a relative path
   (`os.stat("data")`) reads the directory itself. None of these is refused.
 - *Threads the query did not start.* The guard covers threads a query body
   starts, at any depth, and nothing else. A pre-warmed pool, an executor built
@@ -418,7 +440,8 @@ or a `Resource`:
 - A captured standard-library module folds the names of the paths read off it,
   not the behavior behind them, so patching a stdlib function or class
   (`json.dumps = other`) is not detected, warm or fresh. A path read through
-  `getattr` with a computed name contributes no path.
+  `getattr` with a computed name contributes no path. A captured guard wrapper
+  (condition 3) is pinned the same way, by the name it guards.
 - Outside the standard library, a module that stores a process id, an import
   timestamp, or anything derived from them at module scope makes every
   identity that captures it process-varying.

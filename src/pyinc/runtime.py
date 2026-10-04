@@ -881,6 +881,51 @@ _CWD_ADVICE = "Pass an absolute path as a query argument, or read it through a R
 _GUARD_INSTALLED = False
 _GUARD_INSTALL_LOCK = threading.Lock()
 
+
+@dataclass(frozen=True)
+class _GuardedName:
+    """A standard-library callable the guard replaced, and the wrapper it installed.
+
+    `module` and `qualname` are the original's own `__module__` and
+    `__qualname__` -- `posix.getcwd`, `posixpath.realpath`, `pathlib.Path.cwd`
+    -- which is what a capture of the wrapper is fingerprinted by.
+    """
+
+    wrapper: Callable[..., Any]
+    original: Callable[..., Any]
+    module: str
+    qualname: str
+
+
+# Every callable `_install_guards_once` puts in place of a standard-library one,
+# keyed by the wrapper's id. A query module that binds one of those names after
+# the first `Database` exists (`from os import getcwd`) holds the wrapper, a
+# closure over pyinc's own state that the capture walk cannot fold, so the
+# fingerprint recognises it here and pins it by the name it guards instead.
+# Filled once, under the install lock and before the guard is marked installed,
+# and never changed after, so every fingerprint, which a `Database` takes only
+# once it has installed the guard, sees all of it. The entries keep the
+# wrappers alive, so no id here is ever reused. The two environment mappings
+# the guard installs are not callables and are not here: a captured mapping is
+# state, refused as `os.environ` itself is.
+_GUARDED_NAMES: dict[int, _GuardedName] = {}
+
+
+def _guarded_name(value: Any) -> _GuardedName | None:
+    """The registry entry for a guard wrapper, or None for anything else."""
+    entry = _GUARDED_NAMES.get(id(value))
+    if entry is None or entry.wrapper is not value:
+        return None
+    return entry
+
+
+def _is_guarded_name(value: Any) -> bool:
+    """Whether `value` is a guard wrapper, or one bound as a method (`Path.cwd`)."""
+    if isinstance(value, MethodType):
+        return _guarded_name(value.__func__) is not None
+    return _guarded_name(value) is not None
+
+
 # How a refused call names the position it was made from. Keyed by the
 # boundary states that are not "outside", which is the only state that allows
 # everything.
@@ -1128,6 +1173,32 @@ def _install_guards_once() -> None:
                 thread._pyinc_context_bound = True  # type: ignore[attr-defined]
             original_thread_start(thread)
 
+        # `pathlib` and pyinc reach `realpath` and `abspath` through
+        # `os.path`, and the path module's own functions (`relpath`,
+        # `ismount`, Windows' `realpath`) through its namespace, which is the
+        # same object; a module that bound one of them by name before the
+        # guard was installed (`sysconfig` binds `realpath`) keeps the
+        # original.
+        original_realpath = os.path.realpath
+        original_abspath = os.path.abspath
+        guarded_realpath = _cwd_anchoring_realpath(original_realpath, os.path)
+        guarded_abspath = _cwd_anchoring_abspath(original_abspath, os.path)
+        # Every callable installed below, beside the one it replaces.
+        installed: list[tuple[Callable[..., Any], Callable[..., Any]]] = [
+            (guarded_open, original_builtins_open),
+            (guarded_io_open, original_io_open),
+            (guarded_getenv, original_os_getenv),
+            (guarded_listdir, original_os_listdir),
+            (guarded_scandir, original_os_scandir),
+            (guarded_path_iterdir, original_path_iterdir),
+            (guarded_getcwd, original_os_getcwd),
+            (guarded_getcwdb, original_os_getcwdb),
+            (guarded_path_cwd, original_path_cwd),
+            (guarded_realpath, original_realpath),
+            (guarded_abspath, original_abspath),
+            (guarded_thread_start, original_thread_start),
+        ]
+
         builtins.open = guarded_open
         io.open = guarded_io_open
         os.getenv = guarded_getenv  # type: ignore[assignment]
@@ -1138,14 +1209,8 @@ def _install_guards_once() -> None:
         os.getcwd = guarded_getcwd
         os.getcwdb = guarded_getcwdb
         Path.cwd = classmethod(guarded_path_cwd)  # type: ignore[assignment, method-assign]
-        # `pathlib` and pyinc reach `realpath` and `abspath` through
-        # `os.path`, and the path module's own functions (`relpath`,
-        # `ismount`, Windows' `realpath`) through its namespace, which is the
-        # same object; a module that bound one of them by name before the
-        # guard was installed (`sysconfig` binds `realpath`) keeps the
-        # original.
-        os.path.realpath = _cwd_anchoring_realpath(os.path.realpath, os.path)
-        os.path.abspath = _cwd_anchoring_abspath(os.path.abspath, os.path)
+        os.path.realpath = guarded_realpath
+        os.path.abspath = guarded_abspath
         if sys.platform != "win32":
             # The byte-oriented view of the same process environment, and the
             # lookup that reads through it. Windows has neither.
@@ -1165,7 +1230,12 @@ def _install_guards_once() -> None:
                 ),
             )
             os.getenvb = guarded_getenvb  # type: ignore[assignment]
+            installed.append((guarded_getenvb, original_os_getenvb))
         threading.Thread.start = guarded_thread_start  # type: ignore[assignment, method-assign]
+        for wrapper, original in installed:
+            _GUARDED_NAMES[id(wrapper)] = _GuardedName(
+                wrapper, original, original.__module__, original.__qualname__
+            )
         _GUARD_INSTALLED = True
 
 
@@ -4897,6 +4967,10 @@ class Database:
             # true.
             if isinstance(target, (FunctionType, Query, Input)):
                 return True
+            # The one bound method `_module_attribute_payload` folds, and it
+            # folds the class the guard wrapper is bound to live.
+            if isinstance(target, MethodType) and _guarded_name(target.__func__) is not None:
+                return True
             # Mirrors `_module_attribute_payload`, which routes a module and a
             # class to their own branches before the resource and
             # wrapped-callable ones: a module is covered by the memo's other
@@ -4940,6 +5014,10 @@ class Database:
         parameter_types = _TYPE_PARAMETER_TYPES
 
         def observe_value(value: Any) -> Any:
+            if _guarded_name(value) is not None:
+                # Mirrors `_guarded_name_payload`, which folds the registry
+                # entry and never the wrapper's own closure or globals.
+                return value
             if isinstance(value, Query):
                 if id(value) in seen:
                     return value
@@ -5081,7 +5159,7 @@ class Database:
             )
 
         def observe_function(fn: FunctionType) -> Any:
-            if id(fn) in seen:
+            if id(fn) in seen or _guarded_name(fn) is not None:
                 return fn
             seen.add(id(fn))
             code = fn.__code__
@@ -5375,6 +5453,12 @@ class Database:
     def _function_definition_payload(
         self, fn: FunctionType, seen_functions: builtins.set[int]
     ) -> Any:
+        # A guard wrapper's definition is the name it guards, wherever a
+        # function is folded: a class body, a descriptor, a policy, a bound
+        # method, a dataclass default factory.
+        guarded = self._guarded_name_payload(fn)
+        if guarded is not None:
+            return guarded
         self._reject_reflective_namespace_reads(fn)
         fn_id = id(fn)
         if fn_id in seen_functions:
@@ -6164,6 +6248,9 @@ class Database:
     ) -> Any:
         from .core import Input, Query
 
+        guarded = self._guarded_name_payload(value)
+        if guarded is not None:
+            return guarded
         if isinstance(value, Query):
             # Fold the captured query's full definition into the parent's
             # identity so a change to a dependency query's body moves the parent.
@@ -6584,6 +6671,19 @@ class Database:
                 f"Bound method capture {capture_name!r} has a non-Python function."
             )
         bound_owner = method.__self__
+        guarded = self._guarded_name_payload(function)
+        if guarded is not None and isinstance(bound_owner, type):
+            # A guard wrapper installed as a classmethod (`Path.cwd`), bound
+            # to the class it was looked up on. The class is pinned as an
+            # implementation dependency is -- a standard-library one by its
+            # module and name, any other by its body -- not walked whole as
+            # an ordinary method's owner is, which `pathlib.Path` does not
+            # survive.
+            return (
+                "bound-guarded-standard-name",
+                guarded,
+                self._implementation_dependency_type_payload(bound_owner, set()),
+            )
         if isinstance(bound_owner, ModuleType):
             owner_payload: Any = self._captured_module_payload(
                 bound_owner,
@@ -6616,6 +6716,42 @@ class Database:
             "bound-python-method",
             definition,
             owner_payload,
+        )
+
+    def _guarded_name_payload(self, value: Any) -> Any | None:
+        """Pin a guard wrapper as the standard-library callable it guards, or None.
+
+        A wrapper is a closure over pyinc's own state -- the active guards, the
+        working-directory flag, the original it calls -- which the capture
+        walk refuses. What it does is the original's behaviour behind the
+        guard, so a capture of it is pinned the way a standard-library type
+        is: by the original's module and qualified name, that module's
+        identity, and the interpreter build. Every route that folds a capture
+        lands here and folds the same payload.
+
+        Nothing in it moves with pyinc's own code, and nothing else in an
+        identity does either: an identity folds the code a query captures,
+        never pyinc's version or the kernel's source, and the kernel marks a
+        change to its own encoding and rules with versions it bumps by hand --
+        `_KERNEL_FINGERPRINT_VERSION`, the `K2;` prefix every digest carries,
+        and the checkpoint manifest version. A change to the guard that a
+        stored identity must not outlive bumps the tag below the same way.
+        """
+
+        entry = _guarded_name(value)
+        if entry is None:
+            return None
+        module = sys.modules.get(entry.module)
+        if module is None:
+            raise UnsupportedValueError(
+                f"Guarded name {entry.module}.{entry.qualname} has no loaded defining module."
+            )
+        return (
+            "guarded-standard-name-v1",
+            self._runtime_build_payload(),
+            entry.module,
+            entry.qualname,
+            self._module_identity_payload(module),
         )
 
     def _builtin_function_payload(self, function: BuiltinFunctionType) -> Any:
@@ -7013,7 +7149,9 @@ class Database:
 
         def walk_function(target: FunctionType) -> None:
             fn_id = id(target)
-            if fn_id in seen_functions:
+            # A guard wrapper is folded by name, never walked, and reaches no
+            # query or resource.
+            if fn_id in seen_functions or _guarded_name(target) is not None:
                 return
             seen_functions.add(fn_id)
             closure_vars = inspect.getclosurevars(target)
@@ -7354,6 +7492,20 @@ class Database:
     ) -> Any:
         from .core import Input, Query
 
+        # The payloads a direct capture of the same object folds, so
+        # `import m; m.getcwd` and `from m import getcwd` agree. A bound
+        # method is folded here only when it binds a guard wrapper
+        # (`Path.cwd`); any other is refused below, as before.
+        guarded = self._guarded_name_payload(value)
+        if guarded is not None:
+            return guarded
+        if isinstance(value, MethodType) and _guarded_name(value.__func__) is not None:
+            return self._bound_python_method_payload(
+                value,
+                capture_name=capture_name,
+                owner=owner,
+                seen_functions=seen_functions,
+            )
         if isinstance(value, Query):
             return (
                 "query",

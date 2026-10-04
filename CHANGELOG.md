@@ -55,9 +55,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing to join and returned early; on a free-threaded build about one close
   in ten hit it. The reference now lasts until the thread has exited, and a
   stopped watcher can still be started again.
+- A query that captures `os.getcwd` or `os.getcwdb` by name once a `Database`
+  exists (`from os import getcwd`) is fingerprinted again, as in 4.0. The
+  working-directory guard put a wrapper in their place, a closure over
+  pyinc's own state that fingerprinting refused with `UnsupportedValueError`.
 
 ### Changed
 
+- A query may capture any callable the ambient-read guard replaces -- `open`,
+  `io.open`, `os.getenv`, `os.getenvb`, `os.listdir`, `os.scandir`,
+  `os.getcwd`, `os.getcwdb`, `os.path.realpath`, `os.path.abspath`,
+  `Path.iterdir`, `Path.cwd` and `Thread.start` -- by name once a `Database`
+  exists: directly, as a default, through a closure, a container, a helper
+  function, a module attribute, a query handle, or a static method in a class
+  body. Where it used to be refused with `UnsupportedValueError`, it is
+  fingerprinted as the standard-library callable it guards: that callable's
+  module and qualified name, its module's identity, and the interpreter build.
+  A standard-library function that calls one through its module's namespace is
+  folded with it, so `os.path.relpath` and `os.path.ismount` captured by name
+  fingerprint too, `ismount` on POSIX for the first time. Calling a captured
+  wrapper inside a query is refused exactly as the call through its module is.
+  `explain_query_captures` reports such a capture with kind `guarded`. A name
+  bound before the first `Database` still holds the unguarded original and
+  fingerprints as before, and a capture of `os.environ` or `os.environb`
+  itself is still refused.
 - CI runs the test suite, and nightly the property suite, on the free-threaded
   CPython 3.14t build with the GIL disabled, on Linux, macOS, and Windows. The
   release workflow gates on it with the rest of the matrix, and the FAQ no
