@@ -915,16 +915,17 @@ class _GuardedName:
     qualname: str
 
 
-# Every callable `_install_guards_once` puts in place of a standard-library one,
-# keyed by the wrapper's id. A query module that binds one of those names after
-# the first `Database` exists (`from os import getcwd`) holds the wrapper. It is
-# a closure over pyinc's own state that the capture walk cannot fold, so the
-# fingerprint recognises it here and pins it by the name it guards.
+# Every callable the guard puts in place of a standard-library one, keyed by the
+# wrapper's id. A query module that binds one of those names after the first
+# `Database` exists (`from os import getcwd`) holds the wrapper. It is a closure
+# over pyinc's own state that the capture walk cannot fold, so the fingerprint
+# recognises it here and pins it by the name it guards.
 #
-# Filled once, under the install lock and before the guard is marked installed,
-# then never changed. A `Database` fingerprints only after installing the guard,
-# so every fingerprint sees all of it. The entries keep the wrappers alive, so
-# no id here is ever reused.
+# Filled under the install lock: once before the guard is marked installed, and
+# again for each name `_guard_again` wraps a second time. An entry goes in
+# before its wrapper is installed and stays for the life of the process, so
+# every fingerprint of an installed wrapper finds it. The entries keep the
+# wrappers alive, so no id here is ever reused.
 #
 # Two kinds of object stay out. The two environment mappings the guard installs
 # are state, and a captured mapping is refused as `os.environ` itself is. A
@@ -945,8 +946,10 @@ def _standard_library_name(original: Any) -> tuple[str, str] | None:
     itself, as a standard-library type's anchor must. Anything else that held
     a guarded name when the guard was installed gets None: a mock (no
     `__qualname__`), a `functools.partial` (neither attribute), or a function
-    of the caller's own. Called before the guard replaces anything, since the
-    guard replaces `posixpath.realpath` in its own module's namespace.
+    of the caller's own. Called before the guard replaces that name, since the
+    guard replaces `posixpath.realpath` in its own module's namespace. A name
+    the guard replaced earlier still leads to the callable it replaced: on
+    3.11 `open` names itself `io.open`, and `io.open` is guarded.
     """
     module_name = getattr(original, "__module__", None)
     qualname = getattr(original, "__qualname__", None)
@@ -961,6 +964,9 @@ def _standard_library_name(original: Any) -> tuple[str, str] | None:
         current = vars(current).get(part)
         if isinstance(current, (classmethod, staticmethod)):
             current = current.__func__
+        entry = _guarded_name(current)
+        if entry is not None:
+            current = entry.original
     return (module_name, qualname) if current is original else None
 
 
@@ -1129,231 +1135,371 @@ def _cwd_anchoring_abspath(
     return guarded_abspath
 
 
+def _guarded_callable(value: Any) -> Any:
+    """The function a guarded name's value calls: a classmethod's function, or the value."""
+    return value.__func__ if isinstance(value, classmethod) else value
+
+
+def _refusing_open(original: Callable[..., Any]) -> Callable[..., Any]:
+    def guarded_open(*args: Any, **kwargs: Any) -> Any:
+        _raise_if_guarded("Raw open() inside a query is untracked. Use FileResource.read().")
+        return original(*args, **kwargs)
+
+    return guarded_open
+
+
+def _refusing_getenv(original: Callable[..., Any]) -> Callable[..., Any]:
+    def guarded_getenv(key: str, default: str | None = None) -> str | None:
+        _raise_if_guarded("Raw os.getenv() inside a query is untracked. Use EnvResource.read().")
+        return original(key, default)  # type: ignore[no-any-return]
+
+    return guarded_getenv
+
+
+def _refusing_getenvb(original: Callable[..., Any]) -> Callable[..., Any]:
+    def guarded_getenvb(key: bytes, default: bytes | None = None) -> bytes | None:
+        _raise_if_guarded("Raw os.getenvb() inside a query is untracked. Use EnvResource.read().")
+        return original(key, default)  # type: ignore[no-any-return]
+
+    return guarded_getenvb
+
+
+def _refusing_listdir(original: Callable[..., Any]) -> Callable[..., Any]:
+    def guarded_listdir(*args: Any, **kwargs: Any) -> Any:
+        _raise_if_guarded(
+            "Raw os.listdir() inside a query is untracked. Use DirectoryResource.read()."
+        )
+        return original(*args, **kwargs)
+
+    return guarded_listdir
+
+
+def _refusing_scandir(original: Callable[..., Any]) -> Callable[..., Any]:
+    def guarded_scandir(*args: Any, **kwargs: Any) -> Any:
+        _raise_if_guarded(
+            "Raw os.scandir() inside a query is untracked. Use DirectoryResource.read()."
+        )
+        return original(*args, **kwargs)
+
+    return guarded_scandir
+
+
+def _refusing_iterdir(original: Callable[..., Any]) -> Callable[..., Any]:
+    def guarded_path_iterdir(path_obj: Path) -> Any:
+        _raise_if_guarded(
+            "Raw Path.iterdir() inside a query is untracked. Use DirectoryResource.read()."
+        )
+        return original(path_obj)
+
+    return guarded_path_iterdir
+
+
+# The working directory is ambient state like the environment: a relative path
+# means something different after a chdir. `Path.cwd` is wrapped in its own
+# right, so the refusal holds however pathlib reaches the directory. The
+# `os.path.realpath` and `os.path.abspath` wrappers make it hold however the
+# platform's path module does.
+def _refusing_getcwd(original: Callable[[], str]) -> Callable[[], str]:
+    def guarded_getcwd() -> str:
+        if not _CWD_READ_UNUSED.get():
+            _raise_if_guarded(f"Raw os.getcwd() inside a query is untracked. {_CWD_ADVICE}")
+        return original()
+
+    return guarded_getcwd
+
+
+def _refusing_getcwdb(original: Callable[[], bytes]) -> Callable[[], bytes]:
+    def guarded_getcwdb() -> bytes:
+        if not _CWD_READ_UNUSED.get():
+            _raise_if_guarded(f"Raw os.getcwdb() inside a query is untracked. {_CWD_ADVICE}")
+        return original()
+
+    return guarded_getcwdb
+
+
+def _refusing_path_cwd(attribute: Any) -> Callable[[type[Path]], Path]:
+    """Wrap `Path.cwd`, read as the class stores it.
+
+    That is a classmethod, unless something else was patched onto the class
+    (a mock has no `__func__`). Then it is called as `Path.cwd()` would call it.
+    """
+    bind = getattr(type(attribute), "__get__", None)
+    original = _guarded_callable(attribute)
+
+    def guarded_path_cwd(cls: type[Path]) -> Path:
+        _raise_if_guarded(f"Raw Path.cwd() inside a query is untracked. {_CWD_ADVICE}")
+        if bind is None:
+            return original()  # type: ignore[no-any-return]
+        return bind(attribute, None, cls)()  # type: ignore[no-any-return]
+
+    return guarded_path_cwd
+
+
+def _spawning_context_thread_start(original: Callable[[threading.Thread], None]) -> Callable[
+    [threading.Thread], None
+]:
+    def guarded_thread_start(thread: threading.Thread) -> None:
+        """Start `thread` inside the spawning boundary's context, if there is one.
+
+        A thread started inside a query body belongs to that execution:
+        whatever it reads flows back into the result the query stores, so
+        the frame the guard reads has to be visible from it. Threads
+        otherwise start with an empty context, which hides the frame.
+
+        A resource hook counts too, with or without a query running above
+        it. A top-level `read_resource` holds the state lock across the
+        whole hook while opening no execution, so a child that inherited
+        nothing passed every check and then blocked on that lock until its
+        parent returned. If the parent joins the child, that never happens.
+        Only the hook depth says where such a child stands.
+
+        Every other thread start (any thread outside a query or a hook at
+        that instant) is left as it was, at the cost of one scan of an
+        almost always empty tuple.
+        """
+        inside = any(
+            db._current_frame() is not None or db._resource_hook_depth.get() > 0
+            for db in _ACTIVE_GUARDS.get()
+        )
+        if inside and not getattr(thread, "_pyinc_context_bound", False):
+            # A fresh snapshot per spawn: a Context can be entered only
+            # once, and each child needs its own, apart from its siblings.
+            spawning_context = copy_context()
+            original_run = thread.run
+
+            def run_in_spawning_context() -> None:
+                spawning_context.run(original_run)
+
+            # Rebound on the instance, so Thread subclasses and Timer
+            # (which define their own run()) are covered and the class
+            # stays untouched.
+            thread.run = run_in_spawning_context  # type: ignore[method-assign]
+            thread._pyinc_context_bound = True  # type: ignore[attr-defined]
+        original(thread)
+
+    return guarded_thread_start
+
+
+def _refusing_environ(
+    environ: MutableMapping[AnyStr, AnyStr], name: str
+) -> _GuardedEnviron[AnyStr]:
+    return _GuardedEnviron(
+        environ,
+        lambda: _raise_if_guarded(
+            f"Raw {name} access inside a query is untracked. Use EnvResource.read()."
+        ),
+    )
+
+
+class _GuardSlot:
+    """A name the guard holds, how to wrap what it finds there, and what it put there.
+
+    `wrap` takes what the name holds and returns the guarded stand-in for it.
+    A callable stand-in is named after the place it is installed, so it pickles
+    by reference as the callable it replaces did. `built` keeps every stand-in
+    the guard has put in this name. Those stay alive, and none is wrapped again.
+    """
+
+    __slots__ = ("attribute", "built", "mapping", "namespace", "owner", "wrap")
+
+    def __init__(
+        self,
+        owner: Any,
+        attribute: str,
+        wrap: Callable[[Any], Any],
+        *,
+        mapping: bool = False,
+    ) -> None:
+        self.owner = owner
+        self.attribute = attribute
+        # A module's dict or a class's mappingproxy. Both are live views.
+        self.namespace: Mapping[str, Any] = vars(owner)
+        self.wrap = wrap
+        self.mapping = mapping
+        self.built: list[Any] = []
+
+    def held(self) -> Any:
+        """What the name holds now, read as its owner stores it."""
+        return inspect.getattr_static(self.owner, self.attribute, None)
+
+    def is_standard_library_original(self, value: Any) -> bool:
+        """Whether `value` is this name's standard-library object, unguarded.
+
+        For an environment mapping that is the interpreter's own `os._Environ`.
+        For a callable it is a standard-library function its own module and
+        qualified name lead back to, or a C function its own module holds under
+        its name (`posix.getcwd`, `_io.open`). A stand-in the guard built for
+        this name is excluded, and so are a mock, a `functools.partial` and a
+        function of the caller's own.
+        """
+        if any(value is stand_in for stand_in in self.built):
+            return False
+        if self.mapping:
+            return type(value) is os._Environ
+        function = _guarded_callable(value)
+        if isinstance(function, BuiltinFunctionType):
+            home = function.__self__
+            return (
+                isinstance(home, ModuleType)
+                and home.__name__.partition(".")[0] in sys.stdlib_module_names
+                and getattr(home, function.__name__, None) is function
+            )
+        return _standard_library_name(function) is not None
+
+    def install(self, stand_in: Any) -> None:
+        setattr(self.owner, self.attribute, stand_in)
+        self.built.append(stand_in)
+
+
+def _naming_as_installed(
+    factory: Callable[[Any], Callable[..., Any]], module: str, qualname: str
+) -> Callable[[Any], Callable[..., Any]]:
+    """`factory`, with each wrapper it builds named after the place it is installed."""
+
+    def wrap(held: Any) -> Callable[..., Any]:
+        wrapper = factory(held)
+        _name_as_installed(wrapper, module, qualname, held)
+        return wrapper
+
+    return wrap
+
+
+def _guard_slots() -> list[_GuardSlot]:
+    """Every name the guard holds, each with the wrapper it gets."""
+    path_module = Path.__module__
+    path_qualname = Path.__qualname__
+
+    def path_cwd(held: Any) -> classmethod[Any, Any, Any]:
+        wrapper = _refusing_path_cwd(held)
+        _name_as_installed(
+            wrapper, path_module, f"{path_qualname}.cwd", _guarded_callable(held)
+        )
+        return classmethod(wrapper)
+
+    slots = [
+        _GuardSlot(builtins, "open", _naming_as_installed(_refusing_open, "builtins", "open")),
+        _GuardSlot(io, "open", _naming_as_installed(_refusing_open, "io", "open")),
+        _GuardSlot(os, "getenv", _naming_as_installed(_refusing_getenv, "os", "getenv")),
+        _GuardSlot(os, "listdir", _naming_as_installed(_refusing_listdir, "os", "listdir")),
+        _GuardSlot(os, "scandir", _naming_as_installed(_refusing_scandir, "os", "scandir")),
+        _GuardSlot(os, "environ", lambda held: _refusing_environ(held, "os.environ"), mapping=True),
+        _GuardSlot(
+            Path,
+            "iterdir",
+            _naming_as_installed(_refusing_iterdir, path_module, f"{path_qualname}.iterdir"),
+        ),
+        _GuardSlot(os, "getcwd", _naming_as_installed(_refusing_getcwd, "os", "getcwd")),
+        _GuardSlot(os, "getcwdb", _naming_as_installed(_refusing_getcwdb, "os", "getcwdb")),
+        _GuardSlot(Path, "cwd", path_cwd),
+        # `pathlib` and pyinc reach `realpath` and `abspath` through `os.path`.
+        # The path module's own functions (`relpath`, `ismount`, Windows'
+        # `realpath`) reach them through its namespace, which is the same
+        # object. A module that bound one of them by name before the guard was
+        # installed (`sysconfig` binds `realpath`) keeps the original.
+        _GuardSlot(os.path, "realpath", lambda held: _cwd_anchoring_realpath(held, os.path)),
+        _GuardSlot(os.path, "abspath", lambda held: _cwd_anchoring_abspath(held, os.path)),
+        _GuardSlot(
+            threading.Thread,
+            "start",
+            _naming_as_installed(_spawning_context_thread_start, "threading", "Thread.start"),
+        ),
+    ]
+    if sys.platform != "win32":
+        # The byte view of the same process environment, and the lookup that
+        # reads through it. Windows has neither.
+        slots.append(
+            _GuardSlot(
+                os, "environb", lambda held: _refusing_environ(held, "os.environb"), mapping=True
+            )
+        )
+        slots.append(
+            _GuardSlot(os, "getenvb", _naming_as_installed(_refusing_getenvb, "os", "getenvb"))
+        )
+    return slots
+
+
+def _guarded_name_entry(slot: _GuardSlot, held: Any, stand_in: Any) -> _GuardedName | None:
+    """The registry entry for `stand_in`, or None when no standard-library name describes it.
+
+    Called before `stand_in` replaces `held`, since `_standard_library_name`
+    reads the name's own namespace.
+    """
+    if slot.mapping:
+        return None
+    original = _guarded_callable(held)
+    name = _standard_library_name(original)
+    if name is None:
+        return None
+    return _GuardedName(_guarded_callable(stand_in), original, *name)
+
+
+# Every name the guard holds. Set once, when the guard is installed.
+_GUARD_SLOTS: tuple[_GuardSlot, ...] = ()
+
+
 def _install_guards_once() -> None:
     """Install global wrappers around raw I/O entry points once per process.
 
     The wrappers read `_ACTIVE_GUARDS` (a `ContextVar`) to tell whether any
     `Database` has a query frame on the calling context without raw-read
     permission. Installation is idempotent and thread-safe. Once installed,
-    the wrappers stay in place for the life of the process.
+    the wrappers stay in place for the life of the process, and
+    `_keep_guarded_names_in_place` wraps a name again when its
+    standard-library callable comes back unguarded.
     """
-    global _GUARD_INSTALLED
+    global _GUARD_INSTALLED, _GUARD_SLOTS
     if _GUARD_INSTALLED:
         return
     with _GUARD_INSTALL_LOCK:
         if _GUARD_INSTALLED:
             return
-
-        original_builtins_open = builtins.open
-        original_io_open = io.open
-        original_os_getenv = os.getenv
-        original_os_listdir = os.listdir
-        original_os_scandir = os.scandir
-        original_path_iterdir = Path.iterdir
-        original_environ = os.environ
-        original_os_getcwd = os.getcwd
-        original_os_getcwdb = os.getcwdb
-        # Read as the class stores it: a classmethod, unless something else was
-        # patched onto the class before the guard was installed (a mock has no
-        # `__func__`), which is then called as `Path.cwd()` would call it.
-        path_cwd_attribute = inspect.getattr_static(Path, "cwd")
-        bind_path_cwd = getattr(type(path_cwd_attribute), "__get__", None)
-        original_path_cwd: Any = (
-            path_cwd_attribute.__func__
-            if isinstance(path_cwd_attribute, classmethod)
-            else path_cwd_attribute
-        )
-
-        def guarded_open(*args: Any, **kwargs: Any) -> Any:
-            _raise_if_guarded("Raw open() inside a query is untracked. Use FileResource.read().")
-            return original_builtins_open(*args, **kwargs)
-
-        def guarded_io_open(*args: Any, **kwargs: Any) -> Any:
-            _raise_if_guarded("Raw open() inside a query is untracked. Use FileResource.read().")
-            return original_io_open(*args, **kwargs)
-
-        def guarded_getenv(key: str, default: str | None = None) -> str | None:
-            _raise_if_guarded(
-                "Raw os.getenv() inside a query is untracked. Use EnvResource.read()."
-            )
-            return original_os_getenv(key, default)
-
-        def guarded_listdir(*args: Any, **kwargs: Any) -> Any:
-            _raise_if_guarded(
-                "Raw os.listdir() inside a query is untracked. Use DirectoryResource.read()."
-            )
-            return original_os_listdir(*args, **kwargs)
-
-        def guarded_scandir(*args: Any, **kwargs: Any) -> Any:
-            _raise_if_guarded(
-                "Raw os.scandir() inside a query is untracked. Use DirectoryResource.read()."
-            )
-            return original_os_scandir(*args, **kwargs)
-
-        def guarded_path_iterdir(path_obj: Path) -> Any:
-            _raise_if_guarded(
-                "Raw Path.iterdir() inside a query is untracked. Use DirectoryResource.read()."
-            )
-            return original_path_iterdir(path_obj)
-
-        guarded_environ = _GuardedEnviron(
-            original_environ,
-            lambda: _raise_if_guarded(
-                "Raw os.environ access inside a query is untracked. Use EnvResource.read()."
-            ),
-        )
-
-        # The working directory is ambient state like the environment: a
-        # relative path means something different after a chdir. `Path.cwd` is
-        # wrapped in its own right so the refusal holds however pathlib reaches
-        # the directory, and `os.path.realpath` and `os.path.abspath` below so
-        # it holds however the platform's path module does.
-        def guarded_getcwd() -> str:
-            if not _CWD_READ_UNUSED.get():
-                _raise_if_guarded(f"Raw os.getcwd() inside a query is untracked. {_CWD_ADVICE}")
-            return original_os_getcwd()
-
-        def guarded_getcwdb() -> bytes:
-            if not _CWD_READ_UNUSED.get():
-                _raise_if_guarded(f"Raw os.getcwdb() inside a query is untracked. {_CWD_ADVICE}")
-            return original_os_getcwdb()
-
-        def guarded_path_cwd(cls: type[Path]) -> Path:
-            _raise_if_guarded(f"Raw Path.cwd() inside a query is untracked. {_CWD_ADVICE}")
-            if bind_path_cwd is None:
-                return original_path_cwd()  # type: ignore[no-any-return]
-            return bind_path_cwd(path_cwd_attribute, None, cls)()  # type: ignore[no-any-return]
-
-        original_thread_start = threading.Thread.start
-
-        def guarded_thread_start(thread: threading.Thread) -> None:
-            """Start `thread` inside the spawning boundary's context, if there is one.
-
-            A thread started inside a query body belongs to that execution:
-            whatever it reads flows back into the result the query stores, so
-            the frame the guard reads has to be visible from it. Threads
-            otherwise start with an empty context, which hides the frame.
-
-            A resource hook counts too, with or without a query running above
-            it. A top-level `read_resource` holds the state lock across the
-            whole hook while opening no execution, so a child that inherited
-            nothing passed every check and then blocked on that lock until its
-            parent returned. If the parent joins the child, that never happens.
-            Only the hook depth says where such a child stands.
-
-            Every other thread start (any thread outside a query or a hook at
-            that instant) is left as it was, at the cost of one scan of an
-            almost always empty tuple.
-            """
-            inside = any(
-                db._current_frame() is not None or db._resource_hook_depth.get() > 0
-                for db in _ACTIVE_GUARDS.get()
-            )
-            if inside and not getattr(thread, "_pyinc_context_bound", False):
-                # A fresh snapshot per spawn: a Context can be entered only
-                # once, and each child needs its own, apart from its siblings.
-                spawning_context = copy_context()
-                original_run = thread.run
-
-                def run_in_spawning_context() -> None:
-                    spawning_context.run(original_run)
-
-                # Rebound on the instance, so Thread subclasses and Timer
-                # (which define their own run()) are covered and the class
-                # stays untouched.
-                thread.run = run_in_spawning_context  # type: ignore[method-assign]
-                thread._pyinc_context_bound = True  # type: ignore[attr-defined]
-            original_thread_start(thread)
-
-        # `pathlib` and pyinc reach `realpath` and `abspath` through
-        # `os.path`, and the path module's own functions (`relpath`,
-        # `ismount`, Windows' `realpath`) reach them through its namespace,
-        # which is the same object. A module that bound one of them by name
-        # before the guard was installed (`sysconfig` binds `realpath`) keeps
-        # the original.
-        original_realpath = os.path.realpath
-        original_abspath = os.path.abspath
-        guarded_realpath = _cwd_anchoring_realpath(original_realpath, os.path)
-        guarded_abspath = _cwd_anchoring_abspath(original_abspath, os.path)
-        # Every callable installed below, beside the one it replaces.
-        installed: list[tuple[Callable[..., Any], Callable[..., Any]]] = [
-            (guarded_open, original_builtins_open),
-            (guarded_io_open, original_io_open),
-            (guarded_getenv, original_os_getenv),
-            (guarded_listdir, original_os_listdir),
-            (guarded_scandir, original_os_scandir),
-            (guarded_path_iterdir, original_path_iterdir),
-            (guarded_getcwd, original_os_getcwd),
-            (guarded_getcwdb, original_os_getcwdb),
-            (guarded_path_cwd, original_path_cwd),
-            (guarded_realpath, original_realpath),
-            (guarded_abspath, original_abspath),
-            (guarded_thread_start, original_thread_start),
-        ]
-        if sys.platform != "win32":
-            # The byte-oriented view of the same process environment, and the
-            # lookup that reads through it. Windows has neither.
-            original_environb = os.environb
-            original_os_getenvb = os.getenvb
-
-            def guarded_getenvb(key: bytes, default: bytes | None = None) -> bytes | None:
-                _raise_if_guarded(
-                    "Raw os.getenvb() inside a query is untracked. Use EnvResource.read()."
-                )
-                return original_os_getenvb(key, default)
-
-            guarded_environb = _GuardedEnviron(
-                original_environb,
-                lambda: _raise_if_guarded(
-                    "Raw os.environb access inside a query is untracked. Use EnvResource.read()."
-                ),
-            )
-            installed.append((guarded_getenvb, original_os_getenvb))
-            _name_as_installed(guarded_getenvb, "os", "getenvb", original_os_getenvb)
-        # Each wrapper is named after the place it is installed, so it pickles
-        # by reference as the callable it replaces did.
-        path_module = Path.__module__
-        path_qualname = Path.__qualname__
-        for wrapper, module, qualname, original in (
-            (guarded_open, "builtins", "open", original_builtins_open),
-            (guarded_io_open, "io", "open", original_io_open),
-            (guarded_getenv, "os", "getenv", original_os_getenv),
-            (guarded_listdir, "os", "listdir", original_os_listdir),
-            (guarded_scandir, "os", "scandir", original_os_scandir),
-            (guarded_getcwd, "os", "getcwd", original_os_getcwd),
-            (guarded_getcwdb, "os", "getcwdb", original_os_getcwdb),
-            (guarded_path_iterdir, path_module, f"{path_qualname}.iterdir", original_path_iterdir),
-            (guarded_path_cwd, path_module, f"{path_qualname}.cwd", original_path_cwd),
-            (guarded_thread_start, "threading", "Thread.start", original_thread_start),
-        ):
-            _name_as_installed(wrapper, module, qualname, original)
-        # Named before anything is replaced. Everything that can fail runs
-        # here, so the guard goes in whole or not at all, and is marked
-        # installed as soon as it is in.
+        slots = _guard_slots()
+        held = [slot.held() for slot in slots]
+        # Built and named before anything is replaced. Everything that can
+        # fail runs here, so the guard goes in whole or not at all, and is
+        # marked installed as soon as it is in.
+        stand_ins = [slot.wrap(value) for slot, value in zip(slots, held, strict=True)]
         entries: dict[int, _GuardedName] = {}
-        for wrapper, original in installed:
-            name = _standard_library_name(original)
-            if name is not None:
-                entries[id(wrapper)] = _GuardedName(wrapper, original, *name)
-
-        builtins.open = guarded_open
-        io.open = guarded_io_open
-        os.getenv = guarded_getenv  # type: ignore[assignment]
-        os.listdir = guarded_listdir
-        os.scandir = guarded_scandir
-        os.environ = guarded_environ  # type: ignore[assignment]  # noqa: B003
-        Path.iterdir = guarded_path_iterdir  # type: ignore[assignment, method-assign]
-        os.getcwd = guarded_getcwd
-        os.getcwdb = guarded_getcwdb
-        Path.cwd = classmethod(guarded_path_cwd)  # type: ignore[assignment, method-assign]
-        os.path.realpath = guarded_realpath
-        os.path.abspath = guarded_abspath
-        if sys.platform != "win32":
-            os.environb = guarded_environb  # type: ignore[assignment]
-            os.getenvb = guarded_getenvb  # type: ignore[assignment]
-        threading.Thread.start = guarded_thread_start  # type: ignore[assignment, method-assign]
+        for slot, value, stand_in in zip(slots, held, stand_ins, strict=True):
+            entry = _guarded_name_entry(slot, value, stand_in)
+            if entry is not None:
+                entries[id(entry.wrapper)] = entry
+        for slot, stand_in in zip(slots, stand_ins, strict=True):
+            slot.install(stand_in)
         _GUARDED_NAMES.update(entries)
+        _GUARD_SLOTS = tuple(slots)
         _GUARD_INSTALLED = True
+
+
+def _keep_guarded_names_in_place() -> None:
+    """Wrap again each guarded name that holds its standard-library object unguarded.
+
+    A `mock.patch` or `monkeypatch.setattr` that is active when the first
+    `Database` is created saved the standard-library callable, and the guard
+    wrapped the patch's stand-in. When the patch ends it puts the original
+    back. Every query execution calls this as it turns the guard on, so such a
+    name is guarded again before the next query body runs. A name that holds a
+    fake or a mock keeps it. Each check is one dict lookup per name.
+    """
+    for slot in _GUARD_SLOTS:
+        if slot.namespace.get(slot.attribute) is not slot.built[-1]:
+            _guard_again(slot)
+
+
+def _guard_again(slot: _GuardSlot) -> None:
+    if not slot.is_standard_library_original(slot.held()):
+        return
+    with _GUARD_INSTALL_LOCK:
+        held = slot.held()
+        if not slot.is_standard_library_original(held):
+            return
+        stand_in = slot.wrap(held)
+        entry = _guarded_name_entry(slot, held, stand_in)
+        if entry is not None:
+            # In the registry before it is installed, so a fingerprint of the
+            # installed wrapper always finds its entry.
+            _GUARDED_NAMES[id(entry.wrapper)] = entry
+        slot.install(stand_in)
 
 
 class _GuardedEnviron(MutableMapping[AnyStr, AnyStr]):
@@ -4589,6 +4735,7 @@ class Database:
 
     @contextmanager
     def _guard_untracked_reads(self) -> Iterator[None]:
+        _keep_guarded_names_in_place()
         stack = _ACTIVE_GUARDS.get()
         token = _ACTIVE_GUARDS.set(stack + (self,))
         try:

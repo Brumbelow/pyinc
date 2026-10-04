@@ -173,6 +173,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whose range falls outside the edited text is skipped, and the publish that
   follows the edit sends it.
 
+- A guarded name that a patch puts back is guarded again. A `mock.patch` or
+  `monkeypatch.setattr` of a guarded name that was active when the first
+  `Database` was created put the unguarded standard-library callable back when
+  it ended. That name then answered inside every query for the rest of the
+  process. Each query execution now wraps such a name again as it starts, so a
+  read through it raises `UntrackedReadError`, as it would have without the
+  patch. The new wrapper pickles by reference and fingerprints like the first.
+  A fake or a mock set in a guarded name's place keeps it.
+
 ### Changed
 
 - `os.environ.clear()` and `os.environb.clear()` are allowed inside a query,

@@ -906,3 +906,251 @@ def test_the_guard_installs_whole_around_whatever_holds_a_guarded_name(tmp_path:
     # The keyword is the standard library's name for the parameter.
     assert out["outside"][2:] == [True, True, True]
     assert out["capture"] == "refused"
+
+
+_PATCHED_WHILE_THE_FIRST_DATABASE_IS_CREATED = '''\
+"""Patch every guarded name, create the first Database, end the patches, then query."""
+
+import builtins
+import contextlib
+import inspect
+import io
+import json
+import os
+import pickle
+import sys
+import tempfile
+import threading
+from pathlib import Path
+from unittest import mock
+
+root = tempfile.mkdtemp()
+directory = os.path.join(root, "data")
+os.mkdir(directory)
+with open(os.path.join(directory, "sample.txt"), "w", encoding="utf-8") as handle:
+    handle.write("hello")
+os.environ["PYINC_GUARDED_NAME"] = "value"
+
+owners = {
+    "builtins.open": (builtins, "open"),
+    "io.open": (io, "open"),
+    "os.getenv": (os, "getenv"),
+    "os.listdir": (os, "listdir"),
+    "os.scandir": (os, "scandir"),
+    "os.environ": (os, "environ"),
+    "os.getcwd": (os, "getcwd"),
+    "os.getcwdb": (os, "getcwdb"),
+    "os.path.realpath": (os.path, "realpath"),
+    "os.path.abspath": (os.path, "abspath"),
+    "Path.iterdir": (Path, "iterdir"),
+    "Path.cwd": (Path, "cwd"),
+    "Thread.start": (threading.Thread, "start"),
+}
+if sys.platform != "win32":
+    owners["os.environb"] = (os, "environb")
+    owners["os.getenvb"] = (os, "getenvb")
+originals = {label: inspect.getattr_static(*place) for label, place in owners.items()}
+
+
+def stand_in(label):
+    """What a test might patch in: something that answers as the original does."""
+    original = originals[label]
+    if label in ("os.environ", "os.environb"):
+        return type(original)(
+            original._data, original.encodekey, original.decodekey,
+            original.encodevalue, original.decodevalue,
+        )
+    if label == "Path.cwd":
+        return classmethod(lambda cls: original.__func__(cls))
+    if label in ("Path.iterdir", "Thread.start"):
+        return lambda self, *args, **kwargs: original(self, *args, **kwargs)
+    return mock.MagicMock(side_effect=original)
+
+
+PUT_BACK_CALLS = """\\
+import builtins
+import io
+import os
+import threading
+from pathlib import Path
+
+from pyinc import UntrackedReadError, query
+
+directory = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+# Reads through the guarded name `label`.
+def call(label):
+    if label in ("builtins.open", "io.open"):
+        opener = builtins.open if label == "builtins.open" else io.open
+        with opener(os.path.join(directory, "sample.txt"), encoding="utf-8") as handle:
+            return handle.read()
+    if label == "os.getenv":
+        return os.getenv("PYINC_GUARDED_NAME")
+    if label == "os.getenvb":
+        return os.getenvb(b"PYINC_GUARDED_NAME").decode()
+    if label == "os.environ":
+        return os.environ["PYINC_GUARDED_NAME"]
+    if label == "os.environb":
+        return os.environb[b"PYINC_GUARDED_NAME"].decode()
+    if label == "os.listdir":
+        return os.listdir(directory)
+    if label == "os.scandir":
+        return sorted(entry.name for entry in os.scandir(directory))
+    if label == "os.getcwd":
+        return os.getcwd()
+    if label == "os.getcwdb":
+        return os.fsdecode(os.getcwdb())
+    if label == "os.path.realpath":
+        return os.path.realpath("relative")
+    if label == "os.path.abspath":
+        return os.path.abspath("relative")
+    if label == "Path.iterdir":
+        return sorted(child.name for child in Path(directory).iterdir())
+    if label == "Path.cwd":
+        return str(Path.cwd())
+    # A thread started inside a query runs in the query's context, so its read
+    # is refused there too.
+    seen = []
+
+    def read():
+        try:
+            os.getenv("PYINC_GUARDED_NAME")
+            seen.append("answered")
+        except UntrackedReadError:
+            seen.append("refused")
+
+    thread = threading.Thread(target=read)
+    thread.start()
+    thread.join()
+    if seen == ["refused"]:
+        raise UntrackedReadError("refused in the thread")
+    return seen
+
+
+@query(key="put-back:calls")
+def calls(db, label):
+    try:
+        call(label)
+    except UntrackedReadError:
+        return "refused"
+    return "answered"
+
+
+"""
+
+
+out = {}
+with contextlib.ExitStack() as patches:
+    for label, (owner, attribute) in owners.items():
+        patches.enter_context(mock.patch.object(owner, attribute, stand_in(label)))
+    from pyinc import Database, UntrackedReadError, query
+    from pyinc import runtime
+
+    Database()
+out["put_back"] = {
+    label: inspect.getattr_static(*place) is originals[label] for label, place in owners.items()
+}
+
+
+# The helper and the query live in a module of their own: the kernel pins a
+# function that reads `os.environ` by its module's source, and `__main__` has
+# none it can pin.
+with open(os.path.join(root, "put_back_calls.py"), "w", encoding="utf-8") as handle:
+    handle.write(PUT_BACK_CALLS)
+sys.path.insert(0, root)
+from put_back_calls import call, calls
+
+db = Database()
+out["inside"] = {label: db.get(calls, label) for label in owners}
+out["outside"] = {label: call(label) for label in owners}
+cwd = originals["os.getcwd"]()
+out["expected"] = [cwd, originals["os.path.realpath"]("relative"), originals["os.path.abspath"]("relative")]
+live = {label: inspect.getattr_static(*place) for label, place in owners.items()}
+out["guarded"] = {
+    label: value is not originals[label]
+    and (
+        isinstance(value, runtime._GuardedEnviron)
+        if label in ("os.environ", "os.environb")
+        else runtime._guarded_name(runtime._guarded_callable(value)) is not None
+    )
+    for label, value in live.items()
+}
+out["pickles"] = {
+    label: pickle.loads(pickle.dumps(getattr(*owners[label]))) is getattr(*owners[label])
+    for label in owners
+    if label not in ("os.environ", "os.environb", "Path.cwd")
+}
+
+# A capture of a name wrapped again fingerprints as the standard-library callable.
+with open(os.path.join(root, "captures_put_back.py"), "w", encoding="utf-8") as handle:
+    handle.write(
+        "from os import getcwd\\n"
+        "from pyinc import query\\n"
+        "@query(key='put-back:capture')\\n"
+        "def q(db):\\n    return getcwd is not None\\n"
+    )
+import captures_put_back
+
+out["capture"] = db.get(captures_put_back.q)
+
+# A fake set in a guarded name's place keeps it. The original put back is
+# wrapped again. Each check runs on a new Database, so the query executes.
+fake = lambda key, default=None: "fake"  # noqa: E731
+os.getenv = fake
+out["fake"] = [Database().get(calls, "os.getenv"), os.getenv is fake]
+os.getenv = originals["os.getenv"]
+out["original_again"] = Database().get(calls, "os.getenv")
+print("JSON " + json.dumps(out))
+'''
+
+
+def test_a_guarded_name_put_back_after_the_first_database_is_guarded_again(
+    tmp_path: Path,
+) -> None:
+    """A patch active while the first `Database` is created leaves no name unguarded.
+
+    The guard wraps whatever holds each name when the first `Database` is
+    created. A `mock.patch` active then saved the standard-library callable,
+    so ending it put the original back unwrapped, and that name answered
+    inside every query for the rest of the process. Each query execution now
+    wraps such a name again before the body runs. The new wrapper is recorded,
+    pickles by reference, and a capture of it fingerprints. A fake set in a
+    guarded name's place keeps it. A fresh process is the only place no
+    `Database` exists yet.
+    """
+    script = tmp_path / "patched_while_first_database_is_created.py"
+    script.write_text(_PATCHED_WHILE_THE_FIRST_DATABASE_IS_CREATED, encoding="utf-8")
+    src = str(Path(pyinc.__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": src, "PYTHONDONTWRITEBYTECODE": "1"}
+    proc = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, env=env, check=False
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    line = [ln for ln in proc.stdout.splitlines() if ln.startswith("JSON ")][-1]
+    out = json.loads(line[len("JSON ") :])
+    labels = list(out["put_back"])
+    expected = 15 if sys.platform != "win32" else 13
+    assert len(labels) == expected
+    assert out["put_back"] == dict.fromkeys(labels, True)
+    assert out["inside"] == dict.fromkeys(labels, "refused")
+    outside = out["outside"]
+    assert [outside["builtins.open"], outside["io.open"]] == ["hello", "hello"]
+    assert [outside[label] for label in labels if "env" in label] == ["value"] * sum(
+        "env" in label for label in labels
+    )
+    assert outside["os.listdir"] == ["sample.txt"]
+    assert outside["os.scandir"] == ["sample.txt"]
+    assert outside["Path.iterdir"] == ["sample.txt"]
+    cwd, realpath, abspath = out["expected"]
+    assert [outside["os.getcwd"], outside["os.getcwdb"], outside["Path.cwd"]] == [cwd] * 3
+    assert [outside["os.path.realpath"], outside["os.path.abspath"]] == [realpath, abspath]
+    assert outside["Thread.start"] == ["answered"]
+    assert out["guarded"] == dict.fromkeys(labels, True)
+    assert out["pickles"] == dict.fromkeys(
+        [label for label in labels if label not in ("os.environ", "os.environb", "Path.cwd")],
+        True,
+    )
+    assert out["capture"] is True
+    assert out["fake"] == ["answered", True]
+    assert out["original_again"] == "refused"

@@ -41,9 +41,10 @@ def _install_the_guard() -> None:
     """Install the ambient-read guard before any test runs.
 
     The guard wraps whatever each guarded name holds when the first `Database`
-    is built, once per process. A test that patches a guarded name and then
-    builds the first `Database` would leave that name unguarded for every
-    later test once its patch is undone.
+    is built. If a test had a guarded name patched at that moment, the name
+    would hold the plain standard-library callable once the patch ends, until
+    the next query execution wraps it again. Installing first gives every test
+    the same guarded names, whatever order the tests run in.
     """
     from pyinc import Database
 

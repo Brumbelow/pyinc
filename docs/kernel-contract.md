@@ -230,9 +230,10 @@ guards, the same way it pins a standard-library type. The pin uses that
 callable's module and qualified name, its module's identity, and the
 interpreter build, and never the wrapper's own code.
 
-The guard wraps whatever holds a guarded name when it is installed. It pins
-only a wrapper around the standard-library callable that its own module and
-qualified name lead back to. A capture of a wrapper around a mock, a
+The guard wraps whatever holds a guarded name when it is installed, and wraps
+a name again when its standard-library callable comes back unwrapped
+(limitation 1). It pins only a wrapper around the standard-library callable
+that its own module and qualified name lead back to. A capture of a wrapper around a mock, a
 `functools.partial`, or a function of the caller's own put there earlier is
 refused. A standard-library function that calls a guarded callable through its
 module's namespace, such as `os.path.relpath` or `os.path.ismount`, is folded
@@ -417,13 +418,14 @@ reads. Four gaps sit close enough to the guarded set to be named:
   query that waits on such a worker while the worker waits on the state lock
   deadlocks, and nothing refuses it first. Hand the work to a thread the query
   starts, or declare it.
-- *A guarded name put back.* The guard replaces each name once, when the
-  first `Database` is created, and wraps whatever holds the name then. A name
-  assigned afterwards holds what it was given. A `mock.patch` or
-  `monkeypatch.setattr` of a guarded name that is active when the first
-  `Database` is created puts the unguarded original back when it ends. That
-  name then stays unguarded for the rest of the process. Create the first
-  `Database` outside such a patch.
+- *A guarded name replaced.* The guard wraps whatever holds each name when
+  the first `Database` is created. A name assigned afterwards holds what it was
+  given, so a query that calls a fake or a mock there gets its answer. A name
+  that holds its standard-library callable again, unwrapped, is wrapped again
+  when the next query execution starts. That covers a `mock.patch` or
+  `monkeypatch.setattr` that was active when the first `Database` was created
+  and has since ended. A name put back while a query body runs is guarded from
+  the next execution on.
 
 ### 2. Custom `eq=`/`cutoff=` with side effects
 
