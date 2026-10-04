@@ -33,7 +33,6 @@ from pyinc import (
 from pyinc import (
     _safe_fs as safe_fs_module,
 )
-from pyinc import store as store_module
 from pyinc._locking import FileLock
 from pyinc._safe_fs import (
     _WIN_FILE_SHARE_DELETE,
@@ -295,7 +294,7 @@ def test_in_memory_store_refuses_a_conflicting_put_that_races_the_first() -> Non
     rendezvous = Rendezvous()
     store = InMemoryArtifactStore()
     store._items = _HeldItems(rendezvous)
-    store._lock = rendezvous.lock()  # type: ignore[assignment]
+    store._locks[os.getpid()] = rendezvous.lock()  # type: ignore[assignment]
     digest = "a" * 64
 
     def put(payload: bytes) -> str:
@@ -364,11 +363,9 @@ def test_in_memory_store_copies_keep_payloads_and_get_their_own_lock(
     duplicate_store.put("b" * 64, b"only in the copy")
     assert not store.contains("b" * 64)
     # The copy's lock is free while the original's is held.
-    with store._lock:
-        assert duplicate_store._lock.acquire(blocking=False)
-        duplicate_store._lock.release()
-    # A forked child gives the copy a new lock too.
-    assert duplicate_store in store_module._LIVE_STORES
+    with store._process_lock():
+        assert duplicate_store._process_lock().acquire(blocking=False)
+        duplicate_store._process_lock().release()
 
 
 # ---------------------------------------------------------------------------

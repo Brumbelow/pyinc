@@ -23,7 +23,6 @@ from typing import Any
 import pytest
 
 from pyinc import Database, InMemoryArtifactStore
-from pyinc import store as store_module
 from pyinc.integrations import _decoding
 
 posix_fork = pytest.mark.skipif(not hasattr(os, "fork"), reason="os.fork does not exist here")
@@ -115,15 +114,15 @@ def test_a_forked_child_uses_a_store_while_another_thread_held_its_lock(operatio
         else:
             assert dict(store.keys()) == {"a" * 64: b"parent"}
 
-    with _held_by_another_thread(store._lock):
+    with _held_by_another_thread(store._process_lock()):
         exit_code = _exit_code_of_child(use_store)
 
     assert exit_code == 0
 
 
-def test_the_stores_listed_for_a_fork_are_not_kept_alive_by_the_list() -> None:
+def test_nothing_keeps_a_dropped_store_alive() -> None:
     store = InMemoryArtifactStore()
-    assert store in store_module._LIVE_STORES
+    store.put("a" * 64, b"payload")
     store_ref = weakref.ref(store)
 
     del store

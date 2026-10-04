@@ -14,7 +14,6 @@ import os
 import re
 import stat
 import threading
-import weakref
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -75,16 +74,28 @@ class InMemoryArtifactStore:
     absent and the second overwrote the first, so a digest rebound to
     different bytes went unrefused. `keys` copies under the same lock, so its
     snapshot can be iterated while other threads store. `get` and `contains`
-    are one dict operation each and need no lock. A child forked while another
-    thread held the lock gets a new one: see `_new_store_locks_in_child`. A
-    copy, shallow or deep, and a pickle round trip hold their own items under
-    a lock of their own.
+    are one dict operation each and need no lock. Each process uses a lock of
+    its own, so a child forked while another thread held the parent's lock
+    can still store. A copy, shallow or deep, and a pickle round trip hold
+    their own items under a lock of their own.
     """
 
     def __init__(self) -> None:
         self._items: dict[str, bytes] = {}
-        self._lock = threading.Lock()
-        _LIVE_STORES.add(self)
+        # One lock per process id, made on first use there. A thread that held
+        # the parent's lock at a fork does not exist in the child, so the child
+        # needs a lock of its own. The table lives on the instance: a module
+        # registry would be mutable state in the methods a query's fingerprint
+        # folds when it captures this class.
+        self._locks: dict[int, threading.Lock] = {}
+
+    def _process_lock(self) -> threading.Lock:
+        pid = os.getpid()
+        lock = self._locks.get(pid)
+        if lock is None:
+            # setdefault keeps a single lock when two threads arrive together.
+            lock = self._locks.setdefault(pid, threading.Lock())
+        return lock
 
     def get(self, digest: str) -> bytes | None:
         return self._items.get(digest)
@@ -92,7 +103,7 @@ class InMemoryArtifactStore:
     def put(self, digest: str, payload: bytes) -> None:
         if type(payload) is not bytes:
             raise TypeError("Artifact payloads must be bytes.")
-        with self._lock:
+        with self._process_lock():
             existing = self._items.get(digest)
             if existing is None:
                 self._items[digest] = payload
@@ -112,46 +123,24 @@ class InMemoryArtifactStore:
         Call it again to see later puts.
         """
 
-        with self._lock:
+        with self._process_lock():
             return MappingProxyType(dict(self._items))
 
     def __getstate__(self) -> dict[str, Any]:
-        # A lock cannot be pickled or copied, so the state leaves it out. The
-        # items are copied under it, so a put on another thread cannot change
-        # them while they are read, and a copy never shares them with this
-        # store.
-        with self._lock:
+        # Locks cannot be pickled or copied, so the state leaves them out. The
+        # items are copied under the lock, so a put on another thread cannot
+        # change them mid-read, and a copy never shares them with this store.
+        with self._process_lock():
             state = dict(self.__dict__)
             state["_items"] = dict(self._items)
-        del state["_lock"]
+        state.pop("_locks", None)
+        state.pop("_lock", None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
-        self._lock = threading.Lock()
-        _LIVE_STORES.add(self)
-
-
-# Every store still alive, so a forked child can reach each one's lock. Weak, so
-# being listed here keeps no store alive.
-_LIVE_STORES: weakref.WeakSet[InMemoryArtifactStore] = weakref.WeakSet()
-
-
-def _new_store_locks_in_child() -> None:
-    """Give every store a forked child inherits a lock of its own.
-
-    A thread that held a store's lock when another thread forked does not exist
-    in the child, so the child would wait on that lock forever in `put` or
-    `keys`. The items are whole at the fork: each step taken under the lock
-    leaves them consistent.
-    """
-
-    for store in list(_LIVE_STORES):
-        store._lock = threading.Lock()
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_new_store_locks_in_child)
+        self.__dict__.pop("_lock", None)
+        self._locks = {}
 
 
 class FileSystemArtifactStore:
