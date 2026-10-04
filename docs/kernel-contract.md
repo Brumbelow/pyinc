@@ -609,7 +609,8 @@ The opener is that thread itself, not its ident, which a later thread can be
 given once the opener has exited, so a request left open by an exited thread
 is joined by no one. So validation done for one thread's request is never
 reused by another's, and the answer does not depend on whether the interpreter
-copies contexts into new threads.
+copies contexts into new threads. An ended request holds none of its observer
+events or failures, so a copied context keeps none of them alive.
 
 Databases on several threads may share one artifact store. Each shipped store
 checks and stores a digest in one step -- `InMemoryArtifactStore` under a lock,

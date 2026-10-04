@@ -108,10 +108,14 @@ class _Request:
     `threading.Thread` started on a free-threaded 3.14 build, `asyncio.to_thread`
     -- keeps a reference to it after the span has closed and its promise with
     it. So a span belongs to the thread that opened it and ends when it closes,
-    as the kernel's own request does.
+    as the kernel's own request does. When it ends it lets go of the database
+    and the memo. A copied context can live as long as its thread, and a
+    pool's worker thread lives as long as the pool, so a request that kept
+    them would keep the database and every memoized value alive with it.
     """
 
-    db: Database
+    # None once the request has ended.
+    db: Database | None
     memo: dict[Any, Any] = field(default_factory=dict)
     owner: object = field(default_factory=_current_thread_token)
     ended: bool = False
@@ -191,7 +195,10 @@ def request_scope(db: Database) -> Iterator[None]:
     try:
         yield
     finally:
+        # Ended first, so nothing reads the database or the memo once they go.
         request.ended = True
+        request.db = None
+        request.memo = {}
         _REQUEST.reset(token)
 
 
@@ -207,7 +214,9 @@ def request_inputs_changed() -> None:
     """
 
     request = _live_request()
-    if request is not None:
+    # A live request always holds its database; the second test is for the
+    # type checker.
+    if request is not None and request.db is not None:
         request.memo.clear()
         request.db.request_inputs_changed()
 

@@ -67,6 +67,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and left the watcher out of the session, so `close()` never stopped it. A
   stopped watcher can still be started again. A callback that runs past
   `stop()`'s five-second join still outlives `close()`, which prints a warning.
+- `pyinc.integrations.request_scope` lets go of its `Database` and of every
+  value it memoized when it ends. A context copied while it was open holds its
+  request for as long as the context lives, and every thread started on a
+  free-threaded 3.14 build copies one, the workers of a `ThreadPoolExecutor`
+  and of asyncio's default executor included. The database and the memo
+  stayed alive as long as such a thread or its pool, and `shutdown()` did not
+  release them. The kernel's own request lets go of its observer events and
+  failure keys when it ends, and the events are still delivered.
 - A query that captures `os.getcwd` or `os.getcwdb` by name once a `Database`
   exists (`from os import getcwd`) is fingerprinted again, as in 4.0. The
   working-directory guard put a wrapper in their place, a closure over

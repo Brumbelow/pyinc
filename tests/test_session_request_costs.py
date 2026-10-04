@@ -24,7 +24,7 @@ from _rendezvous import Rendezvous, run_in_threads
 
 import pyinc_tools.session as session_module
 from pyinc import Database
-from pyinc.integrations import _decoding, request_scope
+from pyinc.integrations import _decoding, once_per_request, request_scope
 from pyinc.integrations.python_source import workspace_analysis
 from pyinc.integrations.scope_resolution import _decode_scope_tree, scope_tree
 from pyinc.integrations.symbol_resolution import (
@@ -312,6 +312,42 @@ def test_a_context_copied_inside_a_request_scope_does_not_answer_from_its_memo(
     alpha.write_text(three + "\n\ndef four():\n    return 4\n", encoding="utf-8")
     # Closed, the scope answers nobody -- not even its own thread through a copy.
     assert len(carried.run(scope_tree, db, alpha).bindings) == 4
+
+
+class _LargeValue:
+    """A memoized value of a megabyte, which takes weak references."""
+
+    def __init__(self) -> None:
+        self.payload = bytes(1 << 20)
+
+
+def test_a_context_copied_inside_a_request_scope_keeps_nothing_alive_after_it() -> None:
+    """A closed scope lets go of its database and of what it memoized.
+
+    A context copied while the scope was open holds the scope's request for as
+    long as the context lives: every thread started on a free-threaded 3.14
+    build does, a pool's worker thread included, and keeps it after the pool
+    shuts down. When the request held the database and the memo, the copy kept
+    both alive.
+    """
+
+    db = Database()
+    with request_scope(db):
+        value = once_per_request(db, "large", (), _LargeValue)
+        assert once_per_request(db, "large", (), _LargeValue) is value
+        carried = contextvars.copy_context()
+    db_ref = weakref.ref(db)
+    value_ref = weakref.ref(value)
+
+    del db, value
+    gc.collect()
+
+    assert db_ref() is None
+    assert value_ref() is None
+    # The copy is alive and still holds the request, which has ended.
+    request = carried[_decoding._REQUEST]
+    assert request is not None
+    assert request.ended
 
 
 def test_decode_memo_is_skipped_when_payload_identity_is_unstable(tmp_path: Path) -> None:

@@ -797,7 +797,8 @@ class _RequestScope:
     So a request belongs to the thread that opened it and ends when its scope
     exits, and `Database._live_request` sees no request anywhere else. The
     thread is told by its token rather than its ident, which a later thread
-    can be given once this one has exited.
+    can be given once this one has exited. When it ends it lets go of its
+    observer events and failure keys, so a copy keeps none of them alive.
     """
 
     request_id: int
@@ -8929,6 +8930,12 @@ class Database:
             request.ended = True
             self._request_resource_digests = None
             self._release_failure_exceptions(request.failures)
+            # A context copied while the request was open still holds it, for
+            # as long as its thread lives. Nothing reads these lists once the
+            # request has ended, and the caller delivers the events from the
+            # list it was handed, so the request lets go of its own references.
+            request.pending_events = []
+            request.failures = []
             self._request.reset(token)
             self._evict_query_nodes_if_needed()
 

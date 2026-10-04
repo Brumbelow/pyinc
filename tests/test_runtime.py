@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 import dataclasses
+import gc
 import hashlib
 import math
 import mmap
@@ -9,6 +10,7 @@ import os
 import re
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -8606,6 +8608,49 @@ def test_a_change_seen_through_a_closed_span_context_is_still_delivered() -> Non
     # delivered, and it would never arrive.
     assert _run_in_thread(carried, lambda: db.get(doubled)) == 10
     assert [event.decision for event in events] == ["executed", "executed"]
+
+
+def test_a_context_copied_inside_a_span_keeps_none_of_its_events_after_delivery(
+    tmp_path: Path,
+) -> None:
+    """A request lets go of its events and failure keys when it ends.
+
+    A context copied while it was open holds the request for as long as the
+    context lives: every thread started on a free-threaded 3.14 build does, a
+    pool's worker thread included. The events still reach their observers,
+    from the list the request's scope handed its caller.
+    """
+
+    number = Input[int]("released-number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 1)
+    delivered: list[weakref.ref[QueryChangeEvent]] = []
+    db.observe(lambda event: delivered.append(weakref.ref(event)), doubled)
+    target = str(tmp_path / "absent.txt")
+
+    with db.request_span():
+        assert db.get(doubled) == 2
+        with pytest.raises(FileNotFoundError):
+            _SpanFailingResource().read(db, target)
+        carried = contextvars.copy_context()
+        request = carried[db._request]
+        assert request is not None
+        assert len(request.pending_events) == 1
+        assert len(request.failures) == 1
+    gc.collect()
+
+    assert len(delivered) == 1
+    assert delivered[0]() is None
+    # The copy is alive and still holds the request, which has ended.
+    assert carried[db._request] is request
+    assert request.ended
+    assert request.pending_events == []
+    assert request.failures == []
 
 
 class _ReusedIdentThreading:
