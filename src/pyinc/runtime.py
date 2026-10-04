@@ -804,6 +804,27 @@ class _RequestScope:
     ended: bool = False
 
 
+@dataclass
+class _ModuleSourceReads:
+    """The module files one query fingerprint has hashed, for that fingerprint alone.
+
+    Each entry is keyed by module id and path and holds its module, which keeps
+    the id from being reused while the fingerprint runs. The set travels in a
+    `ContextVar`, so a context copied while it is open holds it too. It belongs
+    to the thread that opened it and ends when that fingerprint returns, the
+    same rule `_RequestScope` follows, so a copy reads its files afresh.
+    """
+
+    digests: dict[tuple[int, str], tuple[ModuleType, str | None, OSError | None]] = field(
+        default_factory=dict
+    )
+    owner: object = field(default_factory=_current_thread_token)
+    ended: bool = False
+
+    def live(self) -> bool:
+        return not self.ended and self.owner is _current_thread_token()
+
+
 @dataclass(frozen=True)
 class DatabaseStatistics:
     node_count: int
@@ -1802,6 +1823,11 @@ class Database:
         ] = ContextVar("pyinc_fingerprint_attribute_collector", default=None)
         self._fingerprint_resource_collector: ContextVar[list[tuple[Any, str]] | None] = ContextVar(
             "pyinc_fingerprint_resource_collector", default=None
+        )
+        # The module files the running `_query_fingerprint` has hashed so far.
+        # See `_module_source_digest`.
+        self._module_source_reads: ContextVar[_ModuleSourceReads | None] = ContextVar(
+            "pyinc_module_source_reads", default=None
         )
         # Plain instance state, unlike the ContextVar request slots beside it,
         # on purpose. The only cross-thread effect is one request replacing
@@ -4801,6 +4827,28 @@ class Database:
             )
 
     def _query_fingerprint(self, query: Any) -> str:
+        """Fingerprint a query, reading each module file once for the whole answer.
+
+        An editor can save a module file at any moment. The memo guard stamps
+        the file and then re-reads resource digests that fold it, and a fresh
+        fold reads it and then stamps it. One read per file keeps every part of
+        one answer on the same bytes, so a save shows up as a moved stamp at
+        the next fingerprint. A nested fingerprint joins the read set already
+        open.
+        """
+        reads = self._module_source_reads.get()
+        if reads is not None and reads.live():
+            return self._memoized_query_fingerprint(query)
+        reads = _ModuleSourceReads()
+        token = self._module_source_reads.set(reads)
+        try:
+            return self._memoized_query_fingerprint(query)
+        finally:
+            reads.ended = True
+            reads.digests.clear()
+            self._module_source_reads.reset(token)
+
+    def _memoized_query_fingerprint(self, query: Any) -> str:
         cached = self._query_fingerprint_memo.get(query)
         runtime_build = self._runtime_build_payload()
         definition_observation = self._query_definition_observation(query)
@@ -5064,6 +5112,13 @@ class Database:
         always has.
         """
         for resource, expected in recorded:
+            # A digest kept from earlier in this request answers only when it
+            # agrees. It folds the module files as they stood when it was read,
+            # so a save since then moves it while the resource holds still. Any
+            # other answer is read again here, against the same file bytes the
+            # module stamps above matched.
+            if self._kept_resource_identity_digest(resource) == expected:
+                continue
             digest = self._resource_identity_digest(resource)
             if digest == expected:
                 continue
@@ -5089,6 +5144,27 @@ class Database:
             return False
         return True
 
+    def _kept_resource_identity_digest(self, resource: Any) -> str | None:
+        """The digest this request already read for a resource, if it has one.
+
+        A kept digest spares a second ``identity()`` call inside one request,
+        which is the scope the kernel already gives resource validation. A
+        span declares that the world holds still until it closes, and a caller
+        that changes it mid-span says so, which rolls the request and clears
+        this cache. Outside a request the cache does not exist and every read
+        is fresh. The guard trusts a kept digest only when it agrees.
+        """
+
+        cache = self._request_resource_digests
+        if cache is None:
+            return None
+        entry = cache.get(id(resource))
+        # The resource object is kept beside its digest: an id freed and
+        # reused by another object must not answer from this cache.
+        if entry is not None and entry[0] is resource:
+            return entry[1]
+        return None
+
     def _resource_identity_digest(self, resource: Any) -> str:
         """Re-read a captured resource's configuration for the memo guard.
 
@@ -5098,22 +5174,10 @@ class Database:
         which makes a resource-folding fingerprint memoizable at all. Any
         failure answers with a value no stored digest can equal, so a resource
         that has become unreadable forces the full recompute and no unchecked
-        fingerprint is served.
+        fingerprint is served. The read is kept for the rest of the request.
         """
 
-        # Re-read at most once per request, the scope the kernel already gives
-        # resource validation. A span declares that the world holds still
-        # until it closes, and a caller changing it mid-span must say so, which
-        # rolls the request and clears this cache. So reusing a digest inside
-        # one request adds no new consistency class. Outside a request there is
-        # no cache and every read is fresh.
         cache = self._request_resource_digests
-        if cache is not None:
-            entry = cache.get(id(resource))
-            # The resource object is kept beside its digest, so an id freed and
-            # reused by another object never answers from this cache.
-            if entry is not None and entry[0] is resource:
-                return entry[1]
         try:
             configuration = self._resource_configuration(resource)
             digest = fingerprint_snapshot(
@@ -8220,20 +8284,49 @@ class Database:
         # The read reports and never waits. A module file someone replaced
         # with a pipe or a device has no bytes to hash and never will, and that
         # report is refused here on the same terms as a failed read.
+        digest, error = self._module_source_digest(module, file_path)
+        if digest is None:
+            raise UnsupportedValueError(
+                f"Captured module {module_name!r} file cannot be read safely."
+            ) from error
+        file_identity = ("file-sha256", import_identity, digest)
+        return (version_digest, file_identity, all_tuple, constants_payload)
+
+    def _module_source_digest(
+        self, module: ModuleType, file_path: str
+    ) -> tuple[str | None, OSError | None]:
+        """Hash a module's file, once per query fingerprint.
+
+        The identity payload, the memo stamp and every resource digest that
+        folds a module all hash its file. Inside one `_query_fingerprint` the
+        first hash is kept and every later read reuses it, so all of them
+        describe the same bytes even when an editor saves the file midway.
+        Outside one, every read is fresh.
+
+        Answers the SHA-256 of the bytes, or None with the read's error when
+        the path names no readable regular file.
+        """
+
+        reads = self._module_source_reads.get()
+        digests = reads.digests if reads is not None and reads.live() else None
+        key = (id(module), file_path)
+        if digests is not None:
+            kept = digests.get(key)
+            if kept is not None:
+                return kept[1], kept[2]
+        digest: str | None = None
+        error: OSError | None = None
         with self._allow_raw_reads_scope():
             try:
                 content = read_regular_file_following_links(Path(file_path))
             except OSError as exc:
-                raise UnsupportedValueError(
-                    f"Captured module {module_name!r} file cannot be read safely."
-                ) from exc
-            if content is None:
-                raise UnsupportedValueError(
-                    f"Captured module {module_name!r} file cannot be read safely."
-                )
-            digest = hashlib.sha256(content).hexdigest()
-        file_identity = ("file-sha256", import_identity, digest)
-        return (version_digest, file_identity, all_tuple, constants_payload)
+                error = exc
+            else:
+                if content is not None:
+                    digest = hashlib.sha256(content).hexdigest()
+        if digests is not None:
+            digests[key] = (module, digest, error)
+        return digest, error
 
     @staticmethod
     def _resolve_module_path_target(module: ModuleType, path: tuple[str, ...]) -> Any:
@@ -8298,16 +8391,10 @@ class Database:
                 # what was observed. A token that fails to match sends the
                 # request back to the identity payload, which refuses an
                 # unreadable module file, once.
-                with self._allow_raw_reads_scope():
-                    try:
-                        content = read_regular_file_following_links(Path(file_path))
-                    except OSError:
-                        content = None
-                    source_observation = (
-                        ("unreadable-file",)
-                        if content is None
-                        else ("file-sha256", hashlib.sha256(content).hexdigest())
-                    )
+                digest, _error = self._module_source_digest(module, file_path)
+                source_observation = (
+                    ("unreadable-file",) if digest is None else ("file-sha256", digest)
+                )
         return (
             module.__name__,
             sys.modules.get(module.__name__) is module,

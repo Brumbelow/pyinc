@@ -46,6 +46,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Saving a module file while a database runs re-fingerprints the queries that
+  fold it. The memo guard used to refuse one of them with "Resource ... changed
+  its own state between two reads". A resource that keeps the default
+  `identity()` folds its class into its configuration digest, and with it the
+  bytes of the module that defines the class. One fingerprint read such a file
+  more than once, and a request kept a digest across its fingerprints. So a
+  save could land between two reads, and the guard blamed the difference on
+  the resource. Each query fingerprint now reads each module file once, and
+  the guard reads a kept digest again before it judges the resource.
 - A thread that carries a `request_span`'s context stays out of the span's
   request. Every thread started on a free-threaded 3.14 build copies its
   starter's context, as `asyncio.to_thread` and `Thread(context=...)` do on any

@@ -4,16 +4,19 @@ import contextvars
 import dataclasses
 import gc
 import hashlib
+import importlib.util
 import math
 import mmap
 import os
 import re
+import sys
 import threading
 import time
 import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any, ClassVar, cast
 
 import pytest
@@ -2571,6 +2574,170 @@ def test_a_resource_that_becomes_unreadable_still_recomputes(mode: str, tmp_path
 
     stats = db.statistics()
     assert (stats.query_executions, stats.query_reuses, stats.resource_count) == (1, 1, 1)
+
+
+# A caller's own module with a resource that keeps no state and declares no
+# identity. Its configuration digest folds the module's source bytes through
+# its class, so saving the file is the one thing that moves that digest.
+_SAVED_RESOURCE_MODULE = """\
+from dataclasses import dataclass
+
+from pyinc import Database, Resource, query
+
+
+@dataclass(frozen=True)
+class SavedResource(Resource[str, str, tuple[str]]):
+    def probe(self, key: str) -> tuple[str]:
+        return ("present",)
+
+    def load(self, db: Database, key: str) -> str:
+        return f"{key}-value"
+
+    def label(self, key: str) -> str:
+        return f"saved[{key}]"
+
+
+RESOURCE = SavedResource()
+
+
+@query
+def read_key(db: Database, key: str) -> str:
+    return RESOURCE.read(db, key)
+"""
+
+
+def _saved_resource_module(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
+) -> tuple[ModuleType, Path]:
+    """Import the module above from its own file, as a caller's code is imported."""
+    path = tmp_path / f"{name}.py"
+    path.write_text(_SAVED_RESOURCE_MODULE, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module, path
+
+
+def _save_with_a_new_comment(path: Path, comment: str = "A comment someone saved.") -> None:
+    """Save the file the way an editor does: the code stays and the bytes move."""
+    path.write_text(f"{_SAVED_RESOURCE_MODULE}# {comment}\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_module_saved_inside_a_span_is_not_blamed_on_its_resource(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A save inside a span moves the module's identity and leaves the resource alone.
+
+    The span keeps the resource digest its first guard read. A save then makes
+    the memo fold the module again, and the next guard holds that new fold up
+    against the kept digest. The two describe two versions of one file. That
+    difference belongs to the module, so the query answers.
+    """
+
+    module, path = _saved_resource_module(monkeypatch, tmp_path, f"pyinc_saved_span_{mode}")
+    db = Database(mode=mode)
+    with db.request_span():
+        assert db.get(module.read_key, "a") == "a-value"
+        # This guard reads the resource's digest and keeps it for the span.
+        assert db.get(module.read_key, "a") == "a-value"
+        _save_with_a_new_comment(path)
+        # The module's stamp moved, so the fingerprint is folded again here.
+        assert db.get(module.read_key, "b") == "b-value"
+        # This guard meets the new fold and the digest kept before the save.
+        assert db.get(module.read_key, "c") == "c-value"
+    # The memo now holds the identity a fresh database gives the saved file.
+    assert db._query_fingerprint(module.read_key) == Database()._query_fingerprint(
+        module.read_key
+    )
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(
+    ("stamp_call", "save_first"),
+    [(1, True), (2, False)],
+    ids=["before-the-stamp-after-a-fold", "after-the-stamp-in-a-guard"],
+)
+def test_one_fingerprint_reads_each_module_file_once(
+    stamp_call: int,
+    save_first: bool,
+    mode: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A save between two reads inside one fingerprint is a change to the module.
+
+    The first get folds the module and then stamps it. The second get stamps it
+    and then reads the resource's digest, which folds the same file. Each cell
+    lands a save between those two reads. One computation reads the file once,
+    so its stamp and its digests agree, and the next stamp finds the save.
+    """
+
+    module, path = _saved_resource_module(
+        monkeypatch, tmp_path, f"pyinc_saved_stamp_{stamp_call}_{mode}"
+    )
+    stamp = Database._module_observation_stamp
+    stamped: list[ModuleType] = []
+
+    def stamp_with_a_save(self: Database, observed: ModuleType) -> Any:
+        if observed is not module:
+            return stamp(self, observed)
+        stamped.append(observed)
+        if save_first and len(stamped) == stamp_call:
+            _save_with_a_new_comment(path)
+        result = stamp(self, observed)
+        if not save_first and len(stamped) == stamp_call:
+            _save_with_a_new_comment(path)
+        return result
+
+    monkeypatch.setattr(Database, "_module_observation_stamp", stamp_with_a_save)
+    db = Database(mode=mode)
+    assert db.get(module.read_key, "a") == "a-value"
+    assert db.get(module.read_key, "b") == "b-value"
+    assert db.get(module.read_key, "c") == "c-value"
+    # The save landed where the cell put it, and the memo has caught up with it.
+    assert len(stamped) >= stamp_call
+    assert path.read_text(encoding="utf-8").endswith("# A comment someone saved.\n")
+    assert db._query_fingerprint(module.read_key) == Database()._query_fingerprint(
+        module.read_key
+    )
+
+
+def test_a_context_copied_inside_a_fingerprint_reads_module_files_afresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The files one fingerprint read stay with that fingerprint.
+
+    A context copied while a fingerprint runs carries its read set along. Each
+    fingerprint taken later in that copy opens a read set of its own, so its
+    module stamp sees every save that landed before it.
+    """
+
+    module, path = _saved_resource_module(monkeypatch, tmp_path, "pyinc_saved_copied_context")
+    stamp = Database._module_observation_stamp
+    copies: list[contextvars.Context] = []
+
+    def stamp_and_copy(self: Database, observed: ModuleType) -> Any:
+        if observed is module and not copies:
+            copies.append(contextvars.copy_context())
+        return stamp(self, observed)
+
+    monkeypatch.setattr(Database, "_module_observation_stamp", stamp_and_copy)
+    db = Database()
+    db._query_fingerprint(module.read_key)
+    assert copies
+
+    def fingerprint_after_each_save() -> list[bool]:
+        agreed = []
+        for comment in ("One save.", "Another save."):
+            _save_with_a_new_comment(path, comment)
+            fresh = Database()._query_fingerprint(module.read_key)
+            agreed.append(db._query_fingerprint(module.read_key) == fresh)
+        return agreed
+
+    assert copies[0].run(fingerprint_after_each_save) == [True, True]
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
