@@ -8,9 +8,10 @@ import threading
 import tokenize
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from _rendezvous import Rendezvous, run_in_threads
 
 import pyinc_tools._workspace as workspace
 
@@ -993,6 +994,80 @@ def test_a_stopped_watcher_can_be_started_again(tmp_path: Path) -> None:
     finally:
         watcher.stop(timeout=10)
     assert watcher.is_running is False
+
+
+def test_watcher_stop_during_start_stops_the_thread_start_launches(tmp_path: Path) -> None:
+    """A `stop()` that lands while `start()` runs stops the thread it starts.
+
+    `start()` replaces the stop event under the lifecycle lock, and the stop
+    used to set the event without it. Landing between the two, it set the
+    event being replaced, so the new thread ran on and `stop()` timed out
+    joining it. The driver holds `start()` there: after registering with its
+    session, before the new event exists.
+    """
+
+    rendezvous = Rendezvous()
+    registering = threading.Event()
+
+    class RegisteringDriver(_Driver):
+        def _register_watcher(self, _watcher: object) -> None:
+            registering.set()
+            rendezvous.point()
+
+    watcher = workspace.PollingWorkspaceWatcher(RegisteringDriver(tmp_path))
+    watcher._lifecycle_lock = rendezvous.lock(threading.RLock())  # type: ignore[assignment]
+    starter = threading.Thread(target=watcher.start, args=(lambda _paths: None,))
+    starter.start()
+    try:
+        assert registering.wait(10)
+        watcher.stop(timeout=5)
+        starter.join(10)
+        assert watcher.is_running is False
+    finally:
+        watcher.stop(timeout=10)
+
+
+def test_watcher_poll_refuses_a_start_until_it_has_finished(tmp_path: Path) -> None:
+    """`start()` waits for a `poll()` in progress instead of running beside it.
+
+    `poll()` refused while the watcher ran, but checked before polling, so a
+    `start()` landing after the check began the thread's polling alongside
+    it, over the same pending map and snapshot -- "dictionary changed size
+    during iteration" in one of them. The driver holds the poll in its
+    refresh while another thread starts the watcher.
+    """
+
+    rendezvous = Rendezvous()
+    refreshing = threading.Event()
+    start_returned = threading.Event()
+    seen_during_refresh: list[bool] = []
+
+    class HeldDriver(_Driver):
+        def refresh_paths(self, paths: Any) -> tuple[str, ...]:
+            if not refreshing.is_set():
+                refreshing.set()
+                rendezvous.point()
+                seen_during_refresh.append(start_returned.is_set())
+            return super().refresh_paths(paths)
+
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    watcher = workspace.PollingWorkspaceWatcher(HeldDriver(tmp_path), debounce_ms=0)
+    watcher._lifecycle_lock = rendezvous.lock(threading.RLock())  # type: ignore[assignment]
+    (tmp_path / "a.py").write_text("x = 2\n", encoding="utf-8")
+
+    def start() -> None:
+        assert refreshing.wait(10)
+        watcher.start(lambda _paths: None, interval_s=60.0)
+        start_returned.set()
+        # Arriving here means start() got past a poll still in its refresh.
+        rendezvous.point()
+
+    try:
+        polled, _ = run_in_threads(watcher.poll, start)
+        assert [Path(path).name for path in cast(tuple[str, ...], polled)] == ["a.py"]
+        assert seen_during_refresh == [False]
+    finally:
+        watcher.stop(timeout=10)
 
 
 def test_watcher_error_handler_uses_callback_or_stderr(

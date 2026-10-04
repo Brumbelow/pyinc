@@ -11,6 +11,7 @@ from typing import Any, BinaryIO, cast
 
 import pytest
 from _hostile_paths import within_budget
+from _rendezvous import Rendezvous
 
 import pyinc_tools
 import pyinc_tools.cli as cli
@@ -2321,6 +2322,41 @@ def test_watcher_cannot_start_after_session_close(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="WorkspaceSession is closed"):
         watcher.start(lambda _paths: None)
     assert watcher.is_running is False
+
+
+def test_session_close_during_watcher_start_stops_the_started_thread(tmp_path: Path) -> None:
+    """A close that lands while a watcher starts stops the thread it starts.
+
+    The watcher registers with the session before it replaces its stop event,
+    and the close used to set that event without the watcher's lifecycle lock.
+    Landing between the two, the close set the event being replaced, waited
+    out the join, and removed the mirror with the new thread still running.
+    """
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    _write(root / "a.py", "x = 1\n")
+    rendezvous = Rendezvous()
+    registered = threading.Event()
+
+    class RegisteringSession(WorkspaceSession):
+        def _register_watcher(self, watcher: PollingWorkspaceWatcher) -> None:
+            super()._register_watcher(watcher)
+            registered.set()
+            rendezvous.point()
+
+    session = RegisteringSession(root)
+    watcher = PollingWorkspaceWatcher(session)
+    watcher._lifecycle_lock = rendezvous.lock(threading.RLock())  # type: ignore[assignment]
+    starter = threading.Thread(target=watcher.start, args=(lambda _paths: None,))
+    starter.start()
+    try:
+        assert registered.wait(10)
+        session.close()
+        starter.join(10)
+        assert watcher.is_running is False
+    finally:
+        watcher.stop(timeout=10)
 
 
 def test_watcher_start_failure_unregisters_from_session(

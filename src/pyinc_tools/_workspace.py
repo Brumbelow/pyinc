@@ -609,6 +609,11 @@ class PollingWorkspaceWatcher:
         self._snapshot = self._baseline_snapshot()
         self._pending: dict[str, float] = {}
         self._thread: threading.Thread | None = None
+        # Held by `start`, by `stop` and `_request_stop` while they find the
+        # event and thread to act on, and by `poll` for the whole poll, so none
+        # of them interleaves with another. It is taken before the session's
+        # lock (`start` registers, `poll` refreshes) and never after it, which
+        # is why `_runs_in_current_thread` does without it.
         self._lifecycle_lock = threading.RLock()
         self._stop_event = threading.Event()
         self._on_change: Callable[[tuple[str, ...]], None] | None = None
@@ -638,11 +643,15 @@ class PollingWorkspaceWatcher:
         return thread is not None and thread.is_alive()
 
     def poll(self) -> tuple[str, ...]:
-        if self.is_running:
-            raise RuntimeError(
-                "PollingWorkspaceWatcher is running; stop() it before calling poll() directly."
-            )
-        return self._poll_once()
+        # Checked and polled under the lifecycle lock: checked alone, a
+        # `start()` landing after the check ran the thread's first poll
+        # alongside this one, over the same pending map and snapshot.
+        with self._lifecycle_lock:
+            if self.is_running:
+                raise RuntimeError(
+                    "PollingWorkspaceWatcher is running; stop() it before calling poll() directly."
+                )
+            return self._poll_once()
 
     def _poll_once(self) -> tuple[str, ...]:
         now = self._clock()
@@ -714,8 +723,8 @@ class PollingWorkspaceWatcher:
                 raise
 
     def stop(self, *, timeout: float = 5.0) -> None:
-        self._request_stop()
         with self._lifecycle_lock:
+            self._request_stop()
             thread = self._thread
             if thread is None:
                 return
@@ -729,9 +738,19 @@ class PollingWorkspaceWatcher:
             )
 
     def _request_stop(self) -> None:
-        self._stop_event.set()
+        # `start()` replaces the event under the lifecycle lock. Set without
+        # it, a stop landing while `start()` ran could set the event being
+        # replaced: the new thread then ran on, `stop()` timed out joining it,
+        # and `WorkspaceSession.close()` removed the mirror under it.
+        with self._lifecycle_lock:
+            self._stop_event.set()
 
     def _runs_in_current_thread(self) -> bool:
+        # No lock: `WorkspaceSession.close()` asks this while holding the
+        # session's lock, which `start()` takes inside this one. A reference
+        # read is atomic, and none is needed: `_thread` changes only in
+        # `start()`, which refuses while the previous thread is alive, so it
+        # cannot change under the one thread for which the answer is True.
         return self._thread is threading.current_thread()
 
     def _register_with_session(self) -> None:
@@ -764,6 +783,10 @@ class PollingWorkspaceWatcher:
         self.stop()
 
     def _run(self, interval_s: float) -> None:
+        # This thread reads `_stop_event`, `_on_change` and `_on_error` without
+        # the lifecycle lock, and need not take it: `start()` set them before
+        # starting this thread and cannot set them again while it is alive,
+        # and only this thread clears the callbacks, after its loop.
         try:
             while not self._stop_event.is_set():
                 try:

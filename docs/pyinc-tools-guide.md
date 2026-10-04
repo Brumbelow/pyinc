@@ -120,6 +120,10 @@ with WorkspaceSession("/path/to/workspace") as session:
 Callbacks run on the watcher thread. Keep them short or hand work to a queue.
 Calling `refresh_paths(...)` from an existing platform watcher is also
 supported; do not drive one watcher concurrently from both polling paths.
+`start()`, `stop()`, `poll()` and the session's `close()` may be called from
+different threads: each waits for the others rather than interleaving with
+them, so a stop or a close that lands while the watcher starts stops the thread
+it starts, and `poll()` refuses whenever the watcher is running.
 
 ## Start the LSP server
 

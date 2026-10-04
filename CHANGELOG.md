@@ -97,6 +97,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already closed. Teardown now detaches the session under the write lock
   before closing it, and a publish reads the session once and sends nothing
   once its session is no longer the server's.
+- A `PollingWorkspaceWatcher` stop that lands while `start()` runs stops the
+  thread `start()` launches. `start()` replaces its stop event under the
+  watcher's lifecycle lock, but `stop()`, and `WorkspaceSession.close()` when
+  it stops each watcher, set the event without that lock. A stop landing in
+  between set the event being replaced, so the new thread ran on, `stop()`
+  waited out its five-second join, and `close()` removed the mirror under
+  the running thread. `poll()` checked that the watcher was not running and
+  only then polled, so a `start()` landing between the two polled alongside
+  it over the same pending paths, and one of them raised `RuntimeError`. Both
+  now hold the lifecycle lock.
 
 ### Changed
 
