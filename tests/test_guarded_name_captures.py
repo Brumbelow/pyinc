@@ -529,6 +529,41 @@ def test_a_wrapper_capture_reuses_its_identity_and_warms_from_a_checkpoint(
     assert warm.statistics().query_executions == 0
 
 
+def test_the_memo_sees_an_edit_to_the_class_a_bound_wrapper_is_read_off(
+    module_factory: Callable[[str], ModuleType],
+) -> None:
+    """A bound wrapper reached as a module attribute is observed with the class it is bound to.
+
+    `H.W`, where `W = LocalPath.cwd` on a class of the caller's own, folds
+    that class's body beside the wrapper's pin. The memo reuses a stored
+    identity only while the definitions behind a module attribute hold
+    still, and the bound wrapper is among the landings it observes, so a
+    class attribute written in place moves a warm database's identity as it
+    moves a fresh one's, and the query runs again.
+    """
+    holder = module_factory(
+        "from pathlib import Path\n\n\nclass LocalPath(type(Path())):\n    X = 1\n\n\n"
+        "W = LocalPath.cwd\n"
+    )
+    module = module_factory(
+        f"import {holder.__name__} as H\nfrom pyinc import query\n\n\n"
+        "@query(key='guarded-capture:bound-memo')\n"
+        "def q(db, x):\n    return H.W is not None and x\n"
+    )
+    db = Database()
+    assert db.get(module.q, 1) == 1
+    assert db.get(module.q, 1) == 1
+    assert db.inspect(module.q, 1).last_decision == "reused"
+    before = db._query_fingerprint(module.q)
+
+    holder.LocalPath.X = 2
+    fresh = Database()._query_fingerprint(module.q)
+    assert fresh != before
+    assert db._query_fingerprint(module.q) == fresh
+    assert db.get(module.q, 1) == 1
+    assert db.inspect(module.q, 1).last_decision != "reused"
+
+
 _BEFORE_THE_FIRST_DATABASE = '''\
 """Bind guarded names before any Database exists, then fingerprint captures of them."""
 
