@@ -30,6 +30,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `deep_module_resolution_analysis` and `resolve_module_path` skip a relative
   `sys.path` entry, and on Windows a rooted one with no drive, as they already
   skipped the empty one, instead of resolving it against the working directory.
+- `InMemoryArtifactStore.keys()` returns a read-only snapshot taken at the
+  call instead of a live read-only view, so a mapping held from an earlier
+  call leaves out later puts. The live view raised `RuntimeError` when
+  iterated while another thread stored.
 
 | Symbol or behaviour | Before | After | What to do |
 |---|---|---|---|
@@ -37,6 +41,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 | `os.environb`, `os.getenvb()` in a query body | answered | `UntrackedReadError` | `EnvResource.read()`, then `os.fsencode` |
 | First import of `multiprocessing` or a process pool, `contextlib.chdir` in a query body; `inspect.stack()` there when a frame's file name is not fully qualified | answered | `UntrackedReadError` | import at module scope; keep directory changes and frame inspection outside queries |
 | Relative (or, on Windows, rooted) `sys.path` entry in deep module resolution | resolved against the working directory | ignored | put a fully qualified path on `sys.path` |
+| `InMemoryArtifactStore.keys()` | live read-only view | read-only snapshot at call time | call `keys()` again after puts |
 
 ### Fixed
 
@@ -87,9 +92,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   overwrote the first without the `ValueError` the store protocol requires;
   on a free-threaded build, eight threads putting one digest let a
   conflicting put through in 186 rounds of 2000. `put` now looks and stores
-  under the store's lock. `keys()` returns a snapshot copied under that lock
-  rather than a live view, which raised `RuntimeError` when iterated while
-  another thread stored; call it again to see later puts.
+  under the store's lock. `keys()` copies under the same lock, so it can be
+  iterated while another thread stores. The snapshot it returns is listed
+  under Breaking.
 - A process forked while another thread holds the integrations' decode memo
   lock, or an `InMemoryArtifactStore`'s lock, can go on using them. The child
   inherited the lock held, with no thread left to release it, so its next

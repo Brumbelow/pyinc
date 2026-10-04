@@ -107,7 +107,10 @@ class InMemoryArtifactStore:
         return digest in self._items
 
     def keys(self) -> Mapping[str, bytes]:
-        """A read-only snapshot of the stored payloads, by digest."""
+        """A read-only snapshot of the stored payloads, by digest, taken at the call.
+
+        Call it again to see later puts.
+        """
 
         with self._lock:
             return MappingProxyType(dict(self._items))
