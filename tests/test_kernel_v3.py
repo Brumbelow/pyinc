@@ -1423,8 +1423,15 @@ def test_a_recursive_capture_the_kernel_cannot_fold_is_refused(
     def calls_walk(db: Database) -> int:
         return cast(int, walk(2))
 
-    with pytest.raises(UnsupportedValueError):
+    with pytest.raises(UnsupportedValueError) as refused:
         Database().get(calls_walk)
+    # The chain of causes leads to the global that blocked the fold.
+    causes: list[str] = []
+    error: BaseException | None = refused.value
+    while error is not None:
+        causes.append(str(error))
+        error = error.__cause__
+    assert any("'PATTERN'" in text for text in causes), causes
 
     @query(key="source-pinned-recursive-glob")
     def calls_glob(db: Database) -> bool:

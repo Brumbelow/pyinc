@@ -7829,16 +7829,17 @@ class Database:
                 seen_functions,
                 owner=function,
             )
-        except UnsupportedValueError:
+        except UnsupportedValueError as cause:
             if isinstance(value, type) and "<locals>" not in value.__qualname__:
                 return self._source_pinned_type_payload(value)
             if type(value) not in {dict, list, set}:
+                # Chained, so the traceback shows what inside the global blocked it.
                 raise UnsupportedValueError(
                     f"Source-pinned function {function.__module__}."
                     f"{function.__qualname__} has unsupported global {name!r} "
                     f"of type {type(value).__module__}."
                     f"{type(value).__qualname__}."
-                ) from None
+                ) from cause
             try:
                 frozen_value = freeze(value)
             except UnsupportedValueError as error:
