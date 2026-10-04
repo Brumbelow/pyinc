@@ -7694,7 +7694,16 @@ class Database:
     def _source_pinned_function_payload(
         self, function: FunctionType, seen_functions: builtins.set[int]
     ) -> Any:
-        """Pin a module attribute whose unrelated ambient globals are mutable."""
+        """Pin a module attribute whose unrelated ambient globals are mutable.
+
+        Reached only once `function`'s definition fold has refused it, which
+        has taken it back off `seen_functions`. It goes back on while its own
+        globals are folded, as the definition fold puts a function it is
+        folding: a function among its own globals -- one that calls itself,
+        or one of a pair that call each other -- is folded as the marker that
+        fold leaves, where it used to lead back here for the same function
+        until the interpreter's recursion limit.
+        """
 
         self._reject_reflective_namespace_reads(function)
         defining_module = sys.modules.get(function.__module__)
@@ -7703,55 +7712,60 @@ class Database:
                 f"Function {function.__module__}.{function.__qualname__} has no "
                 "loaded defining module."
             )
-        closure_vars = inspect.getclosurevars(function)
-        return (
-            "source-pinned-function-v3",
-            function.__module__,
-            function.__qualname__,
-            self._module_identity_payload(defining_module),
-            self._code_definition_payload(function.__code__, function.__module__),
-            tuple(
-                self._captured_dependency_digest(
-                    f"default[{index}]",
-                    item,
-                    seen_functions,
-                    owner=function,
-                )
-                for index, item in enumerate(function.__defaults__ or ())
-            ),
-            tuple(
-                (
-                    name,
+        function_id = id(function)
+        seen_functions.add(function_id)
+        try:
+            closure_vars = inspect.getclosurevars(function)
+            return (
+                "source-pinned-function-v3",
+                function.__module__,
+                function.__qualname__,
+                self._module_identity_payload(defining_module),
+                self._code_definition_payload(function.__code__, function.__module__),
+                tuple(
                     self._captured_dependency_digest(
-                        f"kwdefault[{name}]",
+                        f"default[{index}]",
                         item,
                         seen_functions,
                         owner=function,
-                    ),
-                )
-                for name, item in sorted((function.__kwdefaults__ or {}).items())
-            ),
-            tuple(
-                (
-                    name,
-                    self._captured_dependency_digest(name, item, seen_functions, owner=function),
-                )
-                for name, item in sorted(closure_vars.nonlocals.items())
-            ),
-            tuple(
-                (
-                    name,
-                    self._source_pinned_global_payload(
+                    )
+                    for index, item in enumerate(function.__defaults__ or ())
+                ),
+                tuple(
+                    (
                         name,
-                        item,
-                        function=function,
-                        seen_functions=seen_functions,
-                    ),
-                )
-                for name, item in sorted(closure_vars.globals.items())
-            ),
-            self._function_metadata_payload(function, seen_functions),
-        )
+                        self._captured_dependency_digest(
+                            f"kwdefault[{name}]",
+                            item,
+                            seen_functions,
+                            owner=function,
+                        ),
+                    )
+                    for name, item in sorted((function.__kwdefaults__ or {}).items())
+                ),
+                tuple(
+                    (
+                        name,
+                        self._captured_dependency_digest(name, item, seen_functions, owner=function),
+                    )
+                    for name, item in sorted(closure_vars.nonlocals.items())
+                ),
+                tuple(
+                    (
+                        name,
+                        self._source_pinned_global_payload(
+                            name,
+                            item,
+                            function=function,
+                            seen_functions=seen_functions,
+                        ),
+                    )
+                    for name, item in sorted(closure_vars.globals.items())
+                ),
+                self._function_metadata_payload(function, seen_functions),
+            )
+        finally:
+            seen_functions.remove(function_id)
 
     def _source_pinned_global_payload(
         self,

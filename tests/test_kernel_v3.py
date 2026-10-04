@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import decimal
 import functools
 import hashlib
@@ -1340,6 +1341,101 @@ def test_source_pinned_module_function_keeps_imported_mutable_state(
 
     sys.modules.pop(facade_name, None)
     sys.modules.pop(helper_name, None)
+
+
+def test_a_source_pinned_function_that_calls_itself_fingerprints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recursive function the kernel pins by its source folds once, not without end.
+
+    Reading a mutable module global refuses a function's definition fold, so
+    the kernel pins it by its source and folds each global on its own. A
+    function among its own globals -- one that calls itself, or a pair that
+    call each other -- led back into the same fallback for the same function
+    until the interpreter's recursion limit, where the definition fold marks
+    a function it is already folding. The source-pinned fold now marks it the
+    same way, and the identity still moves with the module's source.
+    """
+    module_name = "pyinc_source_pinned_recursive"
+    module_path = tmp_path / f"{module_name}.py"
+    source = (
+        "STATE = {{'base': {base}}}\n"
+        "def countdown(n):\n"
+        "    return countdown(n - 1) if n else STATE['base']\n"
+        "def ping(n):\n"
+        "    return pong(n - 1) if n else STATE['base']\n"
+        "def pong(n):\n"
+        "    return ping(n - 1) if n else -STATE['base']\n"
+    )
+    module_path.write_text(source.format(base=1), encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+
+    @query(key="source-pinned-recursive")
+    def read_recursive(db: Database) -> tuple[int, int, int]:
+        return (module.countdown(3), module.ping(3), module.ping(4))
+
+    db = Database()
+    assert db.get(read_recursive) == (1, -1, 1)
+    before = Database()._query_fingerprint(read_recursive)
+    assert db._query_fingerprint(read_recursive) == before
+
+    module_path.write_text(source.format(base=2), encoding="utf-8")
+    importlib.invalidate_caches()
+    importlib.reload(module)
+    assert Database()._query_fingerprint(read_recursive) != before
+    assert db.get(read_recursive) == (2, -2, 2)
+    assert db.inspect(read_recursive).last_decision == "executed"
+
+    sys.modules.pop(module_name, None)
+
+
+def test_a_recursive_capture_the_kernel_cannot_fold_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recursive function with a global nothing can fold is refused, not overflowed.
+
+    `glob.glob` reaches `glob._iglob`, which calls itself, and `has_magic`,
+    whose compiled pattern no fold accepts; a module of the caller's own
+    with the same shape is refused the same way, with `UnsupportedValueError`
+    where `RecursionError` escaped before.
+    """
+    module_name = "pyinc_source_pinned_recursive_refused"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import re\n"
+        "from glob import glob\n"
+        "PATTERN = re.compile('x')\n"
+        "def leaf():\n"
+        "    return PATTERN\n"
+        "def walk(n):\n"
+        "    leaf()\n"
+        "    return walk(n - 1) if n else 0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    walk = module.walk
+    glob = module.glob
+
+    @query(key="source-pinned-recursive-refused")
+    def calls_walk(db: Database) -> int:
+        return cast(int, walk(2))
+
+    with pytest.raises(UnsupportedValueError):
+        Database().get(calls_walk)
+
+    @query(key="source-pinned-recursive-glob")
+    def calls_glob(db: Database) -> bool:
+        return glob is not None
+
+    # `glob` refuses on every supported version for its pattern; a version
+    # whose `glob` folds may answer, but none may overflow the stack.
+    with contextlib.suppress(UnsupportedValueError):
+        assert Database().get(calls_glob) is True
+
+    sys.modules.pop(module_name, None)
 
 
 def test_module_identity_hashes_compiled_file_bytes_even_when_stat_is_stable(

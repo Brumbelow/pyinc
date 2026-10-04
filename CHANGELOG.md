@@ -108,6 +108,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only then polled, so a `start()` landing between the two polled alongside
   it over the same pending paths, and one of them raised `RuntimeError`. Both
   now hold the lifecycle lock.
+- A query that captures a function the kernel pins by its source -- one whose
+  definition reads a mutable module global, or reaches one that does -- and
+  that calls itself, or one of a pair that call each other, no longer fails at
+  fingerprinting with `RecursionError`. Such a function fingerprints now, and
+  one with a global nothing can fold, such as `glob.glob`, whose helper reads
+  a compiled pattern, is refused with `UnsupportedValueError`.
 
 ### Changed
 
