@@ -2426,6 +2426,153 @@ def test_language_server_watcher_opt_out(tmp_path: Path) -> None:
             server._session.close()
 
 
+class _ReadHookServer(LanguageServer):
+    """A server that runs a hook right after its `_session` is next read.
+
+    The hook stands in for another thread acting between two reads of the
+    attribute: the read has already answered, as it would have for a thread
+    preempted just after it.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._session_value: WorkspaceSession | None = None
+        self.after_next_session_read: Callable[[], None] | None = None
+        super().__init__(**kwargs)
+
+    @property
+    def _session(self) -> WorkspaceSession | None:
+        value = self._session_value
+        hook, self.after_next_session_read = self.after_next_session_read, None
+        if hook is not None:
+            hook()
+        return value
+
+    @_session.setter
+    def _session(self, value: WorkspaceSession | None) -> None:
+        self._session_value = value
+
+
+def _initialized_server(root: Path, out: io.BytesIO) -> _ReadHookServer:
+    """A server over ``root`` whose workspace has one diagnostic to publish."""
+
+    root.mkdir()
+    _write(root / "a.py", "from . import missing\n")
+    server = _ReadHookServer(in_stream=io.BytesIO(), out_stream=out, default_root=str(root))
+    server._handle_request(
+        "initialize",
+        {"rootUri": root.as_uri(), "initializationOptions": {"pyinc.watcher.enabled": False}},
+    )
+    session = server._session
+    assert session is not None
+    assert session.analyze_workspace().diagnostics
+    return server
+
+
+def test_publish_torn_down_right_after_reading_the_session_sends_nothing(
+    tmp_path: Path,
+) -> None:
+    """A teardown between the session check and its use leaves nothing to fail.
+
+    `publish_workspace_diagnostics` runs on the watcher thread and is public,
+    while teardown runs on the request loop. It checked `_session` and read it
+    again to analyze, so a teardown in between left it calling
+    `analyze_workspace` on None.
+    """
+
+    out = io.BytesIO()
+    server = _initialized_server(tmp_path / "workspace", out)
+    server.after_next_session_read = server._teardown_session
+
+    server.publish_workspace_diagnostics()
+
+    assert server._session is None
+    assert out.getvalue() == b""
+
+
+def test_publish_during_teardown_neither_raises_nor_sends(tmp_path: Path) -> None:
+    """A publish that lands while teardown is closing the session stays quiet.
+
+    Teardown closed the session before it let go of it, so a publish from
+    another thread in that window analyzed a closed session and raised
+    "WorkspaceSession is closed.", which the watcher reported on stderr.
+    """
+
+    out = io.BytesIO()
+    server = _initialized_server(tmp_path / "workspace", out)
+    session = server._session
+    assert session is not None
+    original_close = session.close
+    outcomes: list[str] = []
+
+    def close_while_publishing() -> None:
+        original_close()
+        try:
+            server.publish_workspace_diagnostics()
+        except Exception as exc:  # recorded: teardown would swallow it
+            outcomes.append(f"{type(exc).__name__}: {exc}")
+        else:
+            outcomes.append("returned")
+
+    session.close = close_while_publishing  # type: ignore[method-assign]
+    server._teardown_session()
+
+    assert outcomes == ["returned"]
+    assert out.getvalue() == b""
+
+
+def test_publish_whose_session_was_torn_down_during_analysis_sends_nothing(
+    tmp_path: Path,
+) -> None:
+    """Diagnostics for a session the server no longer serves are dropped.
+
+    A watcher join that times out leaves the thread analyzing after teardown
+    has moved on; the diagnostics it then sent described a closed session,
+    possibly after the shutdown response.
+    """
+
+    out = io.BytesIO()
+    server = _initialized_server(tmp_path / "workspace", out)
+    session = server._session
+    assert session is not None
+    original_analyze = session.analyze_workspace
+
+    def analyze_then_tear_down() -> Any:
+        result = original_analyze()
+        server._teardown_session()
+        return result
+
+    session.analyze_workspace = analyze_then_tear_down  # type: ignore[method-assign]
+    server.publish_workspace_diagnostics()
+
+    assert out.getvalue() == b""
+
+
+def test_session_helpers_use_the_session_they_checked(tmp_path: Path) -> None:
+    """`_require_session` and `_source_for_uri` read `_session` once.
+
+    Each checked it and then read it again, so a session detached in between
+    came back as None or failed with AttributeError.
+    """
+
+    out = io.BytesIO()
+    server = _initialized_server(tmp_path / "workspace", out)
+    session = server._session
+    assert session is not None
+
+    def detach() -> None:
+        server._session_value = None
+
+    server.after_next_session_read = detach
+    assert server._require_session() is session
+
+    server._session_value = session
+    server.after_next_session_read = detach
+    uri = (tmp_path / "workspace" / "a.py").as_uri()
+    assert server._source_for_uri(uri) == "from . import missing\n"
+
+    session.close()
+
+
 class _PairedWriteStream:
     """In-memory output stream that stalls after each write until the other
     writer thread has also written.

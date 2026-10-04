@@ -27,6 +27,7 @@ from ._jsonrpc import (
     validate_request,
     write_message,
 )
+from ._workspace import SESSION_CLOSED_MESSAGE
 from .session import (
     AnalysisDiagnostic,
     CallHierarchyCallSite,
@@ -407,7 +408,10 @@ class LanguageServer:
         # while the request loop writes responses, so both the output stream
         # (each frame is two writes plus a flush) and the published-diagnostics
         # bookkeeping need serializing. Reentrant because publishing sends
-        # notifications while holding the lock.
+        # notifications while holding the lock. `_session` is set and cleared
+        # under it too, so a publish that holds it knows whether the session it
+        # analyzed is still the server's. It is never held while a session is
+        # closed or a watcher joined: the watcher thread may be waiting for it.
         self._write_lock = threading.RLock()
 
     def serve(self) -> int:
@@ -643,9 +647,19 @@ class LanguageServer:
         return True
 
     def publish_workspace_diagnostics(self) -> None:
-        if self._session is None:
+        # The watcher thread calls this while the request loop may be tearing
+        # the session down, so the session is read once: a second read could
+        # find None. A session torn down meanwhile is closed, and what its
+        # analysis found is no longer the server's to publish.
+        session = self._session
+        if session is None:
             return
-        result = self._session.analyze_workspace()
+        try:
+            result = session.analyze_workspace()
+        except RuntimeError as exc:
+            if str(exc) == SESSION_CLOSED_MESSAGE and self._session is not session:
+                return
+            raise
         grouped: dict[str, list[dict[str, Any]]] = {}
         for diagnostic in result.diagnostics:
             grouped.setdefault(diagnostic.path, []).append(
@@ -657,6 +671,8 @@ class LanguageServer:
         # write lock so a publish from the watcher thread and one from the
         # request loop cannot interleave their bookkeeping or notifications.
         with self._write_lock:
+            if self._session is not session:
+                return
             for path in sorted(current_paths | self._published_paths):
                 diagnostics = grouped.get(path, [])
                 signature = tuple(_diagnostic_signature(item) for item in diagnostics)
@@ -757,9 +773,11 @@ class LanguageServer:
             else ()
         )
         try:
-            self._session = WorkspaceSession(root, exclude_globs=exclude_globs)
-            self._published_paths.clear()
-            self._published_signatures.clear()
+            session = WorkspaceSession(root, exclude_globs=exclude_globs)
+            with self._write_lock:
+                self._session = session
+                self._published_paths.clear()
+                self._published_signatures.clear()
 
             watcher_enabled = bool(options.get("pyinc.watcher.enabled", True))
             if watcher_enabled:
@@ -770,8 +788,9 @@ class LanguageServer:
                     interval_s = float(interval_ms) / 1000.0
                 else:
                     interval_s = None
-                self._watcher = PollingWorkspaceWatcher(self._session, debounce_ms=debounce_ms)
-                self._watcher.start(self._on_watcher_change, interval_s=interval_s)
+                watcher = PollingWorkspaceWatcher(session, debounce_ms=debounce_ms)
+                self._watcher = watcher
+                watcher.start(self._on_watcher_change, interval_s=interval_s)
         except BaseException:
             self._teardown_session()
             raise
@@ -873,10 +892,16 @@ class LanguageServer:
 
     def _teardown_session(self) -> None:
         self._stop_watcher()
-        if self._session is not None:
-            with contextlib.suppress(Exception):  # pragma: no cover - defensive
-                self._session.close()
+        # Detached before it is closed, and under the write lock, so a publish
+        # still running on the watcher thread (its join can time out) or on a
+        # caller's thread sees that the session is gone instead of reading it
+        # closed, or reading None where it had just found a session.
+        with self._write_lock:
+            session = self._session
             self._session = None
+        if session is not None:
+            with contextlib.suppress(Exception):  # pragma: no cover - defensive
+                session.close()
 
     def _document_symbols(self, params: Any) -> list[dict[str, Any]]:
         document = params["textDocument"]
@@ -1638,9 +1663,10 @@ class LanguageServer:
         return str(resolved)
 
     def _require_session(self) -> WorkspaceSession:
-        if self._session is None:
+        session = self._session
+        if session is None:
             raise RuntimeError("LSP session has not been initialized.")
-        return self._session
+        return session
 
     def _default_uri(self, params: Any) -> str | None:
         if not isinstance(params, dict):
@@ -1654,11 +1680,12 @@ class LanguageServer:
         return None
 
     def _source_for_uri(self, uri: str) -> str | None:
-        if self._session is None:
+        session = self._session
+        if session is None:
             return None
         try:
             path = _uri_to_path(uri)
-            return self._session.source_text(path)
+            return session.source_text(path)
         except (FileNotFoundError, ValueError):
             return None
 

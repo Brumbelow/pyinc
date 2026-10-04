@@ -88,6 +88,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   own, loading `kernel32` and declaring its function prototypes again, and
   the threads could go on using different ones; it is now built once, under a
   lock.
+- The language server's diagnostics publishing no longer races its own
+  shutdown. `publish_workspace_diagnostics`, which the watcher thread calls
+  and which is public, checked the session and then read it again, and
+  teardown closed the session before letting go of it, so a publish in that
+  window raised `AttributeError` on `None` or "WorkspaceSession is closed."
+  (the watcher printed either to stderr), or sent diagnostics for a session
+  already closed. Teardown now detaches the session under the write lock
+  before closing it, and a publish reads the session once and sends nothing
+  once its session is no longer the server's.
 
 ### Changed
 
