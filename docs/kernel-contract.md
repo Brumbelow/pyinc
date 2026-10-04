@@ -580,9 +580,11 @@ opened it. A call from any other thread opens a request of its own, even when
 that thread carries the opener's context -- as every thread started on a
 free-threaded 3.14 build does, and as `asyncio.to_thread` does everywhere --
 and a context copied while a request was open joins nothing once it has ended.
-So validation done for one thread's request is never reused by another's, and
-the answer does not depend on whether the interpreter copies contexts into new
-threads.
+The opener is that thread itself, not its ident, which a later thread can be
+given once the opener has exited, so a request left open by an exited thread
+is joined by no one. So validation done for one thread's request is never
+reused by another's, and the answer does not depend on whether the interpreter
+copies contexts into new threads.
 
 Databases on several threads may share one artifact store. Each shipped store
 checks and stores a digest in one step -- `InMemoryArtifactStore` under a lock,

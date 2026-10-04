@@ -48,7 +48,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fresh `Database` -- and queued its observer events on a list already
   delivered. A request now belongs to the thread that opened it and ends when
   its scope does; `pyinc.integrations.request_scope` follows the same rule for
-  its `once_per_request` memo.
+  its `once_per_request` memo. The thread is told by a token that dies with it,
+  not by its ident, which a later thread can be given once it exits.
 - `WorkspaceSession.close()` no longer removes the mirror while a watcher
   thread is still running. A `PollingWorkspaceWatcher` thread dropped its own
   reference as it wound down, so a `stop()` arriving in that window found

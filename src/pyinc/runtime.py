@@ -768,6 +768,23 @@ class ExecutionFrame:
     completed: bool = False
 
 
+# A thread's ident is reused as soon as the thread exits, so it cannot say which
+# thread opened a request that outlived its thread -- a span abandoned open in a
+# suspended generator, say. A thread-local value dies with its thread instead,
+# and a request holding its token keeps that object from being reallocated.
+_THREAD_TOKENS = threading.local()
+
+
+def _current_thread_token() -> object:
+    """An object for the calling thread that no other thread is handed while it is held."""
+
+    token: object | None = getattr(_THREAD_TOKENS, "token", None)
+    if token is None:
+        token = object()
+        _THREAD_TOKENS.token = token
+    return token
+
+
 @dataclass
 class _RequestScope:
     """One open request: the id its reads are checked in, and what dies with it.
@@ -778,7 +795,9 @@ class _RequestScope:
     later. A copy that joined it would answer from validation done before the
     copy ran -- after the request ended, from a world that has since moved.
     So a request belongs to the thread that opened it and ends when its scope
-    exits, and `Database._live_request` sees no request anywhere else.
+    exits, and `Database._live_request` sees no request anywhere else. The
+    thread is told by its token rather than its ident, which a later thread
+    can be given once this one has exited.
     """
 
     request_id: int
@@ -790,7 +809,7 @@ class _RequestScope:
     # caught up to.
     span: bool = False
     span_epoch_seen: int = 0
-    thread_ident: int = field(default_factory=threading.get_ident)
+    owner: object = field(default_factory=_current_thread_token)
     ended: bool = False
 
 
@@ -8785,7 +8804,7 @@ class Database:
         or one that has since ended -- is not live: see `_RequestScope`.
         """
         request = self._request.get()
-        if request is None or request.ended or request.thread_ident != threading.get_ident():
+        if request is None or request.ended or request.owner is not _current_thread_token():
             return None
         return request
 

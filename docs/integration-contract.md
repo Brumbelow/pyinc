@@ -306,8 +306,9 @@ than analyzed partially.
 **Semantics.** `request_scope(db)` is a context manager bound to one
 `Database`, to the calling context, and to the thread that opens it: a context
 copied while it is open (every thread started on a free-threaded 3.14 build,
-`asyncio.to_thread`) sees no scope from another thread, and none at all once it
-has closed. `once_per_request(db, kind, args,
+`asyncio.to_thread`) sees no scope from another thread, including a later one
+given the ident of an opener that has exited, and none at all once it has
+closed. `once_per_request(db, kind, args,
 compute)` returns `compute()`, answering from the open scope when the same
 `kind` and `args` already ran against that same `Database`.
 `request_inputs_changed()` drops what the open scope has memoized, and also

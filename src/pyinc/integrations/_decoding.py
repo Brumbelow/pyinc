@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pyinc.errors import CompositionError
+from pyinc.runtime import _current_thread_token
 
 if TYPE_CHECKING:
     from pyinc.runtime import Database
@@ -93,7 +94,7 @@ class _Request:
 
     db: Database
     memo: dict[Any, Any] = field(default_factory=dict)
-    thread_ident: int = field(default_factory=threading.get_ident)
+    owner: object = field(default_factory=_current_thread_token)
     ended: bool = False
 
 
@@ -102,7 +103,7 @@ _REQUEST: ContextVar[_Request | None] = ContextVar("pyinc_integration_request", 
 
 def _live_request() -> _Request | None:
     request = _REQUEST.get()
-    if request is None or request.ended or request.thread_ident != threading.get_ident():
+    if request is None or request.ended or request.owner is not _current_thread_token():
         return None
     return request
 

@@ -8606,6 +8606,71 @@ def test_a_change_seen_through_a_closed_span_context_is_still_delivered() -> Non
     assert [event.decision for event in events] == ["executed", "executed"]
 
 
+class _ReusedIdentThreading:
+    """`threading` as a `pyinc` module sees it, reporting one fixed ident.
+
+    Stands in for a later thread that has been given the ident of one that
+    exited, as the system gives out idents once their threads are joined.
+    """
+
+    def __init__(self, ident: int) -> None:
+        self._ident = ident
+
+    def get_ident(self) -> int:
+        return self._ident
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(threading, name)
+
+
+def test_a_thread_given_an_exited_threads_ident_does_not_join_its_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request left open by a thread that has exited stays that thread's.
+
+    A request recorded the ident of the thread that opened it, and a later
+    thread can be given that ident once the first has exited. A span or scope
+    abandoned open -- in a generator never resumed, say -- was then joined by
+    any such thread that carried its context, as every thread started on a
+    free-threaded build does.
+    """
+
+    from pyinc.integrations import _decoding, request_scope
+
+    db = Database()
+    carried = contextvars.copy_context()
+    opened: dict[str, Any] = {}
+
+    def open_and_abandon() -> None:
+        span = db.request_span()
+        span.__enter__()
+        scope = request_scope(db)
+        scope.__enter__()
+        assert db._live_request() is not None
+        assert _decoding._live_request() is not None
+        opened.update(span=span, scope=scope, ident=threading.get_ident())
+
+    opener = threading.Thread(target=carried.run, args=(open_and_abandon,))
+    opener.start()
+    opener.join()
+
+    reused = _ReusedIdentThreading(opened["ident"])
+    monkeypatch.setattr("pyinc.runtime.threading", reused)
+    monkeypatch.setattr(_decoding, "threading", reused)
+    try:
+        joined = _run_in_thread(
+            carried,
+            lambda: (db._live_request() is not None, _decoding._live_request() is not None),
+        )
+    finally:
+        monkeypatch.undo()
+        # Closed in the context that holds their tokens, so nothing leaks.
+        carried.run(opened["scope"].__exit__, None, None, None)
+        carried.run(opened["span"].__exit__, None, None, None)
+
+    assert joined == (False, False)
+
+
 def _held_wrapper() -> FrozenList:
     return cast(FrozenList, freeze([1, 2, 3]))
 
