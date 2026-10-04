@@ -126,6 +126,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Path.iterdir`, `Path.cwd` and `Thread.start` were local functions pickle
   could not find, so handing one to a process pool failed. Each wrapper now
   carries the module and name of the callable it replaces.
+- On Windows 3.11 and 3.12, `os.path.realpath` and `os.path.abspath` inside a
+  query refuse a path such as `/:/data`. Those versions normalise it to
+  `/:\data`, which Windows resolves on the working directory's drive, and the
+  full-qualification check took it for a drive with a root.
 
 ### Changed
 

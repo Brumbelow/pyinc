@@ -339,6 +339,8 @@ def test_resolving_an_absolute_path_never_reads_the_working_directory(
         ("/data/sample.txt", False),
         ("/:data", False),
         ("\\:data", False),
+        ("/:\\data", False),
+        ("/:/data", False),
         (b"relative", False),
     ],
 )
@@ -367,6 +369,30 @@ def test_the_windows_realpath_read_is_let_through_only_where_realpath_ignores_it
     assert seen == [(read_unused, True)]
     assert _CWD_READ_UNUSED.get() is False
     assert is_fully_qualified(path, ntpath) is read_unused
+
+
+@pytest.mark.parametrize("path", ["/:/data", b"/:/data"])
+def test_a_slash_left_before_a_colon_still_counts_as_rooted_on_windows(
+    monkeypatch: pytest.MonkeyPatch, path: str | bytes
+) -> None:
+    """Windows 3.11 and 3.12 normalise in C and keep a leading slash before a colon.
+
+    There `normpath("/:/data")` is `"/:\\data"`, a path rooted on the working
+    directory's drive. The stand-in returns that shape on any platform.
+    """
+    real_normpath = ntpath.normpath
+
+    def c_normpath(value: str | bytes) -> str | bytes:
+        result = real_normpath(value)
+        if isinstance(value, bytes):
+            assert isinstance(result, bytes)
+            return b"/" + result[1:] if value.startswith(b"/:") else result
+        assert isinstance(result, str)
+        return "/" + result[1:] if value.startswith("/:") else result
+
+    monkeypatch.setattr(ntpath, "normpath", c_normpath)
+    assert ntpath.normpath(path)[:1] in ("/", b"/")
+    assert is_fully_qualified(path, ntpath) is False
 
 
 @pytest.mark.parametrize(

@@ -31,6 +31,9 @@ def is_fully_qualified(path: str | bytes, path_module: ModuleType) -> bool:
         return bool(path_module.isabs(normalized))
     is_bytes = isinstance(normalized, bytes)
     sep = b"\\" if is_bytes else "\\"
+    # Windows 3.11 and 3.12 normalise in C, which keeps a leading "/" before a
+    # ":" (normpath("/:/x") is "/:\\x"). Windows reads both separators alike.
+    normalized = normalized.replace(b"/" if is_bytes else "/", sep)
     if normalized.startswith(sep * 2):
         return True
     if path_module.normcase(normalized) == (b"nul" if is_bytes else "nul"):
