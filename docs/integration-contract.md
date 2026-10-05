@@ -361,15 +361,21 @@ reaches the kernel. When the caller holds a `Database.request_span`, the
 declaration rolls that span onto a fresh request, so kernel-level
 once-per-request work re-runs against the moved inputs.
 
+| Declaration | Caller | Opener's memo | Opener's `request_span` |
+|---|---|---|---|
+| `request_inputs_changed()` | opening thread | cleared | rolled |
+| `request_inputs_changed()` | another thread, copied context included | kept | kept |
+| `Database.request_inputs_changed()` | any thread | kept | rolled |
+
 ### Limits
 
 The span is the caller's declaration, and nothing checks it. A caller that
 changes what the integrations read part-way through its own scope must call
-`request_inputs_changed()`. Nothing detects a missing call. Calls made with no
-scope open, or against a `Database` other than the one the scope was opened
-for, compute normally. The memo lives only for the span and is never durable.
-It answers a repeated question inside one request. It stays outside the
-kernel's invalidation and is not a cache across requests.
+`request_inputs_changed()` on the opening thread. Nothing detects a missing
+call. Calls made with no scope open, or against a `Database` other than the
+one the scope was opened for, compute normally. The memo lives only for the
+span and is never durable. It answers a repeated question inside one request.
+It stays outside the kernel's invalidation and is not a cache across requests.
 
 `request_inputs_changed()` clears the innermost open scope only. Under scopes
 nested for different `Database` objects, an outer scope keeps everything it

@@ -8,6 +8,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- Checkpoint manifest: v9. Upgrade: fresh evaluation and a new checkpoint.
+- Integration change declarations: the `request_scope` opening thread.
 - `os.getcwd`, `os.getcwdb` and `Path.cwd` inside a query body raise
   `UntrackedReadError`, and on POSIX so do reads of `os.getenvb` and
   `os.environb`. Both were named gaps in the kernel contract. A query that read
@@ -43,6 +45,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 | First import of `multiprocessing` or a process pool, `contextlib.chdir` in a query body; `inspect.stack()` there when a frame's file name is not fully qualified | answered | `UntrackedReadError` | import at module scope; keep directory changes and frame inspection outside queries |
 | Relative (or, on Windows, rooted) `sys.path` entry in deep module resolution | resolved against the working directory | ignored | put a fully qualified path on `sys.path` |
 | `InMemoryArtifactStore.keys()` | live read-only view | read-only snapshot at call time | call `keys()` again after puts |
+| Checkpoint saved by 4.0 (v8) | loaded | `CheckpointVersionError` | evaluate queries and save a v9 checkpoint |
+| `request_inputs_changed()` from a copied `request_scope` context on another thread | refreshed the opener memo and span | opener memo and span retained | declare on the opening thread |
 
 ### Fixed
 

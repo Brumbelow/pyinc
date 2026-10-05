@@ -96,6 +96,9 @@ ResourceProbeT = TypeVar("ResourceProbeT")
 # record layout or the meaning of a recorded field changes, so a stale manifest
 # is refused loudly and never silently reused.
 #
+# Version 9: working-directory and byte-environment guard boundary.
+# Upgrade: fresh evaluation and a new checkpoint.
+#
 # Version 8: the kernel rebuilds its own file-stat readings through a built-in
 # adapter. Earlier versions froze such a reading field by field into a plain
 # record, and the record layout is otherwise identical, so nothing below this
@@ -119,7 +122,7 @@ ResourceProbeT = TypeVar("ResourceProbeT")
 # NotADirectoryError published no resource edge. Such a record can carry a
 # stale identity, or claim no dependencies for a read a fresh database
 # re-derives.
-_CHECKPOINT_MANIFEST_VERSION = 8
+_CHECKPOINT_MANIFEST_VERSION = 9
 # Version of the snapshot/fingerprint encoding this kernel emits, mirrored from
 # value._KERNEL_FINGERPRINT_PREFIX (b"K2;"). Recorded in the manifest and checked
 # at load so a checkpoint from a differently-encoded kernel is never trusted.

@@ -23,8 +23,8 @@ import pytest
 from _rendezvous import Rendezvous, run_in_threads
 
 import pyinc_tools.session as session_module
-from pyinc import Database
-from pyinc.integrations import _decoding, once_per_request, request_scope
+from pyinc import Database, query
+from pyinc.integrations import _decoding, once_per_request, request_inputs_changed, request_scope
 from pyinc.integrations.python_source import workspace_analysis
 from pyinc.integrations.scope_resolution import _decode_scope_tree, scope_tree
 from pyinc.integrations.symbol_resolution import (
@@ -348,6 +348,54 @@ def test_a_context_copied_inside_a_request_scope_keeps_nothing_alive_after_it() 
     request = carried[_decoding._REQUEST]
     assert request is not None
     assert request.ended
+
+
+def _declare_on_opening_thread(db: Database, carried: contextvars.Context) -> None:
+    request_inputs_changed()
+
+
+def _declare_from_copied_context(db: Database, carried: contextvars.Context) -> None:
+    run_in_threads(lambda: carried.run(request_inputs_changed))
+
+
+def _declare_to_kernel_from_another_thread(db: Database, carried: contextvars.Context) -> None:
+    run_in_threads(db.request_inputs_changed)
+
+
+@pytest.mark.parametrize(
+    ("declare", "computes", "new_requests"),
+    [
+        (_declare_on_opening_thread, 2, 1),
+        (_declare_from_copied_context, 1, 0),
+        (_declare_to_kernel_from_another_thread, 1, 1),
+    ],
+    ids=["opening-thread", "copied-context", "kernel-other-thread"],
+)
+def test_declaration_reach_by_thread(
+    declare: Callable[[Database, contextvars.Context], None], computes: int, new_requests: int
+) -> None:
+    @query
+    def one(db: Database) -> int:
+        return 1
+
+    db = Database()
+    computed: list[int] = []
+
+    def compute() -> int:
+        computed.append(1)
+        return len(computed)
+
+    with db.request_span(), request_scope(db):
+        db.get(one)
+        once_per_request(db, "count", (), compute)
+        requests = db.statistics().total_requests
+        declare(db, contextvars.copy_context())
+        db.get(one)
+        once_per_request(db, "count", (), compute)
+        assert (len(computed), db.statistics().total_requests - requests) == (
+            computes,
+            new_requests,
+        )
 
 
 def test_decode_memo_is_skipped_when_payload_identity_is_unstable(tmp_path: Path) -> None:

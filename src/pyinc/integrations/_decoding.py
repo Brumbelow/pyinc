@@ -204,7 +204,7 @@ def request_scope(db: Database) -> Iterator[None]:
 
 
 def request_inputs_changed() -> None:
-    """Drop what this request has memoized, because its inputs have moved.
+    """Opening-thread scope: memo reset and kernel-span refresh.
 
     A caller that mutates what the integrations read part-way through its own
     request has broken the promise `request_scope` makes and must say so.

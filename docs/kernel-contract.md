@@ -738,7 +738,7 @@ call. A missing method, or an explicit protocol subclass implementing neither
 payloads by digest. Call it again to see later puts.
 
 `Database.save_checkpoint(store=None) -> str` serialises the current query and
-resource records into a content-addressed manifest (schema v8) and returns a
+resource records into a content-addressed manifest (schema v9) and returns a
 key prefixed with `"ck"`. The records carry snapshot bytes, call snapshots,
 resource parameters, dependency edges, per-adapter implementation digests, and
 the saving mode. Saving rejects an adapter whose captures or state cannot be
@@ -750,9 +750,12 @@ fresh run would produce.
 key. It validates every record, dependency, input policy, probe, and content
 address. Only then does it stage records atomically, under the trust rules of
 limitation 4. The store passed to `load_checkpoint` is also used for later
-snapshot loads if the `Database` was constructed without one. Manifest schema
-v8 rejects older manifests with `CheckpointVersionError`. Stale checkpoints
-are re-saved, never migrated.
+snapshot loads if the `Database` was constructed without one.
+
+| Checkpoint version | `load_checkpoint` | Upgrade step |
+|---|---|---|
+| v9 | Validate and stage records | Reuse the current checkpoint |
+| v8 and earlier | `CheckpointVersionError` | Evaluate queries and save a v9 checkpoint |
 
 A store found holding different bytes under a digest the kernel is publishing
 is an integrity fault. `save_checkpoint` raises. A value re-executed because

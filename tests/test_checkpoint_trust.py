@@ -54,6 +54,7 @@ from pyinc import (
     InputKeyError,
     PyIncError,
     UnsupportedValueError,
+    UntrackedReadError,
     freeze,
     query,
     serialize_snapshot,
@@ -1015,6 +1016,62 @@ def test_v7_manifest_rejected_loudly() -> None:
 
     with pytest.raises(ValueError, match="Unsupported checkpoint version"):
         db.load_checkpoint(key)
+
+
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize(
+    "reader",
+    [
+        "cwd",
+        pytest.param(
+            "byte-environment",
+            marks=pytest.mark.skipif(
+                not os.supports_bytes_environ, reason="POSIX byte environment"
+            ),
+        ),
+    ],
+)
+def test_v8_guard_records_report_checkpoint_version_error(
+    mode: str, reader: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @query(key=f"v8-guard-record-{reader}")
+    def observation(db: Database) -> str | bytes:
+        if reader == "cwd":
+            return os.getcwd()
+        if sys.platform != "win32":
+            return os.getenvb(b"PYINC_CHECKPOINT_UPGRADE", b"")
+        return b""
+
+    store = InMemoryArtifactStore()
+    saver = Database(mode, store=store)
+    legacy_value = "legacy-cwd" if reader == "cwd" else b"legacy-env"
+
+    def legacy_read(*args: Any, **kwargs: Any) -> str | bytes:
+        return legacy_value
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(os, "getcwd" if reader == "cwd" else "getenvb", legacy_read)
+        assert saver.get(observation) == legacy_value
+        manifest = json.loads(cast(bytes, store.get(saver.save_checkpoint())))
+        assert len(manifest["records"]) == 1
+        manifest["pyinc_ckpt_version"] = 8
+        manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+        key = "ck" + hashlib.sha256(manifest_bytes).hexdigest()
+        store.put(key, manifest_bytes)
+
+    fresh = Database(mode)
+    with pytest.raises(UntrackedReadError):
+        fresh.get(observation)
+
+    loader = Database(mode, store=store)
+    with pytest.raises(
+        CheckpointVersionError, match=rf"version 8; expected {_CHECKPOINT_MANIFEST_VERSION}"
+    ):
+        loader.load_checkpoint(key)
+    assert loader._checkpoint_query_records == {}
+    assert loader._checkpoint_resource_probes == {}
+    assert loader._checkpoint_adapter_digests == {}
+    assert loader.statistics().node_count == 0
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
