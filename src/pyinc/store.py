@@ -17,7 +17,7 @@ import threading
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from ._locking import FileLock, _validate_lock_timeout
 from ._safe_fs import (
@@ -65,6 +65,33 @@ class ArtifactStore(Protocol):
         return self.get(digest) is not None
 
 
+class _ProcessLocks:
+    """One lock per process id, made on first use in that process.
+
+    A thread that held the parent's lock at a fork is gone in the child, so
+    the child needs a lock of its own. A lock can be neither copied nor
+    pickled, so a copy and a pickle round trip are a new, empty table. That
+    holds wherever the table is reached from, including a subclass's own
+    `__getstate__` over its instance dictionary.
+    """
+
+    __slots__ = ("_by_pid",)
+
+    def __init__(self) -> None:
+        self._by_pid: dict[int, threading.Lock] = {}
+
+    def current(self) -> threading.Lock:
+        pid = os.getpid()
+        lock = self._by_pid.get(pid)
+        if lock is None:
+            # setdefault keeps a single lock when two threads arrive together.
+            lock = self._by_pid.setdefault(pid, threading.Lock())
+        return lock
+
+    def __reduce__(self) -> tuple[type[_ProcessLocks], tuple[()]]:
+        return (_ProcessLocks, ())
+
+
 class InMemoryArtifactStore:
     """In-process dict-backed store. Useful for tests and for retaining values
     beyond `Database(max_query_nodes=...)` LRU eviction within a single run.
@@ -77,26 +104,27 @@ class InMemoryArtifactStore:
     are one dict operation each and need no lock. Each process uses a lock of
     its own, so a child forked while another thread held the parent's lock
     can still store. A copy, shallow or deep, and a pickle round trip hold
-    their own items under a lock of their own.
+    their own items under a lock of their own. Whatever else a subclass
+    keeps, in its instance dictionary or in slots, is copied as Python copies
+    any object.
     """
 
     def __init__(self) -> None:
         self._items: dict[str, bytes] = {}
-        # One lock per process id, made on first use in that process. A thread
-        # that held the parent's lock at a fork is gone in the child, so the
-        # child needs a lock of its own. The table lives on the instance, so the
-        # methods read no mutable module state. A query that captures this
-        # class folds those methods into its fingerprint, and the fold refuses
-        # such state.
-        self._locks: dict[int, threading.Lock] = {}
+        # The table lives on the instance, so the methods read no mutable
+        # module state. A query that captures this class folds those methods
+        # into its fingerprint, and the fold refuses such state.
+        self._locks = _ProcessLocks()
 
     def _process_lock(self) -> threading.Lock:
-        pid = os.getpid()
-        lock = self._locks.get(pid)
-        if lock is None:
-            # setdefault keeps a single lock when two threads arrive together.
-            lock = self._locks.setdefault(pid, threading.Lock())
-        return lock
+        try:
+            locks = self._locks
+        except AttributeError:
+            # State restored without a table, as from a pickle a release
+            # before the lock wrote. setdefault keeps a single table when two
+            # threads arrive together.
+            locks = self.__dict__.setdefault("_locks", _ProcessLocks())
+        return locks.current()
 
     def get(self, digest: str) -> bytes | None:
         return self._items.get(digest)
@@ -127,21 +155,20 @@ class InMemoryArtifactStore:
         with self._process_lock():
             return MappingProxyType(dict(self._items))
 
-    def __getstate__(self) -> dict[str, Any]:
-        # Locks cannot be pickled or copied, so the state leaves them out. The
-        # items are copied under the lock, so a put on another thread cannot
-        # change them while they are read, and a copy gets items of its own.
+    def __getstate__(self) -> object:
+        # The default state, so a subclass keeps its own attributes and slots,
+        # with two entries replaced. The items are copied under the lock, so a
+        # put on another thread cannot change them while they are read, and a
+        # copy gets items of its own. The lock table is a new one, so a shallow
+        # copy does not share the original's lock. Nothing restores the state
+        # by hand: Python's default handles both shapes it can take.
         with self._process_lock():
-            state = dict(self.__dict__)
-            state["_items"] = dict(self._items)
-        state.pop("_locks", None)
-        state.pop("_lock", None)
-        return state
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        self.__dict__.update(state)
-        self.__dict__.pop("_lock", None)
-        self._locks = {}
+            state = object.__getstate__(self)
+            attributes, slots = state if isinstance(state, tuple) else (state, None)
+            attributes = dict(attributes or {})
+            attributes["_items"] = dict(self._items)
+        attributes["_locks"] = _ProcessLocks()
+        return attributes if slots is None else (attributes, slots)
 
 
 class FileSystemArtifactStore:
