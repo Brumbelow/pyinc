@@ -242,6 +242,12 @@ from ._workspace import (
 # Diagnostic codes that `code_actions_for_range` can offer a quick fix for.
 _CODE_ACTION_CODES = frozenset({"unused-import", "missing-import", "unresolved-symbol"})
 
+# Where a diagnostic about a file as a whole points. The range is empty because
+# that is the only range every document has. A range over the first character
+# is outside a file that is empty or begins with an empty line, and the
+# language server cannot convert such a range for its client.
+_START_OF_FILE = SourceRange(SourcePosition(0, 0), SourcePosition(0, 0))
+
 # Target module -> the (importing file, imported name) pairs that name it in a
 # `from` import. `_reexported_names_for_module` needs one entry of this per file
 # it examines. Building it once per request decodes the workspace analysis once,
@@ -3801,7 +3807,7 @@ class WorkspaceSession:
                             message=message,
                             severity="error",
                             source="pyinc.requirements_txt",
-                            range=SourceRange(SourcePosition(0, 0), SourcePosition(0, 1)),
+                            range=_START_OF_FILE,
                         )
                     )
             for requirement in dependency_inputs.requirements.requirements:
@@ -3822,7 +3828,7 @@ class WorkspaceSession:
                 path, source_range = requirements_by_name[status.name]
             elif config_path is not None:
                 path = config_path
-                source_range = SourceRange(SourcePosition(0, 0), SourcePosition(0, 1))
+                source_range = _START_OF_FILE
             else:
                 continue
 
@@ -3856,7 +3862,7 @@ class WorkspaceSession:
                             message=message,
                             severity="warning",
                             source="pyinc.dependency_check",
-                            range=SourceRange(SourcePosition(0, 0), SourcePosition(0, 1)),
+                            range=_START_OF_FILE,
                         )
                     )
 

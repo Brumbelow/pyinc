@@ -7751,6 +7751,83 @@ def test_language_server_workspace_diagnostic_reports_each_file(
     assert by_uri[ok_uri]["items"] == []
 
 
+def test_language_server_delivers_a_file_level_diagnostic_when_the_first_line_is_empty(
+    tmp_path: Path,
+) -> None:
+    """A diagnostic about a whole file reaches the client whatever its first line holds.
+
+    Such a diagnostic pointed at the first character of the file. A file whose
+    first line is empty has none, so the range could not be converted for the
+    client. Every publish skipped the file, and a pull for that file or for the
+    workspace answered with an invalid-params error, which left a pull client
+    with no diagnostics for any file. The diagnostic now points at the start
+    of the file with an empty range.
+    """
+    root = tmp_path / "workspace"
+    _write(
+        root / "pyproject.toml",
+        "\n[project]\nname = 'demo'\nversion = '0.1'\n"
+        "dependencies = ['definitely-not-installed-anywhere>=1']\n",
+    )
+    _write(root / "user.py", "import totally_unknown_module\n")
+    config_uri = (root / "pyproject.toml").as_uri()
+    user_uri = (root / "user.py").as_uri()
+    out = io.BytesIO()
+    server = LanguageServer(in_stream=io.BytesIO(), out_stream=out, default_root=str(root))
+    try:
+        server._handle_request(
+            "initialize",
+            {"rootUri": root.as_uri(), "initializationOptions": {"pyinc.watcher.enabled": False}},
+        )
+        server._handle_message({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        server._handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "textDocument/diagnostic",
+                "params": {"textDocument": {"uri": config_uri}},
+            }
+        )
+        server._handle_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "workspace/diagnostic",
+                "params": {"previousResultIds": []},
+            }
+        )
+    finally:
+        if server._session is not None:
+            server._session.close()
+
+    replay = io.BytesIO(out.getvalue())
+    messages = []
+    while (message := read_message(replay)) is not None:
+        messages.append(message)
+    published = {
+        message["params"]["uri"]: message["params"]["diagnostics"]
+        for message in messages
+        if message.get("method") == "textDocument/publishDiagnostics"
+    }
+    responses = {message["id"]: message for message in messages if "id" in message}
+    start_of_file = {
+        "start": {"line": 0, "character": 0},
+        "end": {"line": 0, "character": 0},
+    }
+
+    assert [(item["code"], item["range"]) for item in published[config_uri]] == [
+        ("dependency-missing", start_of_file)
+    ]
+    assert "error" not in responses[1]
+    assert [(item["code"], item["range"]) for item in responses[1]["result"]["items"]] == [
+        ("dependency-missing", start_of_file)
+    ]
+    assert "error" not in responses[2]
+    by_uri = {item["uri"]: item for item in responses[2]["result"]["items"]}
+    assert [item["code"] for item in by_uri[config_uri]["items"]] == ["dependency-missing"]
+    assert [item["code"] for item in by_uri[user_uri]["items"]] == ["missing-import"]
+
+
 def test_language_server_workspace_diagnostic_unchanged_with_previous_ids(
     tmp_path: Path,
 ) -> None:
