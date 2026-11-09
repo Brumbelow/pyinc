@@ -1661,7 +1661,9 @@ class LanguageServer:
         return str(Path.cwd().resolve(strict=False))
 
     def _analysis_diagnostic_to_lsp(self, diagnostic: AnalysisDiagnostic) -> dict[str, Any]:
-        source_range = diagnostic.range or SourceRange(SourcePosition(0, 0), SourcePosition(0, 1))
+        # A diagnostic without a range points at the start of its file. The
+        # range is empty, so it exists whatever the first line holds.
+        source_range = diagnostic.range or SourceRange(SourcePosition(0, 0), SourcePosition(0, 0))
         payload: dict[str, Any] = {
             "range": _range_to_lsp(source_range),
             "severity": _PYINC_SEVERITY_TO_LSP[diagnostic.severity],
