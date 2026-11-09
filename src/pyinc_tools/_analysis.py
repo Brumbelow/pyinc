@@ -1133,11 +1133,15 @@ def _find_callable_node(tree: ast.Module, qualified_name: str) -> _CallableNode 
                 found = walk(list(node.body), rest)
                 if found is not None:
                     return found
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == head:
-                if not rest:
-                    return node
-                # Nested functions fall outside the symbol-table qualifier
-                # scheme, so stop descending.
+            elif (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == head
+                and not rest
+            ):
+                # A function matches only as the last name. Nested functions
+                # fall outside the symbol-table qualifier scheme, so a
+                # function body is never searched.
+                return node
         return None
 
     return walk(list(tree.body), parts)
