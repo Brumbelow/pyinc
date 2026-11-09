@@ -1262,6 +1262,25 @@ out["fake"] = [
 ]
 os.listdir = real_listdir
 out["original_again"] = Database().get(calls, "original")
+
+# Another standard-library function set in a guarded name's place is a
+# stand-in too. It is not this name's own callable, so it keeps its place.
+os.path.abspath = os.path.normpath
+
+
+@query(key="wraps-fake:stand-in")
+def stands_in(db):
+    try:
+        return os.path.abspath("relative/../path")
+    except UntrackedReadError:
+        return "refused"
+
+
+out["stand_in"] = [
+    Database().get(stands_in),
+    os.path.abspath is os.path.normpath,
+    any(entry.original is os.path.normpath for entry in runtime._GUARDED_NAMES.values()),
+]
 print("JSON " + json.dumps(out))
 '''
 
@@ -1277,8 +1296,10 @@ def test_a_fake_made_with_functools_wraps_is_not_taken_for_the_original(tmp_path
     function of the caller's own. Set afterwards, it was wrapped again at the
     next query execution, so a query that called it got `UntrackedReadError`
     where 4.0 answered. A function now counts as the standard library's only
-    when that module defines it. The original put back is still wrapped
-    again. A fresh process is the only place no `Database` exists yet.
+    when that module defines it. Another standard-library function set in a
+    guarded name's place was wrapped again in the same way, and now keeps its
+    place too. The original put back is still wrapped again. A fresh process
+    is the only place no `Database` exists yet.
     """
     script = tmp_path / "wraps_fake_in_a_guarded_name.py"
     script.write_text(_A_WRAPS_FAKE_IN_A_GUARDED_NAME, encoding="utf-8")
@@ -1302,3 +1323,4 @@ def test_a_fake_made_with_functools_wraps_is_not_taken_for_the_original(tmp_path
     assert out["preview"] == [["getenv", "rejected", False], ["realpath", "rejected", False]]
     assert out["fake"] == ["canned /canned", True, True]
     assert out["original_again"] == "refused"
+    assert out["stand_in"] == ["path", True, False]

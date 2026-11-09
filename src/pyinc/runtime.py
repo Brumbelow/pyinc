@@ -1365,16 +1365,20 @@ class _GuardSlot:
         For an environment mapping that is the interpreter's own `os._Environ`.
         For a callable it is a function a standard-library module defines and
         its own module and qualified name lead back to, or a C function its own
-        module holds under its name (`posix.getcwd`, `_io.open`). A stand-in
-        the guard built for this name is excluded, and so are a mock, a
-        `functools.partial` and a function of the caller's own, whatever names
-        `functools.wraps` copied onto it.
+        module holds under its name (`posix.getcwd`, `_io.open`). Either one
+        carries the name of this slot. Another standard-library function put
+        here (`os.path.realpath = os.path.normpath`) is a stand-in like any
+        other and keeps its place. A stand-in the guard built for this name is
+        excluded, and so are a mock, a `functools.partial` and a function of
+        the caller's own, whatever names `functools.wraps` copied onto it.
         """
         if any(value is stand_in for stand_in in self.built):
             return False
         if self.mapping:
             return type(value) is os._Environ
         function = _guarded_callable(value)
+        if getattr(function, "__name__", None) != self.attribute:
+            return False
         if isinstance(function, BuiltinFunctionType):
             home = function.__self__
             return (
