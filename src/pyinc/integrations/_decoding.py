@@ -49,7 +49,7 @@ import os
 import threading
 import weakref
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -200,7 +200,12 @@ def request_scope(db: Database) -> Iterator[None]:
         request.ended = True
         request.db = None
         request.memo = {}
-        _REQUEST.reset(token)
+        # A scope closed in another context, as when a generator suspended
+        # inside it is finished elsewhere, cannot reset the token there. The
+        # request is already ended, so what the opener's context still holds
+        # answers nothing.
+        with suppress(ValueError):
+            _REQUEST.reset(token)
 
 
 def request_inputs_changed() -> None:

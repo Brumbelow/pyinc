@@ -545,3 +545,42 @@ def test_decode_memo_hands_racing_threads_the_decode_it_stored() -> None:
 
     assert first is second
     assert _decoding.decoded(db, "kind", (payload,), decode) is first
+
+
+def test_a_request_scope_closed_by_another_thread_ends_cleanly() -> None:
+    """A scope left open by a thread that exited can be closed by another.
+
+    The close runs in a context that does not hold the token the scope was
+    opened with, and resetting it there raised `ValueError`. The scope is
+    ended before the reset, so the close now completes.
+    """
+
+    db = Database()
+    calls: list[int] = []
+
+    def compute() -> int:
+        calls.append(1)
+        return len(calls)
+
+    def answers() -> Any:
+        with request_scope(db):
+            yield once_per_request(db, "count", (), compute)
+            yield once_per_request(db, "count", (), compute)
+
+    opened: dict[str, Any] = {}
+
+    def open_and_exit() -> None:
+        generator = answers()
+        opened.update(generator=generator, first=next(generator))
+
+    opener = threading.Thread(target=open_and_exit)
+    opener.start()
+    opener.join()
+    assert opened["first"] == 1
+
+    opened["generator"].close()
+
+    assert _decoding._live_request() is None
+    # No scope is open here, so each call computes.
+    assert once_per_request(db, "count", (), compute) == 2
+    assert once_per_request(db, "count", (), compute) == 3

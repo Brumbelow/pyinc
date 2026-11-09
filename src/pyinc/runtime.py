@@ -9174,7 +9174,15 @@ class Database:
             # list it was handed, so the request drops its own references.
             request.pending_events = []
             request.failures = []
-            self._request.reset(token)
+            # A request can be closed in a context other than the one that
+            # opened it: a generator suspended inside a span and finished by
+            # another thread, or an async generator the event loop finalizes
+            # in another task. The token cannot be reset there. The request
+            # is already marked ended, so the value left behind in the
+            # opener's context joins nothing, and the rest of the close, with
+            # the delivery that follows it, still runs.
+            with suppress(ValueError):
+                self._request.reset(token)
             self._evict_query_nodes_if_needed()
 
     def _live_request(self) -> _RequestScope | None:
