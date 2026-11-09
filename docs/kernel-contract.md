@@ -219,8 +219,11 @@ module namespace is allowed by itself: `sys.modules[name]` and
 `import_module(name)` with no reflective builtin beside them are accepted, and
 neither reaches identity (limitation 5). `pyinc.explain_query_captures(fn)`
 previews how each capture is classified before the first `db.get()`. It judges
-each capture with the fold the kernel gives it, so it accepts and refuses the
-same captures the fingerprint does.
+each capture with the fold a `Database` with the default adapters gives it, so
+it accepts and refuses the same captures that database's fingerprint does. It
+takes no adapters. A captured resource whose `identity()` only a registered
+`ValueAdapter` can freeze is reported as rejected, where a `Database` created
+with that adapter accepts it.
 
 A query may capture a callable the condition 2 guard replaced. A name bound
 once a `Database` exists (`from os import getcwd`, `from os.path import
