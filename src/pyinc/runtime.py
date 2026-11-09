@@ -966,14 +966,19 @@ def _standard_library_name(original: Any) -> tuple[str, str] | None:
     A capture of a guard wrapper is pinned by the callable it replaced, so the
     pin is only as true as that callable's own `__module__` and
     `__qualname__`. They are trusted when the module is part of the standard
-    library and the qualified name, read back through it, reaches `original`
-    itself, as a standard-library type's anchor must. Anything else that held
-    a guarded name when the guard was installed gets None: a mock (no
-    `__qualname__`), a `functools.partial` (neither attribute), or a function
-    of the caller's own. Called before the guard replaces that name, since the
-    guard replaces `posixpath.realpath` in its own module's namespace. A name
-    the guard replaced earlier still leads to the callable it replaced: on
-    3.11 `open` names itself `io.open`, and `io.open` is guarded.
+    library, the qualified name, read back through it, reaches `original`
+    itself, as a standard-library type's anchor must, and that module defines
+    `original`. A Python function is defined by the module whose namespace
+    holds its globals. A C function cannot be given another's names. Anything
+    else that holds a guarded name gets None: a mock (no `__qualname__`), a
+    `functools.partial` (neither attribute), or a function of the caller's
+    own. That includes a fake made with `functools.wraps`, which copies both
+    names from the callable it stands in for, and which the name leads back to
+    because the fake is what the name holds. Called before the guard replaces
+    that name, since the guard replaces `posixpath.realpath` in its own
+    module's namespace. A name the guard replaced earlier still leads to the
+    callable it replaced: on 3.11 `open` names itself `io.open`, and `io.open`
+    is guarded.
     """
     module_name = getattr(original, "__module__", None)
     qualname = getattr(original, "__qualname__", None)
@@ -981,7 +986,8 @@ def _standard_library_name(original: Any) -> tuple[str, str] | None:
         return None
     if module_name.partition(".")[0] not in sys.stdlib_module_names:
         return None
-    current: Any = sys.modules.get(module_name)
+    module = sys.modules.get(module_name)
+    current: Any = module
     for part in qualname.split("."):
         if not isinstance(current, (ModuleType, type)):
             return None
@@ -991,7 +997,14 @@ def _standard_library_name(original: Any) -> tuple[str, str] | None:
         entry = _guarded_name(current)
         if entry is not None:
             current = entry.original
-    return (module_name, qualname) if current is original else None
+    if current is not original:
+        return None
+    if isinstance(original, FunctionType):
+        if module is None or original.__globals__ is not vars(module):
+            return None
+    elif not isinstance(original, BuiltinFunctionType):
+        return None
+    return (module_name, qualname)
 
 
 def _name_as_installed(
@@ -1350,11 +1363,12 @@ class _GuardSlot:
         """Whether `value` is this name's standard-library object, unguarded.
 
         For an environment mapping that is the interpreter's own `os._Environ`.
-        For a callable it is a standard-library function its own module and
-        qualified name lead back to, or a C function its own module holds under
-        its name (`posix.getcwd`, `_io.open`). A stand-in the guard built for
-        this name is excluded, and so are a mock, a `functools.partial` and a
-        function of the caller's own.
+        For a callable it is a function a standard-library module defines and
+        its own module and qualified name lead back to, or a C function its own
+        module holds under its name (`posix.getcwd`, `_io.open`). A stand-in
+        the guard built for this name is excluded, and so are a mock, a
+        `functools.partial` and a function of the caller's own, whatever names
+        `functools.wraps` copied onto it.
         """
         if any(value is stand_in for stand_in in self.built):
             return False

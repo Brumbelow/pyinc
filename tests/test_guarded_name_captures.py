@@ -1153,3 +1153,152 @@ def test_a_guarded_name_put_back_after_the_first_database_is_guarded_again(
     assert out["capture"] is True
     assert out["fake"] == ["answered", True]
     assert out["original_again"] == "refused"
+
+
+# A fake made with `functools.wraps` carries the module and qualified name of
+# the callable it stands in for, so the name it is put in leads back to it.
+_A_WRAPS_FAKE_IN_A_GUARDED_NAME = r'''
+import functools
+import json
+import os
+import sys
+
+root = sys.argv[1]
+real_getenv = os.getenv
+real_realpath = os.path.realpath
+real_listdir = os.listdir
+
+
+@functools.wraps(real_getenv)
+def canned_getenv(key, default=None):
+    return "canned"
+
+
+@functools.wraps(real_realpath)
+def canned_realpath(filename, **kwargs):
+    return "/canned"
+
+
+# Held when the first Database is created.
+os.getenv = canned_getenv
+os.path.realpath = canned_realpath
+sys.path.insert(0, root)
+
+from pyinc import Database, UnsupportedValueError, UntrackedReadError
+from pyinc import explain_query_captures, query
+from pyinc import runtime
+
+Database()
+out = {}
+out["names_copied"] = [
+    [canned_getenv.__module__, canned_getenv.__qualname__] == ["os", "getenv"],
+    canned_realpath.__qualname__ == "realpath",
+    os.path.realpath.__module__ == real_realpath.__module__,
+]
+out["recorded"] = [
+    runtime._guarded_name(os.getenv) is not None,
+    runtime._guarded_name(os.path.realpath) is not None,
+]
+out["recorded_untouched"] = runtime._guarded_name(os.path.abspath) is not None
+
+with open(os.path.join(root, "captures_wraps_fake.py"), "w", encoding="utf-8") as handle:
+    handle.write(
+        "from os import getenv\n"
+        "from os.path import realpath\n"
+        "from pyinc import query\n"
+        "@query(key='wraps-fake:getenv')\n"
+        "def reads_getenv(db):\n    return getenv is not None\n"
+        "@query(key='wraps-fake:realpath')\n"
+        "def reads_realpath(db):\n    return realpath is not None\n"
+    )
+import captures_wraps_fake
+
+db = Database()
+out["capture"] = []
+out["preview"] = []
+for captured in (captures_wraps_fake.reads_getenv, captures_wraps_fake.reads_realpath):
+    try:
+        db.get(captured)
+        out["capture"].append("fingerprinted")
+    except UnsupportedValueError:
+        out["capture"].append("refused")
+    out["preview"].extend(
+        [capture.name, capture.kind, capture.accepted]
+        for capture in explain_query_captures(captured)
+    )
+
+
+# Set after the first Database. The guard's wrapper carries the names it is
+# installed under, and `functools.wraps` copies those onto each fake.
+@functools.wraps(os.listdir)
+def canned_listdir(path="."):
+    return ["canned"]
+
+
+@functools.wraps(os.getcwd)
+def canned_getcwd():
+    return "/canned"
+
+
+out["names_copied"].append(
+    [canned_listdir.__module__, canned_listdir.__qualname__] == ["os", "listdir"]
+)
+os.listdir = canned_listdir
+os.getcwd = canned_getcwd
+
+
+@query(key="wraps-fake:calls")
+def calls(db, label):
+    try:
+        return ",".join(os.listdir(root)) + " " + os.getcwd()
+    except UntrackedReadError:
+        return "refused"
+
+
+out["fake"] = [
+    Database().get(calls, "fake"),
+    os.listdir is canned_listdir,
+    os.getcwd is canned_getcwd,
+]
+os.listdir = real_listdir
+out["original_again"] = Database().get(calls, "original")
+print("JSON " + json.dumps(out))
+'''
+
+
+def test_a_fake_made_with_functools_wraps_is_not_taken_for_the_original(tmp_path: Path) -> None:
+    """A fake that carries a guarded callable's names is treated as any other fake.
+
+    `functools.wraps` copies `__module__` and `__qualname__` onto the fake, and
+    the name the fake is put in leads back to it. The names alone made it pass
+    for the standard-library callable. Held when the first `Database` was
+    created, it was recorded and a capture of its wrapper was pinned as the
+    standard-library callable, where the contract refuses a wrapper around a
+    function of the caller's own. Set afterwards, it was wrapped again at the
+    next query execution, so a query that called it got `UntrackedReadError`
+    where 4.0 answered. A function now counts as the standard library's only
+    when that module defines it. The original put back is still wrapped
+    again. A fresh process is the only place no `Database` exists yet.
+    """
+    script = tmp_path / "wraps_fake_in_a_guarded_name.py"
+    script.write_text(_A_WRAPS_FAKE_IN_A_GUARDED_NAME, encoding="utf-8")
+    src = str(Path(pyinc_runtime.__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": src, "PYTHONDONTWRITEBYTECODE": "1"}
+    proc = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    line = [ln for ln in proc.stdout.splitlines() if ln.startswith("JSON ")][-1]
+    out = json.loads(line[len("JSON ") :])
+    # The premise: each fake does carry the names of what it stands in for.
+    assert out["names_copied"] == [True, True, True, True]
+    assert out["recorded"] == [False, False]
+    assert out["recorded_untouched"] is True
+    assert out["capture"] == ["refused", "refused"]
+    assert out["preview"] == [["getenv", "rejected", False], ["realpath", "rejected", False]]
+    assert out["fake"] == ["canned /canned", True, True]
+    assert out["original_again"] == "refused"
