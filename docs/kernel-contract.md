@@ -793,10 +793,11 @@ the next `get`. An untracked node forfeits its `eq=`/`cutoff=` policy for
 events, as it does for backdating: a byte-different value its policy would
 call equal still fires.
 
-Events are buffered on the outermost request scope. Inside a `request_span`
-that scope is the span itself, and events are delivered when the outermost
-span closes, cleanly or by raising. Delivery happens after the kernel lock is
-released, so a callback may re-enter the database.
+Events are buffered on the outermost request scope and delivered when it
+closes, cleanly or by raising. A sub-query that stored a new value before its
+caller raised keeps that value, so its observers are told. Inside a
+`request_span` that scope is the span itself. Delivery happens after the
+kernel lock is released, so a callback may re-enter the database.
 
 The callback list is snapshotted when the change commits. A subscription added
 after the change does not receive it. One removed before delivery begins

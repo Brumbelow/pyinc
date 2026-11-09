@@ -2213,7 +2213,7 @@ class Database:
 
         if not isinstance(query, Query):
             raise TypeError("db.get() expects a @query-decorated callable.")
-        with self._state_lock, self._request_scope() as pending:
+        with self._top_level_request() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
             had_record = key in self._records
             try:
@@ -2276,7 +2276,7 @@ class Database:
 
         if not isinstance(query, Query):
             raise TypeError("db.inspect() expects a @query-decorated callable.")
-        with self._state_lock, self._request_scope() as pending:
+        with self._top_level_request() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
             had_record = key in self._records
             try:
@@ -2298,7 +2298,7 @@ class Database:
 
         if not isinstance(query, Query):
             raise TypeError("db.inspect_fresh() expects a @query-decorated callable.")
-        with self._state_lock, self._request_scope() as pending:
+        with self._top_level_request() as pending:
             key, call_snapshot = self._query_key(query, args, kwargs)
             had_record = key in self._records
             try:
@@ -3640,7 +3640,7 @@ class Database:
 
     def read_resource(self, resource: Any, parameter: Any) -> Any:
         self._reject_reentrant_read("db.read_resource()")
-        with self._state_lock, self._request_scope() as pending:
+        with self._top_level_request() as pending:
             key = self._resource_key(resource, parameter)
             outcome = _RefreshOutcome()
             try:
@@ -9119,6 +9119,27 @@ class Database:
 
     def _is_resource_handle(self, value: Any) -> bool:
         return all(callable(getattr(value, name, None)) for name in ("label", "probe", "load"))
+
+    @contextmanager
+    def _top_level_request(self) -> Iterator[list[_PendingObserverEvent] | None]:
+        """Hold the state lock and a request for one top-level call.
+
+        Yields the request's pending observer events, or None when the call
+        joined a request that was already open. A call that returns delivers
+        them itself once it has left this block. When the call raises they are
+        delivered here, after the lock and the request are released. A
+        sub-query that stored a new value before the call failed keeps that
+        value, so its observers are told, as they are when a span fails.
+        Delivery on that path never masks the exception.
+        """
+        pending: list[_PendingObserverEvent] | None = None
+        try:
+            with self._state_lock, self._request_scope() as pending:
+                yield pending
+        except BaseException:
+            with suppress(Exception):
+                self._dispatch_events(pending)
+            raise
 
     @contextmanager
     def _request_scope(
