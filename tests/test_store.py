@@ -7,6 +7,7 @@ import os
 import pickle
 import struct
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from queue import Empty
@@ -294,7 +295,7 @@ def test_in_memory_store_refuses_a_conflicting_put_that_races_the_first() -> Non
     rendezvous = Rendezvous()
     store = InMemoryArtifactStore()
     store._items = _HeldItems(rendezvous)
-    store._locks[os.getpid()] = rendezvous.lock()  # type: ignore[assignment]
+    store._locks._by_pid[os.getpid()] = rendezvous.lock()  # type: ignore[assignment]
     digest = "a" * 64
 
     def put(payload: bytes) -> str:
@@ -366,6 +367,123 @@ def test_in_memory_store_copies_keep_payloads_and_get_their_own_lock(
     with store._process_lock():
         assert duplicate_store._process_lock().acquire(blocking=False)
         duplicate_store._process_lock().release()
+
+
+class _SlottedStore(InMemoryArtifactStore):
+    """Keeps one attribute in a slot, outside the instance dictionary."""
+
+    __slots__ = ("label",)
+
+    def __init__(self, label: str) -> None:
+        super().__init__()
+        self.label = label
+
+
+class _OwnStateStore(InMemoryArtifactStore):
+    """Defines its state over the instance dictionary, as the pickle documentation shows."""
+
+    def __getstate__(self) -> dict[str, object]:
+        return dict(self.__dict__)
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+
+
+class _OwnLockStore(InMemoryArtifactStore):
+    """Serializes its own puts with a lock named `_lock`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+
+    def put(self, digest: str, payload: bytes) -> None:
+        with self._lock:
+            super().put(digest, payload)
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [copy.copy, copy.deepcopy, _pickle_round_trip],
+    ids=["copy", "deepcopy", "pickle"],
+)
+def test_in_memory_store_subclass_keeps_its_slots_across_a_copy(
+    duplicate: Callable[[InMemoryArtifactStore], InMemoryArtifactStore],
+) -> None:
+    """A subclass attribute held in a slot survives a copy and a pickle round trip.
+
+    The store's own `__getstate__` returned the instance dictionary alone, so
+    the slot was dropped and the copy raised `AttributeError` when it was read.
+    """
+
+    store = _SlottedStore("mine")
+    store.put("a" * 64, b"payload")
+
+    duplicate_store = duplicate(store)
+
+    assert isinstance(duplicate_store, _SlottedStore)
+    assert duplicate_store.label == "mine"
+    assert dict(duplicate_store.keys()) == {"a" * 64: b"payload"}
+    duplicate_store.put("b" * 64, b"only in the copy")
+    assert not store.contains("b" * 64)
+
+
+@pytest.mark.parametrize(
+    "duplicate",
+    [copy.copy, copy.deepcopy, _pickle_round_trip],
+    ids=["copy", "deepcopy", "pickle"],
+)
+def test_in_memory_store_subclass_with_its_own_state_methods_copies_after_a_put(
+    duplicate: Callable[[InMemoryArtifactStore], InMemoryArtifactStore],
+) -> None:
+    """A subclass whose own `__getstate__` returns its instance dictionary still copies.
+
+    Once the store had been used, that dictionary held a lock, so `pickle` and
+    `copy.deepcopy` raised "cannot pickle '_thread.lock' object". The lock
+    table now copies and pickles as a new, empty one.
+    """
+
+    store = _OwnStateStore()
+    store.put("a" * 64, b"payload")
+
+    duplicate_store = duplicate(store)
+
+    assert isinstance(duplicate_store, _OwnStateStore)
+    assert duplicate_store.get("a" * 64) == b"payload"
+    duplicate_store.put("b" * 64, b"stored after the copy")
+    assert duplicate_store.get("b" * 64) == b"stored after the copy"
+    with pytest.raises(ValueError, match="collision"):
+        duplicate_store.put("a" * 64, b"different")
+
+
+def test_in_memory_store_subclass_keeps_an_attribute_named_lock_across_a_copy() -> None:
+    """A shallow copy keeps a subclass attribute named `_lock`.
+
+    The store's state methods removed that name, so the copy's own `put`
+    raised `AttributeError`.
+    """
+
+    store = _OwnLockStore()
+    store.put("a" * 64, b"payload")
+
+    duplicate_store = copy.copy(store)
+
+    assert duplicate_store._lock is store._lock
+    duplicate_store.put("b" * 64, b"only in the copy")
+    assert duplicate_store.get("b" * 64) == b"only in the copy"
+    assert not store.contains("b" * 64)
+
+
+def test_in_memory_store_state_written_without_a_lock_table_can_store() -> None:
+    """State that carries no lock table, as 4.0 pickled it, restores to a working store."""
+
+    store = InMemoryArtifactStore.__new__(InMemoryArtifactStore)
+    store.__dict__.update({"_items": {"a" * 64: b"payload"}})
+
+    store.put("b" * 64, b"stored after the restore")
+
+    assert set(store.keys()) == {"a" * 64, "b" * 64}
+    with pytest.raises(ValueError, match="collision"):
+        store.put("a" * 64, b"different")
 
 
 # ---------------------------------------------------------------------------
