@@ -4681,6 +4681,106 @@ def test_hook_survivor_stays_refused_where_a_query_survivor_recovers(mode: str) 
     assert _live_observer_entries(query_db) == 1
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+def test_a_query_survivor_reads_the_query_that_started_it(mode: str) -> None:
+    """A thread that outlives its query reads that query as any other thread does.
+
+    The cycle check compared the requested key with every frame on the stack
+    the thread inherited, completed or not. So a survivor's `db.get()` of the
+    query that started it, of a query that was calling that one, or of anything
+    whose check reaches either, raised `CycleError` for the rest of the
+    thread's life, with nothing executing. Completed frames are skipped now, as
+    the boundary checks already skip them. A cycle that is real is still
+    refused on the survivor, and a cold run that fails there leaves no record
+    behind.
+    """
+    inp = Input[int]("x")
+
+    @query
+    def spawning(db: Database) -> int:
+        if not db.survivor_threads:  # type: ignore[attr-defined]
+            thread = threading.Thread(target=db.survivor_body, daemon=True)  # type: ignore[attr-defined]
+            db.survivor_threads.append(thread)  # type: ignore[attr-defined]
+            thread.start()
+        return inp.read(db) * 2
+
+    @query
+    def caller(db: Database) -> int:
+        return spawning(db) + 1
+
+    @query
+    def dependent(db: Database) -> int:
+        return caller(db) * 100
+
+    @query
+    def cyclic(db: Database) -> int:
+        return cyclic(db)
+
+    @query
+    def spawning_then_failing(db: Database) -> int:
+        if not db.survivor_threads:  # type: ignore[attr-defined]
+            thread = threading.Thread(target=db.survivor_body, daemon=True)  # type: ignore[attr-defined]
+            db.survivor_threads.append(thread)  # type: ignore[attr-defined]
+            thread.start()
+        raise ValueError(f"no value for {inp.read(db)}")
+
+    def run_survivor(db: Database, start: Callable[[], object], reads: Callable[[], object]) -> object:
+        results: list[object] = []
+        errors: list[BaseException] = []
+        gate = threading.Event()
+
+        def survivor_body() -> None:
+            try:
+                gate.wait(10.0)
+                results.append(reads())
+            except BaseException as exc:  # noqa: BLE001 (collected for the main thread)
+                errors.append(exc)
+
+        db.survivor_body = survivor_body  # type: ignore[attr-defined]
+        db.survivor_threads = []  # type: ignore[attr-defined]
+        start()
+        (worker,) = db.survivor_threads  # type: ignore[attr-defined]
+        assert worker.is_alive()  # the survivor outlived what started it
+        gate.set()
+        worker.join(timeout=10.0)
+        assert not worker.is_alive()
+        assert errors == []
+        (result,) = results
+        return result
+
+    db = Database(mode)
+    db.set(inp, 3)
+
+    def reads() -> object:
+        answers: list[object] = [db.get(spawning), db.get(caller), db.get(dependent)]
+        with pytest.raises(CycleError):
+            db.get(cyclic)
+        return answers
+
+    # `caller` and `spawning` are both on the stack the survivor inherits.
+    assert run_survivor(db, lambda: db.get(caller), reads) == [6, 7, 700]
+
+    failing_db = Database(mode)
+    failing_db.set(inp, 3)
+
+    def start_failing() -> None:
+        with pytest.raises(ValueError, match="no value for 3"):
+            failing_db.get(spawning_then_failing)
+
+    def registered() -> tuple[int, int]:
+        return (len(failing_db._call_snapshots()), len(failing_db._query_objects()))
+
+    def read_failing() -> object:
+        with pytest.raises(ValueError, match="no value for 3"):
+            failing_db.get(spawning_then_failing)
+        return registered()
+
+    # The survivor's own failed run of the query that started it is discarded,
+    # as the first failed run was on the thread that made it.
+    assert registered() == (0, 0)
+    assert run_survivor(failing_db, start_failing, read_failing) == (0, 0)
+
+
 def test_unrelated_thread_call_serializes_while_a_query_runs() -> None:
     """A thread the query did not start waits its turn and is served.
 
