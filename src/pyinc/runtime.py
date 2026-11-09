@@ -3679,7 +3679,7 @@ class Database:
         return result
 
     def _ensure_query(self, query: Any, key: NodeKey, call_snapshot: Any) -> None:
-        if any(frame.key == key for frame in self._execution_stack.get()):
+        if self._is_executing(key):
             raise CycleError(f"Cycle detected while evaluating {key.label}.")
         existing = self._records.get(key)
         current_request = self._current_request_id()
@@ -9197,7 +9197,7 @@ class Database:
 
     def _discard_uncommitted_query(self, key: NodeKey) -> None:
         """Remove state created while a cold/warmed evaluation was failing."""
-        if any(frame.key == key for frame in self._execution_stack.get()):
+        if self._is_executing(key):
             # A nested same-key request may have failed with CycleError while
             # the outer evaluation catches it and continues. The outer frame
             # still owns this registration until it succeeds or unwinds.
@@ -9217,6 +9217,16 @@ class Database:
         if request is None:
             return -1
         return request.request_id
+
+    def _is_executing(self, key: NodeKey) -> bool:
+        # Whether an execution of `key` is still running on this stack. A
+        # thread spawned inside a query keeps the stack it inherited for its
+        # whole life, so a frame that has completed says nothing about a cycle.
+        # Counting one made such a thread's later read of the query that
+        # started it, or of a query that was calling it, a cycle for good.
+        return any(
+            frame.key == key and not frame.completed for frame in self._execution_stack.get()
+        )
 
     def _current_frame(self) -> ExecutionFrame | None:
         # The innermost execution still running. On the thread that owns the
