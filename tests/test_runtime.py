@@ -8569,6 +8569,76 @@ def test_request_span_delivers_committed_events_when_the_span_body_raises() -> N
     assert events[0].query_id == doubled.key
 
 
+@pytest.mark.parametrize("in_span", [False, True], ids=["plain", "span"])
+@pytest.mark.parametrize("call", ["get", "inspect", "inspect_fresh"])
+def test_a_top_level_call_that_raises_delivers_the_events_it_committed(
+    call: str, in_span: bool
+) -> None:
+    """A sub-query that stored a new value before its caller raised still notifies.
+
+    A top-level call delivered its events only after it returned. When the
+    caller raised, the event of a sub-query that had already re-executed and
+    kept its new value was dropped, and the next read reused that value in
+    silence. The same call inside a span did deliver. Now both do, and the
+    exception leaves the call unchanged.
+    """
+    number = Input[int]("number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    @query
+    def report(db: Database) -> int:
+        raise LookupError(f"no report for {doubled(db)}")
+
+    db = Database()
+    db.set(number, 3)
+    assert db.get(doubled) == 6
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+    db.set(number, 4)
+
+    with pytest.raises(LookupError, match="no report for 8"):
+        if in_span:
+            with db.request_span():
+                getattr(db, call)(report)
+        else:
+            getattr(db, call)(report)
+
+    assert [(event.query_id, event.decision) for event in events] == [(doubled.key, "executed")]
+    # The value the failed call stored is reused, so nothing more is delivered.
+    assert db.get(doubled) == 8
+    assert db.inspect(doubled).last_decision == "reused"
+    assert len(events) == 1
+
+
+def test_an_observer_that_raises_does_not_mask_a_failing_top_level_call() -> None:
+    """Delivery on the failure path leaves the call's own exception in place."""
+    number = Input[int]("number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    @query
+    def report(db: Database) -> int:
+        raise LookupError(f"no report for {doubled(db)}")
+
+    def failing_observer(event: QueryChangeEvent) -> None:
+        raise RuntimeError("observer failure")
+
+    observer_errors: list[BaseException] = []
+    db = Database(observer_error_hook=observer_errors.append)
+    db.set(number, 3)
+    db.observe(failing_observer, doubled)
+
+    with pytest.raises(LookupError, match="no report for 6"):
+        db.get(report)
+
+    assert [str(error) for error in observer_errors] == ["observer failure"]
+
+
 def test_outer_span_continues_and_delivers_after_an_inner_span_raises() -> None:
     number = Input[int]("number")
 
