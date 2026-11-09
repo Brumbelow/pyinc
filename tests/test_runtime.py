@@ -9044,6 +9044,98 @@ def test_a_thread_given_an_exited_threads_ident_does_not_join_its_request(
     assert joined == (False, False)
 
 
+def test_a_span_closed_by_another_thread_delivers_its_events() -> None:
+    """A span left open by a thread that exited can be closed, and still notifies.
+
+    Only another thread can close such a span, in a context that does not hold
+    the token the request was opened with. Resetting that token raised
+    `ValueError` out of the close, before the span's events were delivered and
+    before the end-of-request eviction. The request is marked ended first, so
+    the reset is not what ends it. The close now completes.
+    """
+    number = Input[int]("number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 3)
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+
+    def answers() -> Iterator[int]:
+        with db.request_span():
+            yield db.get(doubled)  # a cold execution: one event queued on the span
+            yield db.get(doubled)
+
+    opened: dict[str, Any] = {}
+
+    def open_and_exit() -> None:
+        generator = answers()
+        opened.update(generator=generator, first=next(generator))
+
+    opener = threading.Thread(target=open_and_exit)
+    opener.start()
+    opener.join()
+    assert opened["first"] == 6
+    assert events == []
+
+    opened["generator"].close()
+
+    assert [(event.query_id, event.decision) for event in events] == [(doubled.key, "executed")]
+    # The database is left unlocked and with no request open.
+    assert db._live_request() is None
+    db.set(number, 4)
+    assert run_in_threads(lambda: db.get(doubled)) == [8]
+    assert len(events) == 2
+
+
+def test_a_span_closed_in_another_task_delivers_its_events() -> None:
+    """An async generator left early closes its span in another task, on the same thread.
+
+    The event loop finalizes such a generator in a task of its own, whose
+    context is not the one the span was opened in. The close raised
+    `ValueError` into the loop's exception handler and the span's events were
+    lost.
+    """
+    import asyncio
+
+    number = Input[int]("number")
+
+    @query
+    def doubled(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 3)
+    events: list[QueryChangeEvent] = []
+    db.observe(events.append, doubled)
+    loop_errors: list[object] = []
+
+    async def answers() -> Any:
+        with db.request_span():
+            yield db.get(doubled)
+            yield db.get(doubled)
+
+    async def consume() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        async for _ in answers():
+            break
+        # The generator is finalized once it is collected, in a task the loop
+        # schedules for it.
+        gc.collect()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    asyncio.run(consume())
+
+    assert loop_errors == []
+    assert [(event.query_id, event.decision) for event in events] == [(doubled.key, "executed")]
+    assert db._live_request() is None
+
+
 def _held_wrapper() -> FrozenList:
     return cast(FrozenList, freeze([1, 2, 3]))
 

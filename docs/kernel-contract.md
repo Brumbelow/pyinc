@@ -683,7 +683,10 @@ started on a free-threaded 3.14 build does, and as `asyncio.to_thread` does
 everywhere. A context copied while a request was open joins nothing once that
 request has ended. The opener is the thread object itself. Its ident plays no
 part, because a later thread can be given that ident once the opener has
-exited. So a request left open by an exited thread is joined by no one.
+exited. So a request left open by an exited thread is joined by no one. A span
+may be closed from another thread or another task, as when a generator
+suspended inside it is finished elsewhere. The close ends the request and
+delivers its events.
 
 As a result, validation done for one thread's request is never reused by
 another thread's request. The answer is the same whether or not the
