@@ -1105,6 +1105,47 @@ def test_environ_raw_data_mapping_stays_hidden_inside_queries() -> None:
         Database().get(peek)
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "reload_environ"), reason="os.reload_environ() arrived in Python 3.14"
+)
+def test_reload_environ_works_once_a_database_exists() -> None:
+    """`os.reload_environ()` rebuilds the environment behind the guard.
+
+    Python 3.14's `os.reload_environ()` updates, in place, the dictionary
+    behind `os.environ`, which it reaches as `os.environ._data`. The guard
+    hides that attribute, so the call raised `AttributeError` once a
+    `Database` existed, in code outside every query too. The attribute is now
+    served to that one function. It is a write, so a query may call it, and
+    reading the attribute anywhere else is still refused.
+    """
+    name = "PYINC_RELOAD_ENVIRON_PROBE"
+
+    @query(key="environ-reload")
+    def reloads(db: Database) -> str:
+        os.reload_environ()  # type: ignore[attr-defined, unused-ignore]
+        return "reloaded"
+
+    Database()
+    os.putenv(name, "put")
+    try:
+        assert name not in os.environ  # putenv alone leaves the mapping behind
+        os.reload_environ()  # type: ignore[attr-defined, unused-ignore]
+        assert os.environ[name] == "put"
+        if sys.platform != "win32":
+            assert os.environb[os.fsencode(name)] == b"put"
+
+        os.putenv(name, "put again")
+        assert Database().get(reloads) == "reloaded"
+        assert os.environ[name] == "put again"
+
+        with pytest.raises(AttributeError, match="_data"):
+            os.environ._data  # type: ignore[attr-defined]  # noqa: B018
+    finally:
+        os.unsetenv(name)
+        os.reload_environ()  # type: ignore[attr-defined, unused-ignore]
+    assert name not in os.environ
+
+
 class _AdaptedPayload:
     def __init__(self, text: str) -> None:
         self.text = text

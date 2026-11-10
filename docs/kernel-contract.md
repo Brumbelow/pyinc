@@ -156,8 +156,9 @@ While a query runs, the kernel intercepts these calls and raises
 - `os.getcwd`, `os.getcwdb`, and `Path.cwd`
 
 Writes to the environment stay allowed: assignment, `del`, `update` and
-`clear`. `pop`, `popitem` and `setdefault` return what they read, so they are
-refused like other reads.
+`clear`. So does `os.reload_environ()` on 3.14, which rebuilds the mapping
+from the process environment and returns nothing. `pop`, `popitem` and
+`setdefault` return what they read, so they are refused like other reads.
 
 Resolving a path that is not fully qualified reads the working directory too.
 `os.path.realpath` and `os.path.abspath` are wrapped, so they refuse such a
