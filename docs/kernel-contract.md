@@ -209,6 +209,15 @@ constants and explicit `Input`, resource, and query handles are accepted.
 Mutable closure or global data, dynamically scoped local classes, and
 reflective namespace reads are rejected before the first execution.
 
+A capture is whatever the query function names, in its body or in code nested
+in it: a generator expression, a lambda, an inner function, and on 3.11 a
+comprehension. The same holds for every function folded into the query's
+identity. So a helper called only from a generator expression is folded like
+one called in the body. A value the body could not capture directly, such as
+mutable module data or a compiled pattern, is rejected when it is read only
+there. A standard-library function is the exception. Its nested code arrived
+with the interpreter, the build identity pins it, and it is not read.
+
 The reflective rule is a conservative static read of the bytecode of the query
 function and of every callable folded into its identity. `globals()`,
 `locals()`, `vars()`, `eval`, `exec`, and a `__globals__` load are always

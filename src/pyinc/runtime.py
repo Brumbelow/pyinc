@@ -261,6 +261,10 @@ def _build_runtime_build_payload() -> tuple[Any, ...]:
 
 _RUNTIME_BUILD_PAYLOAD = _build_runtime_build_payload()
 
+# Named here because `Database.inspect` shadows the module inside the class
+# body, where a method's annotations are read.
+_ClosureVars = inspect.ClosureVars
+
 
 def _stdlib_directory_prefixes() -> tuple[str, ...]:
     """The directories this interpreter's standard library was installed in.
@@ -5556,7 +5560,7 @@ class Database:
                     (name, observe_value(fn_globals[name]))
                     if name in fn_globals
                     else (name, _UNBOUND_GLOBAL_OBSERVATION)
-                    for name in sorted(set(code.co_names))
+                    for name in sorted(Database._names_code_may_read(code))
                 ),
                 tuple(
                     (name, observe_value(value))
@@ -5834,7 +5838,7 @@ class Database:
             return ("recursive-function", fn.__module__, fn.__qualname__)
         seen_functions.add(fn_id)
         try:
-            closure_vars = inspect.getclosurevars(fn)
+            closure_vars = self._closure_vars(fn)
             return (
                 fn.__module__,
                 fn.__qualname__,
@@ -5960,7 +5964,7 @@ class Database:
             return ("recursive-annotation-evaluator", evaluator.__qualname__)
         active_ids.add(evaluator_id)
         try:
-            closure_vars = inspect.getclosurevars(evaluator)
+            closure_vars = self._closure_vars(evaluator)
             return (
                 "annotation-evaluator-v3",
                 evaluator.__module__,
@@ -7491,6 +7495,81 @@ class Database:
         nested = tuple(item for item in code.co_consts if isinstance(item, CodeType))
         return (code, *(child for item in nested for child in Database._walk_code_objects(item)))
 
+    @staticmethod
+    def _names_code_may_read(code: CodeType) -> builtins.set[str]:
+        """Every name `code`, or code nested in it, may read as a global.
+
+        The memo observes the binding of each one, so a global rebound, or
+        bound for the first time, moves the observation whether the body
+        names it or a generator expression, a lambda or an inner function
+        inside the body does. Attribute names are among them. Observing a
+        name the code never reads as a global costs one lookup and can only
+        make the memo check again.
+        """
+        names = builtins.set(code.co_names)
+        for item in code.co_consts:
+            if isinstance(item, CodeType):
+                names |= Database._names_code_may_read(item)
+        return names
+
+    @staticmethod
+    def _is_runtime_pinned_function(fn: FunctionType) -> bool:
+        """True for a function defined by a module the runtime build pins.
+
+        Such a function arrived with the interpreter, nested code and all, and
+        the build identity every fingerprint folds already names it. So its
+        nested code is left unread, and a standard-library function folds as
+        it always has. Reading it would refuse captures that are in everyday
+        use: `dataclasses.fields` reads a sentinel object inside a generator
+        expression, and the `__getstate__` of every slotted frozen dataclass
+        calls it.
+        """
+        module = sys.modules.get(fn.__module__) if isinstance(fn.__module__, str) else None
+        if module is None or vars(module) is not fn.__globals__:
+            return False
+        specification = getattr(module, "__spec__", None)
+        return specification is not None and Database._is_runtime_pinned_module(
+            module, specification
+        )
+
+    @staticmethod
+    def _closure_vars(fn: FunctionType) -> _ClosureVars:
+        """`inspect.getclosurevars(fn)`, with the globals its nested code reads.
+
+        `inspect.getclosurevars` reads the function's own code object. A
+        generator expression, a lambda, an inner function, and on 3.11 a
+        comprehension, each compile to a code object of their own, held among
+        the function's constants. A global named only there (a helper, a
+        module, module data) is a capture like any other. It is folded or
+        refused as one the body names itself. Left out, an edit to such a
+        helper moved no identity, and module data the body could not read
+        directly was accepted. The enclosing function's cells already cover
+        every nonlocal a nested scope reads. A function the runtime build
+        pins is returned as `inspect` reads it.
+        """
+        closure_vars = inspect.getclosurevars(fn)
+        nested = Database._walk_code_objects(fn.__code__)[1:]
+        if not nested or Database._is_runtime_pinned_function(fn):
+            return closure_vars
+        global_ns = fn.__globals__
+        builtin_ns = global_ns.get("__builtins__", builtins.__dict__)
+        if isinstance(builtin_ns, ModuleType):
+            builtin_ns = vars(builtin_ns)
+        found = dict(closure_vars.globals)
+        unbound = builtins.set(closure_vars.unbound)
+        for code in nested:
+            for instruction in dis.get_instructions(code):
+                if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"}:
+                    continue
+                name = instruction.argval
+                if not isinstance(name, str) or name in found:
+                    continue
+                if name in global_ns:
+                    found[name] = global_ns[name]
+                elif name not in builtin_ns:
+                    unbound.add(name)
+        return _ClosureVars(closure_vars.nonlocals, found, closure_vars.builtins, unbound)
+
     def _collect_pinned_captures(
         self, fn: FunctionType
     ) -> tuple[builtins.set[str], builtins.set[str]]:
@@ -7536,7 +7615,7 @@ class Database:
             if fn_id in seen_functions or _guarded_name(target) is not None:
                 return
             seen_functions.add(fn_id)
-            closure_vars = inspect.getclosurevars(target)
+            closure_vars = self._closure_vars(target)
             values: list[Any] = list(target.__defaults__ or ())
             values.extend((target.__kwdefaults__ or {}).values())
             values.extend(vars(target).values())
@@ -7994,7 +8073,7 @@ class Database:
         function_id = id(function)
         seen_functions.add(function_id)
         try:
-            closure_vars = inspect.getclosurevars(function)
+            closure_vars = self._closure_vars(function)
             return (
                 "source-pinned-function-v3",
                 function.__module__,

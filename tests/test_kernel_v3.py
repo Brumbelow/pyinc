@@ -39,6 +39,7 @@ from pyinc import (
     Query,
     Resource,
     UnsupportedValueError,
+    explain_query_captures,
     freeze,
     query,
 )
@@ -4033,6 +4034,179 @@ def test_slotted_instance_state_change_matches_fresh(mode: str) -> None:
         _assert_warm_matches_fresh(db, mode, boxed, 30)
     finally:
         object.__setattr__(_observed_slotted_box, "factor", original)
+
+
+_NESTED_CAPTURE_MODULE = '''\
+from dataclasses import dataclass, fields
+
+from pyinc import query
+
+LIMITS = {"a": 1, "b": 2}
+
+
+def scale(value):
+    return value * 2
+
+
+@dataclass(frozen=True, slots=True)
+class Box:
+    factor: int
+
+
+BOX = Box(2)
+
+
+@query
+def helper_in_body(db):
+    return (scale(0), scale(1), scale(2))
+
+
+@query
+def helper_in_generator(db):
+    return tuple(scale(value) for value in range(3))
+
+
+@query
+def helper_in_lambda(db):
+    return tuple(map(lambda value: scale(value), range(3)))
+
+
+@query
+def helper_in_inner_function(db):
+    def apply(value):
+        return scale(value)
+
+    return (apply(0), apply(1), apply(2))
+
+
+@query
+def helper_in_comprehension(db):
+    return tuple([scale(value) for value in range(3)])
+
+
+@query
+def data_in_body(db):
+    return LIMITS["a"] + LIMITS["b"]
+
+
+@query
+def data_in_generator(db):
+    return sum(LIMITS[name] for name in ("a", "b"))
+
+
+@query
+def data_in_lambda(db):
+    return sum(map(lambda name: LIMITS[name], ("a", "b")))
+
+
+@query
+def data_in_inner_function(db):
+    def limit(name):
+        return LIMITS[name]
+
+    return limit("a") + limit("b")
+
+
+@query
+def standard_library_helper(db):
+    return (len(fields(BOX)), BOX.factor)
+'''
+
+
+def _import_nested_capture_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Import a real module whose queries name their captures in nested code."""
+
+    module_name = f"pyinc_nested_capture_{len(sys.modules)}_{os.getpid()}"
+    (tmp_path / f"{module_name}.py").write_text(_NESTED_CAPTURE_MODULE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    module = importlib.import_module(module_name)
+    # Registered with monkeypatch, so the module leaves `sys.modules` with the test.
+    monkeypatch.setitem(sys.modules, module_name, module)
+    return module
+
+
+def _tripled(value: int) -> int:
+    return value * 3
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "helper_in_body",
+        "helper_in_generator",
+        "helper_in_lambda",
+        "helper_in_inner_function",
+        "helper_in_comprehension",
+    ],
+)
+def test_a_helper_named_only_in_nested_code_is_part_of_query_identity(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A helper called from a generator expression is a capture like one called in the body.
+
+    The capture set was read off the query function's own code object. A
+    generator expression, a lambda and an inner function each compile to a
+    code object of their own, as a comprehension does on 3.11, and a global
+    named only there was left out. Rebinding such a helper moved no identity,
+    so a warm database went on answering with the old one where a fresh
+    database used the new one. The body spelling is the control.
+    """
+
+    module = _import_nested_capture_module(tmp_path, monkeypatch)
+    captured = getattr(module, name)
+    db = Database()
+    assert db.get(captured) == (0, 2, 4)
+    before = db._query_fingerprint(captured)
+    assert "scale" in {info.name for info in explain_query_captures(captured) if info.accepted}
+
+    monkeypatch.setattr(module, "scale", _tripled)
+
+    assert db._query_fingerprint(captured) != before
+    assert db.get(captured) == (0, 3, 6)
+    assert db.get(captured) == Database().get(captured)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["data_in_body", "data_in_generator", "data_in_lambda", "data_in_inner_function"],
+)
+def test_module_data_read_only_in_nested_code_is_refused_as_in_the_body(
+    name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutable module data is refused wherever the query reads it.
+
+    A query that read a module-level dict in its body was refused before its
+    first execution. The same read inside a generator expression, a lambda or
+    an inner function was accepted, and a later write to the dict left a warm
+    database on its old answer. The preview reports the capture the same way.
+    """
+
+    module = _import_nested_capture_module(tmp_path, monkeypatch)
+    captured = getattr(module, name)
+
+    with pytest.raises(UnsupportedValueError, match="'LIMITS' of type dict"):
+        Database().get(captured)
+
+    preview = {info.name: info.accepted for info in explain_query_captures(captured)}
+    assert preview["LIMITS"] is False
+
+
+def test_a_standard_library_function_folds_without_its_nested_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A function the interpreter shipped is folded as it was, nested code unread.
+
+    `dataclasses.fields` reads a sentinel object inside a generator expression,
+    and the `__getstate__` of every slotted frozen dataclass calls it. Reading
+    the nested code of standard-library functions would refuse both captures
+    below. The runtime build identity already pins that code.
+    """
+
+    module = _import_nested_capture_module(tmp_path, monkeypatch)
+
+    assert Database().get(module.standard_library_helper) == (1, 2)
+
 
 
 @pytest.mark.parametrize("mode", ["strict", "checked", "fast"])

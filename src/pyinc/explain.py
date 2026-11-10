@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect as _inspect
 from dataclasses import dataclass
 from types import BuiltinFunctionType, FunctionType, MethodType, ModuleType
 from typing import Any, cast
@@ -269,7 +268,9 @@ def explain_query_captures(fn_or_query: Any) -> tuple[CaptureInfo, ...]:
     for default_name, value in sorted((target.__kwdefaults__ or {}).items()):
         results.append(_classify_capture(f"kwdefault[{default_name}]", value, "kwdefault", owner=target))
 
-    closure_vars = _inspect.getclosurevars(target)
+    from .runtime import Database
+
+    closure_vars = Database._closure_vars(target)
     for capture_name, value in sorted(closure_vars.nonlocals.items()):
         results.append(_classify_capture(capture_name, value, "closure", owner=target))
     for capture_name, value in sorted(closure_vars.globals.items()):

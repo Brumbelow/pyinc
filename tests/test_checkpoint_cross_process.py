@@ -1095,3 +1095,146 @@ def test_cross_process_module_capture_cycle_reexecutes_an_edited_leaf(tmp_path: 
     assert loaded["result"] == loaded["fresh"]
     assert loaded["recompute"] == "executed"
     assert loaded["executions"] >= 1
+
+
+NESTED_CODE_FIXTURE_SCRIPT = '''\
+"""Cross-process fixture: queries that name a helper only in nested code."""
+
+import json
+import sys
+from pathlib import Path
+
+from pyinc import Database, FileSystemArtifactStore
+
+import nested_code_queries
+
+store_dir = sys.argv[1]
+phase = sys.argv[2]
+
+NAMES = (
+    "in_body",
+    "in_generator",
+    "in_lambda",
+    "in_inner_function",
+    "in_comprehension",
+    "module_attribute_in_generator",
+    "child_query_in_generator",
+)
+
+
+def main():
+    store = FileSystemArtifactStore(store_dir)
+    queries = [getattr(nested_code_queries, name) for name in NAMES]
+    db = Database(store=store)
+    if phase == "save":
+        results = [db.get(query) for query in queries]
+        json.dump({"results": results, "key": db.save_checkpoint()}, sys.stdout)
+        return
+    db.load_checkpoint((Path(store_dir).parent / "nested_code.key").read_text())
+    results = [db.get(query) for query in queries]
+    recomputes = [db.inspect(query).last_recompute for query in queries]
+    fresh = Database()
+    json.dump(
+        {
+            "results": results,
+            "recomputes": recomputes,
+            "fresh": [fresh.get(query) for query in queries],
+        },
+        sys.stdout,
+    )
+
+
+main()
+'''
+
+NESTED_CODE_QUERIES_SOURCE = """\
+import nested_code_helpers
+from nested_code_helpers import helper
+
+from pyinc import query
+
+
+@query
+def in_body(db):
+    return helper(0) + helper(1) + helper(2)
+
+
+@query
+def in_generator(db):
+    return sum(helper(value) for value in range(3))
+
+
+@query
+def in_lambda(db):
+    return sum(map(lambda value: helper(value), range(3)))
+
+
+@query
+def in_inner_function(db):
+    def apply(value):
+        return helper(value)
+
+    return apply(0) + apply(1) + apply(2)
+
+
+@query
+def in_comprehension(db):
+    return sum([helper(value) for value in range(3)])
+
+
+@query
+def module_attribute_in_generator(db):
+    return sum(nested_code_helpers.helper(value) for value in range(3))
+
+
+@query
+def child(db, value):
+    return helper(value)
+
+
+@query
+def child_query_in_generator(db):
+    return sum(child(db, value) for value in range(3))
+"""
+
+NESTED_CODE_HELPER_V1 = "def helper(value):\n    return value * 2\n"
+NESTED_CODE_HELPER_V2 = "def helper(value):\n    return value * 3\n"
+
+
+def test_a_helper_named_only_in_nested_code_reexecutes_across_processes(tmp_path: Path) -> None:
+    """An edit to a helper misses the checkpoint wherever the query names the helper.
+
+    A helper called from a generator expression, a lambda or an inner function
+    was outside the query's identity, as was one called from a comprehension
+    on 3.11. After the helper's file was edited, a second process loaded the
+    checkpoint and answered with the old value without executing, where a
+    fresh database computed the new one. The body spelling is the control. A
+    sub-query called only from a generator expression was left out as well. It
+    counted as unpinned, so its caller never warmed. It is pinned now, and the
+    caller is served while nothing has changed.
+    """
+    script = tmp_path / "nested_code_fixture.py"
+    script.write_text(NESTED_CODE_FIXTURE_SCRIPT, encoding="utf-8")
+    (tmp_path / "nested_code_queries.py").write_text(NESTED_CODE_QUERIES_SOURCE, encoding="utf-8")
+    helper = tmp_path / "nested_code_helpers.py"
+    helper.write_text(NESTED_CODE_HELPER_V1, encoding="utf-8")
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    env = _child_env(str(tmp_path), seed=None)
+
+    saved = _run([sys.executable, str(script), str(store_dir), "save"], env)
+    assert saved["results"] == [6] * 7
+    (tmp_path / "nested_code.key").write_text(saved["key"])
+
+    # With the helper untouched every query is served, so a miss below comes
+    # from the edit.
+    unchanged = _run([sys.executable, str(script), str(store_dir), "load"], env)
+    assert unchanged["results"] == [6] * 7
+    assert unchanged["recomputes"] == ["reused"] * 7
+
+    helper.write_text(NESTED_CODE_HELPER_V2, encoding="utf-8")
+
+    loaded = _run([sys.executable, str(script), str(store_dir), "load"], env)
+    assert loaded["fresh"] == [9] * 7
+    assert loaded["results"] == loaded["fresh"]
+    assert loaded["recomputes"] == ["executed"] * 7
