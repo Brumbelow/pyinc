@@ -134,12 +134,18 @@ def _work(
 # execution because the calc and codegen source reads answer with the text
 # they compared. The read re-executes, and the parse instances above it
 # backdate.
+#
+# The synthetic checkpoint row was measured again when a global named in
+# nested code became a capture. The aggregate calls its branches from a
+# generator expression. They used to count as unpinned, so the aggregate
+# re-executed on every restore and reused its six branches. It is pinned now
+# and restores as one reuse with no execution.
 PYINC_WORK_EXPECTATIONS: dict[tuple[str, str], WorkExpectation] = {
     ("synthetic", "cold"): _work(7, 0, 0, 0, 14, 7, 18, 18),
     ("synthetic", "unchanged"): _work(0, 7, 0, 0, 14, 0, 18, 0),
     ("synthetic", "localized_semantic_edit"): _work(2, 11, 0, 0, 14, 0, 18, 0),
     ("synthetic", "high_fanout_shared_edit"): _work(7, 1, 0, 0, 14, 0, 18, 0),
-    ("synthetic", "checkpoint_restore"): _work(1, 6, 0, 0, 14, 7, 18, 18),
+    ("synthetic", "checkpoint_restore"): _work(0, 1, 0, 0, 14, 7, 18, 18),
     ("calc", "cold"): _work(15, 23, 0, 2, 17, 17, 22, 22),
     ("calc", "unchanged"): _work(0, 38, 0, 0, 17, 0, 22, 0),
     ("calc", "unreferenced_file_edit"): _work(0, 38, 0, 0, 17, 0, 22, 0),
