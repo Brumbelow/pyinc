@@ -292,6 +292,13 @@ dependents at results computed from the earlier representative. So
 from-scratch consistency then holds *modulo the declared equivalence*, and
 exact values can differ.
 
+An input works the same way. A `db.set` or `db.set_many` whose value the
+input's policy reports unchanged still stores that value, so `read_input`
+returns the new one. The revision does not move, and no dependent runs again
+on its account. Each keeps the result it computed from the earlier value until
+something else makes it run, and then it reads the new one. To have every
+dependent see every update, declare the input without a policy.
+
 ## Mode-Specific Enforcement
 
 | Mechanism | `strict` | `checked` | `fast` |
