@@ -1559,6 +1559,22 @@ def _guard_again(slot: _GuardSlot) -> None:
         slot.install(stand_in)
 
 
+def _read_by_reload_environ() -> bool:
+    """Whether the standard library's `os.reload_environ` is reading `_data`.
+
+    Python 3.14 added `os.reload_environ()`. It rebuilds, in place, the
+    dictionary behind `os.environ` and `os.environb` from the process
+    environment, and it reaches that dictionary through the `_data` attribute
+    the guard hides from everything else. It hands its caller nothing it read,
+    so it is a write, like `clear` and `update`. Without this it raised
+    `AttributeError` once a `Database` existed, inside a query or not.
+    """
+    code = getattr(getattr(os, "reload_environ", None), "__code__", None)
+    # Frame 0 is this function and frame 1 is `__getattr__`. Frame 2 is the
+    # code that read the attribute.
+    return code is not None and sys._getframe(2).f_code is code
+
+
 class _GuardedEnviron(MutableMapping[AnyStr, AnyStr]):
     """`os.environ`, or on POSIX `os.environb`, with every read checked."""
 
@@ -1656,6 +1672,8 @@ class _GuardedEnviron(MutableMapping[AnyStr, AnyStr]):
         # unchecked read path around the guard.
         if name in ("encodekey", "decodekey", "encodevalue", "decodevalue"):
             return getattr(self._wrapped, name)
+        if name == "_data" and _read_by_reload_environ():
+            return self._wrapped._data  # type: ignore[attr-defined]
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
 
