@@ -12,8 +12,8 @@ behavior may change in any release, including a minor one.
 
 | Version | Supported |
 |---|---|
-| 4.0.x | Yes |
-| < 4.0 | No |
+| 5.0.x | Yes |
+| < 5.0 | No |
 
 ## Reporting a vulnerability
 
