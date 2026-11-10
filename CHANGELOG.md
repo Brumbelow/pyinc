@@ -6,37 +6,61 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-11-10
+
+### Highlights
+
+- A query can no longer read the working directory or the byte environment
+  untracked. Both were named gaps in the kernel contract.
+- The free-threaded CPython 3.14t build is tested on Linux, macOS and Windows
+  with the GIL disabled.
+- A request belongs to the thread that opened it and ends when its scope does.
+- The decode memo, the in-memory store, the watcher and the language server
+  hold up under concurrent threads.
+- A helper or module global named only inside a generator expression, a lambda
+  or an inner function is part of query identity.
+- A query may capture by name any callable the ambient-read guard replaces.
+- Saving a module file under a running database no longer trips the memo guard.
+
 ### Breaking
 
-- Checkpoint manifest: v9. Upgrade: fresh evaluation and a new checkpoint.
-- Integration change declarations: the `request_scope` opening thread.
 - `os.getcwd`, `os.getcwdb` and `Path.cwd` inside a query body raise
-  `UntrackedReadError`, and on POSIX so do reads of `os.getenvb` and
-  `os.environb`. Both were named gaps in the kernel contract. A query that read
-  the working directory or the byte view of the environment recorded no edge, so
-  it was reused after either moved. Resolving a path that is not fully qualified
-  reads the working directory, so it is refused too, on every platform and
-  version. That covers `os.path.realpath` and `os.path.abspath`, which are
-  wrapped to make this hold, and `Path.resolve`, `os.path.relpath` and
-  `Path.absolute`, which are built on them. Windows' `abspath` reads the
-  directory in C, through `nt._getfullpathname`. Without its wrapper, `abspath`,
-  `relpath` and, from 3.12, `Path.absolute` of a drive-relative path (`C:data`)
-  would answer there. On Windows, a rooted path with no drive (`\data`) and a
-  drive-relative path count as not fully qualified. Fully qualified paths
-  resolve on every platform as before, and environment writes stay allowed.
-  Inside a query body, other code that reaches the working directory through
-  these names is refused as well. That includes the first import of a module
-  that reads it at import time (`multiprocessing`), `contextlib.chdir`, and
-  `inspect`'s frame helpers on a frame whose file name is not fully qualified
-  (`python -m`, `exec`'d or generated code).
+  `UntrackedReadError`. On POSIX so do reads of `os.getenvb` and `os.environb`.
+  A query that read one of them recorded no edge, so it was reused after the
+  value moved.
+- Resolving a path that is not fully qualified reads the working directory, so
+  a query body is refused that too: `os.path.realpath`, `os.path.abspath`,
+  `os.path.relpath`, `Path.resolve` and `Path.absolute`. On Windows a rooted
+  path with no drive (`\data`) and a drive-relative one (`C:data`) count as not
+  fully qualified. Fully qualified paths resolve as before, and environment
+  writes stay allowed.
+- Other code that reaches the working directory through these names inside a
+  query body is refused as well: the first import of a module that reads it at
+  import time (`multiprocessing`), `contextlib.chdir`, and `inspect`'s frame
+  helpers on a frame whose file name is not fully qualified (`python -m`,
+  `exec`'d or generated code).
 - `deep_module_resolution_analysis` and `resolve_module_path` skip a relative
-  `sys.path` entry, as they already skipped the empty one. On Windows they also
-  skip a rooted entry with no drive. They used to resolve such an entry against
-  the working directory.
-- `InMemoryArtifactStore.keys()` returns a read-only snapshot taken at the call,
-  so a mapping held from an earlier call leaves out later puts. It used to
-  return a live read-only view, which raised `RuntimeError` when iterated while
-  another thread stored.
+  `sys.path` entry, and on Windows a rooted entry with no drive. They used to
+  resolve such an entry against the working directory.
+- `InMemoryArtifactStore.keys()` returns a read-only snapshot taken at the
+  call. It used to return a live view, which raised `RuntimeError` when
+  iterated while another thread stored. `copy.copy` of a store holds its own
+  items, where it used to share the original's.
+- A global that a query, or a function folded into its identity, names only
+  inside a generator expression, a lambda or an inner function is a capture
+  like one named in the body. On 3.11 that covers a comprehension too. A
+  helper called only there used to be outside query identity, so an edit to it
+  or a rebinding left a warm database, and a checkpoint loaded in a new
+  process, on the old answer. A value the body could not capture directly,
+  such as mutable module data or a compiled pattern, used to be accepted when
+  it was read only there. It is now refused with `UnsupportedValueError`, as a
+  direct read is. Identities of queries over such code move. Standard-library
+  functions fold as before.
+- The checkpoint manifest is v9. A v8 or earlier manifest raises
+  `CheckpointVersionError`.
+- `pyinc.integrations.request_inputs_changed()` acts on a `request_scope` only
+  from the thread that opened it. From another thread, a copied context
+  included, the opener's memo and `request_span` are kept.
 
 | Symbol or behaviour | Before | After | What to do |
 |---|---|---|---|
@@ -45,196 +69,129 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 | First import of `multiprocessing` or a process pool, `contextlib.chdir` in a query body; `inspect.stack()` there when a frame's file name is not fully qualified | answered | `UntrackedReadError` | import at module scope; keep directory changes and frame inspection outside queries |
 | Relative (or, on Windows, rooted) `sys.path` entry in deep module resolution | resolved against the working directory | ignored | put a fully qualified path on `sys.path` |
 | `InMemoryArtifactStore.keys()` | live read-only view | read-only snapshot at call time | call `keys()` again after puts |
+| `copy.copy(store)` of an `InMemoryArtifactStore` | shared the original's items | holds its own items | pass the store itself where one set of items is wanted |
 | Checkpoint saved by 4.0 (v8) | loaded | `CheckpointVersionError` | evaluate queries and save a v9 checkpoint |
 | `request_inputs_changed()` from a copied `request_scope` context on another thread | refreshed the opener memo and span | opener memo and span retained | declare on the opening thread |
+| Mutable module data or a compiled pattern read only inside a generator expression, a lambda or an inner function of a query | accepted, and a change to it went unseen | `UnsupportedValueError` | read it through an `Input` or a `Resource`, or use an immutable value |
 
 ### Fixed
 
 - Saving a module file while a database runs re-fingerprints the queries that
   fold it. The memo guard used to refuse one of them with "Resource ... changed
-  its own state between two reads". A resource that keeps the default
-  `identity()` folds its class into its configuration digest, and with it the
-  bytes of the module that defines the class. One fingerprint read such a file
-  more than once, and a request kept a digest across its fingerprints. So a
-  save could land between two reads, and the guard blamed the difference on
-  the resource. Each query fingerprint now reads each module file once, and
-  the guard reads a kept digest again before it judges the resource.
-- A thread that carries a `request_span`'s context stays out of the span's
-  request. Every thread started on a free-threaded 3.14 build copies its
-  starter's context, as `asyncio.to_thread` and `Thread(context=...)` do on any
-  build. Such a thread used to answer from the validation done for the span,
-  even after the span had closed and the world had moved, so it disagreed with a
-  fresh `Database`. It also queued its observer events on a list already
-  delivered. A request now belongs to the thread that opened it and ends when
-  its scope does. `pyinc.integrations.request_scope` follows the same rule for
-  its `once_per_request` memo. The thread is recognised by a token that dies
-  with it, because a later thread can be given its ident once it exits. On every
-  build, a thread that a query body starts and that outlives the query also
-  stays out of the query's ended request.
+  its own state between two reads", because one fingerprint read the file more
+  than once and a save could land between the reads. Each query fingerprint
+  now reads each module file once, and the guard reads a kept digest again
+  before it judges the resource.
+- A thread that carries a copy of a `request_span`'s context stays out of the
+  span's request. Every thread started on a free-threaded build carries one, as
+  do `asyncio.to_thread` and `Thread(context=...)` on any build. Such a thread
+  used to answer from the span's validation after the span had closed and the
+  world had moved. `pyinc.integrations.request_scope` follows the same rule for
+  its `once_per_request` memo, and releases its `Database` and the memo when it
+  ends. A thread that a query body starts and that outlives the query stays out
+  of the query's ended request.
+- A thread that outlives the query that started it can read that query. Its
+  `db.get()` of the query, of a query that was calling it, or of anything whose
+  check reaches either, used to raise `CycleError` for the rest of the thread's
+  life.
+- A top-level `get`, `inspect` or `inspect_fresh` that raises still delivers
+  the observer events of the sub-queries that stored new values before it
+  failed. They used to be dropped, and the next read reused the value
+  silently. The same call inside a `request_span` already delivered.
+- A `request_span` or a `pyinc.integrations.request_scope` can be closed from a
+  thread or task that did not open it, as when a generator suspended inside it
+  is finished elsewhere. The close used to raise `ValueError` and drop the
+  span's events.
+- A thread started inside a query body no longer keeps the `Database` alive
+  once the query has returned. Its `Thread` object holds the context it was
+  started in, and that context named the database by strong reference. A pool
+  worker first started inside a query kept the database alive, with its
+  records and snapshots, for as long as the pool lived.
 - `WorkspaceSession.close()` waits for a watcher thread that is still finishing
-  before it removes the mirror. A `PollingWorkspaceWatcher` thread used to drop
-  its own reference as it wound down. A `stop()` in that window found nothing to
-  join and returned early. `close()` then removed the mirror under a live
-  thread, in about one close in ten on a free-threaded build. The thread now
-  keeps its reference until it exits, and `start()` refuses while the previous
-  thread is alive. This also fixes a restart that raced the old thread's exit
-  and left the watcher out of the session, so `close()` left it running. A
-  stopped watcher can be started again. A callback that runs past `stop()`'s
-  five-second join still outlives `close()`, which prints a warning.
-- `pyinc.integrations.request_scope` releases its `Database` and every value it
-  memoized when it ends. A context copied while the scope was open holds its
-  request for as long as the context lives. Every thread started on a
-  free-threaded 3.14 build copies one, including the workers of a
-  `ThreadPoolExecutor` and of asyncio's default executor. The database and the
-  memo used to stay alive as long as such a thread or its pool, even after
-  `shutdown()`. The kernel's own request releases its observer events and
-  failure keys when it ends, and still delivers the events.
-- A query that captures `os.getcwd` or `os.getcwdb` by name once a `Database`
-  exists (`from os import getcwd`) is fingerprinted again, as in 4.0. The
-  working-directory guard had put a wrapper in their place. The wrapper was a
-  closure over pyinc's own state, and fingerprinting refused it with
-  `UnsupportedValueError`.
-- Threads that call the integrations directly on one `strict` `Database`, with
-  no `WorkspaceSession` to serialize them, keep each other's decoded results.
-  Two such threads could each find no decode memo for a new database and install
-  their own. The second install dropped what the first had stored, so the next
-  call decoded again. On a free-threaded build, about one such race in three
-  lost an entry. The memo is now read and written under a lock, and decodes run
-  outside it. Threads that decode the same payload at once all get back the one
-  result stored first.
-- Databases constructed at the same moment on several threads use the one digest
-  of the kernel's own adapters that the process memoizes. Each database that
-  found none memoized used to derive its own and keep it, while the memo kept
-  whichever was written last. The derivation is deterministic, so the copies
-  agreed. An out-of-contract rewrite of the adapter between two derivations
-  would still have left databases in one process disagreeing. Every database now
-  uses the first digest published.
-- `InMemoryArtifactStore` refuses a digest rebound to different bytes, even when
-  two threads put it at once. `put` used to look for the digest and store it in
-  two steps. Two puts could both find it absent, and the second overwrote the
-  first without the `ValueError` the store protocol requires. On a free-threaded
-  build, eight threads putting one digest let a conflicting put through in 186
-  rounds of 2000. `put` now looks and stores under the store's lock. `keys()`
-  copies under the same lock, so it can be iterated while another thread stores.
-  The snapshot it returns is listed under Breaking.
-- A process forked while another thread holds the integrations' decode memo
-  lock, or an `InMemoryArtifactStore`'s lock, can go on using them. The child
-  used to inherit the lock in its held state, with no thread left to release it.
-  Its next entrypoint call on a `strict` `Database` (even a new one), or its
-  next `put` or `keys` on that store, waited forever. About half of the children
-  forked while another thread decoded hung, on 3.11 and on 3.14t. The child now
-  gets a new lock for each.
-- `InMemoryArtifactStore` can be pickled and deep copied again, as in 4.0. Its
-  lock made both raise `TypeError`. A copy, shallow or deep, now holds its own
-  items under its own lock, so each store sees only its own puts.
-- On Windows, threads whose first store, action or lock-file operation lands at
-  the same moment share one Win32 boundary. Each thread that found none used to
-  build its own, loading `kernel32` and declaring its function prototypes again,
-  and the threads could go on using different ones. The boundary is now built
-  once, under a lock.
-- The language server's diagnostics publishing is safe against its own shutdown.
-  `publish_workspace_diagnostics` is public, and the watcher thread calls it. It
-  used to check the session and then read it again, while teardown closed the
-  session before letting go of it. A publish in that window raised
-  `AttributeError` on `None` or "WorkspaceSession is closed." (the watcher
-  printed either to stderr), or sent diagnostics for a session already closed.
-  Teardown now detaches the session under the write lock before closing it. A
-  publish reads the session once, and sends only while that session is still the
-  server's.
-- A `PollingWorkspaceWatcher` stop that lands while `start()` runs stops the
-  thread `start()` launches. `start()` replaces its stop event under the
-  watcher's lifecycle lock. `stop()`, and `WorkspaceSession.close()` when it
-  stops each watcher, used to set the event without that lock. A stop landing in
-  between set the event being replaced. The new thread ran on, `stop()` waited
-  out its five-second join, and `close()` removed the mirror under the running
-  thread. `poll()` used to check that the watcher was stopped and only then
-  poll. A `start()` landing between the two polled alongside it over the same
-  pending paths, and one of them raised `RuntimeError`. Setting the stop event
-  and `poll()` now both hold the lifecycle lock.
-- A query can capture a recursive function that the kernel pins by its source.
-  The kernel pins a function by its source when its definition reads a mutable
-  module global, or reaches one that does. Such a function that calls itself, or
-  one of a pair that call each other, used to fail at fingerprinting with
-  `RecursionError`. It now fingerprints. A function with a global that nothing
-  can fold, such as `glob.glob` (whose helper reads a compiled pattern), is
-  refused with `UnsupportedValueError`.
-- `explain_query_captures` accepts the same captures as the kernel's
-  fingerprint, and judges each with the fold the kernel gives it. It used to
-  report three kinds of capture as refused. The first was a tuple, a frozenset
-  or a frozen dataclass holding any callable. The second was a function the
-  kernel pins by its source because it reads a mutable module global. The third
-  was an annotation the kernel folds as a capture, in a query that reads its own
-  annotations back.
-- Every name the ambient-read guard replaces pickles by reference again once a
-  `Database` exists. The wrappers for `open`, `io.open`, `os.getenv`,
-  `os.getenvb`, `os.listdir`, `os.scandir`, `os.getcwd`, `os.getcwdb`,
-  `Path.iterdir`, `Path.cwd` and `Thread.start` were local functions that pickle
-  could not find, so handing one to a process pool failed. Each wrapper now
-  carries the module and name of the callable it replaces.
-- On Windows 3.11 and 3.12, `os.path.realpath` and `os.path.abspath` inside a
-  query refuse a path such as `/:/data`. Those versions normalise it to
-  `/:\data`, which Windows resolves on the working directory's drive. The
-  full-qualification check used to take it for a drive with a root.
-- The language server sends diagnostics in the order its analyses ran. A publish
-  on the watcher thread used to analyze outside the server's locks. It could
-  then send after the request loop had published a newer edit, and bring stale
-  diagnostics back. A publish now holds one lock from before its analysis until
-  its last send. A publish also used to record each document as sent before
-  sending it. When an edit left a stale range past the end of its line, the send
-  raised, and the same diagnostics were later skipped as already sent. The
-  server now records a document once its notification is written. A document
-  whose range falls outside the edited text is skipped, and the publish that
-  follows the edit sends it.
-
-- A guarded name that a patch puts back is guarded again. A `mock.patch` or
-  `monkeypatch.setattr` of a guarded name that was active when the first
-  `Database` was created put the unguarded standard-library callable back when
-  it ended. That name then answered inside every query for the rest of the
-  process. Each query execution now wraps such a name again as it starts, so a
-  read through it raises `UntrackedReadError`, as it would have without the
-  patch. The new wrapper pickles by reference and fingerprints like the first.
-  A fake or a mock set in a guarded name's place keeps it.
+  before it removes the mirror. A `PollingWorkspaceWatcher` stop that lands
+  while `start()` runs stops the thread `start()` launches. `start()` refuses
+  while the previous thread is alive, `poll()` no longer runs beside a
+  `start()`, and a stopped watcher can be started again. A callback that runs
+  past `stop()`'s five-second join still outlives `close()`, which prints a
+  warning.
+- The language server sends diagnostics in the order its analyses ran, and
+  records a document as sent only once its notification is written. A publish
+  on the watcher thread could bring stale diagnostics back, or skip a document
+  whose send had failed. Publishing is also safe against the server's own
+  shutdown. A publish reads the session once and sends only while that session
+  is still the server's.
+- The language server delivers a dependency diagnostic for a `pyproject.toml`
+  or `requirements.txt` whose first line is empty. The diagnostic pointed at
+  the file's first character, which such a file lacks. Every publish skipped
+  the file, and a pull for it, or for the workspace, answered with an error.
+  A diagnostic about a whole file now carries an empty range at its start.
+- Threads that call the integrations directly on one `strict` `Database` keep
+  each other's decoded results. The decode memo is read and written under a
+  lock, and decodes run outside it. Threads that decode one payload at once
+  all get the result stored first.
+- `InMemoryArtifactStore` refuses a digest rebound to different bytes even when
+  two threads put it at once. `put` looks and stores under the store's lock. A
+  copy and a pickle round trip get a lock of their own, and a forked child
+  gets a new lock for each store and for the decode memo.
+- Databases constructed at the same moment on several threads all use the
+  first digest of the kernel's own adapters that the process publishes. On
+  Windows, threads whose first store, action or lock-file operation lands at
+  the same moment share one Win32 boundary.
+- A query can capture a function the kernel pins by its source that calls
+  itself, or one of a pair that call each other. Fingerprinting used to fail
+  with `RecursionError`. A function with a global that nothing can fold, such
+  as `glob.glob`, is refused with `UnsupportedValueError`.
+- `explain_query_captures` accepts the same captures as the fingerprint of a
+  `Database` with the default adapters, and judges each with the kernel's
+  fold. It used to report as refused a tuple, frozenset or frozen dataclass
+  holding a callable, a function pinned by its source, and an annotation
+  folded as a capture.
+- `os.reload_environ()` works on Python 3.14 once a `Database` exists. It
+  reaches the environment through an attribute the guard hides, so it raised
+  `AttributeError`, outside queries too. It is a write, so a query may call
+  it.
+- Every name the ambient-read guard replaces pickles by reference once a
+  `Database` exists, so it can be handed to a process pool. A guarded name that
+  a `mock.patch` or `monkeypatch.setattr` puts back unwrapped is wrapped again
+  when the next query execution starts. Anything else set in a guarded name's
+  place keeps it: a fake, a mock, or another standard-library function.
 
 ### Changed
 
-- `os.environ.clear()` and `os.environb.clear()` are allowed inside a query,
-  like the other environment writes. The inherited `clear()` reads every key
-  first, so the guard used to refuse it. `pop`, `popitem` and `setdefault`
-  return what they read and stay refused.
 - Once a `Database` exists, a query may capture by name any callable the
-  ambient-read guard replaces. These are `open`, `io.open`, `os.getenv`,
-  `os.getenvb`, `os.listdir`, `os.scandir`, `os.getcwd`, `os.getcwdb`,
-  `os.path.realpath`, `os.path.abspath`, `Path.iterdir`, `Path.cwd` and
-  `Thread.start`. The capture may be direct, a default, or through a closure, a
-  container, a helper function, a module attribute, a query handle, or, for
-  every name but `Path.cwd`, a static method in a class body. Such a capture
-  used to be refused with `UnsupportedValueError`, apart from `os.getcwd` and
-  `os.getcwdb`, which 4.0 fingerprinted as builtins (see Fixed). It is now
-  fingerprinted as the standard-library callable it guards. The fingerprint
-  covers that callable's module and qualified name, its module's identity, and
-  the interpreter build. A standard-library function that calls one through its
-  module's namespace is folded with it. So `os.path.relpath` and
-  `os.path.ismount` captured by name fingerprint too, `ismount` on POSIX for the
-  first time. Calling a captured wrapper inside a query behaves as the call
-  through its module does: a guarded read is refused, a fully qualified
-  `realpath` or `abspath` answers, and `Thread.start` binds the thread to the
-  query. `explain_query_captures` reports such a capture with kind `guarded`. A
-  name bound before the first `Database` still holds the unguarded original and
-  fingerprints as before. A capture of `os.environ` or `os.environb` itself is
-  still refused. So is a capture of the wrapper around a mock, a
-  `functools.partial` or a function of your own that held a guarded name when
-  the first `Database` was created. No standard-library name describes what such
-  a wrapper calls.
+  ambient-read guard replaces: `open`, `io.open`, `os.getenv`, `os.getenvb`,
+  `os.listdir`, `os.scandir`, `os.getcwd`, `os.getcwdb`, `os.path.realpath`,
+  `os.path.abspath`, `Path.iterdir`, `Path.cwd` and `Thread.start`. The capture
+  may be direct, a default, or through a closure, a container, a helper
+  function, a module attribute, a query handle, or, for every name but
+  `Path.cwd`, a static method in a class body. It used to be refused with
+  `UnsupportedValueError`, apart from `os.getcwd` and `os.getcwdb`, which 4.0
+  fingerprinted as builtins. It is now fingerprinted as the standard-library
+  callable it guards, and `explain_query_captures` reports it with kind
+  `guarded`. Calling it inside a query behaves as the call through its module
+  does. `os.path.relpath` and `os.path.ismount` captured by name fingerprint
+  too.
+- A capture of `os.environ` or `os.environb` itself is still refused. So is a
+  capture of the wrapper around a mock, a `functools.partial` or a function of
+  your own that held a guarded name when the first `Database` was created. A
+  name bound before the first `Database` holds the unguarded original and
+  fingerprints as before.
+- `os.environ.clear()` and `os.environb.clear()` are allowed inside a query,
+  like the other environment writes. `pop`, `popitem` and `setdefault` return
+  what they read and stay refused.
 - CI runs the test suite on the free-threaded CPython 3.14t build with the GIL
-  disabled, on Linux, macOS, and Windows, and runs the property suite there
-  nightly. The release workflow gates on it with the rest of the matrix. The FAQ
-  drops its statement that free-threaded builds are unverified.
-- The package declares `Programming Language :: Python :: Free Threading ::
-  2 - Beta`. The post-release check also installs the published wheel on
-  3.14t with the GIL disabled, which makes fifteen operating-system and
-  Python combinations.
-- CONTRIBUTING drops the rule that branch coverage must stay at or above 90%.
-  The floor was dropped earlier, and CI reports coverage without gating on it.
+  disabled on Linux, macOS and Windows, runs the property suite there nightly,
+  and type-checks for Windows. The release workflow gates on all of it. The
+  package declares `Programming Language :: Python :: Free Threading :: 2 -
+  Beta`, and the post-release check installs the published wheel on fifteen
+  operating-system and Python combinations.
+- The kernel contract lists one more shape that escapes query identity, under
+  limitation 5. A helper the kernel pins by its source folds a class whose own
+  fold is refused, and a mutable module global, without the code either one
+  reaches in another module. An edit to that code is missed across a
+  checkpoint. 4.0 behaves the same way.
+- The FAQ drops its statement that free-threaded builds are unverified, and
+  CONTRIBUTING drops the rule that branch coverage must stay at or above 90%.
 
 ## [4.0.0] - 2026-09-04
 
@@ -2282,3 +2239,4 @@ The first stable v1 release.
 [3.1.0]: https://github.com/Brumbelow/pyinc/releases/tag/v3.1.0
 [3.1.1]: https://github.com/Brumbelow/pyinc/releases/tag/v3.1.1
 [4.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v4.0.0
+[5.0.0]: https://github.com/Brumbelow/pyinc/releases/tag/v5.0.0

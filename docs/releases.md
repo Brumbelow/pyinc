@@ -112,7 +112,7 @@ to PyPI. The commands below read the release from `VERSION`. Set it to the
 version you are checking, without the leading `v`:
 
 ```console
-VERSION=4.0.0
+VERSION=5.0.0
 gh release download "v$VERSION" --repo Brumbelow/pyinc
 sha256sum --check SHA256SUMS
 ```
