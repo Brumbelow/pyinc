@@ -4726,14 +4726,14 @@ def test_a_query_survivor_reads_the_query_that_started_it(mode: str) -> None:
 
     def run_survivor(db: Database, start: Callable[[], object], reads: Callable[[], object]) -> object:
         results: list[object] = []
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
         gate = threading.Event()
 
         def survivor_body() -> None:
             try:
                 gate.wait(10.0)
                 results.append(reads())
-            except BaseException as exc:  # noqa: BLE001 (collected for the main thread)
+            except Exception as exc:  # noqa: BLE001 (collected for the main thread)
                 errors.append(exc)
 
         db.survivor_body = survivor_body  # type: ignore[attr-defined]
@@ -4753,12 +4753,19 @@ def test_a_query_survivor_reads_the_query_that_started_it(mode: str) -> None:
 
     def reads() -> object:
         answers: list[object] = [db.get(spawning), db.get(caller), db.get(dependent)]
-        with pytest.raises(CycleError):
+        try:
             db.get(cyclic)
+        except CycleError:
+            answers.append("a real cycle is refused")
         return answers
 
     # `caller` and `spawning` are both on the stack the survivor inherits.
-    assert run_survivor(db, lambda: db.get(caller), reads) == [6, 7, 700]
+    assert run_survivor(db, lambda: db.get(caller), reads) == [
+        6,
+        7,
+        700,
+        "a real cycle is refused",
+    ]
 
     failing_db = Database(mode)
     failing_db.set(inp, 3)
@@ -4771,14 +4778,16 @@ def test_a_query_survivor_reads_the_query_that_started_it(mode: str) -> None:
         return (len(failing_db._call_snapshots()), len(failing_db._query_objects()))
 
     def read_failing() -> object:
-        with pytest.raises(ValueError, match="no value for 3"):
+        try:
             failing_db.get(spawning_then_failing)
-        return registered()
+        except ValueError as exc:
+            return (str(exc), registered())
+        return ("answered", registered())
 
     # The survivor's own failed run of the query that started it is discarded,
     # as the first failed run was on the thread that made it.
     assert registered() == (0, 0)
-    assert run_survivor(failing_db, start_failing, read_failing) == (0, 0)
+    assert run_survivor(failing_db, start_failing, read_failing) == ("no value for 3", (0, 0))
 
 
 def test_unrelated_thread_call_serializes_while_a_query_runs() -> None:
