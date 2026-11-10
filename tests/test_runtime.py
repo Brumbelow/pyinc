@@ -212,6 +212,27 @@ def test_equal_recompute_backdates_and_skips_downstream() -> None:
     assert "backdated" in explanation
 
 
+def test_input_eq_equal_update_visible_to_dependents() -> None:
+    """An eq policy that says equal still commits the new snapshot; dependents
+    must read the committed value even though the revision does not move.
+    """
+    number = Input[int]("number", eq=lambda left, right: True)
+
+    @query
+    def double(db: Database) -> int:
+        return number.read(db) * 2
+
+    db = Database()
+    db.set(number, 1)
+    assert db.get(double) == 2
+
+    # A genuinely new value that eq treats as equal. The snapshot commits and
+    # read_input returns it; dependents must not serve the stale snapshot.
+    db.set(number, 3)
+    assert db.read_input(number) == 3
+    assert db.get(double) == 6
+
+
 def test_input_cutoff_suppresses_equal_updates() -> None:
     number = Input[int]("number", cutoff=abs)
 

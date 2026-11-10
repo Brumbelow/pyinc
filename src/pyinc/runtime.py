@@ -2044,6 +2044,7 @@ class Database:
             self._persist_snapshot(snapshot)
             self._commit_input_registration(input_key)
             if record is not None and equal:
+                previous_snapshot = record.snapshot
                 record.snapshot = snapshot
                 record.digest = digest
                 record.verified_at = self._revision
@@ -2051,6 +2052,20 @@ class Database:
                 record.reason = "equal input update ignored"
                 record.checked_in_request = self._current_request_id()
                 self._stats["input_equal_ignores"] += 1
+                # An equal policy suppresses the revision bump and observer
+                # event, but a genuinely new snapshot must still be visible to
+                # dependents. An `eq` policy that reports equal while the
+                # snapshot actually differs is an inconsistent equality: the
+                # new value is real, so move changed_at ahead of the revision
+                # so _ensure_query re-reads the committed snapshot. The
+                # revision stays put so no observer event fires, matching query
+                # backdating semantics. A `cutoff`-only update is a true
+                # no-op for change detection (the token is what matters), so
+                # dependents stay reused.
+                if input_key.eq is not None and not snapshots_equal(
+                    previous_snapshot, snapshot
+                ):
+                    record.changed_at = self._revision + 1
                 return
             self._revision += 1
             changed_at = self._revision
