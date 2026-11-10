@@ -233,6 +233,79 @@ def test_input_cutoff_suppresses_equal_updates() -> None:
     assert input_node.reason == "equal input update ignored"
 
 
+@pytest.mark.parametrize("mode", ["strict", "checked", "fast"])
+@pytest.mark.parametrize("entry_point", ["set", "set_many"])
+@pytest.mark.parametrize("policy", ["eq", "cutoff"])
+def test_an_equal_input_update_is_stored_and_leaves_dependents_alone(
+    policy: str, entry_point: str, mode: str
+) -> None:
+    """An update the input's policy reports unchanged is stored, and nothing runs again.
+
+    The policy declares which values are interchangeable. `read_input` returns
+    the new value, the revision stays where it was, and every dependent keeps
+    the result it computed from the earlier value at no cost, however often it
+    is read. That holds for a dependent the policy is substitutive for and for
+    one it is not. A dependent that runs again for another reason reads the
+    new value then.
+    """
+    config: Input[tuple[str, int]]
+    if policy == "eq":
+        config = Input[tuple[str, int]]("config", eq=lambda left, right: left[0] == right[0])
+    else:
+        config = Input[tuple[str, int]]("config", cutoff=lambda value: value[0])
+    other = Input[int]("other")
+
+    @query
+    def setting(db: Database) -> str:
+        return config.read(db)[0]
+
+    @query
+    def banner(db: Database) -> str:
+        return f"mode={setting(db)}"
+
+    @query
+    def loaded(db: Database) -> tuple[int, int]:
+        # Reads the part of the value the policy leaves out.
+        return (other.read(db), config.read(db)[1])
+
+    def update(db: Database, value: tuple[str, int]) -> None:
+        if entry_point == "set":
+            db.set(config, value)
+        else:
+            db.set_many([(config, value)])
+
+    def work(db: Database) -> tuple[int, int]:
+        stats = db.statistics()
+        return (stats.query_executions, stats.query_backdates)
+
+    db = Database(mode=mode)
+    update(db, ("fast", 1))
+    db.set(other, 0)
+    assert db.get(banner) == "mode=fast"
+    assert db.get(loaded) == (0, 1)
+    revision = db.revision
+    work_before = work(db)
+    ignores_before = db.statistics().input_equal_ignores
+
+    update(db, ("fast", 2))
+
+    assert db.read_input(config) == ("fast", 2)
+    assert db.revision == revision
+    assert db.statistics().input_equal_ignores == ignores_before + 1
+    for _ in range(3):
+        assert db.get(banner) == "mode=fast"
+        assert db.get(loaded) == (0, 1)
+    assert work(db) == work_before
+    assert _inspect_node(db, setting).last_decision == "reused"
+    assert _inspect_node(db, loaded).last_decision == "reused"
+
+    # Another input moves, so `loaded` runs again and reads the stored value.
+    db.set(other, 1)
+    assert db.get(loaded) == (1, 2)
+    assert db.get(banner) == "mode=fast"
+    assert work(db) == (work_before[0] + 1, work_before[1])
+
+
 def test_query_cutoff_backdates_and_skips_downstream(tmp_path: Path) -> None:
     files = FileResource()
     path = tmp_path / "module.py"
