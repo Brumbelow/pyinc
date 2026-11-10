@@ -471,7 +471,8 @@ following hold:
 
 Under these conditions, `load_checkpoint(key)` followed by `db.get(query)`
 returns the value a fresh recomputation on the same declared state would
-return in that mode.
+return in that mode. The one exception is code edited between the runs that
+identity does not fold: the last shape under limitation 5.
 
 A checkpoint record warms when every pinned object and every statically
 captured module chain the record depends on is unchanged. A sub-query or
@@ -519,7 +520,7 @@ each class it reaches to its live module binding. Rebinding such a binding, a
 base, a metaclass, or a directly bound body class then refuses loudly instead
 of moving identity.
 
-Three shapes escape this tracking. Route such state through an `Input` or a
+Four shapes escape this tracking. Route such state through an `Input` or a
 `Resource`:
 
 - A chain that lands on a class or a frozen dataclass instance, named directly
@@ -538,6 +539,16 @@ Three shapes escape this tracking. Route such state through an `Input` or a
 - Outside the standard library, a module that stores a process id, an import
   timestamp, or anything derived from them at module scope makes every
   identity that captures it process-varying.
+- A helper function that reads a mutable module global, or reaches one that
+  does, is pinned by its source: the bytes of its module's file, with what
+  its globals fold to. Two of those folds stop short. A class whose own fold
+  is refused (one whose method captures a module-level logger, say) is folded
+  as the files that define it and its bases. A mutable global is folded as its
+  data. Code that either one reaches in another module stays out: what a
+  method of such a class calls there, and the methods of objects held in such
+  a global. An edit to that code moves no identity. In one process that is the
+  first shape above. Across a checkpoint (limitation 4) a new process is
+  served the saved value where a fresh computation gives another.
 
 ### 6. LRU eviction under active dependencies
 
