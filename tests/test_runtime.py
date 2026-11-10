@@ -4790,6 +4790,44 @@ def test_a_query_survivor_reads_the_query_that_started_it(mode: str) -> None:
     assert run_survivor(failing_db, start_failing, read_failing) == ("no value for 3", (0, 0))
 
 
+def test_a_thread_started_in_a_query_does_not_keep_the_database_alive() -> None:
+    """A thread that outlives its query keeps no hold on the database.
+
+    A thread started inside a query body runs in a copy of the query's
+    context, and its `Thread` object keeps that copy. The copy named the
+    databases whose guard was on, by strong reference. So a worker first
+    started inside a query kept that database alive, with its records and
+    snapshots, for as long as the `Thread` object lived, even after its pool
+    had shut down. The guard holds those databases weakly now.
+    """
+    release = threading.Event()
+
+    @query
+    def spawning(db: Database) -> int:
+        thread = threading.Thread(target=db.survivor_body, daemon=True)  # type: ignore[attr-defined]
+        db.survivor_threads.append(thread)  # type: ignore[attr-defined]
+        thread.start()
+        return 1
+
+    db = Database()
+    threads: list[threading.Thread] = []
+    db.survivor_threads = threads  # type: ignore[attr-defined]
+    db.survivor_body = lambda: release.wait(10.0)  # type: ignore[attr-defined]
+    assert db.get(spawning) == 1
+    (worker,) = threads
+    collected = weakref.ref(db)
+    del db
+    gc.collect()
+    try:
+        # The thread is alive and still holds the context it was started in.
+        assert worker.is_alive()
+        assert collected() is None
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+    assert not worker.is_alive()
+
+
 def test_unrelated_thread_call_serializes_while_a_query_runs() -> None:
     """A thread the query did not start waits its turn and is served.
 

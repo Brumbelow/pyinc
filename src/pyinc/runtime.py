@@ -914,7 +914,16 @@ def _default_observer_error_hook(exc: Exception) -> None:
     sys.stderr.write(f"pyinc: observer callback raised {type(exc).__qualname__}: {exc}\n")
 
 
-_ACTIVE_GUARDS: ContextVar[tuple[Database, ...]] = ContextVar("pyinc_active_guards", default=())
+# The databases whose guard is on in the current context, held weakly. A thread
+# started inside a query body runs in a copy of the query's context, and its
+# Thread object keeps that copy for as long as the object lives. A strong
+# reference here kept every such database alive that long, with its records,
+# snapshots and observers: under an idle pool worker, and under a pool that
+# had shut down. While an execution runs its caller holds the database, so
+# the guard reads the same databases as before.
+_ACTIVE_GUARDS: ContextVar[tuple[weakref.ReferenceType[Database], ...]] = ContextVar(
+    "pyinc_active_guards", default=()
+)
 # Set while a `realpath` that reads the working directory without using it runs
 # on a path the read cannot reach: see `_cwd_anchoring_realpath`.
 _CWD_READ_UNUSED: ContextVar[bool] = ContextVar("pyinc_cwd_read_unused", default=False)
@@ -1066,8 +1075,13 @@ _BOUNDARY_REJECTION_REASONS: Mapping[str, str] = {
 
 def _raise_if_guarded(message: str) -> None:
     """Raise `UntrackedReadError` if any active Database has a running query without raw-read permission."""
-    for db in _ACTIVE_GUARDS.get():
-        if db._current_frame() is not None and not db._allow_raw_reads.get():
+    for reference in _ACTIVE_GUARDS.get():
+        db = reference()
+        if (
+            db is not None
+            and db._current_frame() is not None
+            and not db._allow_raw_reads.get()
+        ):
             raise UntrackedReadError(message)
 
 
@@ -1295,8 +1309,9 @@ def _spawning_context_thread_start(original: Callable[[threading.Thread], None])
         almost always empty tuple.
         """
         inside = any(
-            db._current_frame() is not None or db._resource_hook_depth.get() > 0
-            for db in _ACTIVE_GUARDS.get()
+            db is not None
+            and (db._current_frame() is not None or db._resource_hook_depth.get() > 0)
+            for db in (reference() for reference in _ACTIVE_GUARDS.get())
         )
         if inside and not getattr(thread, "_pyinc_context_bound", False):
             # A fresh snapshot per spawn: a Context can be entered only
@@ -4784,7 +4799,7 @@ class Database:
     def _guard_untracked_reads(self) -> Iterator[None]:
         _keep_guarded_names_in_place()
         stack = _ACTIVE_GUARDS.get()
-        token = _ACTIVE_GUARDS.set(stack + (self,))
+        token = _ACTIVE_GUARDS.set(stack + (weakref.ref(self),))
         try:
             yield
         finally:
