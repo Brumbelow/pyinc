@@ -994,7 +994,13 @@ def scope_tree_payload(db: Database, path: str) -> ScopeTreePayload:
         # parser's stack allows. Such a file gets the empty tree a syntax
         # error gets.
         return path, tuple(), tuple(), tuple()
-    result = _ScopeBuilder(path, source, parsed).build()
+    try:
+        result = _ScopeBuilder(path, source, parsed).build()
+    except RecursionError:
+        # The builder walks the tree recursively, so a tree that parses can
+        # still nest deeper than the interpreter stack allows. It gets the
+        # same empty tree, and never a partial one.
+        return path, tuple(), tuple(), tuple()
     scopes = tuple(
         (item.id, item.kind, _range_payload(item.range), item.parent_id) for item in result.scopes
     )

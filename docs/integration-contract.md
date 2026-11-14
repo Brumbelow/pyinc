@@ -40,7 +40,7 @@ holds that lock, the child gets a new lock.
 | Entrypoints | `file_analysis`, `directory_analysis`, `module_analysis`, `workspace_analysis` |
 | Result types | `DefinitionRef`, `DependencySurface`, `Diagnostic`, `ImportRef`, `PythonFileAnalysis`, `PythonModuleAnalysis`, `PythonWorkspaceAnalysis`, `ResolvedImportRef` |
 | Supported shapes | `.py` files under a workspace; absolute and relative imports; static exports; guarded imports used for type checking or import fallbacks; workspace, stdlib, installed, missing, and ambiguous resolution. |
-| Key limits | It does not execute imports or infer dynamic exports. Conditional or dynamically constructed bindings are reported conservatively, and ambiguous module names stay ambiguous. |
+| Key limits | It does not execute imports or infer dynamic exports. Conditional or dynamically constructed bindings are reported conservatively, and ambiguous module names stay ambiguous. Source can parse and still nest deeper than a recursive walk of its tree can follow. Each query whose walk runs out of stack answers as it does for source that does not parse, so a `DependencySurface` built from that walk has no exports. `file_analysis` reports no diagnostic for such a file, because its parse succeeds. How deep a walk reaches depends on the stack its caller has left, so for a file near that depth the cached answer is the one the first call computed, and another call site or a fresh database can get the other. |
 
 ## Installed packages
 
@@ -283,7 +283,7 @@ subclass of `ValueError`.
 | Entrypoints | `scope_tree`, `symbol_at` |
 | Result types | `Binding`, `Scope`, `ScopeTree`, `SymbolId` |
 | Supported shapes | Module, class, function, lambda, and comprehension scopes; parameters and ordinary Python binding forms; `global`, `nonlocal`, and assignment-expression behavior. |
-| Key limits | Resolution is static and conservative. A position that is ambiguous, dynamic, or outside a resolvable workspace binding returns no symbol and never a speculative target. |
+| Key limits | Resolution is static and conservative. A position that is ambiguous, dynamic, or outside a resolvable workspace binding returns no symbol and never a speculative target. Source can parse and still nest deeper than the recursive walk that builds a `scope_tree` can follow. Such a file gets an empty `scope_tree`, as source that does not parse does. |
 
 ## Symbol resolution
 
@@ -330,7 +330,18 @@ aliased base is reported under its alias. Both are deduplicated in
 first-encounter order, and they report different facts. `truncated_bases`
 holds a base that resolved to a workspace class but sat past the cap.
 `unresolved_bases` holds a base that never resolved to a workspace class at
-all. A base in neither tuple was followed.
+all, or resolved to a class with no model. A base in neither tuple was
+followed.
+
+Source can parse and still nest deeper than a recursive walk of its tree can
+follow. When the symbol walk runs out of stack, `module_symbol_table` answers
+as it does for source that does not parse: no symbols and the `syntax error`
+impurity reason. When the class walk runs out of stack, every class in that
+file gets a `class_model` with no members. A class in another file that
+inherits from one of them lists that base in `unresolved_bases`, as it does
+when the base's file does not parse. The class walk visits every expression,
+so a file can list its classes in `module_symbol_table` and still give each of
+them no members.
 
 ## Notebooks
 

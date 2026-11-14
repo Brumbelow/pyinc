@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -281,6 +282,154 @@ def test_scope_tree_skips_source_nested_too_deeply_to_parse(
     assert (tree.scopes, tree.bindings, tree.occurrences) == ((), (), ())
     assert [binding.name for binding in annotated_tree.bindings] == ["value"]
     assert [occurrence.name for occurrence in annotated_tree.occurrences] == ["value"]
+
+
+# Both modules parse on 3.11 and 3.14. A recursive walk over either tree runs
+# out of interpreter stack on both. ast.unparse, which renders the annotation,
+# is one of those walks.
+_TOO_DEEP_TO_WALK = {
+    "additions": "value = " + "1+" * 2_000 + "1\n",
+    "attributes": "value: a" + ".b" * 2_000 + " = 0\n",
+}
+
+
+def _workspace_too_deep_to_walk(tmp_path: Path, source: str) -> tuple[Path, Path, Path]:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "shallow.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+    deep = root / "deep.py"
+    deep.write_text(source, encoding="utf-8")
+    notebook = root / "deep.ipynb"
+    cell = {"cell_type": "code", "metadata": {}, "source": source, "outputs": []}
+    notebook.write_text(
+        json.dumps({"cells": [cell], "metadata": {}, "nbformat": 4, "nbformat_minor": 5}),
+        encoding="utf-8",
+    )
+    return root, deep, notebook
+
+
+def _call_entrypoint(name: str, root: Path, deep: Path, notebook: Path) -> object:
+    # A fresh database per call, so each entrypoint reaches the walk itself and
+    # none reads a payload another entrypoint cached.
+    db = Database(mode="strict")
+    match name:
+        case "scope_tree":
+            return scope_tree(db, deep)
+        case "symbol_at":
+            return symbol_at(db, deep, SourcePosition(0, 0))
+        case "symbol_at_in_workspace":
+            return symbol_at(db, root, deep, SourcePosition(0, 0))
+        case "find_references":
+            helper = symbol_at(db, root, root / "shallow.py", SourcePosition(0, 4))
+            assert helper is not None
+            return find_references_by_id(db, root, helper)
+        case "module_symbol_table":
+            return module_symbol_table(db, root, deep)
+        case "workspace_symbol_index":
+            return workspace_symbol_index(db, root)
+        case "class_model":
+            return class_model(db, root, deep, "value")
+        case "file_analysis":
+            return integrations.file_analysis(db, deep)
+        case "module_analysis":
+            return integrations.module_analysis(db, root, deep)
+        case "workspace_analysis":
+            return integrations.workspace_analysis(db, root)
+        case "notebook_analysis":
+            return integrations.notebook_analysis(db, notebook)
+        case "workspace_dependency_check":
+            return integrations.workspace_dependency_check(db, str(root), ())
+    raise AssertionError(f"no call for {name!r}")
+
+
+@pytest.mark.parametrize("shape", sorted(_TOO_DEEP_TO_WALK))
+@pytest.mark.parametrize(
+    ("entrypoint", "expected"),
+    [
+        ("scope_tree", ScopeTree),
+        ("symbol_at", (integrations.SymbolId, type(None))),
+        ("symbol_at_in_workspace", (integrations.SymbolId, type(None))),
+        ("find_references", ReferenceQueryResult),
+        ("module_symbol_table", integrations.ModuleSymbolTable),
+        ("workspace_symbol_index", integrations.WorkspaceSymbolIndex),
+        ("class_model", integrations.ClassModel),
+        ("file_analysis", integrations.PythonFileAnalysis),
+        ("module_analysis", integrations.PythonModuleAnalysis),
+        ("workspace_analysis", integrations.PythonWorkspaceAnalysis),
+        ("notebook_analysis", integrations.NotebookAnalysis),
+        ("workspace_dependency_check", integrations.DependencyCheckAnalysis),
+    ],
+)
+def test_entrypoints_answer_source_too_deep_to_walk(
+    entrypoint: str, expected: type | tuple[type, ...], shape: str, tmp_path: Path
+) -> None:
+    root, deep, notebook = _workspace_too_deep_to_walk(tmp_path, _TOO_DEEP_TO_WALK[shape])
+
+    assert isinstance(_call_entrypoint(entrypoint, root, deep, notebook), expected)
+
+
+def test_a_walk_out_of_stack_gets_the_answer_a_failed_parse_gets(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    additions = root / "additions.py"
+    # The class comes before the deep statement, so a walk that stopped at the
+    # deep statement would still have found the class and its member.
+    additions.write_text(
+        "class Model:\n    field = 1\n\n" + _TOO_DEEP_TO_WALK["additions"], encoding="utf-8"
+    )
+    attributes = root / "attributes.py"
+    attributes.write_text(_TOO_DEEP_TO_WALK["attributes"], encoding="utf-8")
+    sub = root / "sub.py"
+    sub.write_text("from additions import Model\nclass Sub(Model):\n    x = 1\n", encoding="utf-8")
+
+    paths = (additions, attributes)
+    db = Database(mode="strict")
+    trees = [scope_tree(db, path) for path in paths]
+    table = module_symbol_table(db, root, attributes)
+    model = class_model(db, root, additions, "Model")
+    listed = module_symbol_table(db, root, additions)
+    derived = class_model(db, root, sub, "Sub")
+
+    # The parse itself succeeds, so neither file reports a syntax error.
+    assert [integrations.file_analysis(db, path).diagnostics for path in paths] == [(), ()]
+    assert [(tree.scopes, tree.bindings, tree.occurrences) for tree in trees] == [
+        ((), (), ()),
+        ((), (), ()),
+    ]
+    assert (table.symbols, table.impurity_reasons) == ((), ("syntax error",))
+    assert [class_models_for_file(db, str(path)) for path in paths] == [(), ()]
+    assert model.members == ()
+    # The symbol walk never enters the assigned value, so it still lists the class.
+    assert [symbol.qualified_name for symbol in listed.symbols] == ["Model", "Model.field", "value"]
+    # The base resolves to that listed class, which has no model. A base whose
+    # file does not parse is unresolved, so this one is too.
+    assert [member.name for member in derived.members] == ["x"]
+    assert (derived.unresolved_bases, derived.truncated_bases) == (("Model",), ())
+
+
+def test_module_exports_answer_when_the_binding_walk_runs_out_of_stack(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Assignment targets nest only as deep as brackets do, and the tokenizer caps
+    # brackets, so no source runs this walk out of stack from a fresh one. A
+    # caller with little stack left can. The patch stands in for that caller.
+    def _exhaust_the_stack(_target: object) -> tuple[str, ...]:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("pyinc.integrations.python_source._target_bound_names", _exhaust_the_stack)
+    root = tmp_path / "workspace"
+    root.mkdir()
+    helpers = root / "helpers.py"
+    helpers.write_text("value = 1\n", encoding="utf-8")
+    user = root / "user.py"
+    user.write_text("import helpers\n", encoding="utf-8")
+
+    db = Database(mode="strict")
+    analysis = integrations.module_analysis(db, root, user)
+    table = module_symbol_table(db, root, helpers)
+
+    assert [dependency.exports for dependency in analysis.dependencies] == [()]
+    assert [symbol.qualified_name for symbol in table.symbols] == ["value"]
 
 
 # ---------------------------------------------------------------------------

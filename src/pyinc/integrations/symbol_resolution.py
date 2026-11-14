@@ -663,7 +663,13 @@ def module_symbol_table_payload(db: Database, path: str) -> ModuleSymbolTablePay
     tree = _try_parse(source)
     if tree is None:
         return ("", path, tuple(), ("syntax error",))
-    symbols, impurity = _module_symbol_walk(tree)
+    try:
+        symbols, impurity = _module_symbol_walk(tree)
+    except RecursionError:
+        # The symbol walk and the ast.unparse that renders each annotation
+        # recurse, so a tree that parses can still nest deeper than the stack
+        # allows. It gets the answer a file that does not parse gets.
+        return ("", path, tuple(), ("syntax error",))
     return ("", path, symbols, impurity)
 
 
@@ -1656,10 +1662,16 @@ def class_models_for_file(db: Database, path: str) -> tuple[OwnClassModelPayload
     if tree is None:
         return tuple()
     out: list[OwnClassModelPayload] = []
-    for qname, cls in _walk_class_defs(tree):
-        bases = tuple(_encode_base(base) for base in cls.bases)
-        members = _class_member_walk(cls)
-        out.append((qname, bases, members))
+    try:
+        for qname, cls in _walk_class_defs(tree):
+            bases = tuple(_encode_base(base) for base in cls.bases)
+            members = _class_member_walk(cls)
+            out.append((qname, bases, members))
+    except RecursionError:
+        # The class walk recurses through every node, so a tree that parses
+        # can still nest deeper than the stack allows. It gets no class
+        # models, as a file that does not parse does.
+        return tuple()
     return tuple(out)
 
 
@@ -1796,7 +1808,15 @@ def resolved_class_model_payload(
         for base in cur_bases:
             site_key = (cur_path, base)
             if site_key not in base_sites:
-                base_sites[site_key] = _resolve_base_to_class(db, root, cur_path, base)
+                site = _resolve_base_to_class(db, root, cur_path, base)
+                if site is not None and all(
+                    model[0] != site[1] for model in class_models_for_file(db, site[0])
+                ):
+                    # The class walk ran out of stack in the base's file, so the
+                    # class has no model. A base whose file does not parse never
+                    # resolves, and this base gets the same answer.
+                    site = None
+                base_sites[site_key] = site
             site = base_sites[site_key]
             if site is None:
                 text = _base_text(base)

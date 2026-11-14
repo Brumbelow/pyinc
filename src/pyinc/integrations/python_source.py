@@ -815,7 +815,13 @@ def module_binding_analysis_payload(db: Database, path: str) -> ModuleBindingAna
     tree = _try_parse(source_text(db, path))
     if tree is None:
         return (tuple(), tuple(), tuple())
-    return _module_binding_analysis(tree)
+    try:
+        return _module_binding_analysis(tree)
+    except RecursionError:
+        # Assignment targets are walked recursively. A caller with little
+        # stack left can run that walk out, and the file then gets the answer
+        # a file that does not parse gets.
+        return (tuple(), tuple(), tuple())
 
 
 @query
