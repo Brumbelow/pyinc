@@ -3478,6 +3478,13 @@ class WorkspaceSession:
         symbol_table = self._remap_module_symbol_table(
             module_symbol_table(self.db, self.mirror_root, str(mirror_path))
         )
+        # An import is undeclared only against a requirements file or a
+        # `[project]` table. A workspace with neither declares nothing, so
+        # every installed import would be reported.
+        declares_dependencies = dependency_inputs.requirements is not None or (
+            dependency_inputs.config is not None
+            and any(section.name == "project" for section in dependency_inputs.config.sections)
+        )
         diagnostics.extend(
             self._module_diagnostics(
                 real_path,
@@ -3485,6 +3492,7 @@ class WorkspaceSession:
                 module_result,
                 dependency_check,
                 reexports,
+                declares_dependencies=declares_dependencies,
             )
         )
         return FileAnalysisResult(
@@ -3502,6 +3510,8 @@ class WorkspaceSession:
         module_result: PythonModuleAnalysis,
         dependency_check: DependencyCheckAnalysis,
         reexports: _ReexportIndex | None = None,
+        *,
+        declares_dependencies: bool,
     ) -> tuple[AnalysisDiagnostic, ...]:
         diagnostics: list[AnalysisDiagnostic] = []
         declared_names = {status.name for status in dependency_check.statuses}
@@ -3553,7 +3563,8 @@ class WorkspaceSession:
                 )
 
             if (
-                resolved_import.resolution == "installed"
+                declares_dependencies
+                and resolved_import.resolution == "installed"
                 and resolved_import.distribution_name is not None
                 and _normalize_dependency_name(resolved_import.distribution_name)
                 not in declared_names

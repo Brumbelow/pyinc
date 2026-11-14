@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 import shutil
+import site
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -9761,3 +9762,67 @@ def test_workspace_navigation_methods_reject_non_python_targets(tmp_path: Path) 
         for call in calls:
             with pytest.raises(FileNotFoundError):
                 call()
+
+
+def _install_fake_distribution(monkeypatch: pytest.MonkeyPatch, site_dir: Path) -> None:
+    # One installed distribution, `fakepkg`, that provides the module `fakepkg`.
+    dist_info = site_dir / "fakepkg-1.0.dist-info"
+    _write(dist_info / "METADATA", "Metadata-Version: 2.1\nName: fakepkg\nVersion: 1.0\n")
+    _write(dist_info / "top_level.txt", "fakepkg\n")
+    monkeypatch.setattr(site, "getsitepackages", lambda *args, **kwargs: [str(site_dir)])
+    monkeypatch.setattr(site, "getusersitepackages", lambda *args, **kwargs: str(site_dir))
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {},
+        {"pyproject.toml": "[tool.ruff]\nline-length = 100\n"},
+    ],
+    ids=["no-manifest", "tool-only-pyproject"],
+)
+def test_undeclared_import_is_silent_without_a_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest: dict[str, str]
+) -> None:
+    # With no requirements file and no `[project]` table, no dependency is
+    # declared anywhere, so every installed import would be reported.
+    _install_fake_distribution(monkeypatch, tmp_path / "site-packages")
+    root = tmp_path / "workspace"
+    _write(root / "app.py", "import fakepkg\n\nfakepkg.run()\n")
+    for name, text in manifest.items():
+        _write(root / name, text)
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "app.py")
+
+    assert [d.code for d in result.diagnostics] == []
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"requirements.txt": ""},
+        {"pyproject.toml": '[project]\nname = "app"\nversion = "1"\ndependencies = []\n'},
+    ],
+    ids=["requirements", "pyproject"],
+)
+def test_undeclared_import_is_reported_against_a_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest: dict[str, str]
+) -> None:
+    _install_fake_distribution(monkeypatch, tmp_path / "site-packages")
+    root = tmp_path / "workspace"
+    _write(root / "app.py", "import fakepkg\n\nfakepkg.run()\n")
+    for name, text in manifest.items():
+        _write(root / name, text)
+
+    with WorkspaceSession(root) as session:
+        result = session.analyze_file(root / "app.py")
+
+    assert [(d.code, d.severity, d.message) for d in result.diagnostics] == [
+        (
+            "undeclared-import",
+            "warning",
+            "Import 'fakepkg' comes from installed distribution 'fakepkg', "
+            "but that dependency is not declared.",
+        )
+    ]
