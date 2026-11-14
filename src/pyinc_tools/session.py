@@ -517,6 +517,42 @@ class WorkspaceSession:
                 diagnostics=diagnostics,
             )
 
+    def _symbol_table_for_file(self, path: str | os.PathLike[str]) -> ModuleSymbolTable | None:
+        """Return the symbol table ``analyze_file`` reports, without its diagnostics.
+
+        Hover and document symbols read only the table. The dependency check
+        and the per-file checks that ``analyze_file`` adds cost seconds on a
+        mid-size workspace. A missing or non-Python path gives None, as
+        ``analyze_file`` gives no table for it.
+        """
+        with self._state_lock:
+            self._check_open()
+            real_path = self._normalize_real_path(path)
+            mirror_path = self._mirror_path_for_real(real_path)
+            if not mirror_path.exists() or mirror_path.suffix != ".py":
+                return None
+            return self._remap_module_symbol_table(
+                module_symbol_table(self.db, self.mirror_root, str(mirror_path))
+            )
+
+    def _workspace_symbol_entries(self) -> tuple[WorkspaceSymbolIndex, dict[str, str]]:
+        """Return the symbol index and each module's real path, without diagnostics.
+
+        These are the ``symbols`` and the module paths ``analyze_workspace``
+        reports, read without the dependency check and the per-file checks.
+        """
+        with self._state_lock:
+            self._check_open()
+            workspace = workspace_analysis(self.db, self.mirror_root)
+            module_paths = {
+                module.module: self._remap_path(module.path) or module.path
+                for module in workspace.modules
+            }
+            index = self._remap_workspace_symbol_index(
+                workspace_symbol_index(self.db, self.mirror_root)
+            )
+            return index, module_paths
+
     def code_actions_for_range(
         self,
         path: str | os.PathLike[str],

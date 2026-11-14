@@ -1078,11 +1078,13 @@ class LanguageServer:
 
     def _document_symbols(self, params: Any) -> list[dict[str, Any]]:
         document = params["textDocument"]
-        result = self._require_session().analyze_file(self._require_safe_path(document["uri"]))
-        if result.symbols is None:
+        table = self._require_session()._symbol_table_for_file(
+            self._require_safe_path(document["uri"])
+        )
+        if table is None:
             return []
         symbols: list[dict[str, Any]] = []
-        for symbol in result.symbols.symbols:
+        for symbol in table.symbols:
             range_payload = _range_to_lsp(symbol.range)
             symbols.append(
                 {
@@ -1098,10 +1100,9 @@ class LanguageServer:
 
     def _workspace_symbols(self, params: Any) -> list[dict[str, Any]]:
         query = str(params.get("query", "")).lower()
-        result = self._require_session().analyze_workspace()
-        module_to_path = {module.module: module.path for module in result.python.modules}
+        index, module_to_path = self._require_session()._workspace_symbol_entries()
         matches: list[dict[str, Any]] = []
-        for entry in result.symbols.entries:
+        for entry in index.entries:
             if query and query not in entry.qualified_name.lower():
                 continue
             path = module_to_path.get(entry.module)
@@ -1134,13 +1135,13 @@ class LanguageServer:
             return None
         if target is None:
             return None
-        analysis = session.analyze_file(target.path)
-        if analysis.symbols is None:
+        table = session._symbol_table_for_file(target.path)
+        if table is None:
             return None
         symbol = next(
             (
                 item
-                for item in analysis.symbols.symbols
+                for item in table.symbols
                 if item.range == target.declaration
                 and item.qualified_name.rsplit(".", 1)[-1] == target.name
             ),

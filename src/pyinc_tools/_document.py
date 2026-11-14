@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any, cast
 
 from pyinc.integrations import (
@@ -98,15 +99,45 @@ def convert_payload_positions(
     source_for_uri: Any,
     uri: str | None = None,
 ) -> Any:
-    """Recursively convert protocol position objects for their document URI."""
+    """Recursively convert protocol position objects for their document URI.
 
+    Each URI's source is read once per payload and its line map built once.
+    A reply can carry thousands of positions in a few documents, and every
+    read takes the session lock and may open the file.
+    """
+
+    documents: dict[str, DocumentMap | None] = {}
+
+    def document_for_uri(document_uri: str) -> DocumentMap | None:
+        if document_uri not in documents:
+            source = source_for_uri(document_uri)
+            documents[document_uri] = DocumentMap(source) if source is not None else None
+        return documents[document_uri]
+
+    return _convert_positions(
+        value,
+        encoding=encoding,
+        to_client=to_client,
+        document_for_uri=document_for_uri,
+        uri=uri,
+    )
+
+
+def _convert_positions(
+    value: Any,
+    *,
+    encoding: PositionEncoding,
+    to_client: bool,
+    document_for_uri: Callable[[str], DocumentMap | None],
+    uri: str | None,
+) -> Any:
     if isinstance(value, list):
         return [
-            convert_payload_positions(
+            _convert_positions(
                 item,
                 encoding=encoding,
                 to_client=to_client,
-                source_for_uri=source_for_uri,
+                document_for_uri=document_for_uri,
                 uri=uri,
             )
             for item in value
@@ -131,8 +162,7 @@ def convert_payload_positions(
         for line_key, character_key in scalar_position_fields
     ):
         converted_value = dict(value)
-        source = source_for_uri(current_uri) if current_uri is not None else None
-        document = DocumentMap(source) if source is not None else None
+        document = document_for_uri(current_uri) if current_uri is not None else None
         for line_key, character_key in scalar_position_fields:
             if line_key not in value and character_key not in value:
                 continue
@@ -166,9 +196,8 @@ def convert_payload_positions(
         if type(line) is not int or type(character) is not int:
             raise InvalidParams("line and character must be integers")
     if has_position_field and current_uri is not None:
-        source = source_for_uri(current_uri)
-        if source is not None:
-            document = DocumentMap(source)
+        document = document_for_uri(current_uri)
+        if document is not None:
             try:
                 position = SourcePosition(line, character)
                 converted = (
@@ -193,22 +222,22 @@ def convert_payload_positions(
     for key, item in value.items():
         if key == "changes" and isinstance(item, dict):
             result[key] = {
-                change_uri: convert_payload_positions(
+                change_uri: _convert_positions(
                     edits,
                     encoding=encoding,
                     to_client=to_client,
-                    source_for_uri=source_for_uri,
+                    document_for_uri=document_for_uri,
                     uri=change_uri,
                 )
                 for change_uri, edits in item.items()
             }
             continue
         item_uri = from_uri if key == "fromRanges" and from_uri is not None else current_uri
-        result[key] = convert_payload_positions(
+        result[key] = _convert_positions(
             item,
             encoding=encoding,
             to_client=to_client,
-            source_for_uri=source_for_uri,
+            document_for_uri=document_for_uri,
             uri=item_uri,
         )
     return result
