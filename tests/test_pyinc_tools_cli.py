@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import queue
+import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO, Any, NoReturn
 
 import pytest
 
@@ -645,3 +650,188 @@ def test_closed_pipe_prints_nothing_to_stderr(tmp_path: Path) -> None:
 
     assert completed.stderr == b""
     assert completed.returncode == cli.EXIT_ERROR
+
+
+# The machine running the suite can be slow and shared, so the bound is loose.
+# It only exists to turn a hung server into a failure.
+_LSP_PROCESS_TIMEOUT_S = 120.0
+
+
+def _lsp_frame(payload: dict[str, Any]) -> bytes:
+    body = json.dumps(payload).encode("utf-8")
+    return b"Content-Length: %d\r\n\r\n" % len(body) + body
+
+
+def _read_lsp_frames(stream: IO[bytes], frames: queue.Queue[dict[str, Any] | None]) -> None:
+    # Framing is parsed here on its own, so a framing bug in the server cannot
+    # cancel out against the same bug in the reader.
+    try:
+        while True:
+            length: int | None = None
+            while True:
+                line = stream.readline()
+                if not line:
+                    return
+                if line == b"\r\n":
+                    break
+                name, _, value = line.decode("ascii").partition(":")
+                if name.strip().lower() == "content-length":
+                    length = int(value)
+            if length is None:
+                return
+            frames.put(json.loads(stream.read(length)))
+    finally:
+        frames.put(None)
+
+
+class _LspProcess:
+    """The server run as ``python -m pyinc_tools lsp`` on binary pipes."""
+
+    def __init__(self, root: Path, temp_dir: Path, stderr_path: Path) -> None:
+        environment = dict(os.environ)
+        # Run the source this test imported, whatever the child's sys.path holds.
+        source_root = str(Path(cli.__file__).resolve().parents[1])
+        python_path = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = (
+            os.pathsep.join((source_root, python_path)) if python_path else source_root
+        )
+        # The mirror goes to the temp directory, so the test can see it.
+        for name in ("TMPDIR", "TMP", "TEMP"):
+            environment[name] = str(temp_dir)
+        self.temp_dir = temp_dir
+        self._stderr_path = stderr_path
+        self._stderr = stderr_path.open("wb")
+        self._deadline = time.monotonic() + _LSP_PROCESS_TIMEOUT_S
+        self.process = subprocess.Popen(
+            [sys.executable, "-m", "pyinc_tools", "lsp", "--root", str(root)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr,
+            env=environment,
+        )
+        assert self.process.stdout is not None
+        self._frames: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._reader = threading.Thread(
+            target=_read_lsp_frames, args=(self.process.stdout, self._frames), daemon=True
+        )
+        self._reader.start()
+
+    def _remaining_s(self) -> float:
+        return self._deadline - time.monotonic()
+
+    def _fail(self, reason: str) -> NoReturn:
+        self.process.kill()
+        self.process.wait()
+        self._stderr.flush()
+        stderr = self._stderr_path.read_text(encoding="utf-8", errors="replace")
+        pytest.fail(f"{reason}\nserver stderr:\n{stderr}")
+
+    def send(self, payload: dict[str, Any]) -> None:
+        assert self.process.stdin is not None
+        try:
+            self.process.stdin.write(_lsp_frame(payload))
+            self.process.stdin.flush()
+        except BrokenPipeError:
+            self._fail(f"the server closed stdin before it read {payload['method']}")
+
+    def request(self, request_id: int, method: str, params: object) -> dict[str, Any]:
+        self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        while True:
+            remaining = self._remaining_s()
+            if remaining <= 0:
+                self._fail(f"no answer to {method} in {_LSP_PROCESS_TIMEOUT_S} s")
+            try:
+                frame = self._frames.get(timeout=remaining)
+            except queue.Empty:
+                self._fail(f"no answer to {method} in {_LSP_PROCESS_TIMEOUT_S} s")
+            if frame is None:
+                self._fail(f"the server closed stdout before it answered {method}")
+            # Diagnostics notifications can come at any point between answers.
+            if "method" not in frame and frame.get("id") == request_id:
+                return frame
+
+    def notify(self, method: str, params: object) -> None:
+        self.send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def wait(self) -> int:
+        try:
+            return self.process.wait(timeout=max(self._remaining_s(), 0.0))
+        except subprocess.TimeoutExpired:
+            self._fail(f"the server did not exit in {_LSP_PROCESS_TIMEOUT_S} s")
+
+    def mirrors(self) -> list[Path]:
+        return sorted(self.temp_dir.glob("pyinc-tools-*"))
+
+    def close(self) -> None:
+        if self.process.poll() is None:
+            self.process.kill()
+        self.process.wait()
+        # The child is gone, so the reader meets the end of its stdout.
+        self._reader.join()
+        if self.process.stdin is not None:
+            with contextlib.suppress(BrokenPipeError):
+                self.process.stdin.close()
+        if self.process.stdout is not None:
+            self.process.stdout.close()
+        self._stderr.close()
+
+
+@pytest.fixture()
+def lsp_process(tmp_path: Path) -> Iterator[_LspProcess]:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "helpers.py").write_text("def helper(x: int) -> int:\n    return x\n", encoding="utf-8")
+    (root / "use.py").write_text("value = 0\n", encoding="utf-8")
+    temp_dir = tmp_path / "temp"
+    temp_dir.mkdir()
+    server = _LspProcess(root, temp_dir, tmp_path / "stderr.txt")
+    try:
+        yield server
+    finally:
+        server.close()
+
+
+_INITIALIZE_PARAMS: dict[str, object] = {"processId": None, "rootUri": None, "capabilities": {}}
+
+
+def test_lsp_stdio_process_round_trip(lsp_process: _LspProcess, tmp_path: Path) -> None:
+    initialize = lsp_process.request(1, "initialize", _INITIALIZE_PARAMS)
+    assert initialize["result"]["capabilities"]["hoverProvider"] is True
+    lsp_process.notify("initialized", {})
+    # The open buffer differs from the file on disk, so the answer shows the
+    # server read the didOpen text from the pipe.
+    use_uri = (tmp_path / "workspace" / "use.py").as_uri()
+    lsp_process.notify(
+        "textDocument/didOpen",
+        {
+            "textDocument": {
+                "uri": use_uri,
+                "languageId": "python",
+                "version": 1,
+                "text": "from helpers import helper\n\nvalue = helper(1)\n",
+            }
+        },
+    )
+    hover = lsp_process.request(
+        2,
+        "textDocument/hover",
+        {"textDocument": {"uri": use_uri}, "position": {"line": 2, "character": 10}},
+    )
+    assert hover["result"]["contents"]["kind"] == "markdown"
+    assert "def helper(x: int) -> int" in hover["result"]["contents"]["value"]
+    assert lsp_process.request(3, "shutdown", None) == {"jsonrpc": "2.0", "id": 3, "result": None}
+    lsp_process.notify("exit", None)
+
+    assert lsp_process.wait() == 0
+    assert lsp_process.mirrors() == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="TerminateProcess cannot be caught")
+def test_lsp_sigterm_removes_the_mirror(lsp_process: _LspProcess) -> None:
+    lsp_process.request(1, "initialize", _INITIALIZE_PARAMS)
+    assert len(lsp_process.mirrors()) == 1
+
+    lsp_process.process.send_signal(signal.SIGTERM)
+
+    assert lsp_process.wait() == 128 + signal.SIGTERM
+    assert lsp_process.mirrors() == []

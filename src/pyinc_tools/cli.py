@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import signal
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict
 from pathlib import Path
+from types import FrameType
 
 from .lsp import LanguageServer, _package_version
 from .session import (
@@ -196,6 +199,34 @@ def _gate_tripped(result: AnalysisResult, fail_on: str) -> bool:
     )
 
 
+@contextlib.contextmanager
+def _exit_on_sigterm() -> Iterator[None]:
+    """Raise SystemExit on SIGTERM while the language server runs.
+
+    The default action ends the process at once, so the workspace mirror stays
+    in the temp directory. The exception unwinds serve(), whose teardown closes
+    the session and removes the mirror. The exit status is 128 plus the signal
+    number. A later SIGTERM is ignored, so it cannot cut the teardown short.
+    """
+
+    if threading.current_thread() is not threading.main_thread():
+        # Only the main thread may set a signal handler.
+        yield
+        return
+
+    def _handle(signum: int, _frame: FrameType | None) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, _handle)
+    try:
+        yield
+    finally:
+        # None means the handler was not set from Python. Nothing better than
+        # the default can be put back.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL if previous is None else previous)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -277,7 +308,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return exit_status
 
     server = LanguageServer(default_root=args.root)
-    return server.serve()
+    with _exit_on_sigterm():
+        return server.serve()
 
 
 if __name__ == "__main__":
