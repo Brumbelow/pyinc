@@ -173,14 +173,22 @@ When your integration cannot determine a dependency statically, return `ambiguou
 Reference: `_resolve_workspace_module` returns `"ambiguous"` when multiple paths match
 a module prefix.
 
-### Mark unsupported cases as untracked
+### Mark reads the guard cannot see as untracked
 
-When a query depends on state the guard cannot intercept (dynamic behavior, time,
-randomness, network state, subprocess output), call `db.report_untracked_read(reason)`.
-The call prevents reuse and nothing more. The read stays untracked and as
-nondeterministic as it was. The node re-executes on every request and never backdates,
-so stale reuse cannot happen. Reference: `module_export_surface` marks dynamic
-`__all__` as untracked.
+When a query depends on state the guard cannot intercept (time, randomness, network
+state, subprocess output, a mutable interpreter list), call
+`db.report_untracked_read(reason)`. The call prevents reuse and nothing more. The read
+stays untracked and as nondeterministic as it was. The node re-executes on every request
+and never backdates, so stale reuse cannot happen. Reference: `_raw_sys_path_entries`
+in `deep_module_resolution.py` marks the live `sys.path` list as untracked.
+
+A case the integration does not model, such as a dynamic `__all__` or a top-level `if`,
+is different when it comes from file text read through a resource. The answer is still a
+function of tracked reads. Return a conservative answer and carry the reason in the
+payload. An untracked mark there would make every reader re-run on each request and
+change no answer. Reference: `module_symbol_table`
+reports a dynamic `__all__` in `impurity_reasons`, and a wildcard lookup of a name that
+module does not list resolves as `"ambiguous"`.
 
 ## Comparison Policies
 
@@ -345,7 +353,8 @@ A new integration needs:
 - [ ] Resource instances are module-level singletons by convention. Equal instances of
       a snapshot-safe resource already share one node
 - [ ] Uncertain resolution cases return conservative outcomes and avoid optimistic reuse
-- [ ] Dynamic or unsupported cases call `db.report_untracked_read(reason)`
+- [ ] Unmodelled cases in tracked text carry their reason in the payload, with no
+      untracked mark
 - [ ] Recursive traversal uses canonical visited sets and root containment checks
 - [ ] Queries that return raw text carry no `cutoff=`
 - [ ] Any `@query(cutoff=fn)` sits on a query whose token determines the value that

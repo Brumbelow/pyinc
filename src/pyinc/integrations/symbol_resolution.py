@@ -682,9 +682,6 @@ def module_symbol_table_for_module(db: Database, root: str, path: str) -> Module
 
     binding = module_binding_analysis_payload(db, path)
     merged_impurity = tuple(dict.fromkeys((*impurity, *binding[2])))
-
-    for reason in merged_impurity:
-        db.report_untracked_read(f"symbol_table({module_name}): {reason}")
     return (module_name, path, symbols, merged_impurity)
 
 
@@ -827,10 +824,8 @@ def _resolve_via_wildcards(
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        db.report_untracked_read(f"wildcard lookup {qualified_name} resolves to multiple providers")
         return "ambiguous"
     if any_dynamic_provider:
-        db.report_untracked_read(f"wildcard lookup {qualified_name} blocked by dynamic __all__")
         return "ambiguous"
     return None
 
@@ -854,7 +849,6 @@ def _resolve_symbol_payload(
         current_module = _module_name_for_path(root, current_path)
         key = (current_module, current_qname)
         if key in visited:
-            db.report_untracked_read(f"symbol resolution cycle at {current_module}:{current_qname}")
             return _terminal(
                 original_module,
                 qualified_name,

@@ -954,18 +954,14 @@ def resolved_imports_for_file(
 @query
 def module_export_surface(db: Database, root: str, path: str) -> DependencySurfacePayload:
     module = _module_name_for_path(root, path)
-    exports, _, impurity_reasons = module_binding_analysis_payload(db, path)
-    for reason in impurity_reasons:
-        db.report_untracked_read(f"{module} export surface: {reason}")
+    exports, _, _ = module_binding_analysis_payload(db, path)
     return (module, path, exports)
 
 
 @query
 def module_wildcard_export_surface(db: Database, root: str, path: str) -> DependencySurfacePayload:
     module = _module_name_for_path(root, path)
-    _, exports, impurity_reasons = module_binding_analysis_payload(db, path)
-    for reason in impurity_reasons:
-        db.report_untracked_read(f"{module} wildcard export surface: {reason}")
+    _, exports, _ = module_binding_analysis_payload(db, path)
     return (module, path, exports)
 
 
@@ -990,9 +986,6 @@ def module_analysis_payload(db: Database, root: str, path: str) -> ModuleAnalysi
     ) in resolved_imports:
         if resolution != "workspace" or resolved_module is None or resolved_path is None:
             continue
-        _, _, impurity_reasons = module_binding_analysis_payload(db, resolved_path)
-        for reason in impurity_reasons:
-            db.report_untracked_read(f"{resolved_module} dependency surface: {reason}")
         use_wildcard_surface = kind == "from" and imported_name == "*"
         if use_wildcard_surface:
             surface = module_wildcard_export_surface(db, root, resolved_path)

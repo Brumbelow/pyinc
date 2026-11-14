@@ -884,7 +884,7 @@ def test_workspace_analysis_executes_wildcard_consumer_when_wildcard_exports_cha
     assert db.inspect(workspace_analysis_payload, str(root)).last_recompute == "executed"
 
 
-def test_dynamic_all_marks_wildcard_consumers_untracked(tmp_path: Path) -> None:
+def test_dynamic_all_wildcard_consumers_are_reused_when_nothing_changed(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     provider = root / "provider.py"
@@ -900,15 +900,16 @@ def test_dynamic_all_marks_wildcard_consumers_untracked(tmp_path: Path) -> None:
     second = workspace_analysis(db, root)
 
     assert second == first
+    assert "dynamic __all__" in module_binding_analysis_payload(db, str(provider))[2]
     wildcard_surface = db.inspect(module_wildcard_export_surface, str(root), str(provider))
     consumer_view = db.inspect(module_analysis_payload, str(root), str(consumer))
-    assert wildcard_surface.is_untracked
-    assert consumer_view.is_untracked
-    assert wildcard_surface.last_recompute == "executed"
-    assert consumer_view.last_recompute == "executed"
+    assert not wildcard_surface.is_untracked
+    assert not consumer_view.is_untracked
+    assert wildcard_surface.last_decision == "reused"
+    assert consumer_view.last_decision == "reused"
 
 
-def test_provider_wildcard_reexport_marks_wildcard_consumers_untracked(
+def test_provider_wildcard_reexport_consumers_are_reused_when_nothing_changed(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "workspace"
@@ -924,12 +925,13 @@ def test_provider_wildcard_reexport_marks_wildcard_consumers_untracked(
     second = workspace_analysis(db, root)
 
     assert second == first
+    assert "top-level wildcard re-export" in module_binding_analysis_payload(db, str(provider))[2]
     wildcard_surface = db.inspect(module_wildcard_export_surface, str(root), str(provider))
     consumer_view = db.inspect(module_analysis_payload, str(root), str(consumer))
-    assert wildcard_surface.is_untracked
-    assert consumer_view.is_untracked
-    assert wildcard_surface.last_recompute == "executed"
-    assert consumer_view.last_recompute == "executed"
+    assert not wildcard_surface.is_untracked
+    assert not consumer_view.is_untracked
+    assert wildcard_surface.last_decision == "reused"
+    assert consumer_view.last_decision == "reused"
 
 
 def test_workspace_analysis_reexecutes_consumer_when_missing_module_is_added(

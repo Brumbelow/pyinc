@@ -515,8 +515,9 @@ def test_resolve_symbol_with_dynamic_all_is_ambiguous(tmp_path: Path) -> None:
     resolved = resolve_symbol(db, root, consumer, "missing_name")
 
     assert resolved.resolution == "ambiguous"
+    assert "dynamic __all__" in module_symbol_table(db, root, provider).impurity_reasons
     inspection = db.inspect(resolve_symbol_payload, str(root), str(consumer), "missing_name")
-    assert inspection.is_untracked
+    assert not inspection.is_untracked
 
 
 # ---------------------------------------------------------------------------
