@@ -7410,3 +7410,190 @@ def test_a_pinned_capture_walk_sees_a_rebound_load_slot(
     _queries, warm = db._collect_pinned_capture_objects(read_slot.fn)
     _queries, fresh = Database()._collect_pinned_capture_objects(read_slot.fn)
     assert set(warm) == set(fresh) != set(before)
+
+
+_FOLD_ONCE_CONSTANTS_SOURCE = """\
+LIMIT = 3
+SCALE = (2, 5)
+"""
+
+
+_FOLD_ONCE_HELPERS_SOURCE = """\
+import _CONSTANTS_MODULE_ as constants
+
+
+def first(value):
+    return value + constants.LIMIT
+
+
+def second(value):
+    return value * constants.LIMIT
+
+
+def third(value):
+    return value - constants.LIMIT
+"""
+
+
+def _three_helper_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> tuple[Any, ModuleType, ModuleType]:
+    """A query that calls three helpers, each reading one constants module.
+
+    It also calls a query that calls two of the same helpers, so one
+    fingerprint reaches each of those twice.
+    """
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    constants = _import_source_module(
+        tmp_path, monkeypatch, f"{name}_constants", _FOLD_ONCE_CONSTANTS_SOURCE
+    )
+    helpers = _import_source_module(
+        tmp_path,
+        monkeypatch,
+        f"{name}_helpers",
+        _FOLD_ONCE_HELPERS_SOURCE.replace("_CONSTANTS_MODULE_", constants.__name__),
+    )
+    first, second, third = helpers.first, helpers.second, helpers.third
+
+    @query(key=f"{name}-inner")
+    def inner(db: Database, value: int) -> int:
+        return cast(int, first(value) + second(value))
+
+    @query(key=f"{name}-combined")
+    def combined(db: Database, value: int) -> int:
+        return cast(int, inner(db, value) + first(value) + second(value) + third(value))
+
+    return combined, constants, helpers
+
+
+def test_one_fingerprint_folds_each_module_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each helper that reads a module reuses the module's identity from the first fold.
+
+    The module's constants are read once for its identity and once for the
+    stamp the memo entry keeps. Before, every helper and every attribute chain
+    on the module folded it again.
+    """
+
+    combined, constants, _helpers = _three_helper_query(tmp_path, monkeypatch, "pyinc_fold_once")
+    read: list[ModuleType] = []
+    fold = Database._module_constants_payload
+
+    def counting(self: Database, module: ModuleType) -> Any:
+        read.append(module)
+        return fold(self, module)
+
+    monkeypatch.setattr(Database, "_module_constants_payload", counting)
+    Database()._query_fingerprint(combined)
+    assert sum(module is constants for module in read) == 2
+
+
+def test_one_fingerprint_walks_each_code_and_name_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The attribute chains one code object reads off one name are found once."""
+
+    combined, _constants, helpers = _three_helper_query(
+        tmp_path, monkeypatch, "pyinc_walk_once"
+    )
+    asked: list[tuple[CodeType, str]] = []
+    walked: list[tuple[CodeType, str]] = []
+    ask = Database._module_access_paths
+    walk = Database._walk_module_access_paths
+
+    def counting_ask(self: Database, owner: FunctionType, capture_name: str) -> Any:
+        asked.append((owner.__code__, capture_name))
+        return ask(self, owner, capture_name)
+
+    def counting_walk(self: Database, code: CodeType, capture_name: str) -> Any:
+        walked.append((code, capture_name))
+        return walk(self, code, capture_name)
+
+    monkeypatch.setattr(Database, "_module_access_paths", counting_ask)
+    monkeypatch.setattr(Database, "_walk_module_access_paths", counting_walk)
+    Database()._query_fingerprint(combined)
+    helper_pairs = {
+        (helper.__code__, "constants") for helper in (helpers.first, helpers.second, helpers.third)
+    }
+    assert helper_pairs <= set(walked)
+    assert len(walked) == len(set(walked))
+    assert len(asked) > len(walked)
+
+
+_SHIPPED_FINGERPRINT_QUERIES = (
+    ("pyinc.integrations.json_config", "json_analysis_payload"),
+    ("pyinc.integrations.python_source", "definitions_for_file"),
+    ("pyinc.integrations.requirements_txt", "requirements_payload"),
+)
+
+
+def _shipped_query(module_name: str, query_name: str) -> Any:
+    return getattr(importlib.import_module(module_name), query_name)
+
+
+def test_a_shipped_query_fingerprint_folds_each_module_and_walk_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cold fingerprint of an integration query folds each module it reaches once.
+
+    Its helpers read the same few modules hundreds of times, and each read
+    folded the module and walked the reader's code again.
+    """
+
+    shipped = _shipped_query(*_SHIPPED_FINGERPRINT_QUERIES[0])
+    asked: list[int] = []
+    folded: list[ModuleType] = []
+    walked: list[tuple[CodeType, str]] = []
+    ask = Database._module_identity_payload
+    fold = Database._fold_module_identity_payload
+    walk = Database._walk_module_access_paths
+
+    def counting_ask(self: Database, module: ModuleType) -> Any:
+        asked.append(id(module))
+        return ask(self, module)
+
+    def counting_fold(self: Database, module: ModuleType) -> Any:
+        folded.append(module)
+        return fold(self, module)
+
+    def counting_walk(self: Database, code: CodeType, capture_name: str) -> Any:
+        walked.append((code, capture_name))
+        return walk(self, code, capture_name)
+
+    monkeypatch.setattr(Database, "_module_identity_payload", counting_ask)
+    monkeypatch.setattr(Database, "_fold_module_identity_payload", counting_fold)
+    monkeypatch.setattr(Database, "_walk_module_access_paths", counting_walk)
+    Database()._query_fingerprint(shipped)
+    assert len({id(module) for module in folded}) == len(folded) > 1
+    assert len(set(walked)) == len(walked) > 1
+    assert len(asked) > len(folded)
+
+
+@pytest.mark.parametrize(("module_name", "query_name"), _SHIPPED_FINGERPRINT_QUERIES)
+def test_the_fold_memo_leaves_shipped_query_digests_unchanged(
+    module_name: str, query_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fingerprint that shares one fold per module digests as one that shares none."""
+
+    shipped = _shipped_query(module_name, query_name)
+    shared = Database()._query_fingerprint(shipped)
+    monkeypatch.setattr(runtime_module._ModuleSourceReads, "live", lambda self: False)
+    assert Database()._query_fingerprint(shipped) == shared
+
+
+def test_a_module_rebound_after_a_fingerprint_is_folded_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fold a fingerprint shares ends with it, so the next one reads the module afresh."""
+
+    combined, constants, _helpers = _three_helper_query(
+        tmp_path, monkeypatch, "pyinc_fold_after"
+    )
+    db = Database()
+    before = db._query_fingerprint(combined)
+    monkeypatch.setattr(constants, "LIMIT", 4)
+    warm = db._query_fingerprint(combined)
+    assert warm == Database()._query_fingerprint(combined) != before
+    assert db.get(combined, 1) == Database().get(combined, 1) == 2 * (1 + 4) + 2 * (1 * 4) + (1 - 4)

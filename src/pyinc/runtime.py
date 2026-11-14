@@ -827,16 +827,34 @@ class _ModuleSourceReads:
     `ContextVar`, so a context copied while it is open holds it too. It belongs
     to the thread that opened it and ends when that fingerprint returns, the
     same rule `_RequestScope` follows, so a copy reads its files afresh.
+
+    The same fingerprint also keeps each module's identity payload, keyed by
+    module id, and the attribute chains each code object reads off a name,
+    keyed by code id and name. Each entry holds the object it is keyed by. A
+    fingerprint reaches the same few modules from hundreds of helpers. A code
+    object never changes, so its walk is fixed. A module is folded once per
+    fingerprint, as its file is read once, so every part of one answer folds
+    the same namespace.
     """
 
     digests: dict[tuple[int, str], tuple[ModuleType, str | None, OSError | None]] = field(
         default_factory=dict
     )
+    identities: dict[int, tuple[ModuleType, Any]] = field(default_factory=dict)
+    access_paths: dict[
+        tuple[int, str], tuple[CodeType, tuple[tuple[tuple[str, ...], ...], bool]]
+    ] = field(default_factory=dict)
     owner: object = field(default_factory=_current_thread_token)
     ended: bool = False
 
     def live(self) -> bool:
         return not self.ended and self.owner is _current_thread_token()
+
+    def close(self) -> None:
+        self.ended = True
+        self.digests.clear()
+        self.identities.clear()
+        self.access_paths.clear()
 
 
 @dataclass(frozen=True, eq=False)
@@ -4945,8 +4963,7 @@ class Database:
         try:
             return self._memoized_query_fingerprint(query)
         finally:
-            reads.ended = True
-            reads.digests.clear()
+            reads.close()
             self._module_source_reads.reset(token)
 
     def _memoized_query_fingerprint(self, query: Any) -> str:
@@ -8023,9 +8040,29 @@ class Database:
     def _module_access_paths(
         self, owner: FunctionType, capture_name: str
     ) -> tuple[tuple[tuple[str, ...], ...], bool]:
+        """The attribute chains `owner`'s code reads off `capture_name`.
+
+        The flag is True when some read of the name is not such a chain. The
+        walk reads only the code object, so inside one query fingerprint the
+        first walk of a code object and name serves every later call.
+        """
+        owner_code = owner.__code__
+        reads = self._module_source_reads.get()
+        if reads is None or not reads.live():
+            return self._walk_module_access_paths(owner_code, capture_name)
+        key = (id(owner_code), capture_name)
+        kept = reads.access_paths.get(key)
+        if kept is None:
+            kept = (owner_code, self._walk_module_access_paths(owner_code, capture_name))
+            reads.access_paths[key] = kept
+        return kept[1]
+
+    def _walk_module_access_paths(
+        self, owner_code: CodeType, capture_name: str
+    ) -> tuple[tuple[tuple[str, ...], ...], bool]:
         paths: builtins.set[tuple[str, ...]] = builtins.set()
         dynamic = False
-        for code in self._walk_code_objects(owner.__code__):
+        for code in self._walk_code_objects(owner_code):
             instructions = tuple(dis.get_instructions(code))
             for index, instruction in enumerate(instructions):
                 if (
@@ -8468,10 +8505,25 @@ class Database:
         object that is none of those callables, a mutable dataclass, a dict, a
         list) raise when the fingerprint is built. Such state belongs in an
         `Input` or a `Resource`.
+
+        Inside one query fingerprint the first fold is kept and every later
+        call reuses it. A fold that raises keeps nothing, so the next call
+        folds again.
         """
         collector = self._fingerprint_module_collector.get()
         if collector is not None:
             collector.setdefault(id(module), module)
+        reads = self._module_source_reads.get()
+        if reads is None or not reads.live():
+            return self._fold_module_identity_payload(module)
+        kept = reads.identities.get(id(module))
+        if kept is None:
+            kept = (module, self._fold_module_identity_payload(module))
+            reads.identities[id(module)] = kept
+        return kept[1]
+
+    def _fold_module_identity_payload(self, module: ModuleType) -> Any:
+        """Fold a module's identity payload afresh, as `_module_identity_payload` describes."""
         namespace = vars(module)
         module_name = module.__name__
         if sys.modules.get(module_name) is not module:
@@ -8873,8 +8925,7 @@ class Database:
         try:
             return self._resource_identity_from_memo(resource, configuration)
         finally:
-            reads.ended = True
-            reads.digests.clear()
+            reads.close()
             self._module_source_reads.reset(token)
 
     def _resource_identity_from_memo(self, resource: Any, configuration: Any) -> tuple[str, str]:
