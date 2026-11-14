@@ -234,6 +234,14 @@ class _InvalidLifecycleRequest(Exception):
     pass
 
 
+class _OutsideWorkspace(InvalidParams):
+    """The URI names no file under the workspace root.
+
+    A request about such a document gets an empty result, and a notification
+    about it is dropped.
+    """
+
+
 def _path_to_uri(path: str) -> str:
     return Path(path).resolve(strict=False).as_uri()
 
@@ -580,8 +588,8 @@ class LanguageServer:
                 self._send_error(request_id, _JSONRPC_METHOD_NOT_FOUND, "Method not found")
             except InvalidParams as exc:
                 # Raised by the params checks, by the conversion of the client's
-                # positions, and where _uri_to_path, _require_safe_path or
-                # _initialize refuse a URI, path or root the client named.
+                # positions, and where _uri_to_path or _initialize refuse the
+                # root the client named.
                 self._send_error(
                     request_id,
                     _JSONRPC_INVALID_PARAMS,
@@ -636,7 +644,14 @@ class LanguageServer:
             source_for_uri=self._source_for_uri,
             uri=uri,
         )
-        result = self._dispatch_request(method, converted_params)
+        try:
+            result = self._dispatch_request(method, converted_params)
+        except _OutsideWorkspace:
+            # The server has nothing to say about a document outside the root,
+            # such as a stdlib file or an untitled buffer. Null is an empty
+            # result for every request that names one. textDocument/diagnostic
+            # needs a report, so it answers an empty one itself.
+            return None
         try:
             return convert_payload_positions(
                 result,
@@ -770,7 +785,16 @@ class LanguageServer:
             return True
         if method == "workspace/didChangeWatchedFiles":
             changes = params.get("changes", [])
-            paths = [self._require_safe_path(item["uri"]) for item in changes if "uri" in item]
+            paths: list[str] = []
+            for item in changes:
+                # A bad entry is skipped alone, so the rest of the batch is
+                # still refreshed.
+                if not isinstance(item, dict) or not isinstance(item.get("uri"), str):
+                    continue
+                try:
+                    paths.append(self._require_safe_path(item["uri"]))
+                except _OutsideWorkspace:
+                    continue
             if paths:
                 self._require_session().refresh_paths(paths)
                 self.publish_workspace_diagnostics()
@@ -1133,9 +1157,9 @@ class LanguageServer:
         line = int(position["line"])
         character = int(position["character"])
         try:
-            items = session.completions_at(real_path, line, character)
+            items, truncated = session._completion_list(real_path, line, character)
         except FileNotFoundError:
-            items = ()
+            items, truncated = (), False
         payload: list[dict[str, Any]] = []
         for item in items:
             entry: dict[str, Any] = {"label": item.label}
@@ -1146,7 +1170,9 @@ class LanguageServer:
                 entry["detail"] = item.detail
             entry["sortText"] = item.sort_text
             payload.append(entry)
-        return {"isIncomplete": False, "items": payload}
+        # A cut list is incomplete, so the client asks again as the prefix
+        # grows instead of filtering the first items.
+        return {"isIncomplete": truncated, "items": payload}
 
     def _definition(self, params: Any) -> list[dict[str, Any]]:
         session = self._require_session()
@@ -1807,13 +1833,16 @@ class LanguageServer:
         return payload
 
     def _require_safe_path(self, uri: str) -> str:
-        path = _uri_to_path(uri)
+        try:
+            path = _uri_to_path(uri)
+        except InvalidParams as exc:
+            raise _OutsideWorkspace(str(exc)) from exc
         root = Path(self._require_session().root).resolve(strict=False)
         resolved = Path(path).resolve(strict=False)
         try:
             resolved.relative_to(root)
         except ValueError as exc:
-            raise InvalidParams(str(exc)) from exc
+            raise _OutsideWorkspace(str(exc)) from exc
         return str(resolved)
 
     def _require_session(self) -> WorkspaceSession:

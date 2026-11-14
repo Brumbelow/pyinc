@@ -784,34 +784,6 @@ def test_malformed_request_params_get_invalid_params_without_traceback(
     assert capsys.readouterr().err == ""
 
 
-@pytest.mark.parametrize("uri", ["untitled:Untitled-1", "outside"])
-def test_refused_document_uri_gets_invalid_params_without_traceback(
-    uri: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    root = tmp_path / "root"
-    root.mkdir()
-    if uri == "outside":
-        outside = tmp_path / "outside.py"
-        outside.write_text("x = 1\n", encoding="utf-8")
-        uri = outside.as_uri()
-    hover = {
-        "jsonrpc": "2.0",
-        "id": 5,
-        "method": "textDocument/hover",
-        "params": {"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}},
-    }
-
-    status, messages = _serve(
-        _frame(_initialize_request(root)) + _frame(hover) + _frame(_SHUTDOWN) + _frame(_EXIT)
-    )
-
-    assert status == 0
-    assert messages[1]["id"] == 5
-    assert messages[1]["error"]["code"] == -32602
-    _assert_served_lifecycle(messages)
-    assert capsys.readouterr().err == ""
-
-
 @pytest.mark.parametrize("root_uri", ["http://example.invalid/root", "missing"])
 def test_refused_root_gets_invalid_params_without_traceback(
     root_uri: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]

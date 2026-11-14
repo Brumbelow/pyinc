@@ -1132,6 +1132,15 @@ class WorkspaceSession:
         comment, outside the workspace, or otherwise has nothing sensible to
         offer.
         """
+        return self._completion_list(path, line, character)[0]
+
+    def _completion_list(
+        self,
+        path: str | os.PathLike[str],
+        line: int,
+        character: int,
+    ) -> tuple[tuple[CompletionItem, ...], bool]:
+        """Return the completions at the caret and whether the limit cut them."""
         with self._state_lock:
             self._check_open()
             real_path = self._normalize_real_path(path)
@@ -1140,10 +1149,10 @@ class WorkspaceSession:
                 raise FileNotFoundError(real_path)
             source = self.source_text(real_path)
             if source is None:
-                return ()
+                return (), False
             context = _find_completion_context(source, line, character)
             if context is None:
-                return ()
+                return (), False
 
             kind = context[0]
             items: list[CompletionItem] = []
@@ -1212,7 +1221,7 @@ class WorkspaceSession:
             for item in items:
                 deduped.setdefault(item.label, item)
             ordered = sorted(deduped.values(), key=lambda c: (c.sort_text, c.label))
-            return tuple(ordered[:_COMPLETION_LIMIT])
+            return tuple(ordered[:_COMPLETION_LIMIT]), len(ordered) > _COMPLETION_LIMIT
 
     @contextlib.contextmanager
     def _repaired_current_file(self, mirror_path: Path, original: str, line: int) -> Iterator[bool]:
