@@ -228,10 +228,15 @@ def _get_site_packages_dirs() -> tuple[str, ...]:
     dirs: list[str] = []
     with contextlib.suppress(AttributeError):
         dirs.extend(site.getsitepackages())
+    # The interpreter puts the user site on sys.path only when ENABLE_USER_SITE
+    # is true. It is False under ``python -s`` and in a virtual environment
+    # without the system site-packages, and None when disabled for safety. A
+    # distribution installed only there cannot be imported then.
     with contextlib.suppress(AttributeError):
-        user_site = site.getusersitepackages()
-        if isinstance(user_site, str):
-            dirs.append(user_site)
+        if site.ENABLE_USER_SITE:
+            user_site = site.getusersitepackages()
+            if isinstance(user_site, str):
+                dirs.append(user_site)
     seen: set[str] = set()
     result: list[str] = []
     for d in dirs:

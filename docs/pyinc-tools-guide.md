@@ -78,7 +78,9 @@ reads the manifests but names the package `src.mypkg`, so `import mypkg` does
 not resolve to the workspace. The `src` directory as root names it `mypkg` but
 holds neither manifest, so no dependency diagnostics appear, and files outside
 `src` are not analyzed. Installed imports resolve against the interpreter that
-runs `pyinc-tools`: its site-packages directories and the user site directory.
+runs `pyinc-tools`: its site-packages directories, plus its user site directory
+when that interpreter puts the user site on `sys.path`. An interpreter in a
+virtual environment without the system site-packages does not.
 
 ### Report diagnostics and gate a CI job
 

@@ -944,9 +944,59 @@ def test_site_package_discovery_ignores_duplicates_missing_paths_and_nonstring_u
         "getsitepackages",
         lambda *args, **kwargs: [str(existing), str(existing), str(missing)],
     )
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", True)
     monkeypatch.setattr(site, "getusersitepackages", lambda *args, **kwargs: (str(existing),))
 
     analysis = installed_packages_analysis(Database())
 
     assert [p.distribution_name for p in analysis.packages] == ["only"]
     assert analysis.diagnostics == ()
+
+
+def _plant_user_site_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Plant one distribution in the user site and none in site-packages."""
+    system_site = tmp_path / "site-packages"
+    system_site.mkdir()
+    user_site = tmp_path / "user-site"
+    _make_dist_info(user_site, "useronly", "1.0", top_level="useronly")
+    monkeypatch.setattr(site, "getsitepackages", lambda *args, **kwargs: [str(system_site)])
+    monkeypatch.setattr(site, "getusersitepackages", lambda *args, **kwargs: str(user_site))
+    root = tmp_path / "workspace"
+    root.mkdir()
+    consumer = root / "app.py"
+    consumer.write_text("import useronly\n", encoding="utf-8")
+    return consumer
+
+
+@pytest.mark.parametrize("enabled", [False, None])
+def test_user_site_distribution_is_not_installed_when_the_user_site_is_off(
+    enabled: bool | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A virtual environment, ``python -s`` and the safety check leave the user
+    # site off ``sys.path``, so a distribution installed only there cannot be
+    # imported. False means disabled and None means disabled for safety.
+    consumer = _plant_user_site_only(tmp_path, monkeypatch)
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", enabled)
+    db = Database()
+
+    assert installed_packages_analysis(db).packages == ()
+    assert installed_distributions_index(db) == ()
+    assert resolve_import_name(db, "useronly").origin == "unknown"
+    resolved = integrations.module_analysis(db, consumer.parent, consumer).resolved_imports
+    assert [(ref.module, ref.resolution) for ref in resolved] == [("useronly", "missing")]
+
+
+def test_user_site_distribution_is_installed_when_the_user_site_is_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    consumer = _plant_user_site_only(tmp_path, monkeypatch)
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", True)
+    db = Database()
+
+    assert [p.distribution_name for p in installed_packages_analysis(db).packages] == ["useronly"]
+    resolution = resolve_import_name(db, "useronly")
+    assert (resolution.origin, resolution.distribution_name) == ("installed", "useronly")
+    resolved = integrations.module_analysis(db, consumer.parent, consumer).resolved_imports
+    assert [(ref.module, ref.resolution, ref.distribution_name) for ref in resolved] == [
+        ("useronly", "installed", "useronly")
+    ]
