@@ -328,8 +328,8 @@ def external_urls(files: tuple[Path, ...]) -> tuple[str, ...]:
     """Return every external URL written in those files' prose, in reading order.
 
     This only collects addresses and opens no connection, and `check_docs`
-    never calls it. A separate scheduled job asks whether the addresses still
-    answer, so the check that runs on every change stays offline.
+    never calls it. A separate job, started by hand, asks whether the addresses
+    still answer, so the check that runs on every change stays offline.
 
     The scan matches any bare `https?://` run, whatever syntax surrounds it.
     The changelog writes its release links as link-reference definitions

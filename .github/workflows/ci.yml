@@ -139,10 +139,10 @@ jobs:
       - name: Run property suite
         # The strict mode at a reduced example budget on every push and pull
         # request, as three jobs split by PYINC_TEST_SHARD (tests/conftest.py).
-        # The full matrix at the written budgets runs nightly. Every case is
-        # parametrized over the three modes, with the mode as the last parameter
-        # in the identifier. The closing bracket keeps a case whose own name
-        # reads "fast" out of the fast shard.
+        # The weekly workflow runs every mode at the written budgets. Every case
+        # is parametrized over the three modes, with the mode as the last
+        # parameter in the identifier. The closing bracket keeps a case whose
+        # own name reads "strict" out of this run.
         shell: bash
         env:
           PYINC_PROPERTY_MAX_EXAMPLES: '10'

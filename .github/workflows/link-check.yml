@@ -1,11 +1,9 @@
 name: Link check
 
-# Runs on a schedule or by dispatch only, and no other job waits on it. The
-# documentation checker that runs on every change stays offline, so an outside
-# site going down can never block a change or a release.
+# Runs by dispatch only, and no other job waits on it. The documentation
+# checker that runs on every change stays offline, so an outside site going
+# down can never block a change or a release.
 on:
-  schedule:
-    - cron: '17 6 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -65,7 +63,7 @@ jobs:
               A link into this repository, at a ref this tree answers for, is
               checked against the worktree on every change. The target must
               exist, and so must the heading a fragment names. Asking GitHub
-              again each week would only spend rate limit.
+              again here would only spend rate limit.
               """
               parsed = urllib.parse.urlsplit(url)
               return _repository_path(parsed.netloc, parsed.path, refs) is not None
