@@ -178,15 +178,26 @@ def _is_workspace_link(path: Path) -> bool:
     return bool(attributes & reparse_point)
 
 
-def _reject_symlink_components(path: Path, root: Path) -> None:
+def _first_link_component(path: Path, root: Path) -> Path | None:
+    """The first component of `path` below `root` that is a link, if any.
+
+    `_validate_symlink` checks that component, so a link out of the root raises.
+    """
+
     relative = path.relative_to(root)
     current = root
     for part in relative.parts:
         current /= part
-        if not _is_workspace_link(current):
-            continue
-        _validate_symlink(current, root)
-        raise ValueError(f"workspace symlinks are not supported: {current!s}")
+        if _is_workspace_link(current):
+            _validate_symlink(current, root)
+            return current
+    return None
+
+
+def _reject_symlink_components(path: Path, root: Path) -> None:
+    link = _first_link_component(path, root)
+    if link is not None:
+        raise ValueError(f"workspace symlinks are not supported: {link!s}")
 
 
 def _require_workspace_parent_identity(
@@ -372,7 +383,10 @@ def _requirements_reference_paths(
         if current in visited:
             continue
         visited.add(current)
-        _reject_symlink_components(current, root)
+        if _first_link_component(current, root) is not None:
+            # A linked requirements file is skipped as the walk skips a linked
+            # file, and its includes are not followed.
+            continue
         try:
             text = _read_workspace_file(current, root).decode("utf-8")
         except (FileNotFoundError, IsADirectoryError):
@@ -393,14 +407,15 @@ def _requirements_reference_paths(
                 target = Path(os.path.abspath(current.parent / raw_target))
             if not _workspace_path_allowed(target, root, ignored_dir_names, exclude_globs):
                 continue
-            _reject_symlink_components(target, root)
+            if _first_link_component(target, root) is not None:
+                continue
             try:
                 metadata = target.lstat()
             except (FileNotFoundError, NotADirectoryError):
                 continue
             if _is_workspace_link(target):
                 _validate_symlink(target, root)
-                raise ValueError(f"workspace symlinks are not supported: {target!s}")
+                continue
             if not stat.S_ISREG(metadata.st_mode):
                 continue
             referenced.add(target)
@@ -518,9 +533,20 @@ def _is_excluded(path: Path, root: Path, patterns: tuple[str, ...]) -> bool:
 
 
 def _validate_symlink(path: Path, root: Path) -> None:
+    """Refuse the workspace when the link at `path` points out of `root`.
+
+    The target is resolved without requiring it to exist. A link whose target
+    lies inside the root is left to the caller, dangling or not: the walk and
+    the requirements closure skip it, and a read refuses it. Emacs keeps a
+    dangling `.#name.py` link beside every buffer with unsaved edits. A link
+    whose target lies outside the root raises, dangling or not.
+    `os.path.realpath` resolves a link loop without raising on every supported
+    version, where `Path.resolve` raises on 3.11 and 3.12.
+    """
+
     try:
-        path.resolve(strict=True).relative_to(root)
-    except (FileNotFoundError, ValueError) as exc:
+        Path(os.path.realpath(path)).relative_to(root)
+    except ValueError as exc:
         raise ValueError(f"workspace symlink escapes the root: {path!s}") from exc
 
 

@@ -158,7 +158,7 @@ def test_exclusion_matching_supports_fnmatch_path_match_and_outside_paths(tmp_pa
     assert workspace._is_excluded(tmp_path / "outside.py", root, ())
 
 
-def test_validate_symlink_accepts_in_root_target_and_rejects_missing_or_escaping(
+def test_validate_symlink_accepts_in_root_targets_and_rejects_escaping_ones(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "root"
@@ -172,8 +172,12 @@ def test_validate_symlink_accepts_in_root_target_and_rejects_missing_or_escaping
 
     missing = root / "missing.py"
     _symlink_or_skip(missing, root / "absent.py")
-    with pytest.raises(ValueError, match="escapes the root"):
-        workspace._validate_symlink(missing, root)
+    workspace._validate_symlink(missing, root)
+
+    loop = root / "loop.py"
+    _symlink_or_skip(loop, root / "partner.py")
+    _symlink_or_skip(root / "partner.py", loop)
+    workspace._validate_symlink(loop, root)
 
     outside_target = tmp_path / "outside.py"
     outside_target.write_text("pass\n", encoding="utf-8")
@@ -181,6 +185,11 @@ def test_validate_symlink_accepts_in_root_target_and_rejects_missing_or_escaping
     _symlink_or_skip(escaping, outside_target)
     with pytest.raises(ValueError, match="escapes the root"):
         workspace._validate_symlink(escaping, root)
+
+    dangling_escape = root / "gone.py"
+    _symlink_or_skip(dangling_escape, tmp_path / "absent.py")
+    with pytest.raises(ValueError, match="escapes the root"):
+        workspace._validate_symlink(dangling_escape, root)
 
 
 def test_reject_symlink_components_rejects_even_an_in_root_link(tmp_path: Path) -> None:
@@ -1402,3 +1411,93 @@ def test_watcher_polls_every_half_second_by_default(
     watcher.stop(timeout=10)
 
     assert intervals == [0.5]
+
+
+# Emacs writes this dangling link beside every buffer with unsaved edits.
+_EMACS_LOCK_TARGET = "user@host.1234:1700000000"
+
+
+def test_session_opens_beside_an_emacs_lock_link(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    _symlink_or_skip(root / ".#a.py", Path(_EMACS_LOCK_TARGET))
+
+    with WorkspaceSession(root) as session:
+        assert _mirrored_files(Path(session.mirror_root)) == {"a.py"}
+
+
+def test_a_poll_ignores_an_emacs_lock_link_made_after_the_session_opened(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    with WorkspaceSession(root) as session:
+        watcher = workspace.PollingWorkspaceWatcher(session, debounce_ms=0)
+        _symlink_or_skip(root / ".#a.py", Path(_EMACS_LOCK_TARGET))
+
+        assert watcher.poll() == ()
+        assert _mirrored_files(Path(session.mirror_root)) == {"a.py"}
+
+
+def test_session_skips_a_dangling_in_root_link(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    _symlink_or_skip(root / "b.py", Path("missing.py"))
+
+    with WorkspaceSession(root) as session:
+        assert _mirrored_files(Path(session.mirror_root)) == {"a.py"}
+
+
+def test_session_skips_a_linked_requirements_entrypoint(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    (root / "reqs").mkdir(parents=True)
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "reqs" / "base.txt").write_text("-r pins.txt\n", encoding="utf-8")
+    (root / "reqs" / "pins.txt").write_text("demo==1\n", encoding="utf-8")
+    _symlink_or_skip(root / "requirements.txt", Path("reqs", "base.txt"))
+
+    with WorkspaceSession(root) as session:
+        assert _mirrored_files(Path(session.mirror_root)) == {"a.py"}
+
+
+@pytest.mark.parametrize("linked", ["file", "parent"])
+def test_session_skips_a_linked_requirements_include(tmp_path: Path, linked: str) -> None:
+    root = tmp_path / "root"
+    real = root / "real"
+    real.mkdir(parents=True)
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "requirements.txt").write_text("-r reqs/base.txt\n", encoding="utf-8")
+    (real / "base.txt").write_text("-r pins.txt\n", encoding="utf-8")
+    (real / "pins.txt").write_text("demo==1\n", encoding="utf-8")
+    if linked == "file":
+        (root / "reqs").mkdir()
+        _symlink_or_skip(root / "reqs" / "base.txt", real / "base.txt")
+    else:
+        _symlink_or_skip(root / "reqs", real, target_is_directory=True)
+
+    with WorkspaceSession(root) as session:
+        assert _mirrored_files(Path(session.mirror_root)) == {"a.py", "requirements.txt"}
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+@pytest.mark.parametrize("link_name", ["c.py", "reqs/base.txt"])
+def test_session_refuses_a_link_out_of_the_root(
+    tmp_path: Path, link_name: str, dangling: bool
+) -> None:
+    root = tmp_path / "root"
+    (root / "reqs").mkdir(parents=True)
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "requirements.txt").write_text("-r reqs/base.txt\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "target.py"
+    if not dangling:
+        target.write_text("x = 2\n", encoding="utf-8")
+    _symlink_or_skip(root / link_name, target)
+
+    with pytest.raises(ValueError, match="workspace symlink escapes the root"):
+        WorkspaceSession(root)
